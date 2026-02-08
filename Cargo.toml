@@ -1,6 +1,10 @@
 [package]
 name = "cjwasm"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+logos = "0.14"           # 词法分析
+wasm-encoder = "0.220"   # WASM 代码生成
+thiserror = "2.0"        # 错误处理
+ariadne = "0.4"          # 错误报告（漂亮的诊断信息）
