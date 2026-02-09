@@ -77,6 +77,40 @@ fn test_compile_struct_and_field() {
 }
 
 #[test]
+fn test_compile_enum_match() {
+    let source = r#"
+        enum Color { Red, Green, Blue }
+        func main() -> Int64 {
+            let c: Color = Color.Red
+            match c {
+                Color.Red => 1,
+                Color.Green => 2,
+                Color.Blue => 3,
+                _ => 0
+            }
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "enum_match");
+}
+
+#[test]
+fn test_compile_struct_method() {
+    let source = r#"
+        struct Rect { width: Int64, height: Int64 }
+        func Rect.area(self: Rect) -> Int64 {
+            return self.width * self.height
+        }
+        func main() -> Int64 {
+            let r = Rect { width: 5, height: 10 }
+            return r.area()
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "struct_method");
+}
+
+#[test]
 fn test_compile_array_and_for() {
     let source = r#"
         func main() -> Int64 {
@@ -177,6 +211,39 @@ fn test_compile_for_range() {
     "#;
     let wasm = compile_source(source);
     assert_valid_wasm(&wasm, "for_range");
+}
+
+#[test]
+fn test_compile_call_type_inference() {
+    // let 无类型注解时，从函数返回类型推断
+    let source = r#"
+        func get_val() -> Int64 { return 42 }
+        func main() -> Int64 {
+            let x = get_val()
+            return x
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "call_type_inference");
+}
+
+#[test]
+fn test_compile_break_continue() {
+    let source = r#"
+        func main() -> Int64 {
+            var i: Int64 = 0
+            var n: Int64 = 0
+            while true {
+                i = i + 1
+                if i > 10 { break }
+                if i % 2 == 0 { continue }
+                n = n + 1
+            }
+            return n
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "break_continue");
 }
 
 #[test]

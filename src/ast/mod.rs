@@ -137,6 +137,11 @@ pub enum Expr {
         end: Box<Expr>,
         inclusive: bool,  // true 表示 ..=
     },
+    /// 枚举变体构造 Color.Red（值为 i32 判别式）
+    VariantConst {
+        enum_name: String,
+        variant_name: String,
+    },
     /// match 表达式
     Match {
         expr: Box<Expr>,
@@ -176,6 +181,11 @@ pub enum Pattern {
     },
     /// 元组解构 (a, b)
     Tuple(Vec<Pattern>),
+    /// 枚举变体模式 Color.Red 或 Red（匹配时用）
+    Variant {
+        enum_name: String,
+        variant_name: String,
+    },
 }
 
 /// 字面量值 (用于模式匹配)
@@ -223,6 +233,10 @@ pub enum Stmt {
         iterable: Expr,
         body: Vec<Stmt>,
     },
+    /// break（跳出当前循环）
+    Break,
+    /// continue（跳到当前循环下一轮）
+    Continue,
 }
 
 /// 赋值目标
@@ -290,9 +304,23 @@ pub struct Function {
     pub body: Vec<Stmt>,
 }
 
+/// 枚举定义（简单枚举，无关联值）
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<String>,
+}
+
+impl EnumDef {
+    pub fn variant_index(&self, name: &str) -> Option<u32> {
+        self.variants.iter().position(|v| v == name).map(|i| i as u32)
+    }
+}
+
 /// 程序 (模块)
 #[derive(Debug)]
 pub struct Program {
     pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
     pub functions: Vec<Function>,
 }

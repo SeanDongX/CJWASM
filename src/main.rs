@@ -52,7 +52,8 @@ fn main() {
     let program = match parser.parse_program() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("语法错误: {}", e);
+            let (line, col) = cjwasm::parser::line_column_from_source(&source, e.byte_start);
+            eprintln!("语法错误: {} (行 {} 列 {})", e, line, col);
             std::process::exit(1);
         }
     };

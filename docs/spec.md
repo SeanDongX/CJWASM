@@ -53,7 +53,7 @@
 | `Option<T>` | `Option<Int64>` | 可选值 | [ ] |
 | `Result<T, E>` | `Result<Int64, Error>` | 结果类型 | [ ] |
 | `Struct` | `struct Point {...}` | 结构体 | [x] |
-| `Enum` | `enum Color {...}` | 枚举类型 | [ ] |
+| `Enum` | `enum Color {...}` | 枚举类型（简单枚举，无关联值） | [x] |
 | `Class` | `class Person {...}` | 类 | [ ] |
 | `Interface` | `interface Drawable {...}` | 接口 | [ ] |
 | `Function` | `(Int64) -> Int64` | 函数类型 | [ ] |
@@ -115,7 +115,7 @@ let s5 = r"raw\nstring"       // 原始字符串
 | 功能 | 状态 |
 |------|------|
 | 基本字符串 | [x] |
-| 转义字符 | [ ] |
+| 转义字符 (\n \t \" \\) | [x] |
 | 多行字符串 | [ ] |
 | 字符串插值 | [ ] |
 | 原始字符串 | [ ] |
@@ -219,7 +219,9 @@ let v = maybeNull ?? defaultValue
 |------|------|
 | if 表达式 | [x] |
 | 块表达式 | [x] |
-| 范围表达式 | [ ] |
+| 方法调用 (obj.method()) | [x] |
+| 枚举变体构造 (Type.Variant) | [x] |
+| 范围表达式（作为值） | [ ] |
 | 类型转换 (as) | [ ] |
 | 空值合并 (??) | [ ] |
 | 三元运算符 | [ ] |
@@ -290,8 +292,8 @@ match value {
 | for-in（数组迭代） | [x] |
 | loop | [ ] |
 | match | [x] |
-| break | [ ] |
-| continue | [ ] |
+| break | [x] |
+| continue | [x] |
 | return | [x] |
 
 ---
@@ -391,7 +393,7 @@ let r = Rectangle { width: 5, height: 10 }
 | 结构体定义 | [x] |
 | 字段访问 | [x] |
 | 结构体初始化 | [x] |
-| 实例方法 | [ ] |
+| 实例方法（func Type.method + obj.method()） | [x] |
 | 静态方法 | [ ] |
 | 构造函数 | [ ] |
 | this 关键字 | [ ] |
@@ -496,7 +498,7 @@ enum Direction {
 
 | 功能 | 状态 |
 |------|------|
-| 简单枚举 | [ ] |
+| 简单枚举 | [x] |
 | 关联值枚举 | [ ] |
 | 泛型枚举 | [ ] |
 | 枚举方法 | [ ] |
@@ -538,6 +540,7 @@ while let Some(item) = iterator.next() {
 | 字面量匹配 | [x] |
 | 多模式 (\|) | [x] |
 | 范围匹配 | [x] |
+| 枚举变体匹配 (Type.Variant) | [x] |
 | 解构匹配 | [ ] |
 | 守卫条件 (if) | [x] |
 | 通配符 (_) | [x] |
@@ -897,18 +900,22 @@ pow(base, exp)
 - [x] 复合赋值 (+=, -=, *=, /=, %=)
 - [x] 一元负号 (-expr)
 - [x] 块表达式 ({ stmt; expr? })
+- [x] break / continue（单层循环）
+- [x] 字符串转义 (\n \t \" \\)
+- [x] 类型推断完善（函数返回类型用于 Call 推断）
+- [x] 方法定义（func Type.method + obj.method()）
+- [x] 简单枚举（enum 定义、Type.Variant 构造、match 枚举变体）
+- [x] 解析错误位置信息（字节偏移与行/列）
 
 #### 进行中
 
-- [ ] 类型推断完善
-- [x] 字段访问改进（已按类型计算多字段偏移）
-- [ ] 更完整的错误信息
+- （暂无）
 
 #### 下一版本 (v0.2.0) 计划
 
-- [ ] 枚举类型
-- [ ] Lambda 表达式
-- [ ] 方法定义
+- [ ] Lambda 表达式（需 table / call_indirect）
+- [ ] 关联值枚举
+- [ ] 枚举方法
 
 #### 未来版本计划
 
@@ -966,14 +973,15 @@ var      where    while
 | Int64 取模 | i64.rem_s |
 | Float64 加法 | f64.add |
 | 函数调用 | call |
+| 方法调用 | call（首参为 receiver） |
 | 局部变量读取 | local.get |
 | 局部变量设置 | local.set |
 | 内存加载 | i64.load / i32.load |
 | 内存存储 | i64.store / i32.store |
 | 条件分支 | if / else / end |
-| 循环 | loop / br |
+| 循环 / break / continue | block + loop + br / br_if |
 
 ---
 
-*文档版本: 1.1.0*
-*最后更新: 2025-02*
+*文档版本: 1.2.0*
+*最后更新: 2025-02（与当前实现同步：break/continue、字符串转义、类型推断、方法、简单枚举、错误位置）*

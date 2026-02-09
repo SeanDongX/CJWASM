@@ -1,5 +1,29 @@
 use logos::Logos;
 
+/// 将字符串字面量内部的反斜杠转义还原（支持 \n \t \" \\）。
+fn unescape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(skip r"[ \t\r\n]+")]  // 跳过空白
 #[logos(skip r"//[^\n]*")]    // 跳过单行注释
@@ -25,8 +49,14 @@ pub enum Token {
     In,
     #[token("match")]
     Match,
+    #[token("break")]
+    Break,
+    #[token("continue")]
+    Continue,
     #[token("struct")]
     Struct,
+    #[token("enum")]
+    Enum,
     #[token("_", priority = 3)]
     Underscore,
 
@@ -58,10 +88,10 @@ pub enum Token {
     #[token("false")]
     False,
 
-    // 字符串字面量
-    #[regex(r#""[^"]*""#, |lex| {
+    // 字符串字面量（支持 \n \t \" \\ 转义）
+    #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let s = lex.slice();
-        s[1..s.len()-1].to_string()
+        unescape_string(&s[1..s.len() - 1])
     })]
     StringLit(String),
 
@@ -192,6 +222,18 @@ mod tests {
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 
         assert_eq!(tokens[3], Token::StringLit("hello world".to_string()));
+    }
+
+    #[test]
+    fn test_string_escape() {
+        let source = r#"let s = "a\nb\tc\"d\\e""#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(
+            tokens[3],
+            Token::StringLit("a\nb\tc\"d\\e".to_string())
+        );
     }
 
     #[test]

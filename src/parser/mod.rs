@@ -1,5 +1,6 @@
 use crate::ast::*;
 use crate::lexer::Token;
+use std::fmt;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -12,6 +13,44 @@ pub enum ParseError {
     UnknownType(String),
 }
 
+/// 带字节偏移的解析错误，用于报告位置（可转换为行/列）
+#[derive(Debug)]
+pub struct ParseErrorAt {
+    pub error: ParseError,
+    pub byte_start: usize,
+    pub byte_end: usize,
+}
+
+impl fmt::Display for ParseErrorAt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} (字节偏移 {}-{})", self.error, self.byte_start, self.byte_end)
+    }
+}
+
+impl std::error::Error for ParseErrorAt {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// 根据字节偏移和源码计算行号与列号（从 1 开始）
+pub fn line_column_from_source(source: &str, byte_offset: usize) -> (usize, usize) {
+    let mut line = 1_usize;
+    let mut col = 1_usize;
+    for (i, c) in source.char_indices() {
+        if i >= byte_offset {
+            return (line, col);
+        }
+        if c == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 pub struct Parser {
     tokens: Vec<(usize, Token, usize)>,
     pos: usize,
@@ -20,6 +59,39 @@ pub struct Parser {
 impl Parser {
     pub fn new(tokens: Vec<(usize, Token, usize)>) -> Self {
         Self { tokens, pos: 0 }
+    }
+
+    fn at(&self) -> (usize, usize) {
+        self.tokens
+            .get(self.pos)
+            .map(|t| (t.0, t.2))
+            .unwrap_or((0, 0))
+    }
+
+    fn at_prev(&self) -> (usize, usize) {
+        if self.pos > 0 {
+            let t = &self.tokens[self.pos - 1];
+            (t.0, t.2)
+        } else {
+            (0, 0)
+        }
+    }
+
+    fn bail<T>(&self, e: ParseError) -> Result<T, ParseErrorAt> {
+        let (s, e_end) = self.at();
+        Err(ParseErrorAt {
+            error: e,
+            byte_start: s,
+            byte_end: e_end,
+        })
+    }
+
+    fn bail_at<T>(&self, e: ParseError, (s, e_end): (usize, usize)) -> Result<T, ParseErrorAt> {
+        Err(ParseErrorAt {
+            error: e,
+            byte_start: s,
+            byte_end: e_end,
+        })
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -40,13 +112,16 @@ impl Parser {
         }
     }
 
-    fn expect(&mut self, expected: Token) -> Result<(), ParseError> {
+    fn expect(&mut self, expected: Token) -> Result<(), ParseErrorAt> {
         match self.advance() {
             Some(tok) if std::mem::discriminant(&tok) == std::mem::discriminant(&expected) => {
                 Ok(())
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok, format!("{:?}", expected))),
-            None => Err(ParseError::UnexpectedEof),
+            Some(tok) => self.bail_at(
+                ParseError::UnexpectedToken(tok, format!("{:?}", expected)),
+                self.at_prev(),
+            ),
+            None => self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
         }
     }
 
@@ -57,33 +132,39 @@ impl Parser {
     }
 
     /// 解析程序
-    pub fn parse_program(&mut self) -> Result<Program, ParseError> {
+    pub fn parse_program(&mut self) -> Result<Program, ParseErrorAt> {
         let mut structs = Vec::new();
         let mut functions = Vec::new();
 
+        let mut enums = Vec::new();
         while let Some(tok) = self.peek() {
             match tok {
                 Token::Struct => structs.push(self.parse_struct()?),
+                Token::Enum => enums.push(self.parse_enum()?),
                 Token::Func => functions.push(self.parse_function()?),
                 _ => {
-                    return Err(ParseError::UnexpectedToken(
+                    return self.bail(ParseError::UnexpectedToken(
                         tok.clone(),
-                        "struct 或 func".to_string(),
+                        "struct、enum 或 func".to_string(),
                     ))
                 }
             }
         }
-        Ok(Program { structs, functions })
+        Ok(Program {
+            structs,
+            enums,
+            functions,
+        })
     }
 
     /// 解析结构体定义
-    fn parse_struct(&mut self) -> Result<StructDef, ParseError> {
+    fn parse_struct(&mut self) -> Result<StructDef, ParseErrorAt> {
         self.expect(Token::Struct)?;
 
         let name = match self.advance() {
             Some(Token::Ident(name)) => name,
-            Some(tok) => return Err(ParseError::UnexpectedToken(tok, "结构体名".to_string())),
-            None => return Err(ParseError::UnexpectedEof),
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "结构体名".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
         };
 
         self.expect(Token::LBrace)?;
@@ -92,8 +173,8 @@ impl Parser {
         while !self.check(&Token::RBrace) {
             let field_name = match self.advance() {
                 Some(Token::Ident(name)) => name,
-                Some(tok) => return Err(ParseError::UnexpectedToken(tok, "字段名".to_string())),
-                None => return Err(ParseError::UnexpectedEof),
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
             };
             self.expect(Token::Colon)?;
             let ty = self.parse_type()?;
@@ -111,14 +192,51 @@ impl Parser {
         Ok(StructDef { name, fields })
     }
 
-    /// 解析函数定义
-    fn parse_function(&mut self) -> Result<Function, ParseError> {
+    /// 解析枚举定义（简单枚举，无关联值）
+    fn parse_enum(&mut self) -> Result<EnumDef, ParseErrorAt> {
+        self.expect(Token::Enum)?;
+        let name = match self.advance() {
+            Some(Token::Ident(n)) => n,
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "枚举名".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
+        };
+        self.expect(Token::LBrace)?;
+        let mut variants = Vec::new();
+        while !self.check(&Token::RBrace) {
+            let v = match self.advance() {
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "变体名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
+            };
+            variants.push(v);
+            if self.check(&Token::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(EnumDef { name, variants })
+    }
+
+    /// 解析函数定义（支持方法名 StructName.methodName）
+    fn parse_function(&mut self) -> Result<Function, ParseErrorAt> {
         self.expect(Token::Func)?;
 
         let name = match self.advance() {
-            Some(Token::Ident(name)) => name,
-            Some(tok) => return Err(ParseError::UnexpectedToken(tok, "标识符".to_string())),
-            None => return Err(ParseError::UnexpectedEof),
+            Some(Token::Ident(n)) => {
+                if self.check(&Token::Dot) {
+                    self.advance();
+                    let method = match self.advance() {
+                        Some(Token::Ident(m)) => m,
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    format!("{}.{}", n, method)
+                } else {
+                    n
+                }
+            }
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "标识符".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
         };
 
         self.expect(Token::LParen)?;
@@ -145,7 +263,7 @@ impl Parser {
     }
 
     /// 解析参数列表
-    fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
+    fn parse_params(&mut self) -> Result<Vec<Param>, ParseErrorAt> {
         let mut params = Vec::new();
         if self.check(&Token::RParen) {
             return Ok(params);
@@ -154,8 +272,8 @@ impl Parser {
         loop {
             let name = match self.advance() {
                 Some(Token::Ident(name)) => name,
-                Some(tok) => return Err(ParseError::UnexpectedToken(tok, "参数名".to_string())),
-                None => return Err(ParseError::UnexpectedEof),
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
             };
             self.expect(Token::Colon)?;
             let ty = self.parse_type()?;
@@ -171,7 +289,7 @@ impl Parser {
     }
 
     /// 解析类型
-    fn parse_type(&mut self) -> Result<Type, ParseError> {
+    fn parse_type(&mut self) -> Result<Type, ParseErrorAt> {
         match self.advance() {
             Some(Token::TypeInt32) => Ok(Type::Int32),
             Some(Token::TypeInt64) => Ok(Type::Int64),
@@ -186,13 +304,13 @@ impl Parser {
                 Ok(Type::Array(Box::new(elem_type)))
             }
             Some(Token::Ident(name)) => Ok(Type::Struct(name)),
-            Some(tok) => Err(ParseError::UnexpectedToken(tok, "类型".to_string())),
-            None => Err(ParseError::UnexpectedEof),
+            Some(tok) => self.bail_at(ParseError::UnexpectedToken(tok, "类型".to_string()), self.at_prev()),
+            None => self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
         }
     }
 
     /// 解析语句列表
-    fn parse_stmts(&mut self) -> Result<Vec<Stmt>, ParseError> {
+    fn parse_stmts(&mut self) -> Result<Vec<Stmt>, ParseErrorAt> {
         let mut stmts = Vec::new();
         while !self.check(&Token::RBrace) && self.peek().is_some() {
             stmts.push(self.parse_stmt()?);
@@ -201,16 +319,16 @@ impl Parser {
     }
 
     /// 解析语句
-    fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_stmt(&mut self) -> Result<Stmt, ParseErrorAt> {
         match self.peek() {
             Some(Token::Let) => {
                 self.advance();
                 let name = match self.advance() {
                     Some(Token::Ident(name)) => name,
                     Some(tok) => {
-                        return Err(ParseError::UnexpectedToken(tok, "变量名".to_string()))
+                        return self.bail(ParseError::UnexpectedToken(tok, "变量名".to_string()))
                     }
-                    None => return Err(ParseError::UnexpectedEof),
+                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 let ty = if self.check(&Token::Colon) {
                     self.advance();
@@ -227,9 +345,9 @@ impl Parser {
                 let name = match self.advance() {
                     Some(Token::Ident(name)) => name,
                     Some(tok) => {
-                        return Err(ParseError::UnexpectedToken(tok, "变量名".to_string()))
+                        return self.bail(ParseError::UnexpectedToken(tok, "变量名".to_string()))
                     }
-                    None => return Err(ParseError::UnexpectedEof),
+                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 let ty = if self.check(&Token::Colon) {
                     self.advance();
@@ -262,9 +380,9 @@ impl Parser {
                 let var = match self.advance() {
                     Some(Token::Ident(name)) => name,
                     Some(tok) => {
-                        return Err(ParseError::UnexpectedToken(tok, "循环变量名".to_string()))
+                        return self.bail(ParseError::UnexpectedToken(tok, "循环变量名".to_string()))
                     }
-                    None => return Err(ParseError::UnexpectedEof),
+                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 self.expect(Token::In)?;
                 // 使用受限的表达式解析，不允许解析结构体初始化 (因为 { 会被误认为 for body)
@@ -273,6 +391,14 @@ impl Parser {
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
                 Ok(Stmt::For { var, iterable, body })
+            }
+            Some(Token::Break) => {
+                self.advance();
+                Ok(Stmt::Break)
+            }
+            Some(Token::Continue) => {
+                self.advance();
+                Ok(Stmt::Continue)
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -321,7 +447,7 @@ impl Parser {
     }
 
     /// 将表达式转换为赋值目标
-    fn expr_to_assign_target(&self, expr: Expr) -> Result<AssignTarget, ParseError> {
+    fn expr_to_assign_target(&self, expr: Expr) -> Result<AssignTarget, ParseErrorAt> {
         match expr {
             Expr::Var(name) => Ok(AssignTarget::Var(name)),
             Expr::Index { array, index } => {
@@ -331,7 +457,7 @@ impl Parser {
                         index,
                     })
                 } else {
-                    Err(ParseError::UnexpectedToken(
+                    return self.bail(ParseError::UnexpectedToken(
                         Token::Assign,
                         "简单数组访问".to_string(),
                     ))
@@ -344,26 +470,28 @@ impl Parser {
                         field,
                     })
                 } else {
-                    Err(ParseError::UnexpectedToken(
+                    return self.bail(ParseError::UnexpectedToken(
                         Token::Assign,
                         "简单字段访问".to_string(),
                     ))
                 }
             }
-            _ => Err(ParseError::UnexpectedToken(
-                Token::Assign,
-                "可赋值的目标".to_string(),
-            )),
+            _ => {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Assign,
+                    "可赋值的目标".to_string(),
+                ))
+            }
         }
     }
 
     /// 解析表达式（顶层为逻辑或）
-    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_expr(&mut self) -> Result<Expr, ParseErrorAt> {
         self.parse_logical_or()
     }
 
     /// 解析逻辑或 (||)
-    fn parse_logical_or(&mut self) -> Result<Expr, ParseError> {
+    fn parse_logical_or(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_logical_and()?;
         while matches!(self.peek(), Some(Token::OrOr)) {
             self.advance();
@@ -378,7 +506,7 @@ impl Parser {
     }
 
     /// 解析逻辑与 (&&)
-    fn parse_logical_and(&mut self) -> Result<Expr, ParseError> {
+    fn parse_logical_and(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_comparison()?;
         while matches!(self.peek(), Some(Token::AndAnd)) {
             self.advance();
@@ -393,7 +521,7 @@ impl Parser {
     }
 
     /// 解析比较表达式
-    fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+    fn parse_comparison(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_additive()?;
 
         while let Some(op) = match self.peek() {
@@ -425,7 +553,7 @@ impl Parser {
     }
 
     /// 解析加减法表达式
-    fn parse_additive(&mut self) -> Result<Expr, ParseError> {
+    fn parse_additive(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_multiplicative()?;
 
         while let Some(op) = match self.peek() {
@@ -446,7 +574,7 @@ impl Parser {
     }
 
     /// 解析乘除法表达式
-    fn parse_multiplicative(&mut self) -> Result<Expr, ParseError> {
+    fn parse_multiplicative(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_unary()?;
 
         while let Some(op) = match self.peek() {
@@ -468,7 +596,7 @@ impl Parser {
     }
 
     /// 解析一元表达式 (!, -)
-    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+    fn parse_unary(&mut self) -> Result<Expr, ParseErrorAt> {
         if matches!(self.peek(), Some(Token::Bang)) {
             self.advance();
             let expr = self.parse_unary()?;
@@ -489,7 +617,7 @@ impl Parser {
     }
 
     /// 解析后缀表达式 (数组访问, 字段访问, 方法调用)
-    fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
+    fn parse_postfix(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut expr = self.parse_primary()?;
 
         loop {
@@ -510,9 +638,9 @@ impl Parser {
                     let name = match self.advance() {
                         Some(Token::Ident(name)) => name,
                         Some(tok) => {
-                            return Err(ParseError::UnexpectedToken(tok, "字段名".to_string()))
+                            return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()))
                         }
-                        None => return Err(ParseError::UnexpectedEof),
+                        None => return self.bail(ParseError::UnexpectedEof),
                     };
 
                     if self.check(&Token::LParen) {
@@ -541,7 +669,7 @@ impl Parser {
     }
 
     /// 解析基础表达式
-    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+    fn parse_primary(&mut self) -> Result<Expr, ParseErrorAt> {
         match self.advance() {
             Some(Token::Integer(n)) => {
                 // 检查是否是范围表达式
@@ -562,17 +690,30 @@ impl Parser {
             Some(Token::False) => Ok(Expr::Bool(false)),
             Some(Token::StringLit(s)) => Ok(Expr::String(s)),
             Some(Token::Ident(name)) => {
+                // 仅当首字母大写时解析为枚举变体 (Color.Red)，否则 . 后续为字段/方法
+                let looks_like_type = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+                if looks_like_type && self.check(&Token::Dot) {
+                    if let Some(Token::Ident(_)) = self.peek_next() {
+                        self.advance();
+                        let variant = match self.advance() {
+                            Some(Token::Ident(v)) => v,
+                            _ => unreachable!(),
+                        };
+                        return Ok(Expr::VariantConst {
+                            enum_name: name,
+                            variant_name: variant,
+                        });
+                    }
+                }
                 // 检查是否是函数调用或结构体初始化
                 match self.peek() {
                     Some(Token::LParen) => {
-                        // 函数调用
                         self.advance();
                         let args = self.parse_args()?;
                         self.expect(Token::RParen)?;
                         Ok(Expr::Call { name, args })
                     }
                     Some(Token::LBrace) => {
-                        // 结构体初始化 Point { x: 1, y: 2 }
                         self.advance();
                         let fields = self.parse_struct_fields()?;
                         self.expect(Token::RBrace)?;
@@ -666,13 +807,13 @@ impl Parser {
                     arms,
                 })
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok, "表达式".to_string())),
-            None => Err(ParseError::UnexpectedEof),
+            Some(tok) => self.bail_at(ParseError::UnexpectedToken(tok, "表达式".to_string()), self.at_prev()),
+            None => self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
         }
     }
 
     /// 解析结构体字段初始化
-    fn parse_struct_fields(&mut self) -> Result<Vec<(String, Expr)>, ParseError> {
+    fn parse_struct_fields(&mut self) -> Result<Vec<(String, Expr)>, ParseErrorAt> {
         let mut fields = Vec::new();
         if self.check(&Token::RBrace) {
             return Ok(fields);
@@ -681,8 +822,8 @@ impl Parser {
         loop {
             let name = match self.advance() {
                 Some(Token::Ident(name)) => name,
-                Some(tok) => return Err(ParseError::UnexpectedToken(tok, "字段名".to_string())),
-                None => return Err(ParseError::UnexpectedEof),
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
             };
             self.expect(Token::Colon)?;
             let value = self.parse_expr()?;
@@ -698,7 +839,7 @@ impl Parser {
     }
 
     /// 解析函数调用参数
-    fn parse_args(&mut self) -> Result<Vec<Expr>, ParseError> {
+    fn parse_args(&mut self) -> Result<Vec<Expr>, ParseErrorAt> {
         let mut args = Vec::new();
         if self.check(&Token::RParen) {
             return Ok(args);
@@ -716,7 +857,7 @@ impl Parser {
     }
 
     /// 解析 match 的主题表达式 (不包括结构体初始化)
-    fn parse_match_subject(&mut self) -> Result<Expr, ParseError> {
+    fn parse_match_subject(&mut self) -> Result<Expr, ParseErrorAt> {
         // 只解析简单表达式: 变量、字面量、函数调用、字段访问等
         // 不解析结构体初始化 (因为 { 会被误认为 match body)
         let mut expr = match self.advance() {
@@ -741,8 +882,8 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 expr
             }
-            Some(tok) => return Err(ParseError::UnexpectedToken(tok, "match 表达式".to_string())),
-            None => return Err(ParseError::UnexpectedEof),
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "match 表达式".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
         };
 
         // 处理后缀表达式 (字段访问、数组索引)
@@ -752,8 +893,8 @@ impl Parser {
                     self.advance();
                     let field = match self.advance() {
                         Some(Token::Ident(name)) => name,
-                        Some(tok) => return Err(ParseError::UnexpectedToken(tok, "字段名".to_string())),
-                        None => return Err(ParseError::UnexpectedEof),
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     expr = Expr::Field {
                         object: Box::new(expr),
@@ -777,7 +918,7 @@ impl Parser {
     }
 
     /// 解析 for 循环的可迭代表达式 (不包括结构体初始化)
-    fn parse_for_iterable(&mut self) -> Result<Expr, ParseError> {
+    fn parse_for_iterable(&mut self) -> Result<Expr, ParseErrorAt> {
         // 支持: 变量、范围表达式、函数调用、数组字面量
         // 不支持: 结构体初始化 (因为 { 会被误认为 for body)
         match self.advance() {
@@ -789,8 +930,8 @@ impl Parser {
                     let end = match self.advance() {
                         Some(Token::Integer(end)) => Expr::Integer(end),
                         Some(Token::Ident(name)) => Expr::Var(name),
-                        Some(tok) => return Err(ParseError::UnexpectedToken(tok, "范围终点".to_string())),
-                        None => return Err(ParseError::UnexpectedEof),
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "范围终点".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     Ok(Expr::Range {
                         start: Box::new(Expr::Integer(n)),
@@ -815,8 +956,8 @@ impl Parser {
                     let end = match self.advance() {
                         Some(Token::Integer(end)) => Expr::Integer(end),
                         Some(Token::Ident(name)) => Expr::Var(name),
-                        Some(tok) => return Err(ParseError::UnexpectedToken(tok, "范围终点".to_string())),
-                        None => return Err(ParseError::UnexpectedEof),
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "范围终点".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     Ok(Expr::Range {
                         start: Box::new(Expr::Var(name)),
@@ -843,13 +984,13 @@ impl Parser {
                 self.expect(Token::RBracket)?;
                 Ok(Expr::Array(elements))
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok, "for 循环可迭代表达式".to_string())),
-            None => Err(ParseError::UnexpectedEof),
+            Some(tok) => self.bail_at(ParseError::UnexpectedToken(tok, "for 循环可迭代表达式".to_string()), self.at_prev()),
+            None => self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
         }
     }
 
     /// 解析 match 分支列表
-    fn parse_match_arms(&mut self) -> Result<Vec<MatchArm>, ParseError> {
+    fn parse_match_arms(&mut self) -> Result<Vec<MatchArm>, ParseErrorAt> {
         let mut arms = Vec::new();
 
         while !self.check(&Token::RBrace) && self.peek().is_some() {
@@ -882,12 +1023,12 @@ impl Parser {
     }
 
     /// 解析模式
-    fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+    fn parse_pattern(&mut self) -> Result<Pattern, ParseErrorAt> {
         self.parse_or_pattern()
     }
 
     /// 解析 or 模式 (1 | 2 | 3)
-    fn parse_or_pattern(&mut self) -> Result<Pattern, ParseError> {
+    fn parse_or_pattern(&mut self) -> Result<Pattern, ParseErrorAt> {
         let mut pattern = self.parse_primary_pattern()?;
 
         while self.check(&Token::Pipe) {
@@ -906,7 +1047,7 @@ impl Parser {
     }
 
     /// 解析基础模式
-    fn parse_primary_pattern(&mut self) -> Result<Pattern, ParseError> {
+    fn parse_primary_pattern(&mut self) -> Result<Pattern, ParseErrorAt> {
         match self.peek() {
             Some(Token::Underscore) => {
                 self.advance();
@@ -945,7 +1086,20 @@ impl Parser {
             Some(Token::Ident(name)) => {
                 let name = name.clone();
                 self.advance();
-                // 检查是否是结构体解构
+                let looks_like_type = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+                if looks_like_type && self.check(&Token::Dot) {
+                    if let Some(Token::Ident(_)) = self.peek_next() {
+                        self.advance();
+                        let variant = match self.advance() {
+                            Some(Token::Ident(v)) => v.clone(),
+                            _ => unreachable!(),
+                        };
+                        return Ok(Pattern::Variant {
+                            enum_name: name,
+                            variant_name: variant,
+                        });
+                    }
+                }
                 if self.check(&Token::LBrace) {
                     self.advance();
                     let fields = self.parse_pattern_fields()?;
@@ -970,13 +1124,13 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(Pattern::Tuple(patterns))
             }
-            Some(tok) => Err(ParseError::UnexpectedToken(tok.clone(), "模式".to_string())),
-            None => Err(ParseError::UnexpectedEof),
+            Some(tok) => self.bail_at(ParseError::UnexpectedToken(tok.clone(), "模式".to_string()), self.at_prev()),
+            None => self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
         }
     }
 
     /// 解析结构体解构字段
-    fn parse_pattern_fields(&mut self) -> Result<Vec<(String, Pattern)>, ParseError> {
+    fn parse_pattern_fields(&mut self) -> Result<Vec<(String, Pattern)>, ParseErrorAt> {
         let mut fields = Vec::new();
         if self.check(&Token::RBrace) {
             return Ok(fields);
@@ -986,9 +1140,9 @@ impl Parser {
             let name = match self.advance() {
                 Some(Token::Ident(name)) => name,
                 Some(tok) => {
-                    return Err(ParseError::UnexpectedToken(tok, "字段名".to_string()))
+                    return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()))
                 }
-                None => return Err(ParseError::UnexpectedEof),
+                None => return self.bail(ParseError::UnexpectedEof),
             };
 
             // 可选的 : pattern, 如果没有则使用同名绑定
