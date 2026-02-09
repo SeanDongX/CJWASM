@@ -5,6 +5,7 @@ use wasm_encoder::ValType;
 pub enum Type {
     Int32,
     Int64,
+    Float32,
     Float64,
     Bool,
     Unit,
@@ -22,6 +23,7 @@ impl Type {
         match self {
             Type::Int32 => ValType::I32,
             Type::Int64 => ValType::I64,
+            Type::Float32 => ValType::F32,
             Type::Float64 => ValType::F64,
             Type::Bool => ValType::I32,
             Type::Unit => panic!("Unit 类型不能转换为 WASM 值类型"),
@@ -37,6 +39,7 @@ impl Type {
         match self {
             Type::Int32 | Type::Bool => 4,
             Type::Int64 => 8,
+            Type::Float32 => 4,
             Type::Float64 => 8,
             Type::Unit => 0,
             Type::String => 4,      // 指针大小
@@ -49,8 +52,9 @@ impl Type {
 /// 一元运算符
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnaryOp {
-    Not,  // !
-    Neg,  // - 负号
+    Not,     // !
+    Neg,     // - 负号
+    BitNot,  // ~ 按位取反
 }
 
 /// 二元运算符
@@ -69,6 +73,12 @@ pub enum BinOp {
     GtEq,   // >=
     LogicalAnd,  // &&
     LogicalOr,   // ||
+    Pow,         // ** 幂运算
+    BitAnd,      // &
+    BitOr,       // |
+    BitXor,      // ^
+    Shl,         // <<
+    Shr,         // >>
 }
 
 /// 表达式
@@ -76,8 +86,10 @@ pub enum BinOp {
 pub enum Expr {
     /// 整数字面量
     Integer(i64),
-    /// 浮点数字面量
+    /// 浮点数字面量 (Float64)
     Float(f64),
+    /// Float32 字面量 (后缀 f)
+    Float32(f32),
     /// 布尔字面量
     Bool(bool),
     /// 字符串字面量
@@ -137,15 +149,22 @@ pub enum Expr {
         end: Box<Expr>,
         inclusive: bool,  // true 表示 ..=
     },
-    /// 枚举变体构造 Color.Red（值为 i32 判别式）
+    /// 枚举变体构造 Color.Red 或 Result.Ok(42)（无关联值时值为 i32 判别式，有关联值为堆指针）
     VariantConst {
         enum_name: String,
         variant_name: String,
+        /// 关联值，如 Ok(42) 的 42
+        arg: Option<Box<Expr>>,
     },
     /// match 表达式
     Match {
         expr: Box<Expr>,
         arms: Vec<MatchArm>,
+    },
+    /// 类型转换 expr as Type
+    Cast {
+        expr: Box<Expr>,
+        target_ty: Type,
     },
 }
 
@@ -181,10 +200,12 @@ pub enum Pattern {
     },
     /// 元组解构 (a, b)
     Tuple(Vec<Pattern>),
-    /// 枚举变体模式 Color.Red 或 Red（匹配时用）
+    /// 枚举变体模式 Color.Red 或 Result.Ok(v)（匹配时用，binding 为关联值绑定名）
     Variant {
         enum_name: String,
         variant_name: String,
+        /// 关联值绑定名，如 Ok(v) 的 v
+        binding: Option<String>,
     },
 }
 
@@ -233,6 +254,8 @@ pub enum Stmt {
         iterable: Expr,
         body: Vec<Stmt>,
     },
+    /// loop 无限循环 loop { ... }
+    Loop { body: Vec<Stmt> },
     /// break（跳出当前循环）
     Break,
     /// continue（跳到当前循环下一轮）
@@ -304,16 +327,43 @@ pub struct Function {
     pub body: Vec<Stmt>,
 }
 
-/// 枚举定义（简单枚举，无关联值）
+/// 枚举变体（可选关联类型）
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    /// 关联值类型，如 Ok(Int64) 的 Int64
+    pub payload: Option<Type>,
+}
+
+/// 枚举定义（支持无关联值或单关联值变体）
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
-    pub variants: Vec<String>,
+    pub variants: Vec<EnumVariant>,
 }
 
 impl EnumDef {
     pub fn variant_index(&self, name: &str) -> Option<u32> {
-        self.variants.iter().position(|v| v == name).map(|i| i as u32)
+        self.variants.iter().position(|v| v.name == name).map(|i| i as u32)
+    }
+
+    pub fn variant_payload(&self, name: &str) -> Option<&Type> {
+        self.variants.iter().find(|v| v.name == name).and_then(|v| v.payload.as_ref())
+    }
+
+    /// 是否有任意变体带关联值
+    pub fn has_payload(&self) -> bool {
+        self.variants.iter().any(|v| v.payload.is_some())
+    }
+
+    /// 所有变体 payload 类型的最大尺寸（字节），用于堆布局
+    pub fn payload_size(&self) -> u32 {
+        self.variants
+            .iter()
+            .filter_map(|v| v.payload.as_ref())
+            .map(|t| t.size())
+            .max()
+            .unwrap_or(0)
     }
 }
 

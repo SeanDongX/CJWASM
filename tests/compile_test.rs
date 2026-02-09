@@ -64,6 +64,50 @@ fn test_compile_arithmetic() {
 }
 
 #[test]
+fn test_compile_pow() {
+    let source = r#"
+        func main() -> Int64 {
+            return 2 ** 10
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "pow");
+}
+
+#[test]
+fn test_compile_cast() {
+    let source = r#"
+        func main() -> Int32 {
+            return (100 as Int64) as Int32
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "cast");
+}
+
+#[test]
+fn test_compile_bitwise() {
+    let source = r#"
+        func main() -> Int64 {
+            return (1 << 4) | 2
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "bitwise");
+}
+
+#[test]
+fn test_compile_float32() {
+    let source = r#"
+        func main() -> Float32 {
+            return 1.0f + 1f
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "float32");
+}
+
+#[test]
 fn test_compile_struct_and_field() {
     let source = r#"
         struct Point { x: Int64, y: Int64 }
@@ -92,6 +136,44 @@ fn test_compile_enum_match() {
     "#;
     let wasm = compile_source(source);
     assert_valid_wasm(&wasm, "enum_match");
+}
+
+#[test]
+fn test_compile_enum_method() {
+    let source = r#"
+        enum Color { Red, Green, Blue }
+        func Color.disc(self: Color) -> Int64 {
+            match self {
+                Color.Red => 1,
+                Color.Green => 2,
+                Color.Blue => 3,
+                _ => 0
+            }
+        }
+        func main() -> Int64 {
+            let c: Color = Color.Red
+            return c.disc()
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "enum_method");
+}
+
+#[test]
+fn test_compile_enum_associated_value() {
+    let source = r#"
+        enum Result { Ok(Int64), Err(Int64) }
+        func main() -> Int64 {
+            let r: Result = Result.Ok(42)
+            match r {
+                Result.Ok(v) => v,
+                Result.Err(e) => 0 - e,
+                _ => 0
+            }
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "enum_associated_value");
 }
 
 #[test]

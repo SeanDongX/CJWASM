@@ -53,10 +53,19 @@ pub enum Token {
     Break,
     #[token("continue")]
     Continue,
+    #[token("loop")]
+    Loop,
     #[token("struct")]
     Struct,
     #[token("enum")]
     Enum,
+
+    #[token("as")]
+    As,
+
+    #[token("this")]
+    This,
+
     #[token("_", priority = 3)]
     Underscore,
 
@@ -67,6 +76,8 @@ pub enum Token {
     TypeInt32,
     #[token("Float64")]
     TypeFloat64,
+    #[token("Float32")]
+    TypeFloat32,
     #[token("Bool")]
     TypeBool,
     #[token("Unit")]
@@ -76,12 +87,28 @@ pub enum Token {
     #[token("Array")]
     TypeArray,
 
-    // 字面量
-    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
-    Integer(i64),
+    // 字面量（Float32 后缀 f 优先，再 Float64，再整型）
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*f|[0-9][0-9_]*f", |lex| {
+        let s: String = lex.slice().chars().filter(|c| *c != '_' && *c != 'f').collect();
+        s.parse::<f32>().ok()
+    })]
+    Float32(f32),
 
-    #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*", |lex| {
+        let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
+        s.parse::<f64>().ok()
+    })]
     Float(f64),
+
+    #[regex(r"0x[0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*", |lex| {
+        let slice = lex.slice();
+        let s: String = slice.chars().filter(|c| *c != '_').collect();
+        if slice.starts_with("0x") { i64::from_str_radix(&s[2..], 16).ok() }
+        else if slice.starts_with("0o") { i64::from_str_radix(&s[2..], 8).ok() }
+        else if slice.starts_with("0b") { i64::from_str_radix(&s[2..], 2).ok() }
+        else { s.parse::<i64>().ok() }
+    })]
+    Integer(i64),
 
     #[token("true")]
     True,
@@ -104,6 +131,8 @@ pub enum Token {
     Plus,
     #[token("-")]
     Minus,
+    #[token("**")]
+    StarStar,
     #[token("*")]
     Star,
     #[token("/")]
@@ -130,6 +159,18 @@ pub enum Token {
     AndAnd,
     #[token("||")]
     OrOr,
+    #[token("&")]
+    And,
+    #[token("|")]
+    Pipe,
+    #[token("^")]
+    Caret,
+    #[token("~")]
+    Tilde,
+    #[token("<<")]
+    Shl,
+    #[token(">>")]
+    Shr,
     #[token("!")]
     Bang,
     #[token("<")]
@@ -148,9 +189,6 @@ pub enum Token {
     DotDotEq,
     #[token("=>")]
     FatArrow,
-    #[token("|")]
-    Pipe,
-    // 注意：&&、||、! 需在 &、| 及 != 之后定义以保证最长匹配
 
     // 分隔符
     #[token("(")]

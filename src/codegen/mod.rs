@@ -73,6 +73,10 @@ impl CodeGen {
                 self.func_return_types.insert(func.name.clone(), ret.clone());
             }
         }
+        let pow_type_idx = program.functions.len() as u32;
+        types.ty().function([ValType::I64, ValType::I64], [ValType::I64]);
+        self.func_types.insert("__pow_i64".to_string(), pow_type_idx);
+        self.func_indices.insert("__pow_i64".to_string(), pow_type_idx);
         module.section(&types);
 
         // 2. 函数段 (Function Section)
@@ -80,6 +84,7 @@ impl CodeGen {
         for i in 0..program.functions.len() {
             functions.function(i as u32);
         }
+        functions.function(pow_type_idx);
         module.section(&functions);
 
         // 3. 内存段 (Memory Section)
@@ -119,6 +124,7 @@ impl CodeGen {
             let wasm_func = self.compile_function(func);
             codes.function(&wasm_func);
         }
+        codes.function(&self.emit_pow_i64());
         module.section(&codes);
 
         // 7. 数据段 (Data Section) - 字符串常量
@@ -159,6 +165,11 @@ impl CodeGen {
             }
             Stmt::While { cond, body } => {
                 self.collect_strings_in_expr(cond);
+                for s in body {
+                    self.collect_strings_in_stmt(s);
+                }
+            }
+            Stmt::Loop { body } => {
                 for s in body {
                     self.collect_strings_in_stmt(s);
                 }
@@ -222,6 +233,9 @@ impl CodeGen {
             Expr::Unary { expr, .. } => {
                 self.collect_strings_in_expr(expr);
             }
+            Expr::Cast { expr, .. } => {
+                self.collect_strings_in_expr(expr);
+            }
             _ => {}
         }
     }
@@ -261,6 +275,42 @@ impl CodeGen {
         wasm_func
     }
 
+    /// 生成 __pow_i64(base: i64, exp: i64) -> i64 辅助函数体（局部 0=base, 1=exp, 2=result）
+    fn emit_pow_i64(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![(1, ValType::I64)]);
+        // exp < 0 -> return 0
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::I64LtS);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // result = 1
+        f.instruction(&Instruction::I64Const(1));
+        f.instruction(&Instruction::LocalSet(2));
+        // loop: if exp <= 0 break; result *= base; exp--
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::I64LeS);
+        f.instruction(&Instruction::BrIf(1));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64Mul);
+        f.instruction(&Instruction::LocalSet(2));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Const(1));
+        f.instruction(&Instruction::I64Sub);
+        f.instruction(&Instruction::LocalSet(1));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
     /// 收集局部变量
     fn collect_locals(&self, stmt: &Stmt, locals: &mut LocalsBuilder) {
         match stmt {
@@ -288,6 +338,11 @@ impl CodeGen {
                     self.collect_locals(s, locals);
                 }
             }
+            Stmt::Loop { body } => {
+                for s in body {
+                    self.collect_locals(s, locals);
+                }
+            }
             Stmt::For { var, iterable, body } => {
                 locals.add(var, ValType::I64, self.expr_object_type(iterable)); // 循环变量：范围时为 Int64，数组时为元素类型
                 if !matches!(iterable, Expr::Range { .. }) {
@@ -309,9 +364,18 @@ impl CodeGen {
         match expr {
             Expr::Match { expr: sub, arms } => {
                 self.collect_locals_from_expr(sub, locals);
+                locals.add("__match_enum_ptr", ValType::I32, None); // 关联值枚举 match 时暂存 ptr
                 for arm in arms {
-                    if let Pattern::Binding(name) = &arm.pattern {
-                        locals.add(name, ValType::I64, None);
+                    match &arm.pattern {
+                        Pattern::Binding(name) => {
+                            locals.add(name, ValType::I64, None);
+                        }
+                        Pattern::Variant { enum_name, variant_name, binding: Some(name) } => {
+                            if let Some(ty) = self.enums.get(enum_name).and_then(|e| e.variant_payload(variant_name)) {
+                                locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                            }
+                        }
+                        _ => {}
                     }
                     self.collect_locals_from_expr(&arm.body, locals);
                     if let Some(g) = &arm.guard {
@@ -377,6 +441,12 @@ impl CodeGen {
                 self.collect_locals_from_expr(start, locals);
                 self.collect_locals_from_expr(end, locals);
             }
+            Expr::Cast { expr, .. } => {
+                self.collect_locals_from_expr(expr, locals);
+            }
+            Expr::VariantConst { arg: Some(e), .. } => {
+                self.collect_locals_from_expr(e, locals);
+            }
             Expr::VariantConst { .. } => {}
             _ => {}
         }
@@ -387,6 +457,7 @@ impl CodeGen {
         match expr {
             Expr::Integer(_) => Some(Type::Int64),
             Expr::Float(_) => Some(Type::Float64),
+            Expr::Float32(_) => Some(Type::Float32),
             Expr::Bool(_) => Some(Type::Bool),
             Expr::String(_) => Some(Type::String),
             Expr::Array(ref elems) => elems
@@ -397,6 +468,7 @@ impl CodeGen {
             Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone())),
             Expr::Call { name, .. } => self.func_return_types.get(name).cloned(),
             Expr::MethodCall { .. } => None, // 需结合 locals 推断，调用处可写类型注解
+            Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
             _ => None,
         }
     }
@@ -449,6 +521,7 @@ impl CodeGen {
         match expr {
             Expr::Integer(_) => ValType::I64,
             Expr::Float(_) => ValType::F64,
+            Expr::Float32(_) => ValType::F32,
             Expr::Bool(_) => ValType::I32,
             Expr::String(_) => ValType::I32,
             Expr::Array(_) => ValType::I32,
@@ -460,7 +533,7 @@ impl CodeGen {
                 .unwrap_or(ValType::I64),
             Expr::Unary { op, expr } => match op {
                 UnaryOp::Not => ValType::I32,
-                UnaryOp::Neg => self.infer_type(expr),
+                UnaryOp::Neg | UnaryOp::BitNot => self.infer_type(expr),
             },
             Expr::Binary { op, left, .. } => match op {
                 BinOp::LogicalAnd | BinOp::LogicalOr => ValType::I32,
@@ -469,6 +542,7 @@ impl CodeGen {
             Expr::Index { .. } => ValType::I64,
             Expr::Field { .. } => ValType::I64,
             Expr::VariantConst { .. } => ValType::I32,
+            Expr::Cast { target_ty, .. } => target_ty.to_wasm(),
             _ => ValType::I64,
         }
     }
@@ -558,6 +632,17 @@ impl CodeGen {
                 } else {
                     func.instruction(&Instruction::Unreachable);
                 }
+            }
+            Stmt::Loop { body } => {
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+                let body_ctx = Some((1u32, 0u32));
+                for s in body {
+                    self.compile_stmt(s, locals, func, body_ctx);
+                }
+                func.instruction(&Instruction::Br(0));
+                func.instruction(&Instruction::End);
+                func.instruction(&Instruction::End);
             }
             Stmt::While { cond, body } => {
                 func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
@@ -715,6 +800,9 @@ impl CodeGen {
             Expr::Integer(n) => {
                 func.instruction(&Instruction::I64Const(*n));
             }
+            Expr::Float32(f) => {
+                func.instruction(&Instruction::F32Const(*f));
+            }
             Expr::Float(f) => {
                 func.instruction(&Instruction::F64Const(*f));
             }
@@ -741,6 +829,21 @@ impl CodeGen {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
+            }
+            Expr::Unary { op: UnaryOp::BitNot, expr } => {
+                self.compile_expr(expr, locals, func, loop_ctx);
+                let ty = self.infer_type(expr);
+                match ty {
+                    ValType::I64 => {
+                        func.instruction(&Instruction::I64Const(-1));
+                        func.instruction(&Instruction::I64Xor);
+                    }
+                    ValType::I32 => {
+                        func.instruction(&Instruction::I32Const(-1));
+                        func.instruction(&Instruction::I32Xor);
+                    }
+                    _ => panic!("~ 仅支持整数类型"),
+                }
             }
             Expr::Unary { op: UnaryOp::Neg, expr } => {
                 let ty = self.infer_type(expr);
@@ -813,6 +916,13 @@ impl CodeGen {
                 func.instruction(&Instruction::End);
             }
             Expr::Binary { op, left, right } => {
+                if op == &BinOp::Pow {
+                    self.compile_expr(left, locals, func, loop_ctx);
+                    self.compile_expr(right, locals, func, loop_ctx);
+                    let idx = *self.func_indices.get("__pow_i64").unwrap();
+                    func.instruction(&Instruction::Call(idx));
+                    return;
+                }
                 self.compile_expr(left, locals, func, loop_ctx);
                 self.compile_expr(right, locals, func, loop_ctx);
 
@@ -853,9 +963,54 @@ impl CodeGen {
                     (BinOp::Eq, ValType::F64) => Instruction::F64Eq,
                     (BinOp::NotEq, ValType::F64) => Instruction::F64Ne,
 
+                    (BinOp::Add, ValType::F32) => Instruction::F32Add,
+                    (BinOp::Sub, ValType::F32) => Instruction::F32Sub,
+                    (BinOp::Mul, ValType::F32) => Instruction::F32Mul,
+                    (BinOp::Div, ValType::F32) => Instruction::F32Div,
+                    (BinOp::Lt, ValType::F32) => Instruction::F32Lt,
+                    (BinOp::Gt, ValType::F32) => Instruction::F32Gt,
+                    (BinOp::LtEq, ValType::F32) => Instruction::F32Le,
+                    (BinOp::GtEq, ValType::F32) => Instruction::F32Ge,
+                    (BinOp::Eq, ValType::F32) => Instruction::F32Eq,
+                    (BinOp::NotEq, ValType::F32) => Instruction::F32Ne,
+
+                    (BinOp::BitAnd, ValType::I64) => Instruction::I64And,
+                    (BinOp::BitOr, ValType::I64) => Instruction::I64Or,
+                    (BinOp::BitXor, ValType::I64) => Instruction::I64Xor,
+                    (BinOp::Shl, ValType::I64) => Instruction::I64Shl,
+                    (BinOp::Shr, ValType::I64) => Instruction::I64ShrS,
+                    (BinOp::BitAnd, ValType::I32) => Instruction::I32And,
+                    (BinOp::BitOr, ValType::I32) => Instruction::I32Or,
+                    (BinOp::BitXor, ValType::I32) => Instruction::I32Xor,
+                    (BinOp::Shl, ValType::I32) => Instruction::I32Shl,
+                    (BinOp::Shr, ValType::I32) => Instruction::I32ShrS,
+
                     _ => panic!("不支持的运算: {:?} for {:?}", op, val_type),
                 };
                 func.instruction(&instr);
+            }
+            Expr::Cast { expr, target_ty } => {
+                self.compile_expr(expr, locals, func, loop_ctx);
+                let src = self.infer_type(expr);
+                let dst = target_ty.to_wasm();
+                if src != dst {
+                    let conv = match (src, dst) {
+                        (ValType::I64, ValType::I32) => Instruction::I32WrapI64,
+                        (ValType::I32, ValType::I64) => Instruction::I64ExtendI32S,
+                        (ValType::I64, ValType::F64) => Instruction::F64ConvertI64S,
+                        (ValType::F64, ValType::I64) => Instruction::I64TruncF64S,
+                        (ValType::I32, ValType::F64) => Instruction::F64ConvertI32S,
+                        (ValType::F64, ValType::I32) => Instruction::I32TruncF64S,
+                        (ValType::F32, ValType::F64) => Instruction::F64PromoteF32,
+                        (ValType::F64, ValType::F32) => Instruction::F32DemoteF64,
+                        (ValType::I32, ValType::F32) => Instruction::F32ConvertI32S,
+                        (ValType::F32, ValType::I32) => Instruction::I32TruncF32S,
+                        (ValType::I64, ValType::F32) => Instruction::F32ConvertI64S,
+                        (ValType::F32, ValType::I64) => Instruction::I64TruncF32S,
+                        _ => panic!("不支持的 as 转换: {:?} -> {:?}", src, target_ty),
+                    };
+                    func.instruction(&conv);
+                }
             }
             Expr::Call { name, args } => {
                 for arg in args {
@@ -865,17 +1020,32 @@ impl CodeGen {
                 func.instruction(&Instruction::Call(idx));
             }
             Expr::MethodCall { object, method, args } => {
-                let struct_ty = self
-                    .get_object_type(object, locals)
-                    .and_then(|ty| match ty {
-                        Type::Struct(s) => Some(s),
-                        _ => None,
-                    });
-                let key = struct_ty
-                    .as_ref()
-                    .map(|s| format!("{}.{}", s, method))
-                    .unwrap_or_else(|| method.clone());
-                self.compile_expr(object, locals, func, loop_ctx);
+                let type_name_opt = if let Expr::Var(ref n) = object.as_ref() {
+                    Some(n.clone())
+                } else {
+                    None
+                };
+                let is_static = type_name_opt.as_ref().map_or(false, |n| {
+                    (self.structs.contains_key(n) || self.enums.contains_key(n))
+                        && self.func_indices.contains_key(&format!("{}.{}", n, method))
+                });
+                let key = if is_static {
+                    format!("{}.{}", type_name_opt.unwrap(), method)
+                } else {
+                    let struct_ty = self
+                        .get_object_type(object, locals)
+                        .and_then(|ty| match ty {
+                            Type::Struct(s) => Some(s),
+                            _ => None,
+                        });
+                    struct_ty
+                        .as_ref()
+                        .map(|s| format!("{}.{}", s, method))
+                        .unwrap_or_else(|| method.clone())
+                };
+                if !is_static {
+                    self.compile_expr(object, locals, func, loop_ctx);
+                }
                 for arg in args {
                     self.compile_expr(arg, locals, func, loop_ctx);
                 }
@@ -1018,13 +1188,51 @@ impl CodeGen {
                 self.compile_expr(start, locals, func, loop_ctx);
                 let _ = (end, inclusive);
             }
-            Expr::VariantConst { enum_name, variant_name } => {
-                let disc = self
-                    .enums
-                    .get(enum_name)
-                    .and_then(|e| e.variant_index(variant_name))
-                    .expect("枚举或变体未找到") as i32;
-                func.instruction(&Instruction::I32Const(disc));
+            Expr::VariantConst {
+                enum_name,
+                variant_name,
+                arg,
+            } => {
+                let enum_def = self.enums.get(enum_name).expect("枚举未找到");
+                let disc = enum_def
+                    .variant_index(variant_name)
+                    .expect("变体未找到") as i32;
+
+                if enum_def.has_payload() {
+                    // 布局: [i32 判别式][payload 区]，payload_size 为各变体 payload 类型最大尺寸
+                    let payload_size = enum_def.payload_size().max(8) as i32; // 至少 8 字节便于存 i64
+                    let total_size = 4 + payload_size;
+
+                    func.instruction(&Instruction::GlobalGet(0)); // 基址留栈
+                    func.instruction(&Instruction::GlobalGet(0));
+                    func.instruction(&Instruction::I32Const(disc));
+                    func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+
+                    if let Some(ref payload_expr) = arg {
+                        let payload_ty = enum_def
+                            .variant_payload(variant_name)
+                            .expect("带关联值变体需提供参数");
+                        func.instruction(&Instruction::GlobalGet(0));
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        self.compile_expr(payload_expr, locals, func, loop_ctx);
+                        self.emit_store_by_type(func, payload_ty);
+                    }
+
+                    func.instruction(&Instruction::GlobalGet(0));
+                    func.instruction(&Instruction::I32Const(total_size));
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::GlobalSet(0));
+                } else {
+                    if arg.is_some() {
+                        panic!("简单枚举变体不能带关联值: {}.{}", enum_name, variant_name);
+                    }
+                    func.instruction(&Instruction::I32Const(disc));
+                }
             }
             Expr::Match { expr, arms } => {
                 let subject_ty = self.infer_type(expr);
@@ -1124,6 +1332,7 @@ impl CodeGen {
                         Pattern::Variant {
                             enum_name,
                             variant_name,
+                            binding,
                         } => {
                             let handled = if let Some(Type::Struct(ref name)) = subject_ast_type {
                                 name == enum_name
@@ -1133,10 +1342,38 @@ impl CodeGen {
                                 false
                             };
                             if handled {
-                                let disc = self.enums[enum_name].variant_index(variant_name).unwrap();
-                                func.instruction(&Instruction::I32Const(disc as i32));
-                                func.instruction(&Instruction::I32Eq);
+                                let enum_def = &self.enums[enum_name];
+                                let expected_disc = enum_def.variant_index(variant_name).unwrap() as i32;
+                                let ptr_tmp = locals.get("__match_enum_ptr").expect("__match_enum_ptr");
+
+                                if enum_def.has_payload() {
+                                    func.instruction(&Instruction::LocalSet(ptr_tmp));
+                                    func.instruction(&Instruction::LocalGet(ptr_tmp));
+                                    func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                        offset: 0,
+                                        align: 2,
+                                        memory_index: 0,
+                                    }));
+                                    func.instruction(&Instruction::I32Const(expected_disc));
+                                    func.instruction(&Instruction::I32Eq);
+                                } else {
+                                    func.instruction(&Instruction::I32Const(expected_disc));
+                                    func.instruction(&Instruction::I32Eq);
+                                }
+
                                 func.instruction(&Instruction::If(result_type));
+                                if enum_def.has_payload() {
+                                    if let Some(ref bind_name) = binding {
+                                        if let Some(payload_ty) = enum_def.variant_payload(variant_name) {
+                                            func.instruction(&Instruction::LocalGet(ptr_tmp));
+                                            func.instruction(&Instruction::I32Const(4));
+                                            func.instruction(&Instruction::I32Add);
+                                            self.emit_load_by_type(func, payload_ty);
+                                            let bind_idx = locals.get(bind_name).expect("关联值绑定未找到");
+                                            func.instruction(&Instruction::LocalSet(bind_idx));
+                                        }
+                                    }
+                                }
                                 if has_guard {
                                     self.compile_expr(
                                         arm.guard.as_ref().unwrap(),

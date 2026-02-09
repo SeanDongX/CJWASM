@@ -54,11 +54,17 @@ pub fn line_column_from_source(source: &str, byte_offset: usize) -> (usize, usiz
 pub struct Parser {
     tokens: Vec<(usize, Token, usize)>,
     pos: usize,
+    /// 方法体内的 receiver 参数名（用于解析 this）
+    receiver_name: Option<String>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<(usize, Token, usize)>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            receiver_name: None,
+        }
     }
 
     fn at(&self) -> (usize, usize) {
@@ -192,7 +198,7 @@ impl Parser {
         Ok(StructDef { name, fields })
     }
 
-    /// 解析枚举定义（简单枚举，无关联值）
+    /// 解析枚举定义（支持无关联值或单关联类型变体，如 Ok(Int64)）
     fn parse_enum(&mut self) -> Result<EnumDef, ParseErrorAt> {
         self.expect(Token::Enum)?;
         let name = match self.advance() {
@@ -203,12 +209,23 @@ impl Parser {
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
         while !self.check(&Token::RBrace) {
-            let v = match self.advance() {
+            let v_name = match self.advance() {
                 Some(Token::Ident(n)) => n,
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "变体名".to_string())),
                 None => return self.bail(ParseError::UnexpectedEof),
             };
-            variants.push(v);
+            let payload = if self.check(&Token::LParen) {
+                self.advance();
+                let ty = self.parse_type()?;
+                self.expect(Token::RParen)?;
+                Some(ty)
+            } else {
+                None
+            };
+            variants.push(EnumVariant {
+                name: v_name,
+                payload,
+            });
             if self.check(&Token::Comma) {
                 self.advance();
             }
@@ -243,6 +260,13 @@ impl Parser {
         let params = self.parse_params()?;
         self.expect(Token::RParen)?;
 
+        let prev_receiver = self.receiver_name.clone();
+        self.receiver_name = if name.contains('.') {
+            params.first().map(|p| p.name.clone())
+        } else {
+            None
+        };
+
         let return_type = if self.check(&Token::Arrow) {
             self.advance();
             Some(self.parse_type()?)
@@ -253,6 +277,8 @@ impl Parser {
         self.expect(Token::LBrace)?;
         let body = self.parse_stmts()?;
         self.expect(Token::RBrace)?;
+
+        self.receiver_name = prev_receiver;
 
         Ok(Function {
             name,
@@ -294,6 +320,7 @@ impl Parser {
             Some(Token::TypeInt32) => Ok(Type::Int32),
             Some(Token::TypeInt64) => Ok(Type::Int64),
             Some(Token::TypeFloat64) => Ok(Type::Float64),
+            Some(Token::TypeFloat32) => Ok(Type::Float32),
             Some(Token::TypeBool) => Ok(Type::Bool),
             Some(Token::TypeUnit) => Ok(Type::Unit),
             Some(Token::TypeString) => Ok(Type::String),
@@ -399,6 +426,13 @@ impl Parser {
             Some(Token::Continue) => {
                 self.advance();
                 Ok(Stmt::Continue)
+            }
+            Some(Token::Loop) => {
+                self.advance();
+                self.expect(Token::LBrace)?;
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                Ok(Stmt::Loop { body })
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -522,14 +556,14 @@ impl Parser {
 
     /// 解析比较表达式
     fn parse_comparison(&mut self) -> Result<Expr, ParseErrorAt> {
-        let mut left = self.parse_additive()?;
+        let mut left = self.parse_bitwise_or()?;
 
         while let Some(op) = match self.peek() {
             Some(Token::Eq) => Some(BinOp::Eq),
             Some(Token::NotEq) => Some(BinOp::NotEq),
             Some(Token::Lt) => {
                 // 检查是否是泛型语法 Array<T>
-                if matches!(self.peek_next(), Some(Token::TypeInt64 | Token::TypeInt32 | Token::TypeFloat64 | Token::TypeBool | Token::TypeString | Token::Ident(_))) {
+                if matches!(self.peek_next(), Some(Token::TypeInt64 | Token::TypeInt32 | Token::TypeFloat64 | Token::TypeFloat32 | Token::TypeBool | Token::TypeString | Token::Ident(_))) {
                     None
                 } else {
                     Some(BinOp::Lt)
@@ -541,7 +575,7 @@ impl Parser {
             _ => None,
         } {
             self.advance();
-            let right = self.parse_additive()?;
+            let right = self.parse_bitwise_or()?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
@@ -549,6 +583,70 @@ impl Parser {
             };
         }
 
+        Ok(left)
+    }
+
+    /// 解析按位或 |
+    fn parse_bitwise_or(&mut self) -> Result<Expr, ParseErrorAt> {
+        let mut left = self.parse_bitwise_xor()?;
+        while matches!(self.peek(), Some(Token::Pipe)) {
+            self.advance();
+            let right = self.parse_bitwise_xor()?;
+            left = Expr::Binary {
+                op: BinOp::BitOr,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// 解析按位异或 ^
+    fn parse_bitwise_xor(&mut self) -> Result<Expr, ParseErrorAt> {
+        let mut left = self.parse_bitwise_and()?;
+        while matches!(self.peek(), Some(Token::Caret)) {
+            self.advance();
+            let right = self.parse_bitwise_and()?;
+            left = Expr::Binary {
+                op: BinOp::BitXor,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// 解析按位与 &
+    fn parse_bitwise_and(&mut self) -> Result<Expr, ParseErrorAt> {
+        let mut left = self.parse_shift()?;
+        while matches!(self.peek(), Some(Token::And)) {
+            self.advance();
+            let right = self.parse_shift()?;
+            left = Expr::Binary {
+                op: BinOp::BitAnd,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// 解析移位 << >>
+    fn parse_shift(&mut self) -> Result<Expr, ParseErrorAt> {
+        let mut left = self.parse_additive()?;
+        while let Some(op) = match self.peek() {
+            Some(Token::Shl) => Some(BinOp::Shl),
+            Some(Token::Shr) => Some(BinOp::Shr),
+            _ => None,
+        } {
+            self.advance();
+            let right = self.parse_additive()?;
+            left = Expr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
         Ok(left)
     }
 
@@ -575,7 +673,7 @@ impl Parser {
 
     /// 解析乘除法表达式
     fn parse_multiplicative(&mut self) -> Result<Expr, ParseErrorAt> {
-        let mut left = self.parse_unary()?;
+        let mut left = self.parse_power()?;
 
         while let Some(op) = match self.peek() {
             Some(Token::Star) => Some(BinOp::Mul),
@@ -584,7 +682,7 @@ impl Parser {
             _ => None,
         } {
             self.advance();
-            let right = self.parse_unary()?;
+            let right = self.parse_power()?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
@@ -592,6 +690,21 @@ impl Parser {
             };
         }
 
+        Ok(left)
+    }
+
+    /// 解析幂运算 (**)，右结合
+    fn parse_power(&mut self) -> Result<Expr, ParseErrorAt> {
+        let mut left = self.parse_unary()?;
+        if matches!(self.peek(), Some(Token::StarStar)) {
+            self.advance();
+            let right = self.parse_power()?;
+            left = Expr::Binary {
+                op: BinOp::Pow,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
         Ok(left)
     }
 
@@ -610,6 +723,14 @@ impl Parser {
             let expr = self.parse_unary()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
+                expr: Box::new(expr),
+            });
+        }
+        if matches!(self.peek(), Some(Token::Tilde)) {
+            self.advance();
+            let expr = self.parse_unary()?;
+            return Ok(Expr::Unary {
+                op: UnaryOp::BitNot,
                 expr: Box::new(expr),
             });
         }
@@ -661,6 +782,14 @@ impl Parser {
                         };
                     }
                 }
+                Some(Token::As) => {
+                    self.advance();
+                    let target_ty = self.parse_type()?;
+                    expr = Expr::Cast {
+                        expr: Box::new(expr),
+                        target_ty,
+                    };
+                }
                 _ => break,
             }
         }
@@ -686,6 +815,14 @@ impl Parser {
                 Ok(Expr::Integer(n))
             }
             Some(Token::Float(f)) => Ok(Expr::Float(f)),
+            Some(Token::Float32(f)) => Ok(Expr::Float32(f)),
+            Some(Token::This) => match self.receiver_name.clone() {
+                Some(n) => Ok(Expr::Var(n)),
+                None => self.bail_at(
+                    ParseError::UnexpectedToken(Token::This, "this 仅可在方法体内使用".to_string()),
+                    self.at_prev(),
+                ),
+            },
             Some(Token::True) => Ok(Expr::Bool(true)),
             Some(Token::False) => Ok(Expr::Bool(false)),
             Some(Token::StringLit(s)) => Ok(Expr::String(s)),
@@ -699,9 +836,18 @@ impl Parser {
                             Some(Token::Ident(v)) => v,
                             _ => unreachable!(),
                         };
+                        let arg = if self.check(&Token::LParen) {
+                            self.advance();
+                            let e = self.parse_expr()?;
+                            self.expect(Token::RParen)?;
+                            Some(Box::new(e))
+                        } else {
+                            None
+                        };
                         return Ok(Expr::VariantConst {
                             enum_name: name,
                             variant_name: variant,
+                            arg,
                         });
                     }
                 }
@@ -863,6 +1009,11 @@ impl Parser {
         let mut expr = match self.advance() {
             Some(Token::Integer(n)) => Expr::Integer(n),
             Some(Token::Float(f)) => Expr::Float(f),
+            Some(Token::Float32(f)) => Expr::Float32(f),
+            Some(Token::This) => match self.receiver_name.clone() {
+                Some(n) => Expr::Var(n),
+                None => return self.bail(ParseError::UnexpectedToken(Token::This, "this 仅可在方法体内使用".to_string())),
+            },
             Some(Token::True) => Expr::Bool(true),
             Some(Token::False) => Expr::Bool(false),
             Some(Token::StringLit(s)) => Expr::String(s),
@@ -1094,9 +1245,22 @@ impl Parser {
                             Some(Token::Ident(v)) => v.clone(),
                             _ => unreachable!(),
                         };
+                        let binding = if self.check(&Token::LParen) {
+                            self.advance();
+                            let b = match self.advance() {
+                                Some(Token::Ident(id)) => id,
+                                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "关联值绑定名".to_string())),
+                                None => return self.bail(ParseError::UnexpectedEof),
+                            };
+                            self.expect(Token::RParen)?;
+                            Some(b)
+                        } else {
+                            None
+                        };
                         return Ok(Pattern::Variant {
                             enum_name: name,
                             variant_name: variant,
+                            binding,
                         });
                     }
                 }
