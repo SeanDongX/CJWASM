@@ -303,7 +303,20 @@ impl Parser {
             };
             self.expect(Token::Colon)?;
             let ty = self.parse_type()?;
-            params.push(Param { name, ty });
+            // 检查是否为可变参数 (Type...)
+            let variadic = if self.check(&Token::DotDotDot) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            let default = if self.check(&Token::Assign) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            params.push(Param { name, ty, default, variadic });
 
             if !self.check(&Token::Comma) {
                 break;
@@ -330,6 +343,7 @@ impl Parser {
                 self.expect(Token::Gt)?;
                 Ok(Type::Array(Box::new(elem_type)))
             }
+            Some(Token::TypeRange) => Ok(Type::Range),
             Some(Token::Ident(name)) => Ok(Type::Struct(name)),
             Some(tok) => self.bail_at(ParseError::UnexpectedToken(tok, "类型".to_string()), self.at_prev()),
             None => self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
@@ -350,12 +364,41 @@ impl Parser {
         match self.peek() {
             Some(Token::Let) => {
                 self.advance();
-                let name = match self.advance() {
+                let first = match self.advance() {
                     Some(Token::Ident(name)) => name,
                     Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(tok, "变量名".to_string()))
+                        return self.bail(ParseError::UnexpectedToken(tok, "变量名或类型名".to_string()))
                     }
                     None => return self.bail(ParseError::UnexpectedEof),
+                };
+                let pattern = if self.check(&Token::LBrace) {
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while !self.check(&Token::RBrace) {
+                        let fname = match self.advance() {
+                            Some(Token::Ident(n)) => n,
+                            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string())),
+                            None => return self.bail(ParseError::UnexpectedEof),
+                        };
+                        let binding = if self.check(&Token::Colon) {
+                            self.advance();
+                            match self.advance() {
+                                Some(Token::Ident(n)) => n,
+                                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "绑定名".to_string())),
+                                None => return self.bail(ParseError::UnexpectedEof),
+                            }
+                        } else {
+                            fname.clone()
+                        };
+                        fields.push((fname, Pattern::Binding(binding)));
+                        if !self.check(&Token::RBrace) {
+                            self.expect(Token::Comma)?;
+                        }
+                    }
+                    self.expect(Token::RBrace)?;
+                    Pattern::Struct { name: first, fields }
+                } else {
+                    Pattern::Binding(first)
                 };
                 let ty = if self.check(&Token::Colon) {
                     self.advance();
@@ -365,7 +408,7 @@ impl Parser {
                 };
                 self.expect(Token::Assign)?;
                 let value = self.parse_expr()?;
-                Ok(Stmt::Let { name, ty, value })
+                Ok(Stmt::Let { pattern, ty, value })
             }
             Some(Token::Var) => {
                 self.advance();
@@ -396,11 +439,23 @@ impl Parser {
             }
             Some(Token::While) => {
                 self.advance();
-                let cond = self.parse_expr()?;
-                self.expect(Token::LBrace)?;
-                let body = self.parse_stmts()?;
-                self.expect(Token::RBrace)?;
-                Ok(Stmt::While { cond, body })
+                if self.check(&Token::Let) {
+                    self.advance();
+                    let pattern = self.parse_pattern()?;
+                    self.expect(Token::Assign)?;
+                    // 使用受限表达式解析，避免 { 被误认为结构体初始化
+                    let expr = Box::new(self.parse_match_subject()?);
+                    self.expect(Token::LBrace)?;
+                    let body = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    Ok(Stmt::WhileLet { pattern, expr, body })
+                } else {
+                    let cond = self.parse_expr()?;
+                    self.expect(Token::LBrace)?;
+                    let body = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    Ok(Stmt::While { cond, body })
+                }
             }
             Some(Token::For) => {
                 self.advance();
@@ -825,7 +880,7 @@ impl Parser {
             },
             Some(Token::True) => Ok(Expr::Bool(true)),
             Some(Token::False) => Ok(Expr::Bool(false)),
-            Some(Token::StringLit(s)) => Ok(Expr::String(s)),
+            Some(Token::StringLit(s)) | Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => Ok(Expr::String(s)),
             Some(Token::Ident(name)) => {
                 // 仅当首字母大写时解析为枚举变体 (Color.Red)，否则 . 后续为字段/方法
                 let looks_like_type = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
@@ -851,13 +906,18 @@ impl Parser {
                         });
                     }
                 }
-                // 检查是否是函数调用或结构体初始化
+                // 检查是否是函数调用、构造函数调用或结构体初始化
                 match self.peek() {
                     Some(Token::LParen) => {
                         self.advance();
                         let args = self.parse_args()?;
                         self.expect(Token::RParen)?;
-                        Ok(Expr::Call { name, args })
+                        // 首字母大写视为构造函数调用，否则为普通函数调用
+                        if looks_like_type {
+                            Ok(Expr::ConstructorCall { name, args })
+                        } else {
+                            Ok(Expr::Call { name, args })
+                        }
                     }
                     Some(Token::LBrace) => {
                         self.advance();
@@ -869,11 +929,47 @@ impl Parser {
                 }
             }
             Some(Token::LParen) => {
+                // 检查是否是 Lambda: (x: T, ...) -> R { body } 或 () -> R { body }
+                // 通过检查 ) -> 或 ident : 来判断
+                if self.check(&Token::RParen) {
+                    // () -> R { body }
+                    self.advance(); // consume )
+                    if self.check(&Token::Arrow) {
+                        return self.parse_lambda_rest(vec![]);
+                    }
+                    // 空括号但没有 ->，解析错误
+                    return self.bail(ParseError::UnexpectedToken(Token::RParen, "表达式".to_string()));
+                }
+                // 检查是否是 (ident : 开头的 Lambda
+                if let Some(Token::Ident(_)) = self.peek() {
+                    if let Some(Token::Colon) = self.peek_next() {
+                        // 这是 Lambda
+                        let params = self.parse_lambda_params()?;
+                        self.expect(Token::RParen)?;
+                        return self.parse_lambda_rest(params);
+                    }
+                }
+                // 普通括号表达式
                 let expr = self.parse_expr()?;
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
             Some(Token::LBrace) => {
+                // 检查是否是 Lambda: { x: T => body }
+                if let Some(Token::Ident(_)) = self.peek() {
+                    if let Some(Token::Colon) = self.peek_next() {
+                        // 尝试解析 Lambda { x: T, y: T => body }
+                        let params = self.parse_lambda_params()?;
+                        self.expect(Token::FatArrow)?;
+                        let body = self.parse_expr()?;
+                        self.expect(Token::RBrace)?;
+                        return Ok(Expr::Lambda {
+                            params,
+                            return_type: None, // 类型推断
+                            body: Box::new(body),
+                        });
+                    }
+                }
                 // 块表达式 { stmt; stmt; expr? }
                 let stmts = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
@@ -905,42 +1001,84 @@ impl Parser {
                 Ok(Expr::Array(elements))
             }
             Some(Token::If) => {
-                let cond = self.parse_expr()?;
-                self.expect(Token::LBrace)?;
-                let then_stmts = self.parse_stmts()?;
-                let then_expr = if then_stmts.is_empty() {
-                    None
-                } else {
-                    match then_stmts.last() {
-                        Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
-                        _ => None,
-                    }
-                };
-                self.expect(Token::RBrace)?;
-
-                let else_branch = if self.check(&Token::Else) {
+                if self.check(&Token::Let) {
                     self.advance();
+                    let pattern = self.parse_pattern()?;
+                    self.expect(Token::Assign)?;
+                    // 使用受限表达式解析，避免 { 被误认为结构体初始化
+                    let expr = Box::new(self.parse_match_subject()?);
                     self.expect(Token::LBrace)?;
-                    let else_stmts = self.parse_stmts()?;
-                    let else_expr = if else_stmts.is_empty() {
+                    let then_stmts = self.parse_stmts()?;
+                    let then_expr = if then_stmts.is_empty() {
+                        Box::new(Expr::Integer(0))
+                    } else {
+                        match then_stmts.last() {
+                            Some(Stmt::Expr(e)) => Box::new(e.clone()),
+                            _ => Box::new(Expr::Integer(0)),
+                        }
+                    };
+                    self.expect(Token::RBrace)?;
+                    let else_branch = if self.check(&Token::Else) {
+                        self.advance();
+                        self.expect(Token::LBrace)?;
+                        let else_stmts = self.parse_stmts()?;
+                        let else_expr = if else_stmts.is_empty() {
+                            None
+                        } else {
+                            match else_stmts.last() {
+                                Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
+                                _ => None,
+                            }
+                        };
+                        self.expect(Token::RBrace)?;
+                        else_expr
+                    } else {
+                        None
+                    };
+                    Ok(Expr::IfLet {
+                        pattern,
+                        expr,
+                        then_branch: then_expr,
+                        else_branch,
+                    })
+                } else {
+                    let cond = self.parse_expr()?;
+                    self.expect(Token::LBrace)?;
+                    let then_stmts = self.parse_stmts()?;
+                    let then_expr = if then_stmts.is_empty() {
                         None
                     } else {
-                        match else_stmts.last() {
+                        match then_stmts.last() {
                             Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
                             _ => None,
                         }
                     };
                     self.expect(Token::RBrace)?;
-                    else_expr
-                } else {
-                    None
-                };
 
-                Ok(Expr::If {
-                    cond: Box::new(cond),
-                    then_branch: then_expr.unwrap_or_else(|| Box::new(Expr::Integer(0))),
-                    else_branch,
-                })
+                    let else_branch = if self.check(&Token::Else) {
+                        self.advance();
+                        self.expect(Token::LBrace)?;
+                        let else_stmts = self.parse_stmts()?;
+                        let else_expr = if else_stmts.is_empty() {
+                            None
+                        } else {
+                            match else_stmts.last() {
+                                Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
+                                _ => None,
+                            }
+                        };
+                        self.expect(Token::RBrace)?;
+                        else_expr
+                    } else {
+                        None
+                    };
+
+                    Ok(Expr::If {
+                        cond: Box::new(cond),
+                        then_branch: then_expr.unwrap_or_else(|| Box::new(Expr::Integer(0))),
+                        else_branch,
+                    })
+                }
             }
             Some(Token::Match) => {
                 // 使用受限的表达式解析，不允许解析结构体初始化
@@ -984,6 +1122,43 @@ impl Parser {
         Ok(fields)
     }
 
+    /// 解析 Lambda 参数列表: x: T, y: T
+    fn parse_lambda_params(&mut self) -> Result<Vec<(String, Type)>, ParseErrorAt> {
+        let mut params = Vec::new();
+
+        loop {
+            let name = match self.advance() {
+                Some(Token::Ident(name)) => name,
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
+            };
+            self.expect(Token::Colon)?;
+            let ty = self.parse_type()?;
+            params.push((name, ty));
+
+            if !self.check(&Token::Comma) {
+                break;
+            }
+            self.advance();
+        }
+
+        Ok(params)
+    }
+
+    /// 解析 Lambda 表达式的剩余部分: -> ReturnType { body }
+    fn parse_lambda_rest(&mut self, params: Vec<(String, Type)>) -> Result<Expr, ParseErrorAt> {
+        self.expect(Token::Arrow)?;
+        let return_type = Some(self.parse_type()?);
+        self.expect(Token::LBrace)?;
+        let body = self.parse_expr()?;
+        self.expect(Token::RBrace)?;
+        Ok(Expr::Lambda {
+            params,
+            return_type,
+            body: Box::new(body),
+        })
+    }
+
     /// 解析函数调用参数
     fn parse_args(&mut self) -> Result<Vec<Expr>, ParseErrorAt> {
         let mut args = Vec::new();
@@ -1016,7 +1191,7 @@ impl Parser {
             },
             Some(Token::True) => Expr::Bool(true),
             Some(Token::False) => Expr::Bool(false),
-            Some(Token::StringLit(s)) => Expr::String(s),
+            Some(Token::StringLit(s)) | Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => Expr::String(s),
             Some(Token::Ident(name)) => {
                 if self.check(&Token::LParen) {
                     // 函数调用
@@ -1229,7 +1404,7 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::Literal(Literal::Bool(false)))
             }
-            Some(Token::StringLit(s)) => {
+            Some(Token::StringLit(s)) | Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => {
                 let s = s.clone();
                 self.advance();
                 Ok(Pattern::Literal(Literal::String(s)))
@@ -1547,5 +1722,39 @@ mod tests {
 
         assert_eq!(program.functions.len(), 1);
         assert_eq!(program.functions[0].body.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_lambda_arrow_syntax() {
+        // Lambda syntax: (x: T) -> R { body }
+        let source = "func test() { let f = (x: Int64) -> Int64 { x * 2 } }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+
+        if let Stmt::Let { value, .. } = &program.functions[0].body[0] {
+            assert!(matches!(value, Expr::Lambda { .. }));
+        } else {
+            panic!("应该是 let 语句");
+        }
+    }
+
+    #[test]
+    fn test_parse_lambda_brace_syntax() {
+        // Lambda syntax: { x: T => body }
+        let source = "func test() { let f = { x: Int64 => x + 1 } }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+
+        if let Stmt::Let { value, .. } = &program.functions[0].body[0] {
+            assert!(matches!(value, Expr::Lambda { .. }));
+        } else {
+            panic!("应该是 let 语句");
+        }
     }
 }

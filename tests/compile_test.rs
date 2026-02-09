@@ -160,6 +160,80 @@ fn test_compile_enum_method() {
 }
 
 #[test]
+fn test_compile_default_param() {
+    let source = r#"
+        func power(base: Int64, exp: Int64 = 2) -> Int64 {
+            return base ** exp
+        }
+        func main() -> Int64 {
+            return power(10)
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "default_param");
+}
+
+#[test]
+fn test_compile_match_struct_destructure() {
+    let source = r#"
+        struct Point { x: Int64, y: Int64 }
+        func main() -> Int64 {
+            let p = Point { x: 1, y: 2 }
+            match p {
+                Point { x: a, y: b } => a + b,
+                _ => 0
+            }
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "match_struct_destructure");
+}
+
+#[test]
+fn test_compile_let_destructure() {
+    let source = r#"
+        struct Point { x: Int64, y: Int64 }
+        func main() -> Int64 {
+            let p = Point { x: 10, y: 20 }
+            let Point { x, y } = p
+            return x + y
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "let_destructure");
+}
+
+#[test]
+fn test_compile_if_let() {
+    let source = r#"
+func main() -> Int64 {
+    let p = 42
+    if let x = p { return x } else { return 0 }
+}
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "if_let");
+}
+
+#[test]
+fn test_compile_while_let() {
+    let source = r#"
+func main() -> Int64 {
+    var n = 3
+    var sum = 0
+    while let x = n {
+        sum = sum + x
+        n = n - 1
+        if n < 0 { break }
+    }
+    return sum
+}
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "while_let");
+}
+
+#[test]
 fn test_compile_enum_associated_value() {
     let source = r#"
         enum Result { Ok(Int64), Err(Int64) }
@@ -174,6 +248,31 @@ fn test_compile_enum_associated_value() {
     "#;
     let wasm = compile_source(source);
     assert_valid_wasm(&wasm, "enum_associated_value");
+}
+
+#[test]
+fn test_compile_raw_string() {
+    let source = r#"
+        func main() -> Int64 {
+            let s = r"raw\nliteral"
+            return 0
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "raw_string");
+}
+
+#[test]
+fn test_compile_constructor() {
+    let source = r#"
+        struct Point { x: Int64, y: Int64 }
+        func main() -> Int64 {
+            let p = Point(10, 20)
+            return p.x + p.y
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "constructor");
 }
 
 #[test]
@@ -296,6 +395,33 @@ fn test_compile_for_range() {
 }
 
 #[test]
+fn test_compile_range_as_value() {
+    // 范围作为值赋给变量
+    let source = r#"
+        func main() -> Int64 {
+            let r = 0..10
+            let r2 = 1..=5
+            return 42
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "range_as_value");
+}
+
+#[test]
+fn test_compile_range_with_type() {
+    // 显式 Range 类型注解
+    let source = r#"
+        func main() -> Int64 {
+            let r: Range = 0..10
+            return 42
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "range_with_type");
+}
+
+#[test]
 fn test_compile_call_type_inference() {
     // let 无类型注解时，从函数返回类型推断
     let source = r#"
@@ -356,4 +482,41 @@ fn test_compile_example_files() {
             assert_valid_wasm(&wasm, &name);
         }
     }
+}
+
+#[test]
+fn test_compile_variadic_params() {
+    let source = r#"
+        func sum(args: Int64...) -> Int64 {
+            var total: Int64 = 0
+            for x in args {
+                total = total + x
+            }
+            return total
+        }
+        func main() -> Int64 {
+            return sum(1, 2, 3, 4, 5)
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "variadic_params");
+}
+
+#[test]
+fn test_compile_function_overload() {
+    let source = r#"
+        func add(a: Int64, b: Int64) -> Int64 {
+            return a + b
+        }
+        func add(a: Float64, b: Float64) -> Float64 {
+            return a + b
+        }
+        func main() -> Int64 {
+            let x = add(1, 2)
+            let y = add(1.0, 2.0)
+            return x
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "function_overload");
 }

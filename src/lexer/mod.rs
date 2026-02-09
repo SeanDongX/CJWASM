@@ -24,6 +24,58 @@ fn unescape_string(s: &str) -> String {
     out
 }
 
+/// 处理多行字符串：移除首行空行，并 strip 公共缩进
+fn process_multiline_string(s: &str) -> String {
+    let mut lines: Vec<&str> = s.lines().collect();
+
+    // 如果第一行是空的（紧跟 """ 后换行），移除它
+    if !lines.is_empty() && lines[0].trim().is_empty() {
+        lines.remove(0);
+    }
+    // 如果最后一行只有空白（""" 前的缩进），移除它
+    if !lines.is_empty() && lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // 计算公共缩进（最小非空行的前导空白数）
+    let min_indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+
+    // 移除公共缩进并拼接
+    lines
+        .iter()
+        .map(|l| {
+            if l.len() >= min_indent {
+                &l[min_indent..]
+            } else {
+                l.trim_start()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 解析多行字符串 """..."""，返回内容（不含引号）和消耗的字节数
+fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
+    let remainder = lex.remainder();
+    // 查找结束的 """
+    if let Some(end_pos) = remainder.find("\"\"\"") {
+        let content = &remainder[..end_pos];
+        lex.bump(end_pos + 3); // 跳过内容和结束的 """
+        Some(process_multiline_string(content))
+    } else {
+        None // 未找到结束引号
+    }
+}
+
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(skip r"[ \t\r\n]+")]  // 跳过空白
 #[logos(skip r"//[^\n]*")]    // 跳过单行注释
@@ -86,19 +138,21 @@ pub enum Token {
     TypeString,
     #[token("Array")]
     TypeArray,
+    #[token("Range")]
+    TypeRange,
 
-    // 字面量（Float32 后缀 f 优先，再 Float64，再整型）
+    // 字面量（Float64：小数或科学计数法；Float32 后缀 f；整型）
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
+        let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
+        s.parse::<f64>().ok()
+    })]
+    Float(f64),
+
     #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*f|[0-9][0-9_]*f", |lex| {
         let s: String = lex.slice().chars().filter(|c| *c != '_' && *c != 'f').collect();
         s.parse::<f32>().ok()
     })]
     Float32(f32),
-
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*", |lex| {
-        let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
-        s.parse::<f64>().ok()
-    })]
-    Float(f64),
 
     #[regex(r"0x[0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*", |lex| {
         let slice = lex.slice();
@@ -114,6 +168,17 @@ pub enum Token {
     True,
     #[token("false")]
     False,
+
+    // 多行字符串 """..."""（strip 公共缩进）
+    #[token(r#"""""#, lex_multiline_string)]
+    MultiLineStringLit(String),
+
+    // 原始字符串 r"..."（不处理转义）
+    #[regex(r#"r"([^"]*)""#, |lex| {
+        let s = lex.slice();
+        s[2..s.len() - 1].to_string()
+    })]
+    RawStringLit(String),
 
     // 字符串字面量（支持 \n \t \" \\ 转义）
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
@@ -187,6 +252,8 @@ pub enum Token {
     DotDot,
     #[token("..=")]
     DotDotEq,
+    #[token("...")]
+    DotDotDot,
     #[token("=>")]
     FatArrow,
 
@@ -358,5 +425,26 @@ mod tests {
         assert_eq!(tokens[0], Token::Match);
         assert_eq!(tokens[4], Token::FatArrow);
         assert_eq!(tokens[7], Token::Underscore);
+    }
+
+    #[test]
+    fn test_multiline_string() {
+        let source = r#"let s = """
+    hello
+    world
+    """"#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(tokens[3], Token::MultiLineStringLit("hello\nworld".to_string()));
+    }
+
+    #[test]
+    fn test_multiline_string_inline() {
+        let source = r#"let s = """hello world""""#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(tokens[3], Token::MultiLineStringLit("hello world".to_string()));
     }
 }

@@ -1,4 +1,4 @@
-use crate::ast::{AssignTarget, BinOp, EnumDef, Expr, Literal, Pattern, Program, Stmt, StructDef, Type, UnaryOp};
+use crate::ast::{AssignTarget, BinOp, EnumDef, Expr, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef, Type, UnaryOp};
 use crate::ast::Function as FuncDef;
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -23,6 +23,10 @@ pub struct CodeGen {
     structs: HashMap<String, StructDef>,
     /// 枚举定义
     enums: HashMap<String, EnumDef>,
+    /// 函数参数列表（含默认值），用于 Call 时补全缺失实参
+    func_params: HashMap<String, Vec<Param>>,
+    /// 每个名字对应的函数个数，用于决定是否用修饰名解析
+    name_count: HashMap<String, usize>,
     /// 字符串常量池 (字符串内容 -> 内存偏移)
     string_pool: Vec<(String, u32)>,
     /// 当前数据段偏移
@@ -37,8 +41,47 @@ impl CodeGen {
             func_return_types: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
+            func_params: HashMap::new(),
+            name_count: HashMap::new(),
             string_pool: Vec::new(),
             data_offset: 0,
+        }
+    }
+
+    /// 重载名字修饰：name$Type1$Type2 用于多态解析
+    fn type_mangle_suffix(ty: &Type) -> String {
+        match ty {
+            Type::Int32 => "Int32".to_string(),
+            Type::Int64 => "Int64".to_string(),
+            Type::Float32 => "Float32".to_string(),
+            Type::Float64 => "Float64".to_string(),
+            Type::Bool => "Bool".to_string(),
+            Type::Unit => "Unit".to_string(),
+            Type::String => "String".to_string(),
+            Type::Array(inner) => format!("Array_{}", Self::type_mangle_suffix(inner)),
+            Type::Struct(s) => s.clone(),
+            Type::Range => "Range".to_string(),
+            Type::Function { params, ret } => {
+                let params_str = params.iter().map(Self::type_mangle_suffix).collect::<Vec<_>>().join("_");
+                let ret_str = ret.as_ref().as_ref().map(Self::type_mangle_suffix).unwrap_or_else(|| "Unit".to_string());
+                format!("Fn_{}_{}", params_str, ret_str)
+            }
+        }
+    }
+
+    fn mangle_key(name: &str, param_tys: &[Type]) -> String {
+        if param_tys.is_empty() {
+            format!("{}$_", name)
+        } else {
+            format!(
+                "{}${}",
+                name,
+                param_tys
+                    .iter()
+                    .map(Self::type_mangle_suffix)
+                    .collect::<Vec<_>>()
+                    .join("$")
+            )
         }
     }
 
@@ -57,21 +100,45 @@ impl CodeGen {
         // 收集字符串常量
         self.collect_strings(program);
 
-        // 1. 类型段 (Type Section)
+        let name_count: HashMap<String, usize> = program
+            .functions
+            .iter()
+            .map(|f| f.name.clone())
+            .fold(HashMap::new(), |mut m, n| {
+                *m.entry(n).or_default() += 1;
+                m
+            });
+        self.name_count = name_count.clone();
+
+        // 1. 类型段 (Type Section)，重载时按参数类型名字修饰
         let mut types = TypeSection::new();
         for (i, func) in program.functions.iter().enumerate() {
-            let params: Vec<ValType> = func.params.iter().map(|p| p.ty.to_wasm()).collect();
+            // 可变参数类型转为 Array<T>
+            let param_tys: Vec<Type> = func.params.iter().map(|p| {
+                if p.variadic {
+                    Type::Array(Box::new(p.ty.clone()))
+                } else {
+                    p.ty.clone()
+                }
+            }).collect();
+            let params: Vec<ValType> = param_tys.iter().map(|p| p.to_wasm()).collect();
             let results: Vec<ValType> = func
                 .return_type
                 .as_ref()
                 .map(|t| vec![t.to_wasm()])
                 .unwrap_or_default();
             types.ty().function(params, results);
-            self.func_types.insert(func.name.clone(), i as u32);
-            self.func_indices.insert(func.name.clone(), i as u32);
+            let key = if *name_count.get(&func.name).unwrap_or(&0) > 1 {
+                Self::mangle_key(&func.name, &param_tys)
+            } else {
+                func.name.clone()
+            };
+            self.func_types.insert(key.clone(), i as u32);
+            self.func_indices.insert(key.clone(), i as u32);
             if let Some(ref ret) = func.return_type {
-                self.func_return_types.insert(func.name.clone(), ret.clone());
+                self.func_return_types.insert(key.clone(), ret.clone());
             }
+            self.func_params.insert(key, func.params.clone());
         }
         let pow_type_idx = program.functions.len() as u32;
         types.ty().function([ValType::I64, ValType::I64], [ValType::I64]);
@@ -110,10 +177,23 @@ impl CodeGen {
         );
         module.section(&globals);
 
-        // 5. 导出段 (Export Section)
+        // 5. 导出段：单一定义用原名，重载用修饰名
         let mut exports = ExportSection::new();
         for (i, func) in program.functions.iter().enumerate() {
-            exports.export(&func.name, ExportKind::Func, i as u32);
+            // 可变参数类型转为 Array<T>
+            let param_tys: Vec<Type> = func.params.iter().map(|p| {
+                if p.variadic {
+                    Type::Array(Box::new(p.ty.clone()))
+                } else {
+                    p.ty.clone()
+                }
+            }).collect();
+            let key = if *name_count.get(&func.name).unwrap_or(&0) > 1 {
+                Self::mangle_key(&func.name, &param_tys)
+            } else {
+                func.name.clone()
+            };
+            exports.export(&key, ExportKind::Func, i as u32);
         }
         exports.export("memory", ExportKind::Memory, 0);
         module.section(&exports);
@@ -146,6 +226,11 @@ impl CodeGen {
     /// 收集所有字符串常量
     fn collect_strings(&mut self, program: &Program) {
         for func in &program.functions {
+            for param in &func.params {
+                if let Some(ref e) = param.default {
+                    self.collect_strings_in_expr(e);
+                }
+            }
             for stmt in &func.body {
                 self.collect_strings_in_stmt(stmt);
             }
@@ -156,6 +241,12 @@ impl CodeGen {
         match stmt {
             Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
                 self.collect_strings_in_expr(value);
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                self.collect_strings_in_expr(expr);
+                for s in body {
+                    self.collect_strings_in_stmt(s);
+                }
             }
             Stmt::Assign { value, .. } => {
                 self.collect_strings_in_expr(value);
@@ -213,6 +304,13 @@ impl CodeGen {
                     self.collect_strings_in_expr(e);
                 }
             }
+            Expr::IfLet { expr, then_branch, else_branch, .. } => {
+                self.collect_strings_in_expr(expr);
+                self.collect_strings_in_expr(then_branch);
+                if let Some(e) = else_branch {
+                    self.collect_strings_in_expr(e);
+                }
+            }
             Expr::Array(elements) => {
                 for e in elements {
                     self.collect_strings_in_expr(e);
@@ -224,6 +322,11 @@ impl CodeGen {
             }
             Expr::StructInit { fields, .. } => {
                 for (_, e) in fields {
+                    self.collect_strings_in_expr(e);
+                }
+            }
+            Expr::ConstructorCall { args, .. } => {
+                for e in args {
                     self.collect_strings_in_expr(e);
                 }
             }
@@ -246,7 +349,13 @@ impl CodeGen {
 
         // 添加参数作为局部变量（含 AST 类型，便于字段访问计算偏移）
         for param in &func.params {
-            locals.add(&param.name, param.ty.to_wasm(), Some(param.ty.clone()));
+            // 可变参数类型转为 Array<T>
+            let actual_ty = if param.variadic {
+                Type::Array(Box::new(param.ty.clone()))
+            } else {
+                param.ty.clone()
+            };
+            locals.add(&param.name, actual_ty.to_wasm(), Some(actual_ty));
         }
 
         // 收集函数体中的局部变量
@@ -314,7 +423,33 @@ impl CodeGen {
     /// 收集局部变量
     fn collect_locals(&self, stmt: &Stmt, locals: &mut LocalsBuilder) {
         match stmt {
-            Stmt::Let { name, ty, value } | Stmt::Var { name, ty, value } => {
+            Stmt::Let { pattern, ty, value } => {
+                match pattern {
+                    Pattern::Binding(name) => {
+                        let val_type = ty
+                            .as_ref()
+                            .map(|t| t.to_wasm())
+                            .unwrap_or_else(|| self.infer_type(value));
+                        let ast_type = ty.clone().or_else(|| self.infer_ast_type(value));
+                        locals.add(name, val_type, ast_type);
+                    }
+                    Pattern::Struct { name: struct_name, fields } => {
+                        locals.add("__let_struct_ptr", ValType::I32, None);
+                        if let Some(def) = self.structs.get(struct_name) {
+                            for (fname, pat) in fields {
+                                if let Pattern::Binding(bind) = pat {
+                                    if let Some(ft) = def.field_type(fname) {
+                                        locals.add(bind, ft.to_wasm(), Some(ft.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.collect_locals_from_expr(value, locals);
+            }
+            Stmt::Var { name, ty, value } => {
                 let val_type = ty
                     .as_ref()
                     .map(|t| t.to_wasm())
@@ -334,6 +469,35 @@ impl CodeGen {
             }
             Stmt::While { cond, body } => {
                 self.collect_locals_from_expr(cond, locals);
+                for s in body {
+                    self.collect_locals(s, locals);
+                }
+            }
+            Stmt::WhileLet { pattern, expr, body } => {
+                self.collect_locals_from_expr(expr, locals);
+                locals.add("__match_enum_ptr", ValType::I32, None);
+                match pattern {
+                    Pattern::Binding(name) => {
+                        locals.add(name, ValType::I64, None);
+                    }
+                    Pattern::Variant { enum_name, variant_name, binding: Some(name) } => {
+                        if let Some(ty) = self.enums.get(enum_name).and_then(|e| e.variant_payload(variant_name)) {
+                            locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                        }
+                    }
+                    Pattern::Struct { name: struct_name, fields } => {
+                        if let Some(def) = self.structs.get(struct_name) {
+                            for (fname, pat) in fields {
+                                if let Pattern::Binding(bind) = pat {
+                                    if let Some(ft) = def.field_type(fname) {
+                                        locals.add(bind, ft.to_wasm(), Some(ft.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 for s in body {
                     self.collect_locals(s, locals);
                 }
@@ -375,12 +539,53 @@ impl CodeGen {
                                 locals.add(name, ty.to_wasm(), Some(ty.clone()));
                             }
                         }
+                        Pattern::Struct { name: struct_name, fields } => {
+                            if let Some(def) = self.structs.get(struct_name) {
+                                for (fname, pat) in fields {
+                                    if let Pattern::Binding(bind) = pat {
+                                        if let Some(ft) = def.field_type(fname) {
+                                            locals.add(bind, ft.to_wasm(), Some(ft.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     self.collect_locals_from_expr(&arm.body, locals);
                     if let Some(g) = &arm.guard {
                         self.collect_locals_from_expr(g, locals);
                     }
+                }
+            }
+            Expr::IfLet { pattern, expr, then_branch, else_branch } => {
+                self.collect_locals_from_expr(expr, locals);
+                locals.add("__match_enum_ptr", ValType::I32, None);
+                match pattern {
+                    Pattern::Binding(name) => {
+                        locals.add(name, ValType::I64, None);
+                    }
+                    Pattern::Variant { enum_name, variant_name, binding: Some(name) } => {
+                        if let Some(ty) = self.enums.get(enum_name).and_then(|e| e.variant_payload(variant_name)) {
+                            locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                        }
+                    }
+                    Pattern::Struct { name: struct_name, fields } => {
+                        if let Some(def) = self.structs.get(struct_name) {
+                            for (fname, pat) in fields {
+                                if let Pattern::Binding(bind) = pat {
+                                    if let Some(ft) = def.field_type(fname) {
+                                        locals.add(bind, ft.to_wasm(), Some(ft.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.collect_locals_from_expr(then_branch, locals);
+                if let Some(eb) = else_branch {
+                    self.collect_locals_from_expr(eb, locals);
                 }
             }
             Expr::Binary { left, right, .. } => {
@@ -431,6 +636,11 @@ impl CodeGen {
                     self.collect_locals_from_expr(e, locals);
                 }
             }
+            Expr::ConstructorCall { args, .. } => {
+                for e in args {
+                    self.collect_locals_from_expr(e, locals);
+                }
+            }
             Expr::Field { object, .. } => {
                 self.collect_locals_from_expr(object, locals);
             }
@@ -448,6 +658,9 @@ impl CodeGen {
                 self.collect_locals_from_expr(e, locals);
             }
             Expr::VariantConst { .. } => {}
+            Expr::Lambda { body, .. } => {
+                self.collect_locals_from_expr(body, locals);
+            }
             _ => {}
         }
     }
@@ -465,19 +678,121 @@ impl CodeGen {
                 .and_then(|e| self.infer_ast_type(e).map(|t| Type::Array(Box::new(t))))
                 .or(Some(Type::Array(Box::new(Type::Int64)))),
             Expr::StructInit { name, .. } => Some(Type::Struct(name.clone())),
+            Expr::ConstructorCall { name, .. } => Some(Type::Struct(name.clone())),
             Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone())),
-            Expr::Call { name, .. } => self.func_return_types.get(name).cloned(),
+            Expr::Call { name, args } => {
+                if self.structs.contains_key(name) {
+                    Some(Type::Struct(name.clone()))
+                } else {
+                    let arg_tys: Vec<Type> = args
+                        .iter()
+                        .filter_map(|a| self.infer_ast_type(a))
+                        .collect();
+                    let key = if *self.name_count.get(name).unwrap_or(&0) > 1 {
+                        if arg_tys.len() == args.len() {
+                            Some(Self::mangle_key(name, &arg_tys))
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(name.to_string())
+                    };
+                    key.and_then(|k| self.func_return_types.get(&k).cloned())
+                }
+            }
             Expr::MethodCall { .. } => None, // 需结合 locals 推断，调用处可写类型注解
             Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
+            Expr::IfLet { then_branch, .. } => self.infer_ast_type(then_branch),
+            Expr::Lambda { params, return_type, .. } => {
+                let param_types = params.iter().map(|(_, t)| t.clone()).collect();
+                Some(Type::Function {
+                    params: param_types,
+                    ret: Box::new(return_type.clone()),
+                })
+            }
             _ => None,
         }
     }
 
-    /// 获取“对象表达式”的 AST 类型（用于字段访问、方法调用时查结构体与偏移）
+    /// 带 locals 的类型推断（用于 Call 实参等，可解析变量类型）
+    fn infer_ast_type_with_locals(&self, expr: &Expr, locals: &LocalsBuilder) -> Option<Type> {
+        match expr {
+            Expr::Var(name) => locals.get_type(name).cloned(),
+            Expr::Integer(_) => Some(Type::Int64),
+            Expr::Float(_) => Some(Type::Float64),
+            Expr::Float32(_) => Some(Type::Float32),
+            Expr::Bool(_) => Some(Type::Bool),
+            Expr::String(_) => Some(Type::String),
+            Expr::Array(ref elems) => elems
+                .first()
+                .and_then(|e| self.infer_ast_type_with_locals(e, locals).map(|t| Type::Array(Box::new(t))))
+                .or(Some(Type::Array(Box::new(Type::Int64)))),
+            Expr::StructInit { name, .. } => Some(Type::Struct(name.clone())),
+            Expr::ConstructorCall { name, .. } => Some(Type::Struct(name.clone())),
+            Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone())),
+            Expr::Call { name, args } => {
+                if self.structs.contains_key(name) {
+                    Some(Type::Struct(name.clone()))
+                } else {
+                    let arg_tys: Vec<Type> = args
+                        .iter()
+                        .filter_map(|a| self.infer_ast_type_with_locals(a, locals))
+                        .collect();
+                    let key = if *self.name_count.get(name).unwrap_or(&0) > 1 {
+                        if arg_tys.len() == args.len() {
+                            Some(Self::mangle_key(name, &arg_tys))
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(name.to_string())
+                    };
+                    key.and_then(|k| self.func_return_types.get(&k).cloned())
+                }
+            }
+            Expr::MethodCall { .. } => None,
+            Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
+            Expr::IfLet { then_branch, .. } => self.infer_ast_type_with_locals(then_branch, locals),
+            Expr::Field { object, field, .. } => {
+                self.infer_ast_type_with_locals(object, locals).and_then(|ty| {
+                    if let Type::Struct(s) = ty {
+                        self.structs.get(&s).and_then(|def| {
+                            def.fields.iter().find(|f| f.name == *field).map(|f| f.ty.clone())
+                        })
+                    } else {
+                        None
+                    }
+                })
+            }
+            Expr::Index { .. } => Some(Type::Int64), // 数组下标结果暂按 Int64
+            Expr::Unary { expr, .. } => self.infer_ast_type_with_locals(expr, locals),
+            Expr::Binary { op, left, right, .. } => {
+                use crate::ast::BinOp;
+                match op {
+                    BinOp::LogicalAnd | BinOp::LogicalOr | BinOp::Eq | BinOp::NotEq
+                    | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => Some(Type::Bool),
+                    _ => self.infer_ast_type_with_locals(left, locals)
+                        .or_else(|| self.infer_ast_type_with_locals(right, locals)),
+                }
+            }
+            Expr::Range { .. } => Some(Type::Range),
+            Expr::Lambda { params, return_type, .. } => {
+                let param_types = params.iter().map(|(_, t)| t.clone()).collect();
+                Some(Type::Function {
+                    params: param_types,
+                    ret: Box::new(return_type.clone()),
+                })
+            }
+            _ => self.infer_ast_type(expr),
+        }
+    }
+
+    /// 获取"对象表达式"的 AST 类型（用于字段访问、方法调用时查结构体与偏移）
     fn get_object_type(&self, expr: &Expr, locals: &LocalsBuilder) -> Option<Type> {
         match expr {
             Expr::Var(name) => locals.get_type(name).cloned(),
             Expr::StructInit { name, .. } => Some(Type::Struct(name.clone())),
+            Expr::ConstructorCall { name, .. } => Some(Type::Struct(name.clone())),
             Expr::Field { object, .. } => self.get_object_type(object, locals),
             _ => None,
         }
@@ -526,11 +841,29 @@ impl CodeGen {
             Expr::String(_) => ValType::I32,
             Expr::Array(_) => ValType::I32,
             Expr::StructInit { .. } => ValType::I32,
-            Expr::Call { name, .. } => self
-                .func_return_types
-                .get(name)
-                .map(|t| t.to_wasm())
-                .unwrap_or(ValType::I64),
+            Expr::ConstructorCall { .. } => ValType::I32,
+            Expr::Call { name, args } => {
+                if self.structs.contains_key(name) {
+                    ValType::I32
+                } else {
+                    let arg_tys: Vec<Type> = args
+                        .iter()
+                        .filter_map(|a| self.infer_ast_type(a))
+                        .collect();
+                    let key = if *self.name_count.get(name).unwrap_or(&0) > 1 {
+                        if arg_tys.len() == args.len() {
+                            Some(Self::mangle_key(name, &arg_tys))
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(name.to_string())
+                    };
+                    key.and_then(|k| self.func_return_types.get(&k))
+                        .map(|t| t.to_wasm())
+                        .unwrap_or(ValType::I64)
+                }
+            }
             Expr::Unary { op, expr } => match op {
                 UnaryOp::Not => ValType::I32,
                 UnaryOp::Neg | UnaryOp::BitNot => self.infer_type(expr),
@@ -543,6 +876,8 @@ impl CodeGen {
             Expr::Field { .. } => ValType::I64,
             Expr::VariantConst { .. } => ValType::I32,
             Expr::Cast { target_ty, .. } => target_ty.to_wasm(),
+            Expr::IfLet { then_branch, .. } => self.infer_type(then_branch),
+            Expr::Lambda { .. } => ValType::I32, // 函数表索引
             _ => ValType::I64,
         }
     }
@@ -556,7 +891,34 @@ impl CodeGen {
         loop_ctx: Option<(u32, u32)>,
     ) {
         match stmt {
-            Stmt::Let { name, value, .. } | Stmt::Var { name, value, .. } => {
+            Stmt::Let { pattern, value, .. } => {
+                self.compile_expr(value, locals, func, loop_ctx);
+                match pattern {
+                    Pattern::Binding(name) => {
+                        let idx = locals.get(name).expect("局部变量未找到");
+                        func.instruction(&Instruction::LocalSet(idx));
+                    }
+                    Pattern::Struct { name: struct_name, fields } => {
+                        let ptr_tmp = locals.get("__let_struct_ptr").expect("__let_struct_ptr");
+                        func.instruction(&Instruction::LocalSet(ptr_tmp));
+                        let struct_def = &self.structs[struct_name];
+                        for (fname, pat) in fields {
+                            let offset = struct_def.field_offset(fname).expect("结构体字段");
+                            let fty = struct_def.field_type(fname).expect("字段类型");
+                            func.instruction(&Instruction::LocalGet(ptr_tmp));
+                            func.instruction(&Instruction::I32Const(offset as i32));
+                            func.instruction(&Instruction::I32Add);
+                            self.emit_load_by_type(func, fty);
+                            if let Pattern::Binding(bind) = pat {
+                                let idx = locals.get(bind).expect("解构绑定名");
+                                func.instruction(&Instruction::LocalSet(idx));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Stmt::Var { name, value, .. } => {
                 self.compile_expr(value, locals, func, loop_ctx);
                 let idx = locals.get(name).expect("局部变量未找到");
                 func.instruction(&Instruction::LocalSet(idx));
@@ -658,6 +1020,119 @@ impl CodeGen {
                 }
 
                 func.instruction(&Instruction::Br(0));
+                func.instruction(&Instruction::End);
+                func.instruction(&Instruction::End);
+            }
+            Stmt::WhileLet { pattern, expr, body } => {
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // Br(1) = break
+                func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));   // Br(0) = continue
+                self.compile_expr(expr, locals, func, loop_ctx);
+                let subject_ty = self.infer_type(expr);
+                let subject_ast_type = self.infer_ast_type(expr);
+                let ptr_tmp = locals.get("__match_enum_ptr").expect("__match_enum_ptr");
+                let body_ctx = Some((1u32, 0u32));
+
+                match pattern {
+                    Pattern::Binding(name) => {
+                        if let Some(idx) = locals.get(name) {
+                            if subject_ty == ValType::I32 {
+                                func.instruction(&Instruction::I64ExtendI32S);
+                            }
+                            func.instruction(&Instruction::LocalSet(idx));
+                        } else {
+                            func.instruction(&Instruction::Drop);
+                        }
+                        for s in body {
+                            self.compile_stmt(s, locals, func, body_ctx);
+                        }
+                        func.instruction(&Instruction::Br(0));
+                    }
+                    Pattern::Wildcard => {
+                        func.instruction(&Instruction::Drop);
+                        for s in body {
+                            self.compile_stmt(s, locals, func, body_ctx);
+                        }
+                        func.instruction(&Instruction::Br(0));
+                    }
+                    Pattern::Variant { enum_name, variant_name, binding } => {
+                        let enum_def = self.enums.get(enum_name).and_then(|e| e.variant_index(variant_name).map(|_| e));
+                        if let Some(enum_def) = enum_def {
+                            func.instruction(&Instruction::LocalSet(ptr_tmp));
+                            let expected_disc = enum_def.variant_index(variant_name).unwrap() as i32;
+                            func.instruction(&Instruction::LocalGet(ptr_tmp));
+                            if enum_def.has_payload() {
+                                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                    offset: 0,
+                                    align: 2,
+                                    memory_index: 0,
+                                }));
+                                func.instruction(&Instruction::I32Const(expected_disc));
+                                func.instruction(&Instruction::I32Eq);
+                            } else {
+                                func.instruction(&Instruction::I32Const(expected_disc));
+                                func.instruction(&Instruction::I32Eq);
+                            }
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                            if enum_def.has_payload() {
+                                if let Some(ref bind_name) = binding {
+                                    if let Some(payload_ty) = enum_def.variant_payload(variant_name) {
+                                        func.instruction(&Instruction::LocalGet(ptr_tmp));
+                                        func.instruction(&Instruction::I32Const(4));
+                                        func.instruction(&Instruction::I32Add);
+                                        self.emit_load_by_type(func, payload_ty);
+                                        let bind_idx = locals.get(bind_name).expect("关联值绑定未找到");
+                                        func.instruction(&Instruction::LocalSet(bind_idx));
+                                    }
+                                }
+                            }
+                            for s in body {
+                                self.compile_stmt(s, locals, func, body_ctx);
+                            }
+                            func.instruction(&Instruction::Br(0));
+                            func.instruction(&Instruction::Else);
+                            func.instruction(&Instruction::Br(1));
+                            func.instruction(&Instruction::End);
+                        } else {
+                            func.instruction(&Instruction::Drop);
+                            func.instruction(&Instruction::Br(1));
+                        }
+                    }
+                    Pattern::Struct { name: struct_name, fields } => {
+                        let handled = if let Some(Type::Struct(ref sub_name)) = subject_ast_type {
+                            sub_name == struct_name && self.structs.contains_key(struct_name)
+                        } else {
+                            false
+                        };
+                        if handled {
+                            func.instruction(&Instruction::LocalSet(ptr_tmp));
+                            let struct_def = &self.structs[struct_name];
+                            for (fname, pat) in fields {
+                                let offset = struct_def.field_offset(fname).expect("结构体字段");
+                                let fty = struct_def.field_type(fname).expect("字段类型");
+                                func.instruction(&Instruction::LocalGet(ptr_tmp));
+                                func.instruction(&Instruction::I32Const(offset as i32));
+                                func.instruction(&Instruction::I32Add);
+                                self.emit_load_by_type(func, fty);
+                                if let Pattern::Binding(bind) = pat {
+                                    let idx = locals.get(bind).expect("解构绑定名");
+                                    func.instruction(&Instruction::LocalSet(idx));
+                                }
+                            }
+                            for s in body {
+                                self.compile_stmt(s, locals, func, body_ctx);
+                            }
+                            func.instruction(&Instruction::Br(0));
+                        } else {
+                            func.instruction(&Instruction::Drop);
+                            func.instruction(&Instruction::Br(1));
+                        }
+                    }
+                    _ => {
+                        func.instruction(&Instruction::Drop);
+                        func.instruction(&Instruction::Br(1));
+                    }
+                }
+
                 func.instruction(&Instruction::End);
                 func.instruction(&Instruction::End);
             }
@@ -1013,11 +1488,61 @@ impl CodeGen {
                 }
             }
             Expr::Call { name, args } => {
-                for arg in args {
-                    self.compile_expr(arg, locals, func, loop_ctx);
+                if let Some(struct_def) = self.structs.get(name) {
+                    if args.len() != struct_def.fields.len() {
+                        panic!(
+                            "结构体 {} 构造函数需要 {} 个参数，得到 {} 个",
+                            name,
+                            struct_def.fields.len(),
+                            args.len()
+                        );
+                    }
+                    let fields: Vec<(String, Expr)> = struct_def
+                        .fields
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .zip(args.clone())
+                        .collect();
+                    let init = Expr::StructInit {
+                        name: name.clone(),
+                        fields,
+                    };
+                    self.compile_expr(&init, locals, func, loop_ctx);
+                } else {
+                    let arg_tys: Vec<Type> = args
+                        .iter()
+                        .map(|a| {
+                            self.infer_ast_type_with_locals(a, locals).expect("无法推断实参类型，无法解析重载")
+                        })
+                        .collect();
+                    let key = if *self.name_count.get(name).unwrap_or(&0) > 1 {
+                        Self::mangle_key(name, &arg_tys)
+                    } else {
+                        name.to_string()
+                    };
+                    let params = self.func_params.get(&key).expect("函数未找到");
+
+                    // 检查是否有可变参数
+                    let variadic_idx = params.iter().position(|p| p.variadic);
+
+                    for (i, param) in params.iter().enumerate() {
+                        if param.variadic {
+                            // 可变参数：将剩余实参打包成数组
+                            let variadic_args: Vec<Expr> = args[i..].to_vec();
+                            let arr_expr = Expr::Array(variadic_args);
+                            self.compile_expr(&arr_expr, locals, func, loop_ctx);
+                        } else if i < args.len() && variadic_idx.map_or(true, |vi| i < vi) {
+                            // 普通参数：直接编译实参
+                            self.compile_expr(&args[i], locals, func, loop_ctx);
+                        } else if let Some(ref default) = param.default {
+                            self.compile_expr(default, locals, func, loop_ctx);
+                        } else {
+                            panic!("函数 {} 第 {} 个参数缺少实参且无默认值", name, i + 1);
+                        }
+                    }
+                    let idx = *self.func_indices.get(&key).expect("函数未找到");
+                    func.instruction(&Instruction::Call(idx));
                 }
-                let idx = *self.func_indices.get(name).expect("函数未找到");
-                func.instruction(&Instruction::Call(idx));
             }
             Expr::MethodCall { object, method, args } => {
                 let type_name_opt = if let Expr::Var(ref n) = object.as_ref() {
@@ -1070,6 +1595,17 @@ impl CodeGen {
                 }
 
                 func.instruction(&Instruction::End);
+            }
+            Expr::IfLet { pattern, expr, then_branch, else_branch } => {
+                let else_expr = else_branch.clone().unwrap_or_else(|| Box::new(Expr::Integer(0)));
+                let match_expr = Expr::Match {
+                    expr: expr.clone(),
+                    arms: vec![
+                        MatchArm { pattern: pattern.clone(), guard: None, body: then_branch.clone() },
+                        MatchArm { pattern: Pattern::Wildcard, guard: None, body: else_expr },
+                    ],
+                };
+                self.compile_expr(&match_expr, locals, func, loop_ctx);
             }
             Expr::Array(elements) => {
                 // 分配内存: global[0] 是堆指针
@@ -1159,6 +1695,29 @@ impl CodeGen {
 
                 // 返回结构体地址 (已在栈上)
             }
+            Expr::ConstructorCall { name, args } => {
+                // 构造函数调用转换为 StructInit
+                let struct_def = self.structs.get(name).expect(&format!("结构体 {} 未定义", name));
+                if args.len() != struct_def.fields.len() {
+                    panic!(
+                        "结构体 {} 构造函数需要 {} 个参数，得到 {} 个",
+                        name,
+                        struct_def.fields.len(),
+                        args.len()
+                    );
+                }
+                let fields: Vec<(String, Expr)> = struct_def
+                    .fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .zip(args.clone())
+                    .collect();
+                let init = Expr::StructInit {
+                    name: name.clone(),
+                    fields,
+                };
+                self.compile_expr(&init, locals, func, loop_ctx);
+            }
             Expr::Field { object, field } => {
                 self.compile_expr(object, locals, func, loop_ctx);
                 let (offset, field_ty) = self
@@ -1185,8 +1744,47 @@ impl CodeGen {
                 }
             }
             Expr::Range { start, end, inclusive } => {
+                // 范围作为值：分配堆内存存储 [start: i64][end: i64][inclusive: i32]
+                // 布局: offset 0 = start (8 bytes), offset 8 = end (8 bytes), offset 16 = inclusive (4 bytes)
+                let range_size = Type::range_heap_size();
+
+                // 保存当前堆指针作为返回值（Range 指针）
+                func.instruction(&Instruction::GlobalGet(0));
+
+                // 存储 start 到 offset 0
+                func.instruction(&Instruction::GlobalGet(0));
                 self.compile_expr(start, locals, func, loop_ctx);
-                let _ = (end, inclusive);
+                func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 3, // 8-byte aligned
+                    memory_index: 0,
+                }));
+
+                // 存储 end 到 offset 8
+                func.instruction(&Instruction::GlobalGet(0));
+                self.compile_expr(end, locals, func, loop_ctx);
+                func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                    offset: 8,
+                    align: 3,
+                    memory_index: 0,
+                }));
+
+                // 存储 inclusive 到 offset 16
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(if *inclusive { 1 } else { 0 }));
+                func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 16,
+                    align: 2, // 4-byte aligned
+                    memory_index: 0,
+                }));
+
+                // 更新堆指针
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(range_size as i32));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::GlobalSet(0));
+
+                // 栈上留下指针（之前已经压入）
             }
             Expr::VariantConst {
                 enum_name,
@@ -1487,6 +2085,68 @@ impl CodeGen {
                             }
                             func.instruction(&Instruction::End);
                         }
+                        Pattern::Struct { name: struct_name, fields } => {
+                            let handled = if let Some(Type::Struct(ref sub_name)) = subject_ast_type {
+                                sub_name == struct_name && self.structs.contains_key(struct_name)
+                            } else {
+                                false
+                            };
+                            if handled {
+                                let struct_def = &self.structs[struct_name];
+                                let ptr_tmp = locals.get("__match_enum_ptr").expect("__match_enum_ptr");
+                                func.instruction(&Instruction::LocalSet(ptr_tmp));
+                                for (fname, pat) in fields {
+                                    let offset = struct_def.field_offset(fname).expect("结构体字段");
+                                    let fty = struct_def.field_type(fname).expect("字段类型");
+                                    func.instruction(&Instruction::LocalGet(ptr_tmp));
+                                    func.instruction(&Instruction::I32Const(offset as i32));
+                                    func.instruction(&Instruction::I32Add);
+                                    self.emit_load_by_type(func, fty);
+                                    if let Pattern::Binding(bind) = pat {
+                                        let idx = locals.get(bind).expect("解构绑定名");
+                                        func.instruction(&Instruction::LocalSet(idx));
+                                    }
+                                }
+                                if has_guard {
+                                    self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
+                                    func.instruction(&Instruction::If(result_type));
+                                    self.compile_expr(&arm.body, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Br(1));
+                                    func.instruction(&Instruction::Else);
+                                    self.compile_expr(expr, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::End);
+                                    func.instruction(&Instruction::Br(1));
+                                } else {
+                                    self.compile_expr(&arm.body, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Br(1));
+                                }
+                                func.instruction(&Instruction::Else);
+                                if is_last {
+                                    func.instruction(&Instruction::I64Const(0));
+                                } else {
+                                    self.compile_expr(expr, locals, func, loop_ctx);
+                                }
+                                func.instruction(&Instruction::End);
+                            } else {
+                                func.instruction(&Instruction::Drop);
+                                if has_guard {
+                                    self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
+                                    func.instruction(&Instruction::If(result_type));
+                                    self.compile_expr(&arm.body, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Br(1));
+                                    func.instruction(&Instruction::Else);
+                                    if is_last {
+                                        func.instruction(&Instruction::I64Const(0));
+                                    } else {
+                                        self.compile_expr(expr, locals, func, loop_ctx);
+                                    }
+                                    func.instruction(&Instruction::End);
+                                } else {
+                                    self.compile_expr(&arm.body, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Br(0));
+                                }
+                            }
+                        }
                         _ => {
                             func.instruction(&Instruction::Drop);
                             self.compile_expr(&arm.body, locals, func, loop_ctx);
@@ -1495,6 +2155,15 @@ impl CodeGen {
                 }
 
                 func.instruction(&Instruction::End);
+            }
+            Expr::Lambda { .. } => {
+                // TODO: Lambda 表达式需要 WASM Table 段 + call_indirect 支持
+                // 完整实现需要：
+                // 1. 在编译阶段收集所有 Lambda
+                // 2. 为每个 Lambda 生成独立函数
+                // 3. 创建函数表 (Table section)
+                // 4. 用 call_indirect 间接调用
+                panic!("Lambda 表达式编译尚未实现 - 需要 WASM Table 支持");
             }
         }
     }
@@ -1590,7 +2259,7 @@ mod tests {
                 return_type: Some(Type::Int32),
                 body: vec![
                     Stmt::Let {
-                        name: "p".to_string(),
+                        pattern: Pattern::Binding("p".to_string()),
                         ty: Some(Type::Struct("Point".to_string())),
                         value: Expr::StructInit {
                             name: "Point".to_string(),
@@ -1637,7 +2306,7 @@ mod tests {
                 return_type: Some(Type::Int64),
                 body: vec![
                     Stmt::Let {
-                        name: "p".to_string(),
+                        pattern: Pattern::Binding("p".to_string()),
                         ty: Some(Type::Struct("Point".to_string())),
                         value: Expr::StructInit {
                             name: "Point".to_string(),
@@ -1694,10 +2363,14 @@ mod tests {
                     Param {
                         name: "a".to_string(),
                         ty: Type::Int64,
+                        default: None,
+                        variadic: false,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: Type::Int64,
+                        default: None,
+                        variadic: false,
                     },
                 ],
                 return_type: Some(Type::Int64),
@@ -1729,7 +2402,7 @@ mod tests {
                 return_type: Some(Type::Int64),
                 body: vec![
                     Stmt::Let {
-                        name: "arr".to_string(),
+                        pattern: Pattern::Binding("arr".to_string()),
                         ty: Some(Type::Array(Box::new(Type::Int64))),
                         value: Expr::Array(vec![
                             Expr::Integer(10),
@@ -1762,6 +2435,8 @@ mod tests {
                 params: vec![Param {
                     name: "n".to_string(),
                     ty: Type::Int64,
+                    default: None,
+                    variadic: false,
                 }],
                 return_type: Some(Type::Int64),
                 body: vec![Stmt::Return(Some(Expr::Match {

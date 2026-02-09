@@ -15,6 +15,15 @@ pub enum Type {
     Array(Box<Type>),
     /// 结构体类型
     Struct(String),
+    /// 范围类型 (start..end 或 start..=end)
+    /// 内存布局: [start: i64][end: i64][inclusive: i32] = 20 bytes
+    Range,
+    /// 函数类型 (param_types) -> return_type，用于 Lambda
+    /// 在 WASM 中以 i32 函数表索引表示
+    Function {
+        params: Vec<Type>,
+        ret: Box<Option<Type>>,
+    },
 }
 
 impl Type {
@@ -31,6 +40,8 @@ impl Type {
             Type::String => ValType::I32,
             Type::Array(_) => ValType::I32,
             Type::Struct(_) => ValType::I32,
+            Type::Range => ValType::I32,    // 指针
+            Type::Function { .. } => ValType::I32, // 函数表索引
         }
     }
 
@@ -45,7 +56,15 @@ impl Type {
             Type::String => 4,      // 指针大小
             Type::Array(_) => 4,    // 指针大小
             Type::Struct(_) => 4,   // 指针大小
+            Type::Range => 4,       // 指针大小
+            Type::Function { .. } => 4, // 函数表索引大小
         }
+    }
+
+    /// 获取 Range 类型在堆上的实际大小
+    pub fn range_heap_size() -> u32 {
+        // [start: i64][end: i64][inclusive: i32] = 8 + 8 + 4 = 20 bytes
+        20
     }
 }
 
@@ -124,6 +143,13 @@ pub enum Expr {
         then_branch: Box<Expr>,
         else_branch: Option<Box<Expr>>,
     },
+    /// if-let 表达式：若 pattern 匹配 expr 则求值 then_branch，否则 else_branch
+    IfLet {
+        pattern: Pattern,
+        expr: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Option<Box<Expr>>,
+    },
     /// 代码块
     Block(Vec<Stmt>, Option<Box<Expr>>),
     /// 数组字面量 [1, 2, 3]
@@ -137,6 +163,11 @@ pub enum Expr {
     StructInit {
         name: String,
         fields: Vec<(String, Expr)>,
+    },
+    /// 构造函数调用 Point(1, 2)，在 codegen 中根据字段定义顺序转换为 StructInit
+    ConstructorCall {
+        name: String,
+        args: Vec<Expr>,
     },
     /// 字段访问 point.x
     Field {
@@ -165,6 +196,12 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         target_ty: Type,
+    },
+    /// Lambda 表达式 (x: Int64) -> Int64 { x * 2 } 或 { x: Int64 => x * 2 }
+    Lambda {
+        params: Vec<(String, Type)>,
+        return_type: Option<Type>,
+        body: Box<Expr>,
     },
 }
 
@@ -222,9 +259,9 @@ pub enum Literal {
 /// 语句
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    /// let 绑定 (不可变)
+    /// let 绑定 (不可变)，pattern 为 Binding(name) 或 Struct 解构
     Let {
-        name: String,
+        pattern: Pattern,
         ty: Option<Type>,
         value: Expr,
     },
@@ -246,6 +283,12 @@ pub enum Stmt {
     /// while 循环
     While {
         cond: Expr,
+        body: Vec<Stmt>,
+    },
+    /// while-let 循环：当 expr 匹配 pattern 时执行 body，否则退出
+    WhileLet {
+        pattern: Pattern,
+        expr: Box<Expr>,
         body: Vec<Stmt>,
     },
     /// for 循环 (for i in 0..10 { ... })
@@ -311,11 +354,15 @@ impl StructDef {
     }
 }
 
-/// 函数参数
+/// 函数参数（可选默认值、可变参数）
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
+    /// 默认值，如 power(base, exp = 2) 的 2
+    pub default: Option<Expr>,
+    /// 可变参数，如 sum(args: Int64...)，调用时 args 展开为数组
+    pub variadic: bool,
 }
 
 /// 函数定义
