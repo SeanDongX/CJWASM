@@ -82,10 +82,26 @@ pub enum Token {
     Percent,
     #[token("=")]
     Assign,
+    #[token("+=")]
+    PlusEq,
+    #[token("-=")]
+    MinusEq,
+    #[token("*=")]
+    StarEq,
+    #[token("/=")]
+    SlashEq,
+    #[token("%=")]
+    PercentEq,
     #[token("==")]
     Eq,
     #[token("!=")]
     NotEq,
+    #[token("&&")]
+    AndAnd,
+    #[token("||")]
+    OrOr,
+    #[token("!")]
+    Bang,
     #[token("<")]
     Lt,
     #[token(">")]
@@ -104,6 +120,7 @@ pub enum Token {
     FatArrow,
     #[token("|")]
     Pipe,
+    // 注意：&&、||、! 需在 &、| 及 != 之后定义以保证最长匹配
 
     // 分隔符
     #[token("(")]

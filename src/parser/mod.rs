@@ -276,15 +276,47 @@ impl Parser {
             }
             _ => {
                 let expr = self.parse_expr()?;
-                // 检查是否是赋值语句
-                if self.check(&Token::Assign) {
+                // 检查是否是赋值或复合赋值语句
+                let (is_assign, bin_op) = match self.peek() {
+                    Some(Token::Assign) => (true, None),
+                    Some(Token::PlusEq) => (true, Some(BinOp::Add)),
+                    Some(Token::MinusEq) => (true, Some(BinOp::Sub)),
+                    Some(Token::StarEq) => (true, Some(BinOp::Mul)),
+                    Some(Token::SlashEq) => (true, Some(BinOp::Div)),
+                    Some(Token::PercentEq) => (true, Some(BinOp::Mod)),
+                    _ => (false, None),
+                };
+                if is_assign {
                     self.advance();
-                    let value = self.parse_expr()?;
+                    let rhs = self.parse_expr()?;
                     let target = self.expr_to_assign_target(expr)?;
+                    let value = match bin_op {
+                        None => rhs,
+                        Some(op) => Expr::Binary {
+                            op,
+                            left: Box::new(self.assign_target_to_expr(&target)),
+                            right: Box::new(rhs),
+                        },
+                    };
                     return Ok(Stmt::Assign { target, value });
                 }
                 Ok(Stmt::Expr(expr))
             }
+        }
+    }
+
+    /// 将赋值目标转回表达式（用于复合赋值的 RHS 展开：x += 1 => x = x + 1）
+    fn assign_target_to_expr(&self, target: &AssignTarget) -> Expr {
+        match target {
+            AssignTarget::Var(name) => Expr::Var(name.clone()),
+            AssignTarget::Index { array, index } => Expr::Index {
+                array: Box::new(Expr::Var(array.clone())),
+                index: index.clone(),
+            },
+            AssignTarget::Field { object, field } => Expr::Field {
+                object: Box::new(Expr::Var(object.clone())),
+                field: field.clone(),
+            },
         }
     }
 
@@ -325,9 +357,39 @@ impl Parser {
         }
     }
 
-    /// 解析表达式
+    /// 解析表达式（顶层为逻辑或）
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_comparison()
+        self.parse_logical_or()
+    }
+
+    /// 解析逻辑或 (||)
+    fn parse_logical_or(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_logical_and()?;
+        while matches!(self.peek(), Some(Token::OrOr)) {
+            self.advance();
+            let right = self.parse_logical_and()?;
+            left = Expr::Binary {
+                op: BinOp::LogicalOr,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// 解析逻辑与 (&&)
+    fn parse_logical_and(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_comparison()?;
+        while matches!(self.peek(), Some(Token::AndAnd)) {
+            self.advance();
+            let right = self.parse_comparison()?;
+            left = Expr::Binary {
+                op: BinOp::LogicalAnd,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     /// 解析比较表达式
@@ -385,7 +447,7 @@ impl Parser {
 
     /// 解析乘除法表达式
     fn parse_multiplicative(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.parse_postfix()?;
+        let mut left = self.parse_unary()?;
 
         while let Some(op) = match self.peek() {
             Some(Token::Star) => Some(BinOp::Mul),
@@ -394,7 +456,7 @@ impl Parser {
             _ => None,
         } {
             self.advance();
-            let right = self.parse_postfix()?;
+            let right = self.parse_unary()?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
@@ -403,6 +465,27 @@ impl Parser {
         }
 
         Ok(left)
+    }
+
+    /// 解析一元表达式 (!, -)
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        if matches!(self.peek(), Some(Token::Bang)) {
+            self.advance();
+            let expr = self.parse_unary()?;
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(expr),
+            });
+        }
+        if matches!(self.peek(), Some(Token::Minus)) {
+            self.advance();
+            let expr = self.parse_unary()?;
+            return Ok(Expr::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(expr),
+            });
+        }
+        self.parse_postfix()
     }
 
     /// 解析后缀表达式 (数组访问, 字段访问, 方法调用)
@@ -502,6 +585,22 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 self.expect(Token::RParen)?;
                 Ok(expr)
+            }
+            Some(Token::LBrace) => {
+                // 块表达式 { stmt; stmt; expr? }
+                let stmts = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                let (stmts, result) = if let Some(Stmt::Expr(e)) = stmts.last() {
+                    let len = stmts.len();
+                    if len == 1 {
+                        (Vec::new(), Some(Box::new(e.clone())))
+                    } else {
+                        (stmts[..len - 1].to_vec(), Some(Box::new(e.clone())))
+                    }
+                } else {
+                    (stmts, None)
+                };
+                Ok(Expr::Block(stmts, result))
             }
             Some(Token::LBracket) => {
                 // 数组字面量 [1, 2, 3]
@@ -1077,6 +1176,47 @@ mod tests {
         let program = parser.parse_program().unwrap();
 
         assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_logical_ops() {
+        let source = "func test() -> Int64 { if true && false || !true { return 0 } return 1 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_unary_neg() {
+        let source = "func test() -> Int64 { let x = -1 let y = -(-2) return x + y }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_block_expr() {
+        let source = "func test() -> Int64 { let x = { let a = 1 let b = 2 a + b } return x }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_compound_assign() {
+        let source = "func test() { var x: Int64 = 0 x += 1 x -= 1 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].body.len(), 3);
     }
 
     #[test]

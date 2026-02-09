@@ -1,4 +1,4 @@
-use crate::ast::{AssignTarget, BinOp, Expr, Literal, Pattern, Program, Stmt, StructDef, Type};
+use crate::ast::{AssignTarget, BinOp, Expr, Literal, Pattern, Program, Stmt, StructDef, Type, UnaryOp};
 use crate::ast::Function as FuncDef;
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -201,6 +201,9 @@ impl CodeGen {
             Expr::Field { object, .. } => {
                 self.collect_strings_in_expr(object);
             }
+            Expr::Unary { expr, .. } => {
+                self.collect_strings_in_expr(expr);
+            }
             _ => {}
         }
     }
@@ -209,15 +212,17 @@ impl CodeGen {
     fn compile_function(&self, func: &FuncDef) -> WasmFunc {
         let mut locals = LocalsBuilder::new();
 
-        // 添加参数作为局部变量
+        // 添加参数作为局部变量（含 AST 类型，便于字段访问计算偏移）
         for param in &func.params {
-            locals.add(&param.name, param.ty.to_wasm());
+            locals.add(&param.name, param.ty.to_wasm(), Some(param.ty.clone()));
         }
 
         // 收集函数体中的局部变量
         for stmt in &func.body {
             self.collect_locals(stmt, &mut locals);
         }
+        // 逻辑或短路求值用临时变量
+        locals.add("__logical_tmp", ValType::I32, None);
 
         // 创建 WASM 函数
         let local_types: Vec<(u32, ValType)> = locals
@@ -246,27 +251,168 @@ impl CodeGen {
                     .as_ref()
                     .map(|t| t.to_wasm())
                     .unwrap_or_else(|| self.infer_type(value));
-                locals.add(name, val_type);
+                let ast_type = ty.clone().or_else(|| self.infer_ast_type(value));
+                locals.add(name, val_type, ast_type);
+                self.collect_locals_from_expr(value, locals);
             }
-            Stmt::While { body, .. } => {
+            Stmt::Assign { value, .. } => {
+                self.collect_locals_from_expr(value, locals);
+            }
+            Stmt::Expr(expr) => {
+                self.collect_locals_from_expr(expr, locals);
+            }
+            Stmt::Return(Some(expr)) => {
+                self.collect_locals_from_expr(expr, locals);
+            }
+            Stmt::While { cond, body } => {
+                self.collect_locals_from_expr(cond, locals);
                 for s in body {
                     self.collect_locals(s, locals);
                 }
             }
             Stmt::For { var, iterable, body } => {
-                locals.add(var, ValType::I64); // 循环变量默认 i64
-                // 如果是数组迭代，需要隐藏的索引变量
+                locals.add(var, ValType::I64, self.expr_object_type(iterable)); // 循环变量：范围时为 Int64，数组时为元素类型
                 if !matches!(iterable, Expr::Range { .. }) {
-                    locals.add(&format!("__{}_idx", var), ValType::I64);
-                    locals.add(&format!("__{}_len", var), ValType::I64);
-                    locals.add(&format!("__{}_arr", var), ValType::I32);
+                    locals.add(&format!("__{}_idx", var), ValType::I64, None);
+                    locals.add(&format!("__{}_len", var), ValType::I64, None);
+                    locals.add(&format!("__{}_arr", var), ValType::I32, None);
                 }
+                self.collect_locals_from_expr(iterable, locals);
                 for s in body {
                     self.collect_locals(s, locals);
                 }
             }
             _ => {}
         }
+    }
+
+    /// 从表达式中收集局部变量（含 match 分支绑定名，使 `x if x < 0` 中的 x 可用）
+    fn collect_locals_from_expr(&self, expr: &Expr, locals: &mut LocalsBuilder) {
+        match expr {
+            Expr::Match { expr: sub, arms } => {
+                self.collect_locals_from_expr(sub, locals);
+                for arm in arms {
+                    if let Pattern::Binding(name) = &arm.pattern {
+                        locals.add(name, ValType::I64, None);
+                    }
+                    self.collect_locals_from_expr(&arm.body, locals);
+                    if let Some(g) = &arm.guard {
+                        self.collect_locals_from_expr(g, locals);
+                    }
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.collect_locals_from_expr(left, locals);
+                self.collect_locals_from_expr(right, locals);
+            }
+            Expr::Call { args, .. } | Expr::MethodCall { args, .. } => {
+                for arg in args {
+                    self.collect_locals_from_expr(arg, locals);
+                }
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.collect_locals_from_expr(cond, locals);
+                self.collect_locals_from_expr(then_branch, locals);
+                if let Some(e) = else_branch {
+                    self.collect_locals_from_expr(e, locals);
+                }
+            }
+            Expr::Block(stmts, result) => {
+                for s in stmts {
+                    self.collect_locals(s, locals);
+                }
+                if let Some(e) = result {
+                    self.collect_locals_from_expr(e, locals);
+                }
+            }
+            Expr::Array(elems) => {
+                for e in elems {
+                    self.collect_locals_from_expr(e, locals);
+                }
+            }
+            Expr::Index { array, index } => {
+                self.collect_locals_from_expr(array, locals);
+                self.collect_locals_from_expr(index, locals);
+            }
+            Expr::StructInit { fields, .. } => {
+                for (_, e) in fields {
+                    self.collect_locals_from_expr(e, locals);
+                }
+            }
+            Expr::Field { object, .. } => {
+                self.collect_locals_from_expr(object, locals);
+            }
+            Expr::Unary { expr, .. } => {
+                self.collect_locals_from_expr(expr, locals);
+            }
+            Expr::Range { start, end, .. } => {
+                self.collect_locals_from_expr(start, locals);
+                self.collect_locals_from_expr(end, locals);
+            }
+            _ => {}
+        }
+    }
+
+    /// 从表达式推断 AST 类型（用于局部变量类型注解缺失时）
+    fn infer_ast_type(&self, expr: &Expr) -> Option<Type> {
+        match expr {
+            Expr::Integer(_) => Some(Type::Int64),
+            Expr::Float(_) => Some(Type::Float64),
+            Expr::Bool(_) => Some(Type::Bool),
+            Expr::String(_) => Some(Type::String),
+            Expr::Array(ref elems) => elems
+                .first()
+                .and_then(|e| self.infer_ast_type(e).map(|t| Type::Array(Box::new(t))))
+                .or(Some(Type::Array(Box::new(Type::Int64)))),
+            Expr::StructInit { name, .. } => Some(Type::Struct(name.clone())),
+            _ => None,
+        }
+    }
+
+    /// 获取“对象表达式”的 AST 类型（用于字段访问时查结构体与偏移）
+    fn get_object_type(&self, expr: &Expr, locals: &LocalsBuilder) -> Option<Type> {
+        match expr {
+            Expr::Var(name) => locals.get_type(name).cloned(),
+            Expr::StructInit { name, .. } => Some(Type::Struct(name.clone())),
+            _ => None,
+        }
+    }
+
+    /// 用于 for 循环变量：可迭代表达式的“元素类型”（范围时为 Int64，数组时为元素类型）
+    fn expr_object_type(&self, expr: &Expr) -> Option<Type> {
+        match expr {
+            Expr::Range { .. } => Some(Type::Int64),
+            Expr::Array(ref elems) => elems.first().and_then(|e| self.infer_ast_type(e)).or(Some(Type::Int64)),
+            _ => None,
+        }
+    }
+
+    /// 按 AST 类型生成 load 指令（栈顶为 i32 地址）
+    fn emit_load_by_type(&self, func: &mut WasmFunc, ty: &Type) {
+        let instr = match ty.to_wasm() {
+            ValType::I32 => Instruction::I32Load(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }),
+            ValType::I64 => Instruction::I64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }),
+            ValType::F64 => Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }),
+            ValType::F32 => Instruction::F32Load(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }),
+            ValType::V128 | ValType::Ref(_) => panic!("不支持的字段类型: {:?}", ty),
+        };
+        func.instruction(&instr);
+    }
+
+    /// 按 AST 类型生成 store 指令（栈顶依次为：地址 i32，值）
+    fn emit_store_by_type(&self, func: &mut WasmFunc, ty: &Type) {
+        let instr = match ty.to_wasm() {
+            ValType::I32 => Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }),
+            ValType::I64 => Instruction::I64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }),
+            ValType::F64 => Instruction::F64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }),
+            ValType::F32 => Instruction::F32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }),
+            ValType::V128 | ValType::Ref(_) => panic!("不支持的字段类型: {:?}", ty),
+        };
+        func.instruction(&instr);
     }
 
     /// 简单的类型推断
@@ -278,7 +424,14 @@ impl CodeGen {
             Expr::String(_) => ValType::I32,
             Expr::Array(_) => ValType::I32,
             Expr::StructInit { .. } => ValType::I32,
-            Expr::Binary { left, .. } => self.infer_type(left),
+            Expr::Unary { op, expr } => match op {
+                UnaryOp::Not => ValType::I32,
+                UnaryOp::Neg => self.infer_type(expr),
+            },
+            Expr::Binary { op, left, .. } => match op {
+                BinOp::LogicalAnd | BinOp::LogicalOr => ValType::I32,
+                _ => self.infer_type(left),
+            },
             Expr::Index { .. } => ValType::I64, // 默认数组元素类型
             Expr::Field { .. } => ValType::I64, // 默认字段类型
             _ => ValType::I64,
@@ -319,19 +472,24 @@ impl CodeGen {
                         }));
                     }
                     AssignTarget::Field { object, field } => {
-                        // obj.field = value
+                        // obj.field = value：用对象类型计算字段偏移与字段类型
                         let obj_idx = locals.get(object).expect("对象未找到");
+                        let (offset, field_ty) = locals
+                            .get_type(object)
+                            .and_then(|ty| match ty {
+                                Type::Struct(name) => self.structs.get(name).and_then(|def| {
+                                    let off = def.field_offset(field)?;
+                                    let ft = def.field_type(field)?.clone();
+                                    Some((off, ft))
+                                }),
+                                _ => None,
+                            })
+                            .unwrap_or((0, Type::Int64));
                         func.instruction(&Instruction::LocalGet(obj_idx));
-                        // TODO: 需要类型信息来计算偏移
-                        func.instruction(&Instruction::I32Const(0)); // 临时偏移
+                        func.instruction(&Instruction::I32Const(offset as i32));
                         func.instruction(&Instruction::I32Add);
                         self.compile_expr(value, locals, func);
-                        func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
-                            offset: 0,
-                            align: 3,
-                            memory_index: 0,
-                        }));
-                        let _ = field; // 抑制警告
+                        self.emit_store_by_type(func, &field_ty);
                     }
                 }
             }
@@ -513,6 +671,83 @@ impl CodeGen {
                 let idx = locals.get(name).expect("变量未找到");
                 func.instruction(&Instruction::LocalGet(idx));
             }
+            Expr::Unary { op: UnaryOp::Not, expr } => {
+                self.compile_expr(expr, locals, func);
+                if self.infer_type(expr) == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
+                func.instruction(&Instruction::I32Eqz);
+            }
+            Expr::Unary { op: UnaryOp::Neg, expr } => {
+                let ty = self.infer_type(expr);
+                match ty {
+                    ValType::I32 => {
+                        func.instruction(&Instruction::I32Const(0));
+                        self.compile_expr(expr, locals, func);
+                        func.instruction(&Instruction::I32Sub);
+                    }
+                    ValType::I64 => {
+                        func.instruction(&Instruction::I64Const(0));
+                        self.compile_expr(expr, locals, func);
+                        func.instruction(&Instruction::I64Sub);
+                    }
+                    ValType::F64 => {
+                        func.instruction(&Instruction::F64Const(0.0));
+                        self.compile_expr(expr, locals, func);
+                        func.instruction(&Instruction::F64Sub);
+                    }
+                    ValType::F32 => {
+                        func.instruction(&Instruction::F32Const(0.0));
+                        self.compile_expr(expr, locals, func);
+                        func.instruction(&Instruction::F32Sub);
+                    }
+                    ValType::V128 | ValType::Ref(_) => panic!("不支持一元负号: {:?}", ty),
+                }
+            }
+            Expr::Binary { op: BinOp::LogicalAnd, left, right } => {
+                // 短路与：left && right，结果为 i32 (0/1)
+                self.compile_expr(left, locals, func);
+                if self.infer_type(left) == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
+                func.instruction(&Instruction::I32Eqz);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::Else);
+                self.compile_expr(right, locals, func);
+                if self.infer_type(right) == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
+                func.instruction(&Instruction::I32Eqz);
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Sub);
+                func.instruction(&Instruction::End);
+            }
+            Expr::Binary { op: BinOp::LogicalOr, left, right } => {
+                // 短路或：left || right，用 __logical_tmp 保存 left，结果为 i32 (0/1)
+                let tmp = locals.get("__logical_tmp").expect("__logical_tmp 未找到");
+                self.compile_expr(left, locals, func);
+                if self.infer_type(left) == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
+                func.instruction(&Instruction::LocalSet(tmp));
+                func.instruction(&Instruction::LocalGet(tmp));
+                func.instruction(&Instruction::I32Eqz);
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                self.compile_expr(right, locals, func);
+                if self.infer_type(right) == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
+                func.instruction(&Instruction::I32Eqz);
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Sub);
+                func.instruction(&Instruction::Else);
+                func.instruction(&Instruction::LocalGet(tmp));
+                func.instruction(&Instruction::I32Eqz);
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Sub);
+                func.instruction(&Instruction::End);
+            }
             Expr::Binary { op, left, right } => {
                 self.compile_expr(left, locals, func);
                 self.compile_expr(right, locals, func);
@@ -685,14 +920,20 @@ impl CodeGen {
             }
             Expr::Field { object, field } => {
                 self.compile_expr(object, locals, func);
-                // TODO: 需要类型信息来计算偏移
-                // 临时实现：假设第一个字段
-                func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 3,
-                    memory_index: 0,
-                }));
-                let _ = field;
+                let (offset, field_ty) = self
+                    .get_object_type(object, locals)
+                    .and_then(|ty| match ty {
+                        Type::Struct(ref name) => self.structs.get(name).and_then(|def| {
+                            let off = def.field_offset(field)?;
+                            let ft = def.field_type(field)?.clone();
+                            Some((off, ft))
+                        }),
+                        _ => None,
+                    })
+                    .unwrap_or((0, Type::Int64)); // 回退：偏移 0，按 i64 加载
+                func.instruction(&Instruction::I32Const(offset as i32));
+                func.instruction(&Instruction::I32Add);
+                self.emit_load_by_type(func, &field_ty);
             }
             Expr::Block(stmts, result) => {
                 for stmt in stmts {
@@ -709,12 +950,8 @@ impl CodeGen {
                 let _ = (end, inclusive);
             }
             Expr::Match { expr, arms } => {
-                // match expr {
-                //     pattern1 if guard1 => body1,
-                //     pattern2 => body2,
-                //     _ => default
-                // }
-
+                // match expr { pattern1 => body1, ... }；分支绑定名已在 collect_locals_from_expr 中收集
+                let subject_ty = self.infer_type(expr);
                 self.compile_expr(expr, locals, func);
 
                 let result_type = if arms.is_empty() {
@@ -785,6 +1022,9 @@ impl CodeGen {
                         }
                         Pattern::Binding(name) => {
                             if let Some(idx) = locals.get(name) {
+                                if subject_ty == ValType::I32 {
+                                    func.instruction(&Instruction::I64ExtendI32S);
+                                }
                                 func.instruction(&Instruction::LocalSet(idx));
                             }
                             if has_guard {
@@ -885,10 +1125,12 @@ impl CodeGen {
     }
 }
 
-/// 局部变量构建器
+/// 局部变量构建器（同时保存 WASM 值类型与 AST 类型，用于字段偏移等）
 struct LocalsBuilder {
     names: HashMap<String, u32>,
     types: Vec<ValType>,
+    /// 变量名 -> AST 类型（结构体/数组等需用于计算字段偏移）
+    ast_types: HashMap<String, Type>,
 }
 
 impl LocalsBuilder {
@@ -896,19 +1138,27 @@ impl LocalsBuilder {
         Self {
             names: HashMap::new(),
             types: Vec::new(),
+            ast_types: HashMap::new(),
         }
     }
 
-    fn add(&mut self, name: &str, ty: ValType) {
+    fn add(&mut self, name: &str, ty: ValType, ast_type: Option<Type>) {
         if !self.names.contains_key(name) {
             let idx = self.types.len() as u32;
             self.names.insert(name.to_string(), idx);
             self.types.push(ty);
+            if let Some(t) = ast_type {
+                self.ast_types.insert(name.to_string(), t);
+            }
         }
     }
 
     fn get(&self, name: &str) -> Option<u32> {
         self.names.get(name).copied()
+    }
+
+    fn get_type(&self, name: &str) -> Option<&Type> {
+        self.ast_types.get(name)
     }
 }
 
@@ -976,6 +1226,52 @@ mod tests {
                     Stmt::Return(Some(Expr::Field {
                         object: Box::new(Expr::Var("p".to_string())),
                         field: "x".to_string(),
+                    })),
+                ],
+            }],
+        };
+
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    /// 验证多字段偏移：返回第二个字段 y（偏移 8）
+    #[test]
+    fn test_compile_struct_field_y() {
+        let program = Program {
+            structs: vec![StructDef {
+                name: "Point".to_string(),
+                fields: vec![
+                    FieldDef {
+                        name: "x".to_string(),
+                        ty: Type::Int64,
+                    },
+                    FieldDef {
+                        name: "y".to_string(),
+                        ty: Type::Int64,
+                    },
+                ],
+            }],
+            functions: vec![FuncDef {
+                name: "get_y".to_string(),
+                params: vec![],
+                return_type: Some(Type::Int64),
+                body: vec![
+                    Stmt::Let {
+                        name: "p".to_string(),
+                        ty: Some(Type::Struct("Point".to_string())),
+                        value: Expr::StructInit {
+                            name: "Point".to_string(),
+                            fields: vec![
+                                ("x".to_string(), Expr::Integer(10)),
+                                ("y".to_string(), Expr::Integer(20)),
+                            ],
+                        },
+                    },
+                    Stmt::Return(Some(Expr::Field {
+                        object: Box::new(Expr::Var("p".to_string())),
+                        field: "y".to_string(),
                     })),
                 ],
             }],

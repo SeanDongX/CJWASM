@@ -46,6 +46,13 @@ impl Type {
     }
 }
 
+/// 一元运算符
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnaryOp {
+    Not,  // !
+    Neg,  // - 负号
+}
+
 /// 二元运算符
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinOp {
@@ -60,6 +67,8 @@ pub enum BinOp {
     Gt,     // >
     LtEq,   // <=
     GtEq,   // >=
+    LogicalAnd,  // &&
+    LogicalOr,   // ||
 }
 
 /// 表达式
@@ -75,6 +84,11 @@ pub enum Expr {
     String(String),
     /// 变量引用
     Var(String),
+    /// 一元运算 (! 等)
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
     /// 二元运算
     Binary {
         op: BinOp,

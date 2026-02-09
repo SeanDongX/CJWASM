@@ -112,6 +112,59 @@ fn test_compile_match_and_guard() {
 }
 
 #[test]
+fn test_compile_logical_ops() {
+    let source = r#"
+        func main() -> Int64 {
+            let a = true && false
+            let b = true || false
+            let c = !false
+            return 0
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "logical_ops");
+}
+
+#[test]
+fn test_compile_unary_neg() {
+    let source = r#"
+        func main() -> Int64 {
+            let a = -42
+            let b = -(1 + 2)
+            return a + b
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "unary_neg");
+}
+
+#[test]
+fn test_compile_block_expr() {
+    let source = r#"
+        func main() -> Int64 {
+            let x = { let a = 10 let b = 20 a + b }
+            return x
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "block_expr");
+}
+
+#[test]
+fn test_compile_compound_assign() {
+    let source = r#"
+        func main() -> Int64 {
+            var x: Int64 = 10
+            x += 5
+            x -= 2
+            return x
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "compound_assign");
+}
+
+#[test]
 fn test_compile_for_range() {
     let source = r#"
         func main() -> Int64 {
@@ -144,15 +197,11 @@ fn test_compile_example_files() {
     if !examples_dir.exists() {
         return;
     }
-    // 含 match 分支绑定+守卫的示例暂不参与编译测试（codegen 未为 arm 绑定分配局部变量）
-    let skip_files = ["for_in_and_guards.cj"];
     for entry in std::fs::read_dir(examples_dir).expect("读取 examples 目录") {
         let entry = entry.expect("目录项");
         let path = entry.path();
         let name = path.file_name().unwrap().to_string_lossy();
-        if path.extension().map(|e| e == "cj").unwrap_or(false)
-            && !skip_files.contains(&name.as_ref())
-        {
+        if path.extension().map(|e| e == "cj").unwrap_or(false) {
             let source = std::fs::read_to_string(&path).expect("读取示例源文件");
             let wasm = compile_source(&source);
             assert_valid_wasm(&wasm, &name);
