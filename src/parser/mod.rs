@@ -998,4 +998,96 @@ mod tests {
 
         assert_eq!(program.functions.len(), 1);
     }
+
+    #[test]
+    fn test_parse_if_else() {
+        let source = "func test(x: Int64) -> Int64 { if x > 0 { return 1 } else { return 0 } }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(program.functions.len(), 1);
+        assert!(!program.functions[0].body.is_empty());
+    }
+
+    #[test]
+    fn test_parse_while() {
+        let source = "func test() -> Int64 { var n: Int64 = 0 while n < 10 { n = n + 1 } return n }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(program.functions.len(), 1);
+        assert!(matches!(&program.functions[0].body[1], Stmt::While { .. }));
+    }
+
+    #[test]
+    fn test_parse_struct_init() {
+        let source = r#"
+            struct Point { x: Int64, y: Int64 }
+            func test() -> Int64 {
+                let p = Point { x: 1, y: 2 }
+                return p.x
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(program.structs.len(), 1);
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_match_guard() {
+        let source = "func test(n: Int64) -> Int64 { match n { x if x < 0 => 1, 0 => 2, _ => 3 } }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_for_in_array() {
+        let source = "func test() -> Int64 { let arr = [1, 2, 3] var s: Int64 = 0 for x in arr { s = s + x } return s }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(program.functions.len(), 1);
+        let for_stmt = program.functions[0]
+            .body
+            .iter()
+            .find(|s| matches!(s, Stmt::For { .. }));
+        assert!(for_stmt.is_some());
+    }
+
+    #[test]
+    fn test_parse_for_range_inclusive() {
+        let source = "func test() -> Int64 { var s: Int64 = 0 for i in 1..=5 { s = s + i } return s }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_var_with_type() {
+        let source = "func test() { var x: Int64 = 0 var y: Float64 = 3.14 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].body.len(), 2);
+    }
 }

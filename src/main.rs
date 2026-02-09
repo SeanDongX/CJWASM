@@ -1,11 +1,6 @@
-mod ast;
-mod codegen;
-mod lexer;
-mod parser;
-
-use codegen::CodeGen;
-use lexer::Lexer;
-use parser::Parser;
+use cjwasm::codegen::CodeGen;
+use cjwasm::lexer::Lexer;
+use cjwasm::parser::Parser;
 use std::env;
 use std::fs;
 use std::path::Path;

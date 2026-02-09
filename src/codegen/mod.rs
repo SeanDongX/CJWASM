@@ -921,7 +921,7 @@ impl Default for CodeGen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{FieldDef, Param};
+    use crate::ast::{AssignTarget, FieldDef, Param};
 
     #[test]
     fn test_compile_simple_function() {
@@ -984,5 +984,218 @@ mod tests {
         let mut codegen = CodeGen::new();
         let wasm = codegen.compile(&program);
         assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_binary_ops() {
+        let program = Program {
+            structs: vec![],
+            functions: vec![FuncDef {
+                name: "compute".to_string(),
+                params: vec![],
+                return_type: Some(Type::Int64),
+                body: vec![Stmt::Return(Some(Expr::Binary {
+                    op: BinOp::Add,
+                    left: Box::new(Expr::Integer(10)),
+                    right: Box::new(Expr::Integer(32)),
+                }))],
+            }],
+        };
+
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+        assert_eq!(&wasm[0..4], b"\0asm");
+    }
+
+    #[test]
+    fn test_compile_if_expr() {
+        let program = Program {
+            structs: vec![],
+            functions: vec![FuncDef {
+                name: "max".to_string(),
+                params: vec![
+                    Param {
+                        name: "a".to_string(),
+                        ty: Type::Int64,
+                    },
+                    Param {
+                        name: "b".to_string(),
+                        ty: Type::Int64,
+                    },
+                ],
+                return_type: Some(Type::Int64),
+                body: vec![Stmt::Return(Some(Expr::If {
+                    cond: Box::new(Expr::Binary {
+                        op: BinOp::Gt,
+                        left: Box::new(Expr::Var("a".to_string())),
+                        right: Box::new(Expr::Var("b".to_string())),
+                    }),
+                    then_branch: Box::new(Expr::Var("a".to_string())),
+                    else_branch: Some(Box::new(Expr::Var("b".to_string()))),
+                }))],
+            }],
+        };
+
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_array_literal_and_index() {
+        let program = Program {
+            structs: vec![],
+            functions: vec![FuncDef {
+                name: "first".to_string(),
+                params: vec![],
+                return_type: Some(Type::Int64),
+                body: vec![
+                    Stmt::Let {
+                        name: "arr".to_string(),
+                        ty: Some(Type::Array(Box::new(Type::Int64))),
+                        value: Expr::Array(vec![
+                            Expr::Integer(10),
+                            Expr::Integer(20),
+                            Expr::Integer(30),
+                        ]),
+                    },
+                    Stmt::Return(Some(Expr::Index {
+                        array: Box::new(Expr::Var("arr".to_string())),
+                        index: Box::new(Expr::Integer(0)),
+                    })),
+                ],
+            }],
+        };
+
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_match_literal() {
+        use crate::ast::{Literal, MatchArm, Pattern};
+
+        let program = Program {
+            structs: vec![],
+            functions: vec![FuncDef {
+                name: "match_test".to_string(),
+                params: vec![Param {
+                    name: "n".to_string(),
+                    ty: Type::Int64,
+                }],
+                return_type: Some(Type::Int64),
+                body: vec![Stmt::Return(Some(Expr::Match {
+                    expr: Box::new(Expr::Var("n".to_string())),
+                    arms: vec![
+                        MatchArm {
+                            pattern: Pattern::Literal(Literal::Integer(0)),
+                            guard: None,
+                            body: Box::new(Expr::Integer(100)),
+                        },
+                        MatchArm {
+                            pattern: Pattern::Wildcard,
+                            guard: None,
+                            body: Box::new(Expr::Integer(999)),
+                        },
+                    ],
+                }))],
+            }],
+        };
+
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_for_range() {
+        let program = Program {
+            structs: vec![],
+            functions: vec![FuncDef {
+                name: "sum_range".to_string(),
+                params: vec![],
+                return_type: Some(Type::Int64),
+                body: vec![
+                    Stmt::Var {
+                        name: "sum".to_string(),
+                        ty: Some(Type::Int64),
+                        value: Expr::Integer(0),
+                    },
+                    Stmt::For {
+                        var: "i".to_string(),
+                        iterable: Expr::Range {
+                            start: Box::new(Expr::Integer(0)),
+                            end: Box::new(Expr::Integer(3)),
+                            inclusive: false,
+                        },
+                        body: vec![Stmt::Assign {
+                            target: AssignTarget::Var("sum".to_string()),
+                            value: Expr::Binary {
+                                op: BinOp::Add,
+                                left: Box::new(Expr::Var("sum".to_string())),
+                                right: Box::new(Expr::Var("i".to_string())),
+                            },
+                        }],
+                    },
+                    Stmt::Return(Some(Expr::Var("sum".to_string()))),
+                ],
+            }],
+        };
+
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_float_ops() {
+        let program = Program {
+            structs: vec![],
+            functions: vec![FuncDef {
+                name: "fadd".to_string(),
+                params: vec![],
+                return_type: Some(Type::Float64),
+                body: vec![Stmt::Return(Some(Expr::Binary {
+                    op: BinOp::Add,
+                    left: Box::new(Expr::Float(1.5)),
+                    right: Box::new(Expr::Float(2.5)),
+                }))],
+            }],
+        };
+
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_multiple_functions() {
+        let program = Program {
+            structs: vec![],
+            functions: vec![
+                FuncDef {
+                    name: "one".to_string(),
+                    params: vec![],
+                    return_type: Some(Type::Int64),
+                    body: vec![Stmt::Return(Some(Expr::Integer(1)))],
+                },
+                FuncDef {
+                    name: "main".to_string(),
+                    params: vec![],
+                    return_type: Some(Type::Int64),
+                    body: vec![Stmt::Return(Some(Expr::Call {
+                        name: "one".to_string(),
+                        args: vec![],
+                    }))],
+                },
+            ],
+        };
+
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+        assert_eq!(&wasm[0..4], b"\0asm");
     }
 }

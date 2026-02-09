@@ -198,4 +198,68 @@ mod tests {
         assert_eq!(tokens[0], Token::Struct);
         assert_eq!(tokens[1], Token::Ident("Point".to_string()));
     }
+
+    #[test]
+    fn test_float_literal() {
+        let source = "let x = 3.14";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(tokens[3], Token::Float(3.14));
+    }
+
+    #[test]
+    fn test_bool_literal() {
+        let source = "let a = true let b = false";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(tokens[3], Token::True);
+        assert_eq!(tokens[7], Token::False);
+    }
+
+    #[test]
+    fn test_comments_skipped() {
+        let source = "func // 注释\n add(a: Int64, b: Int64) -> Int64 { return a + b }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(tokens[0], Token::Func);
+        assert_eq!(tokens[1], Token::Ident("add".to_string()));
+    }
+
+    #[test]
+    fn test_comparison_ops() {
+        let source = "a == b != c < d > e <= f >= g";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert!(matches!(tokens[1], Token::Eq));
+        assert!(matches!(tokens[3], Token::NotEq));
+        assert!(matches!(tokens[5], Token::Lt));
+        assert!(matches!(tokens[7], Token::Gt));
+        assert!(matches!(tokens[9], Token::LtEq));
+        assert!(matches!(tokens[11], Token::GtEq));
+    }
+
+    #[test]
+    fn test_range_operators() {
+        let source = "0..10 0..=10";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(tokens[1], Token::DotDot);
+        assert_eq!(tokens[4], Token::DotDotEq);
+    }
+
+    #[test]
+    fn test_match_tokens() {
+        let source = "match n { 1 => 2, _ => 0 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(tokens[0], Token::Match);
+        assert_eq!(tokens[4], Token::FatArrow);
+        assert_eq!(tokens[7], Token::Underscore);
+    }
 }
