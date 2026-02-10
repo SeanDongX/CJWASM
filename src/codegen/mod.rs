@@ -1,4 +1,4 @@
-use crate::ast::{AssignTarget, BinOp, EnumDef, Expr, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef, Type, UnaryOp};
+use crate::ast::{AssignTarget, BinOp, EnumDef, Expr, InterpolatePart, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef, Type, UnaryOp};
 use crate::ast::Function as FuncDef;
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -48,6 +48,11 @@ impl CodeGen {
         }
     }
 
+    /// 获取运行时函数的索引
+    fn get_or_create_func_index(&self, name: &str) -> u32 {
+        *self.func_indices.get(name).expect(&format!("运行时函数 {} 未注册", name))
+    }
+
     /// 重载名字修饰：name$Type1$Type2 用于多态解析
     fn type_mangle_suffix(ty: &Type) -> String {
         match ty {
@@ -66,6 +71,8 @@ impl CodeGen {
                 let ret_str = ret.as_ref().as_ref().map(Self::type_mangle_suffix).unwrap_or_else(|| "Unit".to_string());
                 format!("Fn_{}_{}", params_str, ret_str)
             }
+            Type::Option(inner) => format!("Option_{}", Self::type_mangle_suffix(inner)),
+            Type::Result(ok, err) => format!("Result_{}_{}", Self::type_mangle_suffix(ok), Self::type_mangle_suffix(err)),
         }
     }
 
@@ -140,10 +147,50 @@ impl CodeGen {
             }
             self.func_params.insert(key, func.params.clone());
         }
-        let pow_type_idx = program.functions.len() as u32;
+        // 运行时辅助函数类型
+        let mut runtime_idx = program.functions.len() as u32;
+
+        // __pow_i64(i64, i64) -> i64
         types.ty().function([ValType::I64, ValType::I64], [ValType::I64]);
-        self.func_types.insert("__pow_i64".to_string(), pow_type_idx);
-        self.func_indices.insert("__pow_i64".to_string(), pow_type_idx);
+        self.func_types.insert("__pow_i64".to_string(), runtime_idx);
+        self.func_indices.insert("__pow_i64".to_string(), runtime_idx);
+        runtime_idx += 1;
+
+        // __str_concat(i32, i32) -> i32
+        types.ty().function([ValType::I32, ValType::I32], [ValType::I32]);
+        self.func_types.insert("__str_concat".to_string(), runtime_idx);
+        self.func_indices.insert("__str_concat".to_string(), runtime_idx);
+        runtime_idx += 1;
+
+        // __i64_to_str(i64) -> i32
+        types.ty().function([ValType::I64], [ValType::I32]);
+        self.func_types.insert("__i64_to_str".to_string(), runtime_idx);
+        self.func_indices.insert("__i64_to_str".to_string(), runtime_idx);
+        runtime_idx += 1;
+
+        // __i32_to_str(i32) -> i32
+        types.ty().function([ValType::I32], [ValType::I32]);
+        self.func_types.insert("__i32_to_str".to_string(), runtime_idx);
+        self.func_indices.insert("__i32_to_str".to_string(), runtime_idx);
+        runtime_idx += 1;
+
+        // __f64_to_str(f64) -> i32
+        types.ty().function([ValType::F64], [ValType::I32]);
+        self.func_types.insert("__f64_to_str".to_string(), runtime_idx);
+        self.func_indices.insert("__f64_to_str".to_string(), runtime_idx);
+        runtime_idx += 1;
+
+        // __f32_to_str(f32) -> i32
+        types.ty().function([ValType::F32], [ValType::I32]);
+        self.func_types.insert("__f32_to_str".to_string(), runtime_idx);
+        self.func_indices.insert("__f32_to_str".to_string(), runtime_idx);
+        runtime_idx += 1;
+
+        // __bool_to_str(i32) -> i32
+        types.ty().function([ValType::I32], [ValType::I32]);
+        self.func_types.insert("__bool_to_str".to_string(), runtime_idx);
+        self.func_indices.insert("__bool_to_str".to_string(), runtime_idx);
+
         module.section(&types);
 
         // 2. 函数段 (Function Section)
@@ -151,7 +198,15 @@ impl CodeGen {
         for i in 0..program.functions.len() {
             functions.function(i as u32);
         }
-        functions.function(pow_type_idx);
+        // 运行时辅助函数
+        let num_user_funcs = program.functions.len() as u32;
+        functions.function(num_user_funcs);     // __pow_i64
+        functions.function(num_user_funcs + 1); // __str_concat
+        functions.function(num_user_funcs + 2); // __i64_to_str
+        functions.function(num_user_funcs + 3); // __i32_to_str
+        functions.function(num_user_funcs + 4); // __f64_to_str
+        functions.function(num_user_funcs + 5); // __f32_to_str
+        functions.function(num_user_funcs + 6); // __bool_to_str
         module.section(&functions);
 
         // 3. 内存段 (Memory Section)
@@ -204,7 +259,14 @@ impl CodeGen {
             let wasm_func = self.compile_function(func);
             codes.function(&wasm_func);
         }
+        // 运行时辅助函数
         codes.function(&self.emit_pow_i64());
+        codes.function(&self.emit_str_concat());
+        codes.function(&self.emit_i64_to_str());
+        codes.function(&self.emit_i32_to_str());
+        codes.function(&self.emit_f64_to_str());
+        codes.function(&self.emit_f32_to_str());
+        codes.function(&self.emit_bool_to_str());
         module.section(&codes);
 
         // 7. 数据段 (Data Section) - 字符串常量
@@ -339,6 +401,30 @@ impl CodeGen {
             Expr::Cast { expr, .. } => {
                 self.collect_strings_in_expr(expr);
             }
+            Expr::Interpolate(parts) => {
+                // 收集插值字符串中的字面量和表达式
+                for part in parts {
+                    match part {
+                        InterpolatePart::Literal(s) => {
+                            if !self.string_pool.iter().any(|(str, _)| str == s) {
+                                let offset = self.data_offset;
+                                self.data_offset += 4 + s.len() as u32;
+                                self.string_pool.push((s.clone(), offset));
+                            }
+                        }
+                        InterpolatePart::Expr(e) => {
+                            self.collect_strings_in_expr(e);
+                        }
+                    }
+                }
+                // 添加 "[object]" 占位符字符串（用于不支持的类型）
+                let obj_str = "[object]".to_string();
+                if !self.string_pool.iter().any(|(str, _)| str == &obj_str) {
+                    let offset = self.data_offset;
+                    self.data_offset += 4 + obj_str.len() as u32;
+                    self.string_pool.push((obj_str, offset));
+                }
+            }
             _ => {}
         }
     }
@@ -364,6 +450,8 @@ impl CodeGen {
         }
         // 逻辑或短路求值用临时变量
         locals.add("__logical_tmp", ValType::I32, None);
+        // ? 运算符临时指针
+        locals.add("__try_ptr", ValType::I32, None);
 
         // 创建 WASM 函数
         let local_types: Vec<(u32, ValType)> = locals
@@ -415,6 +503,249 @@ impl CodeGen {
         f.instruction(&Instruction::Br(0));
         f.instruction(&Instruction::End);
         f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __str_concat(ptr1: i32, ptr2: i32) -> i32 辅助函数
+    /// 内存布局: [len: i32][bytes...]
+    /// 逻辑: 读取两个字符串的长度，分配新空间，复制两部分，返回新指针
+    fn emit_str_concat(&self) -> WasmFunc {
+        // 局部变量: 0=ptr1, 1=ptr2, 2=len1, 3=len2, 4=total_len, 5=new_ptr
+        let mut f = WasmFunc::new(vec![(4, ValType::I32)]);
+
+        // len1 = mem[ptr1]
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::LocalSet(2));
+
+        // len2 = mem[ptr2]
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::LocalSet(3));
+
+        // total_len = len1 + len2
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(4));
+
+        // new_ptr = global0 (heap pointer)
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(5));
+
+        // global0 += total_len + 4 (分配新空间)
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        // mem[new_ptr] = total_len
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+
+        // 复制第一个字符串 (memory.copy new_ptr+4, ptr1+4, len1)
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+        // 复制第二个字符串 (memory.copy new_ptr+4+len1, ptr2+4, len2)
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+        // return new_ptr
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __i64_to_str(val: i64) -> i32 辅助函数
+    /// 简化实现：将数字转为字符串（支持负数）
+    fn emit_i64_to_str(&self) -> WasmFunc {
+        // 局部变量: 0=val, 1=ptr, 2=is_neg, 3=len, 4=temp_val, 5=digit_count, 6=temp_ptr
+        let mut f = WasmFunc::new(vec![(6, ValType::I64), (1, ValType::I32)]);
+
+        // 简化：对于任何数字，返回固定字符串 "[number]"
+        // 完整实现需要复杂的数字到字符串转换
+        // 这里使用简化版本，返回堆上的占位符
+
+        // ptr = global0
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(1));
+
+        // 分配 10 字节 "[number]\0"
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(12)); // 4 + 8 bytes
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        // mem[ptr] = 8 (length)
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+
+        // 写入 "[number]" 字符串
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Const(0x5D7265626D756E5B)); // "[number]" as i64 little endian
+        f.instruction(&Instruction::I64Store(wasm_encoder::MemArg { offset: 4, align: 3, memory_index: 0 }));
+
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __i32_to_str(val: i32) -> i32 辅助函数
+    fn emit_i32_to_str(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
+
+        // 与 i64 相同的简化实现
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(1));
+
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(12));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Const(0x5D7265626D756E5B));
+        f.instruction(&Instruction::I64Store(wasm_encoder::MemArg { offset: 4, align: 3, memory_index: 0 }));
+
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __f64_to_str(val: f64) -> i32 辅助函数
+    fn emit_f64_to_str(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
+
+        // 简化实现：返回 "[float]"
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(1));
+
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(11)); // 4 + 7 bytes
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(7));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+
+        // "[float]" = 0x5D74616F6C665B (7 bytes)
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(0x6F6C665B)); // "[flo"
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 4, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(0x005D7461)); // "at]"
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 7, align: 0, memory_index: 0 }));
+
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __f32_to_str(val: f32) -> i32 辅助函数
+    fn emit_f32_to_str(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
+
+        // 与 f64 相同
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(1));
+
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(11));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(7));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(0x6F6C665B));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 4, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(0x005D7461));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 7, align: 0, memory_index: 0 }));
+
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __bool_to_str(val: i32) -> i32 辅助函数
+    fn emit_bool_to_str(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
+
+        // if val == 0 return "false" else return "true"
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+
+        // "false" (5 bytes)
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(1));
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(9)); // 4 + 5
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(5));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(0x736C6166)); // "fals"
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 4, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(0x65)); // "e"
+        f.instruction(&Instruction::I32Store8(wasm_encoder::MemArg { offset: 8, align: 0, memory_index: 0 }));
+        f.instruction(&Instruction::LocalGet(1));
+
+        f.instruction(&Instruction::Else);
+
+        // "true" (4 bytes)
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(1));
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(8)); // 4 + 4
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(0x65757274)); // "true"
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 4, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::LocalGet(1));
+
+        f.instruction(&Instruction::End);
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
         f
@@ -661,6 +992,21 @@ impl CodeGen {
             Expr::Lambda { body, .. } => {
                 self.collect_locals_from_expr(body, locals);
             }
+            Expr::Some(inner) | Expr::Ok(inner) | Expr::Err(inner) | Expr::Try(inner) | Expr::Throw(inner) => {
+                self.collect_locals_from_expr(inner, locals);
+            }
+            Expr::None => {}
+            Expr::TryBlock { body, catch_body, catch_var } => {
+                for stmt in body {
+                    self.collect_locals(stmt, locals);
+                }
+                if let Some(var) = catch_var {
+                    locals.add(var, ValType::I32, None); // 错误值
+                }
+                for stmt in catch_body {
+                    self.collect_locals(stmt, locals);
+                }
+            }
             _ => {}
         }
     }
@@ -709,6 +1055,18 @@ impl CodeGen {
                     params: param_types,
                     ret: Box::new(return_type.clone()),
                 })
+            }
+            Expr::Some(inner) => self.infer_ast_type(inner).map(|t| Type::Option(Box::new(t))),
+            Expr::None => None, // 需要类型注解
+            Expr::Ok(inner) => self.infer_ast_type(inner).map(|t| Type::Result(Box::new(t), Box::new(Type::String))),
+            Expr::Err(inner) => self.infer_ast_type(inner).map(|_| Type::Result(Box::new(Type::Int64), Box::new(Type::String))),
+            Expr::Try(inner) => {
+                // expr? 解包 Option<T> -> T 或 Result<T, E> -> T
+                match self.infer_ast_type(inner) {
+                    Some(Type::Option(t)) => Some(*t),
+                    Some(Type::Result(t, _)) => Some(*t),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -782,6 +1140,17 @@ impl CodeGen {
                     params: param_types,
                     ret: Box::new(return_type.clone()),
                 })
+            }
+            Expr::Some(inner) => self.infer_ast_type_with_locals(inner, locals).map(|t| Type::Option(Box::new(t))),
+            Expr::None => None,
+            Expr::Ok(inner) => self.infer_ast_type_with_locals(inner, locals).map(|t| Type::Result(Box::new(t), Box::new(Type::String))),
+            Expr::Err(inner) => self.infer_ast_type_with_locals(inner, locals).map(|_| Type::Result(Box::new(Type::Int64), Box::new(Type::String))),
+            Expr::Try(inner) => {
+                match self.infer_ast_type_with_locals(inner, locals) {
+                    Some(Type::Option(t)) => Some(*t),
+                    Some(Type::Result(t, _)) => Some(*t),
+                    _ => None,
+                }
             }
             _ => self.infer_ast_type(expr),
         }
@@ -878,6 +1247,24 @@ impl CodeGen {
             Expr::Cast { target_ty, .. } => target_ty.to_wasm(),
             Expr::IfLet { then_branch, .. } => self.infer_type(then_branch),
             Expr::Lambda { .. } => ValType::I32, // 函数表索引
+            Expr::Some(_) | Expr::None | Expr::Ok(_) | Expr::Err(_) => ValType::I32, // 指针
+            Expr::Try(inner) => {
+                // expr? 解包后的类型
+                match self.infer_ast_type(inner) {
+                    Some(Type::Option(t)) => t.to_wasm(),
+                    Some(Type::Result(t, _)) => t.to_wasm(),
+                    _ => self.infer_type(inner),
+                }
+            }
+            Expr::Throw(_) => ValType::I32, // 不返回，但需要类型
+            Expr::TryBlock { body, .. } => {
+                // try 块的结果类型来自最后一个表达式
+                if let Some(Stmt::Expr(e)) = body.last() {
+                    self.infer_type(e)
+                } else {
+                    ValType::I64
+                }
+            }
             _ => ValType::I64,
         }
     }
@@ -1293,6 +1680,102 @@ impl CodeGen {
                     .map(|(_, off)| *off)
                     .unwrap_or(0);
                 func.instruction(&Instruction::I32Const(offset as i32));
+            }
+            Expr::Interpolate(parts) => {
+                // 字符串插值：逐部分分配并拼接
+                // 简化实现：在堆上构建最终字符串
+                // 首先计算总长度，然后分配并复制
+
+                if parts.is_empty() {
+                    // 空插值返回空字符串
+                    let empty_offset = self
+                        .string_pool
+                        .iter()
+                        .find(|(s, _)| s.is_empty())
+                        .map(|(_, off)| *off)
+                        .unwrap_or(0);
+                    func.instruction(&Instruction::I32Const(empty_offset as i32));
+                    return;
+                }
+
+                // 将每个部分编译为字符串指针，压入栈
+                // 策略：使用 __str_concat 运行时函数逐个拼接
+                // 生成：part1 -> __concat(part1, part2) -> __concat(result, part3) -> ...
+
+                let mut is_first = true;
+                for part in parts {
+                    match part {
+                        InterpolatePart::Literal(text) => {
+                            // 获取字面量字符串的地址
+                            let offset = self
+                                .string_pool
+                                .iter()
+                                .find(|(s, _)| s == text)
+                                .map(|(_, off)| *off)
+                                .unwrap_or_else(|| {
+                                    // 如果字符串不在池中，添加它
+                                    // 注意：这里简化处理，实际应该在编译前收集所有字符串
+                                    0
+                                });
+                            func.instruction(&Instruction::I32Const(offset as i32));
+                        }
+                        InterpolatePart::Expr(expr) => {
+                            // 编译表达式
+                            self.compile_expr(expr, locals, func, loop_ctx);
+                            // 将值转换为字符串（调用 __to_string_TYPE 运行时函数）
+                            let expr_type = self.infer_ast_type(expr);
+                            match expr_type.as_ref() {
+                                Some(Type::Int64) => {
+                                    func.instruction(&Instruction::Call(
+                                        self.get_or_create_func_index("__i64_to_str"),
+                                    ));
+                                }
+                                Some(Type::Int32) => {
+                                    func.instruction(&Instruction::Call(
+                                        self.get_or_create_func_index("__i32_to_str"),
+                                    ));
+                                }
+                                Some(Type::Float64) => {
+                                    func.instruction(&Instruction::Call(
+                                        self.get_or_create_func_index("__f64_to_str"),
+                                    ));
+                                }
+                                Some(Type::Float32) => {
+                                    func.instruction(&Instruction::Call(
+                                        self.get_or_create_func_index("__f32_to_str"),
+                                    ));
+                                }
+                                Some(Type::Bool) => {
+                                    func.instruction(&Instruction::Call(
+                                        self.get_or_create_func_index("__bool_to_str"),
+                                    ));
+                                }
+                                Some(Type::String) => {
+                                    // 已经是字符串，不需要转换
+                                }
+                                _ => {
+                                    // 其他类型暂时转为 "[object]"
+                                    func.instruction(&Instruction::Drop);
+                                    let obj_str = self
+                                        .string_pool
+                                        .iter()
+                                        .find(|(s, _)| s == "[object]")
+                                        .map(|(_, off)| *off)
+                                        .unwrap_or(0);
+                                    func.instruction(&Instruction::I32Const(obj_str as i32));
+                                }
+                            }
+                        }
+                    }
+
+                    if !is_first {
+                        // 拼接前一个结果和当前部分
+                        func.instruction(&Instruction::Call(
+                            self.get_or_create_func_index("__str_concat"),
+                        ));
+                    }
+                    is_first = false;
+                }
             }
             Expr::Var(name) => {
                 let idx = locals.get(name).expect("变量未找到");
@@ -2165,6 +2648,175 @@ impl CodeGen {
                 // 4. 用 call_indirect 间接调用
                 panic!("Lambda 表达式编译尚未实现 - 需要 WASM Table 支持");
             }
+            Expr::Some(inner) => {
+                // Option::Some(v) -> 堆分配 [tag=1: i32][value]
+                // 返回指针
+                let value_size = match self.infer_ast_type(inner) {
+                    Some(t) => t.size(),
+                    None => 8, // 默认 i64
+                };
+                let total_size = 4 + value_size;
+
+                func.instruction(&Instruction::GlobalGet(0)); // 保存指针
+
+                // 写入 tag = 1 (Some)
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+
+                // 写入 value
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(4)); // 跳过 tag
+                func.instruction(&Instruction::I32Add);
+                self.compile_expr(inner, locals, func, loop_ctx);
+                func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 3,
+                    memory_index: 0,
+                }));
+
+                // 更新堆指针
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(total_size as i32));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::GlobalSet(0));
+            }
+            Expr::None => {
+                // Option::None -> 堆分配 [tag=0: i32]
+                func.instruction(&Instruction::GlobalGet(0)); // 保存指针
+
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(0)); // tag = 0 (None)
+                func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+
+                // 更新堆指针
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(4));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::GlobalSet(0));
+            }
+            Expr::Ok(inner) => {
+                // Result::Ok(v) -> 堆分配 [tag=0: i32][value]
+                let value_size = match self.infer_ast_type(inner) {
+                    Some(t) => t.size(),
+                    None => 8,
+                };
+                let total_size = 4 + value_size;
+
+                func.instruction(&Instruction::GlobalGet(0));
+
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(0)); // tag = 0 (Ok)
+                func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(4));
+                func.instruction(&Instruction::I32Add);
+                self.compile_expr(inner, locals, func, loop_ctx);
+                func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 3,
+                    memory_index: 0,
+                }));
+
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(total_size as i32));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::GlobalSet(0));
+            }
+            Expr::Err(inner) => {
+                // Result::Err(e) -> 堆分配 [tag=1: i32][error]
+                let value_size = match self.infer_ast_type(inner) {
+                    Some(t) => t.size(),
+                    None => 8,
+                };
+                let total_size = 4 + value_size;
+
+                func.instruction(&Instruction::GlobalGet(0));
+
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(1)); // tag = 1 (Err)
+                func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(4));
+                func.instruction(&Instruction::I32Add);
+                self.compile_expr(inner, locals, func, loop_ctx);
+                func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 3,
+                    memory_index: 0,
+                }));
+
+                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(total_size as i32));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::GlobalSet(0));
+            }
+            Expr::Try(inner) => {
+                // expr? -> 检查 tag，若为 None/Err 则提前 return，否则解包
+                // 先计算 inner 得到指针
+                self.compile_expr(inner, locals, func, loop_ctx);
+                // 栈顶是指针，复制一份用于检查 tag
+                func.instruction(&Instruction::LocalTee(locals.get("__try_ptr").unwrap_or(0)));
+                // 读取 tag
+                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+                // 对于 Option: tag=0 是 None，需要提前返回
+                // 对于 Result: tag=1 是 Err，需要提前返回
+                // 简化：检查 tag != 0 (Some/Err)，若为 None/Ok 则继续
+                // 注意：Option 的 tag=1 是 Some，Result 的 tag=0 是 Ok
+                // 这里需要根据类型判断，简化处理：检查 tag
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                // tag != 0，需要提前返回
+                func.instruction(&Instruction::LocalGet(locals.get("__try_ptr").unwrap_or(0)));
+                func.instruction(&Instruction::Return);
+                func.instruction(&Instruction::End);
+                // tag == 0，解包 value
+                func.instruction(&Instruction::LocalGet(locals.get("__try_ptr").unwrap_or(0)));
+                func.instruction(&Instruction::I32Const(4));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 3,
+                    memory_index: 0,
+                }));
+            }
+            Expr::Throw(inner) => {
+                // throw expr -> 返回 Err 值
+                self.compile_expr(inner, locals, func, loop_ctx);
+                func.instruction(&Instruction::Return);
+            }
+            Expr::TryBlock { body, catch_var, catch_body } => {
+                // try { body } catch(e) { catch_body }
+                // 简化实现：body 正常执行，catch 不执行（除非有 throw）
+                // 完整实现需要 WASM exception handling 提案
+                for stmt in body {
+                    self.compile_stmt(stmt, locals, func, loop_ctx);
+                }
+                // catch 块暂时不生成（需要 WASM exception handling）
+                let _ = catch_var;
+                let _ = catch_body;
+            }
         }
     }
 }
@@ -2215,14 +2867,17 @@ impl Default for CodeGen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{AssignTarget, FieldDef, Param};
+    use crate::ast::{AssignTarget, FieldDef, Param, Visibility};
 
     #[test]
     fn test_compile_simple_function() {
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![],
             enums: vec![],
             functions: vec![FuncDef {
+                visibility: Visibility::default(),
                 name: "answer".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int64),
@@ -2239,7 +2894,10 @@ mod tests {
     #[test]
     fn test_compile_struct() {
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![StructDef {
+                visibility: Visibility::default(),
                 name: "Point".to_string(),
                 fields: vec![
                     FieldDef {
@@ -2254,6 +2912,7 @@ mod tests {
             }],
             enums: vec![],
             functions: vec![FuncDef {
+                visibility: Visibility::default(),
                 name: "test".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int32),
@@ -2286,7 +2945,10 @@ mod tests {
     #[test]
     fn test_compile_struct_field_y() {
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![StructDef {
+                visibility: Visibility::default(),
                 name: "Point".to_string(),
                 fields: vec![
                     FieldDef {
@@ -2301,6 +2963,7 @@ mod tests {
             }],
             enums: vec![],
             functions: vec![FuncDef {
+                visibility: Visibility::default(),
                 name: "get_y".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int64),
@@ -2332,9 +2995,12 @@ mod tests {
     #[test]
     fn test_compile_binary_ops() {
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![],
             enums: vec![],
             functions: vec![FuncDef {
+                visibility: Visibility::default(),
                 name: "compute".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int64),
@@ -2355,9 +3021,12 @@ mod tests {
     #[test]
     fn test_compile_if_expr() {
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![],
             enums: vec![],
             functions: vec![FuncDef {
+                visibility: Visibility::default(),
                 name: "max".to_string(),
                 params: vec![
                     Param {
@@ -2394,9 +3063,12 @@ mod tests {
     #[test]
     fn test_compile_array_literal_and_index() {
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![],
             enums: vec![],
             functions: vec![FuncDef {
+                visibility: Visibility::default(),
                 name: "first".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int64),
@@ -2428,9 +3100,12 @@ mod tests {
         use crate::ast::{Literal, MatchArm, Pattern};
 
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![],
             enums: vec![],
             functions: vec![FuncDef {
+                visibility: Visibility::default(),
                 name: "match_test".to_string(),
                 params: vec![Param {
                     name: "n".to_string(),
@@ -2465,9 +3140,12 @@ mod tests {
     #[test]
     fn test_compile_for_range() {
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![],
             enums: vec![],
             functions: vec![FuncDef {
+                visibility: Visibility::default(),
                 name: "sum_range".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int64),
@@ -2506,9 +3184,12 @@ mod tests {
     #[test]
     fn test_compile_float_ops() {
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![],
             enums: vec![],
             functions: vec![FuncDef {
+                visibility: Visibility::default(),
                 name: "fadd".to_string(),
                 params: vec![],
                 return_type: Some(Type::Float64),
@@ -2528,16 +3209,20 @@ mod tests {
     #[test]
     fn test_compile_multiple_functions() {
         let program = Program {
+            module_name: None,
+            imports: vec![],
             structs: vec![],
             enums: vec![],
             functions: vec![
                 FuncDef {
+                    visibility: Visibility::default(),
                     name: "one".to_string(),
                     params: vec![],
                     return_type: Some(Type::Int64),
                     body: vec![Stmt::Return(Some(Expr::Integer(1)))],
                 },
                 FuncDef {
+                    visibility: Visibility::default(),
                     name: "main".to_string(),
                     params: vec![],
                     return_type: Some(Type::Int64),

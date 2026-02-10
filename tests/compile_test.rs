@@ -236,12 +236,12 @@ func main() -> Int64 {
 #[test]
 fn test_compile_enum_associated_value() {
     let source = r#"
-        enum Result { Ok(Int64), Err(Int64) }
+        enum MyResult { Success(Int64), Failure(Int64) }
         func main() -> Int64 {
-            let r: Result = Result.Ok(42)
+            let r: MyResult = MyResult.Success(42)
             match r {
-                Result.Ok(v) => v,
-                Result.Err(e) => 0 - e,
+                MyResult.Success(v) => v,
+                MyResult.Failure(e) => 0 - e,
                 _ => 0
             }
         }
@@ -519,4 +519,45 @@ fn test_compile_function_overload() {
     "#;
     let wasm = compile_source(source);
     assert_valid_wasm(&wasm, "function_overload");
+}
+
+#[test]
+fn test_compile_option_type() {
+    let source = r#"
+        func main() -> Int64 {
+            let x: Option<Int64> = Some(42)
+            let y: Option<Int64> = None
+            return 0
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "option_type");
+}
+
+#[test]
+fn test_compile_result_type() {
+    let source = r#"
+        func main() -> Int64 {
+            let x: Result<Int64, String> = Ok(42)
+            let y: Result<Int64, String> = Err("error")
+            return 0
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "result_type");
+}
+
+#[test]
+fn test_compile_string_interpolation() {
+    let source = r#"
+        func main() -> Int64 {
+            let name = "World"
+            let greeting = "Hello, ${name}!"
+            let x = 42
+            let msg = "The answer is ${x}"
+            return 0
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "string_interpolation");
 }

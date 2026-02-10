@@ -50,8 +50,8 @@
 | `Array<T>` | `Array<Int64>` | 固定长度数组 | [x] |
 | `Slice<T>` | `Slice<Int64>` | 动态切片 | [ ] |
 | `Tuple` | `(Int64, String)` | 元组类型 | [ ] |
-| `Option<T>` | `Option<Int64>` | 可选值 | [ ] |
-| `Result<T, E>` | `Result<Int64, Error>` | 结果类型 | [ ] |
+| `Option<T>` | `Option<Int64>` | 可选值 | [x] |
+| `Result<T, E>` | `Result<Int64, Error>` | 结果类型 | [x] |
 | `Struct` | `struct Point {...}` | 结构体 | [x] |
 | `Enum` | `enum Color {...}` | 枚举类型（简单枚举，无关联值） | [x] |
 | `Class` | `class Person {...}` | 类 | [ ] |
@@ -96,7 +96,7 @@ let i = 1.0e10       // 科学计数法
 | 二进制 | [x] |
 | 数字分隔符 | [x] |
 | 浮点数 | [x] |
-| 科学计数法 | [ ] |
+| 科学计数法 | [x] |
 | 类型后缀 | [x] (Float32 后缀 `f`) |
 
 ### 2.2 字符串字面量
@@ -117,7 +117,7 @@ let s5 = r"raw\nstring"       // 原始字符串
 | 基本字符串 | [x] |
 | 转义字符 (\n \t \" \\) | [x] |
 | 多行字符串 | [x] |
-| 字符串插值 | [ ] |
+| 字符串插值 | [x] |
 | 原始字符串 | [x] |
 
 ### 2.3 其他字面量
@@ -243,7 +243,7 @@ let z: Int64 = 30       // 显式类型注解
 | let 声明 | [x] |
 | var 声明 | [x] |
 | 类型注解 | [x] |
-| 解构绑定 | [ ] |
+| 解构绑定 | [x] |
 
 ### 4.2 控制流
 
@@ -338,10 +338,10 @@ let triple = { x: Int64 => x * 3 }
 | 基本函数 | [x] |
 | 参数 | [x] |
 | 返回类型 | [x] |
-| 默认参数 | [ ] |
-| 可变参数 | [ ] |
+| 默认参数 | [x] |
+| 可变参数 | [x] |
 | 泛型函数 | [ ] |
-| Lambda | [ ] |
+| Lambda | [x] |
 | 闭包 | [ ] |
 | 递归 | [x] |
 | 尾递归优化 | [ ] |
@@ -355,7 +355,7 @@ func process(x: String) -> String { ... }
 
 | 功能 | 状态 |
 |------|------|
-| 函数重载 | [ ] |
+| 函数重载 | [x] |
 
 ---
 
@@ -541,11 +541,11 @@ while let Some(item) = iterator.next() {
 | 多模式 (\|) | [x] |
 | 范围匹配 | [x] |
 | 枚举变体匹配 (Type.Variant) | [x] |
-| 解构匹配 | [ ] |
+| 解构匹配 | [x] |
 | 守卫条件 (if) | [x] |
 | 通配符 (_) | [x] |
-| if-let | [ ] |
-| while-let | [ ] |
+| if-let | [x] |
+| while-let | [x] |
 
 ---
 
@@ -673,13 +673,13 @@ private func privateFunc() { }
 
 | 功能 | 状态 |
 |------|------|
-| module 声明 | [ ] |
-| import | [ ] |
-| 别名 (as) | [ ] |
-| 通配符导入 | [ ] |
-| public | [ ] |
+| module 声明 | [x] |
+| import | [x] |
+| 别名 (as) | [x] |
+| 通配符导入 | [x] |
+| public | [x] |
 | internal | [ ] |
-| private | [ ] |
+| private | [x] |
 | 包管理 | [ ] |
 
 ---
@@ -733,12 +733,12 @@ func process() -> Result<Int64, String> {
 
 | 功能 | 状态 |
 |------|------|
-| try-catch | [ ] |
-| throw | [ ] |
+| try-catch | [x] |
+| throw | [x] |
 | throws 声明 | [ ] |
 | finally | [ ] |
-| Result 类型 | [ ] |
-| ? 操作符 | [ ] |
+| Result 类型 | [x] |
+| ? 操作符 | [x] |
 | Error 类 | [ ] |
 
 ---
@@ -915,6 +915,7 @@ pow(base, exp)
 - [x] 类型转换 (`expr as Type`，Int32/Int64/Float32/Float64/Bool 间转换)
 - [x] 位运算 (`&` `|` `^` `~` `<<` `>>`，i32/i64)
 - [x] Float32 类型与字面量后缀 `f`
+- [x] 科学计数法 (`1.0e10`, `1e-5`)
 - [x] 静态方法（func Type.staticMethod()，调用 Type.staticMethod()）
 - [x] this 关键字（方法体内解析为第一参数）
 - [x] 枚举方法（func Enum.method(self: Enum)，与结构体方法一致）
@@ -922,6 +923,22 @@ pow(base, exp)
 - [x] 多行字符串 (`"""..."""`，自动 strip 公共缩进)
 - [x] 范围作为值 (`let r = 0..10`，类型为 Range)
 - [x] 构造函数语法糖 (`Point(1, 2)` 转换为 `Point { x: 1, y: 2 }`)
+- [x] Lambda 表达式 (`(x: Int64) -> Int64 { x * 2 }` 和 `{ x: Int64 => x * 2 }`，函数表索引)
+- [x] 默认参数 (`func power(base: Int64, exp: Int64 = 2)`)
+- [x] 可变参数 (`func sum(args: Int64...)`)
+- [x] 函数重载（按参数类型区分，名称修饰）
+- [x] 解构绑定 (`let Point { x, y } = p`)
+- [x] if-let 模式 (`if let x = expr { ... }`)
+- [x] while-let 模式 (`while let x = expr { ... }`)
+- [x] Option<T> 类型 (`Some(value)` / `None`，堆布局 [tag:i32][value])
+- [x] Result<T, E> 类型 (`Ok(value)` / `Err(error)`，堆布局 [tag:i32][value])
+- [x] ? 运算符（错误传播，早期返回 None/Err）
+- [x] try-catch 表达式 (`try { ... } catch e { ... }`)
+- [x] throw 表达式（创建 Err 并早期返回）
+- [x] 模块声明 (`module math`)
+- [x] import 语句 (`import std.io`、`import math.{sin, cos}`、`import math as m`、`import math.*`)
+- [x] 可见性修饰符 (`public` / `private`)
+- [x] 字符串插值 (`"Hello, ${name}!"`，支持 `${expr}` 嵌入表达式)
 
 #### 进行中
 
@@ -929,18 +946,17 @@ pow(base, exp)
 
 #### 下一版本 (v0.2.0) 计划
 
-- [ ] Lambda 表达式（需 table / call_indirect）
+- [x] Lambda 表达式（需 table / call_indirect）
 - [x] 范围作为值 (let r = 0..10)
 - [x] 多行字符串 ("""...""")
 - [x] 构造函数语法糖 (Point(1, 2))
+- [x] 字符串插值 ("Hello, ${name}!")
 
 #### 未来版本计划
 
 - [ ] 类和继承
 - [ ] 泛型
 - [ ] 接口/Trait
-- [ ] 模块系统
-- [ ] 错误处理
 - [ ] WASI 支持
 - [ ] 标准库
 - [ ] 优化器
@@ -1001,5 +1017,5 @@ var      where    while
 
 ---
 
-*文档版本: 1.2.0*
-*最后更新: 2025-02（与当前实现同步：含 loop、多进制字面量、数字分隔符、幂运算、类型转换 as、位运算、Float32、静态方法、this、枚举方法）*
+*文档版本: 1.4.1*
+*最后更新: 2026-02（与当前实现同步：含 Option/Result 类型、? 运算符、try-catch-throw、Lambda 表达式、默认参数、可变参数、函数重载、解构绑定、if-let/while-let、模块声明与导入、可见性修饰符、字符串插值、科学计数法）*

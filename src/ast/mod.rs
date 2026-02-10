@@ -24,6 +24,10 @@ pub enum Type {
         params: Vec<Type>,
         ret: Box<Option<Type>>,
     },
+    /// Option<T> 类型
+    Option(Box<Type>),
+    /// Result<T, E> 类型
+    Result(Box<Type>, Box<Type>),
 }
 
 impl Type {
@@ -42,6 +46,8 @@ impl Type {
             Type::Struct(_) => ValType::I32,
             Type::Range => ValType::I32,    // 指针
             Type::Function { .. } => ValType::I32, // 函数表索引
+            Type::Option(_) => ValType::I32,      // 指针
+            Type::Result(_, _) => ValType::I32,   // 指针
         }
     }
 
@@ -58,6 +64,8 @@ impl Type {
             Type::Struct(_) => 4,   // 指针大小
             Type::Range => 4,       // 指针大小
             Type::Function { .. } => 4, // 函数表索引大小
+            Type::Option(_) => 4,   // 指针大小
+            Type::Result(_, _) => 4, // 指针大小
         }
     }
 
@@ -100,6 +108,15 @@ pub enum BinOp {
     Shr,         // >>
 }
 
+/// 字符串插值的部分
+#[derive(Debug, Clone)]
+pub enum InterpolatePart {
+    /// 字面量文本
+    Literal(String),
+    /// 插值表达式
+    Expr(Box<Expr>),
+}
+
 /// 表达式
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -113,6 +130,9 @@ pub enum Expr {
     Bool(bool),
     /// 字符串字面量
     String(String),
+    /// 字符串插值 "Hello, ${name}!"
+    /// 各部分依次为字面量文本或表达式
+    Interpolate(Vec<InterpolatePart>),
     /// 变量引用
     Var(String),
     /// 一元运算 (! 等)
@@ -202,6 +222,24 @@ pub enum Expr {
         params: Vec<(String, Type)>,
         return_type: Option<Type>,
         body: Box<Expr>,
+    },
+    /// Some(value) 表达式
+    Some(Box<Expr>),
+    /// None 表达式
+    None,
+    /// Ok(value) 表达式
+    Ok(Box<Expr>),
+    /// Err(value) 表达式
+    Err(Box<Expr>),
+    /// ? 运算符 (expr?)，若为 Err/None 则提前返回
+    Try(Box<Expr>),
+    /// throw 表达式
+    Throw(Box<Expr>),
+    /// try 块表达式
+    TryBlock {
+        body: Vec<Stmt>,
+        catch_var: Option<String>,
+        catch_body: Vec<Stmt>,
     },
 }
 
@@ -326,6 +364,7 @@ pub struct FieldDef {
 /// 结构体定义
 #[derive(Debug, Clone)]
 pub struct StructDef {
+    pub visibility: Visibility,
     pub name: String,
     pub fields: Vec<FieldDef>,
 }
@@ -368,6 +407,7 @@ pub struct Param {
 /// 函数定义
 #[derive(Debug, Clone)]
 pub struct Function {
+    pub visibility: Visibility,
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
@@ -385,6 +425,7 @@ pub struct EnumVariant {
 /// 枚举定义（支持无关联值或单关联值变体）
 #[derive(Debug, Clone)]
 pub struct EnumDef {
+    pub visibility: Visibility,
     pub name: String,
     pub variants: Vec<EnumVariant>,
 }
@@ -414,9 +455,32 @@ impl EnumDef {
     }
 }
 
+/// 可见性修饰符
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Visibility {
+    #[default]
+    Private,
+    Public,
+}
+
+/// 导入项
+#[derive(Debug, Clone)]
+pub struct Import {
+    /// 导入的模块路径，如 "std.io"
+    pub module_path: Vec<String>,
+    /// 导入的具体项，None 表示 import * from module
+    pub items: Option<Vec<String>>,
+    /// 别名，如 import foo as bar
+    pub alias: Option<String>,
+}
+
 /// 程序 (模块)
 #[derive(Debug)]
 pub struct Program {
+    /// 模块名称，None 表示主模块
+    pub module_name: Option<String>,
+    /// 导入列表
+    pub imports: Vec<Import>,
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
     pub functions: Vec<Function>,

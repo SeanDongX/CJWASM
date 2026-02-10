@@ -1,5 +1,14 @@
 use logos::Logos;
 
+/// 字符串插值的部分
+#[derive(Debug, PartialEq, Clone)]
+pub enum StringPart {
+    /// 字面量文本部分
+    Literal(String),
+    /// 插值表达式（原始文本，待 parser 解析）
+    Interpolation(String),
+}
+
 /// 将字符串字面量内部的反斜杠转义还原（支持 \n \t \" \\）。
 fn unescape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -76,6 +85,112 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
     }
 }
 
+/// 解析字符串（普通或插值）
+/// 返回 Ok(Left(String)) 为普通字符串，Ok(Right(Vec<StringPart>)) 为插值字符串
+fn lex_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, Vec<StringPart>>> {
+    let remainder = lex.remainder();
+    let bytes = remainder.as_bytes();
+    let mut pos = 0;
+    let mut parts: Vec<StringPart> = Vec::new();
+    let mut current_literal = String::new();
+    let mut has_interpolation = false;
+
+    while pos < bytes.len() {
+        let c = bytes[pos];
+
+        if c == b'\\' && pos + 1 < bytes.len() {
+            // 转义字符
+            let next = bytes[pos + 1];
+            match next {
+                b'n' => current_literal.push('\n'),
+                b't' => current_literal.push('\t'),
+                b'"' => current_literal.push('"'),
+                b'\\' => current_literal.push('\\'),
+                b'$' => current_literal.push('$'), // 支持 \$ 转义
+                _ => {
+                    current_literal.push('\\');
+                    current_literal.push(next as char);
+                }
+            }
+            pos += 2;
+        } else if c == b'$' && pos + 1 < bytes.len() && bytes[pos + 1] == b'{' {
+            // 插值开始 ${
+            has_interpolation = true;
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            pos += 2; // 跳过 ${
+
+            // 查找匹配的 }，需要处理嵌套大括号
+            let mut brace_depth = 1;
+            let expr_start = pos;
+            while pos < bytes.len() && brace_depth > 0 {
+                match bytes[pos] {
+                    b'{' => brace_depth += 1,
+                    b'}' => brace_depth -= 1,
+                    b'"' => {
+                        // 跳过内嵌字符串
+                        pos += 1;
+                        while pos < bytes.len() && bytes[pos] != b'"' {
+                            if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
+                                pos += 2;
+                            } else {
+                                pos += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if brace_depth > 0 {
+                    pos += 1;
+                }
+            }
+
+            if brace_depth != 0 {
+                return None; // 未闭合的 ${
+            }
+
+            let expr_text = std::str::from_utf8(&bytes[expr_start..pos]).ok()?;
+            parts.push(StringPart::Interpolation(expr_text.to_string()));
+            pos += 1; // 跳过 }
+        } else if c == b'"' {
+            // 字符串结束
+            if has_interpolation {
+                if !current_literal.is_empty() {
+                    parts.push(StringPart::Literal(current_literal));
+                }
+                lex.bump(pos + 1); // +1 跳过结束引号
+                return Some(Err(parts));
+            } else {
+                lex.bump(pos + 1);
+                return Some(Ok(current_literal));
+            }
+        } else {
+            current_literal.push(c as char);
+            pos += 1;
+        }
+    }
+
+    None // 未找到结束引号
+}
+
+/// 词法分析入口：解析字符串（普通或插值）
+fn lex_any_string(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<StringOrInterpolated, ()> {
+    match lex_string(lex) {
+        Some(Ok(s)) => logos::FilterResult::Emit(StringOrInterpolated::Plain(s)),
+        Some(Err(parts)) => logos::FilterResult::Emit(StringOrInterpolated::Interpolated(parts)),
+        None => logos::FilterResult::Error(()),
+    }
+}
+
+/// 用于区分普通字符串和插值字符串的类型
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringOrInterpolated {
+    Plain(String),
+    Interpolated(Vec<StringPart>),
+}
+
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(skip r"[ \t\r\n]+")]  // 跳过空白
 #[logos(skip r"//[^\n]*")]    // 跳过单行注释
@@ -112,11 +227,41 @@ pub enum Token {
     #[token("enum")]
     Enum,
 
+    // 模块系统关键字
+    #[token("module")]
+    Module,
+    #[token("import")]
+    Import,
+    #[token("public")]
+    Public,
+    #[token("private")]
+    Private,
+    #[token("from")]
+    From,
+
     #[token("as")]
     As,
 
     #[token("this")]
     This,
+
+    // 错误处理关键字
+    #[token("try")]
+    Try,
+    #[token("catch")]
+    Catch,
+    #[token("throw")]
+    Throw,
+
+    // Option/Result 关键字
+    #[token("Some")]
+    Some,
+    #[token("None")]
+    None,
+    #[token("Ok")]
+    Ok,
+    #[token("Err")]
+    Err,
 
     #[token("_", priority = 3)]
     Underscore,
@@ -140,6 +285,10 @@ pub enum Token {
     TypeArray,
     #[token("Range")]
     TypeRange,
+    #[token("Option")]
+    TypeOption,
+    #[token("Result")]
+    TypeResult,
 
     // 字面量（Float64：小数或科学计数法；Float32 后缀 f；整型）
     #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
@@ -180,12 +329,9 @@ pub enum Token {
     })]
     RawStringLit(String),
 
-    // 字符串字面量（支持 \n \t \" \\ 转义）
-    #[regex(r#""([^"\\]|\\.)*""#, |lex| {
-        let s = lex.slice();
-        unescape_string(&s[1..s.len() - 1])
-    })]
-    StringLit(String),
+    // 字符串字面量（支持 \n \t \" \\ 转义，以及 ${expr} 插值）
+    #[token("\"", lex_any_string)]
+    StringLit(StringOrInterpolated),
 
     // 标识符
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
@@ -256,6 +402,8 @@ pub enum Token {
     DotDotDot,
     #[token("=>")]
     FatArrow,
+    #[token("?")]
+    Question,
 
     // 分隔符
     #[token("(")]
@@ -326,7 +474,7 @@ mod tests {
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 
-        assert_eq!(tokens[3], Token::StringLit("hello world".to_string()));
+        assert_eq!(tokens[3], Token::StringLit(StringOrInterpolated::Plain("hello world".to_string())));
     }
 
     #[test]
@@ -337,7 +485,7 @@ mod tests {
 
         assert_eq!(
             tokens[3],
-            Token::StringLit("a\nb\tc\"d\\e".to_string())
+            Token::StringLit(StringOrInterpolated::Plain("a\nb\tc\"d\\e".to_string()))
         );
     }
 
@@ -446,5 +594,32 @@ mod tests {
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 
         assert_eq!(tokens[3], Token::MultiLineStringLit("hello world".to_string()));
+    }
+
+    #[test]
+    fn test_string_interpolation() {
+        let source = r#"let s = "Hello, ${name}!""#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        match &tokens[3] {
+            Token::StringLit(StringOrInterpolated::Interpolated(parts)) => {
+                assert_eq!(parts.len(), 3);
+                assert_eq!(parts[0], StringPart::Literal("Hello, ".to_string()));
+                assert_eq!(parts[1], StringPart::Interpolation("name".to_string()));
+                assert_eq!(parts[2], StringPart::Literal("!".to_string()));
+            }
+            _ => panic!("Expected interpolated string"),
+        }
+    }
+
+    #[test]
+    fn test_string_interpolation_escape() {
+        let source = r#"let s = "Price: \$100""#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        // \$ should be escaped to $, so this is a plain string
+        assert_eq!(tokens[3], Token::StringLit(StringOrInterpolated::Plain("Price: $100".to_string())));
     }
 }

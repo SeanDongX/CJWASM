@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::lexer::Token;
+use crate::lexer::{Token, StringOrInterpolated, StringPart};
 use std::fmt;
 use thiserror::Error;
 
@@ -139,32 +139,145 @@ impl Parser {
 
     /// 解析程序
     pub fn parse_program(&mut self) -> Result<Program, ParseErrorAt> {
+        let mut module_name = None;
+        let mut imports = Vec::new();
         let mut structs = Vec::new();
         let mut functions = Vec::new();
-
         let mut enums = Vec::new();
+
+        // 解析可选的 module 声明
+        if self.check(&Token::Module) {
+            self.advance();
+            let name = match self.advance() {
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "模块名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
+            };
+            module_name = Some(name);
+        }
+
+        // 解析 import 语句
+        while self.check(&Token::Import) {
+            imports.push(self.parse_import()?);
+        }
+
         while let Some(tok) = self.peek() {
-            match tok {
-                Token::Struct => structs.push(self.parse_struct()?),
-                Token::Enum => enums.push(self.parse_enum()?),
-                Token::Func => functions.push(self.parse_function()?),
-                _ => {
+            // 解析可见性修饰符
+            let visibility = if self.check(&Token::Public) {
+                self.advance();
+                Visibility::Public
+            } else if self.check(&Token::Private) {
+                self.advance();
+                Visibility::Private
+            } else {
+                Visibility::default()
+            };
+
+            match self.peek() {
+                Some(Token::Struct) => structs.push(self.parse_struct_with_visibility(visibility)?),
+                Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
+                Some(Token::Func) => functions.push(self.parse_function_with_visibility(visibility)?),
+                Some(tok) => {
                     return self.bail(ParseError::UnexpectedToken(
                         tok.clone(),
                         "struct、enum 或 func".to_string(),
                     ))
                 }
+                None => break,
             }
         }
         Ok(Program {
+            module_name,
+            imports,
             structs,
             enums,
             functions,
         })
     }
 
+    /// 解析 import 语句
+    fn parse_import(&mut self) -> Result<Import, ParseErrorAt> {
+        self.expect(Token::Import)?;
+
+        // 解析模块路径或具体项
+        let mut items = Vec::new();
+        let first_item = match self.advance() {
+            Some(Token::Ident(n)) => n,
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "模块名或导入项".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
+        };
+
+        // 检查是否是 import item from module 语法
+        if self.check(&Token::Comma) || self.check(&Token::From) {
+            items.push(first_item);
+            while self.check(&Token::Comma) {
+                self.advance();
+                let item = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "导入项".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                items.push(item);
+            }
+            self.expect(Token::From)?;
+            let mut module_path = Vec::new();
+            let mod_name = match self.advance() {
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "模块名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
+            };
+            module_path.push(mod_name);
+            while self.check(&Token::Dot) {
+                self.advance();
+                let part = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "模块路径".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                module_path.push(part);
+            }
+            Ok(Import {
+                module_path,
+                items: Some(items),
+                alias: None,
+            })
+        } else {
+            // import module.path 或 import module.path as alias
+            let mut module_path = vec![first_item];
+            while self.check(&Token::Dot) {
+                self.advance();
+                let part = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "模块路径".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                module_path.push(part);
+            }
+            let alias = if self.check(&Token::As) {
+                self.advance();
+                match self.advance() {
+                    Some(Token::Ident(n)) => Some(n),
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "别名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                }
+            } else {
+                None
+            };
+            Ok(Import {
+                module_path,
+                items: None,
+                alias,
+            })
+        }
+    }
+
     /// 解析结构体定义
     fn parse_struct(&mut self) -> Result<StructDef, ParseErrorAt> {
+        self.parse_struct_with_visibility(Visibility::default())
+    }
+
+    /// 解析结构体定义（带可见性）
+    fn parse_struct_with_visibility(&mut self, visibility: Visibility) -> Result<StructDef, ParseErrorAt> {
         self.expect(Token::Struct)?;
 
         let name = match self.advance() {
@@ -195,11 +308,16 @@ impl Parser {
         }
 
         self.expect(Token::RBrace)?;
-        Ok(StructDef { name, fields })
+        Ok(StructDef { visibility, name, fields })
     }
 
     /// 解析枚举定义（支持无关联值或单关联类型变体，如 Ok(Int64)）
     fn parse_enum(&mut self) -> Result<EnumDef, ParseErrorAt> {
+        self.parse_enum_with_visibility(Visibility::default())
+    }
+
+    /// 解析枚举定义（带可见性）
+    fn parse_enum_with_visibility(&mut self, visibility: Visibility) -> Result<EnumDef, ParseErrorAt> {
         self.expect(Token::Enum)?;
         let name = match self.advance() {
             Some(Token::Ident(n)) => n,
@@ -231,11 +349,16 @@ impl Parser {
             }
         }
         self.expect(Token::RBrace)?;
-        Ok(EnumDef { name, variants })
+        Ok(EnumDef { visibility, name, variants })
     }
 
     /// 解析函数定义（支持方法名 StructName.methodName）
     fn parse_function(&mut self) -> Result<Function, ParseErrorAt> {
+        self.parse_function_with_visibility(Visibility::default())
+    }
+
+    /// 解析函数定义（带可见性）
+    fn parse_function_with_visibility(&mut self, visibility: Visibility) -> Result<Function, ParseErrorAt> {
         self.expect(Token::Func)?;
 
         let name = match self.advance() {
@@ -281,6 +404,7 @@ impl Parser {
         self.receiver_name = prev_receiver;
 
         Ok(Function {
+            visibility,
             name,
             params,
             return_type,
@@ -344,6 +468,20 @@ impl Parser {
                 Ok(Type::Array(Box::new(elem_type)))
             }
             Some(Token::TypeRange) => Ok(Type::Range),
+            Some(Token::TypeOption) => {
+                self.expect(Token::Lt)?;
+                let inner_type = self.parse_type()?;
+                self.expect(Token::Gt)?;
+                Ok(Type::Option(Box::new(inner_type)))
+            }
+            Some(Token::TypeResult) => {
+                self.expect(Token::Lt)?;
+                let ok_type = self.parse_type()?;
+                self.expect(Token::Comma)?;
+                let err_type = self.parse_type()?;
+                self.expect(Token::Gt)?;
+                Ok(Type::Result(Box::new(ok_type), Box::new(err_type)))
+            }
             Some(Token::Ident(name)) => Ok(Type::Struct(name)),
             Some(tok) => self.bail_at(ParseError::UnexpectedToken(tok, "类型".to_string()), self.at_prev()),
             None => self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
@@ -845,6 +983,11 @@ impl Parser {
                         target_ty,
                     };
                 }
+                Some(Token::Question) => {
+                    // ? 运算符：expr? 提前返回 Err/None
+                    self.advance();
+                    expr = Expr::Try(Box::new(expr));
+                }
                 _ => break,
             }
         }
@@ -880,7 +1023,55 @@ impl Parser {
             },
             Some(Token::True) => Ok(Expr::Bool(true)),
             Some(Token::False) => Ok(Expr::Bool(false)),
-            Some(Token::StringLit(s)) | Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => Ok(Expr::String(s)),
+            Some(Token::StringLit(s)) => self.parse_string_or_interpolated(s),
+            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => Ok(Expr::String(s)),
+            // Option/Result 构造器
+            Some(Token::Some) => {
+                self.expect(Token::LParen)?;
+                let value = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::Some(Box::new(value)))
+            }
+            Some(Token::None) => Ok(Expr::None),
+            Some(Token::Ok) => {
+                self.expect(Token::LParen)?;
+                let value = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::Ok(Box::new(value)))
+            }
+            Some(Token::Err) => {
+                self.expect(Token::LParen)?;
+                let value = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::Err(Box::new(value)))
+            }
+            // throw 表达式
+            Some(Token::Throw) => {
+                let value = self.parse_expr()?;
+                Ok(Expr::Throw(Box::new(value)))
+            }
+            // try 块
+            Some(Token::Try) => {
+                self.expect(Token::LBrace)?;
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                self.expect(Token::Catch)?;
+                let catch_var = if self.check(&Token::LParen) {
+                    self.advance();
+                    let var = match self.advance() {
+                        Some(Token::Ident(v)) => Some(v),
+                        _ => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    self.expect(Token::RParen)?;
+                    var
+                } else {
+                    None
+                };
+                self.expect(Token::LBrace)?;
+                let catch_body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                Ok(Expr::TryBlock { body, catch_var, catch_body })
+            }
             Some(Token::Ident(name)) => {
                 // 仅当首字母大写时解析为枚举变体 (Color.Red)，否则 . 后续为字段/方法
                 let looks_like_type = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
@@ -1191,7 +1382,8 @@ impl Parser {
             },
             Some(Token::True) => Expr::Bool(true),
             Some(Token::False) => Expr::Bool(false),
-            Some(Token::StringLit(s)) | Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => Expr::String(s),
+            Some(Token::StringLit(s)) => self.parse_string_or_interpolated(s)?,
+            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => Expr::String(s),
             Some(Token::Ident(name)) => {
                 if self.check(&Token::LParen) {
                     // 函数调用
@@ -1404,7 +1596,25 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::Literal(Literal::Bool(false)))
             }
-            Some(Token::StringLit(s)) | Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => {
+            Some(Token::StringLit(s)) => {
+                let s_str = match s.clone() {
+                    StringOrInterpolated::Plain(s) => s,
+                    StringOrInterpolated::Interpolated(_) => {
+                        let (byte_start, byte_end) = self.at_prev();
+                        return Err(ParseErrorAt {
+                            error: ParseError::UnexpectedToken(
+                                Token::StringLit(s.clone()),
+                                "模式中不支持字符串插值".to_string(),
+                            ),
+                            byte_start,
+                            byte_end,
+                        });
+                    }
+                };
+                self.advance();
+                Ok(Pattern::Literal(Literal::String(s_str)))
+            }
+            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => {
                 let s = s.clone();
                 self.advance();
                 Ok(Pattern::Literal(Literal::String(s)))
@@ -1501,6 +1711,47 @@ impl Parser {
         }
 
         Ok(fields)
+    }
+
+    /// 解析字符串（普通或插值）
+    fn parse_string_or_interpolated(&mut self, s: StringOrInterpolated) -> Result<Expr, ParseErrorAt> {
+        match s {
+            StringOrInterpolated::Plain(text) => Ok(Expr::String(text)),
+            StringOrInterpolated::Interpolated(parts) => {
+                let mut result_parts = Vec::new();
+                for part in parts {
+                    match part {
+                        StringPart::Literal(text) => {
+                            if !text.is_empty() {
+                                result_parts.push(InterpolatePart::Literal(text));
+                            }
+                        }
+                        StringPart::Interpolation(expr_text) => {
+                            // 解析表达式文本
+                            let expr = self.parse_interpolation_expr(&expr_text)?;
+                            result_parts.push(InterpolatePart::Expr(Box::new(expr)));
+                        }
+                    }
+                }
+                Ok(Expr::Interpolate(result_parts))
+            }
+        }
+    }
+
+    /// 解析插值表达式内的文本
+    fn parse_interpolation_expr(&self, expr_text: &str) -> Result<Expr, ParseErrorAt> {
+        use crate::lexer::Lexer;
+
+        let lexer = Lexer::new(expr_text);
+        let tokens: Result<Vec<_>, _> = lexer.collect();
+        let tokens = tokens.map_err(|e| ParseErrorAt {
+            error: ParseError::UnknownType(format!("插值表达式词法错误: {}", e)),
+            byte_start: self.at_prev().0,
+            byte_end: self.at_prev().1,
+        })?;
+
+        let mut parser = Parser::new(tokens);
+        parser.parse_expr()
     }
 }
 
