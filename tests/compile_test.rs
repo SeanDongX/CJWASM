@@ -467,6 +467,38 @@ fn test_compile_if_expr() {
 }
 
 #[test]
+fn test_compile_stdlib_min_max_abs() {
+    let source = r#"
+        func main() -> Int64 {
+            let a = min(-10, 5)
+            let b = max(3, 8)
+            let c = abs(-42)
+            return a + b + c
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "stdlib_min_max_abs");
+}
+
+#[test]
+fn test_compile_extern_import() {
+    let source = r#"
+        @import("env", "print")
+        extern func hostPrint(ptr: Int32, len: Int32)
+        func main() -> Int64 {
+            return 0
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "extern_import");
+    // WASM 应包含 Import 段（section id 2）；简单检查二进制中含 "env" 或 "print" 表示导入存在
+    assert!(
+        wasm.windows(3).any(|w| w == b"env") || wasm.windows(5).any(|w| w == b"print"),
+        "extern 导入应生成包含模块/函数名的 WASM"
+    );
+}
+
+#[test]
 fn test_compile_example_files() {
     let examples_dir = Path::new("examples");
     if !examples_dir.exists() {

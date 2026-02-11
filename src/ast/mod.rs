@@ -405,6 +405,15 @@ pub struct Param {
 }
 
 /// 函数定义
+/// 外部函数导入：WASM 从宿主导入 (module, name)
+#[derive(Debug, Clone, Default)]
+pub struct ExternImport {
+    /// 模块名，如 "env"、"wasi_snapshot_preview1"
+    pub module: String,
+    /// 导入名，如 "print"、"fd_write"
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Function {
     pub visibility: Visibility,
@@ -412,6 +421,8 @@ pub struct Function {
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     pub body: Vec<Stmt>,
+    /// 若为 Some，则为 extern 函数，从 (module, name) 导入；无 body
+    pub extern_import: Option<ExternImport>,
 }
 
 /// 枚举变体（可选关联类型）

@@ -49,7 +49,7 @@ fn main() {
 
     // 语法分析
     let mut parser = Parser::new(tokens);
-    let program = match parser.parse_program() {
+    let mut program = match parser.parse_program() {
         Ok(p) => p,
         Err(e) => {
             let (line, col) = cjwasm::parser::line_column_from_source(&source, e.byte_start);
@@ -57,6 +57,9 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // 优化（常量折叠等）
+    cjwasm::optimizer::optimize_program(&mut program);
 
     // 代码生成
     let mut codegen = CodeGen::new();

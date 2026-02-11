@@ -252,6 +252,10 @@ pub enum Token {
     Catch,
     #[token("throw")]
     Throw,
+    #[token("extern")]
+    Extern,
+    #[token("@")]
+    At,
 
     // Option/Result 关键字
     #[token("Some")]

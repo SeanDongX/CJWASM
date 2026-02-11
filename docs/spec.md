@@ -53,7 +53,7 @@
 | `Option<T>` | `Option<Int64>` | 可选值 | [x] |
 | `Result<T, E>` | `Result<Int64, Error>` | 结果类型 | [x] |
 | `Struct` | `struct Point {...}` | 结构体 | [x] |
-| `Enum` | `enum Color {...}` | 枚举类型（简单枚举，无关联值） | [x] |
+| `Enum` | `enum Color {...}` | 枚举类型（含关联值如 Ok(T)/Err(E)） | [x] |
 | `Class` | `class Person {...}` | 类 | [ ] |
 | `Interface` | `interface Drawable {...}` | 接口 | [ ] |
 | `Function` | `(Int64) -> Int64` | 函数类型 | [ ] |
@@ -807,10 +807,10 @@ func add(a: Int64, b: Int64) -> Int64 {
 
 | 功能 | 状态 |
 |------|------|
-| @import | [ ] |
+| @import | [x] |
 | @export | [x] (自动) |
-| extern func | [ ] |
-| WASI 基础 | [ ] |
+| extern func | [x] |
+| WASI 基础 | [ ] (需运行时提供 fd_write 等) |
 
 ---
 
@@ -866,7 +866,7 @@ pow(base, exp)
 | 类型转换函数 | [ ] |
 | 数组函数 | [ ] |
 | 字符串函数 | [ ] |
-| 数学函数 | [ ] |
+| 数学函数 | [x]（min/max/abs，Int64；pow 已通过 ** 与 __pow_i64） |
 
 ---
 
@@ -939,6 +939,9 @@ pow(base, exp)
 - [x] import 语句 (`import std.io`、`import math.{sin, cos}`、`import math as m`、`import math.*`)
 - [x] 可见性修饰符 (`public` / `private`)
 - [x] 字符串插值 (`"Hello, ${name}!"`，支持 `${expr}` 嵌入表达式)
+- [x] 优化器（常量折叠：整数/浮点二元运算、一元 Neg/Not，编译前 AST 优化）
+- [x] extern func 与 @import（`@import("module","name") extern func ...`，生成 WASM 导入段）
+- [x] 内置数学函数（`min(a,b)`、`max(a,b)`、`abs(x)`，Int64）
 
 #### 进行中
 
@@ -952,14 +955,15 @@ pow(base, exp)
 - [x] 构造函数语法糖 (Point(1, 2))
 - [x] 字符串插值 ("Hello, ${name}!")
 
-#### 未来版本计划
+#### 未来版本计划（第三优先级 v0.3.0+）
 
-- [ ] 类和继承
-- [ ] 泛型
-- [ ] 接口/Trait
-- [ ] WASI 支持
-- [ ] 标准库
-- [ ] 优化器
+- [ ] 泛型（类型参数、单态化）
+- [ ] 接口/Trait（implements、多态）
+- [ ] 类与继承（init/deinit、override、super）
+- [ ] 模块系统（包管理、多文件链接；当前已支持 module/import/可见性）
+- [x] WASI 支持（extern func + @import 已实现；fd/clock/random 等由运行时提供）
+- [x] 标准库（雏形：min/max/abs 内置；std.core/io/collections 等待做）
+- [x] 优化器（常量折叠已实现；死代码消除、内联待做）
 
 ---
 
@@ -1017,5 +1021,5 @@ var      where    while
 
 ---
 
-*文档版本: 1.4.1*
-*最后更新: 2026-02（与当前实现同步：含 Option/Result 类型、? 运算符、try-catch-throw、Lambda 表达式、默认参数、可变参数、函数重载、解构绑定、if-let/while-let、模块声明与导入、可见性修饰符、字符串插值、科学计数法）*
+*文档版本: 1.4.3*
+*最后更新: 2026-02（与当前实现同步：含 extern func + @import、标准库雏形 min/max/abs、优化器常量折叠；未来计划见 15.1 未来版本计划）*

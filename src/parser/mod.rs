@@ -173,17 +173,28 @@ impl Parser {
                 Visibility::default()
             };
 
-            match self.peek() {
-                Some(Token::Struct) => structs.push(self.parse_struct_with_visibility(visibility)?),
-                Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
-                Some(Token::Func) => functions.push(self.parse_function_with_visibility(visibility)?),
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(
-                        tok.clone(),
-                        "struct、enum 或 func".to_string(),
-                    ))
+            let extern_import = if self.check(&Token::At) {
+                Some(self.parse_import_attr()?)
+            } else {
+                None
+            };
+
+            if self.check(&Token::Extern) {
+                self.advance();
+                functions.push(self.parse_extern_func(visibility, extern_import)?);
+            } else {
+                match self.peek() {
+                    Some(Token::Struct) => structs.push(self.parse_struct_with_visibility(visibility)?),
+                    Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
+                    Some(Token::Func) => functions.push(self.parse_function_with_visibility(visibility)?),
+                    Some(tok) => {
+                        return self.bail(ParseError::UnexpectedToken(
+                            tok.clone(),
+                            "struct、enum、func 或 extern func".to_string(),
+                        ))
+                    }
+                    None => break,
                 }
-                None => break,
             }
         }
         Ok(Program {
@@ -257,8 +268,7 @@ impl Parser {
                 self.advance();
                 match self.advance() {
                     Some(Token::Ident(n)) => Some(n),
-                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "别名".to_string())),
-                    None => return self.bail(ParseError::UnexpectedEof),
+                    _ => return self.bail(ParseError::UnexpectedEof),
                 }
             } else {
                 None
@@ -269,6 +279,56 @@ impl Parser {
                 alias,
             })
         }
+    }
+
+    /// 解析 @import("module", "name") 属性（用于 extern func 前）
+    fn parse_import_attr(&mut self) -> Result<ExternImport, ParseErrorAt> {
+        self.expect(Token::At)?;
+        self.expect(Token::Import)?;
+        self.expect(Token::LParen)?;
+        let module = match self.advance() {
+            Some(Token::StringLit(StringOrInterpolated::Plain(s))) => s,
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "字符串字面量 (模块名)".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
+        };
+        self.expect(Token::Comma)?;
+        let name = match self.advance() {
+            Some(Token::StringLit(StringOrInterpolated::Plain(s))) => s,
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "字符串字面量 (导入名)".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
+        };
+        self.expect(Token::RParen)?;
+        Ok(ExternImport { module, name })
+    }
+
+    /// 解析 extern func 声明（无 body；可选 extern_import 来自前导 @import）
+    fn parse_extern_func(&mut self, visibility: Visibility, extern_import: Option<ExternImport>) -> Result<Function, ParseErrorAt> {
+        self.expect(Token::Func)?;
+        let name = match self.advance() {
+            Some(Token::Ident(n)) => n,
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "函数名".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
+        };
+        self.expect(Token::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(Token::RParen)?;
+        let return_type = if self.check(&Token::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let import = extern_import.or_else(|| {
+            Some(ExternImport { module: "env".to_string(), name: name.clone() })
+        });
+        Ok(Function {
+            visibility,
+            name,
+            params,
+            return_type,
+            body: vec![],
+            extern_import: import,
+        })
     }
 
     /// 解析结构体定义
@@ -409,6 +469,7 @@ impl Parser {
             params,
             return_type,
             body,
+            extern_import: None,
         })
     }
 

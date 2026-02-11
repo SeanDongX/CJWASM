@@ -2,9 +2,9 @@ use crate::ast::{AssignTarget, BinOp, EnumDef, Expr, InterpolatePart, Literal, M
 use crate::ast::Function as FuncDef;
 use std::collections::HashMap;
 use wasm_encoder::{
-    CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function as WasmFunc,
-    FunctionSection, GlobalSection, GlobalType, Instruction, MemorySection, MemoryType, Module,
-    TypeSection, ValType,
+    CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function as WasmFunc,
+    FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemorySection, MemoryType,
+    Module, TypeSection, ValType,
 };
 
 /// 内存布局常量
@@ -141,72 +141,108 @@ impl CodeGen {
                 func.name.clone()
             };
             self.func_types.insert(key.clone(), i as u32);
-            self.func_indices.insert(key.clone(), i as u32);
             if let Some(ref ret) = func.return_type {
                 self.func_return_types.insert(key.clone(), ret.clone());
             }
             self.func_params.insert(key, func.params.clone());
         }
-        // 运行时辅助函数类型
-        let mut runtime_idx = program.functions.len() as u32;
+        let num_imports = program.functions.iter().filter(|f| f.extern_import.is_some()).count() as u32;
+        let num_non_extern = program.functions.len() as u32 - num_imports;
+        let mut import_idx = 0u32;
+        let mut non_extern_idx = 0u32;
+        for (_i, func) in program.functions.iter().enumerate() {
+            let param_tys: Vec<Type> = func.params.iter().map(|p| {
+                if p.variadic { Type::Array(Box::new(p.ty.clone())) } else { p.ty.clone() }
+            }).collect();
+            let key = if *name_count.get(&func.name).unwrap_or(&0) > 1 {
+                Self::mangle_key(&func.name, &param_tys)
+            } else {
+                func.name.clone()
+            };
+            let wasm_idx = if func.extern_import.is_some() {
+                let idx = import_idx;
+                import_idx += 1;
+                idx
+            } else {
+                let idx = num_imports + non_extern_idx;
+                non_extern_idx += 1;
+                idx
+            };
+            self.func_indices.insert(key, wasm_idx);
+        }
+        // 运行时辅助函数类型（类型索引仍为 program.functions.len() + 0,1,...）
+        let runtime_type_base = program.functions.len() as u32;
+        let runtime_func_base = num_imports + num_non_extern;
 
         // __pow_i64(i64, i64) -> i64
         types.ty().function([ValType::I64, ValType::I64], [ValType::I64]);
-        self.func_types.insert("__pow_i64".to_string(), runtime_idx);
-        self.func_indices.insert("__pow_i64".to_string(), runtime_idx);
-        runtime_idx += 1;
+        self.func_types.insert("__pow_i64".to_string(), runtime_type_base);
+        self.func_indices.insert("__pow_i64".to_string(), runtime_func_base);
 
         // __str_concat(i32, i32) -> i32
         types.ty().function([ValType::I32, ValType::I32], [ValType::I32]);
-        self.func_types.insert("__str_concat".to_string(), runtime_idx);
-        self.func_indices.insert("__str_concat".to_string(), runtime_idx);
-        runtime_idx += 1;
+        self.func_types.insert("__str_concat".to_string(), runtime_type_base + 1);
+        self.func_indices.insert("__str_concat".to_string(), runtime_func_base + 1);
 
         // __i64_to_str(i64) -> i32
         types.ty().function([ValType::I64], [ValType::I32]);
-        self.func_types.insert("__i64_to_str".to_string(), runtime_idx);
-        self.func_indices.insert("__i64_to_str".to_string(), runtime_idx);
-        runtime_idx += 1;
+        self.func_types.insert("__i64_to_str".to_string(), runtime_type_base + 2);
+        self.func_indices.insert("__i64_to_str".to_string(), runtime_func_base + 2);
 
         // __i32_to_str(i32) -> i32
         types.ty().function([ValType::I32], [ValType::I32]);
-        self.func_types.insert("__i32_to_str".to_string(), runtime_idx);
-        self.func_indices.insert("__i32_to_str".to_string(), runtime_idx);
-        runtime_idx += 1;
+        self.func_types.insert("__i32_to_str".to_string(), runtime_type_base + 3);
+        self.func_indices.insert("__i32_to_str".to_string(), runtime_func_base + 3);
 
         // __f64_to_str(f64) -> i32
         types.ty().function([ValType::F64], [ValType::I32]);
-        self.func_types.insert("__f64_to_str".to_string(), runtime_idx);
-        self.func_indices.insert("__f64_to_str".to_string(), runtime_idx);
-        runtime_idx += 1;
+        self.func_types.insert("__f64_to_str".to_string(), runtime_type_base + 4);
+        self.func_indices.insert("__f64_to_str".to_string(), runtime_func_base + 4);
 
         // __f32_to_str(f32) -> i32
         types.ty().function([ValType::F32], [ValType::I32]);
-        self.func_types.insert("__f32_to_str".to_string(), runtime_idx);
-        self.func_indices.insert("__f32_to_str".to_string(), runtime_idx);
-        runtime_idx += 1;
+        self.func_types.insert("__f32_to_str".to_string(), runtime_type_base + 5);
+        self.func_indices.insert("__f32_to_str".to_string(), runtime_func_base + 5);
 
         // __bool_to_str(i32) -> i32
         types.ty().function([ValType::I32], [ValType::I32]);
-        self.func_types.insert("__bool_to_str".to_string(), runtime_idx);
-        self.func_indices.insert("__bool_to_str".to_string(), runtime_idx);
+        self.func_types.insert("__bool_to_str".to_string(), runtime_type_base + 6);
+        self.func_indices.insert("__bool_to_str".to_string(), runtime_func_base + 6);
+
+        // 标准库雏形：min/max/abs (Int64)
+        types.ty().function([ValType::I64, ValType::I64], [ValType::I64]);
+        self.func_types.insert("__min_i64".to_string(), runtime_type_base + 7);
+        self.func_indices.insert("__min_i64".to_string(), runtime_func_base + 7);
+        types.ty().function([ValType::I64, ValType::I64], [ValType::I64]);
+        self.func_types.insert("__max_i64".to_string(), runtime_type_base + 8);
+        self.func_indices.insert("__max_i64".to_string(), runtime_func_base + 8);
+        types.ty().function([ValType::I64], [ValType::I64]);
+        self.func_types.insert("__abs_i64".to_string(), runtime_type_base + 9);
+        self.func_indices.insert("__abs_i64".to_string(), runtime_func_base + 9);
 
         module.section(&types);
 
-        // 2. 函数段 (Function Section)
-        let mut functions = FunctionSection::new();
-        for i in 0..program.functions.len() {
-            functions.function(i as u32);
+        // 2. 导入段 (Import Section) — extern func
+        let mut imports = ImportSection::new();
+        for (i, func) in program.functions.iter().enumerate() {
+            if let Some(ref imp) = func.extern_import {
+                imports.import(&imp.module, &imp.name, EntityType::Function(i as u32));
+            }
         }
-        // 运行时辅助函数
-        let num_user_funcs = program.functions.len() as u32;
-        functions.function(num_user_funcs);     // __pow_i64
-        functions.function(num_user_funcs + 1); // __str_concat
-        functions.function(num_user_funcs + 2); // __i64_to_str
-        functions.function(num_user_funcs + 3); // __i32_to_str
-        functions.function(num_user_funcs + 4); // __f64_to_str
-        functions.function(num_user_funcs + 5); // __f32_to_str
-        functions.function(num_user_funcs + 6); // __bool_to_str
+        if num_imports > 0 {
+            module.section(&imports);
+        }
+
+        // 3. 函数段 (Function Section)：仅非 extern 的 type 索引
+        let mut functions = FunctionSection::new();
+        for (i, func) in program.functions.iter().enumerate() {
+            if func.extern_import.is_none() {
+                functions.function(i as u32);
+            }
+        }
+        for r in 0..10u32 {
+            functions.function(runtime_type_base + r);
+        }
         module.section(&functions);
 
         // 3. 内存段 (Memory Section)
@@ -232,30 +268,32 @@ impl CodeGen {
         );
         module.section(&globals);
 
-        // 5. 导出段：单一定义用原名，重载用修饰名
+        // 5. 导出段：仅导出非 extern 函数，单一定义用原名，重载用修饰名
         let mut exports = ExportSection::new();
-        for (i, func) in program.functions.iter().enumerate() {
-            // 可变参数类型转为 Array<T>
+        for func in &program.functions {
+            if func.extern_import.is_some() {
+                continue;
+            }
             let param_tys: Vec<Type> = func.params.iter().map(|p| {
-                if p.variadic {
-                    Type::Array(Box::new(p.ty.clone()))
-                } else {
-                    p.ty.clone()
-                }
+                if p.variadic { Type::Array(Box::new(p.ty.clone())) } else { p.ty.clone() }
             }).collect();
             let key = if *name_count.get(&func.name).unwrap_or(&0) > 1 {
                 Self::mangle_key(&func.name, &param_tys)
             } else {
                 func.name.clone()
             };
-            exports.export(&key, ExportKind::Func, i as u32);
+            let idx = *self.func_indices.get(&key).expect("导出时函数索引");
+            exports.export(&key, ExportKind::Func, idx);
         }
         exports.export("memory", ExportKind::Memory, 0);
         module.section(&exports);
 
-        // 6. 代码段 (Code Section)
+        // 6. 代码段 (Code Section)：仅非 extern 函数
         let mut codes = CodeSection::new();
         for func in &program.functions {
+            if func.extern_import.is_some() {
+                continue;
+            }
             let wasm_func = self.compile_function(func);
             codes.function(&wasm_func);
         }
@@ -267,6 +305,9 @@ impl CodeGen {
         codes.function(&self.emit_f64_to_str());
         codes.function(&self.emit_f32_to_str());
         codes.function(&self.emit_bool_to_str());
+        codes.function(&self.emit_min_i64());
+        codes.function(&self.emit_max_i64());
+        codes.function(&self.emit_abs_i64());
         module.section(&codes);
 
         // 7. 数据段 (Data Section) - 字符串常量
@@ -751,6 +792,56 @@ impl CodeGen {
         f
     }
 
+    /// 标准库雏形：min(a, b) -> i64，局部 0=a, 1=b
+    fn emit_min_i64(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![]);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64LtS);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::Else);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 标准库雏形：max(a, b) -> i64
+    fn emit_max_i64(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![]);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64GtS);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::Else);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 标准库雏形：abs(x) -> i64
+    fn emit_abs_i64(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![]);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::I64LtS);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64Const(-1));
+        f.instruction(&Instruction::I64Mul);
+        f.instruction(&Instruction::Else);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
     /// 收集局部变量
     fn collect_locals(&self, stmt: &Stmt, locals: &mut LocalsBuilder) {
         match stmt {
@@ -1029,6 +1120,10 @@ impl CodeGen {
             Expr::Call { name, args } => {
                 if self.structs.contains_key(name) {
                     Some(Type::Struct(name.clone()))
+                } else if (name == "min" || name == "max") && args.len() == 2
+                    || (name == "abs" && args.len() == 1)
+                {
+                    Some(Type::Int64)
                 } else {
                     let arg_tys: Vec<Type> = args
                         .iter()
@@ -1091,6 +1186,10 @@ impl CodeGen {
             Expr::Call { name, args } => {
                 if self.structs.contains_key(name) {
                     Some(Type::Struct(name.clone()))
+                } else if (name == "min" || name == "max") && args.len() == 2
+                    || (name == "abs" && args.len() == 1)
+                {
+                    Some(Type::Int64)
                 } else {
                     let arg_tys: Vec<Type> = args
                         .iter()
@@ -1214,6 +1313,10 @@ impl CodeGen {
             Expr::Call { name, args } => {
                 if self.structs.contains_key(name) {
                     ValType::I32
+                } else if (name == "min" || name == "max") && args.len() == 2
+                    || (name == "abs" && args.len() == 1)
+                {
+                    ValType::I64
                 } else {
                     let arg_tys: Vec<Type> = args
                         .iter()
@@ -1991,6 +2094,25 @@ impl CodeGen {
                         fields,
                     };
                     self.compile_expr(&init, locals, func, loop_ctx);
+                } else if name == "min" && args.len() == 2
+                    && self.infer_ast_type_with_locals(&args[0], locals).as_ref() == Some(&Type::Int64)
+                    && self.infer_ast_type_with_locals(&args[1], locals).as_ref() == Some(&Type::Int64)
+                {
+                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                    self.compile_expr(&args[1], locals, func, loop_ctx);
+                    func.instruction(&Instruction::Call(self.get_or_create_func_index("__min_i64")));
+                } else if name == "max" && args.len() == 2
+                    && self.infer_ast_type_with_locals(&args[0], locals).as_ref() == Some(&Type::Int64)
+                    && self.infer_ast_type_with_locals(&args[1], locals).as_ref() == Some(&Type::Int64)
+                {
+                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                    self.compile_expr(&args[1], locals, func, loop_ctx);
+                    func.instruction(&Instruction::Call(self.get_or_create_func_index("__max_i64")));
+                } else if name == "abs" && args.len() == 1
+                    && self.infer_ast_type_with_locals(&args[0], locals).as_ref() == Some(&Type::Int64)
+                {
+                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                    func.instruction(&Instruction::Call(self.get_or_create_func_index("__abs_i64")));
                 } else {
                     let arg_tys: Vec<Type> = args
                         .iter()
@@ -2882,6 +3004,7 @@ mod tests {
                 params: vec![],
                 return_type: Some(Type::Int64),
                 body: vec![Stmt::Return(Some(Expr::Integer(42)))],
+                extern_import: None,
             }],
         };
 
@@ -2916,6 +3039,7 @@ mod tests {
                 name: "test".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int32),
+                extern_import: None,
                 body: vec![
                     Stmt::Let {
                         pattern: Pattern::Binding("p".to_string()),
@@ -2967,6 +3091,7 @@ mod tests {
                 name: "get_y".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int64),
+                extern_import: None,
                 body: vec![
                     Stmt::Let {
                         pattern: Pattern::Binding("p".to_string()),
@@ -3009,6 +3134,7 @@ mod tests {
                     left: Box::new(Expr::Integer(10)),
                     right: Box::new(Expr::Integer(32)),
                 }))],
+                extern_import: None,
             }],
         };
 
@@ -3052,6 +3178,7 @@ mod tests {
                     then_branch: Box::new(Expr::Var("a".to_string())),
                     else_branch: Some(Box::new(Expr::Var("b".to_string()))),
                 }))],
+                extern_import: None,
             }],
         };
 
@@ -3072,6 +3199,7 @@ mod tests {
                 name: "first".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int64),
+                extern_import: None,
                 body: vec![
                     Stmt::Let {
                         pattern: Pattern::Binding("arr".to_string()),
@@ -3129,6 +3257,7 @@ mod tests {
                         },
                     ],
                 }))],
+                extern_import: None,
             }],
         };
 
@@ -3149,6 +3278,7 @@ mod tests {
                 name: "sum_range".to_string(),
                 params: vec![],
                 return_type: Some(Type::Int64),
+                extern_import: None,
                 body: vec![
                     Stmt::Var {
                         name: "sum".to_string(),
@@ -3198,6 +3328,7 @@ mod tests {
                     left: Box::new(Expr::Float(1.5)),
                     right: Box::new(Expr::Float(2.5)),
                 }))],
+                extern_import: None,
             }],
         };
 
@@ -3220,6 +3351,7 @@ mod tests {
                     params: vec![],
                     return_type: Some(Type::Int64),
                     body: vec![Stmt::Return(Some(Expr::Integer(1)))],
+                    extern_import: None,
                 },
                 FuncDef {
                     visibility: Visibility::default(),
@@ -3230,6 +3362,7 @@ mod tests {
                         name: "one".to_string(),
                         args: vec![],
                     }))],
+                    extern_import: None,
                 },
             ],
         };
