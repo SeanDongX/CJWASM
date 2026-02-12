@@ -876,7 +876,7 @@ pow(base, exp)
 
 ### 15.1 当前版本: v0.2.0
 
-正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。v0.2.0 剩余工作为 Lambda codegen，详见 [next_steps.md](next_steps.md)。
+正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。v0.2.0 全部完成，下一步计划详见 [next_steps.md](next_steps.md)。
 
 #### 已完成功能
 
@@ -926,7 +926,7 @@ pow(base, exp)
 - [x] 原始字符串 (`r"raw\nstring"`，不处理转义)
 - [x] 范围作为值 (`let r = 0..10`，类型为 Range)
 - [x] 构造函数语法糖 (`Point(1, 2)` 转换为 `Point { x: 1, y: 2 }`)
-- [x] Lambda 表达式（解析：`(x: Int64) -> Int64 { body }` 和 `{ x: Int64 => body }`；codegen 需 WASM Table + call_indirect，待实现）
+- [x] Lambda 表达式（`(x: Int64) -> Int64 { body }` 和 `{ x: Int64 => body }`；codegen 通过 WASM Table + call_indirect 实现）
 - [x] 默认参数 (`func power(base: Int64, exp: Int64 = 2)`)
 - [x] 可变参数 (`func sum(args: Int64...)`)
 - [x] 函数重载（按参数类型区分，名称修饰）
@@ -949,13 +949,9 @@ pow(base, exp)
 - [x] 泛型单态化（泛型函数、泛型结构体；显式类型实参如 `identity<Int64>(42)`、`Pair<Int64,Int64>{...}`）
 - [x] 接口与类（解析：interface、implements、class、init、deinit、extends、override、super；无继承类展平为结构体编译；super codegen、init 中 this、继承类 vtable 待完善）
 
-#### 进行中
+#### v0.2.0 已完成
 
-- （暂无）
-
-#### v0.2.0 剩余工作
-
-- [ ] Lambda 表达式 codegen（需 WASM Table 段 + call_indirect；解析已实现）
+v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirect）。
 
 #### 未来版本计划（v0.3.0+）
 
@@ -1027,5 +1023,5 @@ var      where    while
 
 ---
 
-*文档版本: 1.4.5*
-*最后更新: 2026-02（与 next_steps.md 同步：v0.2.0 剩余 Lambda codegen；v0.3.0+ 计划继承/vtable/super/init/接口多态）*
+*文档版本: 1.5.0*
+*最后更新: 2026-02-12（v0.2.0 完成，含 Lambda codegen；v0.3.0 计划：Phase 2 类型/表达式补全，Phase 3 类与继承）*
