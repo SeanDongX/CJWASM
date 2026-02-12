@@ -872,9 +872,11 @@ pow(base, exp)
 
 ## 15. 实现状态
 
-### 15.1 当前版本: v0.1.0
+*未完成特性的完整实施计划见 [docs/next_steps.md](next_steps.md)。*
 
-正文第 1–7 节各表「状态」列已与本节一致，已实现项均已标为 [x]。
+### 15.1 当前版本: v0.2.0
+
+正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。v0.2.0 剩余工作为 Lambda codegen，详见 [next_steps.md](next_steps.md)。
 
 #### 已完成功能
 
@@ -921,13 +923,15 @@ pow(base, exp)
 - [x] 枚举方法（func Enum.method(self: Enum)，与结构体方法一致）
 - [x] 关联值枚举（变体可带单关联类型如 Ok(Int64)，堆布局 [判别式][payload]，match 解构绑定）
 - [x] 多行字符串 (`"""..."""`，自动 strip 公共缩进)
+- [x] 原始字符串 (`r"raw\nstring"`，不处理转义)
 - [x] 范围作为值 (`let r = 0..10`，类型为 Range)
 - [x] 构造函数语法糖 (`Point(1, 2)` 转换为 `Point { x: 1, y: 2 }`)
-- [x] Lambda 表达式 (`(x: Int64) -> Int64 { x * 2 }` 和 `{ x: Int64 => x * 2 }`，函数表索引)
+- [x] Lambda 表达式（解析：`(x: Int64) -> Int64 { body }` 和 `{ x: Int64 => body }`；codegen 需 WASM Table + call_indirect，待实现）
 - [x] 默认参数 (`func power(base: Int64, exp: Int64 = 2)`)
 - [x] 可变参数 (`func sum(args: Int64...)`)
 - [x] 函数重载（按参数类型区分，名称修饰）
 - [x] 解构绑定 (`let Point { x, y } = p`)
+- [x] 解构匹配 (`Point { x, y } =>` 等 match 分支)
 - [x] if-let 模式 (`if let x = expr { ... }`)
 - [x] while-let 模式 (`while let x = expr { ... }`)
 - [x] Option<T> 类型 (`Some(value)` / `None`，堆布局 [tag:i32][value])
@@ -942,27 +946,29 @@ pow(base, exp)
 - [x] 优化器（常量折叠：整数/浮点二元运算、一元 Neg/Not，编译前 AST 优化）
 - [x] extern func 与 @import（`@import("module","name") extern func ...`，生成 WASM 导入段）
 - [x] 内置数学函数（`min(a,b)`、`max(a,b)`、`abs(x)`，Int64）
+- [x] 泛型单态化（泛型函数、泛型结构体；显式类型实参如 `identity<Int64>(42)`、`Pair<Int64,Int64>{...}`）
+- [x] 接口与类（解析：interface、implements、class、init、deinit、extends、override、super；无继承类展平为结构体编译；super codegen、init 中 this、继承类 vtable 待完善）
 
 #### 进行中
 
 - （暂无）
 
-#### 下一版本 (v0.2.0) 计划
+#### v0.2.0 剩余工作
 
-- [x] Lambda 表达式（需 table / call_indirect）
-- [x] 范围作为值 (let r = 0..10)
-- [x] 多行字符串 ("""...""")
-- [x] 构造函数语法糖 (Point(1, 2))
-- [x] 字符串插值 ("Hello, ${name}!")
+- [ ] Lambda 表达式 codegen（需 WASM Table 段 + call_indirect；解析已实现）
 
-#### 未来版本计划（第三优先级 v0.3.0+）
+#### 未来版本计划（v0.3.0+）
 
-- [ ] 泛型（类型参数、单态化）
-- [ ] 接口/Trait（implements、多态）
-- [ ] 类与继承（init/deinit、override、super）
+- [x] 泛型（类型参数、单态化；显式类型实参已实现）
+- [x] 接口/Trait（解析：interface、implements；多态 codegen 待完善）
+- [x] 类与继承（解析：class、init、deinit、extends、override、super；无继承类展平编译；vtable/继承 codegen 待完善）
+- [ ] 继承类布局与 vtable（子类含父类字段，vtable 方法分派）
+- [ ] super 调用的 codegen
+- [ ] init 中 this 的语义
+- [ ] 接口约束与多态
 - [ ] 模块系统（包管理、多文件链接；当前已支持 module/import/可见性）
 - [x] WASI 支持（extern func + @import 已实现；fd/clock/random 等由运行时提供）
-- [x] 标准库（雏形：min/max/abs 内置；std.core/io/collections 等待做）
+- [x] 标准库（雏形：min/max/abs 内置；std.core/io/collections 待做）
 - [x] 优化器（常量折叠已实现；死代码消除、内联待做）
 
 ---
@@ -1021,5 +1027,5 @@ var      where    while
 
 ---
 
-*文档版本: 1.4.3*
-*最后更新: 2026-02（与当前实现同步：含 extern func + @import、标准库雏形 min/max/abs、优化器常量折叠；未来计划见 15.1 未来版本计划）*
+*文档版本: 1.4.5*
+*最后更新: 2026-02（与 next_steps.md 同步：v0.2.0 剩余 Lambda codegen；v0.3.0+ 计划继承/vtable/super/init/接口多态）*
