@@ -61,7 +61,9 @@ fn main() {
     // 优化（常量折叠等）
     cjwasm::optimizer::optimize_program(&mut program);
 
-    // 代码生成
+    // 泛型单态化：生成特化版本并替换调用点
+    cjwasm::monomorph::monomorphize_program(&mut program);
+
     let mut codegen = CodeGen::new();
     let wasm = codegen.compile(&program);
 

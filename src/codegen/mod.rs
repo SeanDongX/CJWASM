@@ -64,7 +64,13 @@ impl CodeGen {
             Type::Unit => "Unit".to_string(),
             Type::String => "String".to_string(),
             Type::Array(inner) => format!("Array_{}", Self::type_mangle_suffix(inner)),
-            Type::Struct(s) => s.clone(),
+            Type::Struct(s, args) => {
+                if args.is_empty() {
+                    s.clone()
+                } else {
+                    format!("{}_{}", s, args.iter().map(Self::type_mangle_suffix).collect::<Vec<_>>().join("_"))
+                }
+            }
             Type::Range => "Range".to_string(),
             Type::Function { params, ret } => {
                 let params_str = params.iter().map(Self::type_mangle_suffix).collect::<Vec<_>>().join("_");
@@ -73,6 +79,7 @@ impl CodeGen {
             }
             Type::Option(inner) => format!("Option_{}", Self::type_mangle_suffix(inner)),
             Type::Result(ok, err) => format!("Result_{}_{}", Self::type_mangle_suffix(ok), Self::type_mangle_suffix(err)),
+            Type::TypeParam(name) => name.clone(), // 单态化前用于名字修饰的占位
         }
     }
 
@@ -100,6 +107,20 @@ impl CodeGen {
         for s in &program.structs {
             self.structs.insert(s.name.clone(), s.clone());
         }
+        // 将类（无继承）展平为结构体，并将方法加入函数列表
+        for c in &program.classes {
+            if c.extends.is_none() {
+                self.structs.insert(
+                    c.name.clone(),
+                    StructDef {
+                        visibility: c.visibility.clone(),
+                        name: c.name.clone(),
+                        type_params: vec![],
+                        fields: c.fields.clone(),
+                    },
+                );
+            }
+        }
         for e in &program.enums {
             self.enums.insert(e.name.clone(), e.clone());
         }
@@ -107,8 +128,23 @@ impl CodeGen {
         // 收集字符串常量
         self.collect_strings(program);
 
-        let name_count: HashMap<String, usize> = program
+        // 暂不编译泛型函数（单态化待实现），仅编译已单态化的函数
+        let mut functions: Vec<_> = program
             .functions
+            .iter()
+            .filter(|f| f.type_params.is_empty() || f.extern_import.is_some())
+            .cloned()
+            .collect();
+        // 添加类方法（无继承的类）
+        for c in &program.classes {
+            if c.extends.is_none() {
+                for m in &c.methods {
+                    functions.push(m.func.clone());
+                }
+            }
+        }
+
+        let name_count: HashMap<String, usize> = functions
             .iter()
             .map(|f| f.name.clone())
             .fold(HashMap::new(), |mut m, n| {
@@ -119,7 +155,7 @@ impl CodeGen {
 
         // 1. 类型段 (Type Section)，重载时按参数类型名字修饰
         let mut types = TypeSection::new();
-        for (i, func) in program.functions.iter().enumerate() {
+        for (i, func) in functions.iter().enumerate() {
             // 可变参数类型转为 Array<T>
             let param_tys: Vec<Type> = func.params.iter().map(|p| {
                 if p.variadic {
@@ -146,11 +182,11 @@ impl CodeGen {
             }
             self.func_params.insert(key, func.params.clone());
         }
-        let num_imports = program.functions.iter().filter(|f| f.extern_import.is_some()).count() as u32;
-        let num_non_extern = program.functions.len() as u32 - num_imports;
+        let num_imports = functions.iter().filter(|f| f.extern_import.is_some()).count() as u32;
+        let num_non_extern = functions.len() as u32 - num_imports;
         let mut import_idx = 0u32;
         let mut non_extern_idx = 0u32;
-        for (_i, func) in program.functions.iter().enumerate() {
+        for (_i, func) in functions.iter().enumerate() {
             let param_tys: Vec<Type> = func.params.iter().map(|p| {
                 if p.variadic { Type::Array(Box::new(p.ty.clone())) } else { p.ty.clone() }
             }).collect();
@@ -170,8 +206,8 @@ impl CodeGen {
             };
             self.func_indices.insert(key, wasm_idx);
         }
-        // 运行时辅助函数类型（类型索引仍为 program.functions.len() + 0,1,...）
-        let runtime_type_base = program.functions.len() as u32;
+        // 运行时辅助函数类型（类型索引仍为 functions.len() + 0,1,...）
+        let runtime_type_base = functions.len() as u32;
         let runtime_func_base = num_imports + num_non_extern;
 
         // __pow_i64(i64, i64) -> i64
@@ -224,7 +260,7 @@ impl CodeGen {
 
         // 2. 导入段 (Import Section) — extern func
         let mut imports = ImportSection::new();
-        for (i, func) in program.functions.iter().enumerate() {
+        for (i, func) in functions.iter().enumerate() {
             if let Some(ref imp) = func.extern_import {
                 imports.import(&imp.module, &imp.name, EntityType::Function(i as u32));
             }
@@ -234,16 +270,16 @@ impl CodeGen {
         }
 
         // 3. 函数段 (Function Section)：仅非 extern 的 type 索引
-        let mut functions = FunctionSection::new();
-        for (i, func) in program.functions.iter().enumerate() {
+        let mut func_section = FunctionSection::new();
+        for (i, func) in functions.iter().enumerate() {
             if func.extern_import.is_none() {
-                functions.function(i as u32);
+                func_section.function(i as u32);
             }
         }
         for r in 0..10u32 {
-            functions.function(runtime_type_base + r);
+            func_section.function(runtime_type_base + r);
         }
-        module.section(&functions);
+        module.section(&func_section);
 
         // 3. 内存段 (Memory Section)
         let mut memories = MemorySection::new();
@@ -270,7 +306,7 @@ impl CodeGen {
 
         // 5. 导出段：仅导出非 extern 函数，单一定义用原名，重载用修饰名
         let mut exports = ExportSection::new();
-        for func in &program.functions {
+        for func in &functions {
             if func.extern_import.is_some() {
                 continue;
             }
@@ -290,7 +326,7 @@ impl CodeGen {
 
         // 6. 代码段 (Code Section)：仅非 extern 函数
         let mut codes = CodeSection::new();
-        for func in &program.functions {
+        for func in &functions {
             if func.extern_import.is_some() {
                 continue;
             }
@@ -392,6 +428,11 @@ impl CodeGen {
             }
             Expr::MethodCall { object, args, .. } => {
                 self.collect_strings_in_expr(object);
+                for arg in args {
+                    self.collect_strings_in_expr(arg);
+                }
+            }
+            Expr::SuperCall { args, .. } => {
                 for arg in args {
                     self.collect_strings_in_expr(arg);
                 }
@@ -1025,6 +1066,11 @@ impl CodeGen {
                     self.collect_locals_from_expr(arg, locals);
                 }
             }
+            Expr::SuperCall { args, .. } => {
+                for arg in args {
+                    self.collect_locals_from_expr(arg, locals);
+                }
+            }
             Expr::If {
                 cond,
                 then_branch,
@@ -1114,12 +1160,12 @@ impl CodeGen {
                 .first()
                 .and_then(|e| self.infer_ast_type(e).map(|t| Type::Array(Box::new(t))))
                 .or(Some(Type::Array(Box::new(Type::Int64)))),
-            Expr::StructInit { name, .. } => Some(Type::Struct(name.clone())),
-            Expr::ConstructorCall { name, .. } => Some(Type::Struct(name.clone())),
-            Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone())),
-            Expr::Call { name, args } => {
+            Expr::StructInit { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
+            Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
+            Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone(), vec![])),
+            Expr::Call { name, type_args: _, args } => {
                 if self.structs.contains_key(name) {
-                    Some(Type::Struct(name.clone()))
+                    Some(Type::Struct(name.clone(), vec![]))
                 } else if (name == "min" || name == "max") && args.len() == 2
                     || (name == "abs" && args.len() == 1)
                 {
@@ -1142,6 +1188,7 @@ impl CodeGen {
                 }
             }
             Expr::MethodCall { .. } => None, // 需结合 locals 推断，调用处可写类型注解
+            Expr::SuperCall { .. } => None, // super 调用，需结合父类推断
             Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
             Expr::IfLet { then_branch, .. } => self.infer_ast_type(then_branch),
             Expr::Lambda { params, return_type, .. } => {
@@ -1180,12 +1227,12 @@ impl CodeGen {
                 .first()
                 .and_then(|e| self.infer_ast_type_with_locals(e, locals).map(|t| Type::Array(Box::new(t))))
                 .or(Some(Type::Array(Box::new(Type::Int64)))),
-            Expr::StructInit { name, .. } => Some(Type::Struct(name.clone())),
-            Expr::ConstructorCall { name, .. } => Some(Type::Struct(name.clone())),
-            Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone())),
-            Expr::Call { name, args } => {
+            Expr::StructInit { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
+            Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
+            Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone(), vec![])),
+            Expr::Call { name, type_args: _, args } => {
                 if self.structs.contains_key(name) {
-                    Some(Type::Struct(name.clone()))
+                    Some(Type::Struct(name.clone(), vec![]))
                 } else if (name == "min" || name == "max") && args.len() == 2
                     || (name == "abs" && args.len() == 1)
                 {
@@ -1208,11 +1255,12 @@ impl CodeGen {
                 }
             }
             Expr::MethodCall { .. } => None,
+            Expr::SuperCall { .. } => None,
             Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
             Expr::IfLet { then_branch, .. } => self.infer_ast_type_with_locals(then_branch, locals),
             Expr::Field { object, field, .. } => {
                 self.infer_ast_type_with_locals(object, locals).and_then(|ty| {
-                    if let Type::Struct(s) = ty {
+                    if let Type::Struct(s, _) = ty {
                         self.structs.get(&s).and_then(|def| {
                             def.fields.iter().find(|f| f.name == *field).map(|f| f.ty.clone())
                         })
@@ -1259,8 +1307,8 @@ impl CodeGen {
     fn get_object_type(&self, expr: &Expr, locals: &LocalsBuilder) -> Option<Type> {
         match expr {
             Expr::Var(name) => locals.get_type(name).cloned(),
-            Expr::StructInit { name, .. } => Some(Type::Struct(name.clone())),
-            Expr::ConstructorCall { name, .. } => Some(Type::Struct(name.clone())),
+            Expr::StructInit { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
+            Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
             Expr::Field { object, .. } => self.get_object_type(object, locals),
             _ => None,
         }
@@ -1310,7 +1358,7 @@ impl CodeGen {
             Expr::Array(_) => ValType::I32,
             Expr::StructInit { .. } => ValType::I32,
             Expr::ConstructorCall { .. } => ValType::I32,
-            Expr::Call { name, args } => {
+            Expr::Call { name, type_args: _, args } => {
                 if self.structs.contains_key(name) {
                     ValType::I32
                 } else if (name == "min" || name == "max") && args.len() == 2
@@ -1444,7 +1492,7 @@ impl CodeGen {
                         let (offset, field_ty) = locals
                             .get_type(object)
                             .and_then(|ty| match ty {
-                                Type::Struct(name) => self.structs.get(name).and_then(|def| {
+                                Type::Struct(name, _) => self.structs.get(name).and_then(|def| {
                                     let off = def.field_offset(field)?;
                                     let ft = def.field_type(field)?.clone();
                                     Some((off, ft))
@@ -1588,7 +1636,7 @@ impl CodeGen {
                         }
                     }
                     Pattern::Struct { name: struct_name, fields } => {
-                        let handled = if let Some(Type::Struct(ref sub_name)) = subject_ast_type {
+                        let handled = if let Some(Type::Struct(ref sub_name, _)) = subject_ast_type {
                             sub_name == struct_name && self.structs.contains_key(struct_name)
                         } else {
                             false
@@ -2073,7 +2121,7 @@ impl CodeGen {
                     func.instruction(&conv);
                 }
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, type_args: _, args } => {
                 if let Some(struct_def) = self.structs.get(name) {
                     if args.len() != struct_def.fields.len() {
                         panic!(
@@ -2091,6 +2139,7 @@ impl CodeGen {
                         .collect();
                     let init = Expr::StructInit {
                         name: name.clone(),
+                        type_args: None,
                         fields,
                     };
                     self.compile_expr(&init, locals, func, loop_ctx);
@@ -2149,6 +2198,9 @@ impl CodeGen {
                     func.instruction(&Instruction::Call(idx));
                 }
             }
+            Expr::SuperCall { method, args } => {
+                panic!("super 调用暂未实现，需父类上下文与 vtable 支持");
+            }
             Expr::MethodCall { object, method, args } => {
                 let type_name_opt = if let Expr::Var(ref n) = object.as_ref() {
                     Some(n.clone())
@@ -2165,7 +2217,7 @@ impl CodeGen {
                     let struct_ty = self
                         .get_object_type(object, locals)
                         .and_then(|ty| match ty {
-                            Type::Struct(s) => Some(s),
+                            Type::Struct(s, _) => Some(s),
                             _ => None,
                         });
                     struct_ty
@@ -2268,7 +2320,7 @@ impl CodeGen {
                     memory_index: 0,
                 }));
             }
-            Expr::StructInit { name, fields } => {
+            Expr::StructInit { name, type_args, fields } => {
                 let struct_def = self.structs.get(name).expect("结构体未定义");
                 let struct_size = struct_def.size();
 
@@ -2300,7 +2352,7 @@ impl CodeGen {
 
                 // 返回结构体地址 (已在栈上)
             }
-            Expr::ConstructorCall { name, args } => {
+            Expr::ConstructorCall { name, type_args, args } => {
                 // 构造函数调用转换为 StructInit
                 let struct_def = self.structs.get(name).expect(&format!("结构体 {} 未定义", name));
                 if args.len() != struct_def.fields.len() {
@@ -2319,6 +2371,7 @@ impl CodeGen {
                     .collect();
                 let init = Expr::StructInit {
                     name: name.clone(),
+                    type_args: None,
                     fields,
                 };
                 self.compile_expr(&init, locals, func, loop_ctx);
@@ -2328,7 +2381,7 @@ impl CodeGen {
                 let (offset, field_ty) = self
                     .get_object_type(object, locals)
                     .and_then(|ty| match ty {
-                        Type::Struct(ref name) => self.structs.get(name).and_then(|def| {
+                        Type::Struct(ref name, _) => self.structs.get(name).and_then(|def| {
                             let off = def.field_offset(field)?;
                             let ft = def.field_type(field)?.clone();
                             Some((off, ft))
@@ -2537,7 +2590,7 @@ impl CodeGen {
                             variant_name,
                             binding,
                         } => {
-                            let handled = if let Some(Type::Struct(ref name)) = subject_ast_type {
+                            let handled = if let Some(Type::Struct(ref name, _)) = subject_ast_type {
                                 name == enum_name
                                     && self.enums.contains_key(name)
                                     && self.enums[name].variant_index(variant_name).is_some()
@@ -2691,7 +2744,7 @@ impl CodeGen {
                             func.instruction(&Instruction::End);
                         }
                         Pattern::Struct { name: struct_name, fields } => {
-                            let handled = if let Some(Type::Struct(ref sub_name)) = subject_ast_type {
+                            let handled = if let Some(Type::Struct(ref sub_name, _)) = subject_ast_type {
                                 sub_name == struct_name && self.structs.contains_key(struct_name)
                             } else {
                                 false
@@ -2997,10 +3050,13 @@ mod tests {
             module_name: None,
             imports: vec![],
             structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "answer".to_string(),
+                type_params: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 body: vec![Stmt::Return(Some(Expr::Integer(42)))],
@@ -3022,6 +3078,7 @@ mod tests {
             structs: vec![StructDef {
                 visibility: Visibility::default(),
                 name: "Point".to_string(),
+                type_params: vec![],
                 fields: vec![
                     FieldDef {
                         name: "x".to_string(),
@@ -3033,19 +3090,23 @@ mod tests {
                     },
                 ],
             }],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "test".to_string(),
+                type_params: vec![],
                 params: vec![],
                 return_type: Some(Type::Int32),
                 extern_import: None,
                 body: vec![
                     Stmt::Let {
                         pattern: Pattern::Binding("p".to_string()),
-                        ty: Some(Type::Struct("Point".to_string())),
+                        ty: Some(Type::Struct("Point".to_string(), vec![])),
                         value: Expr::StructInit {
                             name: "Point".to_string(),
+                            type_args: None,
                             fields: vec![
                                 ("x".to_string(), Expr::Integer(10)),
                                 ("y".to_string(), Expr::Integer(20)),
@@ -3074,6 +3135,7 @@ mod tests {
             structs: vec![StructDef {
                 visibility: Visibility::default(),
                 name: "Point".to_string(),
+                type_params: vec![],
                 fields: vec![
                     FieldDef {
                         name: "x".to_string(),
@@ -3085,19 +3147,23 @@ mod tests {
                     },
                 ],
             }],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "get_y".to_string(),
+                type_params: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 extern_import: None,
                 body: vec![
                     Stmt::Let {
                         pattern: Pattern::Binding("p".to_string()),
-                        ty: Some(Type::Struct("Point".to_string())),
+                        ty: Some(Type::Struct("Point".to_string(), vec![])),
                         value: Expr::StructInit {
                             name: "Point".to_string(),
+                            type_args: None,
                             fields: vec![
                                 ("x".to_string(), Expr::Integer(10)),
                                 ("y".to_string(), Expr::Integer(20)),
@@ -3123,10 +3189,13 @@ mod tests {
             module_name: None,
             imports: vec![],
             structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "compute".to_string(),
+                type_params: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 body: vec![Stmt::Return(Some(Expr::Binary {
@@ -3150,10 +3219,13 @@ mod tests {
             module_name: None,
             imports: vec![],
             structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "max".to_string(),
+                type_params: vec![],
                 params: vec![
                     Param {
                         name: "a".to_string(),
@@ -3193,10 +3265,13 @@ mod tests {
             module_name: None,
             imports: vec![],
             structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "first".to_string(),
+                type_params: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 extern_import: None,
@@ -3231,10 +3306,13 @@ mod tests {
             module_name: None,
             imports: vec![],
             structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "match_test".to_string(),
+                type_params: vec![],
                 params: vec![Param {
                     name: "n".to_string(),
                     ty: Type::Int64,
@@ -3272,10 +3350,13 @@ mod tests {
             module_name: None,
             imports: vec![],
             structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "sum_range".to_string(),
+                type_params: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 extern_import: None,
@@ -3317,10 +3398,13 @@ mod tests {
             module_name: None,
             imports: vec![],
             structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "fadd".to_string(),
+                type_params: vec![],
                 params: vec![],
                 return_type: Some(Type::Float64),
                 body: vec![Stmt::Return(Some(Expr::Binary {
@@ -3343,11 +3427,14 @@ mod tests {
             module_name: None,
             imports: vec![],
             structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
             enums: vec![],
             functions: vec![
                 FuncDef {
                     visibility: Visibility::default(),
                     name: "one".to_string(),
+                    type_params: vec![],
                     params: vec![],
                     return_type: Some(Type::Int64),
                     body: vec![Stmt::Return(Some(Expr::Integer(1)))],
@@ -3356,10 +3443,12 @@ mod tests {
                 FuncDef {
                     visibility: Visibility::default(),
                     name: "main".to_string(),
+                    type_params: vec![],
                     params: vec![],
                     return_type: Some(Type::Int64),
                     body: vec![Stmt::Return(Some(Expr::Call {
                         name: "one".to_string(),
+                        type_args: None,
                         args: vec![],
                     }))],
                     extern_import: None,

@@ -6,13 +6,32 @@ use std::ops::{Add, Div, Mul, Rem, Shl, Shr, Sub};
 /// 对程序做一次常量折叠（及后续可扩展的优化）。
 pub fn optimize_program(program: &mut crate::ast::Program) {
     for func in &mut program.functions {
-        for stmt in &mut func.body {
-            fold_stmt(stmt);
+        optimize_function(func);
+    }
+    for class in &mut program.classes {
+        for m in &mut class.methods {
+            optimize_function(&mut m.func);
         }
-        for param in &mut func.params {
-            if let Some(ref mut default) = param.default {
-                *default = fold_expr(default.clone());
+        if let Some(ref mut init) = class.init {
+            for stmt in &mut init.body {
+                fold_stmt(stmt);
             }
+        }
+        if let Some(ref mut deinit) = class.deinit {
+            for stmt in deinit {
+                fold_stmt(stmt);
+            }
+        }
+    }
+}
+
+fn optimize_function(func: &mut crate::ast::Function) {
+    for stmt in &mut func.body {
+        fold_stmt(stmt);
+    }
+    for param in &mut func.params {
+        if let Some(ref mut default) = param.default {
+            *default = fold_expr(default.clone());
         }
     }
 }
@@ -117,8 +136,9 @@ fn fold_expr(expr: Expr) -> Expr {
             let tail = tail.map(|e| Box::new(fold_expr(*e)));
             Block(stmts, tail)
         }
-        Call { name, args } => Call {
+        Call { name, type_args, args } => Call {
             name,
+            type_args,
             args: args.into_iter().map(fold_expr).collect(),
         },
         MethodCall {
@@ -139,8 +159,9 @@ fn fold_expr(expr: Expr) -> Expr {
             object: Box::new(fold_expr(*object)),
             field,
         },
-        StructInit { name, fields } => StructInit {
+        StructInit { name, type_args, fields } => StructInit {
             name,
+            type_args,
             fields: fields
                 .into_iter()
                 .map(|(n, e)| (n, fold_expr(e)))

@@ -226,6 +226,22 @@ pub enum Token {
     Struct,
     #[token("enum")]
     Enum,
+    #[token("class")]
+    Class,
+    #[token("interface")]
+    Interface,
+    #[token("extends")]
+    Extends,
+    #[token("implements")]
+    Implements,
+    #[token("init")]
+    Init,
+    #[token("deinit")]
+    Deinit,
+    #[token("override")]
+    Override,
+    #[token("super")]
+    Super,
 
     // 模块系统关键字
     #[token("module")]
@@ -426,6 +442,8 @@ pub enum Token {
     Colon,
     #[token(",")]
     Comma,
+    #[token(";")]
+    Semicolon,
     #[token("->")]
     Arrow,
 }

@@ -1,7 +1,7 @@
 use wasm_encoder::ValType;
 
 /// 仓颉语言类型
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Int32,
     Int64,
@@ -13,8 +13,8 @@ pub enum Type {
     String,
     /// 数组类型 Array<T>
     Array(Box<Type>),
-    /// 结构体类型
-    Struct(String),
+    /// 结构体类型 (可选类型实参，如 Point 或 Pair<Int64,String>)
+    Struct(String, Vec<Type>),
     /// 范围类型 (start..end 或 start..=end)
     /// 内存布局: [start: i64][end: i64][inclusive: i32] = 20 bytes
     Range,
@@ -28,6 +28,8 @@ pub enum Type {
     Option(Box<Type>),
     /// Result<T, E> 类型
     Result(Box<Type>, Box<Type>),
+    /// 泛型类型参数 (如 T)，仅在泛型定义体内使用，单态化时替换为具体类型
+    TypeParam(String),
 }
 
 impl Type {
@@ -43,11 +45,12 @@ impl Type {
             // 复合类型都用 i32 指针表示
             Type::String => ValType::I32,
             Type::Array(_) => ValType::I32,
-            Type::Struct(_) => ValType::I32,
+            Type::Struct(..) => ValType::I32,
             Type::Range => ValType::I32,    // 指针
             Type::Function { .. } => ValType::I32, // 函数表索引
             Type::Option(_) => ValType::I32,      // 指针
             Type::Result(_, _) => ValType::I32,   // 指针
+            Type::TypeParam(_) => panic!("TypeParam 不能直接转换为 WASM，需先单态化"),
         }
     }
 
@@ -61,11 +64,12 @@ impl Type {
             Type::Unit => 0,
             Type::String => 4,      // 指针大小
             Type::Array(_) => 4,    // 指针大小
-            Type::Struct(_) => 4,   // 指针大小
+            Type::Struct(..) => 4,   // 指针大小
             Type::Range => 4,       // 指针大小
             Type::Function { .. } => 4, // 函数表索引大小
             Type::Option(_) => 4,   // 指针大小
             Type::Result(_, _) => 4, // 指针大小
+            Type::TypeParam(_) => panic!("TypeParam 不能直接计算 size，需先单态化"),
         }
     }
 
@@ -146,14 +150,20 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
-    /// 函数调用
+    /// 函数调用 (可选显式类型实参，如 identity<Int64>(42))
     Call {
         name: String,
+        type_args: Option<Vec<Type>>,
         args: Vec<Expr>,
     },
     /// 方法调用 (obj.method(args))
     MethodCall {
         object: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+    },
+    /// super 调用：super.method(args) 或 super(args) 调用父类
+    SuperCall {
         method: String,
         args: Vec<Expr>,
     },
@@ -179,14 +189,16 @@ pub enum Expr {
         array: Box<Expr>,
         index: Box<Expr>,
     },
-    /// 结构体实例化 Point { x: 1, y: 2 }
+    /// 结构体实例化 Point { x: 1, y: 2 } 或 Pair<Int64,String> { first: 1, second: "hi" }
     StructInit {
         name: String,
+        type_args: Option<Vec<Type>>,
         fields: Vec<(String, Expr)>,
     },
-    /// 构造函数调用 Point(1, 2)，在 codegen 中根据字段定义顺序转换为 StructInit
+    /// 构造函数调用 Point(1, 2) 或 Pair<Int64,String>(1, "hi")，在 codegen 中转换为 StructInit
     ConstructorCall {
         name: String,
+        type_args: Option<Vec<Type>>,
         args: Vec<Expr>,
     },
     /// 字段访问 point.x
@@ -366,6 +378,8 @@ pub struct FieldDef {
 pub struct StructDef {
     pub visibility: Visibility,
     pub name: String,
+    /// 泛型类型参数，如 struct Pair<T,U> 的 ["T","U"]
+    pub type_params: Vec<String>,
     pub fields: Vec<FieldDef>,
 }
 
@@ -418,6 +432,8 @@ pub struct ExternImport {
 pub struct Function {
     pub visibility: Visibility,
     pub name: String,
+    /// 泛型类型参数，如 func identity<T>(x: T) 的 ["T"]
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     pub body: Vec<Stmt>,
@@ -431,6 +447,54 @@ pub struct EnumVariant {
     pub name: String,
     /// 关联值类型，如 Ok(Int64) 的 Int64
     pub payload: Option<Type>,
+}
+
+/// 接口方法签名（无实现）
+#[derive(Debug, Clone)]
+pub struct InterfaceMethod {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_type: Option<Type>,
+}
+
+/// 接口定义
+#[derive(Debug, Clone)]
+pub struct InterfaceDef {
+    pub visibility: Visibility,
+    pub name: String,
+    pub methods: Vec<InterfaceMethod>,
+}
+
+/// 类定义（支持继承、init、override、super）
+#[derive(Debug, Clone)]
+pub struct ClassDef {
+    pub visibility: Visibility,
+    pub name: String,
+    /// 继承的父类
+    pub extends: Option<String>,
+    /// 实现的接口列表
+    pub implements: Vec<String>,
+    pub fields: Vec<FieldDef>,
+    /// init 构造函数（无方法名，参数列表 + body）
+    pub init: Option<InitDef>,
+    /// deinit 析构函数
+    pub deinit: Option<Vec<Stmt>>,
+    /// 方法（含 override 标记）
+    pub methods: Vec<ClassMethod>,
+}
+
+/// 构造函数定义
+#[derive(Debug, Clone)]
+pub struct InitDef {
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+}
+
+/// 类方法（含 override 标记）
+#[derive(Debug, Clone)]
+pub struct ClassMethod {
+    pub override_: bool,
+    pub func: Function,
 }
 
 /// 枚举定义（支持无关联值或单关联值变体）
@@ -493,6 +557,8 @@ pub struct Program {
     /// 导入列表
     pub imports: Vec<Import>,
     pub structs: Vec<StructDef>,
+    pub interfaces: Vec<InterfaceDef>,
+    pub classes: Vec<ClassDef>,
     pub enums: Vec<EnumDef>,
     pub functions: Vec<Function>,
 }

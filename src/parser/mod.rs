@@ -56,6 +56,8 @@ pub struct Parser {
     pos: usize,
     /// 方法体内的 receiver 参数名（用于解析 this）
     receiver_name: Option<String>,
+    /// 当前泛型作用域的类型参数名，用于将 Ident 解析为 TypeParam
+    current_type_params: Vec<String>,
 }
 
 impl Parser {
@@ -64,6 +66,7 @@ impl Parser {
             tokens,
             pos: 0,
             receiver_name: None,
+            current_type_params: Vec::new(),
         }
     }
 
@@ -142,6 +145,8 @@ impl Parser {
         let mut module_name = None;
         let mut imports = Vec::new();
         let mut structs = Vec::new();
+        let mut interfaces = Vec::new();
+        let mut classes = Vec::new();
         let mut functions = Vec::new();
         let mut enums = Vec::new();
 
@@ -185,12 +190,14 @@ impl Parser {
             } else {
                 match self.peek() {
                     Some(Token::Struct) => structs.push(self.parse_struct_with_visibility(visibility)?),
+                    Some(Token::Interface) => interfaces.push(self.parse_interface_with_visibility(visibility)?),
+                    Some(Token::Class) => classes.push(self.parse_class_with_visibility(visibility)?),
                     Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
                     Some(Token::Func) => functions.push(self.parse_function_with_visibility(visibility)?),
                     Some(tok) => {
                         return self.bail(ParseError::UnexpectedToken(
                             tok.clone(),
-                            "struct、enum、func 或 extern func".to_string(),
+                            "struct、interface、class、enum、func 或 extern func".to_string(),
                         ))
                     }
                     None => break,
@@ -201,6 +208,8 @@ impl Parser {
             module_name,
             imports,
             structs,
+            interfaces,
+            classes,
             enums,
             functions,
         })
@@ -324,6 +333,7 @@ impl Parser {
         Ok(Function {
             visibility,
             name,
+            type_params: vec![],
             params,
             return_type,
             body: vec![],
@@ -336,6 +346,70 @@ impl Parser {
         self.parse_struct_with_visibility(Visibility::default())
     }
 
+    /// 判断 token 是否为类型的有效起始（避免将 n < 10 的 < 误解析为类型实参）
+    fn is_type_start(t: &Token) -> bool {
+        matches!(t,
+            Token::TypeInt32 | Token::TypeInt64 | Token::TypeFloat32 | Token::TypeFloat64
+            | Token::TypeBool | Token::TypeUnit | Token::TypeString | Token::TypeArray
+            | Token::TypeRange | Token::TypeOption | Token::TypeResult
+            | Token::Ident(_)
+        )
+    }
+
+    /// 解析可选类型实参 <Type1, Type2, ...>，用于调用与实例化
+    fn parse_opt_type_args(&mut self) -> Result<Option<Vec<Type>>, ParseErrorAt> {
+        if !self.check(&Token::Lt) {
+            return Ok(None);
+        }
+        // 避免将 n < 10 的 < 误解析为类型实参：< 后必须是类型起始
+        if !self.peek_next().map(Self::is_type_start).unwrap_or(false) {
+            return Ok(None);
+        }
+        self.advance();
+        let mut args = Vec::new();
+        loop {
+            args.push(self.parse_type()?);
+            if self.check(&Token::Comma) {
+                self.advance();
+            } else if self.check(&Token::Gt) {
+                self.advance();
+                break;
+            } else {
+                return self.bail(ParseError::UnexpectedToken(
+                    self.peek().cloned().unwrap_or(Token::Comma),
+                    "`,` 或 `>`".to_string(),
+                ));
+            }
+        }
+        Ok(Some(args))
+    }
+
+    /// 解析泛型类型参数列表 <T, U, ...>
+    fn parse_type_params(&mut self) -> Result<Vec<String>, ParseErrorAt> {
+        if !self.check(&Token::Lt) {
+            return Ok(Vec::new());
+        }
+        self.advance();
+        let mut params = Vec::new();
+        loop {
+            let p = match self.advance() {
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类型参数名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
+            };
+            params.push(p);
+            if self.check(&Token::Comma) {
+                self.advance();
+            } else if self.check(&Token::Gt) {
+                self.advance();
+                break;
+            } else {
+                return self.bail(ParseError::UnexpectedToken(self.peek().cloned().unwrap_or(Token::Comma), "`,` 或 `>`".to_string()));
+            }
+        }
+        Ok(params)
+    }
+
     /// 解析结构体定义（带可见性）
     fn parse_struct_with_visibility(&mut self, visibility: Visibility) -> Result<StructDef, ParseErrorAt> {
         self.expect(Token::Struct)?;
@@ -345,6 +419,9 @@ impl Parser {
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "结构体名".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
+
+        let type_params = self.parse_type_params()?;
+        let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
 
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
@@ -368,7 +445,8 @@ impl Parser {
         }
 
         self.expect(Token::RBrace)?;
-        Ok(StructDef { visibility, name, fields })
+        self.current_type_params = prev_params;
+        Ok(StructDef { visibility, name, type_params, fields })
     }
 
     /// 解析枚举定义（支持无关联值或单关联类型变体，如 Ok(Int64)）
@@ -412,6 +490,189 @@ impl Parser {
         Ok(EnumDef { visibility, name, variants })
     }
 
+    /// 解析接口定义
+    fn parse_interface_with_visibility(&mut self, visibility: Visibility) -> Result<crate::ast::InterfaceDef, ParseErrorAt> {
+        self.expect(Token::Interface)?;
+        let name = match self.advance() {
+            Some(Token::Ident(n)) => n,
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
+        };
+        self.expect(Token::LBrace)?;
+        let mut methods = Vec::new();
+        while !self.check(&Token::RBrace) {
+            self.expect(Token::Func)?;
+            let m_name = match self.advance() {
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
+            };
+            self.expect(Token::LParen)?;
+            let params = self.parse_params()?;
+            self.expect(Token::RParen)?;
+            let return_type = if self.check(&Token::Arrow) {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            self.expect(Token::Semicolon)?;
+            methods.push(crate::ast::InterfaceMethod {
+                name: m_name,
+                params,
+                return_type,
+            });
+        }
+        self.expect(Token::RBrace)?;
+        Ok(crate::ast::InterfaceDef {
+            visibility,
+            name,
+            methods,
+        })
+    }
+
+    /// 解析类定义
+    fn parse_class_with_visibility(&mut self, visibility: Visibility) -> Result<crate::ast::ClassDef, ParseErrorAt> {
+        self.expect(Token::Class)?;
+        let name = match self.advance() {
+            Some(Token::Ident(n)) => n,
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类名".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
+        };
+        let extends = if self.check(&Token::Extends) {
+            self.advance();
+            Some(match self.advance() {
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "父类名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
+            })
+        } else {
+            None
+        };
+        let implements = if self.check(&Token::Implements) {
+            self.advance();
+            let mut ifaces = Vec::new();
+            loop {
+                ifaces.push(match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                });
+                if !self.check(&Token::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            ifaces
+        } else {
+            Vec::new()
+        };
+        self.expect(Token::LBrace)?;
+        let mut fields = Vec::new();
+        let mut init = None;
+        let mut deinit = None;
+        let mut methods = Vec::new();
+        while !self.check(&Token::RBrace) {
+            let member_vis = if self.check(&Token::Private) {
+                self.advance();
+                crate::ast::Visibility::Private
+            } else if self.check(&Token::Public) {
+                self.advance();
+                crate::ast::Visibility::Public
+            } else {
+                crate::ast::Visibility::default()
+            };
+            if self.check(&Token::Var) {
+                self.advance();
+                let f_name = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                self.expect(Token::Colon)?;
+                let ty = self.parse_type()?;
+                self.expect(Token::Semicolon)?;
+                fields.push(crate::ast::FieldDef {
+                    name: f_name,
+                    ty,
+                });
+            } else if self.check(&Token::Init) {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let params = self.parse_params()?;
+                self.expect(Token::RParen)?;
+                self.expect(Token::LBrace)?;
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                init = Some(crate::ast::InitDef { params, body });
+            } else if self.check(&Token::Deinit) {
+                self.advance();
+                self.expect(Token::LBrace)?;
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                deinit = Some(body);
+            } else if self.check(&Token::Func) {
+                let override_ = self.check(&Token::Override);
+                if override_ {
+                    self.advance();
+                }
+                self.expect(Token::Func)?;
+                let (m_name, type_params) = match self.advance() {
+                    Some(Token::Ident(n)) => {
+                        let tp = self.parse_type_params()?;
+                        (format!("{}.{}", name, n), tp)
+                    }
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
+                self.expect(Token::LParen)?;
+                let params = self.parse_params()?;
+                self.expect(Token::RParen)?;
+                self.receiver_name = params.first().map(|p| p.name.clone());
+                let return_type = if self.check(&Token::Arrow) {
+                    self.advance();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                self.expect(Token::LBrace)?;
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                self.receiver_name = None;
+                self.current_type_params = prev_params;
+                methods.push(crate::ast::ClassMethod {
+                    override_,
+                    func: crate::ast::Function {
+                        visibility: member_vis,
+                        name: m_name,
+                        type_params,
+                        params,
+                        return_type,
+                        body,
+                        extern_import: None,
+                    },
+                });
+            } else {
+                return self.bail(ParseError::UnexpectedToken(
+                    self.peek().cloned().unwrap_or(Token::Semicolon),
+                    "var、init、deinit 或 func".to_string(),
+                ));
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(crate::ast::ClassDef {
+            visibility,
+            name,
+            extends,
+            implements,
+            fields,
+            init,
+            deinit,
+            methods,
+        })
+    }
+
     /// 解析函数定义（支持方法名 StructName.methodName）
     fn parse_function(&mut self) -> Result<Function, ParseErrorAt> {
         self.parse_function_with_visibility(Visibility::default())
@@ -421,9 +682,10 @@ impl Parser {
     fn parse_function_with_visibility(&mut self, visibility: Visibility) -> Result<Function, ParseErrorAt> {
         self.expect(Token::Func)?;
 
-        let name = match self.advance() {
+        let (name, type_params) = match self.advance() {
             Some(Token::Ident(n)) => {
-                if self.check(&Token::Dot) {
+                let tp = self.parse_type_params()?;
+                let full_name = if self.check(&Token::Dot) {
                     self.advance();
                     let method = match self.advance() {
                         Some(Token::Ident(m)) => m,
@@ -433,11 +695,14 @@ impl Parser {
                     format!("{}.{}", n, method)
                 } else {
                     n
-                }
+                };
+                (full_name, tp)
             }
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "标识符".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
+
+        let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
 
         self.expect(Token::LParen)?;
         let params = self.parse_params()?;
@@ -462,10 +727,12 @@ impl Parser {
         self.expect(Token::RBrace)?;
 
         self.receiver_name = prev_receiver;
+        self.current_type_params = prev_params;
 
         Ok(Function {
             visibility,
             name,
+            type_params,
             params,
             return_type,
             body,
@@ -543,7 +810,31 @@ impl Parser {
                 self.expect(Token::Gt)?;
                 Ok(Type::Result(Box::new(ok_type), Box::new(err_type)))
             }
-            Some(Token::Ident(name)) => Ok(Type::Struct(name)),
+            Some(Token::Ident(name)) => {
+                if self.check(&Token::Lt) {
+                    self.advance();
+                    let mut type_args = Vec::new();
+                    loop {
+                        type_args.push(self.parse_type()?);
+                        if self.check(&Token::Comma) {
+                            self.advance();
+                        } else if self.check(&Token::Gt) {
+                            self.advance();
+                            break;
+                        } else {
+                            return self.bail(ParseError::UnexpectedToken(
+                                self.peek().cloned().unwrap_or(Token::Comma),
+                                "`,` 或 `>`".to_string(),
+                            ));
+                        }
+                    }
+                    Ok(Type::Struct(name, type_args))
+                } else if self.current_type_params.contains(&name) {
+                    Ok(Type::TypeParam(name))
+                } else {
+                    Ok(Type::Struct(name, vec![]))
+                }
+            }
             Some(tok) => self.bail_at(ParseError::UnexpectedToken(tok, "类型".to_string()), self.at_prev()),
             None => self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
         }
@@ -1082,6 +1373,33 @@ impl Parser {
                     self.at_prev(),
                 ),
             },
+            Some(Token::Super) => {
+                if self.check(&Token::LParen) {
+                    self.advance();
+                    let args = self.parse_args()?;
+                    self.expect(Token::RParen)?;
+                    Ok(Expr::SuperCall {
+                        method: "init".to_string(),
+                        args,
+                    })
+                } else if self.check(&Token::Dot) {
+                    self.advance();
+                    let method = match self.advance() {
+                        Some(Token::Ident(m)) => m,
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    self.expect(Token::LParen)?;
+                    let args = self.parse_args()?;
+                    self.expect(Token::RParen)?;
+                    Ok(Expr::SuperCall { method, args })
+                } else {
+                    self.bail(ParseError::UnexpectedToken(
+                        self.peek().cloned().unwrap_or(Token::Dot),
+                        "super. 或 super(".to_string(),
+                    ))
+                }
+            }
             Some(Token::True) => Ok(Expr::Bool(true)),
             Some(Token::False) => Ok(Expr::Bool(false)),
             Some(Token::StringLit(s)) => self.parse_string_or_interpolated(s),
@@ -1158,6 +1476,8 @@ impl Parser {
                         });
                     }
                 }
+                // 解析可选类型实参 (如 identity<Int64> 或 Pair<Int64,String>)
+                let type_args = self.parse_opt_type_args()?;
                 // 检查是否是函数调用、构造函数调用或结构体初始化
                 match self.peek() {
                     Some(Token::LParen) => {
@@ -1166,16 +1486,16 @@ impl Parser {
                         self.expect(Token::RParen)?;
                         // 首字母大写视为构造函数调用，否则为普通函数调用
                         if looks_like_type {
-                            Ok(Expr::ConstructorCall { name, args })
+                            Ok(Expr::ConstructorCall { name, type_args, args })
                         } else {
-                            Ok(Expr::Call { name, args })
+                            Ok(Expr::Call { name, type_args, args })
                         }
                     }
                     Some(Token::LBrace) => {
                         self.advance();
                         let fields = self.parse_struct_fields()?;
                         self.expect(Token::RBrace)?;
-                        Ok(Expr::StructInit { name, fields })
+                        Ok(Expr::StructInit { name, type_args, fields })
                     }
                     _ => Ok(Expr::Var(name)),
                 }
@@ -1451,7 +1771,7 @@ impl Parser {
                     self.advance();
                     let args = self.parse_args()?;
                     self.expect(Token::RParen)?;
-                    Expr::Call { name, args }
+                    Expr::Call { name, type_args: None, args }
                 } else {
                     Expr::Var(name)
                 }
@@ -1527,7 +1847,7 @@ impl Parser {
                     self.advance();
                     let args = self.parse_args()?;
                     self.expect(Token::RParen)?;
-                    Ok(Expr::Call { name, args })
+                    Ok(Expr::Call { name, type_args: None, args })
                 } else if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                     // 变量开头的范围 (如 start..end)
                     let inclusive = self.check(&Token::DotDotEq);

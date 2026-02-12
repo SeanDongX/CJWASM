@@ -11,7 +11,9 @@ fn compile_source(source: &str) -> Vec<u8> {
         .collect::<Result<Vec<_>, _>>()
         .expect("词法分析应成功");
     let mut parser = Parser::new(tokens);
-    let program = parser.parse_program().expect("语法分析应成功");
+    let mut program = parser.parse_program().expect("语法分析应成功");
+    cjwasm::optimizer::optimize_program(&mut program);
+    cjwasm::monomorph::monomorphize_program(&mut program);
     let mut codegen = CodeGen::new();
     codegen.compile(&program)
 }
@@ -577,6 +579,39 @@ fn test_compile_result_type() {
     "#;
     let wasm = compile_source(source);
     assert_valid_wasm(&wasm, "result_type");
+}
+
+#[test]
+fn test_compile_interface_and_class() {
+    let source = r#"
+        interface Drawable { func area() -> Int64; }
+        class Rect {
+            private var width: Int64;
+            private var height: Int64;
+            func area(self: Rect) -> Int64 { return self.width * self.height }
+        }
+        func main() -> Int64 {
+            let r = Rect { width: 5, height: 10 }
+            return r.area()
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "interface_and_class");
+}
+
+#[test]
+fn test_compile_generic() {
+    let source = r#"
+        struct Pair<T, U> { first: T, second: U }
+        func identity<T>(value: T) -> T { return value }
+        func main() -> Int64 {
+            let p = Pair<Int64, Int64> { first: 1, second: 2 }
+            let x = identity<Int64>(42)
+            return p.first + x
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "generic");
 }
 
 #[test]
