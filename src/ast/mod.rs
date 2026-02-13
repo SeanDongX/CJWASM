@@ -37,6 +37,10 @@ pub enum Type {
     Option(Box<Type>),
     /// Result<T, E> 类型
     Result(Box<Type>, Box<Type>),
+    /// 切片类型 Slice<T>，引用数组子区间 [ptr, len]
+    Slice(Box<Type>),
+    /// Map 类型 Map<K, V>
+    Map(Box<Type>, Box<Type>),
     /// 泛型类型参数 (如 T)，仅在泛型定义体内使用，单态化时替换为具体类型
     TypeParam(String),
 }
@@ -67,6 +71,8 @@ impl Type {
             Type::Function { .. } => ValType::I32, // 函数表索引
             Type::Option(_) => ValType::I32,      // 指针
             Type::Result(_, _) => ValType::I32,   // 指针
+            Type::Slice(_) => ValType::I32,        // 指针
+            Type::Map(_, _) => ValType::I32,       // 指针
             Type::TypeParam(_) => panic!("TypeParam 不能直接转换为 WASM，需先单态化"),
         }
     }
@@ -89,6 +95,8 @@ impl Type {
             Type::Function { .. } => 4, // 函数表索引大小
             Type::Option(_) => 4,   // 指针大小
             Type::Result(_, _) => 4, // 指针大小
+            Type::Slice(_) => 4,     // 指针大小
+            Type::Map(_, _) => 4,    // 指针大小
             Type::TypeParam(_) => panic!("TypeParam 不能直接计算 size，需先单态化"),
         }
     }
@@ -127,6 +135,8 @@ mod tests {
         assert_eq!(Type::Function { params: vec![], ret: Box::new(Some(Type::Int64)) }.to_wasm(), ValType::I32);
         assert_eq!(Type::Option(Box::new(Type::Int64)).to_wasm(), ValType::I32);
         assert_eq!(Type::Result(Box::new(Type::Int64), Box::new(Type::String)).to_wasm(), ValType::I32);
+        assert_eq!(Type::Slice(Box::new(Type::Int64)).to_wasm(), ValType::I32);
+        assert_eq!(Type::Map(Box::new(Type::String), Box::new(Type::Int64)).to_wasm(), ValType::I32);
     }
 
     #[test]
@@ -164,6 +174,8 @@ mod tests {
         assert_eq!(Type::Function { params: vec![], ret: Box::new(Some(Type::Int64)) }.size(), 4);
         assert_eq!(Type::Option(Box::new(Type::Int64)).size(), 4);
         assert_eq!(Type::Result(Box::new(Type::Int64), Box::new(Type::String)).size(), 4);
+        assert_eq!(Type::Slice(Box::new(Type::Int64)).size(), 4);
+        assert_eq!(Type::Map(Box::new(Type::String), Box::new(Type::Int64)).size(), 4);
     }
 
     #[test]
@@ -367,6 +379,16 @@ pub enum Expr {
         catch_body: Vec<Stmt>,
         /// finally 块（无论是否异常都执行）
         finally_body: Option<Vec<Stmt>>,
+    },
+    /// 切片表达式 arr[start..end]
+    SliceExpr {
+        array: Box<Expr>,
+        start: Box<Expr>,
+        end: Box<Expr>,
+    },
+    /// Map 字面量 Map<K, V> { key1 => val1, key2 => val2 }
+    MapLiteral {
+        entries: Vec<(Expr, Expr)>,
     },
 }
 

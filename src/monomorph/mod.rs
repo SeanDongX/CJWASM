@@ -57,6 +57,12 @@ fn type_mangle_suffix(ty: &Type) -> String {
             )
         }
         Type::TypeParam(name) => name.clone(),
+        Type::Slice(inner) => format!("Slice_{}", type_mangle_suffix(inner)),
+        Type::Map(k, v) => format!(
+            "Map_{}_{}",
+            type_mangle_suffix(k),
+            type_mangle_suffix(v)
+        ),
     }
 }
 
@@ -101,6 +107,11 @@ fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
         Type::Result(ok, err) => Type::Result(
             Box::new(substitute_type(ok, subst)),
             Box::new(substitute_type(err, subst)),
+        ),
+        Type::Slice(inner) => Type::Slice(Box::new(substitute_type(inner, subst))),
+        Type::Map(key, val) => Type::Map(
+            Box::new(substitute_type(key, subst)),
+            Box::new(substitute_type(val, subst)),
         ),
         _ => ty.clone(),
     }
@@ -334,6 +345,17 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
         NullCoalesce { option, default } => NullCoalesce {
             option: Box::new(substitute_expr(*option, subst, rewrites)),
             default: Box::new(substitute_expr(*default, subst, rewrites)),
+        },
+        SliceExpr { array, start, end } => SliceExpr {
+            array: Box::new(substitute_expr(*array, subst, rewrites)),
+            start: Box::new(substitute_expr(*start, subst, rewrites)),
+            end: Box::new(substitute_expr(*end, subst, rewrites)),
+        },
+        MapLiteral { entries } => MapLiteral {
+            entries: entries
+                .into_iter()
+                .map(|(k, v)| (substitute_expr(k, subst, rewrites), substitute_expr(v, subst, rewrites)))
+                .collect(),
         },
         Char(c) => Char(c),
         Var(n) => Var(n),
@@ -719,6 +741,17 @@ impl AstWalk for Expr {
                 }
                 for s in catch_body {
                     s.walk(f);
+                }
+            }
+            SliceExpr { array, start, end } => {
+                array.walk(f);
+                start.walk(f);
+                end.walk(f);
+            }
+            MapLiteral { entries } => {
+                for (k, v) in entries {
+                    k.walk(f);
+                    v.walk(f);
                 }
             }
             _ => {}

@@ -26,6 +26,7 @@ pub fn optimize_program(program: &mut crate::ast::Program) {
 }
 
 fn optimize_function(func: &mut crate::ast::Function) {
+    // Pass 1: 常量折叠
     for stmt in &mut func.body {
         fold_stmt(stmt);
     }
@@ -34,6 +35,96 @@ fn optimize_function(func: &mut crate::ast::Function) {
             *default = fold_expr(default.clone());
         }
     }
+    // Pass 2: 死代码消除 (return/break/continue 后的语句)
+    eliminate_dead_code(&mut func.body);
+    // Pass 3: 尾递归优化
+    optimize_tail_recursion(func);
+}
+
+/// 死代码消除：移除 return/break/continue 后不可达的语句
+fn eliminate_dead_code(stmts: &mut Vec<Stmt>) {
+    // 找到第一个终止语句（return/break/continue）的位置
+    let mut terminator_pos = None;
+    for (i, stmt) in stmts.iter().enumerate() {
+        match stmt {
+            Stmt::Return(_) | Stmt::Break | Stmt::Continue => {
+                terminator_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    // 截断终止语句之后的所有语句
+    if let Some(pos) = terminator_pos {
+        stmts.truncate(pos + 1);
+    }
+    // 递归处理嵌套块
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } => {
+                eliminate_dead_code(body);
+            }
+            Stmt::WhileLet { body, .. } => {
+                eliminate_dead_code(body);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 尾递归优化：将尾递归函数转换为循环
+/// 检测模式：func f(params) { ... return f(new_args) }
+fn optimize_tail_recursion(func: &mut crate::ast::Function) {
+    use crate::ast::AssignTarget;
+    let func_name = func.name.clone();
+    let param_names: Vec<String> = func.params.iter().map(|p| p.name.clone()).collect();
+
+    if param_names.is_empty() || func.body.is_empty() {
+        return;
+    }
+
+    // 检查最后一条语句是否为 return func_name(args)
+    let is_tail_call = match func.body.last() {
+        Some(Stmt::Return(Some(Expr::Call { name, args, .. }))) => {
+            name == &func_name && args.len() == param_names.len()
+        }
+        Some(Stmt::Expr(Expr::Call { name, args, .. })) => {
+            name == &func_name && args.len() == param_names.len()
+        }
+        _ => false,
+    };
+
+    if !is_tail_call {
+        return;
+    }
+
+    // 提取尾调用的参数
+    let tail_args = match func.body.pop() {
+        Some(Stmt::Return(Some(Expr::Call { args, .. }))) => args,
+        Some(Stmt::Expr(Expr::Call { args, .. })) => args,
+        _ => return,
+    };
+
+    // 转换为循环：
+    // loop {
+    //     <original body without last statement>
+    //     param1 = new_arg1
+    //     param2 = new_arg2
+    //     continue
+    // }
+    let mut loop_body = func.body.clone();
+
+    // 添加参数重新赋值
+    for (param_name, arg) in param_names.iter().zip(tail_args) {
+        loop_body.push(Stmt::Assign {
+            target: AssignTarget::Var(param_name.clone()),
+            value: arg,
+        });
+    }
+    loop_body.push(Stmt::Continue);
+
+    // 替换整个函数体为 loop
+    func.body = vec![Stmt::Loop { body: loop_body }];
 }
 
 fn fold_stmt(stmt: &mut Stmt) {
@@ -253,6 +344,18 @@ fn fold_expr(expr: Expr) -> Expr {
                 })
                 .collect(),
         ),
+        // Phase 9: 折叠切片和 Map 字面量中的子表达式
+        SliceExpr { array, start, end } => SliceExpr {
+            array: Box::new(fold_expr(*array)),
+            start: Box::new(fold_expr(*start)),
+            end: Box::new(fold_expr(*end)),
+        },
+        MapLiteral { entries } => MapLiteral {
+            entries: entries
+                .into_iter()
+                .map(|(k, v)| (fold_expr(k), fold_expr(v)))
+                .collect(),
+        },
         e => e,
     }
 }

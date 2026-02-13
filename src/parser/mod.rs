@@ -377,6 +377,7 @@ impl Parser {
             | Token::TypeBool | Token::TypeChar | Token::TypeUnit | Token::TypeString
             | Token::TypeArray | Token::TypeTuple
             | Token::TypeRange | Token::TypeOption | Token::TypeResult
+            | Token::TypeSlice | Token::TypeMap
             | Token::Ident(_)
         )
     }
@@ -1151,8 +1152,23 @@ impl Parser {
         Ok(params)
     }
 
-    /// 解析类型
+    /// 解析类型（含 T? 和 T! 后缀）
     fn parse_type(&mut self) -> Result<Type, ParseErrorAt> {
+        let mut ty = self.parse_base_type()?;
+        // T? 是 Option<T> 的语法糖
+        while self.check(&Token::Question) {
+            self.advance();
+            ty = Type::Option(Box::new(ty));
+        }
+        // T! 是非空断言（当前为恒等）
+        while self.check(&Token::Bang) {
+            self.advance();
+        }
+        Ok(ty)
+    }
+
+    /// 解析基础类型（不含 ? ! 后缀）
+    fn parse_base_type(&mut self) -> Result<Type, ParseErrorAt> {
         match self.advance() {
             Some(Token::TypeInt8) => Ok(Type::Int8),
             Some(Token::TypeInt16) => Ok(Type::Int16),
@@ -1208,6 +1224,20 @@ impl Parser {
                 let err_type = self.parse_type()?;
                 self.expect(Token::Gt)?;
                 Ok(Type::Result(Box::new(ok_type), Box::new(err_type)))
+            }
+            Some(Token::TypeSlice) => {
+                self.expect(Token::Lt)?;
+                let elem_type = self.parse_type()?;
+                self.expect(Token::Gt)?;
+                Ok(Type::Slice(Box::new(elem_type)))
+            }
+            Some(Token::TypeMap) => {
+                self.expect(Token::Lt)?;
+                let key_type = self.parse_type()?;
+                self.expect(Token::Comma)?;
+                let val_type = self.parse_type()?;
+                self.expect(Token::Gt)?;
+                Ok(Type::Map(Box::new(key_type), Box::new(val_type)))
             }
             Some(Token::Ident(name)) => {
                 if self.check(&Token::Lt) {

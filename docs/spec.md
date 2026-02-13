@@ -48,7 +48,8 @@
 |------|------|------|------|
 | `String` | `String` | UTF-8 字符串 | [x] |
 | `Array<T>` | `Array<Int64>` | 固定长度数组 | [x] |
-| `Slice<T>` | `Slice<Int64>` | 动态切片 | [ ] |
+| `Slice<T>` | `Slice<Int64>` | 动态切片 | [x] |
+| `Map<K, V>` | `Map<String, Int64>` | 键值映射 | [x] |
 | `Tuple` | `(Int64, String)` | 元组类型 | [x] |
 | `Option<T>` | `Option<Int64>` | 可选值 | [x] |
 | `Result<T, E>` | `Result<Int64, Error>` | 结果类型 | [x] |
@@ -62,10 +63,10 @@
 
 | 修饰符 | 描述 | 状态 |
 |--------|------|------|
-| `mut` | 可变引用 | [ ] |
-| `ref` | 引用类型 | [ ] |
-| `?` | 可空类型 | [ ] |
-| `!` | 非空断言 | [ ] |
+| `mut` | 可变引用 | [x] |
+| `ref` | 引用类型 | [x] |
+| `?` | 可空类型（`T?` → `Option<T>` 语法糖） | [x] |
+| `!` | 非空断言 | [x] |
 
 ---
 
@@ -132,7 +133,7 @@ let map = {"a": 1, "b": 2}    // Map (语法糖)
 |------|------|
 | 数组字面量 | [x] |
 | 元组字面量 | [x] |
-| Map 字面量 | [ ] |
+| Map 字面量 | [x] |
 
 ---
 
@@ -344,7 +345,7 @@ let triple = { x: Int64 => x * 3 }
 | Lambda | [x] |
 | 闭包 | [x] |
 | 递归 | [x] |
-| 尾递归优化 | [ ] |
+| 尾递归优化 | [x] |
 
 ### 5.2 函数重载
 
@@ -885,9 +886,9 @@ pow(base, exp)
 
 *未完成特性的完整实施计划见 [docs/next_steps.md](next_steps.md)。*
 
-### 15.1 当前版本: v0.6.0
+### 15.1 当前版本: v0.7.0
 
-正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。Phase 1-6, 8 全部完成，下一步计划详见 [next_steps.md](next_steps.md)。
+正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。Phase 1-6, 8-9 全部完成，下一步计划详见 [next_steps.md](next_steps.md)。
 
 #### 已完成功能
 
@@ -983,6 +984,15 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 - [x] 引用计数 RC（__rc_inc/__rc_dec，对象头 refcount，赋值/作用域退出自动管理）
 - [x] Mark-Sweep GC（__gc_collect，堆扫描回收 refcount==0 对象）
 
+#### v0.7.0 新增完成功能
+
+- [x] Slice<T> 切片类型（`arr[start..end]`，堆布局 `[ptr:i32][len:i32]`）
+- [x] Map<K, V> 类型与 Map 字面量（`Map { key => val, ... }`，堆布局线性键值对）
+- [x] 类型修饰符（`mut T`、`ref T`、`T?` → `Option<T>` 语法糖、`T!` 非空断言）
+- [x] 尾递归优化（检测尾调用位置，将递归转为 loop + 参数重赋值）
+- [x] 死代码消除（移除 return/break/continue 后不可达语句）
+- [x] 优化器扩展（函数内联基础）
+
 #### v0.3.0 ~ v0.6.0 已完成
 
 - [x] Phase 2: 基础类型补全（Int8/16, UInt8/16/32/64, Char, Tuple, >>>, ??）
@@ -992,10 +1002,14 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 - [x] Phase 6: 错误处理 + 模块（throws 声明, finally, Error 基类, 自定义错误继承, 多文件编译, import 自动解析）
 - [x] Phase 8: 内存管理升级（Free List Allocator, 引用计数 RC, Mark-Sweep GC, __alloc/__free/__rc_inc/__rc_dec/__gc_collect）
 
+#### v0.7.0 已完成
+
+- [x] Phase 9: 补充特性（Slice<T>, Map<K,V>, 类型修饰符 mut/ref/?/!, 尾递归优化, 死代码消除, 函数内联）
+
 #### 未来版本计划
 
 - [ ] Phase 7: WASI + 标准库（fd_write/fd_read/fd_close/args_get/clock_time_get/random_get, std.core/io/collections）
-- [ ] Phase 9: 补充特性（Slice<T>, Map 字面量, 尾递归优化, 死代码消除, 函数内联）
+- [x] Phase 9: 补充特性（Slice<T>, Map 字面量, 类型修饰符, 尾递归优化, 死代码消除, 函数内联）
 - [ ] 包管理
 
 ---
@@ -1054,5 +1068,5 @@ var      where    while
 
 ---
 
-*文档版本: 2.0.0*
-*最后更新: 2026-02-13（v0.6.0 完成，Phase 1-6, 8 全部完成；含类/泛型/接口/错误处理/内存管理）*
+*文档版本: 2.1.0*
+*最后更新: 2026-02-13（v0.7.0 完成，Phase 1-6, 8-9 全部完成；新增 Slice/Map/类型修饰符/尾递归优化/DCE）*

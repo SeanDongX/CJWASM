@@ -254,6 +254,8 @@ pub enum Token {
     Prop,
     #[token("mut")]
     Mut,
+    #[token("ref")]
+    Ref,
 
     // 模块系统关键字
     #[token("module")]
@@ -345,6 +347,10 @@ pub enum Token {
     TypeOption,
     #[token("Result")]
     TypeResult,
+    #[token("Slice")]
+    TypeSlice,
+    #[token("Map")]
+    TypeMap,
 
     // 字面量（Float64：小数或科学计数法；Float32 后缀 f；整型）
     #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {

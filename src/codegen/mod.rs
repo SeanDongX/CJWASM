@@ -162,6 +162,12 @@ impl CodeGen {
             Type::Option(inner) => format!("Option_{}", Self::type_mangle_suffix(inner)),
             Type::Result(ok, err) => format!("Result_{}_{}", Self::type_mangle_suffix(ok), Self::type_mangle_suffix(err)),
             Type::TypeParam(name) => name.clone(), // 单态化前用于名字修饰的占位
+            Type::Slice(inner) => format!("Slice_{}", Self::type_mangle_suffix(inner)),
+            Type::Map(k, v) => format!(
+                "Map_{}_{}",
+                Self::type_mangle_suffix(k),
+                Self::type_mangle_suffix(v)
+            ),
         }
     }
 
@@ -4380,6 +4386,9 @@ impl CodeGen {
                 // try-catch 所有路径通常都通过 return 退出，
                 // 但 WASM 验证器无法追踪条件返回，标记此处不可达
                 func.instruction(&Instruction::Unreachable);
+            }
+            Expr::SliceExpr { .. } | Expr::MapLiteral { .. } => {
+                todo!("SliceExpr and MapLiteral codegen not yet implemented")
             }
         }
     }
