@@ -153,6 +153,7 @@ impl Parser {
         let mut classes = Vec::new();
         let mut functions = Vec::new();
         let mut enums = Vec::new();
+        let mut extends = Vec::new();
 
         // 解析可选的 module 声明（支持点分路径如 examples.demo）
         if self.check(&Token::Module) {
@@ -210,11 +211,12 @@ impl Parser {
                     Some(Token::Class) | Some(Token::Abstract) | Some(Token::Sealed) | Some(Token::Open)
                         => classes.push(self.parse_class_with_visibility(visibility)?),
                     Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
+                    Some(Token::Extend) => extends.push(self.parse_extend()?),
                     Some(Token::Func) => functions.push(self.parse_function_with_visibility(visibility)?),
                     Some(tok) => {
                         return self.bail(ParseError::UnexpectedToken(
                             tok.clone(),
-                            "struct、interface、class、enum、func 或 extern func".to_string(),
+                            "struct、interface、class、enum、extend、func 或 extern func".to_string(),
                         ))
                     }
                     None => break,
@@ -229,6 +231,7 @@ impl Parser {
             classes,
             enums,
             functions,
+            extends,
         })
     }
 
@@ -600,7 +603,8 @@ impl Parser {
         Ok(EnumDef { visibility, name, type_params, constraints, variants })
     }
 
-    /// 解析接口定义
+    /// 解析接口定义（支持继承、默认实现、关联类型）
+    /// interface Name: Parent1, Parent2 { type Element; func method(args) -> Ret; func default_method(args) -> Ret { body } }
     fn parse_interface_with_visibility(&mut self, visibility: Visibility) -> Result<crate::ast::InterfaceDef, ParseErrorAt> {
         self.expect(Token::Interface)?;
         let name = match self.advance() {
@@ -608,9 +612,42 @@ impl Parser {
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
+        // 解析接口继承 : Parent1, Parent2
+        let parents = if self.check(&Token::Colon) {
+            self.advance();
+            let mut ps = Vec::new();
+            loop {
+                ps.push(match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "父接口名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                });
+                if self.check(&Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            ps
+        } else {
+            Vec::new()
+        };
         self.expect(Token::LBrace)?;
         let mut methods = Vec::new();
+        let mut assoc_types = Vec::new();
         while !self.check(&Token::RBrace) {
+            // 关联类型: type Element;
+            if matches!(self.peek(), Some(Token::Ident(ref s)) if s == "type") {
+                self.advance(); // consume "type"
+                let type_name = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "关联类型名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                self.expect(Token::Semicolon)?;
+                assoc_types.push(crate::ast::AssocTypeDef { name: type_name });
+                continue;
+            }
             self.expect(Token::Func)?;
             let m_name = match self.advance() {
                 Some(Token::Ident(n)) => n,
@@ -626,17 +663,89 @@ impl Parser {
             } else {
                 None
             };
-            self.expect(Token::Semicolon)?;
+            // 判断有无默认实现 { body } 或者纯签名 ;
+            let default_body = if self.check(&Token::LBrace) {
+                self.advance();
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                Some(body)
+            } else {
+                self.expect(Token::Semicolon)?;
+                None
+            };
             methods.push(crate::ast::InterfaceMethod {
                 name: m_name,
                 params,
                 return_type,
+                default_body,
             });
         }
         self.expect(Token::RBrace)?;
         Ok(crate::ast::InterfaceDef {
             visibility,
             name,
+            parents,
+            methods,
+            assoc_types,
+        })
+    }
+
+    /// 解析 extend 定义
+    /// extend TypeName: InterfaceName { type Element = ConcreteType; func method(...) -> ... { ... } }
+    fn parse_extend(&mut self) -> Result<crate::ast::ExtendDef, ParseErrorAt> {
+        self.expect(Token::Extend)?;
+        let target_type = match self.advance() {
+            Some(Token::Ident(n)) => n,
+            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类型名".to_string())),
+            None => return self.bail(ParseError::UnexpectedEof),
+        };
+        // 可选: 实现的接口
+        let interface = if self.check(&Token::Colon) {
+            self.advance();
+            Some(match self.advance() {
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
+            })
+        } else {
+            None
+        };
+        self.expect(Token::LBrace)?;
+        let mut methods = Vec::new();
+        let mut assoc_type_bindings = Vec::new();
+        while !self.check(&Token::RBrace) {
+            // 关联类型绑定: type Element = ConcreteType;
+            if matches!(self.peek(), Some(Token::Ident(ref s)) if s == "type") {
+                self.advance(); // consume "type"
+                let type_name = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "关联类型名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                self.expect(Token::Assign)?;
+                let ty = self.parse_type()?;
+                self.expect(Token::Semicolon)?;
+                assoc_type_bindings.push((type_name, ty));
+                continue;
+            }
+            // 方法: func name(args) -> Ret { body }
+            let func = self.parse_function_with_visibility(Visibility::Public)?;
+            // 重命名为 TypeName.methodName 格式
+            let method_name = if func.name.contains('.') {
+                func.name.clone()
+            } else {
+                format!("{}.{}", target_type, func.name)
+            };
+            methods.push(Function {
+                name: method_name,
+                ..func
+            });
+        }
+        self.expect(Token::RBrace)?;
+        Ok(crate::ast::ExtendDef {
+            target_type,
+            interface,
+            assoc_type_bindings,
             methods,
         })
     }

@@ -1,4 +1,4 @@
-use crate::ast::{AssignTarget, BinOp, ClassDef, EnumDef, EnumVariant, Expr, FieldDef, InitDef, InterpolatePart, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef, Type, UnaryOp, Visibility};
+use crate::ast::{AssignTarget, BinOp, ClassDef, EnumDef, EnumVariant, Expr, FieldDef, InitDef, InterfaceDef, InterfaceMethod, InterpolatePart, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef, Type, UnaryOp, Visibility};
 use crate::ast::Function as FuncDef;
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -93,6 +93,12 @@ pub struct CodeGen {
     data_offset: u32,
     /// vtable 条目列表（function indices, 用于 Element Section）
     vtable_entries: Vec<u32>,
+    /// 接口定义（方法签名表）
+    interfaces: HashMap<String, Vec<InterfaceMethod>>,
+    /// Lambda 函数列表（编译阶段收集），存储生成的函数名
+    lambda_functions: Vec<FuncDef>,
+    /// Lambda 计数器（使用 Cell 以支持在 &self 方法中修改）
+    lambda_counter: std::cell::Cell<u32>,
 }
 
 impl CodeGen {
@@ -109,6 +115,9 @@ impl CodeGen {
             string_pool: Vec::new(),
             data_offset: 0,
             vtable_entries: Vec::new(),
+            interfaces: HashMap::new(),
+            lambda_functions: Vec::new(),
+            lambda_counter: std::cell::Cell::new(0),
         }
     }
 
@@ -223,6 +232,56 @@ impl CodeGen {
         // 收集字符串常量
         self.collect_strings(program);
 
+        // --- 接口 codegen (#29, #30, #33) ---
+        // 注册接口定义（含继承合并），生成默认实现函数
+        let mut interface_methods: HashMap<String, Vec<InterfaceMethod>> = HashMap::new();
+        // 先收集所有接口
+        let mut all_interfaces: HashMap<String, &InterfaceDef> = HashMap::new();
+        for iface in &program.interfaces {
+            all_interfaces.insert(iface.name.clone(), iface);
+        }
+        // 接口继承合并 (#33)
+        for iface in &program.interfaces {
+            let mut methods = Vec::new();
+            // 收集父接口方法
+            for parent_name in &iface.parents {
+                if let Some(parent) = all_interfaces.get(parent_name) {
+                    for m in &parent.methods {
+                        if !methods.iter().any(|em: &InterfaceMethod| em.name == m.name) {
+                            methods.push(m.clone());
+                        }
+                    }
+                }
+            }
+            // 添加自己的方法
+            for m in &iface.methods {
+                // 子接口方法覆盖父接口同名方法
+                if let Some(pos) = methods.iter().position(|em| em.name == m.name) {
+                    methods[pos] = m.clone();
+                } else {
+                    methods.push(m.clone());
+                }
+            }
+            interface_methods.insert(iface.name.clone(), methods);
+        }
+        self.interfaces = interface_methods;
+
+        // --- extends 处理 (#32) ---
+        // 合并 extend 中的方法到 functions 列表
+        let mut extend_functions: Vec<FuncDef> = Vec::new();
+        let mut extend_interfaces: HashMap<String, Vec<String>> = HashMap::new(); // type -> [interface]
+        for ext in &program.extends {
+            for method in &ext.methods {
+                extend_functions.push(method.clone());
+            }
+            if let Some(ref iface) = ext.interface {
+                extend_interfaces
+                    .entry(ext.target_type.clone())
+                    .or_default()
+                    .push(iface.clone());
+            }
+        }
+
         // 暂不编译泛型函数（单态化待实现），仅编译已单态化的函数
         let mut functions: Vec<_> = program
             .functions
@@ -246,6 +305,32 @@ impl CodeGen {
                 functions.push(deinit_func);
             }
         }
+        // 添加 extend 中的方法
+        functions.extend(extend_functions);
+        // 接口默认实现方法 (#30) → 生成为 InterfaceName.__default_method 函数
+        for iface in &program.interfaces {
+            for m in &iface.methods {
+                if let Some(ref body) = m.default_body {
+                    functions.push(FuncDef {
+                        visibility: Visibility::Public,
+                        name: format!("{}.__default_{}", iface.name, m.name),
+                        type_params: vec![],
+                        constraints: vec![],
+                        params: m.params.clone(),
+                        return_type: m.return_type.clone(),
+                        body: body.clone(),
+                        extern_import: None,
+                    });
+                }
+            }
+        }
+
+        // Lambda 预扫描 (#35) — 收集所有 Lambda 表达式，生成匿名函数
+        let mut lambda_counter = 0u32;
+        let mut lambda_funcs = Vec::new();
+        Self::collect_lambdas_from_functions(&functions, &mut lambda_counter, &mut lambda_funcs);
+        functions.extend(lambda_funcs);
+        self.lambda_counter.set(0); // 重置，编译阶段重新计数
 
         let name_count: HashMap<String, usize> = functions
             .iter()
@@ -648,6 +733,97 @@ impl CodeGen {
             info.vtable_base = base;
         }
         self.vtable_entries = entries;
+    }
+
+    /// Lambda 预扫描：递归遍历所有函数体，收集 Lambda 表达式并生成匿名函数
+    fn collect_lambdas_from_functions(
+        functions: &[FuncDef],
+        counter: &mut u32,
+        out: &mut Vec<FuncDef>,
+    ) {
+        for func in functions {
+            for stmt in &func.body {
+                Self::collect_lambdas_from_stmt(stmt, counter, out);
+            }
+        }
+    }
+
+    fn collect_lambdas_from_stmt(stmt: &Stmt, counter: &mut u32, out: &mut Vec<FuncDef>) {
+        match stmt {
+            Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+                Self::collect_lambdas_from_expr(value, counter, out);
+            }
+            Stmt::Assign { value, .. } => {
+                Self::collect_lambdas_from_expr(value, counter, out);
+            }
+            Stmt::Expr(e) => Self::collect_lambdas_from_expr(e, counter, out),
+            Stmt::Return(Some(e)) => Self::collect_lambdas_from_expr(e, counter, out),
+            Stmt::While { cond, body, .. } => {
+                Self::collect_lambdas_from_expr(cond, counter, out);
+                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+            }
+            Stmt::For { iterable, body, .. } => {
+                Self::collect_lambdas_from_expr(iterable, counter, out);
+                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+            }
+            Stmt::Loop { body, .. } => {
+                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_lambdas_from_expr(expr: &Expr, counter: &mut u32, out: &mut Vec<FuncDef>) {
+        match expr {
+            Expr::Lambda { params, return_type, body } => {
+                let lambda_name = format!("__lambda_{}", *counter);
+                *counter += 1;
+                // 将 Lambda body 包装为 return 语句
+                let body_stmt = vec![Stmt::Return(Some(body.as_ref().clone()))];
+                out.push(FuncDef {
+                    visibility: Visibility::Public,
+                    name: lambda_name,
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: params.iter().map(|(name, ty)| Param {
+                        name: name.clone(),
+                        ty: ty.clone(),
+                        default: None,
+                        variadic: false,
+                    }).collect(),
+                    return_type: return_type.clone(),
+                    body: body_stmt,
+                    extern_import: None,
+                });
+                // 递归处理 Lambda body
+                Self::collect_lambdas_from_expr(body, counter, out);
+            }
+            Expr::Binary { left, right, .. } => {
+                Self::collect_lambdas_from_expr(left, counter, out);
+                Self::collect_lambdas_from_expr(right, counter, out);
+            }
+            Expr::Unary { expr, .. } => Self::collect_lambdas_from_expr(expr, counter, out),
+            Expr::Call { args, .. } => {
+                for a in args { Self::collect_lambdas_from_expr(a, counter, out); }
+            }
+            Expr::MethodCall { object, args, .. } => {
+                Self::collect_lambdas_from_expr(object, counter, out);
+                for a in args { Self::collect_lambdas_from_expr(a, counter, out); }
+            }
+            Expr::If { cond, then_branch, else_branch, .. } => {
+                Self::collect_lambdas_from_expr(cond, counter, out);
+                Self::collect_lambdas_from_expr(then_branch, counter, out);
+                if let Some(e) = else_branch { Self::collect_lambdas_from_expr(e, counter, out); }
+            }
+            Expr::Block(stmts, expr) => {
+                for s in stmts { Self::collect_lambdas_from_stmt(s, counter, out); }
+                if let Some(e) = expr { Self::collect_lambdas_from_expr(e, counter, out); }
+            }
+            Expr::Array(elems) | Expr::Tuple(elems) => {
+                for e in elems { Self::collect_lambdas_from_expr(e, counter, out); }
+            }
+            _ => {}
+        }
     }
 
     /// 构建 init 函数：__ClassName_init(params...) -> i32 (对象指针)
@@ -3646,14 +3822,18 @@ impl CodeGen {
 
                 func.instruction(&Instruction::End);
             }
-            Expr::Lambda { .. } => {
-                // TODO: Lambda 表达式需要 WASM Table 段 + call_indirect 支持
-                // 完整实现需要：
-                // 1. 在编译阶段收集所有 Lambda
-                // 2. 为每个 Lambda 生成独立函数
-                // 3. 创建函数表 (Table section)
-                // 4. 用 call_indirect 间接调用
-                panic!("Lambda 表达式编译尚未实现 - 需要 WASM Table 支持");
+            Expr::Lambda { params, return_type, body } => {
+                // Lambda 编译：返回预扫描阶段生成的匿名函数的索引
+                let lambda_idx = self.lambda_counter.get();
+                self.lambda_counter.set(lambda_idx + 1);
+                let lambda_name = format!("__lambda_{}", lambda_idx);
+
+                if let Some(&func_idx) = self.func_indices.get(&lambda_name) {
+                    func.instruction(&Instruction::I32Const(func_idx as i32));
+                } else {
+                    // fallback：Lambda 未找到，返回 0
+                    func.instruction(&Instruction::I32Const(0));
+                }
             }
             Expr::Some(inner) => {
                 // Option::Some(v) -> 堆分配 [tag=1: i32][value]
@@ -3885,6 +4065,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "answer".to_string(),
@@ -3927,6 +4108,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "test".to_string(),
@@ -3986,6 +4168,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "get_y".to_string(),
@@ -4029,6 +4212,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "compute".to_string(),
@@ -4060,6 +4244,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "max".to_string(),
@@ -4107,6 +4292,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "first".to_string(),
@@ -4149,6 +4335,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "match_test".to_string(),
@@ -4194,6 +4381,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "sum_range".to_string(),
@@ -4243,6 +4431,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "fadd".to_string(),
@@ -4273,6 +4462,7 @@ mod tests {
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
+            extends: vec![],
             functions: vec![
                 FuncDef {
                     visibility: Visibility::default(),

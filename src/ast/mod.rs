@@ -488,12 +488,20 @@ pub struct EnumVariant {
     pub payload: Option<Type>,
 }
 
-/// 接口方法签名（无实现）
+/// 接口方法签名（可选默认实现）
 #[derive(Debug, Clone)]
 pub struct InterfaceMethod {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
+    /// 默认实现体（若有则为 Some）
+    pub default_body: Option<Vec<Stmt>>,
+}
+
+/// 接口关联类型定义（如 type Element）
+#[derive(Debug, Clone)]
+pub struct AssocTypeDef {
+    pub name: String,
 }
 
 /// 接口定义
@@ -501,7 +509,25 @@ pub struct InterfaceMethod {
 pub struct InterfaceDef {
     pub visibility: Visibility,
     pub name: String,
+    /// 父接口列表（接口继承）
+    pub parents: Vec<String>,
     pub methods: Vec<InterfaceMethod>,
+    /// 关联类型列表
+    pub assoc_types: Vec<AssocTypeDef>,
+}
+
+/// 扩展定义（为已有类型追加方法/实现接口）
+/// extend TypeName: InterfaceName { ... }
+#[derive(Debug, Clone)]
+pub struct ExtendDef {
+    /// 被扩展的类型名
+    pub target_type: String,
+    /// 实现的接口（可选）
+    pub interface: Option<String>,
+    /// 关联类型绑定（如 type Element = Int64）
+    pub assoc_type_bindings: Vec<(String, Type)>,
+    /// 扩展的方法
+    pub methods: Vec<Function>,
 }
 
 /// 类定义（支持继承、init、override、super、abstract、sealed）
@@ -634,4 +660,6 @@ pub struct Program {
     pub classes: Vec<ClassDef>,
     pub enums: Vec<EnumDef>,
     pub functions: Vec<Function>,
+    /// 扩展定义
+    pub extends: Vec<ExtendDef>,
 }

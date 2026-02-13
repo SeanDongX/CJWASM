@@ -236,6 +236,8 @@ pub enum Token {
     Open,
     #[token("interface")]
     Interface,
+    #[token("extend")]
+    Extend,
     #[token("extends")]
     Extends,
     #[token("implements")]
