@@ -1,5 +1,6 @@
 use crate::ast::{AssignTarget, BinOp, ClassDef, EnumDef, EnumVariant, Expr, FieldDef, InitDef, InterfaceDef, InterfaceMethod, InterpolatePart, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef, Type, UnaryOp, Visibility};
 use crate::ast::Function as FuncDef;
+use crate::memory;
 use std::collections::HashMap;
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, ExportKind,
@@ -527,6 +528,32 @@ impl CodeGen {
         self.func_types.insert("__abs_i64".to_string(), runtime_type_base + 9);
         self.func_indices.insert("__abs_i64".to_string(), runtime_func_base + 9);
 
+        // Phase 8: 内存管理运行时函数
+        // __alloc(size: i32) -> i32
+        types.ty().function([ValType::I32], [ValType::I32]);
+        self.func_types.insert("__alloc".to_string(), runtime_type_base + 10);
+        self.func_indices.insert("__alloc".to_string(), runtime_func_base + 10);
+
+        // __free(ptr: i32)
+        types.ty().function([ValType::I32], []);
+        self.func_types.insert("__free".to_string(), runtime_type_base + 11);
+        self.func_indices.insert("__free".to_string(), runtime_func_base + 11);
+
+        // __rc_inc(ptr: i32)
+        types.ty().function([ValType::I32], []);
+        self.func_types.insert("__rc_inc".to_string(), runtime_type_base + 12);
+        self.func_indices.insert("__rc_inc".to_string(), runtime_func_base + 12);
+
+        // __rc_dec(ptr: i32)
+        types.ty().function([ValType::I32], []);
+        self.func_types.insert("__rc_dec".to_string(), runtime_type_base + 13);
+        self.func_indices.insert("__rc_dec".to_string(), runtime_func_base + 13);
+
+        // __gc_collect() -> i32
+        types.ty().function([], [ValType::I32]);
+        self.func_types.insert("__gc_collect".to_string(), runtime_type_base + 14);
+        self.func_indices.insert("__gc_collect".to_string(), runtime_func_base + 14);
+
         module.section(&types);
 
         // 构建 vtable（需在 func_indices 设置后）
@@ -550,7 +577,7 @@ impl CodeGen {
                 func_section.function(i as u32);
             }
         }
-        for r in 0..10u32 {
+        for r in 0..15u32 {
             func_section.function(runtime_type_base + r);
         }
         module.section(&func_section);
@@ -580,15 +607,26 @@ impl CodeGen {
         });
         module.section(&memories);
 
-        // 4. 全局变量段 (Global Section) - 堆指针
+        // 4. 全局变量段 (Global Section) - 堆指针 + 空闲链表头
+        let heap_start = HEAP_BASE + self.data_offset as i32;
         let mut globals = GlobalSection::new();
+        // Global 0: heap_ptr (bump allocator 指针)
         globals.global(
             GlobalType {
                 val_type: ValType::I32,
                 mutable: true,
                 shared: false,
             },
-            &ConstExpr::i32_const(HEAP_BASE + self.data_offset as i32),
+            &ConstExpr::i32_const(heap_start),
+        );
+        // Global 1: free_list_head (空闲链表头指针，Phase 8)
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(0), // 初始为 null
         );
         module.section(&globals);
 
@@ -610,6 +648,12 @@ impl CodeGen {
             exports.export(&key, ExportKind::Func, idx);
         }
         exports.export("memory", ExportKind::Memory, 0);
+        // Phase 8: 导出内存管理函数
+        exports.export("__alloc", ExportKind::Func, self.func_indices["__alloc"]);
+        exports.export("__free", ExportKind::Func, self.func_indices["__free"]);
+        exports.export("__rc_inc", ExportKind::Func, self.func_indices["__rc_inc"]);
+        exports.export("__rc_dec", ExportKind::Func, self.func_indices["__rc_dec"]);
+        exports.export("__gc_collect", ExportKind::Func, self.func_indices["__gc_collect"]);
         module.section(&exports);
 
         // 6. 代码段 (Code Section)：仅非 extern 函数
@@ -632,6 +676,14 @@ impl CodeGen {
         codes.function(&self.emit_min_i64());
         codes.function(&self.emit_max_i64());
         codes.function(&self.emit_abs_i64());
+
+        // Phase 8: 内存管理运行时函数
+        let free_func_idx = self.func_indices["__free"];
+        codes.function(&memory::emit_alloc_func(heap_start));
+        codes.function(&memory::emit_free_func());
+        codes.function(&memory::emit_rc_inc_func(heap_start));
+        codes.function(&memory::emit_rc_dec_func(heap_start, free_func_idx));
+        codes.function(&memory::emit_gc_collect_func(heap_start, free_func_idx));
         module.section(&codes);
 
         // 7. Element 段 (Element Section) — vtable 函数引用
@@ -1162,6 +1214,12 @@ impl CodeGen {
         locals.add("__logical_tmp", ValType::I32, None);
         // ? 运算符临时指针
         locals.add("__try_ptr", ValType::I32, None);
+        // Phase 8: 内存管理临时变量（__alloc 返回指针暂存）
+        locals.add("__struct_alloc_ptr", ValType::I32, None);
+        locals.add("__array_alloc_ptr", ValType::I32, None);
+        locals.add("__tuple_alloc_ptr", ValType::I32, None);
+        locals.add("__enum_alloc_ptr", ValType::I32, None);
+        locals.add("__range_alloc_ptr", ValType::I32, None);
 
         // 创建 WASM 函数
         let local_types: Vec<(u32, ValType)> = locals
@@ -1173,19 +1231,16 @@ impl CodeGen {
 
         let mut wasm_func = WasmFunc::new(local_types);
 
-        // init 函数前序：分配内存 + 设置 vtable_ptr
+        // init 函数前序：分配内存 + 设置 vtable_ptr (Phase 8: 使用 __alloc)
         if let Some(ref class_name) = init_class_name {
             if let Some(class_info) = self.classes.get(class_name) {
                 let obj_size = class_info.object_size();
-                // this = heap_ptr
-                wasm_func.instruction(&Instruction::GlobalGet(0));
+                let alloc_idx = self.func_indices["__alloc"];
+                // this = __alloc(obj_size)
+                wasm_func.instruction(&Instruction::I32Const(obj_size as i32));
+                wasm_func.instruction(&Instruction::Call(alloc_idx));
                 let this_idx = locals.get("this").expect("this 局部变量");
                 wasm_func.instruction(&Instruction::LocalSet(this_idx));
-                // heap_ptr += obj_size
-                wasm_func.instruction(&Instruction::GlobalGet(0));
-                wasm_func.instruction(&Instruction::I32Const(obj_size as i32));
-                wasm_func.instruction(&Instruction::I32Add);
-                wasm_func.instruction(&Instruction::GlobalSet(0));
                 // 设置 vtable_ptr（如果有 vtable）
                 if class_info.has_vtable && !class_info.vtable_methods.is_empty() {
                     wasm_func.instruction(&Instruction::LocalGet(this_idx));
@@ -1209,6 +1264,30 @@ impl CodeGen {
             if let Some(this_idx) = locals.get("this") {
                 wasm_func.instruction(&Instruction::LocalGet(this_idx));
                 wasm_func.instruction(&Instruction::Return);
+            }
+        }
+
+        // Phase 8: 函数退出前对所有堆类型局部变量执行 rc_dec
+        // 注意：仅对非返回值的局部变量执行，init 函数的 this 除外
+        if let Some(rc_dec_idx) = self.func_indices.get("__rc_dec").copied() {
+            let return_var = func.body.last().and_then(|s| {
+                if let Stmt::Return(Some(Expr::Var(name))) = s {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            });
+            for (name, &idx) in &locals.names {
+                // 跳过内部临时变量、参数、返回值
+                if name.starts_with("__") { continue; }
+                if init_class_name.is_some() && name == "this" { continue; }
+                if Some(name.as_str()) == return_var { continue; }
+                if let Some(ast_ty) = locals.get_type(name) {
+                    if memory::is_heap_type(ast_ty) || memory::may_hold_heap_ptr(ast_ty) {
+                        wasm_func.instruction(&Instruction::LocalGet(idx));
+                        wasm_func.instruction(&Instruction::Call(rc_dec_idx));
+                    }
+                }
             }
         }
 
@@ -1275,17 +1354,13 @@ impl CodeGen {
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::LocalSet(4));
 
-        // new_ptr = global0 (heap pointer)
-        f.instruction(&Instruction::GlobalGet(0));
-        f.instruction(&Instruction::LocalSet(5));
-
-        // global0 += total_len + 4 (分配新空间)
-        f.instruction(&Instruction::GlobalGet(0));
-        f.instruction(&Instruction::LocalGet(4));
+        // Phase 8: 使用 __alloc 分配新空间
+        let alloc_idx = self.func_indices["__alloc"];
+        f.instruction(&Instruction::LocalGet(4)); // total_len
         f.instruction(&Instruction::I32Const(4));
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::I32Add); // total_len + 4
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(5)); // new_ptr
 
         // mem[new_ptr] = total_len
         f.instruction(&Instruction::LocalGet(5));
@@ -1331,15 +1406,11 @@ impl CodeGen {
         // 完整实现需要复杂的数字到字符串转换
         // 这里使用简化版本，返回堆上的占位符
 
-        // ptr = global0
-        f.instruction(&Instruction::GlobalGet(0));
-        f.instruction(&Instruction::LocalSet(1));
-
-        // 分配 10 字节 "[number]\0"
-        f.instruction(&Instruction::GlobalGet(0));
+        // Phase 8: 使用 __alloc 分配空间
+        let alloc_idx = self.func_indices["__alloc"];
         f.instruction(&Instruction::I32Const(12)); // 4 + 8 bytes
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(1)); // ptr
 
         // mem[ptr] = 8 (length)
         f.instruction(&Instruction::LocalGet(1));
@@ -1361,14 +1432,11 @@ impl CodeGen {
     fn emit_i32_to_str(&self) -> WasmFunc {
         let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
 
-        // 与 i64 相同的简化实现
-        f.instruction(&Instruction::GlobalGet(0));
-        f.instruction(&Instruction::LocalSet(1));
-
-        f.instruction(&Instruction::GlobalGet(0));
+        // Phase 8: 使用 __alloc 分配
+        let alloc_idx = self.func_indices["__alloc"];
         f.instruction(&Instruction::I32Const(12));
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(1));
 
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(8));
@@ -1388,14 +1456,11 @@ impl CodeGen {
     fn emit_f64_to_str(&self) -> WasmFunc {
         let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
 
-        // 简化实现：返回 "[float]"
-        f.instruction(&Instruction::GlobalGet(0));
+        // Phase 8: 使用 __alloc 分配
+        let alloc_idx = self.func_indices["__alloc"];
+        f.instruction(&Instruction::I32Const(11));
+        f.instruction(&Instruction::Call(alloc_idx));
         f.instruction(&Instruction::LocalSet(1));
-
-        f.instruction(&Instruction::GlobalGet(0));
-        f.instruction(&Instruction::I32Const(11)); // 4 + 7 bytes
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::GlobalSet(0));
 
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(7));
@@ -1419,14 +1484,11 @@ impl CodeGen {
     fn emit_f32_to_str(&self) -> WasmFunc {
         let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
 
-        // 与 f64 相同
-        f.instruction(&Instruction::GlobalGet(0));
-        f.instruction(&Instruction::LocalSet(1));
-
-        f.instruction(&Instruction::GlobalGet(0));
+        // Phase 8: 使用 __alloc 分配
+        let alloc_idx = self.func_indices["__alloc"];
         f.instruction(&Instruction::I32Const(11));
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(1));
 
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(7));
@@ -1454,13 +1516,11 @@ impl CodeGen {
         f.instruction(&Instruction::I32Eqz);
         f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
 
-        // "false" (5 bytes)
-        f.instruction(&Instruction::GlobalGet(0));
+        // "false" (5 bytes) - Phase 8: 使用 __alloc
+        let alloc_idx = self.func_indices["__alloc"];
+        f.instruction(&Instruction::I32Const(9));
+        f.instruction(&Instruction::Call(alloc_idx));
         f.instruction(&Instruction::LocalSet(1));
-        f.instruction(&Instruction::GlobalGet(0));
-        f.instruction(&Instruction::I32Const(9)); // 4 + 5
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::GlobalSet(0));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(5));
         f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
@@ -1474,13 +1534,10 @@ impl CodeGen {
 
         f.instruction(&Instruction::Else);
 
-        // "true" (4 bytes)
-        f.instruction(&Instruction::GlobalGet(0));
+        // "true" (4 bytes) - Phase 8: 使用 __alloc
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::Call(alloc_idx));
         f.instruction(&Instruction::LocalSet(1));
-        f.instruction(&Instruction::GlobalGet(0));
-        f.instruction(&Instruction::I32Const(8)); // 4 + 4
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::GlobalSet(0));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(4));
         f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
@@ -1720,6 +1777,7 @@ impl CodeGen {
                 for e in elements {
                     self.collect_locals_from_expr(e, locals);
                 }
+                locals.add("__tuple_alloc_ptr", ValType::I32, None);
             }
             Expr::TupleIndex { object, .. } => {
                 self.collect_locals_from_expr(object, locals);
@@ -1771,6 +1829,7 @@ impl CodeGen {
                 for e in elems {
                     self.collect_locals_from_expr(e, locals);
                 }
+                locals.add("__array_alloc_ptr", ValType::I32, None);
             }
             Expr::Index { array, index } => {
                 self.collect_locals_from_expr(array, locals);
@@ -1780,6 +1839,7 @@ impl CodeGen {
                 for (_, e) in fields {
                     self.collect_locals_from_expr(e, locals);
                 }
+                locals.add("__struct_alloc_ptr", ValType::I32, None);
             }
             Expr::ConstructorCall { args, .. } => {
                 for e in args {
@@ -1795,12 +1855,14 @@ impl CodeGen {
             Expr::Range { start, end, .. } => {
                 self.collect_locals_from_expr(start, locals);
                 self.collect_locals_from_expr(end, locals);
+                locals.add("__range_alloc_ptr", ValType::I32, None);
             }
             Expr::Cast { expr, .. } => {
                 self.collect_locals_from_expr(expr, locals);
             }
             Expr::VariantConst { arg: Some(e), .. } => {
                 self.collect_locals_from_expr(e, locals);
+                locals.add("__enum_alloc_ptr", ValType::I32, None);
             }
             Expr::VariantConst { .. } => {}
             Expr::Lambda { body, .. } => {
@@ -2225,6 +2287,16 @@ impl CodeGen {
             Stmt::Assign { target, value } => {
                 match target {
                     AssignTarget::Var(name) => {
+                        // Phase 8: 引用计数 - 赋值前对旧值 rc_dec
+                        if let Some(ast_ty) = locals.get_type(name) {
+                            if memory::is_heap_type(ast_ty) || memory::may_hold_heap_ptr(ast_ty) {
+                                if let Some(rc_dec_idx) = self.func_indices.get("__rc_dec") {
+                                    let idx = locals.get(name).expect("变量未找到");
+                                    func.instruction(&Instruction::LocalGet(idx));
+                                    func.instruction(&Instruction::Call(*rc_dec_idx));
+                                }
+                            }
+                        }
                         self.compile_expr(value, locals, func, loop_ctx);
                         let idx = locals.get(name).expect("变量未找到");
                         func.instruction(&Instruction::LocalSet(idx));
@@ -3233,17 +3305,19 @@ impl CodeGen {
                 self.compile_expr(&match_expr, locals, func, loop_ctx);
             }
             Expr::Tuple(elements) => {
-                // 元组布局: [field0][field1]...，每个字段按其类型大小存储
-                // 简化实现：所有字段都按 8 字节 (i64) 存储
+                // Phase 8: 使用 __alloc 分配元组内存
                 let elem_size = 8i32;
                 let total_size = elements.len() as i32 * elem_size;
+                let alloc_idx = self.func_indices["__alloc"];
+                let tmp_local = locals.get("__tuple_alloc_ptr").expect("__tuple_alloc_ptr 未预注册");
 
-                // 获取当前堆指针作为元组地址
-                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(total_size));
+                func.instruction(&Instruction::Call(alloc_idx));
+                func.instruction(&Instruction::LocalSet(tmp_local));
 
                 // 写入每个元素
                 for (i, elem) in elements.iter().enumerate() {
-                    func.instruction(&Instruction::GlobalGet(0));
+                    func.instruction(&Instruction::LocalGet(tmp_local));
                     func.instruction(&Instruction::I32Const(i as i32 * elem_size));
                     func.instruction(&Instruction::I32Add);
                     self.compile_expr(elem, locals, func, loop_ctx);
@@ -3252,7 +3326,6 @@ impl CodeGen {
                         ValType::I64 => func.instruction(&Instruction::I64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 })),
                         ValType::F64 => func.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 })),
                         ValType::I32 => {
-                            // 零扩展到 i64 存储
                             func.instruction(&Instruction::I64ExtendI32U);
                             func.instruction(&Instruction::I64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }))
                         }
@@ -3264,13 +3337,8 @@ impl CodeGen {
                     };
                 }
 
-                // 更新堆指针
-                func.instruction(&Instruction::GlobalGet(0));
-                func.instruction(&Instruction::I32Const(total_size));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::GlobalSet(0));
-
-                // 栈上已有元组地址
+                // 返回元组地址
+                func.instruction(&Instruction::LocalGet(tmp_local));
             }
             Expr::TupleIndex { object, index } => {
                 // tuple.N -> load from (tuple_ptr + N * 8)
@@ -3328,17 +3396,18 @@ impl CodeGen {
                 func.instruction(&Instruction::End);
             }
             Expr::Array(elements) => {
-                // 分配内存: global[0] 是堆指针
+                // Phase 8: 使用 __alloc 分配数组内存
                 let elem_size = 8; // i64 大小
                 let total_size = 4 + elements.len() as i32 * elem_size; // length + elements
+                let alloc_idx = self.func_indices["__alloc"];
+                let tmp_local = locals.get("__array_alloc_ptr").expect("__array_alloc_ptr 未预注册");
 
-                // 获取当前堆指针
-                func.instruction(&Instruction::GlobalGet(0));
-
-                // 保存数组起始地址到栈上
-                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(total_size));
+                func.instruction(&Instruction::Call(alloc_idx));
+                func.instruction(&Instruction::LocalSet(tmp_local));
 
                 // 写入数组长度
+                func.instruction(&Instruction::LocalGet(tmp_local));
                 func.instruction(&Instruction::I32Const(elements.len() as i32));
                 func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                     offset: 0,
@@ -3348,7 +3417,7 @@ impl CodeGen {
 
                 // 写入每个元素
                 for (i, elem) in elements.iter().enumerate() {
-                    func.instruction(&Instruction::GlobalGet(0));
+                    func.instruction(&Instruction::LocalGet(tmp_local));
                     func.instruction(&Instruction::I32Const(4 + i as i32 * elem_size));
                     func.instruction(&Instruction::I32Add);
                     self.compile_expr(elem, locals, func, loop_ctx);
@@ -3359,13 +3428,8 @@ impl CodeGen {
                     }));
                 }
 
-                // 更新堆指针
-                func.instruction(&Instruction::GlobalGet(0));
-                func.instruction(&Instruction::I32Const(total_size));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::GlobalSet(0));
-
-                // 栈上已经有数组起始地址了
+                // 返回数组地址
+                func.instruction(&Instruction::LocalGet(tmp_local));
             }
             Expr::Index { array, index } => {
                 // arr[i] -> load from (arr + 4 + i * 8)
@@ -3391,12 +3455,17 @@ impl CodeGen {
                 let struct_def = self.structs.get(name).expect("结构体未定义");
                 let struct_size = header_size + struct_def.size();
 
-                // 获取当前堆指针作为对象地址
-                func.instruction(&Instruction::GlobalGet(0));
+                // Phase 8: 使用 __alloc 分配内存
+                let alloc_idx = self.func_indices["__alloc"];
+                let tmp_local = locals.get("__struct_alloc_ptr").expect("__struct_alloc_ptr 未预注册");
+
+                func.instruction(&Instruction::I32Const(struct_size as i32));
+                func.instruction(&Instruction::Call(alloc_idx));
+                func.instruction(&Instruction::LocalSet(tmp_local));
 
                 // 写入 vtable_ptr（如果有 vtable）
                 if has_vtable {
-                    func.instruction(&Instruction::GlobalGet(0));
+                    func.instruction(&Instruction::LocalGet(tmp_local));
                     func.instruction(&Instruction::I32Const(vtable_base as i32));
                     func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                         offset: 0,
@@ -3412,7 +3481,7 @@ impl CodeGen {
                         .expect("字段未定义");
                     let offset = header_size + base_offset;
 
-                    func.instruction(&Instruction::GlobalGet(0));
+                    func.instruction(&Instruction::LocalGet(tmp_local));
                     func.instruction(&Instruction::I32Const(offset as i32));
                     func.instruction(&Instruction::I32Add);
                     self.compile_expr(value, locals, func, loop_ctx);
@@ -3423,13 +3492,8 @@ impl CodeGen {
                     }));
                 }
 
-                // 更新堆指针
-                func.instruction(&Instruction::GlobalGet(0));
-                func.instruction(&Instruction::I32Const(struct_size as i32));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::GlobalSet(0));
-
-                // 返回结构体地址 (已在栈上)
+                // 返回对象地址
+                func.instruction(&Instruction::LocalGet(tmp_local));
             }
             Expr::ConstructorCall { name, type_args, args } => {
                 // abstract 类不能直接实例化
@@ -3507,24 +3571,26 @@ impl CodeGen {
                 }
             }
             Expr::Range { start, end, inclusive } => {
-                // 范围作为值：分配堆内存存储 [start: i64][end: i64][inclusive: i32]
-                // 布局: offset 0 = start (8 bytes), offset 8 = end (8 bytes), offset 16 = inclusive (4 bytes)
+                // Phase 8: 使用 __alloc 分配 Range 内存
                 let range_size = Type::range_heap_size();
+                let alloc_idx = self.func_indices["__alloc"];
+                let tmp_local = locals.get("__range_alloc_ptr").expect("__range_alloc_ptr 未预注册");
 
-                // 保存当前堆指针作为返回值（Range 指针）
-                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::I32Const(range_size as i32));
+                func.instruction(&Instruction::Call(alloc_idx));
+                func.instruction(&Instruction::LocalSet(tmp_local));
 
                 // 存储 start 到 offset 0
-                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::LocalGet(tmp_local));
                 self.compile_expr(start, locals, func, loop_ctx);
                 func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
                     offset: 0,
-                    align: 3, // 8-byte aligned
+                    align: 3,
                     memory_index: 0,
                 }));
 
                 // 存储 end 到 offset 8
-                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::LocalGet(tmp_local));
                 self.compile_expr(end, locals, func, loop_ctx);
                 func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
                     offset: 8,
@@ -3533,19 +3599,16 @@ impl CodeGen {
                 }));
 
                 // 存储 inclusive 到 offset 16
-                func.instruction(&Instruction::GlobalGet(0));
+                func.instruction(&Instruction::LocalGet(tmp_local));
                 func.instruction(&Instruction::I32Const(if *inclusive { 1 } else { 0 }));
                 func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                     offset: 16,
-                    align: 2, // 4-byte aligned
+                    align: 2,
                     memory_index: 0,
                 }));
 
-                // 更新堆指针
-                func.instruction(&Instruction::GlobalGet(0));
-                func.instruction(&Instruction::I32Const(range_size as i32));
-                func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::GlobalSet(0));
+                // 返回 Range 地址
+                func.instruction(&Instruction::LocalGet(tmp_local));
 
                 // 栈上留下指针（之前已经压入）
             }
@@ -3560,12 +3623,18 @@ impl CodeGen {
                     .expect("变体未找到") as i32;
 
                 if enum_def.has_payload() {
-                    // 布局: [i32 判别式][payload 区]，payload_size 为各变体 payload 类型最大尺寸
-                    let payload_size = enum_def.payload_size().max(8) as i32; // 至少 8 字节便于存 i64
+                    // Phase 8: 使用 __alloc 分配枚举内存
+                    let payload_size = enum_def.payload_size().max(8) as i32;
                     let total_size = 4 + payload_size;
+                    let alloc_idx = self.func_indices["__alloc"];
+                    let tmp_local = locals.get("__enum_alloc_ptr").expect("__enum_alloc_ptr 未预注册");
 
-                    func.instruction(&Instruction::GlobalGet(0)); // 基址留栈
-                    func.instruction(&Instruction::GlobalGet(0));
+                    func.instruction(&Instruction::I32Const(total_size));
+                    func.instruction(&Instruction::Call(alloc_idx));
+                    func.instruction(&Instruction::LocalSet(tmp_local));
+
+                    // 写入判别式
+                    func.instruction(&Instruction::LocalGet(tmp_local));
                     func.instruction(&Instruction::I32Const(disc));
                     func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
                         offset: 0,
@@ -3577,17 +3646,15 @@ impl CodeGen {
                         let payload_ty = enum_def
                             .variant_payload(variant_name)
                             .expect("带关联值变体需提供参数");
-                        func.instruction(&Instruction::GlobalGet(0));
+                        func.instruction(&Instruction::LocalGet(tmp_local));
                         func.instruction(&Instruction::I32Const(4));
                         func.instruction(&Instruction::I32Add);
                         self.compile_expr(payload_expr, locals, func, loop_ctx);
                         self.emit_store_by_type(func, payload_ty);
                     }
 
-                    func.instruction(&Instruction::GlobalGet(0));
-                    func.instruction(&Instruction::I32Const(total_size));
-                    func.instruction(&Instruction::I32Add);
-                    func.instruction(&Instruction::GlobalSet(0));
+                    // 返回枚举地址
+                    func.instruction(&Instruction::LocalGet(tmp_local));
                 } else {
                     if arg.is_some() {
                         panic!("简单枚举变体不能带关联值: {}.{}", enum_name, variant_name);
@@ -4188,6 +4255,18 @@ impl LocalsBuilder {
 
     fn get_type(&self, name: &str) -> Option<&Type> {
         self.ast_types.get(name)
+    }
+
+    /// 确保临时变量存在，不存在则创建。返回 local index。
+    fn ensure_temp(&mut self, name: &str, ty: ValType) -> u32 {
+        if let Some(idx) = self.names.get(name) {
+            *idx
+        } else {
+            let idx = self.types.len() as u32;
+            self.names.insert(name.to_string(), idx);
+            self.types.push(ty);
+            idx
+        }
     }
 }
 

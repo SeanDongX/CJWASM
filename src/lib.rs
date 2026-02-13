@@ -3,6 +3,7 @@
 pub mod ast;
 pub mod codegen;
 pub mod lexer;
+pub mod memory;
 pub mod monomorph;
 pub mod optimizer;
 pub mod parser;

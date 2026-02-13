@@ -3230,3 +3230,304 @@ fn test_compile_generic_struct_constraint() {
     let wasm = compile_source(source);
     assert_valid_wasm(&wasm, "generic_struct_constraint");
 }
+
+// ============================================================
+// Phase 8: 内存管理测试
+// ============================================================
+
+/// 验证 WASM 模块导出了内存管理函数（通过在二进制中搜索导出名字符串）
+fn assert_has_memory_exports(wasm: &[u8]) {
+    let wasm_str = String::from_utf8_lossy(wasm);
+    assert!(wasm_str.contains("__alloc"), "应导出 __alloc 函数");
+    assert!(wasm_str.contains("__free"), "应导出 __free 函数");
+    assert!(wasm_str.contains("__rc_inc"), "应导出 __rc_inc 函数");
+    assert!(wasm_str.contains("__rc_dec"), "应导出 __rc_dec 函数");
+    assert!(wasm_str.contains("__gc_collect"), "应导出 __gc_collect 函数");
+}
+
+// --- 内存管理函数导出验证 ---
+#[test]
+fn test_memory_management_exports() {
+    let source = r#"
+        func main() -> Int64 {
+            return 0
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_exports");
+    assert_has_memory_exports(&wasm);
+}
+
+// --- 结构体分配通过 __alloc ---
+#[test]
+fn test_memory_struct_alloc() {
+    let source = r#"
+        struct Point {
+            x: Int64
+            y: Int64
+        }
+
+        func main() -> Int64 {
+            let p = Point { x: 10, y: 20 }
+            return p.x + p.y
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_struct_alloc");
+    assert_has_memory_exports(&wasm);
+}
+
+// --- 数组分配通过 __alloc ---
+#[test]
+fn test_memory_array_alloc() {
+    let source = r#"
+        func main() -> Int64 {
+            let arr = [1, 2, 3, 4, 5]
+            return arr[0] + arr[4]
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_array_alloc");
+    assert_has_memory_exports(&wasm);
+}
+
+// --- 元组分配通过 __alloc ---
+#[test]
+fn test_memory_tuple_alloc() {
+    let source = r#"
+        func main() -> Int64 {
+            let t = (10, 20, 30)
+            return t.0 + t.2
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_tuple_alloc");
+    assert_has_memory_exports(&wasm);
+}
+
+// --- 枚举带关联值分配通过 __alloc ---
+#[test]
+fn test_memory_enum_alloc() {
+    let source = r#"
+        enum Shape {
+            Circle(Int64)
+            Rect(Int64)
+        }
+
+        func area(s: Shape) -> Int64 {
+            return match s {
+                Shape.Circle(r) => r * r,
+                Shape.Rect(side) => side * side,
+                _ => 0
+            }
+        }
+
+        func main() -> Int64 {
+            let c = Shape.Circle(5)
+            return area(c)
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_enum_alloc");
+    assert_has_memory_exports(&wasm);
+}
+
+// --- 类实例分配通过 __alloc ---
+#[test]
+fn test_memory_class_alloc() {
+    let source = r#"
+        class Counter {
+            var count: Int64;
+            init(start: Int64) {
+                this.count = start
+            }
+            func get(self: Counter) -> Int64 {
+                return self.count
+            }
+        }
+
+        func main() -> Int64 {
+            let c = Counter(10)
+            return c.get()
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_class_alloc");
+    assert_has_memory_exports(&wasm);
+}
+
+// --- 字符串拼接通过 __alloc ---
+#[test]
+fn test_memory_string_concat_alloc() {
+    let source = r#"
+        func main() -> Int64 {
+            let a = "hello"
+            let b = " world"
+            let c = a + b
+            return 42
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_string_concat_alloc");
+    assert_has_memory_exports(&wasm);
+}
+
+// --- 多次分配和赋值（RC dec 覆盖） ---
+#[test]
+fn test_memory_rc_on_reassignment() {
+    let source = r#"
+        struct Box {
+            value: Int64
+        }
+
+        func main() -> Int64 {
+            var b = Box { value: 1 }
+            b = Box { value: 2 }
+            b = Box { value: 3 }
+            return b.value
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_rc_reassignment");
+}
+
+// --- Range 分配通过 __alloc ---
+#[test]
+fn test_memory_range_alloc() {
+    let source = r#"
+        func main() -> Int64 {
+            let r = 1..10
+            return 0
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_range_alloc");
+}
+
+// --- 多个堆对象同时使用 ---
+#[test]
+fn test_memory_multiple_heap_objects() {
+    let source = r#"
+        struct Point {
+            x: Int64
+            y: Int64
+        }
+
+        func main() -> Int64 {
+            let p1 = Point { x: 1, y: 2 }
+            let p2 = Point { x: 3, y: 4 }
+            let p3 = Point { x: 5, y: 6 }
+            let arr = [p1.x, p2.x, p3.x]
+            return p1.x + p2.y + p3.x
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_multiple_heap_objects");
+}
+
+// --- 类继承 + deinit + RC ---
+#[test]
+fn test_memory_class_deinit() {
+    let source = r#"
+        class Base {
+            var value: Int64;
+            init(v: Int64) {
+                this.value = v
+            }
+            deinit {
+                let x = 0
+            }
+        }
+
+        func main() -> Int64 {
+            let b = Base(42)
+            return b.value
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_class_deinit");
+}
+
+// --- 复杂场景：循环中分配 ---
+#[test]
+fn test_memory_alloc_in_loop() {
+    let source = r#"
+        struct Item {
+            value: Int64
+        }
+
+        func main() -> Int64 {
+            var sum: Int64 = 0
+            var i: Int64 = 0
+            while i < 5 {
+                let item = Item { value: i * 10 }
+                sum = sum + item.value
+                i = i + 1
+            }
+            return sum
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_alloc_in_loop");
+}
+
+// --- Option/Result 内存分配 ---
+#[test]
+fn test_memory_option_result_alloc() {
+    let source = r#"
+        func maybe(x: Int64) -> Int64 {
+            let opt = Some(x)
+            match opt {
+                Some(v) => v,
+                None => 0,
+            }
+        }
+
+        func main() -> Int64 {
+            return maybe(42)
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_option_alloc");
+}
+
+// --- 综合内存管理测试 ---
+#[test]
+fn test_memory_comprehensive() {
+    let source = r#"
+        struct Node {
+            value: Int64
+            next: Int64
+        }
+
+        enum Color {
+            Red
+            Green
+            Blue
+            Custom(Int64)
+        }
+
+        class Container {
+            var data: Int64;
+            init(d: Int64) {
+                this.data = d
+            }
+            func getData(self: Container) -> Int64 {
+                return self.data
+            }
+        }
+
+        func main() -> Int64 {
+            let n1 = Node { value: 1, next: 0 }
+            let n2 = Node { value: 2, next: 0 }
+            let arr = [n1.value, n2.value, 3]
+            let t = (10, 20)
+            let c = Container(100)
+            let color = Color.Custom(255)
+            return n1.value + arr[1] + t.0 + c.getData()
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "memory_comprehensive");
+    assert_has_memory_exports(&wasm);
+}
