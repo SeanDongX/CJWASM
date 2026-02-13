@@ -351,6 +351,7 @@ impl Parser {
             visibility,
             name,
             type_params: vec![],
+            constraints: vec![],
             params,
             return_type,
             body: vec![],
@@ -412,19 +413,44 @@ impl Parser {
         Ok(Some(args))
     }
 
-    /// 解析泛型类型参数列表 <T, U, ...>
-    fn parse_type_params(&mut self) -> Result<Vec<String>, ParseErrorAt> {
+    /// 解析泛型类型参数列表 <T, U, ...> 或 <T: Bound1 & Bound2, U: Bound3, ...>
+    /// 返回 (类型参数名列表, 类型约束列表)
+    fn parse_type_params_with_constraints(&mut self) -> Result<(Vec<String>, Vec<crate::ast::TypeConstraint>), ParseErrorAt> {
         if !self.check(&Token::Lt) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         self.advance();
         let mut params = Vec::new();
+        let mut constraints = Vec::new();
         loop {
             let p = match self.advance() {
                 Some(Token::Ident(n)) => n,
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类型参数名".to_string())),
                 None => return self.bail(ParseError::UnexpectedEof),
             };
+            // 检查是否有约束 T: Bound1 & Bound2
+            if self.check(&Token::Colon) {
+                self.advance();
+                let mut bounds = Vec::new();
+                loop {
+                    let bound = match self.advance() {
+                        Some(Token::Ident(n)) => n,
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    bounds.push(bound);
+                    // 检查是否有多重约束 &
+                    if self.check(&Token::And) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                constraints.push(crate::ast::TypeConstraint {
+                    param: p.clone(),
+                    bounds,
+                });
+            }
             params.push(p);
             if self.check(&Token::Comma) {
                 self.advance();
@@ -435,7 +461,54 @@ impl Parser {
                 return self.bail(ParseError::UnexpectedToken(self.peek().cloned().unwrap_or(Token::Comma), "`,` 或 `>`".to_string()));
             }
         }
+        Ok((params, constraints))
+    }
+
+    /// 解析泛型类型参数列表 <T, U, ...>（向后兼容，不解析约束）
+    fn parse_type_params(&mut self) -> Result<Vec<String>, ParseErrorAt> {
+        let (params, _) = self.parse_type_params_with_constraints()?;
         Ok(params)
+    }
+
+    /// 解析 where 子句：where T: Bound1 & Bound2, U: Bound3
+    fn parse_where_clause(&mut self) -> Result<Vec<crate::ast::TypeConstraint>, ParseErrorAt> {
+        if !matches!(self.peek(), Some(Token::Ident(ref s)) if s == "where") {
+            return Ok(Vec::new());
+        }
+        self.advance(); // consume "where"
+        let mut constraints = Vec::new();
+        loop {
+            let param = match self.advance() {
+                Some(Token::Ident(n)) => n,
+                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类型参数名".to_string())),
+                None => return self.bail(ParseError::UnexpectedEof),
+            };
+            self.expect(Token::Colon)?;
+            let mut bounds = Vec::new();
+            loop {
+                let bound = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                bounds.push(bound);
+                if self.check(&Token::And) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            constraints.push(crate::ast::TypeConstraint {
+                param,
+                bounds,
+            });
+            if self.check(&Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(constraints)
     }
 
     /// 解析结构体定义（带可见性）
@@ -448,7 +521,10 @@ impl Parser {
             None => return self.bail(ParseError::UnexpectedEof),
         };
 
-        let type_params = self.parse_type_params()?;
+        let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
+        // 解析可选的 where 子句
+        let where_constraints = self.parse_where_clause()?;
+        constraints.extend(where_constraints);
         let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
 
         self.expect(Token::LBrace)?;
@@ -474,7 +550,7 @@ impl Parser {
 
         self.expect(Token::RBrace)?;
         self.current_type_params = prev_params;
-        Ok(StructDef { visibility, name, type_params, fields })
+        Ok(StructDef { visibility, name, type_params, constraints, fields })
     }
 
     /// 解析枚举定义（支持无关联值或单关联类型变体，如 Ok(Int64)）
@@ -490,6 +566,11 @@ impl Parser {
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "枚举名".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
+        // 解析可选的泛型类型参数 <T, E: Bound, ...>
+        let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
+        let where_constraints = self.parse_where_clause()?;
+        constraints.extend(where_constraints);
+        let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
         while !self.check(&Token::RBrace) {
@@ -515,7 +596,8 @@ impl Parser {
             }
         }
         self.expect(Token::RBrace)?;
-        Ok(EnumDef { visibility, name, variants })
+        self.current_type_params = prev_params;
+        Ok(EnumDef { visibility, name, type_params, constraints, variants })
     }
 
     /// 解析接口定义
@@ -574,6 +656,9 @@ impl Parser {
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类名".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
+        // 解析可选的泛型类型参数 <T, U: Bound, ...>
+        let (type_params, constraints) = self.parse_type_params_with_constraints()?;
+        let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
         let extends = if self.check(&Token::Extends) {
             self.advance();
             Some(match self.advance() {
@@ -683,6 +768,7 @@ impl Parser {
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__get_{}", name, prop_name),
                                     type_params: vec![],
+                                    constraints: vec![],
                                     params: vec![Param {
                                         name: "this".to_string(),
                                         ty: Type::Struct(name.clone(), vec![]),
@@ -715,6 +801,7 @@ impl Parser {
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__set_{}", name, prop_name),
                                     type_params: vec![],
+                                    constraints: vec![],
                                     params: vec![
                                         Param {
                                             name: "this".to_string(),
@@ -780,6 +867,7 @@ impl Parser {
                         visibility: member_vis,
                         name: m_name,
                         type_params,
+                        constraints: vec![],
                         params,
                         return_type,
                         body,
@@ -794,9 +882,12 @@ impl Parser {
             }
         }
         self.expect(Token::RBrace)?;
+        self.current_type_params = prev_params;
         Ok(crate::ast::ClassDef {
             visibility,
             name,
+            type_params,
+            constraints,
             is_abstract,
             is_sealed,
             is_open,
@@ -818,9 +909,9 @@ impl Parser {
     fn parse_function_with_visibility(&mut self, visibility: Visibility) -> Result<Function, ParseErrorAt> {
         self.expect(Token::Func)?;
 
-        let (name, type_params) = match self.advance() {
+        let (name, type_params, mut constraints) = match self.advance() {
             Some(Token::Ident(n)) => {
-                let tp = self.parse_type_params()?;
+                let (tp, tc) = self.parse_type_params_with_constraints()?;
                 let full_name = if self.check(&Token::Dot) {
                     self.advance();
                     let method = match self.advance() {
@@ -832,7 +923,7 @@ impl Parser {
                 } else {
                     n
                 };
-                (full_name, tp)
+                (full_name, tp, tc)
             }
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "标识符".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
@@ -858,6 +949,10 @@ impl Parser {
             None
         };
 
+        // 解析可选的 where 子句
+        let where_constraints = self.parse_where_clause()?;
+        constraints.extend(where_constraints);
+
         self.expect(Token::LBrace)?;
         let body = self.parse_stmts()?;
         self.expect(Token::RBrace)?;
@@ -869,6 +964,7 @@ impl Parser {
             visibility,
             name,
             type_params,
+            constraints,
             params,
             return_type,
             body,

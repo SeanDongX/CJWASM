@@ -175,14 +175,23 @@ impl CodeGen {
     pub fn compile(&mut self, program: &Program) -> Vec<u8> {
         let mut module = Module::new();
 
-        // 收集结构体定义
+        // 收集结构体定义（跳过未单态化的泛型结构体）
         for s in &program.structs {
-            self.structs.insert(s.name.clone(), s.clone());
+            if s.type_params.is_empty() {
+                self.structs.insert(s.name.clone(), s.clone());
+            }
         }
-        // 注册所有类（构建 ClassInfo，含继承布局）
-        self.register_classes(&program.classes);
+        // 注册所有类（跳过未单态化的泛型类）
+        let concrete_classes: Vec<_> = program.classes.iter()
+            .filter(|c| c.type_params.is_empty())
+            .cloned()
+            .collect();
+        self.register_classes(&concrete_classes);
+        // 收集枚举定义（跳过未单态化的泛型枚举）
         for e in &program.enums {
-            self.enums.insert(e.name.clone(), e.clone());
+            if e.type_params.is_empty() {
+                self.enums.insert(e.name.clone(), e.clone());
+            }
         }
 
         // 注册内建 Option / Result 枚举（若用户未自定义）
@@ -190,6 +199,8 @@ impl CodeGen {
             self.enums.insert("Option".to_string(), EnumDef {
                 visibility: Visibility::Public,
                 name: "Option".to_string(),
+                type_params: vec![],
+                constraints: vec![],
                 variants: vec![
                     EnumVariant { name: "None".to_string(), payload: None },
                     EnumVariant { name: "Some".to_string(), payload: Some(Type::Int64) },
@@ -200,6 +211,8 @@ impl CodeGen {
             self.enums.insert("Result".to_string(), EnumDef {
                 visibility: Visibility::Public,
                 name: "Result".to_string(),
+                type_params: vec![],
+                constraints: vec![],
                 variants: vec![
                     EnumVariant { name: "Ok".to_string(), payload: Some(Type::Int64) },
                     EnumVariant { name: "Err".to_string(), payload: Some(Type::String) },
@@ -217,8 +230,8 @@ impl CodeGen {
             .filter(|f| f.type_params.is_empty() || f.extern_import.is_some())
             .cloned()
             .collect();
-        // 添加所有类的方法（含有继承的类）
-        for c in &program.classes {
+        // 添加所有类的方法（跳过未单态化的泛型类）
+        for c in program.classes.iter().filter(|c| c.type_params.is_empty()) {
             for m in &c.methods {
                 functions.push(m.func.clone());
             }
@@ -606,6 +619,7 @@ impl CodeGen {
                 visibility: c.visibility.clone(),
                 name: c.name.clone(),
                 type_params: vec![],
+                constraints: vec![],
                 fields: info.all_fields.clone(),
             });
 
@@ -652,6 +666,7 @@ impl CodeGen {
             visibility: Visibility::Public,
             name: func_name,
             type_params: vec![],
+            constraints: vec![],
             params,
             return_type: Some(Type::Struct(class_name.clone(), vec![])),
             body,
@@ -668,6 +683,7 @@ impl CodeGen {
             visibility: Visibility::Public,
             name: func_name,
             type_params: vec![],
+            constraints: vec![],
             params: vec![Param {
                 name: "this".to_string(),
                 ty: Type::Struct(class_name.clone(), vec![]),
@@ -3873,6 +3889,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "answer".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 body: vec![Stmt::Return(Some(Expr::Integer(42)))],
@@ -3895,6 +3912,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "Point".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 fields: vec![
                     FieldDef {
                         name: "x".to_string(),
@@ -3913,6 +3931,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "test".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int32),
                 extern_import: None,
@@ -3952,6 +3971,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "Point".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 fields: vec![
                     FieldDef {
                         name: "x".to_string(),
@@ -3970,6 +3990,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "get_y".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 extern_import: None,
@@ -4012,6 +4033,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "compute".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 body: vec![Stmt::Return(Some(Expr::Binary {
@@ -4042,6 +4064,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "max".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 params: vec![
                     Param {
                         name: "a".to_string(),
@@ -4088,6 +4111,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "first".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 extern_import: None,
@@ -4129,6 +4153,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "match_test".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 params: vec![Param {
                     name: "n".to_string(),
                     ty: Type::Int64,
@@ -4173,6 +4198,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "sum_range".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
                 extern_import: None,
@@ -4221,6 +4247,7 @@ mod tests {
                 visibility: Visibility::default(),
                 name: "fadd".to_string(),
                 type_params: vec![],
+                constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Float64),
                 body: vec![Stmt::Return(Some(Expr::Binary {
@@ -4251,6 +4278,7 @@ mod tests {
                     visibility: Visibility::default(),
                     name: "one".to_string(),
                     type_params: vec![],
+                    constraints: vec![],
                     params: vec![],
                     return_type: Some(Type::Int64),
                     body: vec![Stmt::Return(Some(Expr::Integer(1)))],
@@ -4260,6 +4288,7 @@ mod tests {
                     visibility: Visibility::default(),
                     name: "main".to_string(),
                     type_params: vec![],
+                    constraints: vec![],
                     params: vec![],
                     return_type: Some(Type::Int64),
                     body: vec![Stmt::Return(Some(Expr::Call {

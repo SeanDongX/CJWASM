@@ -415,6 +415,8 @@ pub struct StructDef {
     pub name: String,
     /// 泛型类型参数，如 struct Pair<T,U> 的 ["T","U"]
     pub type_params: Vec<String>,
+    /// 类型约束
+    pub constraints: Vec<TypeConstraint>,
     pub fields: Vec<FieldDef>,
 }
 
@@ -469,6 +471,8 @@ pub struct Function {
     pub name: String,
     /// 泛型类型参数，如 func identity<T>(x: T) 的 ["T"]
     pub type_params: Vec<String>,
+    /// 类型约束（来自 `<T: Bound>` 或 `where T: Bound`）
+    pub constraints: Vec<TypeConstraint>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     pub body: Vec<Stmt>,
@@ -505,6 +509,10 @@ pub struct InterfaceDef {
 pub struct ClassDef {
     pub visibility: Visibility,
     pub name: String,
+    /// 泛型类型参数
+    pub type_params: Vec<String>,
+    /// 类型约束
+    pub constraints: Vec<TypeConstraint>,
     /// 是否为 abstract 类（不能直接实例化）
     pub is_abstract: bool,
     /// 是否为 sealed 类（不能被继承）
@@ -547,11 +555,24 @@ pub struct PropDef {
     pub setter: Option<(String, Vec<Stmt>)>, // (参数名, body)
 }
 
-/// 枚举定义（支持无关联值或单关联值变体）
+/// 类型参数约束：<T: Comparable & Hashable>
+#[derive(Debug, Clone)]
+pub struct TypeConstraint {
+    /// 类型参数名（如 "T"）
+    pub param: String,
+    /// 约束的接口名列表（如 ["Comparable", "Hashable"]）
+    pub bounds: Vec<String>,
+}
+
+/// 枚举定义（支持无关联值或单关联值变体，支持泛型）
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub visibility: Visibility,
     pub name: String,
+    /// 泛型类型参数，如 enum Result<T, E> 的 ["T", "E"]
+    pub type_params: Vec<String>,
+    /// 类型约束
+    pub constraints: Vec<TypeConstraint>,
     pub variants: Vec<EnumVariant>,
 }
 

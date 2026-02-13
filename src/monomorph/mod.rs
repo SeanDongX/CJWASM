@@ -1,6 +1,6 @@
 //! 泛型单态化：将泛型函数与结构体按类型实参生成特化版本。
 
-use crate::ast::{Expr, FieldDef, Function, MatchArm, Param, Pattern, Program, Stmt, StructDef};
+use crate::ast::{ClassDef, ClassMethod, EnumDef, EnumVariant, Expr, FieldDef, Function, InitDef, MatchArm, Param, Pattern, Program, Stmt, StructDef};
 use std::collections::{HashMap, HashSet};
 use crate::ast::Type;
 
@@ -491,9 +491,16 @@ struct RewriteMap {
 }
 
 /// 收集所有需要的泛型实例化
-fn collect_instantiations(program: &Program) -> (HashSet<(String, Vec<Type>)>, HashSet<(String, Vec<Type>)>) {
+fn collect_instantiations(program: &Program) -> (
+    HashSet<(String, Vec<Type>)>,
+    HashSet<(String, Vec<Type>)>,
+    HashSet<(String, Vec<Type>)>,
+    HashSet<(String, Vec<Type>)>,
+) {
     let mut func_insts = HashSet::new();
     let mut struct_insts = HashSet::new();
+    let mut enum_insts = HashSet::new();
+    let mut class_insts = HashSet::new();
 
     let generic_functions: std::collections::HashMap<_, _> = program
         .functions
@@ -509,12 +516,30 @@ fn collect_instantiations(program: &Program) -> (HashSet<(String, Vec<Type>)>, H
         .map(|s| (s.name.clone(), s.type_params.len()))
         .collect();
 
+    let generic_enums: std::collections::HashMap<_, _> = program
+        .enums
+        .iter()
+        .filter(|e| !e.type_params.is_empty())
+        .map(|e| (e.name.clone(), e.type_params.len()))
+        .collect();
+
+    let generic_classes: std::collections::HashMap<_, _> = program
+        .classes
+        .iter()
+        .filter(|c| !c.type_params.is_empty())
+        .map(|c| (c.name.clone(), c.type_params.len()))
+        .collect();
+
     fn visit_expr(
         expr: &Expr,
         gf: &std::collections::HashMap<String, usize>,
         gs: &std::collections::HashMap<String, usize>,
+        ge: &std::collections::HashMap<String, usize>,
+        gc: &std::collections::HashMap<String, usize>,
         fi: &mut HashSet<(String, Vec<Type>)>,
         si: &mut HashSet<(String, Vec<Type>)>,
+        ei: &mut HashSet<(String, Vec<Type>)>,
+        ci: &mut HashSet<(String, Vec<Type>)>,
     ) {
         use crate::ast::Expr::*;
         match expr {
@@ -534,6 +559,12 @@ fn collect_instantiations(program: &Program) -> (HashSet<(String, Vec<Type>)>, H
                             si.insert((name.clone(), tas.clone()));
                         }
                     }
+                    // 也检查泛型类
+                    if let Option::Some(n) = gc.get(name) {
+                        if *n == tas.len() {
+                            ci.insert((name.clone(), tas.clone()));
+                        }
+                    }
                 }
             }
             ConstructorCall { name, type_args, .. } => {
@@ -541,6 +572,18 @@ fn collect_instantiations(program: &Program) -> (HashSet<(String, Vec<Type>)>, H
                     if let Option::Some(n) = gs.get(name) {
                         if *n == tas.len() {
                             si.insert((name.clone(), tas.clone()));
+                        }
+                    }
+                    // 也检查泛型枚举
+                    if let Option::Some(n) = ge.get(name) {
+                        if *n == tas.len() {
+                            ei.insert((name.clone(), tas.clone()));
+                        }
+                    }
+                    // 也检查泛型类
+                    if let Option::Some(n) = gc.get(name) {
+                        if *n == tas.len() {
+                            ci.insert((name.clone(), tas.clone()));
                         }
                     }
                 }
@@ -551,12 +594,12 @@ fn collect_instantiations(program: &Program) -> (HashSet<(String, Vec<Type>)>, H
 
     for func in &program.functions {
         for stmt in &func.body {
-            let mut visit = |e: &Expr| visit_expr(e, &generic_functions, &generic_structs, &mut func_insts, &mut struct_insts);
+            let mut visit = |e: &Expr| visit_expr(e, &generic_functions, &generic_structs, &generic_enums, &generic_classes, &mut func_insts, &mut struct_insts, &mut enum_insts, &mut class_insts);
             stmt.walk(&mut visit);
         }
     }
 
-    (func_insts, struct_insts)
+    (func_insts, struct_insts, enum_insts, class_insts)
 }
 
 /// 为 Expr/Stmt 提供 walk
@@ -780,15 +823,162 @@ impl Pattern {
     fn walk_exprs<F: FnMut(&Expr)>(&self, _f: &mut F) {}
 }
 
+/// 收集类型的接口实现信息，用于约束检查
+fn collect_type_implementations(program: &Program) -> HashMap<String, HashSet<String>> {
+    let mut impls: HashMap<String, HashSet<String>> = HashMap::new();
+    // 类的 implements 声明
+    for c in &program.classes {
+        let entry = impls.entry(c.name.clone()).or_default();
+        for iface in &c.implements {
+            entry.insert(iface.clone());
+        }
+    }
+    // 可扩展：也可从 extension/conform 声明中收集
+    impls
+}
+
+/// 检查类型约束是否满足
+/// 返回不满足的约束描述列表（空列表表示全部满足）
+fn check_constraints(
+    constraints: &[crate::ast::TypeConstraint],
+    type_params: &[String],
+    type_args: &[Type],
+    type_impls: &HashMap<String, HashSet<String>>,
+) -> Vec<String> {
+    let subst: HashMap<_, _> = type_params.iter().cloned().zip(type_args.iter().cloned()).collect();
+    let mut violations = Vec::new();
+
+    for constraint in constraints {
+        if let Some(actual_type) = subst.get(&constraint.param) {
+            let type_name = match actual_type {
+                Type::Int8 => "Int8",
+                Type::Int16 => "Int16",
+                Type::Int32 => "Int32",
+                Type::Int64 => "Int64",
+                Type::UInt8 => "UInt8",
+                Type::UInt16 => "UInt16",
+                Type::UInt32 => "UInt32",
+                Type::UInt64 => "UInt64",
+                Type::Float32 => "Float32",
+                Type::Float64 => "Float64",
+                Type::Bool => "Bool",
+                Type::Char => "Char",
+                Type::String => "String",
+                Type::Struct(name, _) => name.as_str(),
+                _ => continue, // 复杂类型跳过约束检查
+            };
+
+            // 内建类型隐含实现常见接口
+            let builtin_impls: HashSet<&str> = match type_name {
+                "Int8" | "Int16" | "Int32" | "Int64" |
+                "UInt8" | "UInt16" | "UInt32" | "UInt64" |
+                "Float32" | "Float64" =>
+                    ["Comparable", "Hashable", "Equatable", "ToString", "Numeric"]
+                        .iter().copied().collect(),
+                "Bool" =>
+                    ["Comparable", "Hashable", "Equatable", "ToString"]
+                        .iter().copied().collect(),
+                "Char" =>
+                    ["Comparable", "Hashable", "Equatable", "ToString"]
+                        .iter().copied().collect(),
+                "String" =>
+                    ["Comparable", "Hashable", "Equatable", "ToString", "Collection"]
+                        .iter().copied().collect(),
+                _ => HashSet::new(),
+            };
+
+            for bound in &constraint.bounds {
+                let satisfied = builtin_impls.contains(bound.as_str())
+                    || type_impls
+                        .get(type_name)
+                        .map(|s| s.contains(bound))
+                        .unwrap_or(false);
+                if !satisfied {
+                    violations.push(format!(
+                        "类型 {} 不满足约束 {}: {}",
+                        type_name, constraint.param, bound
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
 /// 对程序执行单态化
 pub fn monomorphize_program(program: &mut Program) {
-    let (func_insts, struct_insts) = collect_instantiations(program);
+    let (func_insts, struct_insts, enum_insts, class_insts) = collect_instantiations(program);
+
+    // 收集类型实现信息用于约束检查
+    let type_impls = collect_type_implementations(program);
+
+    // 约束检查：泛型函数
+    for (name, type_args) in &func_insts {
+        if let Some(def) = program.functions.iter().find(|f| &f.name == name && f.type_params.len() == type_args.len()) {
+            if !def.constraints.is_empty() {
+                let violations = check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
+                for v in &violations {
+                    eprintln!("⚠ 泛型约束警告 (函数 {}): {}", name, v);
+                }
+            }
+        }
+    }
+
+    // 约束检查：泛型结构体
+    for (name, type_args) in &struct_insts {
+        if let Some(def) = program.structs.iter().find(|s| &s.name == name && s.type_params.len() == type_args.len()) {
+            if !def.constraints.is_empty() {
+                let violations = check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
+                for v in &violations {
+                    eprintln!("⚠ 泛型约束警告 (结构体 {}): {}", name, v);
+                }
+            }
+        }
+    }
+
+    // 约束检查：泛型枚举
+    for (name, type_args) in &enum_insts {
+        if let Some(def) = program.enums.iter().find(|e| &e.name == name && e.type_params.len() == type_args.len()) {
+            if !def.constraints.is_empty() {
+                let violations = check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
+                for v in &violations {
+                    eprintln!("⚠ 泛型约束警告 (枚举 {}): {}", name, v);
+                }
+            }
+        }
+    }
+
+    // 约束检查：泛型类
+    for (name, type_args) in &class_insts {
+        if let Some(def) = program.classes.iter().find(|c| &c.name == name && c.type_params.len() == type_args.len()) {
+            if !def.constraints.is_empty() {
+                let violations = check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
+                for v in &violations {
+                    eprintln!("⚠ 泛型约束警告 (类 {}): {}", name, v);
+                }
+            }
+        }
+    }
 
     let mut func_rewrites: HashMap<(String, Vec<Type>), String> = HashMap::new();
     let mut struct_rewrites: HashMap<(String, Vec<Type>), String> = HashMap::new();
     let mut struct_pattern_rewrites: HashMap<String, String> = HashMap::new();
 
     for (name, type_args) in &struct_insts {
+        let mangled = mangle_name(name, type_args);
+        struct_rewrites.insert((name.clone(), type_args.clone()), mangled.clone());
+        struct_pattern_rewrites.insert(mangled.clone(), mangled.clone());
+    }
+
+    // 泛型枚举也加入 struct_rewrites（枚举实例化名也需要重写）
+    for (name, type_args) in &enum_insts {
+        let mangled = mangle_name(name, type_args);
+        struct_rewrites.insert((name.clone(), type_args.clone()), mangled.clone());
+        struct_pattern_rewrites.insert(mangled.clone(), mangled.clone());
+    }
+
+    // 泛型类也加入 struct_rewrites
+    for (name, type_args) in &class_insts {
         let mangled = mangle_name(name, type_args);
         struct_rewrites.insert((name.clone(), type_args.clone()), mangled.clone());
         struct_pattern_rewrites.insert(mangled.clone(), mangled.clone());
@@ -831,13 +1021,141 @@ pub fn monomorphize_program(program: &mut Program) {
             visibility: def.visibility.clone(),
             name: mangled_name,
             type_params: vec![],
+            constraints: vec![],
             fields,
         });
     }
     program.structs.append(&mut new_structs);
 
+    // 泛型枚举单态化
+    let mut new_enums = Vec::new();
+    for (name, type_args) in &enum_insts {
+        let def = program
+            .enums
+            .iter()
+            .find(|e| &e.name == name && e.type_params.len() == type_args.len())
+            .expect("泛型枚举定义未找到");
+        let subst: HashMap<_, _> = def
+            .type_params
+            .iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect();
+        let mangled_name = mangle_name(name, type_args);
+        let variants: Vec<EnumVariant> = def
+            .variants
+            .iter()
+            .map(|v| EnumVariant {
+                name: v.name.clone(),
+                payload: v.payload.as_ref().map(|t| substitute_type(t, &subst)),
+            })
+            .collect();
+        new_enums.push(EnumDef {
+            visibility: def.visibility.clone(),
+            name: mangled_name,
+            type_params: vec![],
+            constraints: vec![],
+            variants,
+        });
+    }
+    program.enums.append(&mut new_enums);
+
+    // 泛型类单态化
+    let mut new_classes = Vec::new();
+    for (name, type_args) in &class_insts {
+        let def = program
+            .classes
+            .iter()
+            .find(|c| &c.name == name && c.type_params.len() == type_args.len())
+            .expect("泛型类定义未找到");
+        let subst: HashMap<_, _> = def
+            .type_params
+            .iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect();
+        let mangled_name = mangle_name(name, type_args);
+        let fields: Vec<FieldDef> = def
+            .fields
+            .iter()
+            .map(|f| FieldDef {
+                name: f.name.clone(),
+                ty: substitute_type(&f.ty, &subst),
+            })
+            .collect();
+        let methods: Vec<ClassMethod> = def
+            .methods
+            .iter()
+            .map(|m| {
+                // 替换方法名中的类名：OrigName.method → MangledName.method
+                let method_name = if m.func.name.starts_with(&format!("{}.", name)) {
+                    m.func.name.replacen(name, &mangled_name, 1)
+                } else {
+                    m.func.name.clone()
+                };
+                ClassMethod {
+                    override_: m.override_,
+                    func: Function {
+                        visibility: m.func.visibility.clone(),
+                        name: method_name,
+                        type_params: vec![],
+                        constraints: vec![],
+                        params: m.func.params.iter().map(|p| Param {
+                            name: p.name.clone(),
+                            ty: substitute_type(&p.ty, &subst),
+                            default: p.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                            variadic: p.variadic,
+                        }).collect(),
+                        return_type: m.func.return_type.as_ref().map(|t| substitute_type(t, &subst)),
+                        body: m.func.body.iter().cloned().map(|s| substitute_stmt(s, &subst, &rewrites)).collect(),
+                        extern_import: None,
+                    },
+                }
+            })
+            .collect();
+        let init = def.init.as_ref().map(|i| InitDef {
+            params: i.params.iter().map(|p| Param {
+                name: p.name.clone(),
+                ty: substitute_type(&p.ty, &subst),
+                default: p.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                variadic: p.variadic,
+            }).collect(),
+            body: i.body.iter().cloned().map(|s| substitute_stmt(s, &subst, &rewrites)).collect(),
+        });
+        let deinit = def.deinit.as_ref().map(|d| d.iter().cloned().map(|s| substitute_stmt(s, &subst, &rewrites)).collect());
+        new_classes.push(ClassDef {
+            visibility: def.visibility.clone(),
+            name: mangled_name,
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: def.is_abstract,
+            is_sealed: def.is_sealed,
+            is_open: def.is_open,
+            extends: def.extends.clone(),
+            implements: def.implements.clone(),
+            fields,
+            init,
+            deinit,
+            methods,
+        });
+    }
+    program.classes.append(&mut new_classes);
+
+    // 泛型函数单态化（支持特化：若已存在同名非泛型函数，则优先使用）
     let mut new_functions = Vec::new();
     for (name, type_args) in &func_insts {
+        let mangled_name = mangle_name(name, type_args);
+
+        // 泛型特化检查：若程序中已存在名为 mangled_name 的非泛型函数，跳过生成
+        let has_specialization = program
+            .functions
+            .iter()
+            .any(|f| f.name == mangled_name && f.type_params.is_empty());
+        if has_specialization {
+            // 已有特化实现，直接使用
+            continue;
+        }
+
         let def = program
             .functions
             .iter()
@@ -850,7 +1168,6 @@ pub fn monomorphize_program(program: &mut Program) {
             .zip(type_args.iter().cloned())
             .collect();
 
-        let mangled_name = mangle_name(name, type_args);
         let params: Vec<Param> = def
             .params
             .iter()
@@ -879,6 +1196,7 @@ pub fn monomorphize_program(program: &mut Program) {
             visibility: def.visibility.clone(),
             name: mangled_name,
             type_params: vec![],
+            constraints: vec![],
             params,
             return_type,
             body,
