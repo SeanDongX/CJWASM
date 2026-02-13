@@ -164,6 +164,42 @@ impl CodeGen {
         }
     }
 
+    /// 检查语句列表中是否包含未被 try-catch 包裹的 throw 表达式
+    fn contains_unhandled_throw(stmts: &[Stmt]) -> bool {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Expr(e) => {
+                    if Self::expr_contains_unhandled_throw(e) { return true; }
+                }
+                Stmt::Return(Some(e)) => {
+                    if Self::expr_contains_unhandled_throw(e) { return true; }
+                }
+                Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+                    if Self::expr_contains_unhandled_throw(value) { return true; }
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } => {
+                    if Self::contains_unhandled_throw(body) { return true; }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn expr_contains_unhandled_throw(expr: &Expr) -> bool {
+        match expr {
+            Expr::Throw(_) => true,
+            // try-catch 包裹的 throw 不算未处理
+            Expr::TryBlock { .. } => false,
+            Expr::If { then_branch, else_branch, .. } => {
+                Self::expr_contains_unhandled_throw(then_branch)
+                    || else_branch.as_ref().map_or(false, |eb| Self::expr_contains_unhandled_throw(eb))
+            }
+            Expr::Block(stmts, _) => Self::contains_unhandled_throw(stmts),
+            _ => false,
+        }
+    }
+
     fn mangle_key(name: &str, param_tys: &[Type]) -> String {
         if param_tys.is_empty() {
             format!("{}$_", name)
@@ -227,6 +263,48 @@ impl CodeGen {
                     EnumVariant { name: "Err".to_string(), payload: Some(Type::String) },
                 ],
             });
+        }
+
+        // --- 注册内建 Error 基类 (#37) ---
+        // Error 类有一个 message: String 字段，是 open 类（可被继承）
+        let mut builtin_error_init: Option<FuncDef> = None;
+        if !self.classes.contains_key("Error") {
+            let error_class = ClassDef {
+                visibility: Visibility::Public,
+                name: "Error".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                is_abstract: false,
+                is_sealed: false,
+                is_open: true,
+                extends: None,
+                implements: vec![],
+                fields: vec![FieldDef {
+                    name: "message".to_string(),
+                    ty: Type::String,
+                }],
+                init: Some(InitDef {
+                    params: vec![Param {
+                        name: "message".to_string(),
+                        ty: Type::String,
+                        default: None,
+                        variadic: false,
+                    }],
+                    body: vec![Stmt::Assign {
+                        target: AssignTarget::Field {
+                            object: "this".to_string(),
+                            field: "message".to_string(),
+                        },
+                        value: Expr::Var("message".to_string()),
+                    }],
+                }),
+                deinit: None,
+                methods: vec![],
+            };
+            self.register_classes(&[error_class.clone()]);
+            if let Some(ref init_def) = error_class.init {
+                builtin_error_init = Some(self.build_init_function(&error_class, init_def));
+            }
         }
 
         // 收集字符串常量
@@ -307,6 +385,10 @@ impl CodeGen {
         }
         // 添加 extend 中的方法
         functions.extend(extend_functions);
+        // 添加内建 Error 类的 init 函数
+        if let Some(init_func) = builtin_error_init {
+            functions.push(init_func);
+        }
         // 接口默认实现方法 (#30) → 生成为 InterfaceName.__default_method 函数
         for iface in &program.interfaces {
             for m in &iface.methods {
@@ -318,6 +400,7 @@ impl CodeGen {
                         constraints: vec![],
                         params: m.params.clone(),
                         return_type: m.return_type.clone(),
+                        throws: None,
                         body: body.clone(),
                         extern_import: None,
                     });
@@ -792,6 +875,7 @@ impl CodeGen {
                         variadic: false,
                     }).collect(),
                     return_type: return_type.clone(),
+                    throws: None,
                     body: body_stmt,
                     extern_import: None,
                 });
@@ -845,6 +929,7 @@ impl CodeGen {
             constraints: vec![],
             params,
             return_type: Some(Type::Struct(class_name.clone(), vec![])),
+            throws: None,
             body,
             extern_import: None,
         }
@@ -867,6 +952,7 @@ impl CodeGen {
                 variadic: false,
             }],
             return_type: None,
+            throws: None,
             body: deinit_body.to_vec(),
             extern_import: None,
         }
@@ -1035,6 +1121,13 @@ impl CodeGen {
 
     /// 编译函数
     fn compile_function(&self, func: &FuncDef) -> WasmFunc {
+        // --- throws 声明验证 (#38) ---
+        // 如果函数声明了 throws，但函数体中包含的 throw 表达式是合法的
+        // 如果函数没有声明 throws 但包含 throw，发出警告
+        if func.throws.is_none() && Self::contains_unhandled_throw(&func.body) {
+            eprintln!("[warning] 函数 '{}' 包含 throw 但未声明 throws", func.name);
+        }
+
         let mut locals = LocalsBuilder::new();
 
         // 检查是否为 init 函数（__ClassName_init）
@@ -1717,7 +1810,10 @@ impl CodeGen {
                 self.collect_locals_from_expr(inner, locals);
             }
             Expr::None => {}
-            Expr::TryBlock { body, catch_body, catch_var } => {
+            Expr::TryBlock { body, catch_body, catch_var, finally_body } => {
+                // 预分配 try-catch-finally 所需的内部局部变量
+                locals.add("__err_flag", ValType::I32, None);
+                locals.add("__err_val", ValType::I32, None);
                 for stmt in body {
                     self.collect_locals(stmt, locals);
                 }
@@ -1726,6 +1822,11 @@ impl CodeGen {
                 }
                 for stmt in catch_body {
                     self.collect_locals(stmt, locals);
+                }
+                if let Some(finally_stmts) = finally_body {
+                    for stmt in finally_stmts {
+                        self.collect_locals(stmt, locals);
+                    }
                 }
             }
             _ => {}
@@ -3989,20 +4090,65 @@ impl CodeGen {
                 }));
             }
             Expr::Throw(inner) => {
-                // throw expr -> 返回 Err 值
+                // throw expr -> 设置错误标志并跳出 try 块
+                // 如果在 try-catch 上下文中，设置 __err_flag 并将值存入 __err_val
                 self.compile_expr(inner, locals, func, loop_ctx);
-                func.instruction(&Instruction::Return);
+                if let Some(err_val_idx) = locals.get("__err_val") {
+                    func.instruction(&Instruction::LocalSet(err_val_idx));
+                    // 设置 __err_flag = 1
+                    func.instruction(&Instruction::I32Const(1));
+                    if let Some(err_flag_idx) = locals.get("__err_flag") {
+                        func.instruction(&Instruction::LocalSet(err_flag_idx));
+                    }
+                } else {
+                    // 不在 try 上下文中，直接 return
+                    func.instruction(&Instruction::Return);
+                }
             }
-            Expr::TryBlock { body, catch_var, catch_body } => {
-                // try { body } catch(e) { catch_body }
-                // 简化实现：body 正常执行，catch 不执行（除非有 throw）
-                // 完整实现需要 WASM exception handling 提案
+            Expr::TryBlock { body, catch_var, catch_body, finally_body } => {
+                // try { body } catch(e) { catch_body } finally { finally_body }
+                // 实现策略：
+                //   - try body 正常执行
+                //   - 使用全局标志 __err_flag 来标记是否发生了错误（throw 会设置此标志）
+                //   - 如果 throw 发生，跳转到 catch 块
+                //   - finally 块无论是否异常都执行
+
+                // 使用局部变量 __err_flag 标记是否发生错误（0=正常, 1=异常）
+                // 这些局部变量在 collect_locals 阶段已预分配
+                let err_flag = locals.get("__err_flag").unwrap_or(0);
+                let err_val = locals.get("__err_val").unwrap_or(0);
+
+                // 初始化 __err_flag = 0
+                func.instruction(&Instruction::I32Const(0));
+                func.instruction(&Instruction::LocalSet(err_flag));
+
+                // 编译 try body
                 for stmt in body {
                     self.compile_stmt(stmt, locals, func, loop_ctx);
                 }
-                // catch 块暂时不生成（需要 WASM exception handling）
-                let _ = catch_var;
-                let _ = catch_body;
+
+                // 编译 catch 块（在 throw 发生时执行）
+                // 检查 __err_flag
+                func.instruction(&Instruction::LocalGet(err_flag));
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                // 在 catch 块中，如果有 catch_var，将 __err_val 赋给它
+                if let Some(ref var) = catch_var {
+                    if let Some(var_idx) = locals.get(var) {
+                        func.instruction(&Instruction::LocalGet(err_val));
+                        func.instruction(&Instruction::LocalSet(var_idx));
+                    }
+                }
+                for stmt in catch_body {
+                    self.compile_stmt(stmt, locals, func, loop_ctx);
+                }
+                func.instruction(&Instruction::End);
+
+                // 编译 finally 块（无论是否异常都执行）
+                if let Some(finally_stmts) = finally_body {
+                    for stmt in finally_stmts {
+                        self.compile_stmt(stmt, locals, func, loop_ctx);
+                    }
+                }
             }
         }
     }
@@ -4073,6 +4219,7 @@ mod tests {
                 constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
+                throws: None,
                 body: vec![Stmt::Return(Some(Expr::Integer(42)))],
                 extern_import: None,
             }],
@@ -4116,6 +4263,7 @@ mod tests {
                 constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int32),
+                throws: None,
                 extern_import: None,
                 body: vec![
                     Stmt::Let {
@@ -4176,6 +4324,7 @@ mod tests {
                 constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
+                throws: None,
                 extern_import: None,
                 body: vec![
                     Stmt::Let {
@@ -4220,6 +4369,7 @@ mod tests {
                 constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
+                throws: None,
                 body: vec![Stmt::Return(Some(Expr::Binary {
                     op: BinOp::Add,
                     left: Box::new(Expr::Integer(10)),
@@ -4265,6 +4415,7 @@ mod tests {
                     },
                 ],
                 return_type: Some(Type::Int64),
+                throws: None,
                 body: vec![Stmt::Return(Some(Expr::If {
                     cond: Box::new(Expr::Binary {
                         op: BinOp::Gt,
@@ -4300,6 +4451,7 @@ mod tests {
                 constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
+                throws: None,
                 extern_import: None,
                 body: vec![
                     Stmt::Let {
@@ -4348,6 +4500,7 @@ mod tests {
                     variadic: false,
                 }],
                 return_type: Some(Type::Int64),
+                throws: None,
                 body: vec![Stmt::Return(Some(Expr::Match {
                     expr: Box::new(Expr::Var("n".to_string())),
                     arms: vec![
@@ -4389,6 +4542,7 @@ mod tests {
                 constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Int64),
+                throws: None,
                 extern_import: None,
                 body: vec![
                     Stmt::Var {
@@ -4439,6 +4593,7 @@ mod tests {
                 constraints: vec![],
                 params: vec![],
                 return_type: Some(Type::Float64),
+                throws: None,
                 body: vec![Stmt::Return(Some(Expr::Binary {
                     op: BinOp::Add,
                     left: Box::new(Expr::Float(1.5)),
@@ -4471,6 +4626,7 @@ mod tests {
                     constraints: vec![],
                     params: vec![],
                     return_type: Some(Type::Int64),
+                    throws: None,
                     body: vec![Stmt::Return(Some(Expr::Integer(1)))],
                     extern_import: None,
                 },
@@ -4481,6 +4637,7 @@ mod tests {
                     constraints: vec![],
                     params: vec![],
                     return_type: Some(Type::Int64),
+                    throws: None,
                     body: vec![Stmt::Return(Some(Expr::Call {
                         name: "one".to_string(),
                         type_args: None,

@@ -282,11 +282,13 @@ pub enum Expr {
     Try(Box<Expr>),
     /// throw 表达式
     Throw(Box<Expr>),
-    /// try 块表达式
+    /// try 块表达式（支持 try-catch-finally）
     TryBlock {
         body: Vec<Stmt>,
         catch_var: Option<String>,
         catch_body: Vec<Stmt>,
+        /// finally 块（无论是否异常都执行）
+        finally_body: Option<Vec<Stmt>>,
     },
 }
 
@@ -475,6 +477,8 @@ pub struct Function {
     pub constraints: Vec<TypeConstraint>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
+    /// throws 声明的异常类型（如 func f() throws MyError -> Int64）
+    pub throws: Option<String>,
     pub body: Vec<Stmt>,
     /// 若为 Some，则为 extern 函数，从 (module, name) 导入；无 body
     pub extern_import: Option<ExternImport>,

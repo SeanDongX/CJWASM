@@ -303,6 +303,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             body,
             catch_var,
             catch_body,
+            finally_body,
         } => TryBlock {
             body: body
                 .into_iter()
@@ -313,6 +314,12 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .into_iter()
                 .map(|s| substitute_stmt(s, subst, rewrites))
                 .collect(),
+            finally_body: finally_body.map(|stmts| {
+                stmts
+                    .into_iter()
+                    .map(|s| substitute_stmt(s, subst, rewrites))
+                    .collect()
+            }),
         },
         Tuple(elems) => Tuple(
             elems
@@ -1107,6 +1114,7 @@ pub fn monomorphize_program(program: &mut Program) {
                             variadic: p.variadic,
                         }).collect(),
                         return_type: m.func.return_type.as_ref().map(|t| substitute_type(t, &subst)),
+                        throws: m.func.throws.clone(),
                         body: m.func.body.iter().cloned().map(|s| substitute_stmt(s, &subst, &rewrites)).collect(),
                         extern_import: None,
                     },
@@ -1199,6 +1207,7 @@ pub fn monomorphize_program(program: &mut Program) {
             constraints: vec![],
             params,
             return_type,
+            throws: def.throws.clone(),
             body,
             extern_import: None,
         });

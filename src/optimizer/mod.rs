@@ -206,6 +206,7 @@ fn fold_expr(expr: Expr) -> Expr {
             body,
             catch_var,
             catch_body,
+            finally_body,
         } => {
             let body: Vec<Stmt> = body
                 .into_iter()
@@ -221,10 +222,20 @@ fn fold_expr(expr: Expr) -> Expr {
                     s
                 })
                 .collect();
+            let finally_body = finally_body.map(|stmts| {
+                stmts
+                    .into_iter()
+                    .map(|mut s| {
+                        fold_stmt(&mut s);
+                        s
+                    })
+                    .collect()
+            });
             TryBlock {
                 body,
                 catch_var,
                 catch_body,
+                finally_body,
             }
         }
         Cast { expr, target_ty } => Cast {

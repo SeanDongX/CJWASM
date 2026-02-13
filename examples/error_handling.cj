@@ -1,4 +1,4 @@
-// 错误处理示例
+// 错误处理示例 (Phase 6 增强版)
 
 // 使用 Result 类型
 func divide(a: Int64, b: Int64) -> Result<Int64, String> {
@@ -31,6 +31,34 @@ func safeDivide(a: Int64, b: Int64) -> Int64 {
     } catch(e) {
         return 0  // 错误时返回默认值
     }
+}
+
+// try-catch-finally (#39)
+func safeCompute(a: Int64, b: Int64) -> Int64 {
+    var result: Int64 = 0
+    var log: Int64 = 0
+
+    try {
+        if b == 0 {
+            throw 0
+        }
+        result = a / b
+    } catch(e) {
+        result = -1
+    } finally {
+        // 无论成功或失败，都记录日志
+        log = 1
+    }
+
+    return result + log
+}
+
+// throws 声明 (#38)
+func strictDivide(a: Int64, b: Int64) throws Error -> Int64 {
+    if b == 0 {
+        throw 0
+    }
+    return a / b
 }
 
 // Option 类型与 ? 操作符
@@ -78,10 +106,14 @@ func main() -> Int64 {
     let s1 = safeDivide(10, 2)  // 5
     let s2 = safeDivide(10, 0)  // 0
 
+    // try-catch-finally 测试
+    let f1 = safeCompute(10, 2)  // 5 + 1 = 6
+    let f2 = safeCompute(10, 0)  // -1 + 1 = 0
+
     // Option 测试
     let arr = [100, 200, 300]
     let opt = doubleValue(arr, 0)
     let optVal = handleOption(opt)  // 200
 
-    return v1 + s1 + s2 + optVal    // 5 + 5 + 0 + 200 = 210
+    return v1 + s1 + s2 + f1 + f2 + optVal    // 5 + 5 + 0 + 6 + 0 + 200 = 216
 }

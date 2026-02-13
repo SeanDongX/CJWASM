@@ -280,6 +280,10 @@ pub enum Token {
     Catch,
     #[token("throw")]
     Throw,
+    #[token("throws")]
+    Throws,
+    #[token("finally")]
+    Finally,
     #[token("extern")]
     Extern,
     #[token("@")]

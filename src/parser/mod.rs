@@ -357,6 +357,7 @@ impl Parser {
             constraints: vec![],
             params,
             return_type,
+            throws: None,
             body: vec![],
             extern_import: import,
         })
@@ -885,6 +886,7 @@ impl Parser {
                                         variadic: false,
                                     }],
                                     return_type: Some(prop_ty.clone()),
+                                    throws: None,
                                     body,
                                     extern_import: None,
                                 },
@@ -926,6 +928,7 @@ impl Parser {
                                         },
                                     ],
                                     return_type: None,
+                                    throws: None,
                                     body,
                                     extern_import: None,
                                 },
@@ -979,6 +982,7 @@ impl Parser {
                         constraints: vec![],
                         params,
                         return_type,
+                        throws: None,
                         body,
                         extern_import: None,
                     },
@@ -1051,6 +1055,31 @@ impl Parser {
             None
         };
 
+        // 解析可选的 throws 声明: func f() throws ErrorType -> RetType
+        let throws = if self.check(&Token::Throws) {
+            self.advance();
+            match self.peek() {
+                Some(Token::Arrow) | Some(Token::LBrace) => {
+                    // throws 后面没有类型名，默认为 Error
+                    Some("Error".to_string())
+                }
+                Some(Token::Ident(ref s)) if s == "where" => {
+                    // throws 后面是 where 子句，默认为 Error
+                    Some("Error".to_string())
+                }
+                _ => {
+                    let error_type = match self.advance() {
+                        Some(Token::Ident(n)) => n,
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "异常类型名".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    Some(error_type)
+                }
+            }
+        } else {
+            None
+        };
+
         let return_type = if self.check(&Token::Arrow) {
             self.advance();
             Some(self.parse_type()?)
@@ -1076,6 +1105,7 @@ impl Parser {
             constraints,
             params,
             return_type,
+            throws,
             body,
             extern_import: None,
         })
@@ -1831,7 +1861,7 @@ impl Parser {
                 let value = self.parse_expr()?;
                 Ok(Expr::Throw(Box::new(value)))
             }
-            // try 块
+            // try 块（支持 try-catch-finally）
             Some(Token::Try) => {
                 self.expect(Token::LBrace)?;
                 let body = self.parse_stmts()?;
@@ -1851,7 +1881,17 @@ impl Parser {
                 self.expect(Token::LBrace)?;
                 let catch_body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
-                Ok(Expr::TryBlock { body, catch_var, catch_body })
+                // 解析可选的 finally 块
+                let finally_body = if self.check(&Token::Finally) {
+                    self.advance();
+                    self.expect(Token::LBrace)?;
+                    let stmts = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    Some(stmts)
+                } else {
+                    None
+                };
+                Ok(Expr::TryBlock { body, catch_var, catch_body, finally_body })
             }
             Some(Token::Ident(name)) => {
                 // 仅当首字母大写时解析为枚举变体 (Color.Red)，否则 . 后续为字段/方法
