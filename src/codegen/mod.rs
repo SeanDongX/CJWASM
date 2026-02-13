@@ -201,6 +201,49 @@ impl CodeGen {
         }
     }
 
+    /// 从 try body 语句列表中找到第一个 throw 表达式的内部表达式
+    fn find_throw_inner_in_stmts<'a>(stmts: &'a [Stmt]) -> Option<&'a Expr> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Expr(e) => {
+                    if let Some(inner) = Self::find_throw_inner_in_expr(e) {
+                        return Some(inner);
+                    }
+                }
+                Stmt::Return(Some(e)) => {
+                    if let Some(inner) = Self::find_throw_inner_in_expr(e) {
+                        return Some(inner);
+                    }
+                }
+                Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+                    if let Some(inner) = Self::find_throw_inner_in_expr(value) {
+                        return Some(inner);
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } => {
+                    if let Some(inner) = Self::find_throw_inner_in_stmts(body) {
+                        return Some(inner);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn find_throw_inner_in_expr<'a>(expr: &'a Expr) -> Option<&'a Expr> {
+        match expr {
+            Expr::Throw(inner) => Some(inner),
+            Expr::TryBlock { .. } => None,
+            Expr::If { then_branch, else_branch, .. } => {
+                Self::find_throw_inner_in_expr(then_branch)
+                    .or_else(|| else_branch.as_ref().and_then(|eb| Self::find_throw_inner_in_expr(eb)))
+            }
+            Expr::Block(stmts, _) => Self::find_throw_inner_in_stmts(stmts),
+            _ => None,
+        }
+    }
+
     fn mangle_key(name: &str, param_tys: &[Type]) -> String {
         if param_tys.is_empty() {
             format!("{}$_", name)
@@ -1255,7 +1298,21 @@ impl CodeGen {
         }
 
         // 编译函数体（顶层无循环上下文）
-        for stmt in &func.body {
+        // 特殊处理：最后一条 Stmt::Expr 若产生值，则作为隐式返回值（不 drop）
+        let body_len = func.body.len();
+        let has_return_type = func.return_type.is_some();
+        for (i, stmt) in func.body.iter().enumerate() {
+            let is_last = i == body_len - 1;
+            if is_last && has_return_type {
+                if let Stmt::Expr(expr) = stmt {
+                    if Self::expr_produces_value(expr) {
+                        // 最后一条表达式语句作为隐式返回
+                        self.compile_expr(expr, &locals, &mut wasm_func, None);
+                        wasm_func.instruction(&Instruction::Return);
+                        continue;
+                    }
+                }
+            }
             self.compile_stmt(stmt, &locals, &mut wasm_func, None);
         }
 
@@ -1314,7 +1371,10 @@ impl CodeGen {
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I64Const(0));
         f.instruction(&Instruction::I64LeS);
-        f.instruction(&Instruction::BrIf(1));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
         f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I64Mul);
@@ -1399,8 +1459,8 @@ impl CodeGen {
     /// 生成 __i64_to_str(val: i64) -> i32 辅助函数
     /// 简化实现：将数字转为字符串（支持负数）
     fn emit_i64_to_str(&self) -> WasmFunc {
-        // 局部变量: 0=val, 1=ptr, 2=is_neg, 3=len, 4=temp_val, 5=digit_count, 6=temp_ptr
-        let mut f = WasmFunc::new(vec![(6, ValType::I64), (1, ValType::I32)]);
+        // 局部变量: 0=val(i64 参数), 1=ptr(i32), 2..7=临时(i64)
+        let mut f = WasmFunc::new(vec![(1, ValType::I32), (6, ValType::I64)]);
 
         // 简化：对于任何数字，返回固定字符串 "[number]"
         // 完整实现需要复杂的数字到字符串转换
@@ -1874,13 +1934,17 @@ impl CodeGen {
             Expr::None => {}
             Expr::TryBlock { body, catch_body, catch_var, finally_body } => {
                 // 预分配 try-catch-finally 所需的内部局部变量
+                // 推断 throw 表达式的值类型，以确保 __err_val 类型匹配
+                let err_val_type = Self::find_throw_inner_in_stmts(body)
+                    .map(|inner| self.infer_type(inner))
+                    .unwrap_or(ValType::I32);
                 locals.add("__err_flag", ValType::I32, None);
-                locals.add("__err_val", ValType::I32, None);
+                locals.add("__err_val", err_val_type, None);
                 for stmt in body {
                     self.collect_locals(stmt, locals);
                 }
                 if let Some(var) = catch_var {
-                    locals.add(var, ValType::I32, None); // 错误值
+                    locals.add(var, err_val_type, None); // 错误值，类型与 throw 表达式匹配
                 }
                 for stmt in catch_body {
                     self.collect_locals(stmt, locals);
@@ -2154,6 +2218,18 @@ impl CodeGen {
         func.instruction(&instr);
     }
 
+    /// 按 WASM ValType 生成 store 指令（栈顶依次为：地址 i32，值）
+    fn emit_store_by_wasm_type(func: &mut WasmFunc, vt: ValType) {
+        let instr = match vt {
+            ValType::I32 => Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }),
+            ValType::I64 => Instruction::I64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }),
+            ValType::F64 => Instruction::F64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }),
+            ValType::F32 => Instruction::F32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }),
+            ValType::V128 | ValType::Ref(_) => panic!("不支持的字段类型: {:?}", vt),
+        };
+        func.instruction(&instr);
+    }
+
     /// 按 AST 类型生成 store 指令（栈顶依次为：地址 i32，值）
     fn emit_store_by_type(&self, func: &mut WasmFunc, ty: &Type) {
         let instr = match ty.to_wasm() {
@@ -2164,6 +2240,31 @@ impl CodeGen {
             ValType::V128 | ValType::Ref(_) => panic!("不支持的字段类型: {:?}", ty),
         };
         func.instruction(&instr);
+    }
+
+    /// 判断表达式编译后是否在栈上产生一个值
+    fn expr_produces_value(expr: &Expr) -> bool {
+        match expr {
+            Expr::Block(_, result) => result.is_some(),
+            // if 无 else 编译为 BlockType::Empty，不产生值
+            Expr::If { else_branch: None, .. } => false,
+            // if-else：只有两个分支都产生值时，整个 if-else 才产生值
+            Expr::If { then_branch, else_branch: Some(else_expr), .. } => {
+                Self::expr_produces_value(then_branch) && Self::expr_produces_value(else_expr)
+            }
+            // throw 设置 __err_flag/__err_val 并跳转，不在栈上留值
+            Expr::Throw(_) => false,
+            // try-catch 内部通过 return 处理控制流，不在栈上留值
+            Expr::TryBlock { .. } => false,
+            _ => true,
+        }
+    }
+
+    /// 类型推断（含局部变量上下文），优先使用 AST 类型推断结果
+    fn infer_type_with_locals(&self, expr: &Expr, locals: &LocalsBuilder) -> ValType {
+        self.infer_ast_type_with_locals(expr, locals)
+            .map(|t| t.to_wasm())
+            .unwrap_or_else(|| self.infer_type(expr))
     }
 
     /// 简单的类型推断
@@ -2212,7 +2313,9 @@ impl CodeGen {
                 UnaryOp::Neg | UnaryOp::BitNot => self.infer_type(expr),
             },
             Expr::Binary { op, left, .. } => match op {
-                BinOp::LogicalAnd | BinOp::LogicalOr => ValType::I32,
+                BinOp::LogicalAnd | BinOp::LogicalOr
+                | BinOp::Eq | BinOp::NotEq
+                | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => ValType::I32,
                 _ => self.infer_type(left),
             },
             Expr::Index { .. } => ValType::I64,
@@ -2359,7 +2462,10 @@ impl CodeGen {
             }
             Stmt::Expr(expr) => {
                 self.compile_expr(expr, locals, func, loop_ctx);
-                func.instruction(&Instruction::Drop);
+                // 仅当表达式会在栈上产生值时才 drop
+                if Self::expr_produces_value(expr) {
+                    func.instruction(&Instruction::Drop);
+                }
             }
             Stmt::Break => {
                 if let Some((break_depth, _)) = loop_ctx {
@@ -2391,6 +2497,10 @@ impl CodeGen {
                 func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
                 self.compile_expr(cond, locals, func, loop_ctx);
+                // 条件必须是 i32；仅当条件表达式结果是 i64 时才 wrap
+                if self.infer_type_with_locals(cond, locals) == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
                 func.instruction(&Instruction::I32Eqz);
                 func.instruction(&Instruction::BrIf(1));
 
@@ -2896,7 +3006,7 @@ impl CodeGen {
                 let ast_ty = self.infer_ast_type_with_locals(left, locals);
                 let is_unsigned = matches!(ast_ty.as_ref(), Some(Type::UInt8) | Some(Type::UInt16) | Some(Type::UInt32) | Some(Type::UInt64));
 
-                let val_type = self.infer_type(left);
+                let val_type = self.infer_type_with_locals(left, locals);
 
                 // 无符号类型需要使用无符号指令
                 if is_unsigned {
@@ -3280,15 +3390,43 @@ impl CodeGen {
                 else_branch,
             } => {
                 self.compile_expr(cond, locals, func, loop_ctx);
-                func.instruction(&Instruction::I32WrapI64);
-
-                let result_type = wasm_encoder::BlockType::Result(self.infer_type(then_branch));
-                func.instruction(&Instruction::If(result_type));
-                self.compile_expr(then_branch, locals, func, loop_ctx);
+                // 条件必须是 i32；仅当条件表达式结果是 i64 时才 wrap
+                if self.infer_type_with_locals(cond, locals) == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
 
                 if let Some(else_expr) = else_branch {
-                    func.instruction(&Instruction::Else);
-                    self.compile_expr(else_expr, locals, func, loop_ctx);
+                    let then_produces = Self::expr_produces_value(then_branch);
+                    let else_produces = Self::expr_produces_value(else_expr);
+                    if then_produces && else_produces {
+                        // if-else 表达式：两个分支都有返回值
+                        let result_type = wasm_encoder::BlockType::Result(self.infer_type_with_locals(then_branch, locals));
+                        func.instruction(&Instruction::If(result_type));
+                        self.compile_expr(then_branch, locals, func, loop_ctx);
+                        func.instruction(&Instruction::Else);
+                        self.compile_expr(else_expr, locals, func, loop_ctx);
+                    } else {
+                        // if-else 语句：至少一个分支不产生值，用 Empty 块
+                        func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                        self.compile_expr(then_branch, locals, func, loop_ctx);
+                        if then_produces {
+                            func.instruction(&Instruction::Drop);
+                        }
+                        func.instruction(&Instruction::Else);
+                        self.compile_expr(else_expr, locals, func, loop_ctx);
+                        if else_produces {
+                            func.instruction(&Instruction::Drop);
+                        }
+                    }
+                } else {
+                    // if 无 else：无返回值（语句级）
+                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                    // then_branch 如果会产生值（非 void Block），需要 drop
+                    let produces_value = Self::expr_produces_value(then_branch);
+                    self.compile_expr(then_branch, locals, func, loop_ctx);
+                    if produces_value {
+                        func.instruction(&Instruction::Drop);
+                    }
                 }
 
                 func.instruction(&Instruction::End);
@@ -3485,11 +3623,30 @@ impl CodeGen {
                     func.instruction(&Instruction::I32Const(offset as i32));
                     func.instruction(&Instruction::I32Add);
                     self.compile_expr(value, locals, func, loop_ctx);
-                    func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    }));
+                    // 根据字段值类型选择正确的 store 指令
+                    let field_val_type = self.infer_type_with_locals(value, locals);
+                    match field_val_type {
+                        ValType::I32 => func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        })),
+                        ValType::F64 => func.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 3,
+                            memory_index: 0,
+                        })),
+                        ValType::F32 => func.instruction(&Instruction::F32Store(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        })),
+                        _ => func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 3,
+                            memory_index: 0,
+                        })),
+                    };
                 }
 
                 // 返回对象地址
@@ -3665,7 +3822,6 @@ impl CodeGen {
             Expr::Match { expr, arms } => {
                 let subject_ty = self.infer_type(expr);
                 let subject_ast_type = self.infer_ast_type(expr);
-                self.compile_expr(expr, locals, func, loop_ctx);
 
                 let result_type = if arms.is_empty() {
                     wasm_encoder::BlockType::Empty
@@ -3674,6 +3830,8 @@ impl CodeGen {
                 };
 
                 func.instruction(&Instruction::Block(result_type));
+                // subject 表达式必须在 block 内部求值，否则值在 block 栈帧之下不可访问
+                self.compile_expr(expr, locals, func, loop_ctx);
 
                 for (i, arm) in arms.iter().enumerate() {
                     let is_last = i == arms.len() - 1;
@@ -4060,7 +4218,8 @@ impl CodeGen {
             }
             Expr::Ok(inner) => {
                 // Result::Ok(v) -> 堆分配 [tag=0: i32][value]
-                let value_size = match self.infer_ast_type(inner) {
+                let inner_ast_type = self.infer_ast_type(inner);
+                let value_size = match &inner_ast_type {
                     Some(t) => t.size(),
                     None => 8,
                 };
@@ -4080,11 +4239,8 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(4));
                 func.instruction(&Instruction::I32Add);
                 self.compile_expr(inner, locals, func, loop_ctx);
-                func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 3,
-                    memory_index: 0,
-                }));
+                // 根据内部值类型选择正确的 store 指令
+                Self::emit_store_by_wasm_type(func, inner_ast_type.as_ref().map(|t| t.to_wasm()).unwrap_or(ValType::I64));
 
                 func.instruction(&Instruction::GlobalGet(0));
                 func.instruction(&Instruction::I32Const(total_size as i32));
@@ -4093,7 +4249,8 @@ impl CodeGen {
             }
             Expr::Err(inner) => {
                 // Result::Err(e) -> 堆分配 [tag=1: i32][error]
-                let value_size = match self.infer_ast_type(inner) {
+                let inner_ast_type = self.infer_ast_type(inner);
+                let value_size = match &inner_ast_type {
                     Some(t) => t.size(),
                     None => 8,
                 };
@@ -4113,11 +4270,8 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(4));
                 func.instruction(&Instruction::I32Add);
                 self.compile_expr(inner, locals, func, loop_ctx);
-                func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 3,
-                    memory_index: 0,
-                }));
+                // 根据内部值类型选择正确的 store 指令
+                Self::emit_store_by_wasm_type(func, inner_ast_type.as_ref().map(|t| t.to_wasm()).unwrap_or(ValType::I64));
 
                 func.instruction(&Instruction::GlobalGet(0));
                 func.instruction(&Instruction::I32Const(total_size as i32));
@@ -4189,10 +4343,16 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::LocalSet(err_flag));
 
-                // 编译 try body
+                // 用 block 包裹 try body，throw 后通过 br_if 跳出
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                // 编译 try body，每条语句后检查 err_flag 并提前退出
                 for stmt in body {
                     self.compile_stmt(stmt, locals, func, loop_ctx);
+                    // throw 后 __err_flag=1，br_if 跳出 try block
+                    func.instruction(&Instruction::LocalGet(err_flag));
+                    func.instruction(&Instruction::BrIf(0));
                 }
+                func.instruction(&Instruction::End); // end of try body block
 
                 // 编译 catch 块（在 throw 发生时执行）
                 // 检查 __err_flag
@@ -4208,7 +4368,7 @@ impl CodeGen {
                 for stmt in catch_body {
                     self.compile_stmt(stmt, locals, func, loop_ctx);
                 }
-                func.instruction(&Instruction::End);
+                func.instruction(&Instruction::End); // end of catch if
 
                 // 编译 finally 块（无论是否异常都执行）
                 if let Some(finally_stmts) = finally_body {
@@ -4216,6 +4376,10 @@ impl CodeGen {
                         self.compile_stmt(stmt, locals, func, loop_ctx);
                     }
                 }
+
+                // try-catch 所有路径通常都通过 return 退出，
+                // 但 WASM 验证器无法追踪条件返回，标记此处不可达
+                func.instruction(&Instruction::Unreachable);
             }
         }
     }

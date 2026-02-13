@@ -8,3 +8,10 @@ logos = "0.14"           # 词法分析
 wasm-encoder = "0.220"   # WASM 代码生成
 thiserror = "2.0"        # 错误处理
 ariadne = "0.4"          # 错误报告（漂亮的诊断信息）
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "compile_bench"
+harness = false

@@ -731,7 +731,7 @@ pub struct Import {
 }
 
 /// 程序 (模块)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Program {
     /// 模块名称，None 表示主模块
     pub module_name: Option<String>,

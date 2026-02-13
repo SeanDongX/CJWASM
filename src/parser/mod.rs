@@ -1239,6 +1239,33 @@ impl Parser {
         }
     }
 
+    /// 将语句列表转换为 Expr：
+    /// - 空列表 → Expr::Integer(0) 回退值
+    /// - 只有一条 Expr 语句且无前置语句 → 直接使用该表达式
+    /// - 最后一条是 Expr 语句 → Block(前置语句, Some(最后的表达式))
+    /// - 其他情况 → Block(所有语句, None)，保留 return/let 等
+    fn stmts_to_block_expr(stmts: Vec<Stmt>) -> Box<Expr> {
+        if stmts.is_empty() {
+            return Box::new(Expr::Integer(0));
+        }
+        // 检查最后一条是否是 Expr 语句
+        let last_is_expr = matches!(stmts.last(), Some(Stmt::Expr(_)));
+        if last_is_expr {
+            let mut stmts = stmts;
+            let last = stmts.pop().unwrap();
+            let result = if let Stmt::Expr(e) = last { Some(Box::new(e)) } else { unreachable!() };
+            if stmts.is_empty() {
+                // 单个表达式，直接返回（兼容已有行为）
+                result.unwrap()
+            } else {
+                Box::new(Expr::Block(stmts, result))
+            }
+        } else {
+            // 最后一条不是表达式（如 return、let 等），用 Block 包装保留所有语句
+            Box::new(Expr::Block(stmts, None))
+        }
+    }
+
     /// 解析语句列表
     fn parse_stmts(&mut self) -> Result<Vec<Stmt>, ParseErrorAt> {
         let mut stmts = Vec::new();
@@ -2087,37 +2114,24 @@ impl Parser {
                     let cond = self.parse_expr()?;
                     self.expect(Token::LBrace)?;
                     let then_stmts = self.parse_stmts()?;
-                    let then_expr = if then_stmts.is_empty() {
-                        None
-                    } else {
-                        match then_stmts.last() {
-                            Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
-                            _ => None,
-                        }
-                    };
+                    // 将 if 块体包装为 Expr::Block，保留所有语句（含 return/let 等）
+                    let then_branch = Self::stmts_to_block_expr(then_stmts);
                     self.expect(Token::RBrace)?;
 
                     let else_branch = if self.check(&Token::Else) {
                         self.advance();
                         self.expect(Token::LBrace)?;
                         let else_stmts = self.parse_stmts()?;
-                        let else_expr = if else_stmts.is_empty() {
-                            None
-                        } else {
-                            match else_stmts.last() {
-                                Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
-                                _ => None,
-                            }
-                        };
+                        let else_expr = Self::stmts_to_block_expr(else_stmts);
                         self.expect(Token::RBrace)?;
-                        else_expr
+                        Some(else_expr)
                     } else {
                         None
                     };
 
                     Ok(Expr::If {
                         cond: Box::new(cond),
-                        then_branch: then_expr.unwrap_or_else(|| Box::new(Expr::Integer(0))),
+                        then_branch,
                         else_branch,
                     })
                 }

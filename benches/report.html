@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CJWasm vs CJC 性能对比报告</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 2rem; font-weight: 700; text-align: center; margin-bottom: 0.5rem; background: linear-gradient(135deg, #38bdf8, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .subtitle { text-align: center; color: #94a3b8; margin-bottom: 2rem; font-size: 0.9rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2rem; }
+  .card { background: #1e293b; border-radius: 12px; padding: 1.5rem; border: 1px solid #334155; }
+  .card h2 { font-size: 1.1rem; color: #94a3b8; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+  .card h2 .icon { font-size: 1.3rem; }
+  .full-width { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+  th, td { padding: 0.75rem 1rem; text-align: right; border-bottom: 1px solid #334155; }
+  th { color: #94a3b8; font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  th:first-child, td:first-child { text-align: left; }
+  td { font-size: 0.95rem; }
+  .cjwasm { color: #38bdf8; font-weight: 600; }
+  .cjc { color: #f472b6; font-weight: 600; }
+  .speedup { color: #4ade80; font-weight: 700; font-size: 1.1rem; }
+  .bar-container { display: flex; align-items: center; gap: 0.5rem; }
+  .bar { height: 24px; border-radius: 4px; min-width: 2px; transition: width 0.5s ease; }
+  .bar-cjwasm { background: linear-gradient(90deg, #0ea5e9, #38bdf8); }
+  .bar-cjc { background: linear-gradient(90deg, #ec4899, #f472b6); }
+  .bar-label { font-size: 0.8rem; white-space: nowrap; min-width: 80px; }
+  .legend { display: flex; gap: 2rem; justify-content: center; margin-bottom: 1.5rem; }
+  .legend-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 3px; }
+  .dot-cjwasm { background: #38bdf8; }
+  .dot-cjc { background: #f472b6; }
+  .env-info { display: flex; gap: 2rem; justify-content: center; color: #64748b; font-size: 0.8rem; margin-bottom: 1rem; }
+  .big-number { font-size: 2.5rem; font-weight: 700; text-align: center; margin: 0.5rem 0; }
+  .big-label { text-align: center; color: #64748b; font-size: 0.85rem; }
+  .highlight-row { background: #1e293b; }
+  .highlight-row:nth-child(odd) { background: #0f172a; }
+  .note { background: #1e1b4b; border: 1px solid #3730a3; border-radius: 8px; padding: 1rem; margin-top: 1rem; font-size: 0.85rem; color: #a5b4fc; }
+  .note strong { color: #818cf8; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>CJWasm vs CJC 编译性能对比报告</h1>
+<div class="subtitle">生成时间: 2026-02-13 17:19:01 | 系统: arm64 | CPU: Apple M3</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot dot-cjwasm"></div> <strong>cjwasm</strong> (Rust → WASM 前端编译器)</div>
+  <div class="legend-item"><div class="legend-dot dot-cjc"></div> <strong>cjc</strong> (Cangjie Compiler: 1.0.3 (cjnative)) 原生编译器</div>
+</div>
+<div class="grid">
+<div class="card full-width">
+<h2><span class="icon">⚡</span> 编译速度对比</h2>
+<table>
+<tr><th>规模</th><th>cjwasm (ms)</th><th>cjc (ms)</th><th>加速比</th><th>可视化</th></tr>
+<tr class="highlight-row">
+  <td><strong>小规模(27行)</strong></td>
+  <td class="cjwasm">22.66</td>
+  <td class="cjc">233.70</td>
+  <td class="speedup">10x</td>
+  <td>
+    <div class="bar-container">
+      <span class="bar-label cjwasm">cjwasm</span>
+      <div class="bar bar-cjwasm" style="width: 9.6%"></div>
+    </div>
+    <div class="bar-container" style="margin-top:3px">
+      <span class="bar-label cjc">cjc</span>
+      <div class="bar bar-cjc" style="width: 100%"></div>
+    </div>
+  </td>
+</tr>
+<tr class="highlight-row">
+  <td><strong>中规模(100行)</strong></td>
+  <td class="cjwasm">22.54</td>
+  <td class="cjc">235.67</td>
+  <td class="speedup">10x</td>
+  <td>
+    <div class="bar-container">
+      <span class="bar-label cjwasm">cjwasm</span>
+      <div class="bar bar-cjwasm" style="width: 9.5%"></div>
+    </div>
+    <div class="bar-container" style="margin-top:3px">
+      <span class="bar-label cjc">cjc</span>
+      <div class="bar bar-cjc" style="width: 100%"></div>
+    </div>
+  </td>
+</tr>
+<tr class="highlight-row">
+  <td><strong>大规模(311行)</strong></td>
+  <td class="cjwasm">22.85</td>
+  <td class="cjc">249.01</td>
+  <td class="speedup">10x</td>
+  <td>
+    <div class="bar-container">
+      <span class="bar-label cjwasm">cjwasm</span>
+      <div class="bar bar-cjwasm" style="width: 9.1%"></div>
+    </div>
+    <div class="bar-container" style="margin-top:3px">
+      <span class="bar-label cjc">cjc</span>
+      <div class="bar bar-cjc" style="width: 100%"></div>
+    </div>
+  </td>
+</tr>
+</table>
+<div class="note">
+  <strong>说明：</strong>cjwasm 是轻量级前端编译器，仅生成 WASM 字节码（~1-4KB）；cjc 是完整的原生编译器，生成包含标准库链接的可执行文件（~1MB）。两者定位不同，编译速度差异主要来源于此。
+</div>
+</div>
+<div class="card">
+<h2><span class="icon">📦</span> 输出大小对比</h2>
+<table>
+<tr><th>规模</th><th>源码</th><th>cjwasm WASM</th><th>cjc 原生</th><th>比率</th></tr>
+<tr class="highlight-row">
+  <td>小规模(27行)</td>
+  <td>433 B</td>
+  <td class="cjwasm">1238 B</td>
+  <td class="cjc">1020.0 KB</td>
+  <td class="speedup">843x</td>
+</tr>
+<tr class="highlight-row">
+  <td>中规模(100行)</td>
+  <td>1881 B</td>
+  <td class="cjwasm">1928 B</td>
+  <td class="cjc">1021.3 KB</td>
+  <td class="speedup">542x</td>
+</tr>
+<tr class="highlight-row">
+  <td>大规模(311行)</td>
+  <td>6091 B</td>
+  <td class="cjwasm">3845 B</td>
+  <td class="cjc">1024.7 KB</td>
+  <td class="speedup">272x</td>
+</tr>
+</table>
+</div>
+<div class="card full-width">
+<h2><span class="icon">🚀</span> 运行时性能 (wasmtime vs cjc native)</h2>
+<table>
+<tr><th>规模</th><th>wasmtime (cjwasm)</th><th>native (cjc)</th><th>比率</th></tr>
+<tr class="highlight-row"><td><strong>小规模(27行)</strong></td><td class="cjwasm">24.69 ms</td><td class="cjc">37.70 ms</td><td class="speedup">wasm 1.5x 快</td></tr><tr class="highlight-row"><td><strong>中规模(100行)</strong></td><td class="cjwasm">24.62 ms</td><td class="cjc">36.38 ms</td><td class="speedup">wasm 1.5x 快</td></tr><tr class="highlight-row"><td><strong>大规模(311行)</strong></td><td class="cjwasm">24.61 ms</td><td class="cjc">35.88 ms</td><td class="speedup">wasm 1.4x 快</td></tr>
+</table>
+<div class="note">
+  <strong>说明：</strong>wasmtime 运行时间包含 JIT 编译开销。对于短小程序，JIT 编译耗时占比较大，实际计算密集型程序的差距会更小。
+</div>
+</div>
+<div class="card" style="text-align:center">
+<h2><span class="icon">🏆</span> 总体性能</h2>
+<div class="big-number cjwasm">10x</div>
+<div class="big-label">cjwasm 平均编译加速比 (相比 cjc)</div>
+<div style="margin-top:1rem; color:#64748b; font-size:0.85rem">
+  cjwasm 输出 WASM 字节码, 平均体积仅 cjc 原生产物的 <strong style="color:#4ade80">1/10</strong>
+</div>
+</div>
+</div><!-- grid end -->
+
+<div class="card full-width" style="margin-top:1.5rem">
+<h2><span class="icon">🔬</span> cjwasm 内部管线分析</h2>
+<p style="color:#94a3b8; margin-bottom:0.5rem">
+  更详细的内部管线性能分析（词法分析、语法解析、优化器、代码生成各阶段耗时），请查看 Criterion 微基准报告：
+</p>
+<p><code style="background:#334155; padding:0.3rem 0.6rem; border-radius:4px; color:#38bdf8">target/criterion/report/index.html</code></p>
+<p style="color:#64748b; margin-top:0.5rem; font-size:0.85rem">运行 <code style="background:#334155; padding:0.2rem 0.4rem; border-radius:3px">cargo bench</code> 更新 Criterion 报告</p>
+</div>
+
+<div style="text-align:center; margin-top:2rem; color:#475569; font-size:0.8rem">
+  由 <strong>scripts/benchmark.sh</strong> 自动生成 | CJWasm Compiler Benchmark Suite
+</div>
+
+</div><!-- container end -->
+</body>
+</html>
