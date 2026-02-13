@@ -108,23 +108,39 @@ fn optimize_tail_recursion(func: &mut crate::ast::Function) {
     // 转换为循环：
     // loop {
     //     <original body without last statement>
-    //     param1 = new_arg1
-    //     param2 = new_arg2
+    //     let __tco_tmp0 = new_arg0   // 先计算所有新参数到临时变量
+    //     let __tco_tmp1 = new_arg1
+    //     param0 = __tco_tmp0          // 再统一赋值（避免顺序覆盖）
+    //     param1 = __tco_tmp1
     //     continue
     // }
     let mut loop_body = func.body.clone();
 
-    // 添加参数重新赋值
-    for (param_name, arg) in param_names.iter().zip(tail_args) {
+    // 先将所有尾调用参数保存到临时变量（避免 a=b; b=a%b 的顺序覆盖问题）
+    let tmp_names: Vec<String> = (0..param_names.len())
+        .map(|i| format!("__tco_tmp{}", i))
+        .collect();
+    for (tmp_name, arg) in tmp_names.iter().zip(tail_args) {
+        loop_body.push(Stmt::Var {
+            name: tmp_name.clone(),
+            ty: None,
+            value: arg,
+        });
+    }
+    // 再从临时变量赋值给参数
+    for (param_name, tmp_name) in param_names.iter().zip(tmp_names.iter()) {
         loop_body.push(Stmt::Assign {
             target: AssignTarget::Var(param_name.clone()),
-            value: arg,
+            value: Expr::Var(tmp_name.clone()),
         });
     }
     loop_body.push(Stmt::Continue);
 
-    // 替换整个函数体为 loop
-    func.body = vec![Stmt::Loop { body: loop_body }];
+    // 替换整个函数体为 loop + 不可达的虚拟返回（满足 WASM 类型检查）
+    func.body = vec![
+        Stmt::Loop { body: loop_body },
+        Stmt::Return(Some(Expr::Integer(0))),
+    ];
 }
 
 fn fold_stmt(stmt: &mut Stmt) {
