@@ -207,7 +207,8 @@ impl Parser {
                 match self.peek() {
                     Some(Token::Struct) => structs.push(self.parse_struct_with_visibility(visibility)?),
                     Some(Token::Interface) => interfaces.push(self.parse_interface_with_visibility(visibility)?),
-                    Some(Token::Class) => classes.push(self.parse_class_with_visibility(visibility)?),
+                    Some(Token::Class) | Some(Token::Abstract) | Some(Token::Sealed) | Some(Token::Open)
+                        => classes.push(self.parse_class_with_visibility(visibility)?),
                     Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
                     Some(Token::Func) => functions.push(self.parse_function_with_visibility(visibility)?),
                     Some(tok) => {
@@ -560,6 +561,13 @@ impl Parser {
 
     /// 解析类定义
     fn parse_class_with_visibility(&mut self, visibility: Visibility) -> Result<crate::ast::ClassDef, ParseErrorAt> {
+        // 解析可选修饰符: abstract / sealed / open
+        let is_abstract = self.check(&Token::Abstract);
+        if is_abstract { self.advance(); }
+        let is_sealed = self.check(&Token::Sealed);
+        if is_sealed { self.advance(); }
+        let is_open = self.check(&Token::Open);
+        if is_open { self.advance(); }
         self.expect(Token::Class)?;
         let name = match self.advance() {
             Some(Token::Ident(n)) => n,
@@ -631,9 +639,12 @@ impl Parser {
                 self.expect(Token::LParen)?;
                 let params = self.parse_params()?;
                 self.expect(Token::RParen)?;
+                // init 体内 this 可用，指向当前正在构造的对象
+                self.receiver_name = Some("this".to_string());
                 self.expect(Token::LBrace)?;
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
+                self.receiver_name = None;
                 init = Some(crate::ast::InitDef { params, body });
             } else if self.check(&Token::Deinit) {
                 self.advance();
@@ -641,7 +652,99 @@ impl Parser {
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
                 deinit = Some(body);
-            } else if self.check(&Token::Func) {
+            } else if self.check(&Token::Prop) {
+                // prop name: Type { get() { ... } set(value) { ... } }
+                self.advance();
+                let prop_name = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                self.expect(Token::Colon)?;
+                let prop_ty = self.parse_type()?;
+                self.expect(Token::LBrace)?;
+                // 解析 get/set 块
+                while !self.check(&Token::RBrace) {
+                    if let Some(Token::Ident(ref kw)) = self.peek() {
+                        let kw = kw.clone();
+                        if kw == "get" {
+                            self.advance();
+                            self.expect(Token::LParen)?;
+                            self.expect(Token::RParen)?;
+                            self.receiver_name = Some("this".to_string());
+                            self.expect(Token::LBrace)?;
+                            let body = self.parse_stmts()?;
+                            self.expect(Token::RBrace)?;
+                            self.receiver_name = None;
+                            // 脱糖为 getter 方法: ClassName.__get_propName(this) -> Type
+                            methods.push(crate::ast::ClassMethod {
+                                override_: false,
+                                func: crate::ast::Function {
+                                    visibility: member_vis.clone(),
+                                    name: format!("{}.__get_{}", name, prop_name),
+                                    type_params: vec![],
+                                    params: vec![Param {
+                                        name: "this".to_string(),
+                                        ty: Type::Struct(name.clone(), vec![]),
+                                        default: None,
+                                        variadic: false,
+                                    }],
+                                    return_type: Some(prop_ty.clone()),
+                                    body,
+                                    extern_import: None,
+                                },
+                            });
+                        } else if kw == "set" {
+                            self.advance();
+                            self.expect(Token::LParen)?;
+                            let val_name = match self.advance() {
+                                Some(Token::Ident(n)) => n,
+                                Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "setter 参数名".to_string())),
+                                None => return self.bail(ParseError::UnexpectedEof),
+                            };
+                            self.expect(Token::RParen)?;
+                            self.receiver_name = Some("this".to_string());
+                            self.expect(Token::LBrace)?;
+                            let body = self.parse_stmts()?;
+                            self.expect(Token::RBrace)?;
+                            self.receiver_name = None;
+                            // 脱糖为 setter 方法: ClassName.__set_propName(this, value)
+                            methods.push(crate::ast::ClassMethod {
+                                override_: false,
+                                func: crate::ast::Function {
+                                    visibility: member_vis.clone(),
+                                    name: format!("{}.__set_{}", name, prop_name),
+                                    type_params: vec![],
+                                    params: vec![
+                                        Param {
+                                            name: "this".to_string(),
+                                            ty: Type::Struct(name.clone(), vec![]),
+                                            default: None,
+                                            variadic: false,
+                                        },
+                                        Param {
+                                            name: val_name,
+                                            ty: prop_ty.clone(),
+                                            default: None,
+                                            variadic: false,
+                                        },
+                                    ],
+                                    return_type: None,
+                                    body,
+                                    extern_import: None,
+                                },
+                            });
+                        } else {
+                            return self.bail(ParseError::UnexpectedToken(
+                                Token::Ident(kw), "get 或 set".to_string(),
+                            ));
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(Token::RBrace)?;
+            } else if self.check(&Token::Override) || self.check(&Token::Func) {
                 let override_ = self.check(&Token::Override);
                 if override_ {
                     self.advance();
@@ -694,6 +797,9 @@ impl Parser {
         Ok(crate::ast::ClassDef {
             visibility,
             name,
+            is_abstract,
+            is_sealed,
+            is_open,
             extends,
             implements,
             fields,

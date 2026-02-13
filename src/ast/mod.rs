@@ -500,11 +500,17 @@ pub struct InterfaceDef {
     pub methods: Vec<InterfaceMethod>,
 }
 
-/// 类定义（支持继承、init、override、super）
+/// 类定义（支持继承、init、override、super、abstract、sealed）
 #[derive(Debug, Clone)]
 pub struct ClassDef {
     pub visibility: Visibility,
     pub name: String,
+    /// 是否为 abstract 类（不能直接实例化）
+    pub is_abstract: bool,
+    /// 是否为 sealed 类（不能被继承）
+    pub is_sealed: bool,
+    /// 是否为 open 类（允许被继承，仓颉中类默认不可继承）
+    pub is_open: bool,
     /// 继承的父类
     pub extends: Option<String>,
     /// 实现的接口列表
@@ -530,6 +536,15 @@ pub struct InitDef {
 pub struct ClassMethod {
     pub override_: bool,
     pub func: Function,
+}
+
+/// 属性定义（getter/setter）
+#[derive(Debug, Clone)]
+pub struct PropDef {
+    pub name: String,
+    pub ty: Type,
+    pub getter: Option<Vec<Stmt>>,
+    pub setter: Option<(String, Vec<Stmt>)>, // (参数名, body)
 }
 
 /// 枚举定义（支持无关联值或单关联值变体）

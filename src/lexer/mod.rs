@@ -228,6 +228,12 @@ pub enum Token {
     Enum,
     #[token("class")]
     Class,
+    #[token("abstract")]
+    Abstract,
+    #[token("sealed")]
+    Sealed,
+    #[token("open")]
+    Open,
     #[token("interface")]
     Interface,
     #[token("extends")]
@@ -242,6 +248,10 @@ pub enum Token {
     Override,
     #[token("super")]
     Super,
+    #[token("prop")]
+    Prop,
+    #[token("mut")]
+    Mut,
 
     // 模块系统关键字
     #[token("module")]

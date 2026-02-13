@@ -1,15 +1,73 @@
-use crate::ast::{AssignTarget, BinOp, EnumDef, EnumVariant, Expr, InterpolatePart, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef, Type, UnaryOp, Visibility};
+use crate::ast::{AssignTarget, BinOp, ClassDef, EnumDef, EnumVariant, Expr, FieldDef, InitDef, InterpolatePart, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef, Type, UnaryOp, Visibility};
 use crate::ast::Function as FuncDef;
 use std::collections::HashMap;
 use wasm_encoder::{
-    CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function as WasmFunc,
-    FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemorySection, MemoryType,
-    Module, TypeSection, ValType,
+    CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType, ExportKind,
+    ExportSection, Function as WasmFunc, FunctionSection, GlobalSection, GlobalType, ImportSection,
+    Instruction, MemorySection, MemoryType, Module, RefType, TableSection, TableType, TypeSection,
+    ValType,
 };
 
 /// 内存布局常量
 const HEAP_BASE: i32 = 1024;  // 堆起始地址
 const PAGE_SIZE: u64 = 65536; // WASM 页大小 64KB
+
+/// 类的运行时信息（包含继承布局和 vtable）
+#[derive(Debug, Clone)]
+struct ClassInfo {
+    /// 类名
+    name: String,
+    /// 父类名
+    parent: Option<String>,
+    /// 完整字段列表（先父类后子类），不含 vtable_ptr
+    all_fields: Vec<FieldDef>,
+    /// 自身字段列表（不含继承的）
+    own_fields: Vec<FieldDef>,
+    /// vtable 方法名列表（按槽位顺序）
+    vtable_methods: Vec<String>,
+    /// 方法名 → vtable 槽位索引
+    vtable_slot: HashMap<String, usize>,
+    /// 该类 vtable 在 WASM Table 中的起始索引
+    vtable_base: u32,
+    /// 对象是否需要 vtable_ptr（有继承或被继承时为 true）
+    has_vtable: bool,
+    /// 是否是 abstract 类
+    is_abstract: bool,
+    /// 是否是 sealed 类
+    is_sealed: bool,
+    /// init 定义
+    init: Option<InitDef>,
+    /// deinit body
+    deinit: Option<Vec<Stmt>>,
+    /// 原始 ClassDef 引用的方法列表
+    methods: Vec<(String, bool)>, // (fully_qualified_name, is_override)
+}
+
+impl ClassInfo {
+    /// 对象总大小（包含 vtable_ptr + 所有字段）
+    fn object_size(&self) -> u32 {
+        let header = if self.has_vtable { 4 } else { 0 }; // vtable_ptr: i32
+        header + self.all_fields.iter().map(|f| f.ty.size()).sum::<u32>()
+    }
+
+    /// 字段偏移（已加上 vtable_ptr 的 4 字节头部）
+    fn field_offset(&self, field_name: &str) -> Option<u32> {
+        let header = if self.has_vtable { 4u32 } else { 0 };
+        let mut offset = header;
+        for f in &self.all_fields {
+            if f.name == field_name {
+                return Some(offset);
+            }
+            offset += f.ty.size();
+        }
+        None
+    }
+
+    /// 字段类型查询
+    fn field_type(&self, field_name: &str) -> Option<&Type> {
+        self.all_fields.iter().find(|f| f.name == field_name).map(|f| &f.ty)
+    }
+}
 
 /// 代码生成器
 pub struct CodeGen {
@@ -23,6 +81,8 @@ pub struct CodeGen {
     structs: HashMap<String, StructDef>,
     /// 枚举定义
     enums: HashMap<String, EnumDef>,
+    /// 类信息（含继承布局和 vtable）
+    classes: HashMap<String, ClassInfo>,
     /// 函数参数列表（含默认值），用于 Call 时补全缺失实参
     func_params: HashMap<String, Vec<Param>>,
     /// 每个名字对应的函数个数，用于决定是否用修饰名解析
@@ -31,6 +91,8 @@ pub struct CodeGen {
     string_pool: Vec<(String, u32)>,
     /// 当前数据段偏移
     data_offset: u32,
+    /// vtable 条目列表（function indices, 用于 Element Section）
+    vtable_entries: Vec<u32>,
 }
 
 impl CodeGen {
@@ -41,10 +103,12 @@ impl CodeGen {
             func_return_types: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
+            classes: HashMap::new(),
             func_params: HashMap::new(),
             name_count: HashMap::new(),
             string_pool: Vec::new(),
             data_offset: 0,
+            vtable_entries: Vec::new(),
         }
     }
 
@@ -115,20 +179,8 @@ impl CodeGen {
         for s in &program.structs {
             self.structs.insert(s.name.clone(), s.clone());
         }
-        // 将类（无继承）展平为结构体，并将方法加入函数列表
-        for c in &program.classes {
-            if c.extends.is_none() {
-                self.structs.insert(
-                    c.name.clone(),
-                    StructDef {
-                        visibility: c.visibility.clone(),
-                        name: c.name.clone(),
-                        type_params: vec![],
-                        fields: c.fields.clone(),
-                    },
-                );
-            }
-        }
+        // 注册所有类（构建 ClassInfo，含继承布局）
+        self.register_classes(&program.classes);
         for e in &program.enums {
             self.enums.insert(e.name.clone(), e.clone());
         }
@@ -165,12 +217,20 @@ impl CodeGen {
             .filter(|f| f.type_params.is_empty() || f.extern_import.is_some())
             .cloned()
             .collect();
-        // 添加类方法（无继承的类）
+        // 添加所有类的方法（含有继承的类）
         for c in &program.classes {
-            if c.extends.is_none() {
-                for m in &c.methods {
-                    functions.push(m.func.clone());
-                }
+            for m in &c.methods {
+                functions.push(m.func.clone());
+            }
+            // 为有 init 的类生成 __ClassName_init 函数
+            if let Some(ref init_def) = c.init {
+                let init_func = self.build_init_function(c, init_def);
+                functions.push(init_func);
+            }
+            // 为有 deinit 的类生成 __ClassName_deinit 函数
+            if let Some(ref deinit_body) = c.deinit {
+                let deinit_func = self.build_deinit_function(c, deinit_body);
+                functions.push(deinit_func);
             }
         }
 
@@ -288,6 +348,9 @@ impl CodeGen {
 
         module.section(&types);
 
+        // 构建 vtable（需在 func_indices 设置后）
+        self.build_vtables();
+
         // 2. 导入段 (Import Section) — extern func
         let mut imports = ImportSection::new();
         for (i, func) in functions.iter().enumerate() {
@@ -311,7 +374,21 @@ impl CodeGen {
         }
         module.section(&func_section);
 
-        // 3. 内存段 (Memory Section)
+        // 3a. Table 段 (Table Section) — 用于 vtable / call_indirect
+        let vtable_size = self.vtable_entries.len() as u64;
+        if vtable_size > 0 {
+            let mut tables = TableSection::new();
+            tables.table(TableType {
+                element_type: RefType::FUNCREF,
+                minimum: vtable_size,
+                maximum: Some(vtable_size),
+                table64: false,
+                shared: false,
+            });
+            module.section(&tables);
+        }
+
+        // 3b. 内存段 (Memory Section)
         let mut memories = MemorySection::new();
         memories.memory(MemoryType {
             minimum: 1,
@@ -376,7 +453,19 @@ impl CodeGen {
         codes.function(&self.emit_abs_i64());
         module.section(&codes);
 
-        // 7. 数据段 (Data Section) - 字符串常量
+        // 7. Element 段 (Element Section) — vtable 函数引用
+        if !self.vtable_entries.is_empty() {
+            let mut elements = ElementSection::new();
+            let func_indices: Vec<u32> = self.vtable_entries.clone();
+            elements.active(
+                Some(0), // table index
+                &ConstExpr::i32_const(0),
+                Elements::Functions(std::borrow::Cow::Borrowed(&func_indices)),
+            );
+            module.section(&elements);
+        }
+
+        // 8. 数据段 (Data Section) - 字符串常量
         if !self.string_pool.is_empty() {
             let mut data = DataSection::new();
             for (s, offset) in &self.string_pool {
@@ -390,6 +479,205 @@ impl CodeGen {
         }
 
         module.finish()
+    }
+
+    /// 解析方法索引，支持继承链向上查找
+    /// key 格式为 "ClassName.methodName"，如果找不到，沿继承链向上查找
+    fn resolve_method_index(&self, key: &str, method: &str) -> u32 {
+        if let Some(&idx) = self.func_indices.get(key) {
+            return idx;
+        }
+        // 从 key 提取类名
+        if let Some(dot_pos) = key.find('.') {
+            let class_name = &key[..dot_pos];
+            // 沿继承链向上查找
+            if let Some(ci) = self.classes.get(class_name) {
+                let mut parent = ci.parent.clone();
+                while let Some(ref p) = parent {
+                    let parent_key = format!("{}.{}", p, method);
+                    if let Some(&idx) = self.func_indices.get(&parent_key) {
+                        return idx;
+                    }
+                    parent = self.classes.get(p).and_then(|pi| pi.parent.clone());
+                }
+            }
+        }
+        panic!("方法未找到: '{}'", key);
+    }
+
+    // =========== 类与继承 ===========
+
+    /// 注册所有类，构建 ClassInfo（含继承字段布局和 vtable）
+    fn register_classes(&mut self, class_defs: &[ClassDef]) {
+        // 第一遍：为每个类创建基本 ClassInfo（不含继承解析）
+        let class_map: HashMap<String, &ClassDef> = class_defs.iter().map(|c| (c.name.clone(), c)).collect();
+
+        // 确定哪些类参与继承（被继承或有继承），需要 vtable
+        let mut has_children: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in class_defs {
+            if let Some(ref parent) = c.extends {
+                has_children.insert(parent.clone());
+            }
+        }
+
+        // 拓扑排序：父类先注册
+        let mut registered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut order = Vec::new();
+        fn topo_sort(name: &str, class_map: &HashMap<String, &ClassDef>, registered: &mut std::collections::HashSet<String>, order: &mut Vec<String>) {
+            if registered.contains(name) { return; }
+            if let Some(c) = class_map.get(name) {
+                if let Some(ref parent) = c.extends {
+                    topo_sort(parent, class_map, registered, order);
+                }
+            }
+            registered.insert(name.to_string());
+            order.push(name.to_string());
+        }
+        for c in class_defs {
+            topo_sort(&c.name, &class_map, &mut registered, &mut order);
+        }
+
+        // 按拓扑序注册
+        for name in &order {
+            let c = match class_map.get(name.as_str()) {
+                Some(c) => *c,
+                None => continue, // 父类不在当前文件中
+            };
+
+            let needs_vtable = c.extends.is_some() || has_children.contains(&c.name);
+
+            // 收集所有字段（继承 + 自身）
+            let mut all_fields = Vec::new();
+            let mut vtable_methods: Vec<String> = Vec::new();
+            let mut vtable_slot: HashMap<String, usize> = HashMap::new();
+
+            if let Some(ref parent_name) = c.extends {
+                if let Some(parent_info) = self.classes.get(parent_name) {
+                    // sealed 类不能被继承
+                    if parent_info.is_sealed {
+                        panic!("sealed 类 {} 不能被继承", parent_name);
+                    }
+                    all_fields.extend(parent_info.all_fields.clone());
+                    vtable_methods = parent_info.vtable_methods.clone();
+                    vtable_slot = parent_info.vtable_slot.clone();
+                }
+            }
+            all_fields.extend(c.fields.clone());
+
+            // 注册方法到 vtable
+            let mut method_entries: Vec<(String, bool)> = Vec::new();
+            for m in &c.methods {
+                // 方法全限定名: ClassName.methodName
+                let fqn = m.func.name.clone();
+                // 短名：去掉 ClassName. 前缀
+                let short_name = fqn.strip_prefix(&format!("{}.", c.name)).unwrap_or(&fqn).to_string();
+                method_entries.push((fqn.clone(), m.override_));
+                if m.override_ {
+                    // 替换父类 vtable 中的对应槽位
+                    if let Some(&slot) = vtable_slot.get(&short_name) {
+                        vtable_methods[slot] = fqn;
+                    }
+                } else {
+                    // 新方法，追加到 vtable（仅实例方法）
+                    let slot = vtable_methods.len();
+                    vtable_slot.insert(short_name, slot);
+                    vtable_methods.push(fqn);
+                }
+            }
+
+            let info = ClassInfo {
+                name: c.name.clone(),
+                parent: c.extends.clone(),
+                all_fields,
+                own_fields: c.fields.clone(),
+                vtable_methods,
+                vtable_slot,
+                vtable_base: 0, // 后续填充
+                has_vtable: needs_vtable,
+                is_abstract: c.is_abstract,
+                is_sealed: c.is_sealed,
+                init: c.init.clone(),
+                deinit: c.deinit.clone(),
+                methods: method_entries,
+            };
+
+            // 同时注册为 StructDef（用于字段访问 / ConstructorCall 兼容）
+            self.structs.insert(c.name.clone(), StructDef {
+                visibility: c.visibility.clone(),
+                name: c.name.clone(),
+                type_params: vec![],
+                fields: info.all_fields.clone(),
+            });
+
+            self.classes.insert(c.name.clone(), info);
+        }
+    }
+
+    /// 在函数索引确定后，为每个有 vtable 的类分配 table 条目
+    fn build_vtables(&mut self) {
+        let mut entries = Vec::new();
+        let class_names: Vec<String> = self.classes.keys().cloned().collect();
+        for name in &class_names {
+            let info = self.classes.get(name).unwrap();
+            if !info.has_vtable || info.vtable_methods.is_empty() {
+                continue;
+            }
+            let base = entries.len() as u32;
+            for method_fqn in &info.vtable_methods {
+                let func_idx = self.func_indices.get(method_fqn)
+                    .copied()
+                    .unwrap_or_else(|| panic!("vtable 方法 {} 未找到函数索引", method_fqn));
+                entries.push(func_idx);
+            }
+            // 更新 vtable_base
+            let info = self.classes.get_mut(name).unwrap();
+            info.vtable_base = base;
+        }
+        self.vtable_entries = entries;
+    }
+
+    /// 构建 init 函数：__ClassName_init(params...) -> i32 (对象指针)
+    fn build_init_function(&self, class: &ClassDef, init_def: &InitDef) -> FuncDef {
+        let class_name = &class.name;
+        let func_name = format!("__{}_init", class_name);
+
+        // 参数与 init 定义一致
+        let params = init_def.params.clone();
+
+        // init body 前面加上 this 分配
+        // 在实际编译时会特殊处理 init 函数
+        let body = init_def.body.clone();
+
+        FuncDef {
+            visibility: Visibility::Public,
+            name: func_name,
+            type_params: vec![],
+            params,
+            return_type: Some(Type::Struct(class_name.clone(), vec![])),
+            body,
+            extern_import: None,
+        }
+    }
+
+    /// 构建 deinit 函数：__ClassName_deinit(this: i32) -> Unit
+    fn build_deinit_function(&self, class: &ClassDef, deinit_body: &[Stmt]) -> FuncDef {
+        let class_name = &class.name;
+        let func_name = format!("__{}_deinit", class_name);
+
+        FuncDef {
+            visibility: Visibility::Public,
+            name: func_name,
+            type_params: vec![],
+            params: vec![Param {
+                name: "this".to_string(),
+                ty: Type::Struct(class_name.clone(), vec![]),
+                default: None,
+                variadic: false,
+            }],
+            return_type: None,
+            body: deinit_body.to_vec(),
+            extern_import: None,
+        }
     }
 
     /// 收集所有字符串常量
@@ -557,6 +845,14 @@ impl CodeGen {
     fn compile_function(&self, func: &FuncDef) -> WasmFunc {
         let mut locals = LocalsBuilder::new();
 
+        // 检查是否为 init 函数（__ClassName_init）
+        let is_init = func.name.starts_with("__") && func.name.ends_with("_init");
+        let init_class_name = if is_init {
+            Some(func.name.strip_prefix("__").unwrap().strip_suffix("_init").unwrap().to_string())
+        } else {
+            None
+        };
+
         // 添加参数作为局部变量（含 AST 类型，便于字段访问计算偏移）
         for param in &func.params {
             // 可变参数类型转为 Array<T>
@@ -566,6 +862,11 @@ impl CodeGen {
                 param.ty.clone()
             };
             locals.add(&param.name, actual_ty.to_wasm(), Some(actual_ty));
+        }
+
+        // init 函数额外添加 this 局部变量
+        if let Some(ref class_name) = init_class_name {
+            locals.add("this", ValType::I32, Some(Type::Struct(class_name.clone(), vec![])));
         }
 
         // 收集函数体中的局部变量
@@ -587,9 +888,43 @@ impl CodeGen {
 
         let mut wasm_func = WasmFunc::new(local_types);
 
+        // init 函数前序：分配内存 + 设置 vtable_ptr
+        if let Some(ref class_name) = init_class_name {
+            if let Some(class_info) = self.classes.get(class_name) {
+                let obj_size = class_info.object_size();
+                // this = heap_ptr
+                wasm_func.instruction(&Instruction::GlobalGet(0));
+                let this_idx = locals.get("this").expect("this 局部变量");
+                wasm_func.instruction(&Instruction::LocalSet(this_idx));
+                // heap_ptr += obj_size
+                wasm_func.instruction(&Instruction::GlobalGet(0));
+                wasm_func.instruction(&Instruction::I32Const(obj_size as i32));
+                wasm_func.instruction(&Instruction::I32Add);
+                wasm_func.instruction(&Instruction::GlobalSet(0));
+                // 设置 vtable_ptr（如果有 vtable）
+                if class_info.has_vtable && !class_info.vtable_methods.is_empty() {
+                    wasm_func.instruction(&Instruction::LocalGet(this_idx));
+                    wasm_func.instruction(&Instruction::I32Const(class_info.vtable_base as i32));
+                    wasm_func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                }
+            }
+        }
+
         // 编译函数体（顶层无循环上下文）
         for stmt in &func.body {
             self.compile_stmt(stmt, &locals, &mut wasm_func, None);
+        }
+
+        // init 函数后序：返回 this 指针
+        if init_class_name.is_some() {
+            if let Some(this_idx) = locals.get("this") {
+                wasm_func.instruction(&Instruction::LocalGet(this_idx));
+                wasm_func.instruction(&Instruction::Return);
+            }
         }
 
         wasm_func.instruction(&Instruction::End);
@@ -1625,11 +1960,20 @@ impl CodeGen {
                         let (offset, field_ty) = locals
                             .get_type(object)
                             .and_then(|ty| match ty {
-                                Type::Struct(name, _) => self.structs.get(name).and_then(|def| {
-                                    let off = def.field_offset(field)?;
-                                    let ft = def.field_type(field)?.clone();
-                                    Some((off, ft))
-                                }),
+                                Type::Struct(name, _) => {
+                                    // 优先从 ClassInfo 获取偏移（包含 vtable header）
+                                    if let Some(ci) = self.classes.get(name) {
+                                        let off = ci.field_offset(field)?;
+                                        let ft = ci.field_type(field)?.clone();
+                                        Some((off, ft))
+                                    } else {
+                                        self.structs.get(name).and_then(|def| {
+                                            let off = def.field_offset(field)?;
+                                            let ft = def.field_type(field)?.clone();
+                                            Some((off, ft))
+                                        })
+                                    }
+                                }
                                 _ => None,
                             })
                             .unwrap_or((0, Type::Int64));
@@ -2401,7 +2745,16 @@ impl CodeGen {
                 }
             }
             Expr::Call { name, type_args: _, args } => {
-                if let Some(struct_def) = self.structs.get(name) {
+                // 检查是否为带 init 的类构造调用
+                let init_func_name = format!("__{}_init", name);
+                if self.func_indices.contains_key(&init_func_name) {
+                    // 调用 __ClassName_init(args...) 返回对象指针
+                    for arg in args {
+                        self.compile_expr(arg, locals, func, loop_ctx);
+                    }
+                    let idx = self.func_indices[&init_func_name];
+                    func.instruction(&Instruction::Call(idx));
+                } else if let Some(struct_def) = self.structs.get(name).cloned() {
                     if args.len() != struct_def.fields.len() {
                         panic!(
                             "结构体 {} 构造函数需要 {} 个参数，得到 {} 个",
@@ -2416,12 +2769,12 @@ impl CodeGen {
                         .map(|f| f.name.clone())
                         .zip(args.clone())
                         .collect();
-                    let init = Expr::StructInit {
+                    let init_expr = Expr::StructInit {
                         name: name.clone(),
                         type_args: None,
                         fields,
                     };
-                    self.compile_expr(&init, locals, func, loop_ctx);
+                    self.compile_expr(&init_expr, locals, func, loop_ctx);
                 } else if name == "min" && args.len() == 2
                     && self.infer_ast_type_with_locals(&args[0], locals).as_ref() == Some(&Type::Int64)
                     && self.infer_ast_type_with_locals(&args[1], locals).as_ref() == Some(&Type::Int64)
@@ -2478,7 +2831,49 @@ impl CodeGen {
                 }
             }
             Expr::SuperCall { method, args } => {
-                panic!("super 调用暂未实现，需父类上下文与 vtable 支持");
+                // super 调用：直接调用父类的方法（绕过 vtable）
+                // 从函数名推断当前类 → 找父类 → 调用父类方法
+                // super(args) → 调用父类 init; super.method(args) → 调用父类方法
+                // super 调用分两种：super(args) 和 super.method(args)
+                if method == "init" {
+                    // super(args) → 调用父类的 __ParentClass_init
+                    // this 作为第一个参数已在栈上（由 init body 上下文提供）
+                    for arg in args {
+                        self.compile_expr(arg, locals, func, loop_ctx);
+                    }
+                    // 寻找匹配的父类 init 函数
+                    for ci in self.classes.values() {
+                        if let Some(ref parent) = ci.parent {
+                            let parent_init = format!("__{}_init", parent);
+                            if self.func_indices.contains_key(&parent_init) {
+                                let idx = self.func_indices[&parent_init];
+                                func.instruction(&Instruction::Call(idx));
+                                // super init 返回 i32 (ptr)，但我们忽略（this 已分配）
+                                func.instruction(&Instruction::Drop);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // super.method(args) → 直接调用父类版本的方法
+                    // 查找当前类的父类，调用 ParentClass.method
+                    for ci in self.classes.values() {
+                        if let Some(ref parent) = ci.parent {
+                            let parent_method = format!("{}.{}", parent, method);
+                            if let Some(&idx) = self.func_indices.get(&parent_method) {
+                                // this 指针作为第一个参数
+                                if let Some(this_idx) = locals.get("this") {
+                                    func.instruction(&Instruction::LocalGet(this_idx));
+                                }
+                                for arg in args {
+                                    self.compile_expr(arg, locals, func, loop_ctx);
+                                }
+                                func.instruction(&Instruction::Call(idx));
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             Expr::MethodCall { object, method, args } => {
                 let type_name_opt = if let Expr::Var(ref n) = object.as_ref() {
@@ -2510,7 +2905,8 @@ impl CodeGen {
                 for arg in args {
                     self.compile_expr(arg, locals, func, loop_ctx);
                 }
-                let idx = *self.func_indices.get(&key).expect("方法未找到");
+                // 查找方法索引，支持继承链向上查找
+                let idx = self.resolve_method_index(&key, method);
                 func.instruction(&Instruction::Call(idx));
             }
             Expr::If {
@@ -2695,17 +3091,33 @@ impl CodeGen {
                 }));
             }
             Expr::StructInit { name, type_args, fields } => {
+                let class_info = self.classes.get(name);
+                let has_vtable = class_info.map_or(false, |ci| ci.has_vtable);
+                let vtable_base = class_info.map_or(0, |ci| ci.vtable_base);
+                let header_size = if has_vtable { 4u32 } else { 0 };
                 let struct_def = self.structs.get(name).expect("结构体未定义");
-                let struct_size = struct_def.size();
+                let struct_size = header_size + struct_def.size();
 
-                // 获取当前堆指针作为结构体地址
+                // 获取当前堆指针作为对象地址
                 func.instruction(&Instruction::GlobalGet(0));
 
-                // 写入每个字段
+                // 写入 vtable_ptr（如果有 vtable）
+                if has_vtable {
+                    func.instruction(&Instruction::GlobalGet(0));
+                    func.instruction(&Instruction::I32Const(vtable_base as i32));
+                    func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                }
+
+                // 写入每个字段（偏移需要加上 header）
                 for (field_name, value) in fields {
-                    let offset = struct_def
+                    let base_offset = struct_def
                         .field_offset(field_name)
                         .expect("字段未定义");
+                    let offset = header_size + base_offset;
 
                     func.instruction(&Instruction::GlobalGet(0));
                     func.instruction(&Instruction::I32Const(offset as i32));
@@ -2727,39 +3139,65 @@ impl CodeGen {
                 // 返回结构体地址 (已在栈上)
             }
             Expr::ConstructorCall { name, type_args, args } => {
-                // 构造函数调用转换为 StructInit
-                let struct_def = self.structs.get(name).expect(&format!("结构体 {} 未定义", name));
-                if args.len() != struct_def.fields.len() {
-                    panic!(
-                        "结构体 {} 构造函数需要 {} 个参数，得到 {} 个",
-                        name,
-                        struct_def.fields.len(),
-                        args.len()
-                    );
+                // abstract 类不能直接实例化
+                if let Some(ci) = self.classes.get(name) {
+                    if ci.is_abstract {
+                        panic!("abstract 类 {} 不能直接实例化", name);
+                    }
                 }
-                let fields: Vec<(String, Expr)> = struct_def
-                    .fields
-                    .iter()
-                    .map(|f| f.name.clone())
-                    .zip(args.clone())
-                    .collect();
-                let init = Expr::StructInit {
-                    name: name.clone(),
-                    type_args: None,
-                    fields,
-                };
-                self.compile_expr(&init, locals, func, loop_ctx);
+                // 检查类是否有 init 函数
+                let init_func_name = format!("__{}_init", name);
+                if self.func_indices.contains_key(&init_func_name) {
+                    // 调用 __ClassName_init(args...) 返回对象指针
+                    for arg in args {
+                        self.compile_expr(arg, locals, func, loop_ctx);
+                    }
+                    let idx = self.func_indices[&init_func_name];
+                    func.instruction(&Instruction::Call(idx));
+                } else {
+                    // 无 init: 回退到 StructInit
+                    let struct_def = self.structs.get(name).expect(&format!("结构体 {} 未定义", name));
+                    if args.len() != struct_def.fields.len() {
+                        panic!(
+                            "结构体 {} 构造函数需要 {} 个参数，得到 {} 个",
+                            name,
+                            struct_def.fields.len(),
+                            args.len()
+                        );
+                    }
+                    let fields: Vec<(String, Expr)> = struct_def
+                        .fields
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .zip(args.clone())
+                        .collect();
+                    let init_expr = Expr::StructInit {
+                        name: name.clone(),
+                        type_args: None,
+                        fields,
+                    };
+                    self.compile_expr(&init_expr, locals, func, loop_ctx);
+                }
             }
             Expr::Field { object, field } => {
                 self.compile_expr(object, locals, func, loop_ctx);
                 let (offset, field_ty) = self
                     .get_object_type(object, locals)
                     .and_then(|ty| match ty {
-                        Type::Struct(ref name, _) => self.structs.get(name).and_then(|def| {
-                            let off = def.field_offset(field)?;
-                            let ft = def.field_type(field)?.clone();
-                            Some((off, ft))
-                        }),
+                        Type::Struct(ref name, _) => {
+                            // 优先从 ClassInfo 获取偏移（包含 vtable header）
+                            if let Some(ci) = self.classes.get(name) {
+                                let off = ci.field_offset(field)?;
+                                let ft = ci.field_type(field)?.clone();
+                                Some((off, ft))
+                            } else {
+                                self.structs.get(name).and_then(|def| {
+                                    let off = def.field_offset(field)?;
+                                    let ft = def.field_type(field)?.clone();
+                                    Some((off, ft))
+                                })
+                            }
+                        }
                         _ => None,
                     })
                     .unwrap_or((0, Type::Int64)); // 回退：偏移 0，按 i64 加载
