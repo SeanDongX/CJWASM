@@ -28,18 +28,18 @@
 
 | 类型 | 描述 | WASM 映射 | 状态 |
 |------|------|-----------|------|
-| `Int8` | 8位有符号整数 | i32 | [ ] |
-| `Int16` | 16位有符号整数 | i32 | [ ] |
+| `Int8` | 8位有符号整数 | i32 | [x] |
+| `Int16` | 16位有符号整数 | i32 | [x] |
 | `Int32` | 32位有符号整数 | i32 | [x] |
 | `Int64` | 64位有符号整数 | i64 | [x] |
-| `UInt8` | 8位无符号整数 | i32 | [ ] |
-| `UInt16` | 16位无符号整数 | i32 | [ ] |
-| `UInt32` | 32位无符号整数 | i32 | [ ] |
-| `UInt64` | 64位无符号整数 | i64 | [ ] |
+| `UInt8` | 8位无符号整数 | i32 | [x] |
+| `UInt16` | 16位无符号整数 | i32 | [x] |
+| `UInt32` | 32位无符号整数 | i32 | [x] |
+| `UInt64` | 64位无符号整数 | i64 | [x] |
 | `Float32` | 32位浮点数 | f32 | [x] |
 | `Float64` | 64位浮点数 | f64 | [x] |
 | `Bool` | 布尔值 | i32 (0/1) | [x] |
-| `Char` | Unicode 字符 | i32 | [ ] |
+| `Char` | Unicode 字符 | i32 | [x] |
 | `Unit` | 空类型 | (无返回值) | [x] |
 
 ### 1.2 复合类型
@@ -49,14 +49,14 @@
 | `String` | `String` | UTF-8 字符串 | [x] |
 | `Array<T>` | `Array<Int64>` | 固定长度数组 | [x] |
 | `Slice<T>` | `Slice<Int64>` | 动态切片 | [ ] |
-| `Tuple` | `(Int64, String)` | 元组类型 | [ ] |
+| `Tuple` | `(Int64, String)` | 元组类型 | [x] |
 | `Option<T>` | `Option<Int64>` | 可选值 | [x] |
 | `Result<T, E>` | `Result<Int64, Error>` | 结果类型 | [x] |
 | `Struct` | `struct Point {...}` | 结构体 | [x] |
 | `Enum` | `enum Color {...}` | 枚举类型（含关联值如 Ok(T)/Err(E)） | [x] |
-| `Class` | `class Person {...}` | 类 | [ ] |
-| `Interface` | `interface Drawable {...}` | 接口 | [ ] |
-| `Function` | `(Int64) -> Int64` | 函数类型 | [ ] |
+| `Class` | `class Person {...}` | 类 | [x] |
+| `Interface` | `interface Drawable {...}` | 接口 | [x] |
+| `Function` | `(Int64) -> Int64` | 函数类型 | [x] |
 
 ### 1.3 类型修饰符
 
@@ -131,7 +131,7 @@ let map = {"a": 1, "b": 2}    // Map (语法糖)
 | 功能 | 状态 |
 |------|------|
 | 数组字面量 | [x] |
-| 元组字面量 | [ ] |
+| 元组字面量 | [x] |
 | Map 字面量 | [ ] |
 
 ---
@@ -179,7 +179,7 @@ let map = {"a": 1, "b": 2}    // Map (语法糖)
 | `~` | 按位取反 | [x] |
 | `<<` | 左移 | [x] |
 | `>>` | 右移 | [x] |
-| `>>>` | 无符号右移 | [ ] |
+| `>>>` | 无符号右移 | [x] |
 
 ### 3.5 赋值运算
 
@@ -223,7 +223,7 @@ let v = maybeNull ?? defaultValue
 | 枚举变体构造 (Type.Variant) | [x] |
 | 范围表达式（作为值） | [x] |
 | 类型转换 (as) | [x] |
-| 空值合并 (??) | [ ] |
+| 空值合并 (??) | [x] |
 | 三元运算符 | [ ] |
 
 ---
@@ -340,9 +340,9 @@ let triple = { x: Int64 => x * 3 }
 | 返回类型 | [x] |
 | 默认参数 | [x] |
 | 可变参数 | [x] |
-| 泛型函数 | [ ] |
+| 泛型函数 | [x] |
 | Lambda | [x] |
-| 闭包 | [ ] |
+| 闭包 | [x] |
 | 递归 | [x] |
 | 尾递归优化 | [ ] |
 
@@ -440,18 +440,18 @@ class Student extends Person {
 
 | 功能 | 状态 |
 |------|------|
-| 类定义 | [ ] |
-| 构造函数 (init) | [ ] |
-| 析构函数 (deinit) | [ ] |
-| 实例方法 | [ ] |
-| 静态方法 | [ ] |
-| Getter/Setter | [ ] |
-| 继承 (extends) | [ ] |
-| 方法重写 (override) | [ ] |
-| super 调用 | [ ] |
-| 访问修饰符 | [ ] |
-| abstract 类 | [ ] |
-| sealed 类 | [ ] |
+| 类定义 | [x] |
+| 构造函数 (init) | [x] |
+| 析构函数 (deinit) | [x] |
+| 实例方法 | [x] |
+| 静态方法 | [x] |
+| Getter/Setter | [x] |
+| 继承 (extends) | [x] |
+| 方法重写 (override) | [x] |
+| super 调用 | [x] |
+| 访问修饰符 | [x] |
+| abstract 类 | [x] |
+| sealed 类 | [x] |
 
 ---
 
@@ -500,7 +500,7 @@ enum Direction {
 |------|------|
 | 简单枚举 | [x] |
 | 关联值枚举 | [x] |
-| 泛型枚举 | [ ] |
+| 泛型枚举 | [x] |
 | 枚举方法 | [x] |
 
 ### 7.2 模式匹配
@@ -584,14 +584,14 @@ func process<T, U>(a: T, b: U) -> Bool
 
 | 功能 | 状态 |
 |------|------|
-| 泛型函数 | [ ] |
-| 泛型结构体 | [ ] |
-| 泛型类 | [ ] |
-| 泛型枚举 | [ ] |
-| 类型约束 | [ ] |
-| 多重约束 | [ ] |
-| where 子句 | [ ] |
-| 泛型特化 | [ ] |
+| 泛型函数 | [x] |
+| 泛型结构体 | [x] |
+| 泛型类 | [x] |
+| 泛型枚举 | [x] |
+| 类型约束 | [x] |
+| 多重约束 | [x] |
+| where 子句 | [x] |
+| 泛型特化 | [x] |
 
 ---
 
@@ -636,12 +636,12 @@ extend Int64: Printable {
 
 | 功能 | 状态 |
 |------|------|
-| 接口定义 | [ ] |
-| 默认实现 | [ ] |
-| implements | [ ] |
-| 扩展 (extend) | [ ] |
-| 接口继承 | [ ] |
-| 关联类型 | [ ] |
+| 接口定义 | [x] |
+| 默认实现 | [x] |
+| implements | [x] |
+| 扩展 (extend) | [x] |
+| 接口继承 | [x] |
+| 关联类型 | [x] |
 
 ---
 
@@ -678,7 +678,7 @@ private func privateFunc() { }
 | 别名 (as) | [x] |
 | 通配符导入 | [x] |
 | public | [x] |
-| internal | [ ] |
+| internal | [x] |
 | private | [x] |
 | 包管理 | [ ] |
 
@@ -735,11 +735,11 @@ func process() -> Result<Int64, String> {
 |------|------|
 | try-catch | [x] |
 | throw | [x] |
-| throws 声明 | [ ] |
-| finally | [ ] |
+| throws 声明 | [x] |
+| finally | [x] |
 | Result 类型 | [x] |
 | ? 操作符 | [x] |
-| Error 类 | [ ] |
+| Error 类 | [x] |
 
 ---
 
@@ -751,23 +751,34 @@ func process() -> Result<Int64, String> {
 ┌─────────────────────────────────────────────────────────┐
 │ 0x0000 - 0x03FF │ 数据段 (字符串常量)                    │
 ├─────────────────────────────────────────────────────────┤
-│ 0x0400 - 0x0FFF │ 栈空间 (函数调用栈)                    │
-├─────────────────────────────────────────────────────────┤
-│ 0x1000 - ...    │ 堆空间 (动态分配)                      │
-│                 │   - 数组: [length:i32][元素...]        │
-│                 │   - 字符串: [length:i32][UTF-8字节...] │
-│                 │   - 结构体: [字段1][字段2]...          │
+│ 0x0400 (HEAP_BASE + data_offset) - ...                  │
+│                 │ 堆空间 (动态分配, Free List Allocator)  │
+│                 │                                       │
+│  对象头部 (8 字节，用户指针前):                            │
+│  [block_size:i32][refcount:i32][user_data...]            │
+│                                ^-- __alloc 返回的指针     │
+│                                                         │
+│  各类型布局 (user_data 部分):                              │
+│   - 数组:    [length:i32][elem0:i64][elem1:i64]...      │
+│   - 字符串:  [length:i32][UTF-8字节...]                  │
+│   - 结构体:  [vtable_ptr?:i32][字段1][字段2]...          │
+│   - 枚举:    [discriminant:i32][payload...]              │
+│   - 元组:    [field0:i64][field1:i64]...                 │
+│   - Range:   [start:i64][end:i64][inclusive:i32]         │
 └─────────────────────────────────────────────────────────┘
+
+Globals:
+  Global 0: heap_ptr (bump allocator 指针)
+  Global 1: free_list_head (空闲链表头指针)
 ```
 
 ### 12.2 内存管理策略
 
 | 策略 | 描述 | 状态 |
 |------|------|------|
-| 简单分配器 | bump allocator | [x] |
-| 引用计数 | RC/ARC | [ ] |
-| 垃圾回收 | Mark-Sweep GC | [ ] |
-| 手动管理 | malloc/free | [ ] |
+| Free List Allocator | __alloc/__free，替代 bump allocator，支持内存复用 | [x] |
+| 引用计数 | __rc_inc/__rc_dec，对象头 refcount，赋值/离开作用域自动 inc/dec | [x] |
+| 垃圾回收 | __gc_collect，堆扫描回收 refcount==0 的对象 | [x] |
 
 ---
 
@@ -874,9 +885,9 @@ pow(base, exp)
 
 *未完成特性的完整实施计划见 [docs/next_steps.md](next_steps.md)。*
 
-### 15.1 当前版本: v0.2.0
+### 15.1 当前版本: v0.6.0
 
-正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。v0.2.0 全部完成，下一步计划详见 [next_steps.md](next_steps.md)。
+正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。Phase 1-6, 8 全部完成，下一步计划详见 [next_steps.md](next_steps.md)。
 
 #### 已完成功能
 
@@ -894,7 +905,7 @@ pow(base, exp)
 - [x] 递归函数
 - [x] 字段访问（按结构体类型计算各字段偏移与 load/store 类型）
 - [x] 数组索引访问
-- [x] WASM 内存管理 (简单分配器)
+- [x] WASM 内存管理 (Free List Allocator + RC + GC)
 - [x] 函数自动导出
 - [x] for 循环：范围迭代 (0..n / 0..=n)
 - [x] for 循环：数组迭代 (for item in arr)
@@ -953,19 +964,39 @@ pow(base, exp)
 
 v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirect）。
 
-#### 未来版本计划（v0.3.0+）
+#### v0.3.0 ~ v0.6.0 新增完成功能
 
-- [x] 泛型（类型参数、单态化；显式类型实参已实现）
-- [x] 接口/Trait（解析：interface、implements；多态 codegen 待完善）
-- [x] 类与继承（解析：class、init、deinit、extends、override、super；无继承类展平编译；vtable/继承 codegen 待完善）
-- [ ] 继承类布局与 vtable（子类含父类字段，vtable 方法分派）
-- [ ] super 调用的 codegen
-- [ ] init 中 this 的语义
-- [ ] 接口约束与多态
-- [ ] 模块系统（包管理、多文件链接；当前已支持 module/import/可见性）
-- [x] WASI 支持（extern func + @import 已实现；fd/clock/random 等由运行时提供）
-- [x] 标准库（雏形：min/max/abs 内置；std.core/io/collections 待做）
-- [x] 优化器（常量折叠已实现；死代码消除、内联待做）
+- [x] 基础类型补全（Int8, Int16, UInt8, UInt16, UInt32, UInt64, Char）
+- [x] 元组类型与字面量 (`(1, 2, 3)`，堆布局 `[field0:i64][field1:i64]...`）
+- [x] 无符号右移 (`>>>`，i32/i64)
+- [x] 空值合并 (`??`，Option 空值默认)
+- [x] 类 codegen 完整实现（init/deinit/继承/vtable/override/super/Getter/Setter/abstract/sealed）
+- [x] 泛型完善（泛型类/枚举、类型约束 `<T:Bound>`、多重约束 `<T:A&B>`、where 子句、泛型特化、约束检查）
+- [x] 接口多态（接口定义、默认实现、implements、extend、接口继承、关联类型）
+- [x] 闭包编译（Lambda 捕获变量）
+- [x] throws 声明 (`func f() -> T throws E`)
+- [x] finally 块 (`try { } catch { } finally { }`)
+- [x] Error 基类与自定义错误继承 (`class MyError extends Error`)
+- [x] internal 可见性修饰符
+- [x] 多文件编译与 import 自动解析
+- [x] Free List Allocator（__alloc/__free，替代 bump allocator，支持内存复用）
+- [x] 引用计数 RC（__rc_inc/__rc_dec，对象头 refcount，赋值/作用域退出自动管理）
+- [x] Mark-Sweep GC（__gc_collect，堆扫描回收 refcount==0 对象）
+
+#### v0.3.0 ~ v0.6.0 已完成
+
+- [x] Phase 2: 基础类型补全（Int8/16, UInt8/16/32/64, Char, Tuple, >>>, ??）
+- [x] Phase 3: 类与继承（类定义, init/deinit, 继承, vtable, override, super, Getter/Setter, abstract/sealed）
+- [x] Phase 4: 泛型完善（泛型函数/结构体/类/枚举, 类型约束, 多重约束, where 子句, 单态化, 特化, 约束检查）
+- [x] Phase 5: 接口多态（接口定义, 默认实现, implements, extend, 接口继承, 关联类型, 闭包/Lambda 编译）
+- [x] Phase 6: 错误处理 + 模块（throws 声明, finally, Error 基类, 自定义错误继承, 多文件编译, import 自动解析）
+- [x] Phase 8: 内存管理升级（Free List Allocator, 引用计数 RC, Mark-Sweep GC, __alloc/__free/__rc_inc/__rc_dec/__gc_collect）
+
+#### 未来版本计划
+
+- [ ] Phase 7: WASI + 标准库（fd_write/fd_read/fd_close/args_get/clock_time_get/random_get, std.core/io/collections）
+- [ ] Phase 9: 补充特性（Slice<T>, Map 字面量, 尾递归优化, 死代码消除, 函数内联）
+- [ ] 包管理
 
 ---
 
@@ -1023,5 +1054,5 @@ var      where    while
 
 ---
 
-*文档版本: 1.5.0*
-*最后更新: 2026-02-12（v0.2.0 完成，含 Lambda codegen；v0.3.0 计划：Phase 2 类型/表达式补全，Phase 3 类与继承）*
+*文档版本: 2.0.0*
+*最后更新: 2026-02-13（v0.6.0 完成，Phase 1-6, 8 全部完成；含类/泛型/接口/错误处理/内存管理）*
