@@ -100,6 +100,84 @@ impl Type {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_encoder::ValType;
+
+    #[test]
+    fn test_to_wasm_all_types() {
+        assert_eq!(Type::Int8.to_wasm(), ValType::I32);
+        assert_eq!(Type::Int16.to_wasm(), ValType::I32);
+        assert_eq!(Type::Int32.to_wasm(), ValType::I32);
+        assert_eq!(Type::Int64.to_wasm(), ValType::I64);
+        assert_eq!(Type::UInt8.to_wasm(), ValType::I32);
+        assert_eq!(Type::UInt16.to_wasm(), ValType::I32);
+        assert_eq!(Type::UInt32.to_wasm(), ValType::I32);
+        assert_eq!(Type::UInt64.to_wasm(), ValType::I64);
+        assert_eq!(Type::Float32.to_wasm(), ValType::F32);
+        assert_eq!(Type::Float64.to_wasm(), ValType::F64);
+        assert_eq!(Type::Bool.to_wasm(), ValType::I32);
+        assert_eq!(Type::Char.to_wasm(), ValType::I32);
+        assert_eq!(Type::String.to_wasm(), ValType::I32);
+        assert_eq!(Type::Array(Box::new(Type::Int64)).to_wasm(), ValType::I32);
+        assert_eq!(Type::Tuple(vec![Type::Int64, Type::Int64]).to_wasm(), ValType::I32);
+        assert_eq!(Type::Struct("Foo".to_string(), vec![]).to_wasm(), ValType::I32);
+        assert_eq!(Type::Range.to_wasm(), ValType::I32);
+        assert_eq!(Type::Function { params: vec![], ret: Box::new(Some(Type::Int64)) }.to_wasm(), ValType::I32);
+        assert_eq!(Type::Option(Box::new(Type::Int64)).to_wasm(), ValType::I32);
+        assert_eq!(Type::Result(Box::new(Type::Int64), Box::new(Type::String)).to_wasm(), ValType::I32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unit 类型不能转换为 WASM")]
+    fn test_to_wasm_unit_panic() {
+        Type::Unit.to_wasm();
+    }
+
+    #[test]
+    #[should_panic(expected = "TypeParam 不能直接转换")]
+    fn test_to_wasm_typeparam_panic() {
+        Type::TypeParam("T".to_string()).to_wasm();
+    }
+
+    #[test]
+    fn test_size_all_types() {
+        assert_eq!(Type::Int8.size(), 1);
+        assert_eq!(Type::UInt8.size(), 1);
+        assert_eq!(Type::Int16.size(), 2);
+        assert_eq!(Type::UInt16.size(), 2);
+        assert_eq!(Type::Int32.size(), 4);
+        assert_eq!(Type::UInt32.size(), 4);
+        assert_eq!(Type::Bool.size(), 4);
+        assert_eq!(Type::Char.size(), 4);
+        assert_eq!(Type::Int64.size(), 8);
+        assert_eq!(Type::UInt64.size(), 8);
+        assert_eq!(Type::Float32.size(), 4);
+        assert_eq!(Type::Float64.size(), 8);
+        assert_eq!(Type::Unit.size(), 0);
+        assert_eq!(Type::String.size(), 4);
+        assert_eq!(Type::Array(Box::new(Type::Int64)).size(), 4);
+        assert_eq!(Type::Tuple(vec![]).size(), 4);
+        assert_eq!(Type::Struct("S".to_string(), vec![]).size(), 4);
+        assert_eq!(Type::Range.size(), 4);
+        assert_eq!(Type::Function { params: vec![], ret: Box::new(Some(Type::Int64)) }.size(), 4);
+        assert_eq!(Type::Option(Box::new(Type::Int64)).size(), 4);
+        assert_eq!(Type::Result(Box::new(Type::Int64), Box::new(Type::String)).size(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "TypeParam 不能直接计算 size")]
+    fn test_size_typeparam_panic() {
+        Type::TypeParam("T".to_string()).size();
+    }
+
+    #[test]
+    fn test_range_heap_size() {
+        assert_eq!(Type::range_heap_size(), 20);
+    }
+}
+
 /// 一元运算符
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnaryOp {

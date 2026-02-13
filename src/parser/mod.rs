@@ -2931,4 +2931,1096 @@ mod tests {
             panic!("应该是 let 语句");
         }
     }
+
+    // === 覆盖率补充：Parser 单元测试 ===
+
+    #[test]
+    fn test_parse_import_from() {
+        let source = "import foo from bar.baz\nfunc main() -> Int64 { return 0 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert!(!program.imports.is_empty());
+    }
+
+    #[test]
+    fn test_parse_import_as() {
+        let source = "import std.math as m\nfunc main() -> Int64 { return 0 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert!(!program.imports.is_empty());
+    }
+
+    #[test]
+    fn test_parse_import_plain() {
+        let source = "import std.io\nfunc main() -> Int64 { return 0 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert!(!program.imports.is_empty());
+    }
+
+    #[test]
+    fn test_parse_module_declaration() {
+        let source = "module test.app\nfunc main() -> Int64 { return 0 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert!(program.module_name.is_some());
+    }
+
+    #[test]
+    fn test_parse_interface_with_default_and_assoc() {
+        let source = r#"
+            interface Describable {
+                type Element;
+                func describe() -> String;
+                func default_method() -> Int64 { return 0 }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.interfaces.len(), 1);
+        assert!(!program.interfaces[0].assoc_types.is_empty());
+    }
+
+    #[test]
+    fn test_parse_interface_with_inheritance() {
+        let source = r#"
+            interface Base { func id() -> Int64; }
+            interface Extended: Base { func extra() -> Int64; }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.interfaces.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_extend_with_assoc_type() {
+        let source = r#"
+            struct Foo { x: Int64 }
+            extend Foo: SomeInterface {
+                type Element = Int64;
+                func method() -> Int64 { return 0 }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert!(!program.extends.is_empty());
+    }
+
+    #[test]
+    fn test_parse_class_with_init_deinit_prop() {
+        let source = r#"
+            class MyClass {
+                var x: Int64;
+                var y: String;
+                init(x: Int64) { this.x = x }
+                deinit { }
+                prop value: Int64 {
+                    get() { return this.x }
+                    set(v) { this.x = v }
+                }
+                func method(self: MyClass) -> Int64 { return self.x }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 1);
+        let cls = &program.classes[0];
+        assert!(cls.init.is_some());
+        assert!(cls.deinit.is_some());
+        // methods include the generated getter/setter + method
+        assert!(!cls.methods.is_empty());
+    }
+
+    #[test]
+    fn test_parse_class_override_method() {
+        let source = r#"
+            open class Base {
+                var x: Int64;
+                init(x: Int64) { this.x = x }
+                func get(self: Base) -> Int64 { return self.x }
+            }
+            class Derived extends Base {
+                init(x: Int64) { super(x) }
+                override func get(self: Derived) -> Int64 { return self.x * 2 }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_class_abstract_sealed() {
+        let source = r#"
+            abstract class Shape {
+                var name: String;
+            }
+            sealed class Container {
+                var size: Int64;
+                init(size: Int64) { this.size = size }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_throws_function() {
+        let source = r#"
+            func validate(x: Int64) throws Error -> Int64 {
+                if x < 0 { throw 0 }
+                return x
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert!(program.functions[0].throws.is_some());
+    }
+
+    #[test]
+    fn test_parse_throws_default() {
+        let source = r#"
+            func f() throws -> Int64 { return 0 }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions[0].throws, Some("Error".to_string()));
+    }
+
+    #[test]
+    fn test_parse_try_catch_finally() {
+        let source = r#"
+            func main() -> Int64 {
+                try {
+                    throw 1
+                } catch(e) {
+                    return 0
+                } finally {
+                    let x = 1
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_enum_with_where() {
+        let source = r#"
+            enum Container<T> where T: Comparable {
+                Full(T)
+                Empty
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.enums.len(), 1);
+        assert!(!program.enums[0].type_params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_struct_with_type_constraint() {
+        let source = r#"
+            struct Wrapper<T: Hashable> { inner: T }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.structs.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_variadic_and_default_params() {
+        let source = r#"
+            func f(x: Int64, y: Int64 = 10) -> Int64 { return x + y }
+            func g(args: Int64...) -> Int64 { return 0 }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 2);
+        // Check default param
+        assert!(program.functions[0].params[1].default.is_some());
+        // Check variadic
+        assert!(program.functions[1].params[0].variadic);
+    }
+
+    #[test]
+    fn test_parse_type_annotations() {
+        let source = r#"
+            func main() {
+                let a: Array<Int64> = [1, 2]
+                let t: Tuple<Int64, Int64> = (1, 2)
+                let o: Option<Int64> = None
+                let r: Result<Int64, String> = Ok(1)
+                let rng: Range = 0..10
+                let c: Char = 'A'
+                let u: Unit = ()
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_super_call() {
+        let source = r#"
+            open class Base {
+                var x: Int64;
+                init(x: Int64) { this.x = x }
+                func get(self: Base) -> Int64 { return self.x }
+            }
+            class Child extends Base {
+                init(x: Int64) { super(x) }
+                func get2(self: Child) -> Int64 { return super.get() }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_where_clause_function() {
+        let source = r#"
+            func compare<T>(a: T, b: T) -> Int64 where T: Comparable {
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert!(!program.functions[0].constraints.is_empty());
+    }
+
+    #[test]
+    fn test_parse_class_implements() {
+        let source = r#"
+            interface I { func foo() -> Int64; }
+            class C implements I {
+                var x: Int64;
+                init(x: Int64) { this.x = x }
+                func foo(self: C) -> Int64 { return self.x }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 1);
+        assert!(!program.classes[0].implements.is_empty());
+    }
+
+    #[test]
+    fn test_parse_for_in_range_and_array() {
+        let source = r#"
+            func main() -> Int64 {
+                for i in 0..10 { }
+                for v in [1, 2, 3] { }
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_match_arms() {
+        let source = r#"
+            func main() -> Int64 {
+                return match 5 {
+                    0 => 1,
+                    x if x > 10 => 2,
+                    1 | 2 | 3 => 3,
+                    _ => 0
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_if_let() {
+        let source = r#"
+            func main() -> Int64 {
+                let o: Option<Int64> = Some(1)
+                if let Some(v) = o {
+                    return v
+                }
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_while_let() {
+        let source = r#"
+            func main() -> Int64 {
+                var o: Option<Int64> = Some(1)
+                while let Some(v) = o {
+                    o = None
+                }
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_multi_constraint() {
+        let source = r#"
+            func process<T: Comparable & Hashable>(x: T) -> T {
+                return x
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].constraints.len(), 1);
+        // Single constraint with two bounds
+        assert_eq!(program.functions[0].constraints[0].bounds.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_class_with_generic_method() {
+        let source = r#"
+            class Container {
+                var x: Int64;
+                init(x: Int64) { this.x = x }
+                func transform<T>(self: Container) -> Int64 {
+                    return self.x
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_throws_with_where() {
+        let source = r#"
+            func process<T>(x: T) throws where T: Comparable { }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert!(program.functions[0].throws.is_some());
+    }
+
+    // === 覆盖率补充：解析器错误处理路径 ===
+
+    #[test]
+    fn test_parse_error_display() {
+        let err = ParseErrorAt {
+            error: ParseError::UnexpectedEof,
+            byte_start: 10,
+            byte_end: 20,
+        };
+        let display = format!("{}", err);
+        assert!(display.contains("10"));
+        assert!(display.contains("20"));
+    }
+
+    #[test]
+    fn test_parse_error_source() {
+        use std::error::Error;
+        let err = ParseErrorAt {
+            error: ParseError::UnexpectedEof,
+            byte_start: 0,
+            byte_end: 0,
+        };
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn test_line_column_from_source() {
+        let source = "abc\ndef\nghi";
+        assert_eq!(super::line_column_from_source(source, 0), (1, 1));
+        assert_eq!(super::line_column_from_source(source, 3), (1, 4));
+        assert_eq!(super::line_column_from_source(source, 4), (2, 1));
+        assert_eq!(super::line_column_from_source(source, 7), (2, 4));
+        assert_eq!(super::line_column_from_source(source, 8), (3, 1));
+        // Past end
+        assert_eq!(super::line_column_from_source(source, 100), (3, 4));
+    }
+
+    #[test]
+    fn test_parse_visibility() {
+        let source = r#"
+            public func foo() -> Int64 { return 1 }
+            private func bar() -> Int64 { return 2 }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_struct_standalone() {
+        let source = r#"
+            struct Empty {}
+            struct Single { x: Int64 }
+            struct Multi { x: Int64, y: Float64, z: Bool }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.structs.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_enum_variants() {
+        let source = r#"
+            enum Color { Red Green Blue }
+            enum Value {
+                Num(Int64)
+                Str(String)
+                Nothing
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.enums.len(), 2);
+        assert_eq!(program.enums[0].variants.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_extern_func() {
+        let source = r#"
+            @import("env", "print")
+            extern func print(msg: String)
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert!(program.functions[0].extern_import.is_some());
+    }
+
+    #[test]
+    fn test_parse_extern_func_no_attr() {
+        let source = r#"
+            extern func console_log(msg: String) -> Int64
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert!(program.functions[0].extern_import.is_some());
+    }
+
+    #[test]
+    fn test_parse_complex_expressions() {
+        let source = r#"
+            func main() -> Int64 {
+                let a = 1 + 2 * 3
+                let b = (1 + 2) * 3
+                let c = -5
+                let d = !true
+                let e = ~0xFF
+                let f = 2 ** 3
+                return a + b
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_cast_expression() {
+        let source = r#"
+            func main() -> Int64 {
+                let a = 42 as Float64
+                let b = 1.5 as Int64
+                return b
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_null_coalesce() {
+        let source = r#"
+            func main() -> Int64 {
+                let o: Option<Int64> = None
+                let v = o ?? 42
+                return v
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_try_operator() {
+        let source = r#"
+            func main() -> Int64 {
+                let o: Option<Int64> = Some(1)
+                let v = o?
+                return v
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_block_expression() {
+        let source = r#"
+            func main() -> Int64 {
+                let x = {
+                    let a = 10
+                    a + 20
+                }
+                return x
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_range_expression() {
+        let source = r#"
+            func main() -> Int64 {
+                let r = 0..10
+                let r2 = 0..=10
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_match_with_guard() {
+        let source = r#"
+            func main() -> Int64 {
+                let x = 5
+                return match x {
+                    n if n > 10 => 1,
+                    n if n > 0 => 2,
+                    _ => 0
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_compound_assignment() {
+        let source = r#"
+            func main() -> Int64 {
+                var x: Int64 = 10
+                x += 5
+                x -= 2
+                x *= 3
+                x /= 2
+                x %= 7
+                return x
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_loop_break_continue() {
+        let source = r#"
+            func main() -> Int64 {
+                var i: Int64 = 0
+                loop {
+                    i = i + 1
+                    if i > 10 { break }
+                    if i % 2 == 0 { continue }
+                }
+                return i
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_method_call() {
+        let source = r#"
+            struct Foo { x: Int64 }
+            func main() -> Int64 {
+                let f = Foo { x: 42 }
+                return f.x
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_string_interpolation_expr() {
+        let source = r#"
+            func main() -> Int64 {
+                let name = "world"
+                let s = "Hello ${name}!"
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_class_with_type_params() {
+        let source = r#"
+            class Container<T> {
+                var value: T;
+                init(v: T) { this.value = v }
+                func get(self: Container<T>) -> T { return self.value }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 1);
+        assert!(!program.classes[0].type_params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_multiple_imports() {
+        let source = r#"
+            import std.io
+            import math
+            import foo from bar.baz
+            func main() -> Int64 { return 0 }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.imports.len(), 3);
+    }
+
+    // === 覆盖率补充：错误处理路径 ===
+
+    fn parse_should_fail(source: &str) -> ParseErrorAt {
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        parser.parse_program().unwrap_err()
+    }
+
+    #[test]
+    fn test_parse_error_unexpected_token() {
+        let err = parse_should_fail("func 123() {}");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_missing_rparen() {
+        let err = parse_should_fail("func foo( -> Int64 { return 0 }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_missing_lbrace() {
+        let err = parse_should_fail("func foo() -> Int64 return 0");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_empty_source() {
+        // Empty source should just produce empty program
+        let lexer = Lexer::new("");
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert!(program.functions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_error_bad_type_annotation() {
+        let err = parse_should_fail("func foo(x: ) -> Int64 { return 0 }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_unclosed_struct() {
+        let err = parse_should_fail("struct Foo { x: Int64");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..) | ParseError::UnexpectedEof));
+    }
+
+    #[test]
+    fn test_parse_error_bad_import() {
+        let err = parse_should_fail("import 123");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_let() {
+        let err = parse_should_fail("func main() { let 123 = 1 }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_var() {
+        let err = parse_should_fail("func main() { var 123 = 1 }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_class_member() {
+        let err = parse_should_fail("class Foo { 123 }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_enum_variant() {
+        let err = parse_should_fail("enum Foo { 123 }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_interface_method() {
+        let err = parse_should_fail("interface Foo { 123 }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_extend() {
+        let err = parse_should_fail("extend 123 {}");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_at_prev_position() {
+        // Test that bail_at works with position tracking
+        let err = parse_should_fail("func foo() -> { return 0 }");
+        assert!(err.byte_start > 0 || err.byte_end > 0);
+    }
+
+    // --- 更多错误路径覆盖 ---
+
+    #[test]
+    fn test_parse_error_bad_module_name() {
+        // module 后面跟非标识符
+        let err = parse_should_fail("module 123");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_module_path_part() {
+        // module a.123 - 模块路径中有数字
+        let err = parse_should_fail("module a.123");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_unexpected_top_level() {
+        // 顶层出现非声明关键字
+        let err = parse_should_fail("let x = 1");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_import_item() {
+        // import 123, foo from bar
+        let err = parse_should_fail("import 123 from bar");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_import_multi_items() {
+        // import foo, 123 from bar (第二项是数字)
+        let err = parse_should_fail("import foo, 123 from bar");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_import_bad_module_in_from() {
+        // import foo from 123
+        let err = parse_should_fail("import foo from 123");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_import_bad_module_path() {
+        // import foo from bar.123
+        let err = parse_should_fail("import foo from bar.123");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_import_path_bad_part() {
+        // import a.123 (非 from 语法)
+        let err = parse_should_fail("import a.123");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_import_alias_missing_name() {
+        // import foo as
+        let err = parse_should_fail("import foo as");
+        assert!(matches!(err.error, ParseError::UnexpectedEof));
+    }
+
+    #[test]
+    fn test_parse_error_bad_extern_import_attr() {
+        // @import(123, "foo") extern func
+        let err = parse_should_fail(r#"@import(123, "foo") extern func bar()"#);
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_extern_import_name() {
+        // @import("env", 123) extern func
+        let err = parse_should_fail(r#"@import("env", 123) extern func bar()"#);
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_extern_func_name() {
+        // extern func 123()
+        let err = parse_should_fail("extern func 123()");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_struct_name() {
+        // struct 123 {}
+        let err = parse_should_fail("struct 123 {}");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_struct_field_name() {
+        // struct Foo { 123: Int64 }
+        let err = parse_should_fail("struct Foo { 123: Int64 }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_struct_field_type() {
+        // struct Foo { x: }
+        let err = parse_should_fail("struct Foo { x: }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_enum_name() {
+        // enum 123 {}
+        let err = parse_should_fail("enum 123 {}");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_interface_name() {
+        // interface 123 {}
+        let err = parse_should_fail("interface 123 {}");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_class_name() {
+        // class 123 {}
+        let err = parse_should_fail("class 123 {}");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_function_name() {
+        // func 123() {}
+        let err = parse_should_fail("func 123() {}");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_for_iterable() {
+        // for i in 123.456 {} - float as iterable
+        let err = parse_should_fail("func main() { for i in {} {} }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_error_bad_match_subject() {
+        // match 无效token
+        let err = parse_should_fail("func main() -> Int64 { return match {} {} }");
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_parse_import_multi_items_success() {
+        // import foo, bar from baz.qux
+        let source = "import foo, bar from baz.qux\nfunc main() -> Int64 { return 0 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.imports.len(), 1);
+        assert_eq!(program.imports[0].items.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_parse_for_variable_range() {
+        let source = r#"
+            func main() -> Int64 {
+                let n: Int64 = 5
+                var sum: Int64 = 0
+                for i in 0..n {
+                    sum = sum + i
+                }
+                return sum
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_for_array_literal() {
+        let source = r#"
+            func main() -> Int64 {
+                var sum: Int64 = 0
+                for i in [1, 2, 3] {
+                    sum = sum + i
+                }
+                return sum
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_match_with_bool_and_string_patterns() {
+        let source = r#"
+            func main() -> Int64 {
+                let b: Bool = true
+                let r1 = match b {
+                    true => 1,
+                    false => 0
+                }
+                let s: String = "hello"
+                let r2 = match s {
+                    "hello" => 10,
+                    _ => 0
+                }
+                return r1 + r2
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
 }

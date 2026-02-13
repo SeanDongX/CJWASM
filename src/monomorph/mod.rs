@@ -1226,3 +1226,116 @@ pub fn monomorphize_program(program: &mut Program) {
         func.body = new_body;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::Type;
+
+    #[test]
+    fn test_type_mangle_suffix_basic() {
+        assert_eq!(type_mangle_suffix(&Type::Int8), "Int8");
+        assert_eq!(type_mangle_suffix(&Type::Int16), "Int16");
+        assert_eq!(type_mangle_suffix(&Type::Int32), "Int32");
+        assert_eq!(type_mangle_suffix(&Type::Int64), "Int64");
+        assert_eq!(type_mangle_suffix(&Type::UInt8), "UInt8");
+        assert_eq!(type_mangle_suffix(&Type::UInt16), "UInt16");
+        assert_eq!(type_mangle_suffix(&Type::UInt32), "UInt32");
+        assert_eq!(type_mangle_suffix(&Type::UInt64), "UInt64");
+        assert_eq!(type_mangle_suffix(&Type::Float32), "Float32");
+        assert_eq!(type_mangle_suffix(&Type::Float64), "Float64");
+        assert_eq!(type_mangle_suffix(&Type::Bool), "Bool");
+        assert_eq!(type_mangle_suffix(&Type::Char), "Char");
+        assert_eq!(type_mangle_suffix(&Type::Unit), "Unit");
+        assert_eq!(type_mangle_suffix(&Type::String), "String");
+        assert_eq!(type_mangle_suffix(&Type::Range), "Range");
+    }
+
+    #[test]
+    fn test_type_mangle_suffix_compound() {
+        assert_eq!(
+            type_mangle_suffix(&Type::Array(Box::new(Type::Int64))),
+            "Array_Int64"
+        );
+        assert_eq!(
+            type_mangle_suffix(&Type::Tuple(vec![Type::Int64, Type::Float64])),
+            "Tuple_Int64_Float64"
+        );
+        assert_eq!(
+            type_mangle_suffix(&Type::Struct("Foo".to_string(), vec![])),
+            "Foo"
+        );
+        assert_eq!(
+            type_mangle_suffix(&Type::Struct("Pair".to_string(), vec![Type::Int64, Type::String])),
+            "Pair_Int64_String"
+        );
+        assert_eq!(
+            type_mangle_suffix(&Type::Option(Box::new(Type::Int64))),
+            "Option_Int64"
+        );
+        assert_eq!(
+            type_mangle_suffix(&Type::Result(Box::new(Type::Int64), Box::new(Type::String))),
+            "Result_Int64_String"
+        );
+        assert_eq!(
+            type_mangle_suffix(&Type::Function {
+                params: vec![Type::Int64],
+                ret: Box::new(Some(Type::Bool)),
+            }),
+            "Fn_Int64_Bool"
+        );
+        assert_eq!(
+            type_mangle_suffix(&Type::TypeParam("T".to_string())),
+            "T"
+        );
+    }
+
+    #[test]
+    fn test_mangle_name() {
+        assert_eq!(mangle_name("foo", &[Type::Int64]), "foo$Int64");
+        assert_eq!(mangle_name("bar", &[Type::Int64, Type::String]), "bar$Int64$String");
+        assert_eq!(mangle_name("baz", &[]), "baz$_");
+    }
+
+    #[test]
+    fn test_monomorphize_empty_program() {
+        let mut program = Program {
+            module_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![],
+            extends: vec![],
+        };
+        monomorphize_program(&mut program);
+        assert!(program.functions.is_empty());
+    }
+
+    #[test]
+    fn test_monomorphize_no_generics() {
+        let mut program = Program {
+            module_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: crate::ast::Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Integer(42)))],
+                extern_import: None,
+            }],
+            extends: vec![],
+        };
+        monomorphize_program(&mut program);
+        assert_eq!(program.functions.len(), 1);
+    }
+}

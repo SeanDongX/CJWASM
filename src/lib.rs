@@ -6,3 +6,4 @@ pub mod lexer;
 pub mod monomorph;
 pub mod optimizer;
 pub mod parser;
+pub mod pipeline;

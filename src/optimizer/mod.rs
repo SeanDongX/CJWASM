@@ -342,4 +342,241 @@ mod tests {
         let got = fold_expr(e);
         assert!(matches!(got, Expr::Integer(10)));
     }
+
+    // === 覆盖率补充：optimizer 单元测试 ===
+
+    #[test]
+    fn fold_int_sub() {
+        let e = Expr::Binary { op: BinOp::Sub, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(3)) };
+        assert!(matches!(fold_expr(e), Expr::Integer(7)));
+    }
+
+    #[test]
+    fn fold_int_div() {
+        let e = Expr::Binary { op: BinOp::Div, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(3)) };
+        assert!(matches!(fold_expr(e), Expr::Integer(3)));
+    }
+
+    #[test]
+    fn fold_int_div_zero() {
+        let e = Expr::Binary { op: BinOp::Div, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(0)) };
+        // 除零不折叠，应保持为 Binary
+        assert!(matches!(fold_expr(e), Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn fold_int_mod() {
+        let e = Expr::Binary { op: BinOp::Mod, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(3)) };
+        assert!(matches!(fold_expr(e), Expr::Integer(1)));
+    }
+
+    #[test]
+    fn fold_int_mod_zero() {
+        let e = Expr::Binary { op: BinOp::Mod, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(0)) };
+        assert!(matches!(fold_expr(e), Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn fold_int_comparisons() {
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Eq, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(1)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::NotEq, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(2)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Lt, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(2)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Gt, left: Box::new(Expr::Integer(2)), right: Box::new(Expr::Integer(1)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::LtEq, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(1)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::GtEq, left: Box::new(Expr::Integer(2)), right: Box::new(Expr::Integer(2)) }), Expr::Bool(true)));
+    }
+
+    #[test]
+    fn fold_int_bitwise() {
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::BitAnd, left: Box::new(Expr::Integer(0xFF)), right: Box::new(Expr::Integer(0x0F)) }), Expr::Integer(0x0F)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::BitOr, left: Box::new(Expr::Integer(0xF0)), right: Box::new(Expr::Integer(0x0F)) }), Expr::Integer(0xFF)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::BitXor, left: Box::new(Expr::Integer(0xFF)), right: Box::new(Expr::Integer(0x0F)) }), Expr::Integer(0xF0)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Shl, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(4)) }), Expr::Integer(16)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Shr, left: Box::new(Expr::Integer(16)), right: Box::new(Expr::Integer(2)) }), Expr::Integer(4)));
+    }
+
+    #[test]
+    fn fold_int_ushr() {
+        let e = Expr::Binary { op: BinOp::UShr, left: Box::new(Expr::Integer(256)), right: Box::new(Expr::Integer(2)) };
+        assert!(matches!(fold_expr(e), Expr::Integer(64)));
+    }
+
+    #[test]
+    fn fold_int_logical_returns_none() {
+        // LogicalAnd, LogicalOr, Pow 不折叠整数
+        let e = Expr::Binary { op: BinOp::Pow, left: Box::new(Expr::Integer(2)), right: Box::new(Expr::Integer(3)) };
+        assert!(matches!(fold_expr(e), Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn fold_float_add() {
+        let e = Expr::Binary { op: BinOp::Add, left: Box::new(Expr::Float(1.5)), right: Box::new(Expr::Float(2.5)) };
+        if let Expr::Float(v) = fold_expr(e) { assert!((v - 4.0).abs() < 0.001); } else { panic!("expected float"); }
+    }
+
+    #[test]
+    fn fold_float_sub() {
+        let e = Expr::Binary { op: BinOp::Sub, left: Box::new(Expr::Float(5.0)), right: Box::new(Expr::Float(2.0)) };
+        if let Expr::Float(v) = fold_expr(e) { assert!((v - 3.0).abs() < 0.001); } else { panic!("expected float"); }
+    }
+
+    #[test]
+    fn fold_float_mul() {
+        let e = Expr::Binary { op: BinOp::Mul, left: Box::new(Expr::Float(3.0)), right: Box::new(Expr::Float(4.0)) };
+        if let Expr::Float(v) = fold_expr(e) { assert!((v - 12.0).abs() < 0.001); } else { panic!("expected float"); }
+    }
+
+    #[test]
+    fn fold_float_div() {
+        let e = Expr::Binary { op: BinOp::Div, left: Box::new(Expr::Float(10.0)), right: Box::new(Expr::Float(4.0)) };
+        if let Expr::Float(v) = fold_expr(e) { assert!((v - 2.5).abs() < 0.001); } else { panic!("expected float"); }
+    }
+
+    #[test]
+    fn fold_float_comparisons() {
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Eq, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(1.0)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::NotEq, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(2.0)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Lt, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(2.0)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Gt, left: Box::new(Expr::Float(2.0)), right: Box::new(Expr::Float(1.0)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::LtEq, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(1.0)) }), Expr::Bool(true)));
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::GtEq, left: Box::new(Expr::Float(2.0)), right: Box::new(Expr::Float(2.0)) }), Expr::Bool(true)));
+    }
+
+    #[test]
+    fn fold_float_unsupported_ops() {
+        // Mod, BitAnd 等不支持浮点
+        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Mod, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(2.0)) }), Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn fold_unary_neg_int() {
+        use crate::ast::UnaryOp;
+        let e = Expr::Unary { op: UnaryOp::Neg, expr: Box::new(Expr::Integer(42)) };
+        assert!(matches!(fold_expr(e), Expr::Integer(-42)));
+    }
+
+    #[test]
+    fn fold_unary_neg_float_not_folded() {
+        use crate::ast::UnaryOp;
+        // Neg on Float is not folded by the optimizer (only Integer)
+        let e = Expr::Unary { op: UnaryOp::Neg, expr: Box::new(Expr::Float(3.14)) };
+        assert!(matches!(fold_expr(e), Expr::Unary { .. }));
+    }
+
+    #[test]
+    fn fold_unary_not() {
+        use crate::ast::UnaryOp;
+        let e = Expr::Unary { op: UnaryOp::Not, expr: Box::new(Expr::Bool(true)) };
+        assert!(matches!(fold_expr(e), Expr::Bool(false)));
+        let e2 = Expr::Unary { op: UnaryOp::Not, expr: Box::new(Expr::Bool(false)) };
+        assert!(matches!(fold_expr(e2), Expr::Bool(true)));
+    }
+
+    #[test]
+    fn fold_unary_bitnot_not_folded() {
+        use crate::ast::UnaryOp;
+        // BitNot is not folded by the optimizer
+        let e = Expr::Unary { op: UnaryOp::BitNot, expr: Box::new(Expr::Integer(0)) };
+        assert!(matches!(fold_expr(e), Expr::Unary { .. }));
+    }
+
+    #[test]
+    fn fold_if_recursive() {
+        // If 应递归折叠子表达式
+        let e = Expr::If {
+            cond: Box::new(Expr::Binary {
+                op: BinOp::Eq,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(1)),
+            }),
+            then_branch: Box::new(Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(Expr::Integer(2)),
+                right: Box::new(Expr::Integer(3)),
+            }),
+            else_branch: Some(Box::new(Expr::Integer(0))),
+        };
+        let folded = fold_expr(e);
+        // cond should become Bool(true), then_branch should become Integer(5)
+        if let Expr::If { cond, then_branch, .. } = folded {
+            assert!(matches!(*cond, Expr::Bool(true)));
+            assert!(matches!(*then_branch, Expr::Integer(5)));
+        } else {
+            panic!("Expected If");
+        }
+    }
+
+    #[test]
+    fn fold_if_let_recursive() {
+        use crate::ast::Pattern;
+        let e = Expr::IfLet {
+            pattern: Pattern::Wildcard,
+            expr: Box::new(Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(2)),
+            }),
+            then_branch: Box::new(Expr::Integer(10)),
+            else_branch: Some(Box::new(Expr::Integer(0))),
+        };
+        let folded = fold_expr(e);
+        if let Expr::IfLet { expr, .. } = folded {
+            assert!(matches!(*expr, Expr::Integer(3)));
+        } else {
+            panic!("Expected IfLet");
+        }
+    }
+
+    #[test]
+    fn fold_block_recursive() {
+        let e = Expr::Block(
+            vec![],
+            Some(Box::new(Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(2)),
+            })),
+        );
+        let folded = fold_expr(e);
+        if let Expr::Block(_, Some(tail)) = folded {
+            assert!(matches!(*tail, Expr::Integer(3)));
+        } else {
+            panic!("Expected Block");
+        }
+    }
+
+    #[test]
+    fn fold_try_block_recursive() {
+        use crate::ast::Stmt;
+        let e = Expr::TryBlock {
+            body: vec![Stmt::Expr(Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(2)),
+            })],
+            catch_var: None,
+            catch_body: vec![],
+            finally_body: Some(vec![Stmt::Expr(Expr::Binary {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Integer(3)),
+                right: Box::new(Expr::Integer(4)),
+            })]),
+        };
+        let folded = fold_expr(e);
+        if let Expr::TryBlock { body, finally_body, .. } = folded {
+            if let Stmt::Expr(Expr::Integer(3)) = &body[0] {
+                // body folded correctly
+            } else {
+                panic!("Body should be folded to Integer(3)");
+            }
+            let fb = finally_body.unwrap();
+            if let Stmt::Expr(Expr::Integer(12)) = &fb[0] {
+                // finally folded correctly
+            } else {
+                panic!("Finally should be folded to Integer(12)");
+            }
+        } else {
+            panic!("Expected TryBlock");
+        }
+    }
 }

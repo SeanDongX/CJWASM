@@ -4653,4 +4653,73 @@ mod tests {
         assert!(!wasm.is_empty());
         assert_eq!(&wasm[0..4], b"\0asm");
     }
+
+    #[test]
+    fn test_codegen_default() {
+        let codegen = CodeGen::default();
+        // default() should be equivalent to new()
+        let _ = codegen;
+    }
+
+    #[test]
+    fn test_type_mangle_suffix_all() {
+        // 测试所有类型的名字修饰
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Int8), "Int8");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Int16), "Int16");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Int32), "Int32");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Int64), "Int64");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::UInt8), "UInt8");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::UInt16), "UInt16");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::UInt32), "UInt32");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::UInt64), "UInt64");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Float32), "Float32");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Float64), "Float64");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Bool), "Bool");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Char), "Char");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Unit), "Unit");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::String), "String");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Range), "Range");
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::Array(Box::new(Type::Int64))),
+            "Array_Int64"
+        );
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::Tuple(vec![Type::Int64, Type::Float64])),
+            "Tuple_Int64_Float64"
+        );
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::Struct("Point".to_string(), vec![])),
+            "Point"
+        );
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::Struct("Pair".to_string(), vec![Type::Int64, Type::String])),
+            "Pair_Int64_String"
+        );
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::Function {
+                params: vec![Type::Int64],
+                ret: Box::new(Some(Type::Bool)),
+            }),
+            "Fn_Int64_Bool"
+        );
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::Function {
+                params: vec![],
+                ret: Box::new(None),
+            }),
+            "Fn__Unit"
+        );
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::Option(Box::new(Type::Int64))),
+            "Option_Int64"
+        );
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::Result(Box::new(Type::Int64), Box::new(Type::String))),
+            "Result_Int64_String"
+        );
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::TypeParam("T".to_string())),
+            "T"
+        );
+    }
 }

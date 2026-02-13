@@ -10,7 +10,7 @@ pub enum StringPart {
 }
 
 /// 将字符串字面量内部的反斜杠转义还原（支持 \n \t \" \\）。
-fn unescape_string(s: &str) -> String {
+pub fn unescape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars();
     while let Some(c) = it.next() {
@@ -34,7 +34,7 @@ fn unescape_string(s: &str) -> String {
 }
 
 /// 处理多行字符串：移除首行空行，并 strip 公共缩进
-fn process_multiline_string(s: &str) -> String {
+pub fn process_multiline_string(s: &str) -> String {
     let mut lines: Vec<&str> = s.lines().collect();
 
     // 如果第一行是空的（紧跟 """ 后换行），移除它
@@ -703,5 +703,175 @@ mod tests {
 
         // \$ should be escaped to $, so this is a plain string
         assert_eq!(tokens[3], Token::StringLit(StringOrInterpolated::Plain("Price: $100".to_string())));
+    }
+
+    #[test]
+    fn test_unescape_string_all_escapes() {
+        // 直接测试 unescape_string
+        assert_eq!(super::unescape_string("hello\\nworld"), "hello\nworld");
+        assert_eq!(super::unescape_string("tab\\there"), "tab\there");
+        assert_eq!(super::unescape_string("quote\\\"inside"), "quote\"inside");
+        assert_eq!(super::unescape_string("back\\\\slash"), "back\\slash");
+    }
+
+    #[test]
+    fn test_unescape_unknown_sequence() {
+        // 未知转义如 \x => 保留 \x
+        assert_eq!(super::unescape_string("test\\xend"), "test\\xend");
+    }
+
+    #[test]
+    fn test_unescape_trailing_backslash() {
+        // 尾部 \ 应保留
+        assert_eq!(super::unescape_string("end\\"), "end\\");
+    }
+
+    #[test]
+    fn test_unescape_no_escape() {
+        assert_eq!(super::unescape_string("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_unescape_empty() {
+        assert_eq!(super::unescape_string(""), "");
+    }
+
+    #[test]
+    fn test_process_multiline_string_basic() {
+        let s = "\n    hello\n    world\n    ";
+        let result = super::process_multiline_string(s);
+        assert_eq!(result, "hello\nworld");
+    }
+
+    #[test]
+    fn test_process_multiline_string_empty() {
+        assert_eq!(super::process_multiline_string(""), "");
+    }
+
+    #[test]
+    fn test_process_multiline_string_no_indent() {
+        let s = "\nhello\nworld\n";
+        let result = super::process_multiline_string(s);
+        assert_eq!(result, "hello\nworld");
+    }
+
+    #[test]
+    fn test_string_interpolation_with_nested_braces() {
+        // ${expr} 中包含嵌套 {} 的情况
+        let source = r#"let s = "value: ${if true { 1 } else { 0 }}""#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        // 应该能正常解析
+        assert!(tokens.len() >= 4);
+    }
+
+    #[test]
+    fn test_string_interpolation_with_embedded_string() {
+        // ${expr} 中包含内嵌字符串
+        let source = r#"let s = "hello ${name + "!"} world""#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert!(tokens.len() >= 4);
+    }
+
+    #[test]
+    fn test_lexer_error_handling_tokens() {
+        // 确保 try, catch, throw, throws, finally tokens 正确识别
+        let source = "try catch throw throws finally";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Try);
+        assert_eq!(tokens[1], Token::Catch);
+        assert_eq!(tokens[2], Token::Throw);
+        assert_eq!(tokens[3], Token::Throws);
+        assert_eq!(tokens[4], Token::Finally);
+    }
+
+    #[test]
+    fn test_lexer_type_tokens() {
+        let source = "Int8 Int16 Int32 Int64 UInt8 UInt16 UInt32 UInt64 Float32 Float64 Bool Char String Unit";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::TypeInt8);
+        assert_eq!(tokens[1], Token::TypeInt16);
+        assert_eq!(tokens[2], Token::TypeInt32);
+        assert_eq!(tokens[3], Token::TypeInt64);
+        assert_eq!(tokens[4], Token::TypeUInt8);
+        assert_eq!(tokens[5], Token::TypeUInt16);
+        assert_eq!(tokens[6], Token::TypeUInt32);
+        assert_eq!(tokens[7], Token::TypeUInt64);
+        assert_eq!(tokens[8], Token::TypeFloat32);
+        assert_eq!(tokens[9], Token::TypeFloat64);
+        assert_eq!(tokens[10], Token::TypeBool);
+        assert_eq!(tokens[11], Token::TypeChar);
+        assert_eq!(tokens[12], Token::TypeString);
+        assert_eq!(tokens[13], Token::TypeUnit);
+    }
+
+    #[test]
+    fn test_lexer_keyword_tokens() {
+        let source = "module import from as open abstract sealed override extend interface implements prop deinit";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Module);
+        assert_eq!(tokens[1], Token::Import);
+        assert_eq!(tokens[2], Token::From);
+        assert_eq!(tokens[3], Token::As);
+        assert_eq!(tokens[4], Token::Open);
+        assert_eq!(tokens[5], Token::Abstract);
+        assert_eq!(tokens[6], Token::Sealed);
+        assert_eq!(tokens[7], Token::Override);
+        assert_eq!(tokens[8], Token::Extend);
+        assert_eq!(tokens[9], Token::Interface);
+        assert_eq!(tokens[10], Token::Implements);
+        assert_eq!(tokens[11], Token::Prop);
+        assert_eq!(tokens[12], Token::Deinit);
+    }
+
+    #[test]
+    fn test_lexer_operator_tokens() {
+        let source = "** ?? >>> << >> & | ^ ~ !";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::StarStar);
+        assert_eq!(tokens[1], Token::QuestionQuestion);
+        assert_eq!(tokens[2], Token::UShr);
+        assert_eq!(tokens[3], Token::Shl);
+        assert_eq!(tokens[4], Token::Shr);
+        assert_eq!(tokens[5], Token::And);
+        assert_eq!(tokens[6], Token::Pipe);
+        assert_eq!(tokens[7], Token::Caret);
+        assert_eq!(tokens[8], Token::Tilde);
+        assert_eq!(tokens[9], Token::Bang);
+    }
+
+    #[test]
+    fn test_lexer_float32_literal() {
+        let source = "3.14f 2.0f";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        match &tokens[0] {
+            Token::Float32(v) => assert!((*v - 3.14_f32).abs() < 0.001),
+            _ => panic!("Expected Float32, got {:?}", tokens[0]),
+        }
+    }
+
+    #[test]
+    fn test_lexer_char_literal() {
+        let source = "'A' 'Z'";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::CharLit('A'));
+        assert_eq!(tokens[1], Token::CharLit('Z'));
+    }
+
+    #[test]
+    fn test_lexer_hex_literal() {
+        let source = "0xFF 0x0F 0xABCD";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Integer(255));
+        assert_eq!(tokens[1], Token::Integer(15));
+        assert_eq!(tokens[2], Token::Integer(0xABCD));
     }
 }
