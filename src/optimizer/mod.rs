@@ -151,6 +151,15 @@ fn fold_expr(expr: Expr) -> Expr {
             args: args.into_iter().map(fold_expr).collect(),
         },
         Array(elems) => Array(elems.into_iter().map(fold_expr).collect()),
+        Tuple(elems) => Tuple(elems.into_iter().map(fold_expr).collect()),
+        TupleIndex { object, index } => TupleIndex {
+            object: Box::new(fold_expr(*object)),
+            index,
+        },
+        NullCoalesce { option, default } => NullCoalesce {
+            option: Box::new(fold_expr(*option)),
+            default: Box::new(fold_expr(*default)),
+        },
         Index { array, index } => Index {
             array: Box::new(fold_expr(*array)),
             index: Box::new(fold_expr(*index)),
@@ -267,6 +276,7 @@ fn fold_binary_int(a: i64, b: i64, op: &BinOp) -> Option<Expr> {
         BitXor => Integer(a ^ b),
         Shl => Integer(a.shl(b as u32)),
         Shr => Integer(a.shr(b as u32)),
+        UShr => Integer(((a as u64).shr(b as u32)) as i64),
         LogicalAnd | LogicalOr | Pow => return None,
     };
     Some(out)
@@ -286,7 +296,7 @@ fn fold_binary_float(x: f64, y: f64, op: &BinOp) -> Option<Expr> {
         Gt => Bool(x > y),
         LtEq => Bool(x <= y),
         GtEq => Bool(x >= y),
-        Mod | BitAnd | BitOr | BitXor | Shl | Shr | LogicalAnd | LogicalOr | Pow => return None,
+        Mod | BitAnd | BitOr | BitXor | Shl | Shr | UShr | LogicalAnd | LogicalOr | Pow => return None,
     };
     Some(out)
 }

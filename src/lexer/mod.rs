@@ -286,23 +286,43 @@ pub enum Token {
     #[token("_", priority = 3)]
     Underscore,
 
+    // 可见性
+    #[token("internal")]
+    Internal,
+
     // 类型
     #[token("Int64")]
     TypeInt64,
     #[token("Int32")]
     TypeInt32,
+    #[token("Int16")]
+    TypeInt16,
+    #[token("Int8")]
+    TypeInt8,
+    #[token("UInt64")]
+    TypeUInt64,
+    #[token("UInt32")]
+    TypeUInt32,
+    #[token("UInt16")]
+    TypeUInt16,
+    #[token("UInt8")]
+    TypeUInt8,
     #[token("Float64")]
     TypeFloat64,
     #[token("Float32")]
     TypeFloat32,
     #[token("Bool")]
     TypeBool,
+    #[token("Char")]
+    TypeChar,
     #[token("Unit")]
     TypeUnit,
     #[token("String")]
     TypeString,
     #[token("Array")]
     TypeArray,
+    #[token("Tuple")]
+    TypeTuple,
     #[token("Range")]
     TypeRange,
     #[token("Option")]
@@ -317,7 +337,7 @@ pub enum Token {
     })]
     Float(f64),
 
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*f|[0-9][0-9_]*f", |lex| {
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
         let s: String = lex.slice().chars().filter(|c| *c != '_' && *c != 'f').collect();
         s.parse::<f32>().ok()
     })]
@@ -332,6 +352,26 @@ pub enum Token {
         else { s.parse::<i64>().ok() }
     })]
     Integer(i64),
+
+    // 字符字面量 'a' (支持转义 '\n' '\t' '\\' '\'' '\0')
+    #[regex(r"'[^'\\]'|'\\[ntr\\0']'", |lex| {
+        let s = lex.slice();
+        let inner = &s[1..s.len()-1]; // 去除引号
+        if inner.starts_with('\\') {
+            match inner.chars().nth(1) {
+                Some('n') => Some('\n'),
+                Some('t') => Some('\t'),
+                Some('r') => Some('\r'),
+                Some('\\') => Some('\\'),
+                Some('0') => Some('\0'),
+                Some('\'') => Some('\''),
+                _ => None,
+            }
+        } else {
+            inner.chars().next()
+        }
+    })]
+    CharLit(char),
 
     #[token("true")]
     True,
@@ -400,6 +440,8 @@ pub enum Token {
     Tilde,
     #[token("<<")]
     Shl,
+    #[token(">>>")]
+    UShr,
     #[token(">>")]
     Shr,
     #[token("!")]
@@ -422,6 +464,8 @@ pub enum Token {
     DotDotDot,
     #[token("=>")]
     FatArrow,
+    #[token("??")]
+    QuestionQuestion,
     #[token("?")]
     Question,
 

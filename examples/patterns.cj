@@ -13,7 +13,7 @@ struct Rectangle {
 
 // if-let 模式
 func processOption(opt: Option<Int64>) -> Int64 {
-    if let Option.Some(value) = opt {
+    if let Some(value) = opt {
         return value * 2
     }
     return 0
@@ -21,7 +21,7 @@ func processOption(opt: Option<Int64>) -> Int64 {
 
 // if-let 与 Result
 func processResult(res: Result<Int64, String>) -> Int64 {
-    if let Result.Ok(value) = res {
+    if let Ok(value) = res {
         return value + 10
     }
     return 0
@@ -29,15 +29,15 @@ func processResult(res: Result<Int64, String>) -> Int64 {
 
 // while-let 模式（模拟迭代）
 func countDown(start: Int64) -> Int64 {
-    var current = Option.Some(start)
+    var current = Some(start)
     var sum: Int64 = 0
 
-    while let Option.Some(n) = current {
+    while let Some(n) = current {
         sum = sum + n
         if n > 0 {
-            current = Option.Some(n - 1)
+            current = Some(n - 1)
         } else {
-            current = Option.None
+            current = None
         }
     }
     return sum
@@ -84,8 +84,8 @@ func classifyPoint(p: Point) -> String {
 
 func main() -> Int64 {
     // if-let 测试
-    let opt1 = Option.Some(5)
-    let opt2: Option<Int64> = Option.None
+    let opt1 = Some(5)
+    let opt2: Option<Int64> = None
     let a = processOption(opt1)     // 10
     let b = processOption(opt2)     // 0
 

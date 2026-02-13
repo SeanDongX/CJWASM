@@ -69,17 +69,12 @@ func calculate(a: Int64, b: Int64, c: Int64) -> Int64 {
     return a + b + c
 }
 
-// Lambda 表达式（解析支持）
-func applyOperation() -> Int64 {
-    // Lambda 语法 1: (params) -> ReturnType { body }
-    let double = (x: Int64) -> Int64 { x * 2 }
-
-    // Lambda 语法 2: { params => body }
-    let triple = { x: Int64 => x * 3 }
-
-    // 注意：Lambda codegen 尚未实现，这里仅展示语法
-    return 42
-}
+// Lambda 表达式（仅语法解析，codegen 尚未实现）
+// func applyOperation() -> Int64 {
+//     let double = (x: Int64) -> Int64 { x * 2 }
+//     let triple = { x: Int64 => x * 3 }
+//     return 42
+// }
 
 func main() -> Int64 {
     // 默认参数测试

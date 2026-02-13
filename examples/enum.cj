@@ -17,17 +17,17 @@ enum Message {
 // 使用 Option 类型
 func divide(a: Int64, b: Int64) -> Option<Int64> {
     if b == 0 {
-        return Option.None
+        return None
     }
-    return Option.Some(a / b)
+    return Some(a / b)
 }
 
 // 使用 Result 类型
 func safeDivide(a: Int64, b: Int64) -> Result<Int64, String> {
     if b == 0 {
-        return Result.Err("Division by zero")
+        return Err("Division by zero")
     }
-    return Result.Ok(a / b)
+    return Ok(a / b)
 }
 
 // 枚举方法
@@ -53,7 +53,7 @@ func handleMessage(m: Message) -> Int64 {
     match m {
         Message.Quit => 0,
         Message.Move(distance) => distance,
-        Message.Write(_) => 100
+        Message.Write(s) => 100
     }
 }
 

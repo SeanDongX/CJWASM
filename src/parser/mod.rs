@@ -111,6 +111,10 @@ impl Parser {
         self.tokens.get(self.pos + 1).map(|(_, t, _)| t)
     }
 
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset).map(|(_, t, _)| t)
+    }
+
     fn advance(&mut self) -> Option<Token> {
         if self.pos < self.tokens.len() {
             let tok = self.tokens[self.pos].1.clone();
@@ -150,14 +154,23 @@ impl Parser {
         let mut functions = Vec::new();
         let mut enums = Vec::new();
 
-        // 解析可选的 module 声明
+        // 解析可选的 module 声明（支持点分路径如 examples.demo）
         if self.check(&Token::Module) {
             self.advance();
-            let name = match self.advance() {
+            let mut name = match self.advance() {
                 Some(Token::Ident(n)) => n,
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "模块名".to_string())),
                 None => return self.bail(ParseError::UnexpectedEof),
             };
+            while self.check(&Token::Dot) {
+                self.advance();
+                let part = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "模块路径".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                name = format!("{}.{}", name, part);
+            }
             module_name = Some(name);
         }
 
@@ -174,6 +187,9 @@ impl Parser {
             } else if self.check(&Token::Private) {
                 self.advance();
                 Visibility::Private
+            } else if self.check(&Token::Internal) {
+                self.advance();
+                Visibility::Internal
             } else {
                 Visibility::default()
             };
@@ -349,8 +365,11 @@ impl Parser {
     /// 判断 token 是否为类型的有效起始（避免将 n < 10 的 < 误解析为类型实参）
     fn is_type_start(t: &Token) -> bool {
         matches!(t,
-            Token::TypeInt32 | Token::TypeInt64 | Token::TypeFloat32 | Token::TypeFloat64
-            | Token::TypeBool | Token::TypeUnit | Token::TypeString | Token::TypeArray
+            Token::TypeInt8 | Token::TypeInt16 | Token::TypeInt32 | Token::TypeInt64
+            | Token::TypeUInt8 | Token::TypeUInt16 | Token::TypeUInt32 | Token::TypeUInt64
+            | Token::TypeFloat32 | Token::TypeFloat64
+            | Token::TypeBool | Token::TypeChar | Token::TypeUnit | Token::TypeString
+            | Token::TypeArray | Token::TypeTuple
             | Token::TypeRange | Token::TypeOption | Token::TypeResult
             | Token::Ident(_)
         )
@@ -364,6 +383,14 @@ impl Parser {
         // 避免将 n < 10 的 < 误解析为类型实参：< 后必须是类型起始
         if !self.peek_next().map(Self::is_type_start).unwrap_or(false) {
             return Ok(None);
+        }
+        // 如果 < 后面是普通标识符（非类型关键字），再检查其后是否为 >, , 或 <（泛型上下文）
+        // 例: i < end {  → end 后为 {，不是泛型
+        //     Map<MyType> → MyType 后为 >，是泛型
+        if let Some(Token::Ident(_)) = self.peek_next() {
+            if !matches!(self.peek_at(2), Some(Token::Gt | Token::Comma | Token::Lt)) {
+                return Ok(None);
+            }
         }
         self.advance();
         let mut args = Vec::new();
@@ -579,6 +606,9 @@ impl Parser {
             } else if self.check(&Token::Public) {
                 self.advance();
                 crate::ast::Visibility::Public
+            } else if self.check(&Token::Internal) {
+                self.advance();
+                crate::ast::Visibility::Internal
             } else {
                 crate::ast::Visibility::default()
             };
@@ -750,6 +780,7 @@ impl Parser {
         loop {
             let name = match self.advance() {
                 Some(Token::Ident(name)) => name,
+                Some(Token::This) => "this".to_string(),
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string())),
                 None => return self.bail(ParseError::UnexpectedEof),
             };
@@ -782,11 +813,18 @@ impl Parser {
     /// 解析类型
     fn parse_type(&mut self) -> Result<Type, ParseErrorAt> {
         match self.advance() {
+            Some(Token::TypeInt8) => Ok(Type::Int8),
+            Some(Token::TypeInt16) => Ok(Type::Int16),
             Some(Token::TypeInt32) => Ok(Type::Int32),
             Some(Token::TypeInt64) => Ok(Type::Int64),
+            Some(Token::TypeUInt8) => Ok(Type::UInt8),
+            Some(Token::TypeUInt16) => Ok(Type::UInt16),
+            Some(Token::TypeUInt32) => Ok(Type::UInt32),
+            Some(Token::TypeUInt64) => Ok(Type::UInt64),
             Some(Token::TypeFloat64) => Ok(Type::Float64),
             Some(Token::TypeFloat32) => Ok(Type::Float32),
             Some(Token::TypeBool) => Ok(Type::Bool),
+            Some(Token::TypeChar) => Ok(Type::Char),
             Some(Token::TypeUnit) => Ok(Type::Unit),
             Some(Token::TypeString) => Ok(Type::String),
             Some(Token::TypeArray) => {
@@ -794,6 +832,26 @@ impl Parser {
                 let elem_type = self.parse_type()?;
                 self.expect(Token::Gt)?;
                 Ok(Type::Array(Box::new(elem_type)))
+            }
+            Some(Token::TypeTuple) => {
+                // Tuple<T1, T2, ...> 语法
+                self.expect(Token::Lt)?;
+                let mut types = Vec::new();
+                loop {
+                    types.push(self.parse_type()?);
+                    if self.check(&Token::Comma) {
+                        self.advance();
+                    } else if self.check(&Token::Gt) {
+                        self.advance();
+                        break;
+                    } else {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::Comma),
+                            "`,` 或 `>`".to_string(),
+                        ));
+                    }
+                }
+                Ok(Type::Tuple(types))
             }
             Some(Token::TypeRange) => Ok(Type::Range),
             Some(Token::TypeOption) => {
@@ -1064,9 +1122,23 @@ impl Parser {
         }
     }
 
-    /// 解析表达式（顶层为逻辑或）
+    /// 解析表达式（顶层为空值合并）
     fn parse_expr(&mut self) -> Result<Expr, ParseErrorAt> {
-        self.parse_logical_or()
+        self.parse_null_coalesce()
+    }
+
+    /// 解析空值合并 (??)
+    fn parse_null_coalesce(&mut self) -> Result<Expr, ParseErrorAt> {
+        let mut left = self.parse_logical_or()?;
+        while matches!(self.peek(), Some(Token::QuestionQuestion)) {
+            self.advance();
+            let right = self.parse_logical_or()?;
+            left = Expr::NullCoalesce {
+                option: Box::new(left),
+                default: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     /// 解析逻辑或 (||)
@@ -1107,8 +1179,15 @@ impl Parser {
             Some(Token::Eq) => Some(BinOp::Eq),
             Some(Token::NotEq) => Some(BinOp::NotEq),
             Some(Token::Lt) => {
-                // 检查是否是泛型语法 Array<T>
-                if matches!(self.peek_next(), Some(Token::TypeInt64 | Token::TypeInt32 | Token::TypeFloat64 | Token::TypeFloat32 | Token::TypeBool | Token::TypeString | Token::Ident(_))) {
+                // 启发式区分泛型 Array<T> 与比较 a < b：
+                // 如果 < 后是类型关键字，视为泛型（返回 None，不当作比较）
+                // 如果 < 后是 Ident，再看其后第三个 token 是否 > 或 , （泛型上下文）
+                let next = self.peek_next();
+                let is_type_keyword = matches!(next, Some(Token::TypeInt64 | Token::TypeInt32 | Token::TypeFloat64 | Token::TypeFloat32 | Token::TypeBool | Token::TypeString
+                    | Token::TypeInt8 | Token::TypeInt16 | Token::TypeUInt8 | Token::TypeUInt16 | Token::TypeUInt32 | Token::TypeUInt64 | Token::TypeChar));
+                let is_generic_ident = matches!(next, Some(Token::Ident(_)))
+                    && matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
+                if is_type_keyword || is_generic_ident {
                     None
                 } else {
                     Some(BinOp::Lt)
@@ -1176,12 +1255,13 @@ impl Parser {
         Ok(left)
     }
 
-    /// 解析移位 << >>
+    /// 解析移位 << >> >>>
     fn parse_shift(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_additive()?;
         while let Some(op) = match self.peek() {
             Some(Token::Shl) => Some(BinOp::Shl),
             Some(Token::Shr) => Some(BinOp::Shr),
+            Some(Token::UShr) => Some(BinOp::UShr),
             _ => None,
         } {
             self.advance();
@@ -1299,8 +1379,18 @@ impl Parser {
                     };
                 }
                 Some(Token::Dot) => {
-                    // 字段访问或方法调用
+                    // 字段访问、方法调用或元组索引
                     self.advance();
+                    // 检查是否为元组索引 (.0, .1, ...)
+                    if let Some(Token::Integer(n)) = self.peek() {
+                        let idx = *n as u32;
+                        self.advance();
+                        expr = Expr::TupleIndex {
+                            object: Box::new(expr),
+                            index: idx,
+                        };
+                        continue;
+                    }
                     let name = match self.advance() {
                         Some(Token::Ident(name)) => name,
                         Some(tok) => {
@@ -1400,6 +1490,7 @@ impl Parser {
                     ))
                 }
             }
+            Some(Token::CharLit(c)) => Ok(Expr::Char(c)),
             Some(Token::True) => Ok(Expr::Bool(true)),
             Some(Token::False) => Ok(Expr::Bool(false)),
             Some(Token::StringLit(s)) => self.parse_string_or_interpolated(s),
@@ -1453,27 +1544,36 @@ impl Parser {
             }
             Some(Token::Ident(name)) => {
                 // 仅当首字母大写时解析为枚举变体 (Color.Red)，否则 . 后续为字段/方法
+                // 变体名也必须首字母大写，避免将静态方法 Point.origin() 误解析
                 let looks_like_type = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
                 if looks_like_type && self.check(&Token::Dot) {
-                    if let Some(Token::Ident(_)) = self.peek_next() {
-                        self.advance();
-                        let variant = match self.advance() {
-                            Some(Token::Ident(v)) => v,
-                            _ => unreachable!(),
-                        };
-                        let arg = if self.check(&Token::LParen) {
+                    if let Some(Token::Ident(ref v)) = self.peek_next() {
+                        let variant_looks_like_type = v.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+                        if variant_looks_like_type {
                             self.advance();
-                            let e = self.parse_expr()?;
-                            self.expect(Token::RParen)?;
-                            Some(Box::new(e))
-                        } else {
-                            None
-                        };
-                        return Ok(Expr::VariantConst {
-                            enum_name: name,
-                            variant_name: variant,
-                            arg,
-                        });
+                            let variant = match self.advance() {
+                                Some(Token::Ident(v)) => v,
+                                _ => unreachable!(),
+                            };
+                            let arg = if self.check(&Token::LParen) {
+                                self.advance();
+                                if self.check(&Token::RParen) {
+                                    self.advance();
+                                    None
+                                } else {
+                                    let e = self.parse_expr()?;
+                                    self.expect(Token::RParen)?;
+                                    Some(Box::new(e))
+                                }
+                            } else {
+                                None
+                            };
+                            return Ok(Expr::VariantConst {
+                                enum_name: name,
+                                variant_name: variant,
+                                arg,
+                            });
+                        }
                     }
                 }
                 // 解析可选类型实参 (如 identity<Int64> 或 Pair<Int64,String>)
@@ -1491,7 +1591,8 @@ impl Parser {
                             Ok(Expr::Call { name, type_args, args })
                         }
                     }
-                    Some(Token::LBrace) => {
+                    Some(Token::LBrace) if looks_like_type => {
+                        // 仅对类型名（首字母大写）解析为结构体初始化
                         self.advance();
                         let fields = self.parse_struct_fields()?;
                         self.expect(Token::RBrace)?;
@@ -1504,13 +1605,13 @@ impl Parser {
                 // 检查是否是 Lambda: (x: T, ...) -> R { body } 或 () -> R { body }
                 // 通过检查 ) -> 或 ident : 来判断
                 if self.check(&Token::RParen) {
-                    // () -> R { body }
+                    // () -> R { body } 或空元组
                     self.advance(); // consume )
                     if self.check(&Token::Arrow) {
                         return self.parse_lambda_rest(vec![]);
                     }
-                    // 空括号但没有 ->，解析错误
-                    return self.bail(ParseError::UnexpectedToken(Token::RParen, "表达式".to_string()));
+                    // () 空元组
+                    return Ok(Expr::Tuple(vec![]));
                 }
                 // 检查是否是 (ident : 开头的 Lambda
                 if let Some(Token::Ident(_)) = self.peek() {
@@ -1521,10 +1622,28 @@ impl Parser {
                         return self.parse_lambda_rest(params);
                     }
                 }
-                // 普通括号表达式
-                let expr = self.parse_expr()?;
-                self.expect(Token::RParen)?;
-                Ok(expr)
+                // 解析第一个表达式
+                let first = self.parse_expr()?;
+                if self.check(&Token::Comma) {
+                    // 这是元组字面量 (a, b, ...)
+                    self.advance();
+                    let mut elements = vec![first];
+                    if !self.check(&Token::RParen) {
+                        loop {
+                            elements.push(self.parse_expr()?);
+                            if !self.check(&Token::Comma) {
+                                break;
+                            }
+                            self.advance();
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                    Ok(Expr::Tuple(elements))
+                } else {
+                    // 普通括号表达式
+                    self.expect(Token::RParen)?;
+                    Ok(first)
+                }
             }
             Some(Token::LBrace) => {
                 // 检查是否是 Lambda: { x: T => body }
@@ -1951,6 +2070,78 @@ impl Parser {
             Some(Token::Underscore) => {
                 self.advance();
                 Ok(Pattern::Wildcard)
+            }
+            // Some/None/Ok/Err 作为模式中的变体
+            Some(Token::Some) => {
+                self.advance();
+                let binding = if self.check(&Token::LParen) {
+                    self.advance();
+                    let b = match self.advance() {
+                        Some(Token::Ident(id)) => Some(id),
+                        Some(Token::Underscore) => None,
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "关联值绑定名".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    self.expect(Token::RParen)?;
+                    b
+                } else {
+                    None
+                };
+                Ok(Pattern::Variant {
+                    enum_name: "Option".to_string(),
+                    variant_name: "Some".to_string(),
+                    binding,
+                })
+            }
+            Some(Token::None) => {
+                self.advance();
+                Ok(Pattern::Variant {
+                    enum_name: "Option".to_string(),
+                    variant_name: "None".to_string(),
+                    binding: None,
+                })
+            }
+            Some(Token::Ok) => {
+                self.advance();
+                let binding = if self.check(&Token::LParen) {
+                    self.advance();
+                    let b = match self.advance() {
+                        Some(Token::Ident(id)) => Some(id),
+                        Some(Token::Underscore) => None,
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "关联值绑定名".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    self.expect(Token::RParen)?;
+                    b
+                } else {
+                    None
+                };
+                Ok(Pattern::Variant {
+                    enum_name: "Result".to_string(),
+                    variant_name: "Ok".to_string(),
+                    binding,
+                })
+            }
+            Some(Token::Err) => {
+                self.advance();
+                let binding = if self.check(&Token::LParen) {
+                    self.advance();
+                    let b = match self.advance() {
+                        Some(Token::Ident(id)) => Some(id),
+                        Some(Token::Underscore) => None,
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "关联值绑定名".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    self.expect(Token::RParen)?;
+                    b
+                } else {
+                    None
+                };
+                Ok(Pattern::Variant {
+                    enum_name: "Result".to_string(),
+                    variant_name: "Err".to_string(),
+                    binding,
+                })
             }
             Some(Token::Integer(n)) => {
                 let n = *n;

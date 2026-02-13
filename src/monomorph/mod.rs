@@ -7,14 +7,22 @@ use crate::ast::Type;
 /// 类型实参到名字修饰后缀
 fn type_mangle_suffix(ty: &Type) -> String {
     match ty {
+        Type::Int8 => "Int8".to_string(),
+        Type::Int16 => "Int16".to_string(),
         Type::Int32 => "Int32".to_string(),
         Type::Int64 => "Int64".to_string(),
+        Type::UInt8 => "UInt8".to_string(),
+        Type::UInt16 => "UInt16".to_string(),
+        Type::UInt32 => "UInt32".to_string(),
+        Type::UInt64 => "UInt64".to_string(),
         Type::Float32 => "Float32".to_string(),
         Type::Float64 => "Float64".to_string(),
         Type::Bool => "Bool".to_string(),
+        Type::Char => "Char".to_string(),
         Type::Unit => "Unit".to_string(),
         Type::String => "String".to_string(),
         Type::Array(inner) => format!("Array_{}", type_mangle_suffix(inner)),
+        Type::Tuple(types) => format!("Tuple_{}", types.iter().map(type_mangle_suffix).collect::<Vec<_>>().join("_")),
         Type::Struct(s, args) => {
             if args.is_empty() {
                 s.clone()
@@ -77,6 +85,7 @@ fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             .cloned()
             .unwrap_or_else(|| ty.clone()),
         Type::Array(inner) => Type::Array(Box::new(substitute_type(inner, subst))),
+        Type::Tuple(types) => Type::Tuple(types.iter().map(|t| substitute_type(t, subst)).collect()),
         Type::Struct(name, args) => Type::Struct(
             name.clone(),
             args.iter().map(|t| substitute_type(t, subst)).collect(),
@@ -305,6 +314,21 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .map(|s| substitute_stmt(s, subst, rewrites))
                 .collect(),
         },
+        Tuple(elems) => Tuple(
+            elems
+                .into_iter()
+                .map(|e| substitute_expr(e, subst, rewrites))
+                .collect(),
+        ),
+        TupleIndex { object, index } => TupleIndex {
+            object: Box::new(substitute_expr(*object, subst, rewrites)),
+            index,
+        },
+        NullCoalesce { option, default } => NullCoalesce {
+            option: Box::new(substitute_expr(*option, subst, rewrites)),
+            default: Box::new(substitute_expr(*default, subst, rewrites)),
+        },
+        Char(c) => Char(c),
         Var(n) => Var(n),
         Integer(i) => Integer(i),
         Float(f) => Float(f),
@@ -322,8 +346,8 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 })
                 .collect(),
         ),
-        Unit => Unit,
         Expr::None => Expr::None,
+        e => e,
     }
 }
 
@@ -594,6 +618,12 @@ impl AstWalk for Expr {
                 }
             }
             Array(elems) => elems.iter().for_each(|a| a.walk(f)),
+            Tuple(elems) => elems.iter().for_each(|a| a.walk(f)),
+            TupleIndex { object, .. } => object.walk(f),
+            NullCoalesce { option, default } => {
+                option.walk(f);
+                default.walk(f);
+            }
             Interpolate(parts) => {
                 for p in parts {
                     if let crate::ast::InterpolatePart::Expr(ref e) = p {

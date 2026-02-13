@@ -3,11 +3,18 @@ use wasm_encoder::ValType;
 /// 仓颉语言类型
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
+    Int8,
+    Int16,
     Int32,
     Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
     Float32,
     Float64,
     Bool,
+    Char,
     Unit,
     /// 字符串类型 (指针, 在内存中存储)
     String,
@@ -15,6 +22,8 @@ pub enum Type {
     Array(Box<Type>),
     /// 结构体类型 (可选类型实参，如 Point 或 Pair<Int64,String>)
     Struct(String, Vec<Type>),
+    /// 元组类型 (T1, T2, ...)
+    Tuple(Vec<Type>),
     /// 范围类型 (start..end 或 start..=end)
     /// 内存布局: [start: i64][end: i64][inclusive: i32] = 20 bytes
     Range,
@@ -36,15 +45,23 @@ impl Type {
     /// 转换为 WASM 值类型
     pub fn to_wasm(&self) -> ValType {
         match self {
+            Type::Int8 => ValType::I32,   // 小整数映射为 i32
+            Type::Int16 => ValType::I32,
             Type::Int32 => ValType::I32,
             Type::Int64 => ValType::I64,
+            Type::UInt8 => ValType::I32,   // 无符号小整数映射为 i32
+            Type::UInt16 => ValType::I32,
+            Type::UInt32 => ValType::I32,
+            Type::UInt64 => ValType::I64,  // UInt64 映射为 i64
             Type::Float32 => ValType::F32,
             Type::Float64 => ValType::F64,
             Type::Bool => ValType::I32,
+            Type::Char => ValType::I32,    // Unicode code point 映射为 i32
             Type::Unit => panic!("Unit 类型不能转换为 WASM 值类型"),
             // 复合类型都用 i32 指针表示
             Type::String => ValType::I32,
             Type::Array(_) => ValType::I32,
+            Type::Tuple(_) => ValType::I32,  // 堆指针
             Type::Struct(..) => ValType::I32,
             Type::Range => ValType::I32,    // 指针
             Type::Function { .. } => ValType::I32, // 函数表索引
@@ -57,13 +74,16 @@ impl Type {
     /// 获取类型在内存中的大小 (字节)
     pub fn size(&self) -> u32 {
         match self {
-            Type::Int32 | Type::Bool => 4,
-            Type::Int64 => 8,
+            Type::Int8 | Type::UInt8 => 1,
+            Type::Int16 | Type::UInt16 => 2,
+            Type::Int32 | Type::UInt32 | Type::Bool | Type::Char => 4,
+            Type::Int64 | Type::UInt64 => 8,
             Type::Float32 => 4,
             Type::Float64 => 8,
             Type::Unit => 0,
             Type::String => 4,      // 指针大小
             Type::Array(_) => 4,    // 指针大小
+            Type::Tuple(_) => 4,    // 指针大小
             Type::Struct(..) => 4,   // 指针大小
             Type::Range => 4,       // 指针大小
             Type::Function { .. } => 4, // 函数表索引大小
@@ -110,6 +130,7 @@ pub enum BinOp {
     BitXor,      // ^
     Shl,         // <<
     Shr,         // >>
+    UShr,        // >>>
 }
 
 /// 字符串插值的部分
@@ -132,6 +153,8 @@ pub enum Expr {
     Float32(f32),
     /// 布尔字面量
     Bool(bool),
+    /// 字符字面量 (Unicode code point)
+    Char(char),
     /// 字符串字面量
     String(String),
     /// 字符串插值 "Hello, ${name}!"
@@ -182,6 +205,13 @@ pub enum Expr {
     },
     /// 代码块
     Block(Vec<Stmt>, Option<Box<Expr>>),
+    /// 元组字面量 (a, b, c)
+    Tuple(Vec<Expr>),
+    /// 元组索引访问 tuple.0, tuple.1
+    TupleIndex {
+        object: Box<Expr>,
+        index: u32,
+    },
     /// 数组字面量 [1, 2, 3]
     Array(Vec<Expr>),
     /// 数组访问 arr[index]
@@ -243,6 +273,11 @@ pub enum Expr {
     Ok(Box<Expr>),
     /// Err(value) 表达式
     Err(Box<Expr>),
+    /// 空值合并: a ?? b，若 a 为 Some(v) 则返回 v，否则返回 b
+    NullCoalesce {
+        option: Box<Expr>,
+        default: Box<Expr>,
+    },
     /// ? 运算符 (expr?)，若为 Err/None 则提前返回
     Try(Box<Expr>),
     /// throw 表达式
@@ -536,6 +571,8 @@ pub enum Visibility {
     #[default]
     Private,
     Public,
+    /// 模块内可见
+    Internal,
 }
 
 /// 导入项
