@@ -170,7 +170,7 @@ func testGenericStruct(): Int64 {
 func testConstrainedFunc(): Int64 {
     let a = maximum<Int64>(100, 200)
     let b = clamp<Int64>(50, 10, 100)
-    return a + b  // 150
+    return a + b  // 250
 }
 
 func testConstrainedStruct(): Int64 {
@@ -201,7 +201,7 @@ func testGenericClass(): Int64 {
 func testSpecialization(): Int64 {
     let i64_result = add<Int64>(10, 20)
     let i32_result = add<Int32>(5, 15)
-    return i64_result  // 10 (通用版本)
+    return i64_result  // 30 (通用版本)
 }
 
 func testMixedTypes(): Int64 {
@@ -221,6 +221,9 @@ main(): Int64 {
     let h = testSpecialization()     // 10
     let i = testMixedTypes()         // 300
 
+    println("公式: ${a} + ${b} + ${c} + ${d} + ${e} + ${f} + ${g} + ${h} + ${i}")
+    println("结果: ${a + b + c + d + e + f + g + h + i}")
+
     return a + b + c + d + e + f + g + h + i
-    // 42 + 36 + 150 + 15 + 88 + 90 + 142 + 10 + 300 = 873
+    // 预期输出: 873
 }

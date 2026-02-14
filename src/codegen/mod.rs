@@ -1523,111 +1523,230 @@ impl CodeGen {
     }
 
     /// 生成 __i64_to_str(val: i64) -> i32 辅助函数
-    /// 简化实现：将数字转为字符串（支持负数）
+    /// 将 i64 值转换为十进制字符串，返回堆上字符串指针 [len: i32][bytes...]
+    /// 使用 I/O 缓冲区 (地址 0-63) 作为临时空间，然后 alloc + memory.copy
     fn emit_i64_to_str(&self) -> WasmFunc {
-        // 局部变量: 0=val(i64 参数), 1=ptr(i32), 2..7=临时(i64)
-        let mut f = WasmFunc::new(vec![(1, ValType::I32), (6, ValType::I64)]);
-
-        // 简化：对于任何数字，返回固定字符串 "[number]"
-        // 完整实现需要复杂的数字到字符串转换
-        // 这里使用简化版本，返回堆上的占位符
-
-        // Phase 8: 使用 __alloc 分配空间
         let alloc_idx = self.func_indices["__alloc"];
-        f.instruction(&Instruction::I32Const(12)); // 4 + 8 bytes
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset, align, memory_index: 0,
+        };
+        // 参数: local 0 = val (i64)
+        // 局部变量: local 1 = pos (i32), local 2 = is_neg (i32), local 3 = len (i32), local 4 = ptr (i32)
+        let mut f = WasmFunc::new(vec![
+            (1, ValType::I32), // pos
+            (1, ValType::I32), // is_neg
+            (1, ValType::I32), // len
+            (1, ValType::I32), // ptr
+        ]);
+
+        // pos = 23 (缓冲区末尾)
+        f.instruction(&Instruction::I32Const(23));
+        f.instruction(&Instruction::LocalSet(1));
+
+        // if value == 0
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // pos = 22, buf[22] = '0'
+            f.instruction(&Instruction::I32Const(22));
+            f.instruction(&Instruction::LocalSet(1));
+            f.instruction(&Instruction::I32Const(22));
+            f.instruction(&Instruction::I32Const(48));
+            f.instruction(&Instruction::I32Store8(mem(0, 0)));
+        }
+        f.instruction(&Instruction::Else);
+        {
+            // is_neg = (val < 0)
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64Const(0));
+            f.instruction(&Instruction::I64LtS);
+            f.instruction(&Instruction::LocalSet(2));
+
+            // if is_neg: val = 0 - val
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::I64Const(0));
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64Sub);
+            f.instruction(&Instruction::LocalSet(0));
+            f.instruction(&Instruction::End);
+
+            // while val > 0
+            f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64Eqz);
+            f.instruction(&Instruction::BrIf(1));
+
+            // pos--
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalSet(1));
+
+            // buf[pos] = (val %u 10) + '0'
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64Const(10));
+            f.instruction(&Instruction::I64RemU);
+            f.instruction(&Instruction::I32WrapI64);
+            f.instruction(&Instruction::I32Const(48));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::I32Store8(mem(0, 0)));
+
+            // val = val /u 10
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64Const(10));
+            f.instruction(&Instruction::I64DivU);
+            f.instruction(&Instruction::LocalSet(0));
+
+            f.instruction(&Instruction::Br(0));
+            f.instruction(&Instruction::End); // end loop
+            f.instruction(&Instruction::End); // end block
+
+            // if is_neg: prepend '-'
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalSet(1));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(45)); // '-'
+            f.instruction(&Instruction::I32Store8(mem(0, 0)));
+            f.instruction(&Instruction::End);
+        }
+        f.instruction(&Instruction::End); // end if val == 0
+
+        // len = 23 - pos (数字字符串在 buf[pos..23) 中，位置 23 不含)
+        f.instruction(&Instruction::I32Const(23));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(3));
+
+        // ptr = __alloc(len + 4)
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::Call(alloc_idx));
-        f.instruction(&Instruction::LocalSet(1)); // ptr
+        f.instruction(&Instruction::LocalSet(4));
 
-        // mem[ptr] = 8 (length)
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Const(8));
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        // mem[ptr] = len
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
 
-        // 写入 "[number]" 字符串
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I64Const(0x5D7265626D756E5B)); // "[number]" as i64 little endian
-        f.instruction(&Instruction::I64Store(wasm_encoder::MemArg { offset: 4, align: 3, memory_index: 0 }));
+        // memory.copy(ptr + 4, pos, len)  — 将 buf[pos..pos+len] 复制到 ptr+4
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);  // dst = ptr + 4
+        f.instruction(&Instruction::LocalGet(1)); // src = pos
+        f.instruction(&Instruction::LocalGet(3)); // len
+        f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
 
-        f.instruction(&Instruction::LocalGet(1));
+        // return ptr
+        f.instruction(&Instruction::LocalGet(4));
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
         f
     }
 
     /// 生成 __i32_to_str(val: i32) -> i32 辅助函数
+    /// 将 i32 值扩展为 i64 后调用 __i64_to_str
     fn emit_i32_to_str(&self) -> WasmFunc {
-        let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
-
-        // Phase 8: 使用 __alloc 分配
-        let alloc_idx = self.func_indices["__alloc"];
-        f.instruction(&Instruction::I32Const(12));
-        f.instruction(&Instruction::Call(alloc_idx));
-        f.instruction(&Instruction::LocalSet(1));
-
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Const(8));
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
-
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I64Const(0x5D7265626D756E5B));
-        f.instruction(&Instruction::I64Store(wasm_encoder::MemArg { offset: 4, align: 3, memory_index: 0 }));
-
-        f.instruction(&Instruction::LocalGet(1));
+        let i64_to_str_idx = self.func_indices["__i64_to_str"];
+        let mut f = WasmFunc::new(vec![]);
+        // i32 -> i64 (符号扩展) -> __i64_to_str
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64ExtendI32S);
+        f.instruction(&Instruction::Call(i64_to_str_idx));
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
         f
     }
 
     /// 生成 __f64_to_str(val: f64) -> i32 辅助函数
+    /// 简化实现：输出整数部分 + "." + 小数部分（最多 6 位）
+    /// 使用 I/O 缓冲区 (地址 32-63) 作为临时空间
     fn emit_f64_to_str(&self) -> WasmFunc {
-        let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
-
-        // Phase 8: 使用 __alloc 分配
         let alloc_idx = self.func_indices["__alloc"];
-        f.instruction(&Instruction::I32Const(11));
+        let i64_to_str_idx = self.func_indices["__i64_to_str"];
+        let str_concat_idx = self.func_indices["__str_concat"];
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset, align, memory_index: 0,
+        };
+        // 参数: local 0 = val (f64)
+        // 局部变量: local 1 = int_str (i32), local 2 = frac_str (i32),
+        //          local 3 = result (i32), local 4 = frac_val (i64),
+        //          local 5 = dot_str (i32), local 6 = is_neg (i32)
+        let mut f = WasmFunc::new(vec![
+            (1, ValType::I32), (1, ValType::I32), (1, ValType::I32),
+            (1, ValType::I64), (1, ValType::I32), (1, ValType::I32),
+        ]);
+
+        // 整数部分字符串: __i64_to_str(trunc(val))
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64TruncF64S);
+        f.instruction(&Instruction::Call(i64_to_str_idx));
+        f.instruction(&Instruction::LocalSet(1)); // int_str
+
+        // 创建 "." 字符串: alloc(5), len=1, byte='.'
+        f.instruction(&Instruction::I32Const(5));
         f.instruction(&Instruction::Call(alloc_idx));
-        f.instruction(&Instruction::LocalSet(1));
+        f.instruction(&Instruction::LocalSet(5)); // dot_str
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Const(46)); // '.'
+        f.instruction(&Instruction::I32Store8(mem(4, 0)));
 
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Const(7));
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        // 小数部分: frac = abs((val - trunc(val)) * 1000000) 取整后得到6位小数
+        // is_neg = val < 0.0
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Const(0.0));
+        f.instruction(&Instruction::F64Lt);
+        f.instruction(&Instruction::LocalSet(6));
 
-        // "[float]" = 0x5D74616F6C665B (7 bytes)
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Const(0x6F6C665B)); // "[flo"
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 4, align: 2, memory_index: 0 }));
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Const(0x005D7461)); // "at]"
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 7, align: 0, memory_index: 0 }));
+        // frac_f = val - trunc(val), 然后取绝对值
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Trunc);
+        f.instruction(&Instruction::F64Sub);
+        f.instruction(&Instruction::F64Abs);
+        f.instruction(&Instruction::F64Const(1000000.0));
+        f.instruction(&Instruction::F64Mul);
+        f.instruction(&Instruction::F64Nearest); // 四舍五入
+        f.instruction(&Instruction::I64TruncF64U);
+        f.instruction(&Instruction::LocalSet(4)); // frac_val
 
+        // frac_str = __i64_to_str(frac_val)
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::Call(i64_to_str_idx));
+        f.instruction(&Instruction::LocalSet(2)); // frac_str
+
+        // result = __str_concat(int_str, dot_str)
         f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Call(str_concat_idx));
+        // result = __str_concat(result, frac_str)
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::Call(str_concat_idx));
+
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
         f
     }
 
     /// 生成 __f32_to_str(val: f32) -> i32 辅助函数
+    /// 提升为 f64 后调用 __f64_to_str
     fn emit_f32_to_str(&self) -> WasmFunc {
-        let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
-
-        // Phase 8: 使用 __alloc 分配
-        let alloc_idx = self.func_indices["__alloc"];
-        f.instruction(&Instruction::I32Const(11));
-        f.instruction(&Instruction::Call(alloc_idx));
-        f.instruction(&Instruction::LocalSet(1));
-
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Const(7));
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
-
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Const(0x6F6C665B));
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 4, align: 2, memory_index: 0 }));
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Const(0x005D7461));
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 7, align: 0, memory_index: 0 }));
-
-        f.instruction(&Instruction::LocalGet(1));
+        let f64_to_str_idx = self.func_indices["__f64_to_str"];
+        let mut f = WasmFunc::new(vec![]);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64PromoteF32);
+        f.instruction(&Instruction::Call(f64_to_str_idx));
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
         f
@@ -2568,8 +2687,15 @@ impl CodeGen {
             Expr::IfLet { then_branch, .. } => self.infer_ast_type_with_locals(then_branch, locals),
             Expr::Field { object, field, .. } => {
                 self.infer_ast_type_with_locals(object, locals).and_then(|ty| {
-                    if let Type::Struct(s, _) = ty {
-                        self.structs.get(&s).and_then(|def| {
+                    if let Type::Struct(s, ref type_args) = ty {
+                        // 泛型类型需要查找修饰后的名字
+                        let lookup_name = if !type_args.is_empty() {
+                            let mangled = crate::monomorph::mangle_name(&s, type_args);
+                            if self.structs.contains_key(&mangled) { mangled } else { s }
+                        } else {
+                            s
+                        };
+                        self.structs.get(&lookup_name).and_then(|def| {
                             def.fields.iter().find(|f| f.name == *field).map(|f| f.ty.clone())
                         })
                     } else {
@@ -2935,14 +3061,25 @@ impl CodeGen {
                         let (offset, field_ty) = locals
                             .get_type(object)
                             .and_then(|ty| match ty {
-                                Type::Struct(name, _) => {
+                                Type::Struct(name, type_args) => {
+                                    // 泛型类型需要查找修饰后的名字
+                                    let lookup_name = if !type_args.is_empty() {
+                                        let mangled = crate::monomorph::mangle_name(name, type_args);
+                                        if self.classes.contains_key(&mangled) || self.structs.contains_key(&mangled) {
+                                            mangled
+                                        } else {
+                                            name.clone()
+                                        }
+                                    } else {
+                                        name.clone()
+                                    };
                                     // 优先从 ClassInfo 获取偏移（包含 vtable header）
-                                    if let Some(ci) = self.classes.get(name) {
+                                    if let Some(ci) = self.classes.get(&lookup_name) {
                                         let off = ci.field_offset(field)?;
                                         let ft = ci.field_type(field)?.clone();
                                         Some((off, ft))
                                     } else {
-                                        self.structs.get(name).and_then(|def| {
+                                        self.structs.get(&lookup_name).and_then(|def| {
                                             let off = def.field_offset(field)?;
                                             let ft = def.field_type(field)?.clone();
                                             Some((off, ft))
@@ -3344,7 +3481,7 @@ impl CodeGen {
                             // 编译表达式
                             self.compile_expr(expr, locals, func, loop_ctx);
                             // 将值转换为字符串（调用 __to_string_TYPE 运行时函数）
-                            let expr_type = self.infer_ast_type(expr);
+                            let expr_type = self.infer_ast_type_with_locals(expr, locals);
                             match expr_type.as_ref() {
                                 Some(Type::Int64) => {
                                     func.instruction(&Instruction::Call(
@@ -4343,14 +4480,25 @@ impl CodeGen {
                 let (offset, field_ty) = self
                     .get_object_type(object, locals)
                     .and_then(|ty| match ty {
-                        Type::Struct(ref name, _) => {
+                        Type::Struct(ref name, ref type_args) => {
+                            // 泛型类型需要查找修饰后的名字，如 Stack + [Int64] → Stack$Int64
+                            let lookup_name = if !type_args.is_empty() {
+                                let mangled = crate::monomorph::mangle_name(name, type_args);
+                                if self.classes.contains_key(&mangled) || self.structs.contains_key(&mangled) {
+                                    mangled
+                                } else {
+                                    name.clone()
+                                }
+                            } else {
+                                name.clone()
+                            };
                             // 优先从 ClassInfo 获取偏移（包含 vtable header）
-                            if let Some(ci) = self.classes.get(name) {
+                            if let Some(ci) = self.classes.get(&lookup_name) {
                                 let off = ci.field_offset(field)?;
                                 let ft = ci.field_type(field)?.clone();
                                 Some((off, ft))
                             } else {
-                                self.structs.get(name).and_then(|def| {
+                                self.structs.get(&lookup_name).and_then(|def| {
                                     let off = def.field_offset(field)?;
                                     let ft = def.field_type(field)?.clone();
                                     Some((off, ft))
