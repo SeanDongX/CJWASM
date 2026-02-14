@@ -22,11 +22,11 @@ func floatLiterals() : Float64 {
     return f64 + neg
 }
 
-// Float32 类型 (cjc 不支持 f 后缀，使用 as Float32 转换)
+// Float32 类型 (cjc: as 返回 Option，使用 Float32(x) 构造函数)
 func float32Literals() : Float32 {
-    let f1: Float32 = 3.14 as Float32   // Float32
-    let f2 = 2.718 as Float32           // Float32
-    let f3 = 1.0e5 as Float32          // 科学计数法 Float32
+    let f1: Float32 = Float32(3.14)     // Float32
+    let f2 = Float32(2.718)             // Float32
+    let f3 = Float32(1.0e5)             // 科学计数法 Float32
 
     return f1 + f2 + f3
 }
@@ -58,12 +58,12 @@ func binaryOperations() : Int64 {
 func typeAnnotations() : Int64 {
     let a: Int32 = 42
     let b: Int64 = 100
-    let c: Float32 = 3.14 as Float32
+    let c: Float32 = Float32(3.14)
     let d: Float64 = 2.718
     let e: Bool = true
 
-    // 类型转换
-    let sum = (a as Int64) + b + (e as Int64)
+    // 类型转换 (cjc: as 返回 Option，使用 Int64(x) 和 if 代替)
+    let sum = Int64(a) + b + (if (e) { 1 } else { 0 })
     return sum  // 42 + 100 + 1 = 143
 }
 

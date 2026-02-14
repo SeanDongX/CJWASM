@@ -1,20 +1,24 @@
 use wasm_encoder::ValType;
 
-/// 仓颉语言类型
+/// 仓颉语言类型 (与 cjc release/1.0 对齐)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Int8,
     Int16,
     Int32,
     Int64,
+    IntNative,
     UInt8,
     UInt16,
     UInt32,
     UInt64,
+    UIntNative,
+    Float16,
     Float32,
     Float64,
+    Rune,
     Bool,
-    Char,
+    Nothing,
     Unit,
     /// 字符串类型 (指针, 在内存中存储)
     String,
@@ -53,14 +57,18 @@ impl Type {
             Type::Int16 => ValType::I32,
             Type::Int32 => ValType::I32,
             Type::Int64 => ValType::I64,
+            Type::IntNative => ValType::I64,  // Native 整数映射为 i64
             Type::UInt8 => ValType::I32,   // 无符号小整数映射为 i32
             Type::UInt16 => ValType::I32,
             Type::UInt32 => ValType::I32,
             Type::UInt64 => ValType::I64,  // UInt64 映射为 i64
+            Type::UIntNative => ValType::I64, // Native 无符号映射为 i64
+            Type::Float16 => ValType::F32,  // Float16 用 f32 模拟
             Type::Float32 => ValType::F32,
             Type::Float64 => ValType::F64,
+            Type::Rune => ValType::I32,    // Unicode code point 映射为 i32
             Type::Bool => ValType::I32,
-            Type::Char => ValType::I32,    // Unicode code point 映射为 i32
+            Type::Nothing => panic!("Nothing 类型不能转换为 WASM 值类型"),
             Type::Unit => panic!("Unit 类型不能转换为 WASM 值类型"),
             // 复合类型都用 i32 指针表示
             Type::String => ValType::I32,
@@ -82,10 +90,12 @@ impl Type {
         match self {
             Type::Int8 | Type::UInt8 => 1,
             Type::Int16 | Type::UInt16 => 2,
-            Type::Int32 | Type::UInt32 | Type::Bool | Type::Char => 4,
-            Type::Int64 | Type::UInt64 => 8,
+            Type::Int32 | Type::UInt32 | Type::Bool | Type::Rune => 4,
+            Type::Int64 | Type::UInt64 | Type::IntNative | Type::UIntNative => 8,
+            Type::Float16 => 2,
             Type::Float32 => 4,
             Type::Float64 => 8,
+            Type::Nothing => 0,
             Type::Unit => 0,
             Type::String => 4,      // 指针大小
             Type::Array(_) => 4,    // 指针大小
@@ -126,7 +136,7 @@ mod tests {
         assert_eq!(Type::Float32.to_wasm(), ValType::F32);
         assert_eq!(Type::Float64.to_wasm(), ValType::F64);
         assert_eq!(Type::Bool.to_wasm(), ValType::I32);
-        assert_eq!(Type::Char.to_wasm(), ValType::I32);
+        assert_eq!(Type::Rune.to_wasm(), ValType::I32);
         assert_eq!(Type::String.to_wasm(), ValType::I32);
         assert_eq!(Type::Array(Box::new(Type::Int64)).to_wasm(), ValType::I32);
         assert_eq!(Type::Tuple(vec![Type::Int64, Type::Int64]).to_wasm(), ValType::I32);
@@ -137,6 +147,12 @@ mod tests {
         assert_eq!(Type::Result(Box::new(Type::Int64), Box::new(Type::String)).to_wasm(), ValType::I32);
         assert_eq!(Type::Slice(Box::new(Type::Int64)).to_wasm(), ValType::I32);
         assert_eq!(Type::Map(Box::new(Type::String), Box::new(Type::Int64)).to_wasm(), ValType::I32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Nothing 类型不能转换为 WASM")]
+    fn test_to_wasm_nothing_panic() {
+        Type::Nothing.to_wasm();
     }
 
     #[test]
@@ -160,7 +176,7 @@ mod tests {
         assert_eq!(Type::Int32.size(), 4);
         assert_eq!(Type::UInt32.size(), 4);
         assert_eq!(Type::Bool.size(), 4);
-        assert_eq!(Type::Char.size(), 4);
+        assert_eq!(Type::Rune.size(), 4);
         assert_eq!(Type::Int64.size(), 8);
         assert_eq!(Type::UInt64.size(), 8);
         assert_eq!(Type::Float32.size(), 4);
@@ -198,7 +214,7 @@ pub enum UnaryOp {
     BitNot,  // ~ 按位取反
 }
 
-/// 二元运算符
+/// 二元运算符 (与 cjc release/1.0 对齐, 移除 >>>)
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinOp {
     Add,    // +
@@ -220,7 +236,6 @@ pub enum BinOp {
     BitXor,      // ^
     Shl,         // <<
     Shr,         // >>
-    UShr,        // >>>
 }
 
 /// 字符串插值的部分
@@ -243,8 +258,8 @@ pub enum Expr {
     Float32(f32),
     /// 布尔字面量
     Bool(bool),
-    /// 字符字面量 (Unicode code point)
-    Char(char),
+    /// Rune 字面量 (Unicode code point, cjc: Rune)
+    Rune(char),
     /// 字符串字面量
     String(String),
     /// 字符串插值 "Hello, ${name}!"
@@ -440,7 +455,7 @@ pub enum Literal {
     Float(f64),
     Bool(bool),
     String(String),
-    Char(char),
+    Rune(char),
 }
 
 /// 语句
@@ -733,14 +748,15 @@ impl EnumDef {
     }
 }
 
-/// 可见性修饰符
+/// 可见性修饰符 (与 cjc release/1.0 对齐)
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Visibility {
     #[default]
-    Private,
-    Public,
-    /// 模块内可见
     Internal,
+    Public,
+    Private,
+    /// 子类可见
+    Protected,
 }
 
 /// 导入项
@@ -754,11 +770,11 @@ pub struct Import {
     pub alias: Option<String>,
 }
 
-/// 程序 (模块)
+/// 程序 (包, 与 cjc release/1.0 对齐)
 #[derive(Debug, Clone)]
 pub struct Program {
-    /// 模块名称，None 表示主模块
-    pub module_name: Option<String>,
+    /// 包名称，None 表示主包 (cjc: package)
+    pub package_name: Option<String>,
     /// 导入列表
     pub imports: Vec<Import>,
     pub structs: Vec<StructDef>,

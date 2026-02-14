@@ -10,31 +10,44 @@ func bitOperations(a: Int64, b: Int64): Int64 {
     return and + or + xor + shl + shr
 }
 
-// 幂运算
+// 幂运算 (cjc 不支持 **，使用自定义 pow)
+func pow(base: Int64, exp: Int64): Int64 {
+    if (exp <= 0) { return 1 }
+    var result: Int64 = 1
+    var b: Int64 = base
+    var e: Int64 = exp
+    while (e > 0) {
+        if (e % 2 == 1) { result = result * b }
+        b = b * b
+        e = e / 2
+    }
+    return result
+}
+
 func powerTest(): Int64 {
-    let a = 2 ** 10      // 1024
-    let b = 3 ** 4       // 81
-    let c = 2 ** 3 ** 2  // 右结合: 2 ** (3 ** 2) = 2 ** 9 = 512
+    let a = pow(2, 10)       // 1024
+    let b = pow(3, 4)        // 81
+    let c = pow(2, pow(3, 2))  // 右结合: 2 ** (3 ** 2) = 2 ** 9 = 512
     return a + b + c
 }
 
-// 类型转换
+// 类型转换 (cjc: as 返回 Option，使用 Int64/Float64 构造函数和 if)
 func typeConversion(): Int64 {
     let i: Int64 = 42
     let f: Float64 = 3.14
 
     // Int64 -> Float64
-    let toFloat = i as Float64
+    let toFloat = Float64(i)
 
     // Float64 -> Int64
-    let toInt = f as Int64      // 截断为 3
+    let toInt = Int64(f)       // 截断为 3
 
     // Int64 -> Int32
-    let small = i as Int32
+    let small = Int32(i)
 
     // Bool 转换
     let b = true
-    let boolToInt = b as Int64  // 1
+    let boolToInt = if (b) { 1 } else { 0 }  // 1
 
     return toInt + boolToInt
 }

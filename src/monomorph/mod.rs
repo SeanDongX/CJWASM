@@ -18,7 +18,11 @@ fn type_mangle_suffix(ty: &Type) -> String {
         Type::Float32 => "Float32".to_string(),
         Type::Float64 => "Float64".to_string(),
         Type::Bool => "Bool".to_string(),
-        Type::Char => "Char".to_string(),
+        Type::Rune => "Rune".to_string(),
+        Type::IntNative => "IntNative".to_string(),
+        Type::UIntNative => "UIntNative".to_string(),
+        Type::Float16 => "Float16".to_string(),
+        Type::Nothing => "Nothing".to_string(),
         Type::Unit => "Unit".to_string(),
         Type::String => "String".to_string(),
         Type::Array(inner) => format!("Array_{}", type_mangle_suffix(inner)),
@@ -357,7 +361,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .map(|(k, v)| (substitute_expr(k, subst, rewrites), substitute_expr(v, subst, rewrites)))
                 .collect(),
         },
-        Char(c) => Char(c),
+        Rune(c) => Rune(c),
         Var(n) => Var(n),
         Integer(i) => Integer(i),
         Float(f) => Float(f),
@@ -902,7 +906,11 @@ fn check_constraints(
                 Type::Float32 => "Float32",
                 Type::Float64 => "Float64",
                 Type::Bool => "Bool",
-                Type::Char => "Char",
+                Type::Rune => "Rune",
+                Type::IntNative => "IntNative",
+                Type::UIntNative => "UIntNative",
+                Type::Float16 => "Float16",
+                Type::Nothing => "Nothing",
                 Type::String => "String",
                 Type::Struct(name, _) => name.as_str(),
                 _ => continue, // 复杂类型跳过约束检查
@@ -1280,7 +1288,7 @@ mod tests {
         assert_eq!(type_mangle_suffix(&Type::Float32), "Float32");
         assert_eq!(type_mangle_suffix(&Type::Float64), "Float64");
         assert_eq!(type_mangle_suffix(&Type::Bool), "Bool");
-        assert_eq!(type_mangle_suffix(&Type::Char), "Char");
+        assert_eq!(type_mangle_suffix(&Type::Rune), "Rune");
         assert_eq!(type_mangle_suffix(&Type::Unit), "Unit");
         assert_eq!(type_mangle_suffix(&Type::String), "String");
         assert_eq!(type_mangle_suffix(&Type::Range), "Range");
@@ -1335,7 +1343,7 @@ mod tests {
     #[test]
     fn test_monomorphize_empty_program() {
         let mut program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -1351,7 +1359,7 @@ mod tests {
     #[test]
     fn test_monomorphize_no_generics() {
         let mut program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],

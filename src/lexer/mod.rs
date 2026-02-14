@@ -238,14 +238,8 @@ pub enum Token {
     Interface,
     #[token("extend")]
     Extend,
-    #[token("extends")]
-    Extends,
-    #[token("implements")]
-    Implements,
     #[token("init")]
     Init,
-    #[token("deinit")]
-    Deinit,
     #[token("override")]
     Override,
     #[token("super")]
@@ -254,23 +248,25 @@ pub enum Token {
     Prop,
     #[token("mut")]
     Mut,
-    #[token("ref")]
-    Ref,
 
-    // 模块系统关键字
-    #[token("module")]
-    Module,
+    // 包/模块系统关键字 (cjc: package)
+    #[token("package")]
+    Package,
     #[token("import")]
     Import,
     #[token("public")]
     Public,
     #[token("private")]
     Private,
-    #[token("from")]
-    From,
+    #[token("protected")]
+    Protected,
+    #[token("internal")]
+    Internal,
 
     #[token("as")]
     As,
+    #[token("is")]
+    Is,
 
     #[token("this")]
     This,
@@ -282,16 +278,14 @@ pub enum Token {
     Catch,
     #[token("throw")]
     Throw,
-    #[token("throws")]
-    Throws,
     #[token("finally")]
     Finally,
-    #[token("extern")]
-    Extern,
+    #[token("foreign")]
+    Foreign,
     #[token("@")]
     At,
 
-    // Option/Result 关键字
+    // Option/Result 关键字 (cjwasm 扩展, cjc 中为普通标识符)
     #[token("Some")]
     Some,
     #[token("None")]
@@ -304,37 +298,80 @@ pub enum Token {
     #[token("_", priority = 3)]
     Underscore,
 
-    // 可见性
-    #[token("internal")]
-    Internal,
+    // cjc 额外关键字
+    #[token("const")]
+    Const,
+    #[token("static")]
+    Static,
+    #[token("redef")]
+    Redef,
+    #[token("operator")]
+    Operator,
+    #[token("unsafe")]
+    Unsafe,
+    #[token("do")]
+    Do,
+    #[token("case")]
+    Case,
+    #[token("where")]
+    Where,
+    #[token("type")]
+    TypeAlias,
+    #[token("main")]
+    Main,
+    #[token("spawn")]
+    Spawn,
+    #[token("synchronized")]
+    Synchronized,
+    #[token("macro")]
+    Macro,
+    #[token("quote")]
+    Quote,
+    #[token("inout")]
+    Inout,
+    #[token("with")]
+    With,
 
-    // 类型
-    #[token("Int64")]
-    TypeInt64,
-    #[token("Int32")]
-    TypeInt32,
-    #[token("Int16")]
-    TypeInt16,
+    // 类型 (与 cjc release/1.0 对齐)
     #[token("Int8")]
     TypeInt8,
-    #[token("UInt64")]
-    TypeUInt64,
-    #[token("UInt32")]
-    TypeUInt32,
-    #[token("UInt16")]
-    TypeUInt16,
+    #[token("Int16")]
+    TypeInt16,
+    #[token("Int32")]
+    TypeInt32,
+    #[token("Int64")]
+    TypeInt64,
+    #[token("IntNative")]
+    TypeIntNative,
     #[token("UInt8")]
     TypeUInt8,
-    #[token("Float64")]
-    TypeFloat64,
+    #[token("UInt16")]
+    TypeUInt16,
+    #[token("UInt32")]
+    TypeUInt32,
+    #[token("UInt64")]
+    TypeUInt64,
+    #[token("UIntNative")]
+    TypeUIntNative,
+    #[token("Float16")]
+    TypeFloat16,
     #[token("Float32")]
     TypeFloat32,
+    #[token("Float64")]
+    TypeFloat64,
+    #[token("Rune")]
+    TypeRune,
     #[token("Bool")]
     TypeBool,
-    #[token("Char")]
-    TypeChar,
+    #[token("Nothing")]
+    TypeNothing,
     #[token("Unit")]
     TypeUnit,
+    #[token("VArray")]
+    TypeVArray,
+    #[token("This", priority = 3)]
+    TypeThis,
+    // cjwasm 扩展类型关键字 (cjc 中为标准库标识符)
     #[token("String")]
     TypeString,
     #[token("Array")]
@@ -419,39 +456,35 @@ pub enum Token {
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
 
-    // 运算符
-    #[token("+")]
-    Plus,
-    #[token("-")]
-    Minus,
+    // 运算符 (与 cjc release/1.0 对齐)
     #[token("**")]
     StarStar,
     #[token("*")]
     Star,
-    #[token("/")]
-    Slash,
     #[token("%")]
     Percent,
-    #[token("=")]
-    Assign,
-    #[token("+=")]
-    PlusEq,
-    #[token("-=")]
-    MinusEq,
-    #[token("*=")]
-    StarEq,
-    #[token("/=")]
-    SlashEq,
-    #[token("%=")]
-    PercentEq,
-    #[token("==")]
-    Eq,
-    #[token("!=")]
-    NotEq,
+    #[token("/")]
+    Slash,
+    #[token("+")]
+    Plus,
+    #[token("-")]
+    Minus,
+    #[token("++")]
+    Incr,
+    #[token("--")]
+    Decr,
     #[token("&&")]
     AndAnd,
     #[token("||")]
     OrOr,
+    #[token("??")]
+    QuestionQuestion,
+    #[token("|>")]
+    Pipeline,
+    #[token("~>")]
+    Composition,
+    #[token("!")]
+    Bang,
     #[token("&")]
     And,
     #[token("|")]
@@ -462,16 +495,60 @@ pub enum Token {
     Tilde,
     #[token("<<")]
     Shl,
-    #[token(">>>")]
-    UShr,
     #[token(">>")]
     Shr,
-    #[token("!")]
-    Bang,
-    #[token("<:")]
-    SubType,
+    #[token("==")]
+    Eq,
+    #[token("!=")]
+    NotEq,
+    #[token("=")]
+    Assign,
+    #[token("+=")]
+    PlusEq,
+    #[token("-=")]
+    MinusEq,
+    #[token("*=")]
+    StarEq,
+    #[token("**=")]
+    StarStarEq,
+    #[token("/=")]
+    SlashEq,
+    #[token("%=")]
+    PercentEq,
+    #[token("&&=")]
+    AndAndEq,
+    #[token("||=")]
+    OrOrEq,
+    #[token("&=")]
+    AndEq,
+    #[token("|=")]
+    PipeEq,
+    #[token("^=")]
+    CaretEq,
+    #[token("<<=")]
+    ShlEq,
+    #[token(">>=")]
+    ShrEq,
+    #[token("->")]
+    Arrow,
     #[token("<-")]
     LeftArrow,
+    #[token("=>")]
+    FatArrow,
+    #[token("..")]
+    DotDot,
+    #[token("..=")]
+    DotDotEq,
+    #[token("...")]
+    DotDotDot,
+    #[token("#")]
+    Hash,
+    #[token("@!")]
+    AtExcl,
+    #[token("?")]
+    Question,
+    #[token("<:")]
+    SubType,
     #[token("<")]
     Lt,
     #[token(">")]
@@ -482,18 +559,6 @@ pub enum Token {
     GtEq,
     #[token(".")]
     Dot,
-    #[token("..")]
-    DotDot,
-    #[token("..=")]
-    DotDotEq,
-    #[token("...")]
-    DotDotDot,
-    #[token("=>")]
-    FatArrow,
-    #[token("??")]
-    QuestionQuestion,
-    #[token("?")]
-    Question,
 
     // 分隔符
     #[token("(")]
@@ -514,8 +579,8 @@ pub enum Token {
     Comma,
     #[token(";")]
     Semicolon,
-    #[token("->")]
-    Arrow,
+    #[token("$")]
+    Dollar,
 }
 
 pub struct Lexer<'a> {
@@ -786,20 +851,19 @@ mod tests {
 
     #[test]
     fn test_lexer_error_handling_tokens() {
-        // 确保 try, catch, throw, throws, finally tokens 正确识别
-        let source = "try catch throw throws finally";
+        // 确保 try, catch, throw, finally tokens 正确识别
+        let source = "try catch throw finally";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(tokens[0], Token::Try);
         assert_eq!(tokens[1], Token::Catch);
         assert_eq!(tokens[2], Token::Throw);
-        assert_eq!(tokens[3], Token::Throws);
-        assert_eq!(tokens[4], Token::Finally);
+        assert_eq!(tokens[3], Token::Finally);
     }
 
     #[test]
     fn test_lexer_type_tokens() {
-        let source = "Int8 Int16 Int32 Int64 UInt8 UInt16 UInt32 UInt64 Float32 Float64 Bool Char String Unit";
+        let source = "Int8 Int16 Int32 Int64 UInt8 UInt16 UInt32 UInt64 Float32 Float64 Bool Rune String Unit";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(tokens[0], Token::TypeInt8);
@@ -813,46 +877,46 @@ mod tests {
         assert_eq!(tokens[8], Token::TypeFloat32);
         assert_eq!(tokens[9], Token::TypeFloat64);
         assert_eq!(tokens[10], Token::TypeBool);
-        assert_eq!(tokens[11], Token::TypeChar);
+        assert_eq!(tokens[11], Token::TypeRune);
         assert_eq!(tokens[12], Token::TypeString);
         assert_eq!(tokens[13], Token::TypeUnit);
     }
 
     #[test]
     fn test_lexer_keyword_tokens() {
-        let source = "module import from as open abstract sealed override extend interface implements prop deinit";
+        let source = "package import as is open abstract sealed override extend interface prop foreign";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(tokens[0], Token::Module);
+        assert_eq!(tokens[0], Token::Package);
         assert_eq!(tokens[1], Token::Import);
-        assert_eq!(tokens[2], Token::From);
-        assert_eq!(tokens[3], Token::As);
+        assert_eq!(tokens[2], Token::As);
+        assert_eq!(tokens[3], Token::Is);
         assert_eq!(tokens[4], Token::Open);
         assert_eq!(tokens[5], Token::Abstract);
         assert_eq!(tokens[6], Token::Sealed);
         assert_eq!(tokens[7], Token::Override);
         assert_eq!(tokens[8], Token::Extend);
         assert_eq!(tokens[9], Token::Interface);
-        assert_eq!(tokens[10], Token::Implements);
-        assert_eq!(tokens[11], Token::Prop);
-        assert_eq!(tokens[12], Token::Deinit);
+        assert_eq!(tokens[10], Token::Prop);
+        assert_eq!(tokens[11], Token::Foreign);
     }
 
     #[test]
     fn test_lexer_operator_tokens() {
-        let source = "** ?? >>> << >> & | ^ ~ !";
+        let source = "** ?? |> ~> << >> & | ^ ~ !";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(tokens[0], Token::StarStar);
         assert_eq!(tokens[1], Token::QuestionQuestion);
-        assert_eq!(tokens[2], Token::UShr);
-        assert_eq!(tokens[3], Token::Shl);
-        assert_eq!(tokens[4], Token::Shr);
-        assert_eq!(tokens[5], Token::And);
-        assert_eq!(tokens[6], Token::Pipe);
-        assert_eq!(tokens[7], Token::Caret);
-        assert_eq!(tokens[8], Token::Tilde);
-        assert_eq!(tokens[9], Token::Bang);
+        assert_eq!(tokens[2], Token::Pipeline);
+        assert_eq!(tokens[3], Token::Composition);
+        assert_eq!(tokens[4], Token::Shl);
+        assert_eq!(tokens[5], Token::Shr);
+        assert_eq!(tokens[6], Token::And);
+        assert_eq!(tokens[7], Token::Pipe);
+        assert_eq!(tokens[8], Token::Caret);
+        assert_eq!(tokens[9], Token::Tilde);
+        assert_eq!(tokens[10], Token::Bang);
     }
 
     #[test]

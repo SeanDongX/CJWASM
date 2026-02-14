@@ -68,7 +68,7 @@ class Counter {
     }
 }
 
-// Resource 类 (cjc 不支持 deinit，已移除)
+// Resource 类 (cjc 使用 ~init 替代 deinit，已移除)
 class Resource {
     var id: Int64;
     init(id: Int64) {

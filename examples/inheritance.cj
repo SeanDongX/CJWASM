@@ -77,7 +77,7 @@ class Counter {
     }
 }
 
-// === 4. 带 deinit 析构函数的类 ===
+// === 4. 带 ~init 析构函数的类 ===
 class Resource {
     var id: Int64;
 

@@ -38,9 +38,13 @@
 | `UInt64` | 64位无符号整数 | i64 | [x] |
 | `Float32` | 32位浮点数 | f32 | [x] |
 | `Float64` | 64位浮点数 | f64 | [x] |
+| `Float16` | 16位浮点数 | f32 | [x] |
 | `Bool` | 布尔值 | i32 (0/1) | [x] |
-| `Char` | Unicode 字符 | i32 | [x] |
+| `Rune` | Unicode 字符 | i32 | [x] |
 | `Unit` | 空类型 | (无返回值) | [x] |
+| `Nothing` | 底类型（永不返回） | (无返回值) | [x] |
+| `IntNative` | 平台原生有符号整数 | i64 | [x] |
+| `UIntNative` | 平台原生无符号整数 | i64 | [x] |
 
 ### 1.2 复合类型
 
@@ -57,7 +61,9 @@
 | `Enum` | `enum Color {...}` | 枚举类型（含关联值如 Ok(T)/Err(E)） | [x] |
 | `Class` | `class Person {...}` | 类 | [x] |
 | `Interface` | `interface Drawable {...}` | 接口 | [x] |
+| `VArray<T, N>` | `VArray<Int64, 10>` | 固定长度值类型数组 | [x] |
 | `Function` | `(Int64) -> Int64` | 函数类型 | [x] |
+| `This` | `This` | 当前类型（接口/扩展中） | [x] |
 
 ### 1.3 类型修饰符
 
@@ -180,7 +186,6 @@ let map = {"a": 1, "b": 2}    // Map (语法糖)
 | `~` | 按位取反 | [x] |
 | `<<` | 左移 | [x] |
 | `>>` | 右移 | [x] |
-| `>>>` | 无符号右移 | [x] |
 
 ### 3.5 赋值运算
 
@@ -192,8 +197,25 @@ let map = {"a": 1, "b": 2}    // Map (语法糖)
 | `*=` | 乘法赋值 | [x] |
 | `/=` | 除法赋值 | [x] |
 | `%=` | 取模赋值 | [x] |
+| `**=` | 幂运算赋值 | [x] |
+| `&&=` | 逻辑与赋值 | [x] |
+| `\|\|=` | 逻辑或赋值 | [x] |
+| `&=` | 按位与赋值 | [x] |
+| `\|=` | 按位或赋值 | [x] |
+| `^=` | 按位异或赋值 | [x] |
+| `<<=` | 左移赋值 | [x] |
+| `>>=` | 右移赋值 | [x] |
 
-### 3.6 其他表达式
+### 3.6 自增/自减与管道运算
+
+| 运算符 | 描述 | 状态 |
+|--------|------|------|
+| `++` | 自增 | [x] |
+| `--` | 自减 | [x] |
+| `\|>` | 管道运算符 | [x] |
+| `~>` | 函数组合运算符 | [x] |
+
+### 3.7 其他表达式
 
 ```cangjie
 // 条件表达式
@@ -304,8 +326,8 @@ match value {
 ### 5.1 函数定义
 
 ```cangjie
-// 基本函数
-func add(a: Int64, b: Int64) -> Int64 {
+// 基本函数（cjc: 返回类型使用 : 而非 ->）
+func add(a: Int64, b: Int64): Int64 {
     return a + b
 }
 
@@ -315,18 +337,23 @@ func greet(name: String) {
 }
 
 // 默认参数
-func power(base: Int64, exp: Int64 = 2) -> Int64 {
+func power(base: Int64, exp: Int64 = 2): Int64 {
     // ...
 }
 
 // 可变参数
-func sum(numbers: Int64...) -> Int64 {
+func sum(numbers: Int64...): Int64 {
     // ...
 }
 
 // 泛型函数
-func identity<T>(value: T) -> T {
+func identity<T>(value: T): T {
     return value
+}
+
+// main 入口函数（cjc: 无需 func 关键字）
+main(): Int64 {
+    return 0
 }
 
 // Lambda 表达式
@@ -350,8 +377,8 @@ let triple = { x: Int64 => x * 3 }
 ### 5.2 函数重载
 
 ```cangjie
-func process(x: Int64) -> Int64 { ... }
-func process(x: String) -> String { ... }
+func process(x: Int64): Int64 { ... }
+func process(x: String): String { ... }
 ```
 
 | 功能 | 状态 |
@@ -366,20 +393,20 @@ func process(x: String) -> String { ... }
 
 ```cangjie
 struct Point {
-    x: Int64
-    y: Int64
+    var x: Int64;
+    var y: Int64;
 }
 
 // 带方法的结构体
 struct Rectangle {
-    width: Int64
-    height: Int64
+    var width: Int64;
+    var height: Int64;
 
-    func area() -> Int64 {
+    func area(): Int64 {
         return this.width * this.height
     }
 
-    static func square(size: Int64) -> Rectangle {
+    static func square(size: Int64): Rectangle {
         return Rectangle { width: size, height: size }
     }
 }
@@ -402,9 +429,10 @@ let r = Rectangle { width: 5, height: 10 }
 ### 6.2 类
 
 ```cangjie
-class Person {
-    private var name: String
-    private var age: Int64
+// cjc: 使用 open 允许继承，默认可见性为 internal
+open class Person {
+    private var name: String;
+    private var age: Int64;
 
     // 构造函数
     init(name: String, age: Int64) {
@@ -412,28 +440,28 @@ class Person {
         this.age = age
     }
 
-    // 析构函数
-    deinit {
+    // 析构函数（cjc: ~init 替代 deinit）
+    ~init {
         // 清理资源
     }
 
-    // 实例方法
-    func greet() -> String {
+    // 实例方法（cjc: open 允许子类重写）
+    open func greet(): String {
         return "Hello, I'm ${this.name}"
     }
 
     // Getter/Setter
-    var displayName: String {
+    prop displayName: String {
         get { return this.name }
         set { this.name = value }
     }
 }
 
-// 继承
-class Student extends Person {
-    private var grade: Int64
+// 继承（cjc: 使用 <: 替代 extends）
+class Student <: Person {
+    private var grade: Int64;
 
-    override func greet() -> String {
+    override func greet(): String {
         return "${super.greet()}, I'm a student"
     }
 }
@@ -443,14 +471,15 @@ class Student extends Person {
 |------|------|
 | 类定义 | [x] |
 | 构造函数 (init) | [x] |
-| 析构函数 (deinit) | [x] |
+| 析构函数 (~init) | [x] |
 | 实例方法 | [x] |
 | 静态方法 | [x] |
-| Getter/Setter | [x] |
-| 继承 (extends) | [x] |
+| open 修饰符 | [x] |
+| Getter/Setter (prop) | [x] |
+| 继承 (<:) | [x] |
 | 方法重写 (override) | [x] |
 | super 调用 | [x] |
-| 访问修饰符 | [x] |
+| 访问修饰符 (public/protected/internal/private) | [x] |
 | abstract 类 | [x] |
 | sealed 类 | [x] |
 
@@ -602,34 +631,39 @@ func process<T, U>(a: T, b: U) -> Bool
 // 接口定义
 interface Drawable {
     func draw()
-    func boundingBox() -> Rectangle
+    func boundingBox(): Rectangle
 }
 
 // 带默认实现
 interface Printable {
-    func toString() -> String
+    func toString(): String
 
     func print() {
         println(this.toString())
     }
 }
 
-// 实现接口
-struct Circle implements Drawable {
-    radius: Float64
+// 接口继承（cjc: 使用 <:）
+interface Drawable3D <: Drawable {
+    func depth(): Int64
+}
+
+// 实现接口（cjc: 使用 <: 替代 implements）
+struct Circle <: Drawable {
+    var radius: Float64;
 
     func draw() {
         // ...
     }
 
-    func boundingBox() -> Rectangle {
+    func boundingBox(): Rectangle {
         // ...
     }
 }
 
 // 扩展实现
-extend Int64: Printable {
-    func toString() -> String {
+extend Int64 <: Printable {
+    func toString(): String {
         // ...
     }
 }
@@ -639,28 +673,28 @@ extend Int64: Printable {
 |------|------|
 | 接口定义 | [x] |
 | 默认实现 | [x] |
-| implements | [x] |
+| 接口实现 (<:) | [x] |
 | 扩展 (extend) | [x] |
-| 接口继承 | [x] |
+| 接口继承 (<:) | [x] |
 | 关联类型 | [x] |
 
 ---
 
-## 10. 模块系统
+## 10. 包与模块系统
 
 ```cangjie
-// 模块声明 (文件顶部)
-module math
+// 包声明（cjc: package 替代 module）
+package math
 
-// 导入
+// 导入（cjc: 点分路径，无 from 关键字）
 import std.io
-import std.collections.{HashMap, HashSet}
-import math.geometry as geo
-import math.* // 通配符导入
+import std.io.Console        // 导入具体项
+import std.collections.*     // 通配符导入
 
-// 可见性
+// 可见性（cjc: 默认 internal，新增 protected）
 public func publicFunc() { }
-internal func internalFunc() { }
+protected func protectedFunc() { }  // 子类可见
+internal func internalFunc() { }    // 包内可见（默认）
 private func privateFunc() { }
 
 // 包结构
@@ -674,23 +708,24 @@ private func privateFunc() { }
 
 | 功能 | 状态 |
 |------|------|
-| module 声明 | [x] |
-| import | [x] |
-| 别名 (as) | [x] |
-| 通配符导入 | [x] |
+| package 声明 | [x] |
+| import（点分路径） | [x] |
+| 通配符导入 (*) | [x] |
 | public | [x] |
-| internal | [x] |
+| protected | [x] |
+| internal（默认） | [x] |
 | private | [x] |
-| 包管理 | [ ] |
+| 多文件编译 | [x] |
+| import 自动解析 | [x] |
 
 ---
 
 ## 11. 错误处理
 
 ```cangjie
-// 定义错误类型
-class FileError extends Error {
-    var path: String
+// 定义错误类型（cjc: <: 替代 extends）
+class FileError <: Error {
+    var path: String;
 
     init(path: String, message: String) {
         super(message)
@@ -698,8 +733,8 @@ class FileError extends Error {
     }
 }
 
-// 抛出异常
-func readFile(path: String) -> String throws FileError {
+// 抛出异常（cjc: 函数签名无 throws 声明）
+func readFile(path: String): String {
     if !exists(path) {
         throw FileError(path, "File not found")
     }
@@ -709,16 +744,16 @@ func readFile(path: String) -> String throws FileError {
 // 捕获异常
 try {
     let content = readFile("config.json")
-} catch e: FileError {
+} catch (e: FileError) {
     println("File error: ${e.message}")
-} catch e: Error {
+} catch (e: Error) {
     println("Unknown error: ${e.message}")
 } finally {
     // 清理代码
 }
 
 // Result 类型 (函数式错误处理)
-func divide(a: Int64, b: Int64) -> Result<Int64, String> {
+func divide(a: Int64, b: Int64): Result<Int64, String> {
     if b == 0 {
         return Err("Division by zero")
     }
@@ -726,7 +761,7 @@ func divide(a: Int64, b: Int64) -> Result<Int64, String> {
 }
 
 // 错误传播
-func process() -> Result<Int64, String> {
+func process(): Result<Int64, String> {
     let x = divide(10, 2)?  // 自动传播错误
     return Ok(x * 2)
 }
@@ -736,11 +771,10 @@ func process() -> Result<Int64, String> {
 |------|------|
 | try-catch | [x] |
 | throw | [x] |
-| throws 声明 | [x] |
 | finally | [x] |
 | Result 类型 | [x] |
 | ? 操作符 | [x] |
-| Error 类 | [x] |
+| Error 基类 (<:) | [x] |
 
 ---
 
@@ -788,12 +822,12 @@ Globals:
 ### 13.1 导入外部函数
 
 ```cangjie
-// 从 WASM 宿主导入
+// 从 WASM 宿主导入（cjc: foreign 替代 extern）
 @import("env", "print")
-extern func hostPrint(ptr: Int32, len: Int32)
+foreign func hostPrint(ptr: Int32, len: Int32)
 
 @import("wasi_snapshot_preview1", "fd_write")
-extern func fdWrite(fd: Int32, iovs: Int32, iovsLen: Int32, nwritten: Int32) -> Int32
+foreign func fdWrite(fd: Int32, iovs: Int32, iovsLen: Int32, nwritten: Int32): Int32
 ```
 
 ### 13.2 导出函数
@@ -801,7 +835,7 @@ extern func fdWrite(fd: Int32, iovs: Int32, iovsLen: Int32, nwritten: Int32) -> 
 ```cangjie
 // 导出为 WASM 函数
 @export("add")
-func add(a: Int64, b: Int64) -> Int64 {
+func add(a: Int64, b: Int64): Int64 {
     return a + b
 }
 ```
@@ -821,7 +855,7 @@ func add(a: Int64, b: Int64) -> Int64 {
 |------|------|
 | @import | [x] |
 | @export | [x] (自动) |
-| extern func | [x] |
+| foreign func | [x] |
 | WASI 基础 | [ ] (需运行时提供 fd_write 等) |
 
 ---
@@ -886,9 +920,9 @@ pow(base, exp)
 
 *未完成特性的完整实施计划见 [docs/next_steps.md](next_steps.md)。*
 
-### 15.1 当前版本: v0.7.0
+### 15.1 当前版本: v0.8.0
 
-正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。Phase 1-6, 8-9 全部完成，下一步计划详见 [next_steps.md](next_steps.md)。
+v0.8.0 完成了与 cjc release/1.0 分支的语法严格对齐。正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。Phase 1-6, 8-9 全部完成，下一步计划详见 [next_steps.md](next_steps.md)。
 
 #### 已完成功能
 
@@ -927,7 +961,7 @@ pow(base, exp)
 - [x] 数字分隔符 (1_000_000)
 - [x] 幂运算 (`**`，右结合，i64 通过运行时 __pow_i64)
 - [x] 类型转换 (`expr as Type`，Int32/Int64/Float32/Float64/Bool 间转换)
-- [x] 位运算 (`&` `|` `^` `~` `<<` `>>`，i32/i64)
+- [x] 位运算 (`&` `|` `^` `~` `<<` `>>`, i32/i64)
 - [x] Float32 类型与字面量后缀 `f`
 - [x] 科学计数法 (`1.0e10`, `1e-5`)
 - [x] 静态方法（func Type.staticMethod()，调用 Type.staticMethod()）
@@ -951,15 +985,15 @@ pow(base, exp)
 - [x] ? 运算符（错误传播，早期返回 None/Err）
 - [x] try-catch 表达式 (`try { ... } catch e { ... }`)
 - [x] throw 表达式（创建 Err 并早期返回）
-- [x] 模块声明 (`module math`)
-- [x] import 语句 (`import std.io`、`import math.{sin, cos}`、`import math as m`、`import math.*`)
-- [x] 可见性修饰符 (`public` / `private`)
+- [x] 包声明 (`package math`)
+- [x] import 语句 (`import std.io`、`import std.io.Console`、`import math.*`)
+- [x] 可见性修饰符 (`public` / `protected` / `internal` / `private`)
 - [x] 字符串插值 (`"Hello, ${name}!"`，支持 `${expr}` 嵌入表达式)
 - [x] 优化器（常量折叠：整数/浮点二元运算、一元 Neg/Not，编译前 AST 优化）
-- [x] extern func 与 @import（`@import("module","name") extern func ...`，生成 WASM 导入段）
+- [x] foreign func 与 @import（`@import("module","name") foreign func ...`，生成 WASM 导入段）
 - [x] 内置数学函数（`min(a,b)`、`max(a,b)`、`abs(x)`，Int64）
 - [x] 泛型单态化（泛型函数、泛型结构体；显式类型实参如 `identity<Int64>(42)`、`Pair<Int64,Int64>{...}`）
-- [x] 接口与类（解析：interface、implements、class、init、deinit、extends、override、super；无继承类展平为结构体编译；super codegen、init 中 this、继承类 vtable 待完善）
+- [x] 接口与类（解析：interface、<: 实现、class、init、~init、<: 继承、override、super；无继承类展平为结构体编译；super codegen、init 中 this、继承类 vtable）
 
 #### v0.2.0 已完成
 
@@ -967,18 +1001,16 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 
 #### v0.3.0 ~ v0.6.0 新增完成功能
 
-- [x] 基础类型补全（Int8, Int16, UInt8, UInt16, UInt32, UInt64, Char）
+- [x] 基础类型补全（Int8, Int16, UInt8, UInt16, UInt32, UInt64, Rune）
 - [x] 元组类型与字面量 (`(1, 2, 3)`，堆布局 `[field0:i64][field1:i64]...`）
-- [x] 无符号右移 (`>>>`，i32/i64)
 - [x] 空值合并 (`??`，Option 空值默认)
-- [x] 类 codegen 完整实现（init/deinit/继承/vtable/override/super/Getter/Setter/abstract/sealed）
+- [x] 类 codegen 完整实现（init/~init/继承/vtable/override/super/Getter/Setter/abstract/sealed）
 - [x] 泛型完善（泛型类/枚举、类型约束 `<T:Bound>`、多重约束 `<T:A&B>`、where 子句、泛型特化、约束检查）
-- [x] 接口多态（接口定义、默认实现、implements、extend、接口继承、关联类型）
+- [x] 接口多态（接口定义、默认实现、<: 实现、extend、接口继承、关联类型）
 - [x] 闭包编译（Lambda 捕获变量）
-- [x] throws 声明 (`func f() -> T throws E`)
 - [x] finally 块 (`try { } catch { } finally { }`)
-- [x] Error 基类与自定义错误继承 (`class MyError extends Error`)
-- [x] internal 可见性修饰符
+- [x] Error 基类与自定义错误继承 (`class MyError <: Error`)
+- [x] internal / protected 可见性修饰符
 - [x] 多文件编译与 import 自动解析
 - [x] Free List Allocator（__alloc/__free，替代 bump allocator，支持内存复用）
 - [x] 引用计数 RC（__rc_inc/__rc_dec，对象头 refcount，赋值/作用域退出自动管理）
@@ -995,16 +1027,36 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 
 #### v0.3.0 ~ v0.6.0 已完成
 
-- [x] Phase 2: 基础类型补全（Int8/16, UInt8/16/32/64, Char, Tuple, >>>, ??）
-- [x] Phase 3: 类与继承（类定义, init/deinit, 继承, vtable, override, super, Getter/Setter, abstract/sealed）
+- [x] Phase 2: 基础类型补全（Int8/16, UInt8/16/32/64, Rune, Tuple, ??）
+- [x] Phase 3: 类与继承（类定义, init/~init, <: 继承, vtable, override, super, Getter/Setter, abstract/sealed）
 - [x] Phase 4: 泛型完善（泛型函数/结构体/类/枚举, 类型约束, 多重约束, where 子句, 单态化, 特化, 约束检查）
-- [x] Phase 5: 接口多态（接口定义, 默认实现, implements, extend, 接口继承, 关联类型, 闭包/Lambda 编译）
-- [x] Phase 6: 错误处理 + 模块（throws 声明, finally, Error 基类, 自定义错误继承, 多文件编译, import 自动解析）
+- [x] Phase 5: 接口多态（接口定义, 默认实现, <: 实现, extend, 接口继承, 关联类型, 闭包/Lambda 编译）
+- [x] Phase 6: 错误处理 + 模块（finally, Error 基类, 自定义错误继承, 多文件编译, import 自动解析）
 - [x] Phase 8: 内存管理升级（Free List Allocator, 引用计数 RC, Mark-Sweep GC, __alloc/__free/__rc_inc/__rc_dec/__gc_collect）
 
 #### v0.7.0 已完成
 
 - [x] Phase 9: 补充特性（Slice<T>, Map<K,V>, 类型修饰符 mut/ref/?/!, 尾递归优化, 死代码消除, 函数内联）
+
+#### v0.8.0 新增完成功能
+
+- [x] **与 cjc release/1.0 语法严格对齐**（全面语法兼容）
+- [x] `module` → `package` 包声明
+- [x] `import foo from bar.baz` → `import bar.baz.foo` 点分路径导入
+- [x] `extends` → `<:` 类继承语法
+- [x] `implements` → `<:` 接口实现语法
+- [x] `deinit` → `~init` 析构函数语法
+- [x] `extern func` → `foreign func` 外部函数声明
+- [x] `Char` → `Rune` 字符类型重命名
+- [x] 移除 `throws` 函数签名声明（cjc 无此语法）
+- [x] 移除 `>>>` 无符号右移运算符（cjc 无此运算符）
+- [x] 新增 `protected` 可见性修饰符，默认可见性改为 `internal`
+- [x] 新增类型：`IntNative`、`UIntNative`、`Float16`、`Nothing`、`VArray`、`This`
+- [x] 新增运算符：`++`、`--`、`|>`、`~>`、`**=`、`&&=`、`||=`、`&=`、`|=`、`^=`、`<<=`、`>>=`、`#`、`@!`、`$`
+- [x] 新增关键字：`protected`、`const`、`static`、`redef`、`operator`、`unsafe`、`do`、`is`、`case`、`where`、`type`、`main`、`spawn`、`synchronized`、`macro`、`quote`、`inout`、`with`、`foreign`
+- [x] `main()` 入口函数无需 `func` 关键字
+- [x] `open` / `static` 方法修饰符在类体内支持
+- [x] 上下文相关关键字处理（`main`、`where`、`type`、`is`、`case`、`with` 可作标识符使用）
 
 #### 未来版本计划
 
@@ -1019,33 +1071,36 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 ### A. 保留关键字
 
 ```
-as       break    catch    class    const    continue
-do       else     enum     extends  extern   false
-finally  for      func     if       implements import
-in       init     interface internal let     loop
-match    module   mut      override private  public
-ref      return   sealed   static   struct   super
-this     throw    throws   true     try      type
-var      where    while
+as        break     case      catch     class     const
+continue  do        else      enum      false     finally
+for       foreign   func      if        import    in
+init      inout     interface internal  is        let
+loop      macro     main      match     mut       open
+operator  override  package   private   protected public
+quote     redef     ref       return    sealed    spawn
+static    struct    super     synchronized  this  throw
+true      try       type      unsafe    var       where
+while     with
 ```
 
 ### B. 运算符优先级 (从高到低)
 
-1. `()` `[]` `.` `::`
-2. `!` `~` `-` (一元)
+1. `()` `[]` `.` `::` `++` `--` (后缀)
+2. `!` `~` `-` `++` `--` (前缀/一元)
 3. `**` (幂运算，右结合)
 4. `*` `/` `%`
 5. `+` `-`
-6. `<<` `>>` `>>>`
-7. `<` `<=` `>` `>=`
+6. `<<` `>>`
+7. `<` `<=` `>` `>=` `is` `as`
 8. `==` `!=`
 9. `&`
 10. `^`
 11. `|`
 12. `&&`
 13. `||`
-14. `?:`
-15. `=` `+=` `-=` 等赋值运算符
+14. `??` (空值合并)
+15. `|>` (管道) `~>` (组合)
+16. `=` `+=` `-=` `*=` `/=` `%=` `**=` `&&=` `||=` `&=` `|=` `^=` `<<=` `>>=`
 
 ### C. WASM 指令映射参考
 
@@ -1068,5 +1123,5 @@ var      where    while
 
 ---
 
-*文档版本: 2.1.0*
-*最后更新: 2026-02-13（v0.7.0 完成，Phase 1-6, 8-9 全部完成；新增 Slice/Map/类型修饰符/尾递归优化/DCE）*
+*文档版本: 3.0.0*
+*最后更新: 2026-02-14（v0.8.0 完成，与 cjc release/1.0 语法严格对齐；Phase 1-6, 8-9 全部完成）*

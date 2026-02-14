@@ -1,6 +1,6 @@
 // 多文件编译示例 - 主文件
 // 编译命令: cjwasm examples/module_main.cj examples/module_lib.cj -o module_test.wasm
-module examples.main
+package examples.main
 
 import examples.lib
 

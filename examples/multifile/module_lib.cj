@@ -1,5 +1,5 @@
 // 模块库文件 - 提供工具函数
-module examples.lib
+package examples.lib
 
 func add(a: Int64, b: Int64) : Int64 {
     return a + b

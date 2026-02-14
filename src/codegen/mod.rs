@@ -141,7 +141,11 @@ impl CodeGen {
             Type::Float32 => "Float32".to_string(),
             Type::Float64 => "Float64".to_string(),
             Type::Bool => "Bool".to_string(),
-            Type::Char => "Char".to_string(),
+            Type::Rune => "Rune".to_string(),
+            Type::IntNative => "IntNative".to_string(),
+            Type::UIntNative => "UIntNative".to_string(),
+            Type::Float16 => "Float16".to_string(),
+            Type::Nothing => "Nothing".to_string(),
             Type::Unit => "Unit".to_string(),
             Type::String => "String".to_string(),
             Type::Array(inner) => format!("Array_{}", Self::type_mangle_suffix(inner)),
@@ -2007,7 +2011,7 @@ impl CodeGen {
             Expr::Float(_) => Some(Type::Float64),
             Expr::Float32(_) => Some(Type::Float32),
             Expr::Bool(_) => Some(Type::Bool),
-            Expr::Char(_) => Some(Type::Char),
+            Expr::Rune(_) => Some(Type::Rune),
             Expr::String(_) => Some(Type::String),
             Expr::Tuple(ref elems) => {
                 let types: Vec<Type> = elems.iter().filter_map(|e| self.infer_ast_type(e)).collect();
@@ -2093,7 +2097,7 @@ impl CodeGen {
             Expr::Float(_) => Some(Type::Float64),
             Expr::Float32(_) => Some(Type::Float32),
             Expr::Bool(_) => Some(Type::Bool),
-            Expr::Char(_) => Some(Type::Char),
+            Expr::Rune(_) => Some(Type::Rune),
             Expr::String(_) => Some(Type::String),
             Expr::Tuple(ref elems) => {
                 let types: Vec<Type> = elems.iter().filter_map(|e| self.infer_ast_type_with_locals(e, locals)).collect();
@@ -2281,7 +2285,7 @@ impl CodeGen {
             Expr::Float(_) => ValType::F64,
             Expr::Float32(_) => ValType::F32,
             Expr::Bool(_) => ValType::I32,
-            Expr::Char(_) => ValType::I32,
+            Expr::Rune(_) => ValType::I32,
             Expr::String(_) => ValType::I32,
             Expr::Array(_) => ValType::I32,
             Expr::Tuple(_) => ValType::I32,
@@ -2783,7 +2787,7 @@ impl CodeGen {
             Expr::Bool(b) => {
                 func.instruction(&Instruction::I32Const(if *b { 1 } else { 0 }));
             }
-            Expr::Char(c) => {
+            Expr::Rune(c) => {
                 func.instruction(&Instruction::I32Const(*c as i32));
             }
             Expr::String(s) => {
@@ -2860,7 +2864,7 @@ impl CodeGen {
                                         self.get_or_create_func_index("__f32_to_str"),
                                     ));
                                 }
-                                Some(Type::Int8) | Some(Type::Int16) | Some(Type::UInt8) | Some(Type::UInt16) | Some(Type::UInt32) | Some(Type::Char) => {
+                                Some(Type::Int8) | Some(Type::Int16) | Some(Type::UInt8) | Some(Type::UInt16) | Some(Type::UInt32) | Some(Type::Rune) => {
                                     func.instruction(&Instruction::Call(
                                         self.get_or_create_func_index("__i32_to_str"),
                                     ));
@@ -3044,7 +3048,6 @@ impl CodeGen {
                                 (BinOp::BitOr, ValType::I32) => Instruction::I32Or,
                                 (BinOp::BitXor, ValType::I32) => Instruction::I32Xor,
                                 (BinOp::Shl, ValType::I32) => Instruction::I32Shl,
-                                (BinOp::UShr, ValType::I32) => Instruction::I32ShrU,
                                 (BinOp::Add, ValType::I64) => Instruction::I64Add,
                                 (BinOp::Sub, ValType::I64) => Instruction::I64Sub,
                                 (BinOp::Mul, ValType::I64) => Instruction::I64Mul,
@@ -3054,7 +3057,6 @@ impl CodeGen {
                                 (BinOp::BitOr, ValType::I64) => Instruction::I64Or,
                                 (BinOp::BitXor, ValType::I64) => Instruction::I64Xor,
                                 (BinOp::Shl, ValType::I64) => Instruction::I64Shl,
-                                (BinOp::UShr, ValType::I64) => Instruction::I64ShrU,
                                 _ => panic!("不支持的无符号运算: {:?} for {:?}", op, val_type),
                             }
                         }
@@ -3134,13 +3136,11 @@ impl CodeGen {
                     (BinOp::BitXor, ValType::I64) => Instruction::I64Xor,
                     (BinOp::Shl, ValType::I64) => Instruction::I64Shl,
                     (BinOp::Shr, ValType::I64) => Instruction::I64ShrS,
-                    (BinOp::UShr, ValType::I64) => Instruction::I64ShrU,
                     (BinOp::BitAnd, ValType::I32) => Instruction::I32And,
                     (BinOp::BitOr, ValType::I32) => Instruction::I32Or,
                     (BinOp::BitXor, ValType::I32) => Instruction::I32Xor,
                     (BinOp::Shl, ValType::I32) => Instruction::I32Shl,
                     (BinOp::Shr, ValType::I32) => Instruction::I32ShrS,
-                    (BinOp::UShr, ValType::I32) => Instruction::I32ShrU,
 
                     _ => panic!("不支持的运算: {:?} for {:?}", op, val_type),
                 };
@@ -3276,6 +3276,23 @@ impl CodeGen {
                 {
                     self.compile_expr(&args[0], locals, func, loop_ctx);
                     func.instruction(&Instruction::Call(self.get_or_create_func_index("__abs_i64")));
+                } else if args.len() == 1 && ["Int64", "Int32", "Int16", "Int8", "UInt64", "UInt32", "UInt16", "UInt8", "Float64", "Float32", "Bool"].contains(&name.as_str()) {
+                    // 类型转换构造函数 T(e) - cjc 兼容
+                    let target_ty = match name.as_str() {
+                        "Int64" => Type::Int64,
+                        "Int32" => Type::Int32,
+                        "Int16" => Type::Int16,
+                        "Int8" => Type::Int8,
+                        "UInt64" => Type::UInt64,
+                        "UInt32" => Type::UInt32,
+                        "UInt16" => Type::UInt16,
+                        "UInt8" => Type::UInt8,
+                        "Float64" => Type::Float64,
+                        "Float32" => Type::Float32,
+                        "Bool" => Type::Bool,
+                        _ => unreachable!(),
+                    };
+                    self.compile_expr(&Expr::Cast { expr: Box::new(args[0].clone()), target_ty }, locals, func, loop_ctx);
                 } else {
                     let arg_tys: Vec<Type> = args
                         .iter()
@@ -4458,7 +4475,7 @@ mod tests {
     #[test]
     fn test_compile_simple_function() {
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -4487,7 +4504,7 @@ mod tests {
     #[test]
     fn test_compile_struct() {
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![StructDef {
                 visibility: Visibility::default(),
@@ -4550,7 +4567,7 @@ mod tests {
     #[test]
     fn test_compile_struct_field_y() {
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![StructDef {
                 visibility: Visibility::default(),
@@ -4612,7 +4629,7 @@ mod tests {
     #[test]
     fn test_compile_binary_ops() {
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -4645,7 +4662,7 @@ mod tests {
     #[test]
     fn test_compile_if_expr() {
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -4694,7 +4711,7 @@ mod tests {
     #[test]
     fn test_compile_array_literal_and_index() {
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -4738,7 +4755,7 @@ mod tests {
         use crate::ast::{Literal, MatchArm, Pattern};
 
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -4785,7 +4802,7 @@ mod tests {
     #[test]
     fn test_compile_for_range() {
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -4836,7 +4853,7 @@ mod tests {
     #[test]
     fn test_compile_float_ops() {
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -4868,7 +4885,7 @@ mod tests {
     #[test]
     fn test_compile_multiple_functions() {
         let program = Program {
-            module_name: None,
+            package_name: None,
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -4932,7 +4949,7 @@ mod tests {
         assert_eq!(CodeGen::type_mangle_suffix(&Type::Float32), "Float32");
         assert_eq!(CodeGen::type_mangle_suffix(&Type::Float64), "Float64");
         assert_eq!(CodeGen::type_mangle_suffix(&Type::Bool), "Bool");
-        assert_eq!(CodeGen::type_mangle_suffix(&Type::Char), "Char");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Rune), "Rune");
         assert_eq!(CodeGen::type_mangle_suffix(&Type::Unit), "Unit");
         assert_eq!(CodeGen::type_mangle_suffix(&Type::String), "String");
         assert_eq!(CodeGen::type_mangle_suffix(&Type::Range), "Range");

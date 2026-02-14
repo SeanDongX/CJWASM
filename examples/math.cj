@@ -53,12 +53,12 @@ func floatOperations(): Float64 {
     return sum + diff + prod + quot
 }
 
-// 混合类型运算（需要显式转换）
+// 混合类型运算（需要显式转换，cjc: as 返回 Option，使用 Float64/Int64 构造函数）
 func mixedOperations(): Int64 {
     let i: Int64 = 42
     let f: Float64 = 3.5
-    let result = (i as Float64) + f
-    return result as Int64
+    let result = Float64(i) + f
+    return Int64(result)
 }
 
 // 取模运算

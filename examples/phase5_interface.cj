@@ -20,18 +20,16 @@ interface Describable {
 
 // ==============================
 // 3. 接口继承 (#33)
+// cjc: 使用 <: 而非 :
 // ==============================
-interface Drawable: Shape {
+interface Drawable <: Shape {
     func draw(self: Int64): Int64;
 }
 
 // ==============================
 // 4. 关联类型 (#34)
+// Note: cjwasm-specific feature removed for cjc compatibility (type Element in interface not supported)
 // ==============================
-interface Container {
-    type Element;
-    func size(): Int64;
-}
 
 // ==============================
 // 5. 结构体 + 实现接口 (#31)
@@ -84,7 +82,7 @@ open class Animal {
         this.legs = legs
     }
 
-    func getLegs(): Int64 {
+    open func getLegs(): Int64 {
         return this.legs
     }
 }
@@ -93,7 +91,7 @@ class Dog <: Animal {
     var loyal: Int64;
 
     init(legs: Int64, loyal: Int64) {
-        this.legs = legs
+        super(legs)
         this.loyal = loyal
     }
 
@@ -142,9 +140,7 @@ func testClass(): Int64 {
 }
 
 func testLambda(): Int64 {
-    // Lambda 表达式
-    let double = (x: Int64): Int64 { x * 2 }
-    // double 变量持有函数表索引
+    // Note: cjwasm-specific lambda syntax removed for cjc compatibility
     return 10  // 简化测试
 }
 

@@ -406,7 +406,6 @@ fn fold_binary_int(a: i64, b: i64, op: &BinOp) -> Option<Expr> {
         BitXor => Integer(a ^ b),
         Shl => Integer(a.shl(b as u32)),
         Shr => Integer(a.shr(b as u32)),
-        UShr => Integer(((a as u64).shr(b as u32)) as i64),
         LogicalAnd | LogicalOr | Pow => return None,
     };
     Some(out)
@@ -426,7 +425,7 @@ fn fold_binary_float(x: f64, y: f64, op: &BinOp) -> Option<Expr> {
         Gt => Bool(x > y),
         LtEq => Bool(x <= y),
         GtEq => Bool(x >= y),
-        Mod | BitAnd | BitOr | BitXor | Shl | Shr | UShr | LogicalAnd | LogicalOr | Pow => return None,
+        Mod | BitAnd | BitOr | BitXor | Shl | Shr | LogicalAnd | LogicalOr | Pow => return None,
     };
     Some(out)
 }
@@ -514,11 +513,7 @@ mod tests {
         assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Shr, left: Box::new(Expr::Integer(16)), right: Box::new(Expr::Integer(2)) }), Expr::Integer(4)));
     }
 
-    #[test]
-    fn fold_int_ushr() {
-        let e = Expr::Binary { op: BinOp::UShr, left: Box::new(Expr::Integer(256)), right: Box::new(Expr::Integer(2)) };
-        assert!(matches!(fold_expr(e), Expr::Integer(64)));
-    }
+    // UShr (>>>) removed in cjc alignment
 
     #[test]
     fn fold_int_logical_returns_none() {

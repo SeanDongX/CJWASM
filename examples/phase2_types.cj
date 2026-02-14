@@ -13,26 +13,27 @@ func unsignedDemo(): Int64 {
     let div = x / y       // 无符号除法 = 3
     let rem = x % y       // 无符号取模 = 1
 
-    return (div as Int64) + (rem as Int64)  // 3 + 1 = 4
+    // cjc: as returns Option, use Int64() constructor for conversion
+    return Int64(div) + Int64(rem)  // 3 + 1 = 4
 }
 
-// === 2. Char 类型 ===
+// === 2. Rune 类型 ===
 func charDemo(): Int64 {
     let ch = 'A'           // 字符字面量
     let newline = '\n'     // 转义字符
     let tab = '\t'
 
-    return (ch as Int64)   // 65 ('A' 的 Unicode)
+    // cjc: as returns Option, use Int64() constructor for Rune->Int64
+    return Int64(ch)   // 65 ('A' 的 Unicode)
 }
 
 // === 3. Tuple 类型 ===
-// cjc 中元组可用 .0/.1 索引，或解构 let (a, b) = pair
 func tupleDemo(): Int64 {
     let pair = (42, 100)   // 元组字面量
-    let a = pair.0         // 元组索引访问
-    let b = pair.1
+    let a = pair[0]        // 元组索引
+    let b = pair[1]
 
-    return (a as Int64) + (b as Int64)  // 42 + 100 = 142
+    return a + b  // 42 + 100 = 142
 }
 
 // === 4. 空值合并运算符 ?? ===
@@ -55,11 +56,8 @@ internal func internalHelper(): Int64 {
 }
 
 // === 6. 无符号右移 >>> ===
-func unsignedShiftDemo(): Int64 {
-    let val: Int64 = -8
-    let shifted = val >>> 1    // 无符号右移
-    return shifted
-}
+// Note: cjwasm-specific feature removed for cjc compatibility (>>> not supported in cjc)
+// func unsignedShiftDemo(): Int64 { ... }
 
 // === 综合测试 ===
 main(): Int64 {

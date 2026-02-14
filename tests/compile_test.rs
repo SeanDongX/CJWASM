@@ -523,7 +523,7 @@ fn test_compile_stdlib_min_max_abs() {
 fn test_compile_extern_import() {
     let source = r#"
         @import("env", "print")
-        extern func hostPrint(ptr: Int32, len: Int32)
+        foreign func hostPrint(ptr: Int32, len: Int32)
         func main() : Int64 {
             return 0
         }
@@ -533,7 +533,7 @@ fn test_compile_extern_import() {
     // WASM 应包含 Import 段（section id 2）；简单检查二进制中含 "env" 或 "print" 表示导入存在
     assert!(
         wasm.windows(3).any(|w| w == b"env") || wasm.windows(5).any(|w| w == b"print"),
-        "extern 导入应生成包含模块/函数名的 WASM"
+        "foreign 导入应生成包含模块/函数名的 WASM"
     );
 }
 
@@ -674,7 +674,7 @@ fn test_compile_string_interpolation() {
 // 覆盖率补充测试 — 集中覆盖未测试的代码路径
 // ====================================================================
 
-// --- 类继承 + vtable + super + deinit ---
+// --- 类继承 + vtable + super + ~init ---
 #[test]
 fn test_compile_class_inheritance_super_deinit() {
     let source = r#"
@@ -687,7 +687,7 @@ fn test_compile_class_inheritance_super_deinit() {
                 this.age = age
             }
 
-            deinit { }
+            ~init { }
 
             func speak(self: Animal) : Int64 {
                 return self.kind
@@ -698,7 +698,7 @@ fn test_compile_class_inheritance_super_deinit() {
             }
         }
 
-        class Dog extends Animal {
+        class Dog <: Animal {
             var breed: Int64;
 
             init(age: Int64, breed: Int64) {
@@ -805,14 +805,14 @@ fn test_compile_try_catch_finally_throw() {
 #[test]
 fn test_compile_throws_declaration() {
     let source = r#"
-        func validate(x: Int64) throws Error : Int64 {
+        func validate(x: Int64) : Int64 {
             if x < 0 {
                 throw 0
             }
             return x
         }
 
-        func process(x: Int64) throws : Int64 {
+        func process(x: Int64) : Int64 {
             return validate(x) + 1
         }
 
@@ -824,15 +824,15 @@ fn test_compile_throws_declaration() {
     assert_valid_wasm(&wasm, "throws_declaration");
 }
 
-// --- import + module ---
+// --- import + package ---
 #[test]
 fn test_compile_import_module() {
     let source = r#"
-        module test.main
+        package test.main
 
-        import foo from bar.baz
+        import bar.baz.foo
         import std.io
-        import std.math as m
+        import std.math
 
         func main() : Int64 {
             return 0
@@ -1289,8 +1289,8 @@ fn test_compile_string_interpolation_types() {
 fn test_compile_char_type() {
     let source = r#"
         func main() : Int64 {
-            let c: Char = 'A'
-            let d: Char = 'Z'
+            let c: Rune = 'A'
+            let d: Rune = 'Z'
             let n = (c as Int64) + (d as Int64)
             return n
         }
@@ -1334,7 +1334,7 @@ fn test_compile_bitwise_all() {
             let c = 0xFF ^ 0x0F
             let d = 1 << 4
             let e = 256 >> 2
-            let f = 256 >>> 2
+            let f = 256 >> 2
             return a + b + c + d + e + f
         }
     "#;
@@ -1362,7 +1362,7 @@ fn test_compile_const_fold_float_cmp() {
             let m = 1 ^ 0
             let n = 1 << 2
             let o = 8 >> 1
-            let p = 8 >>> 1
+            let p = 8 >> 1
             return 0
         }
     "#;
@@ -1531,14 +1531,14 @@ fn test_compile_try_operator_result() {
     assert_valid_wasm(&wasm, "try_operator_result");
 }
 
-// --- 多文件特性 (module + import) ---
+// --- 多文件特性 (package + import) ---
 #[test]
 fn test_compile_module_declaration() {
     let source = r#"
-        module my.app
+        package my.app
 
-        import io from std.io
-        import math
+        import std.io
+        import std.math
 
         func helper() : Int64 {
             return 42
@@ -1679,14 +1679,14 @@ fn test_compile_string_varieties() {
 #[test]
 fn test_compile_error_class_hierarchy() {
     let source = r#"
-        open class CustomError extends Error {
+        open class CustomError <: Error {
             var code: Int64;
             init(code: Int64) {
                 this.code = code
             }
         }
 
-        class SpecificError extends CustomError {
+        class SpecificError <: CustomError {
             init() {
                 super(404)
             }
@@ -2062,7 +2062,7 @@ fn test_compile_class_implements_interface() {
             func compute() : Int64;
         }
 
-        class Calculator implements Calculable {
+        class Calculator <: Calculable {
             var value: Int64;
 
             init(v: Int64) {
@@ -2114,7 +2114,7 @@ fn test_compile_class_chain() {
             func val(self: A) : Int64 { return self.x }
         }
 
-        open class B extends A {
+        open class B <: A {
             var y: Int64;
             init(x: Int64, y: Int64) {
                 super(x)
@@ -2123,7 +2123,7 @@ fn test_compile_class_chain() {
             override func val(self: B) : Int64 { return self.x + self.y }
         }
 
-        class C extends B {
+        class C <: B {
             init(x: Int64, y: Int64) {
                 super(x, y)
             }
@@ -2359,7 +2359,7 @@ fn test_compile_comprehensive_coverage() {
             func getSpeed(self: Vehicle) : Int64 { return self.speed }
         }
 
-        class Car extends Vehicle {
+        class Car <: Vehicle {
             var fuel: Int64;
             init(s: Int64, f: Int64) {
                 super(s)
@@ -2429,7 +2429,7 @@ fn test_compile_uint64_full_ops() {
             let bor = a | b
             let bxor = a ^ b
             let shl = a << b
-            let ushr = a >>> b
+            let ushr = a >> b
             return 0
         }
     "#;
@@ -2460,7 +2460,7 @@ fn test_compile_int32_full_ops() {
             let bxor = a ^ b
             let shl = a << b
             let shr = a >> b
-            let ushr = a >>> b
+            let ushr = a >> b
             return 0
         }
     "#;
@@ -3466,7 +3466,7 @@ fn test_memory_multiple_heap_objects() {
     assert_valid_wasm(&wasm, "memory_multiple_heap_objects");
 }
 
-// --- 类继承 + deinit + RC ---
+// --- 类继承 + ~init + RC ---
 #[test]
 fn test_memory_class_deinit() {
     let source = r#"
@@ -3475,7 +3475,7 @@ fn test_memory_class_deinit() {
             init(v: Int64) {
                 this.value = v
             }
-            deinit {
+            ~init {
                 let x = 0
             }
         }

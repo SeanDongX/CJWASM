@@ -33,7 +33,7 @@ pub fn parse_file(path: &str) -> Result<(Program, String), String> {
 /// 合并多个 Program AST 为一个
 pub fn merge_programs(programs: Vec<Program>) -> Program {
     let mut merged = Program {
-        module_name: None,
+        package_name: None,
         imports: vec![],
         structs: vec![],
         interfaces: vec![],
@@ -44,8 +44,8 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
     };
 
     for prog in programs {
-        if merged.module_name.is_none() && prog.module_name.is_some() {
-            merged.module_name = prog.module_name;
+        if merged.package_name.is_none() && prog.package_name.is_some() {
+            merged.package_name = prog.package_name;
         }
         merged.imports.extend(prog.imports);
         merged.structs.extend(prog.structs);
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_parse_source_lex_error() {
-        let source = "func main() { let x = $$ }";
+        let source = "func main() { let x = ` }";
         let result = parse_source(source);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("词法错误"));
@@ -174,7 +174,7 @@ mod tests {
     fn test_merge_programs_empty() {
         let merged = merge_programs(vec![]);
         assert!(merged.functions.is_empty());
-        assert!(merged.module_name.is_none());
+        assert!(merged.package_name.is_none());
     }
 
     #[test]
@@ -196,13 +196,13 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_programs_module_name() {
-        let source1 = "module app.main\nfunc main(): Int64 { return 0 }";
+    fn test_merge_programs_package_name() {
+        let source1 = "package app.main\nfunc main(): Int64 { return 0 }";
         let source2 = "func helper(): Int64 { return 1 }";
         let prog1 = parse_source(source1).unwrap();
         let prog2 = parse_source(source2).unwrap();
         let merged = merge_programs(vec![prog1, prog2]);
-        assert!(merged.module_name.is_some());
+        assert!(merged.package_name.is_some());
         assert_eq!(merged.functions.len(), 2);
     }
 
