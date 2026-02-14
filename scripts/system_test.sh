@@ -267,6 +267,46 @@ if [[ -d "$MULTIFILE_DIR" && -z "$FILTER" ]]; then
   fi
 fi
 
+# ── cjpm 工程测试 (examples/project/) ────────────────────────
+
+PROJECT_DIR="$EXAMPLES_DIR/project"
+if [[ -d "$PROJECT_DIR" && -f "$PROJECT_DIR/cjpm.toml" && -z "$FILTER" ]]; then
+  echo ""
+  echo -e "${CYAN}[附加] cjpm 工程测试: examples/project/${NC}"
+
+  wasm_file="$OUT_DIR/project_demo.wasm"
+  if compile_output=$("$CJWASM" build -p "$PROJECT_DIR" -o "$wasm_file" 2>&1); then
+    run_output=$(wasmtime run -W timeout=10s --invoke main "$wasm_file" 2>&1) || true
+    actual=$(echo "$run_output" | tail -1 | tr -d '[:space:]')
+
+    # 从 src/main.cj 提取预期值
+    proj_main="$PROJECT_DIR/src/main.cj"
+    proj_expected=""
+    if [[ -f "$proj_main" ]] && grep -q '预期输出' "$proj_main"; then
+      proj_expected=$(grep '预期输出' "$proj_main" | tail -1 | grep -oE '[-]?[0-9]+' | tail -1)
+    fi
+
+    if [[ -n "$proj_expected" && "$actual" == "$proj_expected" ]]; then
+      printf "  %-28s ${GREEN}✓${NC}          %-14s %-14s ${GREEN}✓ PASS${NC}\n" "project/" "$proj_expected" "$actual"
+      ((PASS++)) || true
+    elif [[ -n "$proj_expected" ]]; then
+      printf "  %-28s ${GREEN}✓${NC}          %-14s ${RED}%-14s${NC} ${RED}✗ FAIL${NC}\n" "project/" "$proj_expected" "$actual"
+      ((FAIL++)) || true
+      ERRORS+=("project/: 预期=$proj_expected 实际=$actual")
+    else
+      printf "  %-28s ${GREEN}✓${NC}          ${DIM}%-14s${NC} %-14s ${YELLOW}○ SKIP${NC}\n" "project/" "无预期值" "$actual"
+      ((SKIP++)) || true
+    fi
+  else
+    printf "  %-28s ${RED}✗ 编译失败${NC}\n" "project/"
+    ((FAIL++)) || true
+    ERRORS+=("project/ (编译失败)")
+    if $VERBOSE; then
+      echo -e "  ${DIM}${RED}$compile_output${NC}"
+    fi
+  fi
+fi
+
 # ── 汇总 ──
 
 echo ""

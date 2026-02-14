@@ -27,39 +27,68 @@ cd cjwasm
 cargo build --release
 ```
 
-### 编译仓颉程序
+### 使用 cjpm 工程（推荐）
+
+CJWasm 兼容仓颉包管理器 (cjpm) 的项目结构，可直接读取 `cjpm.toml` 进行编译：
+
+```bash
+# 初始化新项目
+cjwasm init myproject
+cd myproject
+
+# 编译工程（读取 cjpm.toml，自动发现 src/ 下的 .cj 文件）
+cjwasm build
+
+# 指定输出文件
+cjwasm build -o app.wasm
+
+# 显示详细编译信息
+cjwasm build -v
+
+# 运行编译结果
+wasmtime run --invoke main target/wasm/myproject.wasm
+```
+
+生成的项目结构：
+```
+myproject/
+├── cjpm.toml          # 项目配置（兼容 cjpm 格式）
+└── src/
+    └── main.cj        # 入口源文件
+```
+
+### 直接编译（无需 cjpm.toml）
 
 ```bash
 # 编译单文件
-./target/release/cjwasm examples/hello.cj
+cjwasm examples/hello.cj
 
 # 指定输出
-./target/release/cjwasm examples/hello.cj -o hello.wasm
+cjwasm examples/hello.cj -o hello.wasm
 
 # 多文件编译
-./target/release/cjwasm main.cj lib.cj -o app.wasm
+cjwasm main.cj lib.cj -o app.wasm
 ```
-### 运行单元测试
-
-```bash
-cargo test
-```
-
-以上命令会运行所有 Rust 层的单元测试和集成测试（源码与测试目录共计 165 个），可帮助快速验证 cjwasm 各模块的正确性。
-
-如需查看具体测试覆盖率，可执行：
-
-```bash
-./scripts/coverage.sh
-./scripts/coverage.sh --html   # 生成 HTML 报告到 target/llvm-cov/html/index.html
-```
-
 
 ### 运行 WASM
 
 ```bash
 # 使用 wasmtime 运行
 wasmtime run --invoke main hello.wasm
+```
+
+### 测试
+
+```bash
+# 运行单元测试（178 个）
+cargo test
+
+# 运行系统测试（编译运行所有示例并验证返回值）
+./scripts/system_test.sh
+
+# 测试覆盖率
+./scripts/coverage.sh
+./scripts/coverage.sh --html   # 生成 HTML 报告到 target/llvm-cov/html/index.html
 ```
 
 
@@ -120,8 +149,9 @@ func main() -> Int64 {
 ```
 cjwasm/
 ├── src/
-│   ├── main.rs          # CLI 入口
+│   ├── main.rs          # CLI 入口（build/init/compile 子命令）
 │   ├── lib.rs           # 库入口
+│   ├── cjpm.rs          # cjpm.toml 解析 & build 命令
 │   ├── lexer/           # 词法分析（基于 logos）
 │   ├── parser/          # 递归下降语法分析器
 │   ├── ast/             # 抽象语法树定义
@@ -137,6 +167,7 @@ cjwasm/
 │   └── report.html      # 性能对比报告（自动生成）
 ├── scripts/
 │   ├── benchmark.sh     # CJWasm vs CJC 综合性能对比
+│   ├── system_test.sh   # 系统测试（编译运行示例 & 验证结果）
 │   └── coverage.sh      # 测试覆盖率
 ├── docs/
 │   └── spec.md          # 编译器规格说明书
@@ -224,6 +255,7 @@ cargo test
 | [wasm-encoder](https://crates.io/crates/wasm-encoder) | WASM 字节码编码 |
 | [thiserror](https://crates.io/crates/thiserror) | 错误类型派生 |
 | [ariadne](https://crates.io/crates/ariadne) | 编译错误诊断输出 |
+| [toml](https://crates.io/crates/toml) + [serde](https://crates.io/crates/serde) | cjpm.toml 配置解析 |
 | [criterion](https://crates.io/crates/criterion) | 性能基准测试（dev） |
 
 ### 运行时工具（可选）
