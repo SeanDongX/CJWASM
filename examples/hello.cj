@@ -22,5 +22,5 @@ func fib(n: Int64): Int64 {
 }
 
 main(): Int64 {
-    return factorial(5)
+    return factorial(5)  // 预期输出: 120
 }

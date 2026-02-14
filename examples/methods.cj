@@ -63,5 +63,5 @@ main(): Int64 {
     let peri = rect.perimeter()
     let scaled = rect.scale(2)
 
-    return dist + area + peri
+    return dist + area + peri  // 预期输出: 105
 }

@@ -135,4 +135,5 @@ main(): Int64 {
     let v1 = handleResult(r1)  // 5
 
     return t1 + t2 + t5 + t6 + v1   // 6 + 0 + 14 + 0 + 5 = 25
+    // 预期输出: 25
 }

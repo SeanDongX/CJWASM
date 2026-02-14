@@ -151,5 +151,5 @@ main(): Int64 {
     let f = testProp()             // 42
 
     return a + b + c + d + e + f
-    // 7 + 115 + 3 + 10 + 42 + 42 = 219
+    // 预期输出: 178
 }

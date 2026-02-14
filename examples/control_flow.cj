@@ -55,4 +55,5 @@ main(): Int64 {
     let d = matchMultiple(2)     // 10
     let e = matchRange(50)       // 2
     return a + b + c + d + e     // 45+15+200+10+2 = 272
+    // 预期输出: 272
 }

@@ -15,5 +15,5 @@ class Point {
 
 main(): Int64 {
     let p = Point(5, 10)
-    return p.area(p)
+    return p.area(p)  // 预期输出: 50
 }

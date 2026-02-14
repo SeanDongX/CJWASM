@@ -53,5 +53,5 @@ main(): Int64 {
     let rect = Rectangle(5, 10)
     let a = area(rect)
 
-    return total + a
+    return total + a  // 预期输出: 110
 }

@@ -48,5 +48,5 @@ main(): Int64 {
     let escaped = escapedString()
 
     // 返回一个固定值表示成功
-    return 42
+    return 42  // 预期输出: 42
 }

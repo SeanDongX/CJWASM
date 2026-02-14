@@ -81,5 +81,5 @@ main(): Int64 {
     let calc2 = calc.add(50)
     let status = Status.Active
     let internal_result = internalFunc(5)
-    return sum + p.x + calc2.value + internal_result
+    return sum + p.x + calc2.value + internal_result  // 预期输出: 196
 }

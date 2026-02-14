@@ -15,5 +15,5 @@ func identity<T>(value: T): T {
 main(): Int64 {
     let p = Pair<Int64, Int64>(1, 2)
     let x = identity<Int64>(42)
-    return p.first + x
+    return p.first + x  // 预期输出: 43
 }

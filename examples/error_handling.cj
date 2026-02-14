@@ -124,4 +124,5 @@ main(): Int64 {
     let optVal = handleOption(opt)  // 200
 
     return v1 + s1 + s2 + f1 + f2 + optVal    // 5 + 5 + 0 + 6 + 0 + 200 = 216
+    // 预期输出: 216
 }

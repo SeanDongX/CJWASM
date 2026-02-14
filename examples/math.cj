@@ -107,5 +107,5 @@ main(): Int64 {
     let f = discriminant(1, 5, 6)
     let g = manhattanDistance(0, 0, 3, 4)
     let h = average(10, 20, 30)
-    return a + b + c + d + e + f + g + h
+    return a + b + c + d + e + f + g + h  // 预期输出: 1957
 }

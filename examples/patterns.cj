@@ -101,5 +101,5 @@ main(): Int64 {
     let e = matchPoint(p1)          // 5 (y轴上)
     let f = matchPoint(p2)          // 7
 
-    return a + b + c + d + e + f    // 10 + 0 + 15 + 30 + 5 + 7 = 67
+    return a + b + c + d + e + f    // 预期输出: 35
 }

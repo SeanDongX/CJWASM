@@ -157,5 +157,5 @@ main(): Int64 {
     let rcResult = testReassignment()
     let loopResult = loopAllocation()
 
-    return pSum + cVal + rId + sv + aSum + rcResult + loopResult
+    return pSum + cVal + rId + sv + aSum + rcResult + loopResult  // 预期输出: 453
 }

@@ -27,4 +27,5 @@ main(): Int64 {
     let d = classifyNumber(50)   // 4
     let e = classifyNumber(200)  // 5
     return a + b + c + d + e     // 100+2+3+4+5 = 114
+    // 预期输出: 114
 }

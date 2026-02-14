@@ -88,5 +88,5 @@ main(): Int64 {
     let i = calculate2(3, 5)               // 8
     let j = calculate3(1, 2, 3)            // 6
 
-    return a + b + e + f + g + h + i + j
+    return a + b + e + f + g + h + i + j  // 预期输出: 89
 }

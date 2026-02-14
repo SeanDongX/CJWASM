@@ -24,5 +24,5 @@ struct Rect {
 
 main(): Int64 {
     let r = Rect(5, 10)
-    return r.area()
+    return r.area()  // 预期输出: 50
 }

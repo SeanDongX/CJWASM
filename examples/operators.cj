@@ -90,5 +90,5 @@ main(): Int64 {
     let c = typeConversion()         // 3 + 1 = 4
     let d = compoundAssignment()     // 2
     let e = negation(5)              // -5 + 5 = 0
-    return b + c + d
+    return b + c + d  // 预期输出: 1623
 }
