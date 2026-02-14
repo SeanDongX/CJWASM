@@ -12,6 +12,12 @@ use wasm_encoder::{
 /// 内存布局常量
 const HEAP_BASE: i32 = 1024;  // 堆起始地址
 const PAGE_SIZE: u64 = 65536; // WASM 页大小 64KB
+/// I/O 缓冲区保留大小（地址 0-127 用于 println 等 I/O 操作）
+const IO_BUFFER_RESERVE: u32 = 128;
+/// iovec 结构体的内存偏移（8 字节：buf_ptr + buf_len）
+const IOVEC_OFFSET: i32 = 64;
+/// fd_write 的 nwritten 输出指针偏移
+const NWRITTEN_OFFSET: i32 = 72;
 
 /// 类的运行时信息（包含继承布局和 vtable）
 #[derive(Debug, Clone)]
@@ -114,7 +120,7 @@ impl CodeGen {
             func_params: HashMap::new(),
             name_count: HashMap::new(),
             string_pool: Vec::new(),
-            data_offset: 0,
+            data_offset: IO_BUFFER_RESERVE,
             vtable_entries: Vec::new(),
             interfaces: HashMap::new(),
             lambda_functions: Vec::new(),
@@ -508,8 +514,10 @@ impl CodeGen {
             }
             self.func_params.insert(key, func.params.clone());
         }
-        let num_imports = functions.iter().filter(|f| f.extern_import.is_some()).count() as u32;
-        let num_non_extern = functions.len() as u32 - num_imports;
+        let num_user_imports = functions.iter().filter(|f| f.extern_import.is_some()).count() as u32;
+        let num_builtin_imports = 1u32; // WASI fd_write
+        let num_imports = num_user_imports + num_builtin_imports;
+        let num_non_extern = functions.len() as u32 - num_user_imports;
         let mut import_idx = 0u32;
         let mut non_extern_idx = 0u32;
         for (_i, func) in functions.iter().enumerate() {
@@ -608,21 +616,50 @@ impl CodeGen {
         self.func_types.insert("__gc_collect".to_string(), runtime_type_base + 14);
         self.func_indices.insert("__gc_collect".to_string(), runtime_func_base + 14);
 
+        // Phase 9: WASI I/O 支持 — println 实现
+        // WASI fd_write 类型: (i32, i32, i32, i32) -> i32
+        let wasi_fd_write_type_idx = runtime_type_base + 15;
+        types.ty().function(
+            [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            [ValType::I32],
+        );
+        // fd_write 是内置导入，索引在用户导入之后
+        self.func_indices.insert("__wasi_fd_write".to_string(), num_user_imports);
+
+        // __println_i64(i64) -> ()
+        types.ty().function([ValType::I64], []);
+        self.func_types.insert("__println_i64".to_string(), runtime_type_base + 16);
+        self.func_indices.insert("__println_i64".to_string(), runtime_func_base + 15);
+
+        // __println_str(i32) -> ()
+        types.ty().function([ValType::I32], []);
+        self.func_types.insert("__println_str".to_string(), runtime_type_base + 17);
+        self.func_indices.insert("__println_str".to_string(), runtime_func_base + 16);
+
+        // __println_bool(i32) -> ()
+        types.ty().function([ValType::I32], []);
+        self.func_types.insert("__println_bool".to_string(), runtime_type_base + 18);
+        self.func_indices.insert("__println_bool".to_string(), runtime_func_base + 17);
+
         module.section(&types);
 
         // 构建 vtable（需在 func_indices 设置后）
         self.build_vtables();
 
-        // 2. 导入段 (Import Section) — extern func
+        // 2. 导入段 (Import Section) — extern func + WASI 内置导入
         let mut imports = ImportSection::new();
         for (i, func) in functions.iter().enumerate() {
             if let Some(ref imp) = func.extern_import {
                 imports.import(&imp.module, &imp.name, EntityType::Function(i as u32));
             }
         }
-        if num_imports > 0 {
-            module.section(&imports);
-        }
+        // WASI fd_write 内置导入（用于 println 等 I/O 操作）
+        imports.import(
+            "wasi_snapshot_preview1",
+            "fd_write",
+            EntityType::Function(wasi_fd_write_type_idx),
+        );
+        module.section(&imports);
 
         // 3. 函数段 (Function Section)：仅非 extern 的 type 索引
         let mut func_section = FunctionSection::new();
@@ -634,6 +671,10 @@ impl CodeGen {
         for r in 0..15u32 {
             func_section.function(runtime_type_base + r);
         }
+        // Phase 9: println 运行时函数
+        func_section.function(runtime_type_base + 16); // __println_i64
+        func_section.function(runtime_type_base + 17); // __println_str
+        func_section.function(runtime_type_base + 18); // __println_bool
         module.section(&func_section);
 
         // 3a. Table 段 (Table Section) — 用于 vtable / call_indirect
@@ -738,6 +779,11 @@ impl CodeGen {
         codes.function(&memory::emit_rc_inc_func(heap_start));
         codes.function(&memory::emit_rc_dec_func(heap_start, free_func_idx));
         codes.function(&memory::emit_gc_collect_func(heap_start, free_func_idx));
+
+        // Phase 9: println 运行时函数
+        codes.function(&self.emit_println_i64());
+        codes.function(&self.emit_println_str());
+        codes.function(&self.emit_println_bool());
 
         // 7. Element 段 (Element Section) — vtable 函数引用
         // 注意: WASM 规范要求 Element 在 Code 之前 (Type→Import→Function→Table→Memory→Global→Export→Element→Code→Data)
@@ -1682,6 +1728,273 @@ impl CodeGen {
         f
     }
 
+    // =========================================================================
+    // Phase 9: println 运行时函数实现（基于 WASI fd_write）
+    // =========================================================================
+
+    /// 生成 __println_i64(value: i64) -> () 函数
+    /// 将 Int64 值转换为十进制字符串并输出到 stdout，末尾加换行符
+    /// 使用内存地址 0-63 作为数字转换缓冲区，64-75 作为 iovec/nwritten
+    fn emit_println_i64(&self) -> WasmFunc {
+        let fd_write_idx = self.func_indices["__wasi_fd_write"];
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
+
+        // 参数: local 0 = value (i64)
+        // 局部变量: local 1 = pos (i32), local 2 = is_neg (i32)
+        let mut f = WasmFunc::new(vec![(1, ValType::I32), (1, ValType::I32)]);
+
+        // pos = 23 (缓冲区末尾，位置 23 用于换行符)
+        f.instruction(&Instruction::I32Const(23));
+        f.instruction(&Instruction::LocalSet(1));
+
+        // mem[23] = '\n' (10)
+        f.instruction(&Instruction::I32Const(23));
+        f.instruction(&Instruction::I32Const(10));
+        f.instruction(&Instruction::I32Store8(mem(0, 0)));
+
+        // if value == 0
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // pos = 22, mem[22] = '0'
+            f.instruction(&Instruction::I32Const(22));
+            f.instruction(&Instruction::LocalSet(1));
+            f.instruction(&Instruction::I32Const(22));
+            f.instruction(&Instruction::I32Const(48)); // '0'
+            f.instruction(&Instruction::I32Store8(mem(0, 0)));
+        }
+        f.instruction(&Instruction::Else);
+        {
+            // is_neg = (value < 0)
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64Const(0));
+            f.instruction(&Instruction::I64LtS);
+            f.instruction(&Instruction::LocalSet(2));
+
+            // if is_neg: value = 0 - value
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::I64Const(0));
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64Sub);
+            f.instruction(&Instruction::LocalSet(0));
+            f.instruction(&Instruction::End);
+
+            // while value > 0 (使用无符号运算，正确处理 i64::MIN)
+            f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            {
+                // if value == 0, break
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Eqz);
+                f.instruction(&Instruction::BrIf(1));
+
+                // pos = pos - 1
+                f.instruction(&Instruction::LocalGet(1));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Sub);
+                f.instruction(&Instruction::LocalSet(1));
+
+                // mem[pos] = (value %u 10) + '0'
+                f.instruction(&Instruction::LocalGet(1)); // addr
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Const(10));
+                f.instruction(&Instruction::I64RemU);
+                f.instruction(&Instruction::I32WrapI64);
+                f.instruction(&Instruction::I32Const(48)); // '0'
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::I32Store8(mem(0, 0)));
+
+                // value = value /u 10
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Const(10));
+                f.instruction(&Instruction::I64DivU);
+                f.instruction(&Instruction::LocalSet(0));
+
+                f.instruction(&Instruction::Br(0)); // continue loop
+            }
+            f.instruction(&Instruction::End); // end loop
+            f.instruction(&Instruction::End); // end block
+
+            // if is_neg: prepend '-'
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalSet(1));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(45)); // '-'
+            f.instruction(&Instruction::I32Store8(mem(0, 0)));
+            f.instruction(&Instruction::End);
+        }
+        f.instruction(&Instruction::End); // end if value == 0
+
+        // 设置 iovec: buf = pos, len = 24 - pos
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::I32Const(24));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Store(mem(4, 2)));
+
+        // fd_write(stdout=1, iovs=IOVEC_OFFSET, iovs_len=1, nwritten=NWRITTEN_OFFSET)
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Const(NWRITTEN_OFFSET));
+        f.instruction(&Instruction::Call(fd_write_idx));
+        f.instruction(&Instruction::Drop);
+
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __println_str(ptr: i32) -> () 函数
+    /// 输出字符串内容 + 换行符。字符串格式: [length: i32][bytes...]
+    fn emit_println_str(&self) -> WasmFunc {
+        let fd_write_idx = self.func_indices["__wasi_fd_write"];
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
+
+        // 参数: local 0 = ptr (i32)
+        // 局部变量: local 1 = len (i32)
+        let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
+
+        // len = mem[ptr] (字符串长度)
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(mem(0, 2)));
+        f.instruction(&Instruction::LocalSet(1));
+
+        // iovec.buf = ptr + 4 (跳过 length 前缀)
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+
+        // iovec.len = len
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Store(mem(4, 2)));
+
+        // fd_write(1, IOVEC_OFFSET, 1, NWRITTEN_OFFSET) - 输出字符串内容
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Const(NWRITTEN_OFFSET));
+        f.instruction(&Instruction::Call(fd_write_idx));
+        f.instruction(&Instruction::Drop);
+
+        // 输出换行符: mem[0] = '\n'
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Const(10));
+        f.instruction(&Instruction::I32Store8(mem(0, 0)));
+
+        // iovec: buf=0, len=1
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Store(mem(4, 2)));
+
+        // fd_write(1, IOVEC_OFFSET, 1, NWRITTEN_OFFSET) - 输出换行符
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Const(NWRITTEN_OFFSET));
+        f.instruction(&Instruction::Call(fd_write_idx));
+        f.instruction(&Instruction::Drop);
+
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __println_bool(val: i32) -> () 函数
+    /// 输出 "true\n" 或 "false\n"
+    fn emit_println_bool(&self) -> WasmFunc {
+        let fd_write_idx = self.func_indices["__wasi_fd_write"];
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
+
+        // 参数: local 0 = val (i32)
+        let mut f = WasmFunc::new(vec![]);
+
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // "true\n" -> 字节: 116, 114, 117, 101, 10
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Const(0x65757274)); // "true" as little-endian i32
+            f.instruction(&Instruction::I32Store(mem(0, 2)));
+            f.instruction(&Instruction::I32Const(4));
+            f.instruction(&Instruction::I32Const(10)); // '\n'
+            f.instruction(&Instruction::I32Store8(mem(0, 0)));
+
+            // iovec: buf=0, len=5
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Store(mem(0, 2)));
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(5));
+            f.instruction(&Instruction::I32Store(mem(4, 2)));
+
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Const(NWRITTEN_OFFSET));
+            f.instruction(&Instruction::Call(fd_write_idx));
+            f.instruction(&Instruction::Drop);
+        }
+        f.instruction(&Instruction::Else);
+        {
+            // "false\n" -> 字节: 102, 97, 108, 115, 101, 10
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Const(0x736C6166)); // "fals" as little-endian i32
+            f.instruction(&Instruction::I32Store(mem(0, 2)));
+            f.instruction(&Instruction::I32Const(4));
+            f.instruction(&Instruction::I32Const(101)); // 'e'
+            f.instruction(&Instruction::I32Store8(mem(0, 0)));
+            f.instruction(&Instruction::I32Const(5));
+            f.instruction(&Instruction::I32Const(10)); // '\n'
+            f.instruction(&Instruction::I32Store8(mem(0, 0)));
+
+            // iovec: buf=0, len=6
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Store(mem(0, 2)));
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(6));
+            f.instruction(&Instruction::I32Store(mem(4, 2)));
+
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Const(NWRITTEN_OFFSET));
+            f.instruction(&Instruction::Call(fd_write_idx));
+            f.instruction(&Instruction::Drop);
+        }
+        f.instruction(&Instruction::End); // end if
+
+        f.instruction(&Instruction::End);
+        f
+    }
+
     /// 收集局部变量
     fn collect_locals(&self, stmt: &Stmt, locals: &mut LocalsBuilder) {
         match stmt {
@@ -2430,6 +2743,8 @@ impl CodeGen {
             Expr::TryBlock { .. } => false,
             // super(args) 初始化调用不产生值（已在 compile_expr 中 drop）
             Expr::SuperCall { method, .. } => method != "init" && !method.is_empty(),
+            // println/print 不返回值
+            Expr::Call { name, .. } if name == "println" || name == "print" => false,
             _ => true,
         }
     }
@@ -2461,7 +2776,9 @@ impl CodeGen {
             Expr::StructInit { .. } => ValType::I32,
             Expr::ConstructorCall { .. } => ValType::I32,
             Expr::Call { name, type_args: _, args } => {
-                if self.structs.contains_key(name) {
+                if name == "println" || name == "print" {
+                    ValType::I32 // println/print 无返回值，返回虚拟类型
+                } else if self.structs.contains_key(name) {
                     ValType::I32
                 } else if (name == "min" || name == "max") && args.len() == 2
                     || (name == "abs" && args.len() == 1)
@@ -3412,6 +3729,117 @@ impl CodeGen {
                 }
             }
             Expr::Call { name, type_args: _, args } => {
+                // Phase 9: println/print 内置函数处理
+                if name == "println" || name == "print" {
+                    let is_println = name == "println";
+                    if args.is_empty() && is_println {
+                        // println() - 输出空行
+                        let fd_write_idx = self.func_indices["__wasi_fd_write"];
+                        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+                            offset, align, memory_index: 0,
+                        };
+                        // mem[0] = '\n'
+                        func.instruction(&Instruction::I32Const(0));
+                        func.instruction(&Instruction::I32Const(10));
+                        func.instruction(&Instruction::I32Store8(mem(0, 0)));
+                        // iovec: buf=0, len=1
+                        func.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+                        func.instruction(&Instruction::I32Const(0));
+                        func.instruction(&Instruction::I32Store(mem(0, 2)));
+                        func.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Store(mem(4, 2)));
+                        // fd_write(1, IOVEC_OFFSET, 1, NWRITTEN_OFFSET)
+                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+                        func.instruction(&Instruction::I32Const(1));
+                        func.instruction(&Instruction::I32Const(NWRITTEN_OFFSET));
+                        func.instruction(&Instruction::Call(fd_write_idx));
+                        func.instruction(&Instruction::Drop);
+                    } else if args.len() == 1 || (args.is_empty() && !is_println) {
+                        if args.is_empty() {
+                            // print() without args - do nothing
+                        } else {
+                            let arg = &args[0];
+                            let arg_ast_type = self.infer_ast_type_with_locals(arg, locals);
+                            self.compile_expr(arg, locals, func, loop_ctx);
+                            match arg_ast_type.as_ref() {
+                                Some(Type::Bool) => {
+                                    if is_println {
+                                        func.instruction(&Instruction::Call(self.func_indices["__println_bool"]));
+                                    } else {
+                                        // print(bool) - 使用 println_bool 但不换行
+                                        // 暂时也用 println_bool（包含换行），后续可优化
+                                        func.instruction(&Instruction::Call(self.func_indices["__println_bool"]));
+                                    }
+                                }
+                                Some(Type::String) => {
+                                    if is_println {
+                                        func.instruction(&Instruction::Call(self.func_indices["__println_str"]));
+                                    } else {
+                                        func.instruction(&Instruction::Call(self.func_indices["__println_str"]));
+                                    }
+                                }
+                                _ => {
+                                    // 其他类型：转为 i64 后输出数字
+                                    let wasm_type = self.infer_type_with_locals(arg, locals);
+                                    match wasm_type {
+                                        ValType::I64 => {} // 已经是 i64
+                                        ValType::I32 => {
+                                            func.instruction(&Instruction::I64ExtendI32S);
+                                        }
+                                        ValType::F64 => {
+                                            func.instruction(&Instruction::I64TruncF64S);
+                                        }
+                                        ValType::F32 => {
+                                            func.instruction(&Instruction::F64PromoteF32);
+                                            func.instruction(&Instruction::I64TruncF64S);
+                                        }
+                                        _ => {}
+                                    }
+                                    if is_println {
+                                        func.instruction(&Instruction::Call(self.func_indices["__println_i64"]));
+                                    } else {
+                                        func.instruction(&Instruction::Call(self.func_indices["__println_i64"]));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // 多参数：逐个输出（最后一个后面加换行符）
+                        // 简化实现：每个参数都用 println 输出
+                        for arg in args {
+                            let arg_ast_type = self.infer_ast_type_with_locals(arg, locals);
+                            self.compile_expr(arg, locals, func, loop_ctx);
+                            match arg_ast_type.as_ref() {
+                                Some(Type::Bool) => {
+                                    func.instruction(&Instruction::Call(self.func_indices["__println_bool"]));
+                                }
+                                Some(Type::String) => {
+                                    func.instruction(&Instruction::Call(self.func_indices["__println_str"]));
+                                }
+                                _ => {
+                                    let wasm_type = self.infer_type_with_locals(arg, locals);
+                                    match wasm_type {
+                                        ValType::I64 => {}
+                                        ValType::I32 => {
+                                            func.instruction(&Instruction::I64ExtendI32S);
+                                        }
+                                        ValType::F64 => {
+                                            func.instruction(&Instruction::I64TruncF64S);
+                                        }
+                                        ValType::F32 => {
+                                            func.instruction(&Instruction::F64PromoteF32);
+                                            func.instruction(&Instruction::I64TruncF64S);
+                                        }
+                                        _ => {}
+                                    }
+                                    func.instruction(&Instruction::Call(self.func_indices["__println_i64"]));
+                                }
+                            }
+                        }
+                    }
+                } else {
                 // 检查是否为带 init 的类构造调用
                 let init_func_name = format!("__{}_init", name);
                 if self.func_indices.contains_key(&init_func_name) {
@@ -3517,6 +3945,7 @@ impl CodeGen {
                     let idx = *self.func_indices.get(&key).expect("函数未找到");
                     func.instruction(&Instruction::Call(idx));
                 }
+                } // end else (non-println)
             }
             Expr::SuperCall { method, args } => {
                 // super 调用：直接调用父类的方法（绕过 vtable）
