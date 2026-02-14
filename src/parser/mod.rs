@@ -1075,7 +1075,10 @@ impl Parser {
                     Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string())),
                     None => return self.bail(ParseError::UnexpectedEof),
                 };
-                let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
+                // 合并类的泛型参数与方法自身的泛型参数，使类的 T 在方法体和返回类型中可识别为 TypeParam
+                let mut merged_type_params = self.current_type_params.clone();
+                merged_type_params.extend(type_params.clone());
+                let prev_params = std::mem::replace(&mut self.current_type_params, merged_type_params);
                 self.expect(Token::LParen)?;
                 let mut params = self.parse_params()?;
                 self.expect(Token::RParen)?;

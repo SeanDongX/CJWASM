@@ -738,9 +738,9 @@ impl CodeGen {
         codes.function(&memory::emit_rc_inc_func(heap_start));
         codes.function(&memory::emit_rc_dec_func(heap_start, free_func_idx));
         codes.function(&memory::emit_gc_collect_func(heap_start, free_func_idx));
-        module.section(&codes);
 
         // 7. Element 段 (Element Section) — vtable 函数引用
+        // 注意: WASM 规范要求 Element 在 Code 之前 (Type→Import→Function→Table→Memory→Global→Export→Element→Code→Data)
         if !self.vtable_entries.is_empty() {
             let mut elements = ElementSection::new();
             let func_indices: Vec<u32> = self.vtable_entries.clone();
@@ -751,6 +751,8 @@ impl CodeGen {
             );
             module.section(&elements);
         }
+
+        module.section(&codes);
 
         // 8. 数据段 (Data Section) - 字符串常量
         if !self.string_pool.is_empty() {
@@ -1359,6 +1361,13 @@ impl CodeGen {
             }
         }
 
+        // 如果函数有返回类型，在函数末尾添加 unreachable 指令
+        // 这处理了所有路径都通过 return 退出的情况（如 match 所有分支都 return）
+        // 没有 unreachable，WASM 验证器会报 "nothing on stack" 错误
+        if func.return_type.is_some() && init_class_name.is_none() {
+            wasm_func.instruction(&Instruction::Unreachable);
+        }
+
         wasm_func.instruction(&Instruction::End);
         wasm_func
     }
@@ -1682,8 +1691,15 @@ impl CodeGen {
                         let val_type = ty
                             .as_ref()
                             .map(|t| t.to_wasm())
-                            .unwrap_or_else(|| self.infer_type(value));
-                        let ast_type = ty.clone().or_else(|| self.infer_ast_type(value));
+                            .unwrap_or_else(|| {
+                                // 优先使用带 locals 上下文的 AST 类型推断（更精确）
+                                self.infer_ast_type_with_locals(value, locals)
+                                    .map(|t| t.to_wasm())
+                                    .unwrap_or_else(|| self.infer_type(value))
+                            });
+                        let ast_type = ty.clone()
+                            .or_else(|| self.infer_ast_type_with_locals(value, locals))
+                            .or_else(|| self.infer_ast_type(value));
                         locals.add(name, val_type, ast_type);
                     }
                     Pattern::Struct { name: struct_name, fields } => {
@@ -1706,8 +1722,14 @@ impl CodeGen {
                 let val_type = ty
                     .as_ref()
                     .map(|t| t.to_wasm())
-                    .unwrap_or_else(|| self.infer_type(value));
-                let ast_type = ty.clone().or_else(|| self.infer_ast_type(value));
+                    .unwrap_or_else(|| {
+                        self.infer_ast_type_with_locals(value, locals)
+                            .map(|t| t.to_wasm())
+                            .unwrap_or_else(|| self.infer_type(value))
+                    });
+                let ast_type = ty.clone()
+                    .or_else(|| self.infer_ast_type_with_locals(value, locals))
+                    .or_else(|| self.infer_ast_type(value));
                 locals.add(name, val_type, ast_type);
                 self.collect_locals_from_expr(value, locals);
             }
@@ -1954,8 +1976,12 @@ impl CodeGen {
                 for stmt in body {
                     self.collect_locals(stmt, locals);
                 }
+                // catch 变量用 __err_val 的实际类型（可能被嵌套 try 升级）
+                let actual_err_val_type = locals.get("__err_val")
+                    .map(|idx| locals.types[idx as usize])
+                    .unwrap_or(err_val_type);
                 if let Some(var) = catch_var {
-                    locals.add(var, err_val_type, None); // 错误值，类型与 throw 表达式匹配
+                    locals.add(var, actual_err_val_type, None);
                 }
                 for stmt in catch_body {
                     self.collect_locals(stmt, locals);
@@ -2039,6 +2065,22 @@ impl CodeGen {
             Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
             Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone(), vec![])),
             Expr::Call { name, type_args: _, args } => {
+                // 类型构造函数：Float32(x), Float64(x), Int64(x) 等
+                match name.as_str() {
+                    "Int8" => return Some(Type::Int8),
+                    "Int16" => return Some(Type::Int16),
+                    "Int32" => return Some(Type::Int32),
+                    "Int64" => return Some(Type::Int64),
+                    "UInt8" => return Some(Type::UInt8),
+                    "UInt16" => return Some(Type::UInt16),
+                    "UInt32" => return Some(Type::UInt32),
+                    "UInt64" => return Some(Type::UInt64),
+                    "Float32" => return Some(Type::Float32),
+                    "Float64" => return Some(Type::Float64),
+                    "Bool" => return Some(Type::Bool),
+                    "Rune" => return Some(Type::Rune),
+                    _ => {}
+                }
                 if self.structs.contains_key(name) {
                     Some(Type::Struct(name.clone(), vec![]))
                 } else if (name == "min" || name == "max") && args.len() == 2
@@ -2062,7 +2104,20 @@ impl CodeGen {
                     key.and_then(|k| self.func_return_types.get(&k).cloned())
                 }
             }
-            Expr::MethodCall { .. } => None, // 需结合 locals 推断，调用处可写类型注解
+            Expr::Interpolate(_) => Some(Type::String), // 字符串插值结果是 String
+            Expr::MethodCall { object, method, .. } => {
+                // 尝试通过对象类型 + 方法名查找 func_return_types
+                self.infer_ast_type(object).and_then(|ty| {
+                    let type_name = match &ty {
+                        Type::Struct(name, _) => Some(name.clone()),
+                        _ => None,
+                    };
+                    type_name.and_then(|tn| {
+                        let key = format!("{}.{}", tn, method);
+                        self.func_return_types.get(&key).cloned()
+                    })
+                })
+            }
             Expr::SuperCall { .. } => None, // super 调用，需结合父类推断
             Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
             Expr::IfLet { then_branch, .. } => self.infer_ast_type(then_branch),
@@ -2084,6 +2139,23 @@ impl CodeGen {
                     Some(Type::Result(t, _)) => Some(*t),
                     _ => None,
                 }
+            }
+            Expr::Match { arms, .. } => {
+                arms.first().and_then(|arm| self.infer_ast_type(&arm.body))
+            }
+            Expr::If { then_branch, else_branch, .. } => {
+                self.infer_ast_type(then_branch)
+                    .or_else(|| else_branch.as_ref().and_then(|eb| self.infer_ast_type(eb)))
+            }
+            Expr::Block(stmts, tail) => {
+                tail.as_ref().and_then(|t| self.infer_ast_type(t))
+                    .or_else(|| stmts.last().and_then(|s| {
+                        if let Stmt::Expr(ref e) = s {
+                            self.infer_ast_type(e)
+                        } else {
+                            None
+                        }
+                    }))
             }
             _ => None,
         }
@@ -2125,6 +2197,22 @@ impl CodeGen {
             Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
             Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone(), vec![])),
             Expr::Call { name, type_args: _, args } => {
+                // 类型构造函数：Float32(x), Float64(x), Int64(x) 等
+                match name.as_str() {
+                    "Int8" => return Some(Type::Int8),
+                    "Int16" => return Some(Type::Int16),
+                    "Int32" => return Some(Type::Int32),
+                    "Int64" => return Some(Type::Int64),
+                    "UInt8" => return Some(Type::UInt8),
+                    "UInt16" => return Some(Type::UInt16),
+                    "UInt32" => return Some(Type::UInt32),
+                    "UInt64" => return Some(Type::UInt64),
+                    "Float32" => return Some(Type::Float32),
+                    "Float64" => return Some(Type::Float64),
+                    "Bool" => return Some(Type::Bool),
+                    "Rune" => return Some(Type::Rune),
+                    _ => {}
+                }
                 if self.structs.contains_key(name) {
                     Some(Type::Struct(name.clone(), vec![]))
                 } else if (name == "min" || name == "max") && args.len() == 2
@@ -2148,7 +2236,20 @@ impl CodeGen {
                     key.and_then(|k| self.func_return_types.get(&k).cloned())
                 }
             }
-            Expr::MethodCall { .. } => None,
+            Expr::Interpolate(_) => Some(Type::String), // 字符串插值结果是 String
+            Expr::MethodCall { object, method, .. } => {
+                // 尝试通过对象类型 + 方法名查找 func_return_types
+                self.infer_ast_type_with_locals(object, locals).and_then(|ty| {
+                    let type_name = match &ty {
+                        Type::Struct(name, _) => Some(name.clone()),
+                        _ => None,
+                    };
+                    type_name.and_then(|tn| {
+                        let key = format!("{}.{}", tn, method);
+                        self.func_return_types.get(&key).cloned()
+                    })
+                })
+            }
             Expr::SuperCall { .. } => None,
             Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
             Expr::IfLet { then_branch, .. } => self.infer_ast_type_with_locals(then_branch, locals),
@@ -2163,7 +2264,18 @@ impl CodeGen {
                     }
                 })
             }
-            Expr::Index { .. } => Some(Type::Int64), // 数组下标结果暂按 Int64
+            Expr::Index { array, .. } => {
+                // 数组下标：Array<T>[i] 返回 T；Tuple[i] 返回元素类型
+                match self.infer_ast_type_with_locals(array, locals) {
+                    Some(Type::Array(elem_ty)) => Some(*elem_ty),
+                    Some(Type::Tuple(types)) => {
+                        // 元组索引在编译时可能已知
+                        types.first().cloned() // 默认返回第一个元素的类型
+                    }
+                    Some(Type::Slice(elem_ty)) => Some(*elem_ty),
+                    _ => Some(Type::Int64), // 未知时默认 Int64
+                }
+            }
             Expr::Unary { expr, .. } => self.infer_ast_type_with_locals(expr, locals),
             Expr::Binary { op, left, right, .. } => {
                 use crate::ast::BinOp;
@@ -2193,6 +2305,25 @@ impl CodeGen {
                     _ => None,
                 }
             }
+            Expr::Match { arms, .. } => {
+                // match 结果类型 = 第一个 arm 的 body 类型
+                arms.first().and_then(|arm| self.infer_ast_type_with_locals(&arm.body, locals))
+            }
+            Expr::If { then_branch, else_branch, .. } => {
+                self.infer_ast_type_with_locals(then_branch, locals)
+                    .or_else(|| else_branch.as_ref().and_then(|eb| self.infer_ast_type_with_locals(eb, locals)))
+            }
+            Expr::Block(stmts, tail) => {
+                // Block 的结果类型 = tail 表达式的类型，或最后一个语句（如果是 Expr）的类型
+                tail.as_ref().and_then(|t| self.infer_ast_type_with_locals(t, locals))
+                    .or_else(|| stmts.last().and_then(|s| {
+                        if let Stmt::Expr(ref e) = s {
+                            self.infer_ast_type_with_locals(e, locals)
+                        } else {
+                            None
+                        }
+                    }))
+            }
             _ => self.infer_ast_type(expr),
         }
     }
@@ -2214,6 +2345,36 @@ impl CodeGen {
             Expr::Range { .. } => Some(Type::Int64),
             Expr::Array(ref elems) => elems.first().and_then(|e| self.infer_ast_type(e)).or(Some(Type::Int64)),
             _ => None,
+        }
+    }
+
+    /// match 表达式最后一个 arm 不匹配时的默认值（按 result_type 生成正确类型的零值）
+    fn emit_match_default_value(func: &mut WasmFunc, result_type: wasm_encoder::BlockType) {
+        match result_type {
+            wasm_encoder::BlockType::Result(ValType::I32) => { func.instruction(&Instruction::I32Const(0)); }
+            wasm_encoder::BlockType::Result(ValType::F32) => { func.instruction(&Instruction::F32Const(0.0)); }
+            wasm_encoder::BlockType::Result(ValType::F64) => { func.instruction(&Instruction::F64Const(0.0)); }
+            _ => { func.instruction(&Instruction::I64Const(0)); }
+        }
+    }
+
+    /// 当值类型与目标类型不匹配时，生成自动类型转换指令
+    fn emit_type_coercion(&self, func: &mut WasmFunc, src: ValType, dst: ValType) {
+        if src == dst { return; }
+        match (src, dst) {
+            (ValType::I64, ValType::I32) => { func.instruction(&Instruction::I32WrapI64); }
+            (ValType::I32, ValType::I64) => { func.instruction(&Instruction::I64ExtendI32S); }
+            (ValType::I64, ValType::F64) => { func.instruction(&Instruction::F64ConvertI64S); }
+            (ValType::F64, ValType::I64) => { func.instruction(&Instruction::I64TruncF64S); }
+            (ValType::I32, ValType::F64) => { func.instruction(&Instruction::F64ConvertI32S); }
+            (ValType::F64, ValType::I32) => { func.instruction(&Instruction::I32TruncF64S); }
+            (ValType::F32, ValType::F64) => { func.instruction(&Instruction::F64PromoteF32); }
+            (ValType::F64, ValType::F32) => { func.instruction(&Instruction::F32DemoteF64); }
+            (ValType::I32, ValType::F32) => { func.instruction(&Instruction::F32ConvertI32S); }
+            (ValType::F32, ValType::I32) => { func.instruction(&Instruction::I32TruncF32S); }
+            (ValType::I64, ValType::F32) => { func.instruction(&Instruction::F32ConvertI64S); }
+            (ValType::F32, ValType::I64) => { func.instruction(&Instruction::I64TruncF32S); }
+            _ => {} // 相同类型或无法转换，跳过
         }
     }
 
@@ -2267,6 +2428,8 @@ impl CodeGen {
             Expr::Throw(_) => false,
             // try-catch 内部通过 return 处理控制流，不在栈上留值
             Expr::TryBlock { .. } => false,
+            // super(args) 初始化调用不产生值（已在 compile_expr 中 drop）
+            Expr::SuperCall { method, .. } => method != "init" && !method.is_empty(),
             _ => true,
         }
     }
@@ -2280,6 +2443,10 @@ impl CodeGen {
 
     /// 简单的类型推断
     fn infer_type(&self, expr: &Expr) -> ValType {
+        // 优先使用 AST 类型推断（更精确，能处理 Field/Index/MethodCall 等）
+        if let Some(ast_ty) = self.infer_ast_type(expr) {
+            return ast_ty.to_wasm();
+        }
         match expr {
             Expr::Integer(_) => ValType::I64,
             Expr::Float(_) => ValType::F64,
@@ -2289,7 +2456,7 @@ impl CodeGen {
             Expr::String(_) => ValType::I32,
             Expr::Array(_) => ValType::I32,
             Expr::Tuple(_) => ValType::I32,
-            Expr::TupleIndex { .. } => ValType::I64, // 默认假设 i64，实际需类型推断
+            Expr::TupleIndex { .. } => ValType::I64, // 默认假设 i64，实际由 AST 推断处理
             Expr::NullCoalesce { default, .. } => self.infer_type(default),
             Expr::StructInit { .. } => ValType::I32,
             Expr::ConstructorCall { .. } => ValType::I32,
@@ -2329,8 +2496,8 @@ impl CodeGen {
                 | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => ValType::I32,
                 _ => self.infer_type(left),
             },
-            Expr::Index { .. } => ValType::I64,
-            Expr::Field { .. } => ValType::I64,
+            Expr::Index { .. } => ValType::I64,    // AST 推断未覆盖时的回退
+            Expr::Field { .. } => ValType::I64,    // AST 推断未覆盖时的回退
             Expr::VariantConst { .. } => ValType::I32,
             Expr::Cast { target_ty, .. } => target_ty.to_wasm(),
             Expr::IfLet { then_branch, .. } => self.infer_type(then_branch),
@@ -2371,6 +2538,10 @@ impl CodeGen {
                 match pattern {
                     Pattern::Binding(name) => {
                         let idx = locals.get(name).expect("局部变量未找到");
+                        // 值类型与局部变量类型不匹配时自动转换
+                        let val_ty = self.infer_type_with_locals(value, locals);
+                        let local_ty = locals.get_valtype(name).unwrap_or(val_ty);
+                        self.emit_type_coercion(func, val_ty, local_ty);
                         func.instruction(&Instruction::LocalSet(idx));
                     }
                     Pattern::Struct { name: struct_name, fields } => {
@@ -2396,6 +2567,10 @@ impl CodeGen {
             Stmt::Var { name, value, .. } => {
                 self.compile_expr(value, locals, func, loop_ctx);
                 let idx = locals.get(name).expect("局部变量未找到");
+                // 值类型与局部变量类型不匹配时自动转换
+                let val_ty = self.infer_type_with_locals(value, locals);
+                let local_ty = locals.get_valtype(name).unwrap_or(val_ty);
+                self.emit_type_coercion(func, val_ty, local_ty);
                 func.instruction(&Instruction::LocalSet(idx));
             }
             Stmt::Assign { target, value } => {
@@ -2413,6 +2588,10 @@ impl CodeGen {
                         }
                         self.compile_expr(value, locals, func, loop_ctx);
                         let idx = locals.get(name).expect("变量未找到");
+                        // 值类型与局部变量类型不匹配时自动转换
+                        let val_ty = self.infer_type_with_locals(value, locals);
+                        let local_ty = locals.get_valtype(name).unwrap_or(val_ty);
+                        self.emit_type_coercion(func, val_ty, local_ty);
                         func.instruction(&Instruction::LocalSet(idx));
                     }
                     AssignTarget::Index { array, index } => {
@@ -2528,8 +2707,8 @@ impl CodeGen {
                 func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // Br(1) = break
                 func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));   // Br(0) = continue
                 self.compile_expr(expr, locals, func, loop_ctx);
-                let subject_ty = self.infer_type(expr);
-                let subject_ast_type = self.infer_ast_type(expr);
+                let subject_ty = self.infer_type_with_locals(expr, locals);
+                let subject_ast_type = self.infer_ast_type_with_locals(expr, locals);
                 let ptr_tmp = locals.get("__match_enum_ptr").expect("__match_enum_ptr");
                 let body_ctx = Some((1u32, 0u32));
 
@@ -2651,7 +2830,7 @@ impl CodeGen {
                         self.compile_expr(start, locals, func, loop_ctx);
                         func.instruction(&Instruction::LocalSet(var_idx));
 
-                        // block { loop { ... } }
+                        // block { loop { block { body } increment; br 0 } }
                         func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
                         func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
@@ -2663,13 +2842,16 @@ impl CodeGen {
                         } else {
                             func.instruction(&Instruction::I64GeS); // i >= end
                         }
-                        func.instruction(&Instruction::BrIf(1)); // 退出
+                        func.instruction(&Instruction::BrIf(1)); // 退出外层 block
 
-                        // 循环体
-                        let body_ctx = Some((1u32, 0u32));
+                        // 循环体用 block 包裹，使 continue 跳到增量步骤
+                        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                        // break=2 (outer block), continue=0 (exits body block → increment)
+                        let body_ctx = Some((2u32, 0u32));
                         for s in body {
                             self.compile_stmt(s, locals, func, body_ctx);
                         }
+                        func.instruction(&Instruction::End); // body block end
 
                         // 递增循环变量
                         func.instruction(&Instruction::LocalGet(var_idx));
@@ -2677,7 +2859,7 @@ impl CodeGen {
                         func.instruction(&Instruction::I64Add);
                         func.instruction(&Instruction::LocalSet(var_idx));
 
-                        func.instruction(&Instruction::Br(0)); // 继续循环
+                        func.instruction(&Instruction::Br(0)); // 继续循环 (target loop)
                         func.instruction(&Instruction::End); // loop end
                         func.instruction(&Instruction::End); // block end
                     }
@@ -2745,11 +2927,14 @@ impl CodeGen {
                         }));
                         func.instruction(&Instruction::LocalSet(var_idx));
 
-                        // 循环体
-                        let body_ctx = Some((1u32, 0u32));
+                        // 循环体用 block 包裹，使 continue 跳到增量步骤
+                        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                        // break=2 (outer block), continue=0 (exits body block → increment)
+                        let body_ctx = Some((2u32, 0u32));
                         for s in body {
                             self.compile_stmt(s, locals, func, body_ctx);
                         }
+                        func.instruction(&Instruction::End); // body block end
 
                         // 递增索引
                         func.instruction(&Instruction::LocalGet(idx_idx));
@@ -2757,7 +2942,7 @@ impl CodeGen {
                         func.instruction(&Instruction::I64Add);
                         func.instruction(&Instruction::LocalSet(idx_idx));
 
-                        func.instruction(&Instruction::Br(0)); // 继续循环
+                        func.instruction(&Instruction::Br(0)); // 继续循环 (target loop)
                         func.instruction(&Instruction::End); // loop end
                         func.instruction(&Instruction::End); // block end
                     }
@@ -2912,14 +3097,14 @@ impl CodeGen {
             }
             Expr::Unary { op: UnaryOp::Not, expr } => {
                 self.compile_expr(expr, locals, func, loop_ctx);
-                if self.infer_type(expr) == ValType::I64 {
+                if self.infer_type_with_locals(expr, locals) == ValType::I64 {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
             }
             Expr::Unary { op: UnaryOp::BitNot, expr } => {
                 self.compile_expr(expr, locals, func, loop_ctx);
-                let ty = self.infer_type(expr);
+                let ty = self.infer_type_with_locals(expr, locals);
                 match ty {
                     ValType::I64 => {
                         func.instruction(&Instruction::I64Const(-1));
@@ -2933,7 +3118,7 @@ impl CodeGen {
                 }
             }
             Expr::Unary { op: UnaryOp::Neg, expr } => {
-                let ty = self.infer_type(expr);
+                let ty = self.infer_type_with_locals(expr, locals);
                 match ty {
                     ValType::I32 => {
                         func.instruction(&Instruction::I32Const(0));
@@ -2961,7 +3146,7 @@ impl CodeGen {
             Expr::Binary { op: BinOp::LogicalAnd, left, right } => {
                 // 短路与：left && right，结果为 i32 (0/1)
                 self.compile_expr(left, locals, func, loop_ctx);
-                if self.infer_type(left) == ValType::I64 {
+                if self.infer_type_with_locals(left, locals) == ValType::I64 {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -2969,7 +3154,7 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::Else);
                 self.compile_expr(right, locals, func, loop_ctx);
-                if self.infer_type(right) == ValType::I64 {
+                if self.infer_type_with_locals(right, locals) == ValType::I64 {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -2981,7 +3166,7 @@ impl CodeGen {
                 // 短路或：left || right，用 __logical_tmp 保存 left，结果为 i32 (0/1)
                 let tmp = locals.get("__logical_tmp").expect("__logical_tmp 未找到");
                 self.compile_expr(left, locals, func, loop_ctx);
-                if self.infer_type(left) == ValType::I64 {
+                if self.infer_type_with_locals(left, locals) == ValType::I64 {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::LocalSet(tmp));
@@ -2989,7 +3174,7 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Eqz);
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
                 self.compile_expr(right, locals, func, loop_ctx);
-                if self.infer_type(right) == ValType::I64 {
+                if self.infer_type_with_locals(right, locals) == ValType::I64 {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -3181,7 +3366,7 @@ impl CodeGen {
             }
             Expr::Cast { expr, target_ty } => {
                 self.compile_expr(expr, locals, func, loop_ctx);
-                let src = self.infer_type(expr);
+                let src = self.infer_type_with_locals(expr, locals);
                 let dst = target_ty.to_wasm();
                 if src != dst {
                     let conv = match (src, dst) {
@@ -3319,6 +3504,10 @@ impl CodeGen {
                         } else if i < args.len() && variadic_idx.map_or(true, |vi| i < vi) {
                             // 普通参数：直接编译实参
                             self.compile_expr(&args[i], locals, func, loop_ctx);
+                            // 参数类型适配：当实参类型与形参类型不匹配时自动转换
+                            let arg_wasm_ty = self.infer_type_with_locals(&args[i], locals);
+                            let param_wasm_ty = param.ty.to_wasm();
+                            self.emit_type_coercion(func, arg_wasm_ty, param_wasm_ty);
                         } else if let Some(ref default) = param.default {
                             self.compile_expr(default, locals, func, loop_ctx);
                         } else {
@@ -3419,6 +3608,9 @@ impl CodeGen {
                     func.instruction(&Instruction::I32WrapI64);
                 }
 
+                // if 指令创建新的 WASM 块，需要将 loop_ctx 的 break/continue 深度 +1
+                let inner_ctx = loop_ctx.map(|(b, c)| (b + 1, c + 1));
+
                 if let Some(else_expr) = else_branch {
                     let then_produces = Self::expr_produces_value(then_branch);
                     let else_produces = Self::expr_produces_value(else_expr);
@@ -3426,18 +3618,18 @@ impl CodeGen {
                         // if-else 表达式：两个分支都有返回值
                         let result_type = wasm_encoder::BlockType::Result(self.infer_type_with_locals(then_branch, locals));
                         func.instruction(&Instruction::If(result_type));
-                        self.compile_expr(then_branch, locals, func, loop_ctx);
+                        self.compile_expr(then_branch, locals, func, inner_ctx);
                         func.instruction(&Instruction::Else);
-                        self.compile_expr(else_expr, locals, func, loop_ctx);
+                        self.compile_expr(else_expr, locals, func, inner_ctx);
                     } else {
                         // if-else 语句：至少一个分支不产生值，用 Empty 块
                         func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                        self.compile_expr(then_branch, locals, func, loop_ctx);
+                        self.compile_expr(then_branch, locals, func, inner_ctx);
                         if then_produces {
                             func.instruction(&Instruction::Drop);
                         }
                         func.instruction(&Instruction::Else);
-                        self.compile_expr(else_expr, locals, func, loop_ctx);
+                        self.compile_expr(else_expr, locals, func, inner_ctx);
                         if else_produces {
                             func.instruction(&Instruction::Drop);
                         }
@@ -3447,7 +3639,7 @@ impl CodeGen {
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     // then_branch 如果会产生值（非 void Block），需要 drop
                     let produces_value = Self::expr_produces_value(then_branch);
-                    self.compile_expr(then_branch, locals, func, loop_ctx);
+                    self.compile_expr(then_branch, locals, func, inner_ctx);
                     if produces_value {
                         func.instruction(&Instruction::Drop);
                     }
@@ -3483,7 +3675,7 @@ impl CodeGen {
                     func.instruction(&Instruction::I32Const(i as i32 * elem_size));
                     func.instruction(&Instruction::I32Add);
                     self.compile_expr(elem, locals, func, loop_ctx);
-                    let elem_ty = self.infer_type(elem);
+                    let elem_ty = self.infer_type_with_locals(elem, locals);
                     match elem_ty {
                         ValType::I64 => func.instruction(&Instruction::I64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 })),
                         ValType::F64 => func.instruction(&Instruction::F64Store(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 })),
@@ -3533,7 +3725,7 @@ impl CodeGen {
                 // Option 内存布局: [tag: i32][value: ...]
                 // tag == 0 => None, tag == 1 => Some
                 self.compile_expr(option, locals, func, loop_ctx);
-                let result_type = self.infer_type(default);
+                let result_type = self.infer_type_with_locals(default, locals);
                 // 保存 option 指针到临时变量
                 let tmp = locals.get("__try_ptr").expect("__try_ptr");
                 func.instruction(&Instruction::LocalSet(tmp));
@@ -3844,13 +4036,13 @@ impl CodeGen {
                 }
             }
             Expr::Match { expr, arms } => {
-                let subject_ty = self.infer_type(expr);
-                let subject_ast_type = self.infer_ast_type(expr);
+                let subject_ty = self.infer_type_with_locals(expr, locals);
+                let subject_ast_type = self.infer_ast_type_with_locals(expr, locals);
 
                 let result_type = if arms.is_empty() {
                     wasm_encoder::BlockType::Empty
                 } else {
-                    wasm_encoder::BlockType::Result(self.infer_type(&arms[0].body))
+                    wasm_encoder::BlockType::Result(self.infer_type_with_locals(&arms[0].body, locals))
                 };
 
                 func.instruction(&Instruction::Block(result_type));
@@ -3867,16 +4059,15 @@ impl CodeGen {
                             if has_guard {
                                 // _ if cond => body
                                 self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
-                                func.instruction(&Instruction::If(result_type));
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 self.compile_expr(&arm.body, locals, func, loop_ctx);
                                 func.instruction(&Instruction::Br(1));
-                                func.instruction(&Instruction::Else);
+                                func.instruction(&Instruction::End);
                                 if is_last {
-                                    func.instruction(&Instruction::I64Const(0));
+                                    Self::emit_match_default_value(func, result_type);
                                 } else {
                                     self.compile_expr(expr, locals, func, loop_ctx);
                                 }
-                                func.instruction(&Instruction::End);
                             } else {
                                 self.compile_expr(&arm.body, locals, func, loop_ctx);
                                 func.instruction(&Instruction::Br(0));
@@ -3904,16 +4095,15 @@ impl CodeGen {
                                 func.instruction(&Instruction::End);
                             }
 
-                            func.instruction(&Instruction::If(result_type));
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                             self.compile_expr(&arm.body, locals, func, loop_ctx);
                             func.instruction(&Instruction::Br(1));
-                            func.instruction(&Instruction::Else);
+                            func.instruction(&Instruction::End);
                             if is_last {
-                                func.instruction(&Instruction::I64Const(0));
+                                Self::emit_match_default_value(func, result_type);
                             } else {
                                 self.compile_expr(expr, locals, func, loop_ctx);
                             }
-                            func.instruction(&Instruction::End);
                         }
                         Pattern::Binding(name) => {
                             if let Some(idx) = locals.get(name) {
@@ -3924,16 +4114,15 @@ impl CodeGen {
                             }
                             if has_guard {
                                 self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
-                                func.instruction(&Instruction::If(result_type));
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 self.compile_expr(&arm.body, locals, func, loop_ctx);
                                 func.instruction(&Instruction::Br(1));
-                                func.instruction(&Instruction::Else);
+                                func.instruction(&Instruction::End);
                                 if is_last {
-                                    func.instruction(&Instruction::I64Const(0));
+                                    Self::emit_match_default_value(func, result_type);
                                 } else {
                                     self.compile_expr(expr, locals, func, loop_ctx);
                                 }
-                                func.instruction(&Instruction::End);
                             } else {
                                 self.compile_expr(&arm.body, locals, func, loop_ctx);
                                 func.instruction(&Instruction::Br(0));
@@ -3975,7 +4164,7 @@ impl CodeGen {
                                     func.instruction(&Instruction::I32Eq);
                                 }
 
-                                func.instruction(&Instruction::If(result_type));
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 if has_variant_payload {
                                     if let Some(ref bind_name) = binding {
                                         if let Some(ref payload_ty) = resolved_payload {
@@ -3995,38 +4184,33 @@ impl CodeGen {
                                         func,
                                         loop_ctx,
                                     );
-                                    func.instruction(&Instruction::If(result_type));
+                                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                     self.compile_expr(&arm.body, locals, func, loop_ctx);
-                                    func.instruction(&Instruction::Br(1));
-                                    func.instruction(&Instruction::Else);
-                                    self.compile_expr(expr, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Br(2)); // 0=guard-if, 1=variant-if, 2=outer block
                                     func.instruction(&Instruction::End);
-                                    func.instruction(&Instruction::Br(1));
                                 } else {
                                     self.compile_expr(&arm.body, locals, func, loop_ctx);
-                                    func.instruction(&Instruction::Br(1));
-                                }
-                                func.instruction(&Instruction::Else);
-                                if is_last {
-                                    func.instruction(&Instruction::I64Const(0));
-                                } else {
-                                    self.compile_expr(expr, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Br(1)); // 0=variant-if, 1=outer block
                                 }
                                 func.instruction(&Instruction::End);
+                                if is_last {
+                                    Self::emit_match_default_value(func, result_type);
+                                } else {
+                                    self.compile_expr(expr, locals, func, loop_ctx);
+                                }
                             } else {
                                 func.instruction(&Instruction::Drop);
                                 if has_guard {
                                     self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
-                                    func.instruction(&Instruction::If(result_type));
+                                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                     self.compile_expr(&arm.body, locals, func, loop_ctx);
                                     func.instruction(&Instruction::Br(1));
-                                    func.instruction(&Instruction::Else);
+                                    func.instruction(&Instruction::End);
                                     if is_last {
-                                        func.instruction(&Instruction::I64Const(0));
+                                        Self::emit_match_default_value(func, result_type);
                                     } else {
                                         self.compile_expr(expr, locals, func, loop_ctx);
                                     }
-                                    func.instruction(&Instruction::End);
                                 } else {
                                     self.compile_expr(&arm.body, locals, func, loop_ctx);
                                     func.instruction(&Instruction::Br(0));
@@ -4056,16 +4240,15 @@ impl CodeGen {
                                     func.instruction(&Instruction::End);
                                 }
 
-                                func.instruction(&Instruction::If(result_type));
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 self.compile_expr(&arm.body, locals, func, loop_ctx);
                                 func.instruction(&Instruction::Br(1));
-                                func.instruction(&Instruction::Else);
+                                func.instruction(&Instruction::End);
                                 if is_last {
-                                    func.instruction(&Instruction::I64Const(0));
+                                    Self::emit_match_default_value(func, result_type);
                                 } else {
                                     self.compile_expr(expr, locals, func, loop_ctx);
                                 }
-                                func.instruction(&Instruction::End);
                             }
                         }
                         Pattern::Or(patterns) => {
@@ -4090,16 +4273,15 @@ impl CodeGen {
                                 func.instruction(&Instruction::End);
                             }
 
-                            func.instruction(&Instruction::If(result_type));
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                             self.compile_expr(&arm.body, locals, func, loop_ctx);
                             func.instruction(&Instruction::Br(1));
-                            func.instruction(&Instruction::Else);
+                            func.instruction(&Instruction::End);
                             if is_last {
-                                func.instruction(&Instruction::I64Const(0));
+                                Self::emit_match_default_value(func, result_type);
                             } else {
                                 self.compile_expr(expr, locals, func, loop_ctx);
                             }
-                            func.instruction(&Instruction::End);
                         }
                         Pattern::Struct { name: struct_name, fields } => {
                             let handled = if let Some(Type::Struct(ref sub_name, _)) = subject_ast_type {
@@ -4125,38 +4307,34 @@ impl CodeGen {
                                 }
                                 if has_guard {
                                     self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
-                                    func.instruction(&Instruction::If(result_type));
+                                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                     self.compile_expr(&arm.body, locals, func, loop_ctx);
-                                    func.instruction(&Instruction::Br(1));
-                                    func.instruction(&Instruction::Else);
-                                    self.compile_expr(expr, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Br(1)); // 0=guard-if, 1=outer block
                                     func.instruction(&Instruction::End);
-                                    func.instruction(&Instruction::Br(1));
+                                    // guard 失败时，需要为下一个 arm 重新推送 subject 或默认值
+                                    if is_last {
+                                        Self::emit_match_default_value(func, result_type);
+                                    } else {
+                                        self.compile_expr(expr, locals, func, loop_ctx);
+                                    }
                                 } else {
+                                    // struct 模式无 guard 总是匹配成功
                                     self.compile_expr(&arm.body, locals, func, loop_ctx);
-                                    func.instruction(&Instruction::Br(1));
+                                    func.instruction(&Instruction::Br(0)); // 0=outer block
                                 }
-                                func.instruction(&Instruction::Else);
-                                if is_last {
-                                    func.instruction(&Instruction::I64Const(0));
-                                } else {
-                                    self.compile_expr(expr, locals, func, loop_ctx);
-                                }
-                                func.instruction(&Instruction::End);
                             } else {
                                 func.instruction(&Instruction::Drop);
                                 if has_guard {
                                     self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
-                                    func.instruction(&Instruction::If(result_type));
+                                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                     self.compile_expr(&arm.body, locals, func, loop_ctx);
                                     func.instruction(&Instruction::Br(1));
-                                    func.instruction(&Instruction::Else);
+                                    func.instruction(&Instruction::End);
                                     if is_last {
-                                        func.instruction(&Instruction::I64Const(0));
+                                        Self::emit_match_default_value(func, result_type);
                                     } else {
                                         self.compile_expr(expr, locals, func, loop_ctx);
                                     }
-                                    func.instruction(&Instruction::End);
                                 } else {
                                     self.compile_expr(&arm.body, locals, func, loop_ctx);
                                     func.instruction(&Instruction::Br(0));
@@ -4188,7 +4366,7 @@ impl CodeGen {
             Expr::Some(inner) => {
                 // Option::Some(v) -> 堆分配 [tag=1: i32][value]
                 // 返回指针
-                let value_size = match self.infer_ast_type(inner) {
+                let value_size = match self.infer_ast_type_with_locals(inner, locals) {
                     Some(t) => t.size(),
                     None => 8, // 默认 i64
                 };
@@ -4210,11 +4388,8 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(4)); // 跳过 tag
                 func.instruction(&Instruction::I32Add);
                 self.compile_expr(inner, locals, func, loop_ctx);
-                func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 3,
-                    memory_index: 0,
-                }));
+                let inner_wasm_ty = self.infer_type_with_locals(inner, locals);
+                Self::emit_store_by_wasm_type(func, inner_wasm_ty);
 
                 // 更新堆指针
                 func.instruction(&Instruction::GlobalGet(0));
@@ -4242,7 +4417,7 @@ impl CodeGen {
             }
             Expr::Ok(inner) => {
                 // Result::Ok(v) -> 堆分配 [tag=0: i32][value]
-                let inner_ast_type = self.infer_ast_type(inner);
+                let inner_ast_type = self.infer_ast_type_with_locals(inner, locals);
                 let value_size = match &inner_ast_type {
                     Some(t) => t.size(),
                     None => 8,
@@ -4273,7 +4448,7 @@ impl CodeGen {
             }
             Expr::Err(inner) => {
                 // Result::Err(e) -> 堆分配 [tag=1: i32][error]
-                let inner_ast_type = self.infer_ast_type(inner);
+                let inner_ast_type = self.infer_ast_type_with_locals(inner, locals);
                 let value_size = match &inner_ast_type {
                     Some(t) => t.size(),
                     None => 8,
@@ -4401,9 +4576,8 @@ impl CodeGen {
                     }
                 }
 
-                // try-catch 所有路径通常都通过 return 退出，
-                // 但 WASM 验证器无法追踪条件返回，标记此处不可达
-                func.instruction(&Instruction::Unreachable);
+                // try-catch-finally 完成后，控制流正常继续
+                // 不添加 unreachable，因为 try-catch 可能作为语句使用，后续还有代码
             }
             Expr::SliceExpr { .. } | Expr::MapLiteral { .. } => {
                 todo!("SliceExpr and MapLiteral codegen not yet implemented")
@@ -4430,7 +4604,21 @@ impl LocalsBuilder {
     }
 
     fn add(&mut self, name: &str, ty: ValType, ast_type: Option<Type>) {
-        if !self.names.contains_key(name) {
+        if let Some(&idx) = self.names.get(name) {
+            // 如果已存在但新类型更宽（例如 i32→i64），升级类型
+            // 这处理嵌套 try-catch 共享 __err_val 的情况
+            let existing = self.types[idx as usize];
+            let should_upgrade = matches!(
+                (existing, ty),
+                (ValType::I32, ValType::I64) | (ValType::F32, ValType::F64)
+            );
+            if should_upgrade {
+                self.types[idx as usize] = ty;
+                if let Some(t) = ast_type {
+                    self.ast_types.insert(name.to_string(), t);
+                }
+            }
+        } else {
             let idx = self.types.len() as u32;
             self.names.insert(name.to_string(), idx);
             self.types.push(ty);
@@ -4446,6 +4634,11 @@ impl LocalsBuilder {
 
     fn get_type(&self, name: &str) -> Option<&Type> {
         self.ast_types.get(name)
+    }
+
+    /// 获取局部变量的 WASM ValType
+    fn get_valtype(&self, name: &str) -> Option<ValType> {
+        self.names.get(name).map(|&idx| self.types[idx as usize])
     }
 
     /// 确保临时变量存在，不存在则创建。返回 local index。

@@ -194,7 +194,7 @@ func testWhereClause(): Int64 {
 func testGenericClass(): Int64 {
     let b = Box<Int64>(42)
     let s = Stack<Int64>(99, 1)
-    return b.getContent(b) + s.peek(s) + s.getSize(s)
+    return b.getContent() + s.peek() + s.getSize()
     // 42 + 99 + 1 = 142
 }
 
