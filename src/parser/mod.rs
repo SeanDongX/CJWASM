@@ -204,7 +204,7 @@ impl Parser {
             imports.push(self.parse_import()?);
         }
 
-        while let Some(tok) = self.peek() {
+        while let Some(_tok) = self.peek() {
             // 解析可见性修饰符
             let visibility = if self.check(&Token::Public) {
                 self.advance();

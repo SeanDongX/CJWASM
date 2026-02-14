@@ -180,7 +180,13 @@ for filepath in "${FILES[@]}"; do
   # ── 运行 ──
   run_output=""
   exit_code=0
-  run_output=$(wasmtime run -W timeout=10s --invoke main "$wasm_file" 2>&1) || exit_code=$?
+  stderr_file=$(mktemp)
+  run_output=$(wasmtime run -W timeout=10s --invoke main "$wasm_file" 2>"$stderr_file") || exit_code=$?
+  # 如果 stdout 为空但 stderr 有内容（如 wasmtime warning），合并以便错误检测
+  if [[ -z "$run_output" && -s "$stderr_file" ]]; then
+    run_output=$(cat "$stderr_file")
+  fi
+  rm -f "$stderr_file"
 
   # 提取返回值（最后一行）
   actual=""
