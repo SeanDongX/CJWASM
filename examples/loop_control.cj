@@ -1,14 +1,14 @@
 // 循环控制语句示例
 
 // loop 无限循环与 break
-func loopWithBreak() -> Int64 {
+func loopWithBreak(): Int64 {
     var i: Int64 = 0
     var sum: Int64 = 0
 
-    loop {
+    while (true) {
         sum = sum + i
         i = i + 1
-        if i >= 10 {
+        if (i >= 10) {
             break
         }
     }
@@ -16,10 +16,10 @@ func loopWithBreak() -> Int64 {
 }
 
 // continue 跳过迭代
-func sumEvenNumbers() -> Int64 {
+func sumEvenNumbers(): Int64 {
     var sum: Int64 = 0
-    for i in 0..20 {
-        if i % 2 != 0 {
+    for (i in 0..20) {
+        if (i % 2 != 0) {
             continue  // 跳过奇数
         }
         sum = sum + i
@@ -28,13 +28,13 @@ func sumEvenNumbers() -> Int64 {
 }
 
 // while 循环中的 break
-func findFirst() -> Int64 {
+func findFirst(): Int64 {
     let arr = [5, 12, 8, 20, 3, 15]
     var result: Int64 = 0
     var i: Int64 = 0
 
-    while i < 6 {
-        if arr[i] > 10 {
+    while (i < 6) {
+        if (arr[i] > 10) {
             result = arr[i]
             break  // 找到第一个大于10的数
         }
@@ -44,13 +44,13 @@ func findFirst() -> Int64 {
 }
 
 // 组合 break 和 continue
-func filterAndSum() -> Int64 {
+func filterAndSum(): Int64 {
     var sum: Int64 = 0
     var count: Int64 = 0
 
-    for i in 0..100 {
+    for (i in 0..100) {
         // 跳过能被3整除的数
-        if i % 3 == 0 {
+        if (i % 3 == 0) {
             continue
         }
 
@@ -58,7 +58,7 @@ func filterAndSum() -> Int64 {
         count = count + 1
 
         // 只累加前10个
-        if count >= 10 {
+        if (count >= 10) {
             break
         }
     }
@@ -66,19 +66,19 @@ func filterAndSum() -> Int64 {
 }
 
 // 复杂循环逻辑
-func searchMatrix() -> Int64 {
+func searchMatrix(): Int64 {
     // 模拟在"矩阵"中搜索
     // 找到第一个满足条件的值
     var target: Int64 = 0
     var found = false
 
-    for i in 0..5 {
-        if found {
+    for (i in 0..5) {
+        if (found) {
             break
         }
-        for j in 0..5 {
+        for (j in 0..5) {
             let value = i * 5 + j
-            if value == 17 {
+            if (value == 17) {
                 target = value
                 found = true
                 break  // 只退出内层循环
@@ -89,20 +89,20 @@ func searchMatrix() -> Int64 {
 }
 
 // loop 实现 do-while 语义
-func doWhileStyle() -> Int64 {
+func doWhileStyle(): Int64 {
     var n: Int64 = 0
 
-    loop {
+    while (true) {
         n = n + 1
         // 至少执行一次，然后检查条件
-        if n >= 5 {
+        if (n >= 5) {
             break
         }
     }
     return n  // 5
 }
 
-func main() -> Int64 {
+main(): Int64 {
     let a = loopWithBreak()      // 45
     let b = sumEvenNumbers()     // 90
     let c = findFirst()          // 12

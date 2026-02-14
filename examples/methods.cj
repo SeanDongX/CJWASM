@@ -1,74 +1,67 @@
 // 方法定义示例
 
 struct Point {
-    x: Int64,
-    y: Int64
-}
+    var x: Int64;
+    var y: Int64;
 
-struct Rectangle {
-    width: Int64,
-    height: Int64
-}
+    init(x: Int64, y: Int64) {
+        this.x = x;
+        this.y = y;
+    }
 
-// 实例方法（使用 func Type.method 语法）
-func Point.distance(self: Point) -> Int64 {
-    // 使用 this 或 self 引用实例
-    return self.x * self.x + self.y * self.y
-}
+    func distance(): Int64 {
+        return this.x * this.x + this.y * this.y
+    }
 
-func Point.add(self: Point, other: Point) -> Point {
-    return Point { x: self.x + other.x, y: self.y + other.y }
-}
-
-// this 关键字示例
-func Rectangle.area(this: Rectangle) -> Int64 {
-    return this.width * this.height
-}
-
-func Rectangle.perimeter(this: Rectangle) -> Int64 {
-    return 2 * (this.width + this.height)
-}
-
-func Rectangle.scale(this: Rectangle, factor: Int64) -> Rectangle {
-    return Rectangle {
-        width: this.width * factor,
-        height: this.height * factor
+    func add(other: Point): Point {
+        return Point(this.x + other.x, this.y + other.y)
     }
 }
 
-// 静态方法
-func Point.origin() -> Point {
-    return Point { x: 0, y: 0 }
+func createOrigin(): Point {
+    return Point(0, 0)
 }
 
-func Rectangle.square(size: Int64) -> Rectangle {
-    return Rectangle { width: size, height: size }
+struct Rectangle {
+    var width: Int64;
+    var height: Int64;
+
+    init(width: Int64, height: Int64) {
+        this.width = width;
+        this.height = height;
+    }
+
+    func area(): Int64 {
+        return this.width * this.height
+    }
+
+    func perimeter(): Int64 {
+        return 2 * (this.width + this.height)
+    }
+
+    func scale(factor: Int64): Rectangle {
+        return Rectangle(this.width * factor, this.height * factor)
+    }
 }
 
-// 构造函数语法糖
-func createPoint(x: Int64, y: Int64) -> Point {
-    // Point(x, y) 转换为 Point { x: x, y: y }
-    return Point(x, y)
+func createSquare(size: Int64): Rectangle {
+    return Rectangle(size, size)
 }
 
-func main() -> Int64 {
-    // 使用构造函数语法
+main(): Int64 {
     let p1 = Point(3, 4)
-    let p2 = Point { x: 1, y: 2 }
+    let p2 = Point(1, 2)
 
-    // 调用实例方法
-    let dist = p1.distance()           // 9 + 16 = 25
-    let p3 = p1.add(p2)                // Point { x: 4, y: 6 }
+    let dist = p1.distance()
+    let p3 = p1.add(p2)
 
-    // 调用静态方法
-    let origin = Point.origin()        // Point { x: 0, y: 0 }
-    let sq = Rectangle.square(5)       // 5x5 正方形
+    let origin = createOrigin()
+    let sq = createSquare(5)
 
-    // 矩形方法
-    let rect = Rectangle { width: 10, height: 5 }
-    let area = rect.area()             // 50
-    let peri = rect.perimeter()        // 30
-    let scaled = rect.scale(2)         // 20x10
+    let rect = Rectangle(10, 5)
+    let area = rect.area()
+    let peri = rect.perimeter()
+    let scaled = rect.scale(2)
 
-    return dist + area + peri          // 25 + 50 + 30 = 105
+    return dist + area + peri
 }

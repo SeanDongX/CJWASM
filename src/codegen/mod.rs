@@ -332,6 +332,7 @@ impl CodeGen {
                 fields: vec![FieldDef {
                     name: "message".to_string(),
                     ty: Type::String,
+                    default: None,
                 }],
                 init: Some(InitDef {
                     params: vec![Param {
@@ -4497,10 +4498,12 @@ mod tests {
                     FieldDef {
                         name: "x".to_string(),
                         ty: Type::Int64,
+                        default: None,
                     },
                     FieldDef {
                         name: "y".to_string(),
                         ty: Type::Int64,
+                        default: None,
                     },
                 ],
             }],
@@ -4558,10 +4561,12 @@ mod tests {
                     FieldDef {
                         name: "x".to_string(),
                         ty: Type::Int64,
+                        default: None,
                     },
                     FieldDef {
                         name: "y".to_string(),
                         ty: Type::Int64,
+                        default: None,
                     },
                 ],
             }],

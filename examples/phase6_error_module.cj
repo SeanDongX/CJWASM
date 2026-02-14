@@ -5,8 +5,8 @@
 // #37 Error 类 — 内置 Error 基类 + 自定义错误继承体系
 // =============================================================
 
-// 自定义错误类继承自 Error
-open class DivideError extends Error {
+// 自定义错误类继承自 Error (cjc: <: 代替 extends)
+open class DivideError <: Error {
     var code: Int64;
 
     init(code: Int64) {
@@ -15,26 +15,26 @@ open class DivideError extends Error {
 }
 
 // 另一个自定义错误
-class ValidationError extends Error {
+class ValidationError <: Error {
     init() {
     }
 }
 
 // =============================================================
-// #38 throws 声明 — func f() throws ErrorType -> RetType
+// #38 错误处理 — cjc 中 throws 在函数体内，无 throws 注解
 // =============================================================
 
-// 带 throws 声明的函数
-func safeDivide(a: Int64, b: Int64) throws DivideError -> Int64 {
-    if b == 0 {
+// 可能 throw 的函数（throw 在函数体内）
+func safeDivide(a: Int64, b: Int64): Int64 {
+    if (b == 0) {
         throw 1001
     }
     return a / b
 }
 
-// throws 不指定具体类型，默认为 Error
-func validate(value: Int64) throws -> Int64 {
-    if value < 0 {
+// 可能 throw 的函数
+func validate(value: Int64): Int64 {
+    if (value < 0) {
         throw 0
     }
     return value
@@ -45,16 +45,16 @@ func validate(value: Int64) throws -> Int64 {
 // =============================================================
 
 // finally 块确保清理代码一定执行
-func computeWithCleanup(a: Int64, b: Int64) -> Int64 {
+func computeWithCleanup(a: Int64, b: Int64): Int64 {
     var result: Int64 = 0
     var cleaned: Int64 = 0
 
     try {
-        if b == 0 {
+        if (b == 0) {
             throw 0
         }
         result = a / b
-    } catch(e) {
+    } catch (e: Exception) {
         result = -1  // 错误时返回 -1
     } finally {
         // 无论是否异常都执行清理
@@ -65,23 +65,23 @@ func computeWithCleanup(a: Int64, b: Int64) -> Int64 {
 }
 
 // 嵌套 try-catch-finally
-func nestedTry(x: Int64) -> Int64 {
+func nestedTry(x: Int64): Int64 {
     var outer: Int64 = 0
     var inner: Int64 = 0
 
     try {
         try {
-            if x == 0 {
+            if (x == 0) {
                 throw 0
             }
             inner = x * 10
-        } catch(e1) {
+        } catch (e1: Exception) {
             inner = -1
         } finally {
             inner = inner + 1  // 内层 finally
         }
         outer = inner + 100
-    } catch(e2) {
+    } catch (e2: Exception) {
         outer = -100
     } finally {
         outer = outer + 1  // 外层 finally
@@ -91,13 +91,13 @@ func nestedTry(x: Int64) -> Int64 {
 }
 
 // try-catch 无 finally（兼容旧语法）
-func tryCatchOnly(x: Int64) -> Int64 {
+func tryCatchOnly(x: Int64): Int64 {
     try {
-        if x < 0 {
+        if (x < 0) {
             throw 0
         }
         return x * 2
-    } catch(e) {
+    } catch (e: Exception) {
         return 0
     }
 }
@@ -107,21 +107,21 @@ func tryCatchOnly(x: Int64) -> Int64 {
 // =============================================================
 
 // 使用 Result 处理错误
-func divide(a: Int64, b: Int64) -> Result<Int64, String> {
-    if b == 0 {
+func divide(a: Int64, b: Int64): Result<Int64, String> {
+    if (b == 0) {
         return Err("Cannot divide by zero")
     }
     return Ok(a / b)
 }
 
-func handleResult(r: Result<Int64, String>) -> Int64 {
-    match r {
-        Ok(value) => value,
-        Err(_) => 0
+func handleResult(r: Result<Int64, String>): Int64 {
+    match (r) {
+        case Ok(value) => value
+        case Err(_) => 0
     }
 }
 
-func main() -> Int64 {
+main(): Int64 {
     // 测试 try-catch-finally
     let t1 = computeWithCleanup(10, 2)     // 5 + 1 = 6
     let t2 = computeWithCleanup(10, 0)     // -1 + 1 = 0

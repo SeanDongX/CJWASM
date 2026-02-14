@@ -58,6 +58,8 @@ pub struct Parser {
     receiver_name: Option<String>,
     /// 当前泛型作用域的类型参数名，用于将 Ident 解析为 TypeParam
     current_type_params: Vec<String>,
+    /// struct/enum 内部方法，解析完成后合并到 functions
+    pending_struct_methods: Vec<Function>,
 }
 
 impl Parser {
@@ -67,6 +69,7 @@ impl Parser {
             pos: 0,
             receiver_name: None,
             current_type_params: Vec::new(),
+            pending_struct_methods: Vec::new(),
         }
     }
 
@@ -213,6 +216,10 @@ impl Parser {
                     Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
                     Some(Token::Extend) => extends.push(self.parse_extend()?),
                     Some(Token::Func) => functions.push(self.parse_function_with_visibility(visibility)?),
+                    // cjc 兼容: main() 无需 func 关键字
+                    Some(Token::Ident(ref s)) if s == "main" => {
+                        functions.push(self.parse_main_function(visibility)?);
+                    }
                     Some(tok) => {
                         return self.bail(ParseError::UnexpectedToken(
                             tok.clone(),
@@ -223,6 +230,7 @@ impl Parser {
                 }
             }
         }
+        functions.extend(self.pending_struct_methods.drain(..));
         Ok(Program {
             module_name,
             imports,
@@ -341,7 +349,7 @@ impl Parser {
         self.expect(Token::LParen)?;
         let params = self.parse_params()?;
         self.expect(Token::RParen)?;
-        let return_type = if self.check(&Token::Arrow) {
+        let return_type = if self.check(&Token::Colon) {
             self.advance();
             Some(self.parse_type()?)
         } else {
@@ -433,8 +441,8 @@ impl Parser {
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类型参数名".to_string())),
                 None => return self.bail(ParseError::UnexpectedEof),
             };
-            // 检查是否有约束 T: Bound1 & Bound2
-            if self.check(&Token::Colon) {
+            // 检查是否有约束 T: Bound1 & Bound2 或 T <: Bound1 & Bound2 (cjc)
+            if self.check(&Token::Colon) || self.check(&Token::SubType) {
                 self.advance();
                 let mut bounds = Vec::new();
                 loop {
@@ -488,7 +496,11 @@ impl Parser {
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类型参数名".to_string())),
                 None => return self.bail(ParseError::UnexpectedEof),
             };
-            self.expect(Token::Colon)?;
+            // cjc 兼容: where T <: Bound 或 where T: Bound
+            if !self.check(&Token::Colon) && !self.check(&Token::SubType) {
+                return self.bail(ParseError::UnexpectedToken(self.peek().cloned().unwrap_or(Token::Colon), "`:` 或 `<:`".to_string()));
+            }
+            self.advance();
             let mut bounds = Vec::new();
             loop {
                 let bound = match self.advance() {
@@ -497,6 +509,10 @@ impl Parser {
                     None => return self.bail(ParseError::UnexpectedEof),
                 };
                 bounds.push(bound);
+                // 消费类型实参，如 Comparable<T> 中的 <T>
+                if self.check(&Token::Lt) {
+                    let _ = self.parse_opt_type_args()?;
+                }
                 if self.check(&Token::And) {
                     self.advance();
                 } else {
@@ -527,15 +543,65 @@ impl Parser {
         };
 
         let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
-        // 解析可选的 where 子句
         let where_constraints = self.parse_where_clause()?;
         constraints.extend(where_constraints);
         let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
 
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
+        let mut methods = Vec::new();
 
         while !self.check(&Token::RBrace) {
+            // cjc 兼容: init 构造函数 — 解析并忽略 body（cjwasm 通过字段顺序构造）
+            if self.check(&Token::Init) {
+                self.advance(); // consume 'init'
+                self.expect(Token::LParen)?;
+                let _params = self.parse_params()?;
+                self.expect(Token::RParen)?;
+                self.expect(Token::LBrace)?;
+                // 跳过 init body（平衡大括号）
+                let mut depth = 1;
+                while depth > 0 {
+                    match self.advance() {
+                        Some(Token::LBrace) => depth += 1,
+                        Some(Token::RBrace) => depth -= 1,
+                        None => return self.bail(ParseError::UnexpectedEof),
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
+            // cjc 兼容: struct 内部方法 → 转为外部方法 func StructName.method(self, ...)
+            if self.check(&Token::Func) {
+                // 预设 receiver_name 使方法体内 this 可用
+                let prev_receiver = self.receiver_name.clone();
+                self.receiver_name = Some("this".to_string());
+                let mut func = self.parse_function_with_visibility(Visibility::Public)?;
+                self.receiver_name = prev_receiver;
+                // 重命名为 StructName.methodName
+                if !func.name.contains('.') {
+                    func.name = format!("{}.{}", name, func.name);
+                }
+                // 添加隐式 self 参数（如果没有）
+                let has_self = func.params.iter().any(|p| p.name == "self" || p.name == "this");
+                if !has_self {
+                    func.params.insert(0, crate::ast::Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct(name.clone(), type_params.iter().map(|t| Type::TypeParam(t.clone())).collect()),
+                        default: None,
+                        variadic: false,
+                    });
+                }
+                methods.push(func);
+                continue;
+            }
+
+            // 普通字段
+            // cjc 兼容: 跳过可选的 var/let 前缀
+            if self.check(&Token::Var) || self.check(&Token::Let) {
+                self.advance();
+            }
             let field_name = match self.advance() {
                 Some(Token::Ident(name)) => name,
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string())),
@@ -543,18 +609,32 @@ impl Parser {
             };
             self.expect(Token::Colon)?;
             let ty = self.parse_type()?;
+
+            // cjc 兼容: 可选默认值 = expr
+            let default = if self.check(&Token::Assign) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+
             fields.push(FieldDef {
                 name: field_name,
                 ty,
+                default,
             });
 
-            if self.check(&Token::Comma) {
+            if self.check(&Token::Comma) || self.check(&Token::Semicolon) {
                 self.advance();
             }
         }
 
         self.expect(Token::RBrace)?;
         self.current_type_params = prev_params;
+
+        // 将 struct 内部方法存入 pending_methods，在解析完成后合并到 functions
+        self.pending_struct_methods.extend(methods);
+
         Ok(StructDef { visibility, name, type_params, constraints, fields })
     }
 
@@ -579,6 +659,32 @@ impl Parser {
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
         while !self.check(&Token::RBrace) {
+            // cjc 兼容: enum 内部方法 → 转为外部方法 func EnumName.method(this, ...)
+            if self.check(&Token::Func) {
+                let prev_receiver = self.receiver_name.clone();
+                self.receiver_name = Some("this".to_string());
+                let mut func = self.parse_function_with_visibility(Visibility::Public)?;
+                self.receiver_name = prev_receiver;
+                if !func.name.contains('.') {
+                    func.name = format!("{}.{}", name, func.name);
+                }
+                let has_self = func.params.iter().any(|p| p.name == "self" || p.name == "this");
+                if !has_self {
+                    func.params.insert(0, crate::ast::Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct(name.clone(), type_params.iter().map(|t| Type::TypeParam(t.clone())).collect()),
+                        default: None,
+                        variadic: false,
+                    });
+                }
+                self.pending_struct_methods.push(func);
+                continue;
+            }
+
+            // cjc 兼容: 跳过可选的 | 前缀
+            if self.check(&Token::Pipe) {
+                self.advance();
+            }
             let v_name = match self.advance() {
                 Some(Token::Ident(n)) => n,
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "变体名".to_string())),
@@ -606,7 +712,7 @@ impl Parser {
     }
 
     /// 解析接口定义（支持继承、默认实现、关联类型）
-    /// interface Name: Parent1, Parent2 { type Element; func method(args) -> Ret; func default_method(args) -> Ret { body } }
+    /// interface Name: Parent1, Parent2 { type Element; func method(args): Ret; func default_method(args): Ret { body } }
     fn parse_interface_with_visibility(&mut self, visibility: Visibility) -> Result<crate::ast::InterfaceDef, ParseErrorAt> {
         self.expect(Token::Interface)?;
         let name = match self.advance() {
@@ -659,7 +765,7 @@ impl Parser {
             self.expect(Token::LParen)?;
             let params = self.parse_params()?;
             self.expect(Token::RParen)?;
-            let return_type = if self.check(&Token::Arrow) {
+            let return_type = if self.check(&Token::Colon) {
                 self.advance();
                 Some(self.parse_type()?)
             } else {
@@ -693,7 +799,7 @@ impl Parser {
     }
 
     /// 解析 extend 定义
-    /// extend TypeName: InterfaceName { type Element = ConcreteType; func method(...) -> ... { ... } }
+    /// extend TypeName: InterfaceName { type Element = ConcreteType; func method(...): ... { ... } }
     fn parse_extend(&mut self) -> Result<crate::ast::ExtendDef, ParseErrorAt> {
         self.expect(Token::Extend)?;
         let target_type = match self.advance() {
@@ -730,7 +836,7 @@ impl Parser {
                 assoc_type_bindings.push((type_name, ty));
                 continue;
             }
-            // 方法: func name(args) -> Ret { body }
+            // 方法: func name(args): Ret { body }
             let func = self.parse_function_with_visibility(Visibility::Public)?;
             // 重命名为 TypeName.methodName 格式
             let method_name = if func.name.contains('.') {
@@ -770,17 +876,16 @@ impl Parser {
         // 解析可选的泛型类型参数 <T, U: Bound, ...>
         let (type_params, constraints) = self.parse_type_params_with_constraints()?;
         let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
-        let extends = if self.check(&Token::Extends) {
+        // cjc 兼容: extends / implements 或 <: (SubType)
+        let (extends, implements) = if self.check(&Token::Extends) {
             self.advance();
-            Some(match self.advance() {
+            let base = match self.advance() {
                 Some(Token::Ident(n)) => n,
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "父类名".to_string())),
                 None => return self.bail(ParseError::UnexpectedEof),
-            })
-        } else {
-            None
-        };
-        let implements = if self.check(&Token::Implements) {
+            };
+            (Some(base), Vec::new())
+        } else if self.check(&Token::Implements) {
             self.advance();
             let mut ifaces = Vec::new();
             loop {
@@ -794,9 +899,30 @@ impl Parser {
                 }
                 self.advance();
             }
-            ifaces
+            (None, ifaces)
+        } else if self.check(&Token::SubType) {
+            self.advance();
+            let mut types = Vec::new();
+            loop {
+                types.push(match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "父类或接口名".to_string())),
+                    None => return self.bail(ParseError::UnexpectedEof),
+                });
+                if self.check(&Token::And) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            // 第一个为 extends（父类），其余为 implements（接口）
+            if types.is_empty() {
+                (None, Vec::new())
+            } else {
+                (Some(types[0].clone()), types[1..].to_vec())
+            }
         } else {
-            Vec::new()
+            (None, Vec::new())
         };
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
@@ -829,6 +955,7 @@ impl Parser {
                 fields.push(crate::ast::FieldDef {
                     name: f_name,
                     ty,
+                    default: None,
                 });
             } else if self.check(&Token::Init) {
                 self.advance();
@@ -872,7 +999,7 @@ impl Parser {
                             let body = self.parse_stmts()?;
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
-                            // 脱糖为 getter 方法: ClassName.__get_propName(this) -> Type
+                            // 脱糖为 getter 方法: ClassName.__get_propName(this): Type
                             methods.push(crate::ast::ClassMethod {
                                 override_: false,
                                 func: crate::ast::Function {
@@ -960,10 +1087,20 @@ impl Parser {
                 };
                 let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
                 self.expect(Token::LParen)?;
-                let params = self.parse_params()?;
+                let mut params = self.parse_params()?;
                 self.expect(Token::RParen)?;
-                self.receiver_name = params.first().map(|p| p.name.clone());
-                let return_type = if self.check(&Token::Arrow) {
+                // cjc 兼容: 无 self/this 时添加隐式 this 参数
+                let has_self = params.iter().any(|p| p.name == "self" || p.name == "this");
+                if !has_self {
+                    params.insert(0, crate::ast::Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct(name.clone(), type_params.iter().map(|t| Type::TypeParam(t.clone())).collect()),
+                        default: None,
+                        variadic: false,
+                    });
+                }
+                self.receiver_name = Some(params.first().map(|p| p.name.clone()).unwrap_or_else(|| "this".to_string()));
+                let return_type = if self.check(&Token::Colon) {
                     self.advance();
                     Some(self.parse_type()?)
                 } else {
@@ -1050,17 +1187,24 @@ impl Parser {
         self.expect(Token::RParen)?;
 
         let prev_receiver = self.receiver_name.clone();
+        // 方法体: 当 name 含 '.' 或首参为 self/this 时，允许 body 内使用 this
+        // 当从 struct/enum 内部解析方法时, prev_receiver 已预设为 "this"
         self.receiver_name = if name.contains('.') {
             params.first().map(|p| p.name.clone())
+        } else if params.first().map_or(false, |p| p.name == "self" || p.name == "this") {
+            params.first().map(|p| p.name.clone())
+        } else if prev_receiver.is_some() {
+            // 保持从 struct/enum 方法体继承的 receiver（cjc 内部方法无显式 self 参数）
+            prev_receiver.clone()
         } else {
             None
         };
 
-        // 解析可选的 throws 声明: func f() throws ErrorType -> RetType
+        // 解析可选的 throws 声明: func f() throws ErrorType : RetType
         let throws = if self.check(&Token::Throws) {
             self.advance();
             match self.peek() {
-                Some(Token::Arrow) | Some(Token::LBrace) => {
+                Some(Token::Colon) | Some(Token::LBrace) => {
                     // throws 后面没有类型名，默认为 Error
                     Some("Error".to_string())
                 }
@@ -1081,7 +1225,7 @@ impl Parser {
             None
         };
 
-        let return_type = if self.check(&Token::Arrow) {
+        let return_type = if self.check(&Token::Colon) {
             self.advance();
             Some(self.parse_type()?)
         } else {
@@ -1107,6 +1251,38 @@ impl Parser {
             params,
             return_type,
             throws,
+            body,
+            extern_import: None,
+        })
+    }
+
+    /// cjc 兼容: 解析 main() { ... } 形式的入口函数（无需 func 关键字）
+    fn parse_main_function(&mut self, visibility: Visibility) -> Result<Function, ParseErrorAt> {
+        // consume "main"
+        self.advance();
+        self.expect(Token::LParen)?;
+        let params = self.parse_params()?;
+        self.expect(Token::RParen)?;
+
+        let return_type = if self.check(&Token::Colon) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        self.expect(Token::LBrace)?;
+        let body = self.parse_stmts()?;
+        self.expect(Token::RBrace)?;
+
+        Ok(Function {
+            visibility,
+            name: "main".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            params,
+            return_type,
+            throws: None,
             body,
             extern_import: None,
         })
@@ -1385,10 +1561,30 @@ impl Parser {
             }
             Some(Token::While) => {
                 self.advance();
-                if self.check(&Token::Let) {
+                // cjc 兼容: while (let pattern <- expr) 或 while let pattern = expr
+                let is_paren_let = self.check(&Token::LParen) && matches!(self.peek_next(), Some(Token::Let));
+                let is_let = self.check(&Token::Let);
+                if is_paren_let {
+                    self.advance(); // consume (
+                    self.advance(); // consume let
+                    let pattern = self.parse_pattern()?;
+                    if !self.check(&Token::Assign) && !self.check(&Token::LeftArrow) {
+                        return self.bail(ParseError::UnexpectedToken(self.peek().cloned().unwrap_or(Token::Assign), "`=` 或 `<-`".to_string()));
+                    }
+                    self.advance();
+                    let expr = Box::new(self.parse_match_subject()?);
+                    self.expect(Token::RParen)?;
+                    self.expect(Token::LBrace)?;
+                    let body = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    Ok(Stmt::WhileLet { pattern, expr, body })
+                } else if is_let {
                     self.advance();
                     let pattern = self.parse_pattern()?;
-                    self.expect(Token::Assign)?;
+                    if !self.check(&Token::Assign) && !self.check(&Token::LeftArrow) {
+                        return self.bail(ParseError::UnexpectedToken(self.peek().cloned().unwrap_or(Token::Assign), "`=` 或 `<-`".to_string()));
+                    }
+                    self.advance();
                     // 使用受限表达式解析，避免 { 被误认为结构体初始化
                     let expr = Box::new(self.parse_match_subject()?);
                     self.expect(Token::LBrace)?;
@@ -1405,6 +1601,11 @@ impl Parser {
             }
             Some(Token::For) => {
                 self.advance();
+                // 支持 for (i in x) 和 for i in x 两种语法 (cjc 兼容)
+                let has_paren = self.check(&Token::LParen);
+                if has_paren {
+                    self.advance();
+                }
                 let var = match self.advance() {
                     Some(Token::Ident(name)) => name,
                     Some(tok) => {
@@ -1415,6 +1616,9 @@ impl Parser {
                 self.expect(Token::In)?;
                 // 使用受限的表达式解析，不允许解析结构体初始化 (因为 { 会被误认为 for body)
                 let iterable = self.parse_for_iterable()?;
+                if has_paren {
+                    self.expect(Token::RParen)?;
+                }
                 self.expect(Token::LBrace)?;
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
@@ -1930,6 +2134,11 @@ impl Parser {
                         Some(Token::Ident(v)) => Some(v),
                         _ => return self.bail(ParseError::UnexpectedEof),
                     };
+                    // cjc 兼容: catch (e: Exception) 可选类型注解
+                    if self.check(&Token::Colon) {
+                        self.advance();
+                        let _ = self.parse_type()?;
+                    }
                     self.expect(Token::RParen)?;
                     var
                 } else {
@@ -2010,12 +2219,12 @@ impl Parser {
                 }
             }
             Some(Token::LParen) => {
-                // 检查是否是 Lambda: (x: T, ...) -> R { body } 或 () -> R { body }
-                // 通过检查 ) -> 或 ident : 来判断
+                // 检查是否是 Lambda: (x: T, ...): R { body } 或 (): R { body }
+                // 通过检查 ): 或 ident : 来判断
                 if self.check(&Token::RParen) {
-                    // () -> R { body } 或空元组
+                    // (): R { body } 或空元组
                     self.advance(); // consume )
-                    if self.check(&Token::Arrow) {
+                    if self.check(&Token::Colon) {
                         return self.parse_lambda_rest(vec![]);
                     }
                     // () 空元组
@@ -2100,10 +2309,60 @@ impl Parser {
                 Ok(Expr::Array(elements))
             }
             Some(Token::If) => {
-                if self.check(&Token::Let) {
+                // cjc 兼容: if (let pattern <- expr) 或 if let pattern = expr
+                let is_paren_let = self.check(&Token::LParen) && matches!(self.peek_next(), Some(Token::Let));
+                let is_let = self.check(&Token::Let);
+                if is_paren_let {
+                    self.advance(); // consume (
+                    self.advance(); // consume let
+                    let pattern = self.parse_pattern()?;
+                    if !self.check(&Token::Assign) && !self.check(&Token::LeftArrow) {
+                        return self.bail(ParseError::UnexpectedToken(self.peek().cloned().unwrap_or(Token::Assign), "`=` 或 `<-`".to_string()));
+                    }
+                    self.advance();
+                    let expr = Box::new(self.parse_match_subject()?);
+                    self.expect(Token::RParen)?;
+                    self.expect(Token::LBrace)?;
+                    let then_stmts = self.parse_stmts()?;
+                    let then_expr = if then_stmts.is_empty() {
+                        Box::new(Expr::Integer(0))
+                    } else {
+                        match then_stmts.last() {
+                            Some(Stmt::Expr(e)) => Box::new(e.clone()),
+                            _ => Box::new(Expr::Integer(0)),
+                        }
+                    };
+                    self.expect(Token::RBrace)?;
+                    let else_branch = if self.check(&Token::Else) {
+                        self.advance();
+                        self.expect(Token::LBrace)?;
+                        let else_stmts = self.parse_stmts()?;
+                        let else_expr = if else_stmts.is_empty() {
+                            None
+                        } else {
+                            match else_stmts.last() {
+                                Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
+                                _ => None,
+                            }
+                        };
+                        self.expect(Token::RBrace)?;
+                        else_expr
+                    } else {
+                        None
+                    };
+                    Ok(Expr::IfLet {
+                        pattern,
+                        expr,
+                        then_branch: then_expr,
+                        else_branch,
+                    })
+                } else if is_let {
                     self.advance();
                     let pattern = self.parse_pattern()?;
-                    self.expect(Token::Assign)?;
+                    if !self.check(&Token::Assign) && !self.check(&Token::LeftArrow) {
+                        return self.bail(ParseError::UnexpectedToken(self.peek().cloned().unwrap_or(Token::Assign), "`=` 或 `<-`".to_string()));
+                    }
+                    self.advance();
                     // 使用受限表达式解析，避免 { 被误认为结构体初始化
                     let expr = Box::new(self.parse_match_subject()?);
                     self.expect(Token::LBrace)?;
@@ -2167,8 +2426,16 @@ impl Parser {
                 }
             }
             Some(Token::Match) => {
+                // 支持 match (x) { 和 match x { 两种语法 (cjc 兼容)
+                let has_paren = self.check(&Token::LParen);
+                if has_paren {
+                    self.advance();
+                }
                 // 使用受限的表达式解析，不允许解析结构体初始化
                 let expr = self.parse_match_subject()?;
+                if has_paren {
+                    self.expect(Token::RParen)?;
+                }
                 self.expect(Token::LBrace)?;
                 let arms = self.parse_match_arms()?;
                 self.expect(Token::RBrace)?;
@@ -2231,9 +2498,16 @@ impl Parser {
         Ok(params)
     }
 
-    /// 解析 Lambda 表达式的剩余部分: -> ReturnType { body }
+    /// 解析 Lambda 表达式的剩余部分: : ReturnType { body }
     fn parse_lambda_rest(&mut self, params: Vec<(String, Type)>) -> Result<Expr, ParseErrorAt> {
-        self.expect(Token::Arrow)?;
+        if self.check(&Token::Colon) {
+            self.advance();
+        } else {
+            return self.bail(ParseError::UnexpectedToken(
+                self.peek().cloned().unwrap_or(Token::Colon),
+                "`:` (返回类型)".to_string(),
+            ));
+        }
         let return_type = Some(self.parse_type()?);
         self.expect(Token::LBrace)?;
         let body = self.parse_expr()?;
@@ -2407,10 +2681,17 @@ impl Parser {
         let mut arms = Vec::new();
 
         while !self.check(&Token::RBrace) && self.peek().is_some() {
+            // cjc 兼容: 跳过可选的 `case` 关键字
+            if matches!(self.peek(), Some(Token::Ident(ref s)) if s == "case") {
+                self.advance();
+            }
             let pattern = self.parse_pattern()?;
 
-            // 可选的守卫条件
+            // 可选的守卫条件 (cjc 用 where，cjwasm 兼容 if)
             let guard = if self.check(&Token::If) {
+                self.advance();
+                Some(Box::new(self.parse_expr()?))
+            } else if matches!(self.peek(), Some(Token::Ident(ref s)) if s == "where") {
                 self.advance();
                 Some(Box::new(self.parse_expr()?))
             } else {
@@ -2729,7 +3010,7 @@ mod tests {
 
     #[test]
     fn test_parse_function() {
-        let source = "func add(a: Int64, b: Int64) -> Int64 { return a + b }";
+        let source = "func add(a: Int64, b: Int64): Int64 { return a + b }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2754,7 +3035,7 @@ mod tests {
 
     #[test]
     fn test_parse_array() {
-        let source = "func test() -> Int64 { let arr = [1, 2, 3] return arr[0] }";
+        let source = "func test(): Int64 { let arr = [1, 2, 3] return arr[0] }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2765,7 +3046,7 @@ mod tests {
 
     #[test]
     fn test_parse_for_loop() {
-        let source = "func test() -> Int64 { var sum: Int64 = 0 for i in 0..10 { sum = sum + i } return sum }";
+        let source = "func test(): Int64 { var sum: Int64 = 0 for i in 0..10 { sum = sum + i } return sum }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2778,7 +3059,7 @@ mod tests {
 
     #[test]
     fn test_parse_match() {
-        let source = "func test(n: Int64) -> Int64 { match n { 0 => 100, 1 => 200, _ => 999 } }";
+        let source = "func test(n: Int64): Int64 { match n { 0 => 100, 1 => 200, _ => 999 } }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2789,7 +3070,7 @@ mod tests {
 
     #[test]
     fn test_parse_match_or_pattern() {
-        let source = "func test(n: Int64) -> Int64 { match n { 1 | 2 | 3 => 10, _ => 0 } }";
+        let source = "func test(n: Int64): Int64 { match n { 1 | 2 | 3 => 10, _ => 0 } }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2800,7 +3081,7 @@ mod tests {
 
     #[test]
     fn test_parse_match_range_pattern() {
-        let source = "func test(n: Int64) -> Int64 { match n { 0..10 => 1, 10..100 => 2, _ => 3 } }";
+        let source = "func test(n: Int64): Int64 { match n { 0..10 => 1, 10..100 => 2, _ => 3 } }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2811,7 +3092,7 @@ mod tests {
 
     #[test]
     fn test_parse_if_else() {
-        let source = "func test(x: Int64) -> Int64 { if x > 0 { return 1 } else { return 0 } }";
+        let source = "func test(x: Int64): Int64 { if x > 0 { return 1 } else { return 0 } }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2823,7 +3104,7 @@ mod tests {
 
     #[test]
     fn test_parse_while() {
-        let source = "func test() -> Int64 { var n: Int64 = 0 while n < 10 { n = n + 1 } return n }";
+        let source = "func test(): Int64 { var n: Int64 = 0 while n < 10 { n = n + 1 } return n }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2837,7 +3118,7 @@ mod tests {
     fn test_parse_struct_init() {
         let source = r#"
             struct Point { x: Int64, y: Int64 }
-            func test() -> Int64 {
+            func test(): Int64 {
                 let p = Point { x: 1, y: 2 }
                 return p.x
             }
@@ -2853,7 +3134,7 @@ mod tests {
 
     #[test]
     fn test_parse_match_guard() {
-        let source = "func test(n: Int64) -> Int64 { match n { x if x < 0 => 1, 0 => 2, _ => 3 } }";
+        let source = "func test(n: Int64): Int64 { match n { x if x < 0 => 1, 0 => 2, _ => 3 } }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2864,7 +3145,7 @@ mod tests {
 
     #[test]
     fn test_parse_for_in_array() {
-        let source = "func test() -> Int64 { let arr = [1, 2, 3] var s: Int64 = 0 for x in arr { s = s + x } return s }";
+        let source = "func test(): Int64 { let arr = [1, 2, 3] var s: Int64 = 0 for x in arr { s = s + x } return s }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2880,7 +3161,7 @@ mod tests {
 
     #[test]
     fn test_parse_for_range_inclusive() {
-        let source = "func test() -> Int64 { var s: Int64 = 0 for i in 1..=5 { s = s + i } return s }";
+        let source = "func test(): Int64 { var s: Int64 = 0 for i in 1..=5 { s = s + i } return s }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2891,7 +3172,7 @@ mod tests {
 
     #[test]
     fn test_parse_logical_ops() {
-        let source = "func test() -> Int64 { if true && false || !true { return 0 } return 1 }";
+        let source = "func test(): Int64 { if true && false || !true { return 0 } return 1 }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2901,7 +3182,7 @@ mod tests {
 
     #[test]
     fn test_parse_unary_neg() {
-        let source = "func test() -> Int64 { let x = -1 let y = -(-2) return x + y }";
+        let source = "func test(): Int64 { let x = -1 let y = -(-2) return x + y }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2911,7 +3192,7 @@ mod tests {
 
     #[test]
     fn test_parse_block_expr() {
-        let source = "func test() -> Int64 { let x = { let a = 1 let b = 2 a + b } return x }";
+        let source = "func test(): Int64 { let x = { let a = 1 let b = 2 a + b } return x }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2944,8 +3225,8 @@ mod tests {
 
     #[test]
     fn test_parse_lambda_arrow_syntax() {
-        // Lambda syntax: (x: T) -> R { body }
-        let source = "func test() { let f = (x: Int64) -> Int64 { x * 2 } }";
+        // Lambda syntax: (x: T): R { body }
+        let source = "func test() { let f = (x: Int64): Int64 { x * 2 } }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2980,7 +3261,7 @@ mod tests {
 
     #[test]
     fn test_parse_import_from() {
-        let source = "import foo from bar.baz\nfunc main() -> Int64 { return 0 }";
+        let source = "import foo from bar.baz\nfunc main(): Int64 { return 0 }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -2990,7 +3271,7 @@ mod tests {
 
     #[test]
     fn test_parse_import_as() {
-        let source = "import std.math as m\nfunc main() -> Int64 { return 0 }";
+        let source = "import std.math as m\nfunc main(): Int64 { return 0 }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -3000,7 +3281,7 @@ mod tests {
 
     #[test]
     fn test_parse_import_plain() {
-        let source = "import std.io\nfunc main() -> Int64 { return 0 }";
+        let source = "import std.io\nfunc main(): Int64 { return 0 }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -3010,7 +3291,7 @@ mod tests {
 
     #[test]
     fn test_parse_module_declaration() {
-        let source = "module test.app\nfunc main() -> Int64 { return 0 }";
+        let source = "module test.app\nfunc main(): Int64 { return 0 }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -3023,8 +3304,8 @@ mod tests {
         let source = r#"
             interface Describable {
                 type Element;
-                func describe() -> String;
-                func default_method() -> Int64 { return 0 }
+                func describe(): String;
+                func default_method(): Int64 { return 0 }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3038,8 +3319,8 @@ mod tests {
     #[test]
     fn test_parse_interface_with_inheritance() {
         let source = r#"
-            interface Base { func id() -> Int64; }
-            interface Extended: Base { func extra() -> Int64; }
+            interface Base { func id(): Int64; }
+            interface Extended: Base { func extra(): Int64; }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -3054,7 +3335,7 @@ mod tests {
             struct Foo { x: Int64 }
             extend Foo: SomeInterface {
                 type Element = Int64;
-                func method() -> Int64 { return 0 }
+                func method(): Int64 { return 0 }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3076,7 +3357,7 @@ mod tests {
                     get() { return this.x }
                     set(v) { this.x = v }
                 }
-                func method(self: MyClass) -> Int64 { return self.x }
+                func method(self: MyClass): Int64 { return self.x }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3097,11 +3378,11 @@ mod tests {
             open class Base {
                 var x: Int64;
                 init(x: Int64) { this.x = x }
-                func get(self: Base) -> Int64 { return self.x }
+                func get(self: Base): Int64 { return self.x }
             }
             class Derived extends Base {
                 init(x: Int64) { super(x) }
-                override func get(self: Derived) -> Int64 { return self.x * 2 }
+                override func get(self: Derived): Int64 { return self.x * 2 }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3132,7 +3413,7 @@ mod tests {
     #[test]
     fn test_parse_throws_function() {
         let source = r#"
-            func validate(x: Int64) throws Error -> Int64 {
+            func validate(x: Int64) throws Error : Int64 {
                 if x < 0 { throw 0 }
                 return x
             }
@@ -3148,7 +3429,7 @@ mod tests {
     #[test]
     fn test_parse_throws_default() {
         let source = r#"
-            func f() throws -> Int64 { return 0 }
+            func f() throws : Int64 { return 0 }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -3160,7 +3441,7 @@ mod tests {
     #[test]
     fn test_parse_try_catch_finally() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 try {
                     throw 1
                 } catch(e) {
@@ -3208,8 +3489,8 @@ mod tests {
     #[test]
     fn test_parse_variadic_and_default_params() {
         let source = r#"
-            func f(x: Int64, y: Int64 = 10) -> Int64 { return x + y }
-            func g(args: Int64...) -> Int64 { return 0 }
+            func f(x: Int64, y: Int64 = 10): Int64 { return x + y }
+            func g(args: Int64...): Int64 { return 0 }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -3248,11 +3529,11 @@ mod tests {
             open class Base {
                 var x: Int64;
                 init(x: Int64) { this.x = x }
-                func get(self: Base) -> Int64 { return self.x }
+                func get(self: Base): Int64 { return self.x }
             }
             class Child extends Base {
                 init(x: Int64) { super(x) }
-                func get2(self: Child) -> Int64 { return super.get() }
+                func get2(self: Child): Int64 { return super.get() }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3265,7 +3546,7 @@ mod tests {
     #[test]
     fn test_parse_where_clause_function() {
         let source = r#"
-            func compare<T>(a: T, b: T) -> Int64 where T: Comparable {
+            func compare<T>(a: T, b: T): Int64 where T: Comparable {
                 return 0
             }
         "#;
@@ -3280,11 +3561,11 @@ mod tests {
     #[test]
     fn test_parse_class_implements() {
         let source = r#"
-            interface I { func foo() -> Int64; }
+            interface I { func foo(): Int64; }
             class C implements I {
                 var x: Int64;
                 init(x: Int64) { this.x = x }
-                func foo(self: C) -> Int64 { return self.x }
+                func foo(self: C): Int64 { return self.x }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3298,7 +3579,7 @@ mod tests {
     #[test]
     fn test_parse_for_in_range_and_array() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 for i in 0..10 { }
                 for v in [1, 2, 3] { }
                 return 0
@@ -3314,7 +3595,7 @@ mod tests {
     #[test]
     fn test_parse_match_arms() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 return match 5 {
                     0 => 1,
                     x if x > 10 => 2,
@@ -3333,7 +3614,7 @@ mod tests {
     #[test]
     fn test_parse_if_let() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let o: Option<Int64> = Some(1)
                 if let Some(v) = o {
                     return v
@@ -3351,7 +3632,7 @@ mod tests {
     #[test]
     fn test_parse_while_let() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 var o: Option<Int64> = Some(1)
                 while let Some(v) = o {
                     o = None
@@ -3369,7 +3650,7 @@ mod tests {
     #[test]
     fn test_parse_multi_constraint() {
         let source = r#"
-            func process<T: Comparable & Hashable>(x: T) -> T {
+            func process<T: Comparable & Hashable>(x: T): T {
                 return x
             }
         "#;
@@ -3389,7 +3670,7 @@ mod tests {
             class Container {
                 var x: Int64;
                 init(x: Int64) { this.x = x }
-                func transform<T>(self: Container) -> Int64 {
+                func transform<T>(self: Container): Int64 {
                     return self.x
                 }
             }
@@ -3454,8 +3735,8 @@ mod tests {
     #[test]
     fn test_parse_visibility() {
         let source = r#"
-            public func foo() -> Int64 { return 1 }
-            private func bar() -> Int64 { return 2 }
+            public func foo(): Int64 { return 1 }
+            private func bar(): Int64 { return 2 }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -3513,7 +3794,7 @@ mod tests {
     #[test]
     fn test_parse_extern_func_no_attr() {
         let source = r#"
-            extern func console_log(msg: String) -> Int64
+            extern func console_log(msg: String): Int64
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -3526,7 +3807,7 @@ mod tests {
     #[test]
     fn test_parse_complex_expressions() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let a = 1 + 2 * 3
                 let b = (1 + 2) * 3
                 let c = -5
@@ -3546,7 +3827,7 @@ mod tests {
     #[test]
     fn test_parse_cast_expression() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let a = 42 as Float64
                 let b = 1.5 as Int64
                 return b
@@ -3562,7 +3843,7 @@ mod tests {
     #[test]
     fn test_parse_null_coalesce() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let o: Option<Int64> = None
                 let v = o ?? 42
                 return v
@@ -3578,7 +3859,7 @@ mod tests {
     #[test]
     fn test_parse_try_operator() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let o: Option<Int64> = Some(1)
                 let v = o?
                 return v
@@ -3594,7 +3875,7 @@ mod tests {
     #[test]
     fn test_parse_block_expression() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let x = {
                     let a = 10
                     a + 20
@@ -3612,7 +3893,7 @@ mod tests {
     #[test]
     fn test_parse_range_expression() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let r = 0..10
                 let r2 = 0..=10
                 return 0
@@ -3628,7 +3909,7 @@ mod tests {
     #[test]
     fn test_parse_match_with_guard() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let x = 5
                 return match x {
                     n if n > 10 => 1,
@@ -3647,7 +3928,7 @@ mod tests {
     #[test]
     fn test_parse_compound_assignment() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 var x: Int64 = 10
                 x += 5
                 x -= 2
@@ -3667,7 +3948,7 @@ mod tests {
     #[test]
     fn test_parse_loop_break_continue() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 var i: Int64 = 0
                 loop {
                     i = i + 1
@@ -3688,7 +3969,7 @@ mod tests {
     fn test_parse_method_call() {
         let source = r#"
             struct Foo { x: Int64 }
-            func main() -> Int64 {
+            func main(): Int64 {
                 let f = Foo { x: 42 }
                 return f.x
             }
@@ -3703,7 +3984,7 @@ mod tests {
     #[test]
     fn test_parse_string_interpolation_expr() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let name = "world"
                 let s = "Hello ${name}!"
                 return 0
@@ -3722,7 +4003,7 @@ mod tests {
             class Container<T> {
                 var value: T;
                 init(v: T) { this.value = v }
-                func get(self: Container<T>) -> T { return self.value }
+                func get(self: Container<T>): T { return self.value }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3739,7 +4020,7 @@ mod tests {
             import std.io
             import math
             import foo from bar.baz
-            func main() -> Int64 { return 0 }
+            func main(): Int64 { return 0 }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -3765,13 +4046,13 @@ mod tests {
 
     #[test]
     fn test_parse_error_missing_rparen() {
-        let err = parse_should_fail("func foo( -> Int64 { return 0 }");
+        let err = parse_should_fail("func foo( : Int64 { return 0 }");
         assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
     }
 
     #[test]
     fn test_parse_error_missing_lbrace() {
-        let err = parse_should_fail("func foo() -> Int64 return 0");
+        let err = parse_should_fail("func foo(): Int64 return 0");
         assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
     }
 
@@ -3787,7 +4068,7 @@ mod tests {
 
     #[test]
     fn test_parse_error_bad_type_annotation() {
-        let err = parse_should_fail("func foo(x: ) -> Int64 { return 0 }");
+        let err = parse_should_fail("func foo(x: ): Int64 { return 0 }");
         assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
     }
 
@@ -3842,7 +4123,7 @@ mod tests {
     #[test]
     fn test_parse_error_at_prev_position() {
         // Test that bail_at works with position tracking
-        let err = parse_should_fail("func foo() -> { return 0 }");
+        let err = parse_should_fail("func foo()): { return 0 }");
         assert!(err.byte_start > 0 || err.byte_end > 0);
     }
 
@@ -3991,14 +4272,14 @@ mod tests {
     #[test]
     fn test_parse_error_bad_match_subject() {
         // match 无效token
-        let err = parse_should_fail("func main() -> Int64 { return match {} {} }");
+        let err = parse_should_fail("func main(): Int64 { return match {} {} }");
         assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
     }
 
     #[test]
     fn test_parse_import_multi_items_success() {
         // import foo, bar from baz.qux
-        let source = "import foo, bar from baz.qux\nfunc main() -> Int64 { return 0 }";
+        let source = "import foo, bar from baz.qux\nfunc main(): Int64 { return 0 }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -4010,7 +4291,7 @@ mod tests {
     #[test]
     fn test_parse_for_variable_range() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let n: Int64 = 5
                 var sum: Int64 = 0
                 for i in 0..n {
@@ -4029,7 +4310,7 @@ mod tests {
     #[test]
     fn test_parse_for_array_literal() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 var sum: Int64 = 0
                 for i in [1, 2, 3] {
                     sum = sum + i
@@ -4047,7 +4328,7 @@ mod tests {
     #[test]
     fn test_parse_match_with_bool_and_string_patterns() {
         let source = r#"
-            func main() -> Int64 {
+            func main(): Int64 {
                 let b: Bool = true
                 let r1 = match b {
                     true => 1,

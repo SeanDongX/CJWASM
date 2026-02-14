@@ -3,12 +3,17 @@ class Point {
     private var x: Int64;
     private var y: Int64;
 
-    func area(self: Point) -> Int64 {
+    init(x: Int64, y: Int64) {
+        this.x = x
+        this.y = y
+    }
+
+    func area(self: Point): Int64 {
         return self.x * self.y
     }
 }
 
-func main() -> Int64 {
-    let p = Point { x: 5, y: 10 }
-    return p.area()
+main(): Int64 {
+    let p = Point(5, 10)
+    return p.area(p)
 }

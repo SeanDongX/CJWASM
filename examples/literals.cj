@@ -1,7 +1,7 @@
 // 数值字面量示例
 
 // 整数字面量
-func integerLiterals() -> Int64 {
+func integerLiterals() : Int64 {
     let dec = 42              // 十进制
     let hex = 0xFF            // 十六进制 = 255
     let oct = 0o77            // 八进制 = 63
@@ -13,7 +13,7 @@ func integerLiterals() -> Int64 {
 }
 
 // 浮点数字面量
-func floatLiterals() -> Float64 {
+func floatLiterals() : Float64 {
     let f64 = 3.14159         // Float64 (默认)
     let sci = 1.5e10          // 科学计数法 = 15000000000
     let neg = 2.5e-3          // 负指数 = 0.0025
@@ -22,17 +22,17 @@ func floatLiterals() -> Float64 {
     return f64 + neg
 }
 
-// Float32 类型
-func float32Literals() -> Float32 {
-    let f1: Float32 = 3.14f   // Float32 后缀
-    let f2 = 2.718f           // 后缀推断为 Float32
-    let f3 = 1.0e5f           // 科学计数法 Float32
+// Float32 类型 (cjc 不支持 f 后缀，使用 as Float32 转换)
+func float32Literals() : Float32 {
+    let f1: Float32 = 3.14 as Float32   // Float32
+    let f2 = 2.718 as Float32           // Float32
+    let f3 = 1.0e5 as Float32          // 科学计数法 Float32
 
     return f1 + f2 + f3
 }
 
 // 不同进制运算
-func hexOperations() -> Int64 {
+func hexOperations() : Int64 {
     let a = 0xFF       // 255
     let b = 0x0F       // 15
 
@@ -44,7 +44,7 @@ func hexOperations() -> Int64 {
 }
 
 // 位移运算与二进制
-func binaryOperations() -> Int64 {
+func binaryOperations() : Int64 {
     let a = 0b0001     // 1
     let b = 0b1000     // 8
 
@@ -55,10 +55,10 @@ func binaryOperations() -> Int64 {
 }
 
 // 类型标注
-func typeAnnotations() -> Int64 {
+func typeAnnotations() : Int64 {
     let a: Int32 = 42
     let b: Int64 = 100
-    let c: Float32 = 3.14f
+    let c: Float32 = 3.14 as Float32
     let d: Float64 = 2.718
     let e: Bool = true
 
@@ -67,7 +67,7 @@ func typeAnnotations() -> Int64 {
     return sum  // 42 + 100 + 1 = 143
 }
 
-func main() -> Int64 {
+main(): Int64 {
     let a = integerLiterals()    // 370
     let b = hexOperations()      // 510
     let c = binaryOperations()   // 10

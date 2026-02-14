@@ -5,41 +5,61 @@ class Point {
     var x: Int64;
     var y: Int64;
 
-    func sum(self: Point) -> Int64 {
-        return self.x + self.y
+    init(x: Int64, y: Int64) {
+        this.x = x
+        this.y = y
+    }
+
+    func sum(): Int64 {
+        return this.x + this.y
     }
 }
 
 // === 2. 继承类 ===
-class Animal {
+open class Animal {
     var kind: Int64;
     var age: Int64;
 
-    func speak(self: Animal) -> Int64 {
+    init(kind: Int64, age: Int64) {
+        this.kind = kind
+        this.age = age
+    }
+
+    func speak(): Int64 {
         return 0
     }
 
-    func getAge(self: Animal) -> Int64 {
-        return self.age
+    func getAge(): Int64 {
+        return this.age
     }
 }
 
-class Dog extends Animal {
+class Dog <: Animal {
     var breed: Int64;
 
-    override func speak(self: Dog) -> Int64 {
+    init(kind: Int64, age: Int64, breed: Int64) {
+        super(kind, age)
+        this.breed = breed
+    }
+
+    override func speak(): Int64 {
         return 1  // "Woof"
     }
 
-    func fetch(self: Dog) -> Int64 {
-        return self.breed + 10
+    func fetch(): Int64 {
+        return this.breed + 10
     }
 }
 
-class Cat extends Animal {
+class Cat <: Animal {
     var indoor: Int64;
 
-    override func speak(self: Cat) -> Int64 {
+    init(kind: Int64, age: Int64, indoor: Int64) {
+        super(kind, age)
+        this.indoor = indoor
+    }
+
+    override func speak(): Int64 {
         return 2  // "Meow"
     }
 }
@@ -52,8 +72,8 @@ class Counter {
         this.count = start
     }
 
-    func getValue(self: Counter) -> Int64 {
-        return self.count
+    func getValue(): Int64 {
+        return this.count
     }
 }
 
@@ -65,8 +85,8 @@ class Resource {
         this.id = rid
     }
 
-    func getId(self: Resource) -> Int64 {
-        return self.id
+    func getId(): Int64 {
+        return this.id
     }
 }
 
@@ -74,6 +94,11 @@ class Resource {
 class Rect {
     var w: Int64;
     var h: Int64;
+
+    init(w: Int64, h: Int64) {
+        this.w = w
+        this.h = h
+    }
 
     prop area: Int64 {
         get() {
@@ -84,40 +109,40 @@ class Rect {
 
 // === 测试函数 ===
 
-func testPoint() -> Int64 {
-    let p = Point { x: 3, y: 4 }
+func testPoint(): Int64 {
+    let p = Point(3, 4)
     return p.sum()  // 7
 }
 
-func testInheritedFields() -> Int64 {
-    let dog = Dog { kind: 42, age: 5, breed: 100 }
+func testInheritedFields(): Int64 {
+    let dog = Dog(42, 5, 100)
     let age = dog.getAge()
     let breed_val = dog.fetch()
     return age + breed_val  // 5 + 110 = 115
 }
 
-func testOverride() -> Int64 {
-    let dog = Dog { kind: 1, age: 3, breed: 50 }
-    let cat = Cat { kind: 2, age: 4, indoor: 1 }
+func testOverride(): Int64 {
+    let dog = Dog(1, 3, 50)
+    let cat = Cat(2, 4, 1)
     return dog.speak() + cat.speak()  // 1 + 2 = 3
 }
 
-func testInit() -> Int64 {
+func testInit(): Int64 {
     let c = Counter(10)
     return c.getValue()  // 10
 }
 
-func testResource() -> Int64 {
+func testResource(): Int64 {
     let r = Resource(42)
     return r.getId()  // 42
 }
 
-func testProp() -> Int64 {
-    let r = Rect { w: 6, h: 7 }
-    return r.__get_area()  // 6 * 7 = 42
+func testProp(): Int64 {
+    let r = Rect(6, 7)
+    return r.area  // 6 * 7 = 42
 }
 
-func main() -> Int64 {
+main(): Int64 {
     let a = testPoint()            // 7
     let b = testInheritedFields()  // 115
     let c = testOverride()         // 3

@@ -36,6 +36,7 @@ private struct PrivateData {
 
 // 默认可见性（等同于 internal）
 func internalFunc(x: Int64): Int64 {
+    // 可以调用私有函数
     return privateHelper(x) + 1
 }
 
@@ -74,12 +75,27 @@ private enum InternalState {
     | Done
 }
 
+// extern 函数导入（与外部 WASM 模块互操作）
+// @Import("env", "log")
+// extern func hostLog(ptr: Int32, len: Int32)
+
+// @Import("env", "get_time")
+// extern func getTime(): Int64
+
 main(): Int64 {
+    // 使用公开 API
     let sum = publicAdd(10, 20)
+
     let p = PublicPoint(5, 10)
+
     let calc = Calculator(100)
     let calc2 = calc.add(50)
+
     let status = Status.Active
+
+    // 使用内部函数
     let internal_result = internalFunc(5)
+
     return sum + p.x + calc2.value + internal_result
+    // 30 + 5 + 150 + 11 = 196
 }

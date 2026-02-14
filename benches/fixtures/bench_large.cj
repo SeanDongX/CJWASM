@@ -2,27 +2,36 @@
 
 // ── 泛型结构体 ──
 struct Pair<T, U> {
-    first: T,
-    second: U
+    var first: T;
+    var second: U;
+    init(first: T, second: U) {
+        this.first = first;
+        this.second = second;
+    }
 }
 
 struct Triple<T, U, V> {
-    a: T,
-    b: U,
-    c: V
+    var a: T;
+    var b: U;
+    var c: V;
+    init(a: T, b: U, c: V) {
+        this.a = a;
+        this.b = b;
+        this.c = c;
+    }
 }
 
 // ── 枚举 ──
 enum Color {
-    Red,
-    Green,
-    Blue
+    | Red
+    | Green
+    | Blue
 }
 
 enum Message {
-    Quit,
-    Move(Int64),
-    Write(Int64)
+    | Quit
+    | Move(Int64)
+    | Write(Int64)
 }
 
 // ── 类 ──
@@ -30,11 +39,16 @@ class Vector2D {
     var x: Int64;
     var y: Int64;
 
-    func length(self: Vector2D) -> Int64 {
+    init(x: Int64, y: Int64) {
+        this.x = x
+        this.y = y
+    }
+
+    func length(self: Vector2D): Int64 {
         return self.x * self.x + self.y * self.y
     }
 
-    func dot(self: Vector2D, ox: Int64, oy: Int64) -> Int64 {
+    func dot(self: Vector2D, ox: Int64, oy: Int64): Int64 {
         return self.x * ox + self.y * oy
     }
 }
@@ -42,15 +56,19 @@ class Vector2D {
 class Counter {
     var count: Int64;
 
-    func increment(self: Counter) -> Int64 {
+    init(count: Int64) {
+        this.count = count
+    }
+
+    func increment(self: Counter): Int64 {
         return self.count + 1
     }
 
-    func decrement(self: Counter) -> Int64 {
+    func decrement(self: Counter): Int64 {
         return self.count - 1
     }
 
-    func get(self: Counter) -> Int64 {
+    func get(self: Counter): Int64 {
         return self.count
     }
 }
@@ -61,64 +79,71 @@ class Matrix {
     var a21: Int64;
     var a22: Int64;
 
-    func determinant(self: Matrix) -> Int64 {
+    init(a11: Int64, a12: Int64, a21: Int64, a22: Int64) {
+        this.a11 = a11
+        this.a12 = a12
+        this.a21 = a21
+        this.a22 = a22
+    }
+
+    func determinant(self: Matrix): Int64 {
         return self.a11 * self.a22 - self.a12 * self.a21
     }
 
-    func trace(self: Matrix) -> Int64 {
+    func trace(self: Matrix): Int64 {
         return self.a11 + self.a22
     }
 }
 
 // ── 泛型函数 ──
-func identity<T>(value: T) -> T {
+func identity<T>(value: T): T {
     return value
 }
 
-func maximum<T: Comparable>(a: T, b: T) -> T {
+func maximum<T: Comparable>(a: T, b: T): T {
     return a
 }
 
 // ── 普通函数 ──
-func fibonacci(n: Int64) -> Int64 {
-    if n <= 1 {
+func fibonacci(n: Int64): Int64 {
+    if (n <= 1) {
         n
     } else {
         fibonacci(n - 1) + fibonacci(n - 2)
     }
 }
 
-func gcd(a: Int64, b: Int64) -> Int64 {
-    if b == 0 {
+func gcd(a: Int64, b: Int64): Int64 {
+    if (b == 0) {
         return a
     }
     return gcd(b, a % b)
 }
 
-func power(base: Int64, exp: Int64) -> Int64 {
-    if exp == 0 {
+func power(base: Int64, exp: Int64): Int64 {
+    if (exp == 0) {
         return 1
     }
     return base * power(base, exp - 1)
 }
 
-func sumOfSquares(n: Int64) -> Int64 {
+func sumOfSquares(n: Int64): Int64 {
     var sum: Int64 = 0
     var i: Int64 = 1
-    while i <= n {
+    while (i <= n) {
         sum = sum + i * i
         i = i + 1
     }
     return sum
 }
 
-func isPrime(n: Int64) -> Bool {
-    if n < 2 {
+func isPrime(n: Int64): Bool {
+    if (n < 2) {
         return false
     }
     var i: Int64 = 2
-    while i * i <= n {
-        if n % i == 0 {
+    while (i * i <= n) {
+        if (n % i == 0) {
             return false
         }
         i = i + 1
@@ -126,11 +151,11 @@ func isPrime(n: Int64) -> Bool {
     return true
 }
 
-func countPrimes(limit: Int64) -> Int64 {
+func countPrimes(limit: Int64): Int64 {
     var count: Int64 = 0
     var i: Int64 = 2
-    while i < limit {
-        if isPrime(i) {
+    while (i < limit) {
+        if (isPrime(i)) {
             count = count + 1
         }
         i = i + 1
@@ -138,11 +163,11 @@ func countPrimes(limit: Int64) -> Int64 {
     return count
 }
 
-func collatz(n: Int64) -> Int64 {
+func collatz(n: Int64): Int64 {
     var steps: Int64 = 0
     var current = n
-    while current != 1 {
-        if current % 2 == 0 {
+    while (current != 1) {
+        if (current % 2 == 0) {
             current = current / 2
         } else {
             current = current * 3 + 1
@@ -153,31 +178,31 @@ func collatz(n: Int64) -> Int64 {
 }
 
 // ── 错误处理 ──
-func safeDivide(a: Int64, b: Int64) -> Result<Int64, String> {
-    if b == 0 {
+func safeDivide(a: Int64, b: Int64): Result<Int64, String> {
+    if (b == 0) {
         return Err("Division by zero")
     }
     return Ok(a / b)
 }
 
-func handleResult(r: Result<Int64, String>) -> Int64 {
-    match r {
-        Ok(val) => val,
-        Err(e) => -1
+func handleResult(r: Result<Int64, String>): Int64 {
+    match (r) {
+        case Ok(val) => val,
+        case Err(e) => -1
     }
 }
 
-func handleOption(opt: Option<Int64>) -> Int64 {
-    match opt {
-        Some(val) => val,
-        None => 0
+func handleOption(opt: Option<Int64>): Int64 {
+    match (opt) {
+        case Some(val) => val,
+        case None => 0
     }
 }
 
 // ── try-catch ──
-func tryCatchExample(a: Int64, b: Int64) -> Int64 {
+func tryCatchExample(a: Int64, b: Int64): Int64 {
     try {
-        if b == 0 {
+        if (b == 0) {
             throw 0
         }
         return a / b
@@ -187,53 +212,53 @@ func tryCatchExample(a: Int64, b: Int64) -> Int64 {
 }
 
 // ── 颜色处理 ──
-func colorValue(c: Color) -> Int64 {
-    match c {
-        Color.Red => 1,
-        Color.Green => 2,
-        Color.Blue => 3
+func colorValue(c: Color): Int64 {
+    match (c) {
+        case Color.Red => 1,
+        case Color.Green => 2,
+        case Color.Blue => 3
     }
 }
 
-func messageValue(m: Message) -> Int64 {
-    match m {
-        Message.Quit => 0,
-        Message.Move(distance) => distance,
-        Message.Write(code) => code
+func messageValue(m: Message): Int64 {
+    match (m) {
+        case Message.Quit => 0,
+        case Message.Move(distance) => distance,
+        case Message.Write(code) => code
     }
 }
 
 // ── 测试子函数 ──
-func testStructs() -> Int64 {
-    let p1 = Pair<Int64, Int64> { first: 10, second: 20 }
-    let p2 = Pair<Int64, Bool> { first: 42, second: true }
-    let t = Triple<Int64, Int64, Int64> { a: 1, b: 2, c: 3 }
+func testStructs(): Int64 {
+    let p1 = Pair<Int64, Int64>(10, 20)
+    let p2 = Pair<Int64, Bool>(42, true)
+    let t = Triple<Int64, Int64, Int64>(1, 2, 3)
     return p1.first + p1.second + p2.first + t.a + t.b + t.c
 }
 
-func testClasses() -> Int64 {
-    let v1 = Vector2D { x: 3, y: 4 }
+func testClasses(): Int64 {
+    let v1 = Vector2D(3, 4)
     let len = v1.length()
     let d = v1.dot(1, 2)
 
-    let c = Counter { count: 10 }
+    let c = Counter(10)
     let inc = c.increment()
     let dec = c.decrement()
 
-    let m = Matrix { a11: 1, a12: 2, a21: 3, a22: 4 }
+    let m = Matrix(1, 2, 3, 4)
     let det = m.determinant()
     let tr = m.trace()
 
     return len + d + inc + dec + det + tr
 }
 
-func testGenerics() -> Int64 {
+func testGenerics(): Int64 {
     let a = identity<Int64>(42)
     let c = maximum<Int64>(100, 200)
     return a + c
 }
 
-func testAlgorithms() -> Int64 {
+func testAlgorithms(): Int64 {
     let fib = fibonacci(10)
     let g = gcd(48, 18)
     let pw = power(2, 10)
@@ -243,7 +268,7 @@ func testAlgorithms() -> Int64 {
     return fib + g + pw + sq + primes + col
 }
 
-func testErrorHandling() -> Int64 {
+func testErrorHandling(): Int64 {
     let r1 = safeDivide(100, 5)
     let r2 = safeDivide(100, 0)
     let v1 = handleResult(r1)
@@ -258,7 +283,7 @@ func testErrorHandling() -> Int64 {
     return v1 + v2 + o1 + o2 + tc1 + tc2
 }
 
-func testEnums() -> Int64 {
+func testEnums(): Int64 {
     let c1 = colorValue(Color.Red)
     let c2 = colorValue(Color.Green)
     let c3 = colorValue(Color.Blue)
@@ -268,11 +293,11 @@ func testEnums() -> Int64 {
     return c1 + c2 + c3 + m1 + m2 + m3
 }
 
-func testLoops() -> Int64 {
+func testLoops(): Int64 {
     var sum: Int64 = 0
     var i: Int64 = 0
-    while i < 50 {
-        if isPrime(i) {
+    while (i < 50) {
+        if (isPrime(i)) {
             sum = sum + i
         }
         i = i + 1
@@ -280,13 +305,13 @@ func testLoops() -> Int64 {
     return sum
 }
 
-func testNested() -> Int64 {
+func testNested(): Int64 {
     var result: Int64 = 0
     var i: Int64 = 1
-    while i <= 10 {
+    while (i <= 10) {
         var j: Int64 = 1
-        while j <= 10 {
-            if i * j % 7 == 0 {
+        while (j <= 10) {
+            if (i * j % 7 == 0) {
                 result = result + i * j
             }
             j = j + 1
@@ -297,7 +322,7 @@ func testNested() -> Int64 {
 }
 
 // ── 主函数 ──
-func main() -> Int64 {
+main(): Int64 {
     let a = testStructs()
     let b = testClasses()
     let c = testGenerics()

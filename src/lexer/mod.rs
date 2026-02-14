@@ -468,6 +468,10 @@ pub enum Token {
     Shr,
     #[token("!")]
     Bang,
+    #[token("<:")]
+    SubType,
+    #[token("<-")]
+    LeftArrow,
     #[token("<")]
     Lt,
     #[token(">")]
@@ -548,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_basic_tokens() {
-        let source = "func add(a: Int64, b: Int64) -> Int64 { return a + b }";
+        let source = "func add(a: Int64, b: Int64): Int64 { return a + b }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 
@@ -620,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_comments_skipped() {
-        let source = "func // 注释\n add(a: Int64, b: Int64) -> Int64 { return a + b }";
+        let source = "func // 注释\n add(a: Int64, b: Int64): Int64 { return a + b }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 

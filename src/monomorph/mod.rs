@@ -1055,6 +1055,7 @@ pub fn monomorphize_program(program: &mut Program) {
             .map(|f| FieldDef {
                 name: f.name.clone(),
                 ty: substitute_type(&f.ty, &subst),
+                default: f.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
             })
             .collect();
         new_structs.push(StructDef {
@@ -1121,6 +1122,7 @@ pub fn monomorphize_program(program: &mut Program) {
             .map(|f| FieldDef {
                 name: f.name.clone(),
                 ty: substitute_type(&f.ty, &subst),
+                default: f.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
             })
             .collect();
         let methods: Vec<ClassMethod> = def

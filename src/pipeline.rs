@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_parse_source_success() {
-        let source = "func main() -> Int64 { return 42 }";
+        let source = "func main(): Int64 { return 42 }";
         let program = parse_source(source).unwrap();
         assert_eq!(program.functions.len(), 1);
     }
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_merge_programs_single() {
-        let source = "func main() -> Int64 { return 0 }";
+        let source = "func main(): Int64 { return 0 }";
         let prog = parse_source(source).unwrap();
         let merged = merge_programs(vec![prog]);
         assert_eq!(merged.functions.len(), 1);
@@ -187,8 +187,8 @@ mod tests {
 
     #[test]
     fn test_merge_programs_multiple() {
-        let source1 = "func foo() -> Int64 { return 1 }";
-        let source2 = "func bar() -> Int64 { return 2 }";
+        let source1 = "func foo(): Int64 { return 1 }";
+        let source2 = "func bar(): Int64 { return 2 }";
         let prog1 = parse_source(source1).unwrap();
         let prog2 = parse_source(source2).unwrap();
         let merged = merge_programs(vec![prog1, prog2]);
@@ -197,8 +197,8 @@ mod tests {
 
     #[test]
     fn test_merge_programs_module_name() {
-        let source1 = "module app.main\nfunc main() -> Int64 { return 0 }";
-        let source2 = "func helper() -> Int64 { return 1 }";
+        let source1 = "module app.main\nfunc main(): Int64 { return 0 }";
+        let source2 = "func helper(): Int64 { return 1 }";
         let prog1 = parse_source(source1).unwrap();
         let prog2 = parse_source(source2).unwrap();
         let merged = merge_programs(vec![prog1, prog2]);
@@ -214,7 +214,7 @@ mod tests {
         "#;
         let source2 = r#"
             enum Color { Red Green Blue }
-            interface Drawable { func draw() -> Int64; }
+            interface Drawable { func draw(): Int64; }
         "#;
         let prog1 = parse_source(source1).unwrap();
         let prog2 = parse_source(source2).unwrap();
@@ -238,7 +238,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("cjwasm_test_resolve_dir");
         let _ = fs::create_dir_all(&tmp.join("math"));
         let test_file = tmp.join("math/utils.cj");
-        let _ = fs::write(&test_file, "func foo() -> Int64 { return 0 }");
+        let _ = fs::write(&test_file, "func foo(): Int64 { return 0 }");
 
         let result = resolve_import_path(
             &["math".to_string(), "utils".to_string()],
@@ -255,7 +255,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("cjwasm_test_resolve_underscore");
         let _ = fs::create_dir_all(&tmp);
         let test_file = tmp.join("math_utils.cj");
-        let _ = fs::write(&test_file, "func foo() -> Int64 { return 0 }");
+        let _ = fs::write(&test_file, "func foo(): Int64 { return 0 }");
 
         let result = resolve_import_path(
             &["math".to_string(), "utils".to_string()],
@@ -271,7 +271,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("cjwasm_test_resolve_src");
         let _ = fs::create_dir_all(&tmp.join("src").join("math"));
         let test_file = tmp.join("src/math/utils.cj");
-        let _ = fs::write(&test_file, "func foo() -> Int64 { return 0 }");
+        let _ = fs::write(&test_file, "func foo(): Int64 { return 0 }");
 
         let result = resolve_import_path(
             &["math".to_string(), "utils".to_string()],
@@ -286,7 +286,7 @@ mod tests {
     fn test_collect_import_files() {
         let source = r#"
             import nonexistent.mylib
-            func main() -> Int64 { return 0 }
+            func main(): Int64 { return 0 }
         "#;
         let program = parse_source(source).unwrap();
         let tmp = std::env::temp_dir();
@@ -301,9 +301,9 @@ mod tests {
         let tmp = std::env::temp_dir().join("cjwasm_test_collect_imports");
         let _ = fs::create_dir_all(&tmp);
         let lib_file = tmp.join("mylib.cj");
-        let _ = fs::write(&lib_file, "func helper() -> Int64 { return 1 }");
+        let _ = fs::write(&lib_file, "func helper(): Int64 { return 1 }");
 
-        let source = "import mylib\nfunc main() -> Int64 { return 0 }";
+        let source = "import mylib\nfunc main(): Int64 { return 0 }";
         let program = parse_source(source).unwrap();
         let mut visited = HashSet::new();
         let files = collect_import_files(&program, &tmp, &mut visited);
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_compile_source_to_wasm() {
-        let source = "func main() -> Int64 { return 42 }";
+        let source = "func main(): Int64 { return 42 }";
         let wasm = compile_source_to_wasm(source).unwrap();
         assert!(wasm.len() >= 8);
         assert_eq!(&wasm[0..4], b"\0asm");
@@ -336,9 +336,9 @@ mod tests {
         let tmp = std::env::temp_dir().join("cjwasm_test_compile_files");
         let _ = fs::create_dir_all(&tmp);
         let file1 = tmp.join("main.cj");
-        let _ = fs::write(&file1, "func main() -> Int64 { return helper() }");
+        let _ = fs::write(&file1, "func main(): Int64 { return helper() }");
         let file2 = tmp.join("helper.cj");
-        let _ = fs::write(&file2, "func helper() -> Int64 { return 42 }");
+        let _ = fs::write(&file2, "func helper(): Int64 { return 42 }");
 
         let wasm = compile_files_to_wasm(&[
             file1.to_str().unwrap(),
@@ -362,7 +362,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("cjwasm_test_parse_file");
         let _ = fs::create_dir_all(&tmp);
         let file = tmp.join("test.cj");
-        let _ = fs::write(&file, "func main() -> Int64 { return 0 }");
+        let _ = fs::write(&file, "func main(): Int64 { return 0 }");
 
         let (program, source) = parse_file(file.to_str().unwrap()).unwrap();
         assert_eq!(program.functions.len(), 1);
@@ -384,9 +384,9 @@ mod tests {
                 West
             }
             
-            func add(a: Int64, b: Int64) -> Int64 { return a + b }
+            func add(a: Int64, b: Int64): Int64 { return a + b }
             
-            func main() -> Int64 {
+            func main(): Int64 {
                 let p = Point { x: 10, y: 20 }
                 let d = Direction.North
                 let sum = add(p.x, p.y)

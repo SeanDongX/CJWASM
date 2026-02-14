@@ -1,7 +1,9 @@
 /target
 *.wasm
+*.cjo
 .DS_Store
 Cargo.lock
+main
 
 # 基准测试报告
 /target/bench_reports/

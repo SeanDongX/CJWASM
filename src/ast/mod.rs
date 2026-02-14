@@ -508,6 +508,8 @@ pub enum AssignTarget {
 pub struct FieldDef {
     pub name: String,
     pub ty: Type,
+    /// cjc 兼容: 字段默认值 (如 `var x: Int64 = 0`)
+    pub default: Option<Expr>,
 }
 
 /// 结构体定义

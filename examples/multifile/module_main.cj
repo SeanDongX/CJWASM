@@ -4,7 +4,7 @@ module examples.main
 
 import examples.lib
 
-func main() -> Int64 {
+func main() : Int64 {
     let a = add(10, 20)       // 30
     let b = multiply(3, 4)    // 12
     let c = square(5)         // 25
