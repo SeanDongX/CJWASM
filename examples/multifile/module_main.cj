@@ -8,5 +8,5 @@ func main() : Int64 {
     let a = add(10, 20)       // 30
     let b = multiply(3, 4)    // 12
     let c = square(5)         // 25
-    return a + b + c          // 67
+    return a + b + c          // 预期输出: 67
 }
