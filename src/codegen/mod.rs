@@ -435,10 +435,13 @@ impl CodeGen {
             for m in &c.methods {
                 functions.push(m.func.clone());
             }
-            // 为有 init 的类生成 __ClassName_init 函数
+            // 为有 init 的类生成 __ClassName_init 函数和 __ClassName_init_body 函数
             if let Some(ref init_def) = c.init {
                 let init_func = self.build_init_function(c, init_def);
                 functions.push(init_func);
+                // Bug B3: 生成 init_body 函数（用于 super() 调用）
+                let init_body_func = self.build_init_body_function(c, init_def);
+                functions.push(init_body_func);
             }
             // 为有 deinit 的类生成 __ClassName_deinit 函数
             if let Some(ref deinit_body) = c.deinit {
@@ -1463,6 +1466,34 @@ impl CodeGen {
             return_type: Some(Type::Struct(class_name.clone(), vec![])),
             throws: None,
             body,
+            extern_import: None,
+        }
+    }
+
+    /// Bug B3 修复: 构建 init body 函数 __ClassName_init_body(this, params...) -> Unit
+    /// 不分配内存，只执行 init body（用于 super() 调用）
+    fn build_init_body_function(&self, class: &ClassDef, init_def: &InitDef) -> FuncDef {
+        let class_name = &class.name;
+        let func_name = format!("__{}_init_body", class_name);
+
+        // 第一个参数是 this: ClassName
+        let mut params = vec![Param {
+            name: "this".to_string(),
+            ty: Type::Struct(class_name.clone(), vec![]),
+            default: None,
+            variadic: false,
+        }];
+        params.extend(init_def.params.iter().cloned());
+
+        FuncDef {
+            visibility: Visibility::Public,
+            name: func_name,
+            type_params: vec![],
+            constraints: vec![],
+            params,
+            return_type: None, // 无返回值
+            throws: None,
+            body: init_def.body.clone(),
             extern_import: None,
         }
     }
@@ -6793,6 +6824,12 @@ impl CodeGen {
                     .unwrap_or(ValType::I32);
                 locals.add("__err_flag", ValType::I32, None);
                 locals.add("__err_val", err_val_type, None);
+                // Bug B6 修复: 为 try-catch 表达式结果添加临时变量
+                // 推断 try body 最后一条表达式的类型作为结果类型
+                let try_result_type = body.last().and_then(|s| {
+                    if let Stmt::Expr(e) = s { Some(self.infer_type(e)) } else { None }
+                }).unwrap_or(ValType::I64);
+                locals.add("__try_result", try_result_type, None);
                 for stmt in body {
                     self.collect_locals(stmt, locals);
                 }
@@ -7140,12 +7177,23 @@ impl CodeGen {
     fn infer_ast_type_with_locals(&self, expr: &Expr, locals: &LocalsBuilder) -> Option<Type> {
         match expr {
             Expr::Var(name) => {
-                // 优先从 locals 获取类型，若无则检查 math 常数
+                // 优先从 locals 获取类型，若无则检查 math 常数，最后检查隐式 this 字段
                 locals.get_type(name).cloned().or_else(|| {
                     match name.as_str() {
                         "PI" | "E" | "TAU" | "INF" | "INFINITY" | "NEG_INF" | "NEG_INFINITY" | "NAN"
                             if locals.get(name).is_none() => Some(Type::Float64),
-                        _ => None,
+                        _ => {
+                            // Bug B2 修复: 隐式 this 字段类型推断
+                            if locals.get("this").is_some() {
+                                let this_field = Expr::Field {
+                                    object: Box::new(Expr::Var("this".to_string())),
+                                    field: name.clone(),
+                                };
+                                self.infer_ast_type_with_locals(&this_field, locals)
+                            } else {
+                                None
+                            }
+                        }
                     }
                 })
             }
@@ -7252,7 +7300,7 @@ impl CodeGen {
             Expr::Field { object, field, .. } => {
                 // Phase 7.2: 内建类型属性
                 let obj_ty = self.infer_ast_type_with_locals(object, locals);
-                if field == "size" && obj_ty.as_ref() == Some(&Type::String) {
+                if field == "size" && (obj_ty.as_ref() == Some(&Type::String) || matches!(obj_ty.as_ref(), Some(Type::Array(_)))) {
                     return Some(Type::Int64);
                 }
                 obj_ty.and_then(|ty| {
@@ -7260,13 +7308,20 @@ impl CodeGen {
                         // 泛型类型需要查找修饰后的名字
                         let lookup_name = if !type_args.is_empty() {
                             let mangled = crate::monomorph::mangle_name(&s, type_args);
-                            if self.structs.contains_key(&mangled) { mangled } else { s }
+                            if self.structs.contains_key(&mangled) { mangled } else { s.clone() }
                         } else {
-                            s
+                            s.clone()
                         };
-                        self.structs.get(&lookup_name).and_then(|def| {
+                        // 先查找 struct 字段
+                        let field_ty = self.structs.get(&lookup_name).and_then(|def| {
                             def.fields.iter().find(|f| f.name == *field).map(|f| f.ty.clone())
-                        })
+                        });
+                        if field_ty.is_some() {
+                            return field_ty;
+                        }
+                        // Bug B2 补充修复: 查找 prop getter 的返回类型
+                        let getter_name = format!("{}.__get_{}", s, field);
+                        self.func_return_types.get(&getter_name).cloned()
                     } else {
                         None
                     }
@@ -7290,6 +7345,16 @@ impl CodeGen {
                 match op {
                     BinOp::LogicalAnd | BinOp::LogicalOr | BinOp::Eq | BinOp::NotEq
                     | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => Some(Type::Bool),
+                    BinOp::Add => {
+                        // Bug B4: String + x 或 x + String 结果为 String
+                        let left_ty = self.infer_ast_type_with_locals(left, locals);
+                        let right_ty = self.infer_ast_type_with_locals(right, locals);
+                        if left_ty == Some(Type::String) || right_ty == Some(Type::String) {
+                            Some(Type::String)
+                        } else {
+                            left_ty.or(right_ty)
+                        }
+                    }
                     _ => self.infer_ast_type_with_locals(left, locals)
                         .or_else(|| self.infer_ast_type_with_locals(right, locals)),
                 }
@@ -7343,6 +7408,10 @@ impl CodeGen {
             Expr::StructInit { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
             Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
             Expr::Field { object, .. } => self.get_object_type(object, locals),
+            // Bug B5 修复: 方法调用返回类型追踪（支持链式调用）
+            Expr::MethodCall { object, method, .. } => {
+                self.infer_ast_type_with_locals(expr, locals)
+            }
             _ => None,
         }
     }
@@ -7363,6 +7432,43 @@ impl CodeGen {
             wasm_encoder::BlockType::Result(ValType::F32) => { func.instruction(&Instruction::F32Const(0.0)); }
             wasm_encoder::BlockType::Result(ValType::F64) => { func.instruction(&Instruction::F64Const(0.0)); }
             _ => { func.instruction(&Instruction::I64Const(0)); }
+        }
+    }
+
+    /// Bug B4 修复: 将栈顶值转为字符串指针（i32）
+    /// 假设栈顶已有对应类型的值
+    fn emit_to_string(&self, func: &mut WasmFunc, ast_ty: Option<&Type>) {
+        match ast_ty {
+            Some(Type::String) => {
+                // 已是字符串，无需转换
+            }
+            Some(Type::Int64) | Some(Type::Int32) | Some(Type::IntNative) => {
+                func.instruction(&Instruction::Call(self.func_indices["__i64_to_str"]));
+            }
+            Some(Type::Int8) | Some(Type::Int16) | Some(Type::UInt8) | Some(Type::UInt16) | Some(Type::UInt32) | Some(Type::Rune) => {
+                func.instruction(&Instruction::Call(self.func_indices["__i32_to_str"]));
+            }
+            Some(Type::UInt64) | Some(Type::UIntNative) => {
+                func.instruction(&Instruction::Call(self.func_indices["__i64_to_str"]));
+            }
+            Some(Type::Float64) => {
+                func.instruction(&Instruction::Call(self.func_indices["__f64_to_str"]));
+            }
+            Some(Type::Float32) => {
+                func.instruction(&Instruction::Call(self.func_indices["__f32_to_str"]));
+            }
+            Some(Type::Bool) => {
+                func.instruction(&Instruction::Call(self.func_indices["__bool_to_str"]));
+            }
+            _ => {
+                // 未知类型，转为 "[object]"
+                func.instruction(&Instruction::Drop);
+                let obj_str = self.string_pool.iter()
+                    .find(|(s, _)| s == "[object]")
+                    .map(|(_, off)| *off)
+                    .unwrap_or(0);
+                func.instruction(&Instruction::I32Const(obj_str as i32));
+            }
         }
     }
 
@@ -7434,8 +7540,10 @@ impl CodeGen {
             }
             // throw 设置 __err_flag/__err_val 并跳转，不在栈上留值
             Expr::Throw(_) => false,
-            // try-catch 内部通过 return 处理控制流，不在栈上留值
-            Expr::TryBlock { .. } => false,
+            // Bug B6 修复: try-catch 可以作为表达式使用（当 body 最后一条是表达式时产生值）
+            Expr::TryBlock { body, .. } => {
+                body.last().map_or(false, |s| matches!(s, Stmt::Expr(e) if Self::expr_produces_value(e)))
+            }
             // super(args) 初始化调用不产生值（已在 compile_expr 中 drop）
             Expr::SuperCall { method, .. } => method != "init" && !method.is_empty(),
             // I/O 函数不返回值
@@ -7592,29 +7700,47 @@ impl CodeGen {
             Stmt::Assign { target, value } => {
                 match target {
                     AssignTarget::Var(name) => {
-                        // Phase 8: 引用计数 - 赋值前对旧值 rc_dec
-                        if let Some(ast_ty) = locals.get_type(name) {
-                            if memory::is_heap_type(ast_ty) || memory::may_hold_heap_ptr(ast_ty) {
-                                if let Some(rc_dec_idx) = self.func_indices.get("__rc_dec") {
-                                    let idx = locals.get(name).expect("变量未找到");
-                                    func.instruction(&Instruction::LocalGet(idx));
-                                    func.instruction(&Instruction::Call(*rc_dec_idx));
+                        // Bug B2 修复: 隐式 this 字段赋值 — 将 `field = value` 重写为 `this.field = value`
+                        if locals.get(name).is_none() && locals.get("this").is_some() {
+                            let field_target = AssignTarget::Field {
+                                object: "this".to_string(),
+                                field: name.clone(),
+                            };
+                            self.compile_stmt(&Stmt::Assign { target: field_target, value: value.clone() }, locals, func, loop_ctx);
+                        } else {
+                            // Phase 8: 引用计数 - 赋值前对旧值 rc_dec
+                            if let Some(ast_ty) = locals.get_type(name) {
+                                if memory::is_heap_type(ast_ty) || memory::may_hold_heap_ptr(ast_ty) {
+                                    if let Some(rc_dec_idx) = self.func_indices.get("__rc_dec") {
+                                        let idx = locals.get(name).expect("变量未找到");
+                                        func.instruction(&Instruction::LocalGet(idx));
+                                        func.instruction(&Instruction::Call(*rc_dec_idx));
+                                    }
                                 }
                             }
+                            self.compile_expr(value, locals, func, loop_ctx);
+                            let idx = locals.get(name).expect("变量未找到");
+                            // 值类型与局部变量类型不匹配时自动转换
+                            let val_ty = self.infer_type_with_locals(value, locals);
+                            let local_ty = locals.get_valtype(name).unwrap_or(val_ty);
+                            self.emit_type_coercion(func, val_ty, local_ty);
+                            func.instruction(&Instruction::LocalSet(idx));
                         }
-                        self.compile_expr(value, locals, func, loop_ctx);
-                        let idx = locals.get(name).expect("变量未找到");
-                        // 值类型与局部变量类型不匹配时自动转换
-                        let val_ty = self.infer_type_with_locals(value, locals);
-                        let local_ty = locals.get_valtype(name).unwrap_or(val_ty);
-                        self.emit_type_coercion(func, val_ty, local_ty);
-                        func.instruction(&Instruction::LocalSet(idx));
                     }
                     AssignTarget::Index { array, index } => {
                         // arr[i] = value
-                        // 计算地址: arr + i * 8
+                        // 计算地址: arr + 4 + i * 8
                         let arr_idx = locals.get(array).expect("数组未找到");
+                        // 检测数组元素类型，Float64 使用 F64Store
+                        let is_float_elem = locals.get_type(array)
+                            .map(|ty| match ty {
+                                Type::Array(ref elem_ty) => matches!(**elem_ty, Type::Float64 | Type::Float32),
+                                _ => false,
+                            })
+                            .unwrap_or(false);
                         func.instruction(&Instruction::LocalGet(arr_idx));
+                        func.instruction(&Instruction::I32Const(4)); // 跳过长度字段
+                        func.instruction(&Instruction::I32Add);
                         self.compile_expr(index, locals, func, loop_ctx);
                         func.instruction(&Instruction::I32WrapI64);
                         func.instruction(&Instruction::I32Const(8)); // 元素大小
@@ -7622,11 +7748,19 @@ impl CodeGen {
                         func.instruction(&Instruction::I32Add);
                         // 存储值
                         self.compile_expr(value, locals, func, loop_ctx);
-                        func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
-                            offset: 0,
-                            align: 3,
-                            memory_index: 0,
-                        }));
+                        if is_float_elem {
+                            func.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 3,
+                                memory_index: 0,
+                            }));
+                        } else {
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 3,
+                                memory_index: 0,
+                            }));
+                        }
                     }
                     AssignTarget::Field { object, field } => {
                         // obj.field = value：用对象类型计算字段偏移与字段类型
@@ -8293,8 +8427,18 @@ impl CodeGen {
                         func.instruction(&Instruction::F64Const(std::f64::consts::TAU));
                     }
                     _ => {
-                        let idx = locals.get(name).unwrap_or_else(|| panic!("变量未找到: '{}'", name));
-                        func.instruction(&Instruction::LocalGet(idx));
+                        if let Some(idx) = locals.get(name) {
+                            func.instruction(&Instruction::LocalGet(idx));
+                        } else if let Some(this_idx) = locals.get("this") {
+                            // Bug B2 修复: 隐式 this 字段访问 — 将 `field` 解析为 `this.field`
+                            let this_field = Expr::Field {
+                                object: Box::new(Expr::Var("this".to_string())),
+                                field: name.clone(),
+                            };
+                            self.compile_expr(&this_field, locals, func, loop_ctx);
+                        } else {
+                            panic!("变量未找到: '{}'", name);
+                        }
                     }
                 }
             }
@@ -8397,6 +8541,25 @@ impl CodeGen {
                     let idx = *self.func_indices.get("__pow_i64").unwrap();
                     func.instruction(&Instruction::Call(idx));
                     return;
+                }
+                // Bug B4 修复: String `+` 应调用 __str_concat 而非 I32Add
+                if op == &BinOp::Add {
+                    let left_ast = self.infer_ast_type_with_locals(left, locals);
+                    let right_ast = self.infer_ast_type_with_locals(right, locals);
+                    if left_ast == Some(Type::String) || right_ast == Some(Type::String) {
+                        // 如果一侧不是字符串，先转为字符串
+                        self.compile_expr(left, locals, func, loop_ctx);
+                        if left_ast != Some(Type::String) {
+                            self.emit_to_string(func, left_ast.as_ref());
+                        }
+                        self.compile_expr(right, locals, func, loop_ctx);
+                        if right_ast != Some(Type::String) {
+                            self.emit_to_string(func, right_ast.as_ref());
+                        }
+                        let concat_idx = self.func_indices["__str_concat"];
+                        func.instruction(&Instruction::Call(concat_idx));
+                        return;
+                    }
                 }
                 self.compile_expr(left, locals, func, loop_ctx);
                 self.compile_expr(right, locals, func, loop_ctx);
@@ -8878,21 +9041,43 @@ impl CodeGen {
                 // super(args) → 调用父类 init; super.method(args) → 调用父类方法
                 // super 调用分两种：super(args) 和 super.method(args)
                 if method == "init" {
-                    // super(args) → 调用父类的 __ParentClass_init
-                    // this 作为第一个参数已在栈上（由 init body 上下文提供）
-                    for arg in args {
-                        self.compile_expr(arg, locals, func, loop_ctx);
-                    }
-                    // 寻找匹配的父类 init 函数
+                    // Bug B3 修复: super(args) → 调用父类的 __ParentClass_init_body(this, args...)
+                    // 而非 __ParentClass_init(args...) 以避免分配新对象
+                    // 优先使用 init_body 版本（传入当前 this），回退到旧逻辑
+                    let mut found = false;
                     for ci in self.classes.values() {
                         if let Some(ref parent) = ci.parent {
-                            let parent_init = format!("__{}_init", parent);
-                            if self.func_indices.contains_key(&parent_init) {
-                                let idx = self.func_indices[&parent_init];
+                            let parent_init_body = format!("__{}_init_body", parent);
+                            if self.func_indices.contains_key(&parent_init_body) {
+                                // 传递当前 this 作为第一个参数
+                                if let Some(this_idx) = locals.get("this") {
+                                    func.instruction(&Instruction::LocalGet(this_idx));
+                                }
+                                for arg in args {
+                                    self.compile_expr(arg, locals, func, loop_ctx);
+                                }
+                                let idx = self.func_indices[&parent_init_body];
                                 func.instruction(&Instruction::Call(idx));
-                                // super init 返回 i32 (ptr)，但我们忽略（this 已分配）
-                                func.instruction(&Instruction::Drop);
+                                // init_body 无返回值，不需要 Drop
+                                found = true;
                                 break;
+                            }
+                        }
+                    }
+                    if !found {
+                        // 回退: 旧逻辑（调用 __Parent_init 并丢弃结果）
+                        for arg in args {
+                            self.compile_expr(arg, locals, func, loop_ctx);
+                        }
+                        for ci in self.classes.values() {
+                            if let Some(ref parent) = ci.parent {
+                                let parent_init = format!("__{}_init", parent);
+                                if self.func_indices.contains_key(&parent_init) {
+                                    let idx = self.func_indices[&parent_init];
+                                    func.instruction(&Instruction::Call(idx));
+                                    func.instruction(&Instruction::Drop);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -9131,17 +9316,28 @@ impl CodeGen {
                     memory_index: 0,
                 }));
 
-                // 写入每个元素
+                // 写入每个元素（检测元素类型，Float64 使用 F64Store）
+                let is_float_array = elements.first()
+                    .map(|e| self.infer_type_with_locals(e, locals) == ValType::F64)
+                    .unwrap_or(false);
                 for (i, elem) in elements.iter().enumerate() {
                     func.instruction(&Instruction::LocalGet(tmp_local));
                     func.instruction(&Instruction::I32Const(4 + i as i32 * elem_size));
                     func.instruction(&Instruction::I32Add);
                     self.compile_expr(elem, locals, func, loop_ctx);
-                    func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    }));
+                    if is_float_array {
+                        func.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 3,
+                            memory_index: 0,
+                        }));
+                    } else {
+                        func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 3,
+                            memory_index: 0,
+                        }));
+                    }
                 }
 
                 // 返回数组地址
@@ -9149,6 +9345,11 @@ impl CodeGen {
             }
             Expr::Index { array, index } => {
                 // arr[i] -> load from (arr + 4 + i * 8)
+                // 检测数组元素类型，Float64 数组使用 F64Load
+                let is_float_elem = match self.infer_ast_type_with_locals(array, locals) {
+                    Some(Type::Array(ref elem_ty)) => matches!(**elem_ty, Type::Float64 | Type::Float32),
+                    _ => false,
+                };
                 self.compile_expr(array, locals, func, loop_ctx);
                 func.instruction(&Instruction::I32Const(4)); // 跳过长度字段
                 func.instruction(&Instruction::I32Add);
@@ -9157,11 +9358,19 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(8));
                 func.instruction(&Instruction::I32Mul);
                 func.instruction(&Instruction::I32Add);
-                func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 3,
-                    memory_index: 0,
-                }));
+                if is_float_elem {
+                    func.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                } else {
+                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                }
             }
             Expr::StructInit { name, type_args, fields } => {
                 let class_info = self.classes.get(name);
@@ -9290,13 +9499,33 @@ impl CodeGen {
             Expr::Field { object, field } => {
                 // Phase 7.2: 内建类型属性拦截
                 let obj_ast_type = self.infer_ast_type_with_locals(object, locals);
-                if field == "size" && obj_ast_type.as_ref() == Some(&Type::String) {
-                    // String.size → 读取字符串指针处的 i32 长度，扩展为 i64
+                let is_array_type = matches!(obj_ast_type.as_ref(), Some(Type::Array(_)));
+                if field == "size" && (obj_ast_type.as_ref() == Some(&Type::String) || is_array_type) {
+                    // String.size / Array.size → 读取指针处的 i32 长度，扩展为 i64
                     self.compile_expr(object, locals, func, loop_ctx);
                     func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                         offset: 0, align: 2, memory_index: 0,
                     }));
                     func.instruction(&Instruction::I64ExtendI32S);
+                } else {
+                // Bug B2 修复: 检查是否有 prop getter 方法
+                let getter_name = self.get_object_type(object, locals).and_then(|ty| {
+                    if let Type::Struct(ref name, _) = ty {
+                        let getter = format!("{}.__get_{}", name, field);
+                        if self.func_indices.contains_key(&getter) {
+                            Some(getter)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some(getter_func_name) = getter_name {
+                    // prop getter: 编译为 ClassName.__get_propName(object)
+                    self.compile_expr(object, locals, func, loop_ctx);
+                    let getter_idx = self.func_indices[&getter_func_name];
+                    func.instruction(&Instruction::Call(getter_idx));
                 } else {
                 self.compile_expr(object, locals, func, loop_ctx);
                 let (offset, field_ty) = self
@@ -9333,6 +9562,7 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(offset as i32));
                 func.instruction(&Instruction::I32Add);
                 self.emit_load_by_type(func, &field_ty);
+                } // end else (non-prop field)
                 } // end else (non-builtin field)
             }
             Expr::Block(stmts, result) => {
@@ -9506,14 +9736,26 @@ impl CodeGen {
                             }
                         }
                         Pattern::Binding(name) => {
-                            if let Some(idx) = locals.get(name) {
-                                if subject_ty == ValType::I32 {
-                                    func.instruction(&Instruction::I64ExtendI32S);
+                            // Bug B1 修复: 检查是否为未限定的枚举变体名（如 `case RED` 而非 `case Color.RED`）
+                            let enum_variant_disc = if let Some(Type::Struct(ref enum_type_name, _)) = subject_ast_type {
+                                self.enums.get(enum_type_name).and_then(|e| e.variant_index(name)).map(|idx| idx as i32)
+                            } else {
+                                None
+                            };
+
+                            if let Some(expected_disc) = enum_variant_disc {
+                                // 作为枚举变体比较（而非变量绑定）
+                                func.instruction(&Instruction::I32Const(expected_disc));
+                                func.instruction(&Instruction::I32Eq);
+
+                                if has_guard {
+                                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                                    self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Else);
+                                    func.instruction(&Instruction::I32Const(0));
+                                    func.instruction(&Instruction::End);
                                 }
-                                func.instruction(&Instruction::LocalSet(idx));
-                            }
-                            if has_guard {
-                                self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
+
                                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 self.compile_expr(&arm.body, locals, func, loop_ctx);
                                 func.instruction(&Instruction::Br(1));
@@ -9524,8 +9766,28 @@ impl CodeGen {
                                     self.compile_expr(expr, locals, func, loop_ctx);
                                 }
                             } else {
-                                self.compile_expr(&arm.body, locals, func, loop_ctx);
-                                func.instruction(&Instruction::Br(0));
+                                // 普通变量绑定
+                                if let Some(idx) = locals.get(name) {
+                                    if subject_ty == ValType::I32 {
+                                        func.instruction(&Instruction::I64ExtendI32S);
+                                    }
+                                    func.instruction(&Instruction::LocalSet(idx));
+                                }
+                                if has_guard {
+                                    self.compile_expr(arm.guard.as_ref().unwrap(), locals, func, loop_ctx);
+                                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                                    self.compile_expr(&arm.body, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Br(1));
+                                    func.instruction(&Instruction::End);
+                                    if is_last {
+                                        Self::emit_match_default_value(func, result_type);
+                                    } else {
+                                        self.compile_expr(expr, locals, func, loop_ctx);
+                                    }
+                                } else {
+                                    self.compile_expr(&arm.body, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::Br(0));
+                                }
                             }
                         }
                         Pattern::Variant {
@@ -9927,16 +10189,16 @@ impl CodeGen {
             }
             Expr::TryBlock { body, catch_var, catch_body, finally_body } => {
                 // try { body } catch(e) { catch_body } finally { finally_body }
-                // 实现策略：
-                //   - try body 正常执行
-                //   - 使用全局标志 __err_flag 来标记是否发生了错误（throw 会设置此标志）
-                //   - 如果 throw 发生，跳转到 catch 块
-                //   - finally 块无论是否异常都执行
+                // Bug B6 修复: 支持 try-catch 作为表达式使用
 
-                // 使用局部变量 __err_flag 标记是否发生错误（0=正常, 1=异常）
-                // 这些局部变量在 collect_locals 阶段已预分配
                 let err_flag = locals.get("__err_flag").unwrap_or(0);
                 let err_val = locals.get("__err_val").unwrap_or(0);
+                let try_result = locals.get("__try_result").unwrap_or(0);
+
+                // 检查 try body 最后一条是否为表达式（即 try-catch 用作表达式）
+                let produces_value = body.last().map_or(false, |s| {
+                    matches!(s, Stmt::Expr(e) if Self::expr_produces_value(e))
+                });
 
                 // 初始化 __err_flag = 0
                 func.instruction(&Instruction::I32Const(0));
@@ -9944,9 +10206,20 @@ impl CodeGen {
 
                 // 用 block 包裹 try body，throw 后通过 br_if 跳出
                 func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
-                // 编译 try body，每条语句后检查 err_flag 并提前退出
-                for stmt in body {
-                    self.compile_stmt(stmt, locals, func, loop_ctx);
+                let body_len = body.len();
+                for (i, stmt) in body.iter().enumerate() {
+                    let is_last = i == body_len - 1;
+                    if is_last && produces_value {
+                        // 最后一条表达式：编译并存入 __try_result
+                        if let Stmt::Expr(e) = stmt {
+                            self.compile_expr(e, locals, func, loop_ctx);
+                            func.instruction(&Instruction::LocalSet(try_result));
+                        } else {
+                            self.compile_stmt(stmt, locals, func, loop_ctx);
+                        }
+                    } else {
+                        self.compile_stmt(stmt, locals, func, loop_ctx);
+                    }
                     // throw 后 __err_flag=1，br_if 跳出 try block
                     func.instruction(&Instruction::LocalGet(err_flag));
                     func.instruction(&Instruction::BrIf(0));
@@ -9954,30 +10227,42 @@ impl CodeGen {
                 func.instruction(&Instruction::End); // end of try body block
 
                 // 编译 catch 块（在 throw 发生时执行）
-                // 检查 __err_flag
                 func.instruction(&Instruction::LocalGet(err_flag));
                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                // 在 catch 块中，如果有 catch_var，将 __err_val 赋给它
                 if let Some(ref var) = catch_var {
                     if let Some(var_idx) = locals.get(var) {
                         func.instruction(&Instruction::LocalGet(err_val));
                         func.instruction(&Instruction::LocalSet(var_idx));
                     }
                 }
-                for stmt in catch_body {
-                    self.compile_stmt(stmt, locals, func, loop_ctx);
+                let catch_len = catch_body.len();
+                for (i, stmt) in catch_body.iter().enumerate() {
+                    let is_last = i == catch_len - 1;
+                    if is_last && produces_value {
+                        // catch 最后一条表达式也存入 __try_result
+                        if let Stmt::Expr(e) = stmt {
+                            self.compile_expr(e, locals, func, loop_ctx);
+                            func.instruction(&Instruction::LocalSet(try_result));
+                        } else {
+                            self.compile_stmt(stmt, locals, func, loop_ctx);
+                        }
+                    } else {
+                        self.compile_stmt(stmt, locals, func, loop_ctx);
+                    }
                 }
                 func.instruction(&Instruction::End); // end of catch if
 
-                // 编译 finally 块（无论是否异常都执行）
+                // 编译 finally 块
                 if let Some(finally_stmts) = finally_body {
                     for stmt in finally_stmts {
                         self.compile_stmt(stmt, locals, func, loop_ctx);
                     }
                 }
 
-                // try-catch-finally 完成后，控制流正常继续
-                // 不添加 unreachable，因为 try-catch 可能作为语句使用，后续还有代码
+                // Bug B6: 如果 try-catch 产生值，加载 __try_result
+                if produces_value {
+                    func.instruction(&Instruction::LocalGet(try_result));
+                }
             }
             Expr::SliceExpr { .. } | Expr::MapLiteral { .. } => {
                 todo!("SliceExpr and MapLiteral codegen not yet implemented")
