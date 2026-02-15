@@ -57,6 +57,8 @@ main(): Int64 {
     // Option 使用
     let result1 = divide(10, 2)        // Some(5)
     let result2 = divide(10, 0)        // None
-
+    @Assert(code, 0xFF0000)
+    @Assert(n, 2)
+    @Assert(n + code, 16711682)
     return n + code  // 预期输出: 16711682
 }

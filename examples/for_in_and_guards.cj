@@ -26,6 +26,12 @@ main(): Int64 {
     let c = classifyNumber(5)    // 3
     let d = classifyNumber(50)   // 4
     let e = classifyNumber(200)  // 5
+    @Assert(a, 100)
+    @Assert(b, 2)
+    @Assert(c, 3)
+    @Assert(d, 4)
+    @Assert(e, 5)
+    @Assert(a + b + c + d + e, 114)
     return a + b + c + d + e     // 100+2+3+4+5 = 114
     // 预期输出: 114
 }

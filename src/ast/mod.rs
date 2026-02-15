@@ -505,6 +505,18 @@ pub enum Stmt {
     Break,
     /// continue（跳到当前循环下一轮）
     Continue,
+    /// @Assert(left, right) — 断言 left == right，失败则立即终止
+    Assert {
+        left: Expr,
+        right: Expr,
+        line: usize,
+    },
+    /// @Expect(left, right) — 断言 left == right，失败则记录但继续执行
+    Expect {
+        left: Expr,
+        right: Expr,
+        line: usize,
+    },
 }
 
 /// 赋值目标

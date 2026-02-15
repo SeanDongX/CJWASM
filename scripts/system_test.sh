@@ -153,7 +153,12 @@ for filepath in "${FILES[@]}"; do
   # ── 提取预期输出 ──
   expected=""
   if grep -q '预期输出' "$filepath"; then
-    expected=$(grep '预期输出' "$filepath" | tail -1 | grep -oE '[-]?[0-9]+' | tail -1)
+    # 先尝试提取数字（兼容已有格式）
+    expected=$(grep '预期输出' "$filepath" | tail -1 | grep -oE '[-]?[0-9]+' | tail -1 || true)
+    # 若无数字，提取 "预期输出:" 后的文本值（如 PASS）
+    if [[ -z "$expected" ]]; then
+      expected=$(grep '预期输出' "$filepath" | tail -1 | sed 's/.*预期输出[：:][[:space:]]*//' | sed 's/[[:space:]]*$//')
+    fi
   fi
 
   # ── 编译 ──

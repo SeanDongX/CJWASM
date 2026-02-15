@@ -109,7 +109,13 @@ main(): Int64 {
     let d = filterAndSum()       // 75
     let e = searchMatrix()       // 17
     let f = doWhileStyle()       // 5
-
+    @Assert(a, 45)
+    @Assert(b, 90)
+    @Assert(c, 12)
+    @Assert(d, 75)
+    @Assert(e, 17)
+    @Assert(f, 5)
+    @Assert(a + b + c + d + e + f, 244)
     return a + b + c + d + e + f
     // 45 + 90 + 12 + 75 + 17 + 5 = 244
     // 预期输出: 244

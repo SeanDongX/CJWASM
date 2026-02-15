@@ -15,5 +15,7 @@ class Point {
 
 main(): Int64 {
     let p = Point(5, 10)
+    @Assert(p.area(p), 50)
+
     return p.area(p)  // 预期输出: 50
 }

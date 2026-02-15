@@ -53,5 +53,9 @@ main(): Int64 {
     let rect = Rectangle(5, 10)
     let a = area(rect)
 
+    @Assert(total, 60)
+    @Assert(a, 50)
+    @Assert(total + a, 110)
+
     return total + a  // 预期输出: 110
 }

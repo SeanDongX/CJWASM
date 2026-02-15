@@ -54,6 +54,12 @@ main(): Int64 {
     let c = matchNumber(1)       // 200
     let d = matchMultiple(2)     // 10
     let e = matchRange(50)       // 2
+    @Assert(a, 45)
+    @Assert(b, 15)
+    @Assert(c, 200)
+    @Assert(d, 10)
+    @Assert(e, 2)
+    @Assert(a + b + c + d + e, 272)
     return a + b + c + d + e     // 45+15+200+10+2 = 272
     // 预期输出: 272
 }

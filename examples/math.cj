@@ -107,5 +107,16 @@ main(): Int64 {
     let f = discriminant(1, 5, 6)
     let g = manhattanDistance(0, 0, 3, 4)
     let h = average(10, 20, 30)
+
+    @Assert(a, 72)
+    @Assert(b, 1486)
+    @Assert(c, 4)
+    @Assert(d, 350)
+    @Assert(e, 17)
+    @Assert(f, 1)
+    @Assert(g, 7)
+    @Assert(h, 20)
+    @Assert(a + b + c + d + e + f + g + h, 1957)
+
     return a + b + c + d + e + f + g + h  // 预期输出: 1957
 }

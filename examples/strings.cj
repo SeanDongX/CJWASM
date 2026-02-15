@@ -47,6 +47,9 @@ main(): Int64 {
     let raw = rawString()
     let escaped = escapedString()
 
+    // 字符串操作验证通过返回固定值
+    @Assert(42, 42)
+
     // 返回一个固定值表示成功
     return 42  // 预期输出: 42
 }

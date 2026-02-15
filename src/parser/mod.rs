@@ -1623,6 +1623,34 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 Ok(Stmt::Loop { body })
             }
+            Some(Token::At) => {
+                let (at_start, _) = self.at();
+                self.advance(); // consume @
+                match self.peek().cloned() {
+                    Some(Token::Ident(name)) if name == "Assert" || name == "Expect" => {
+                        let is_assert = name == "Assert";
+                        self.advance(); // consume Assert/Expect
+                        self.expect(Token::LParen)?;
+                        let left = self.parse_expr()?;
+                        // 双参数形式 @Assert(a, b) 或单参数形式 @Assert(cond)
+                        let right = if self.check(&Token::Comma) {
+                            self.advance();
+                            self.parse_expr()?
+                        } else {
+                            Expr::Bool(true)
+                        };
+                        self.expect(Token::RParen)?;
+                        if is_assert {
+                            Ok(Stmt::Assert { left, right, line: at_start })
+                        } else {
+                            Ok(Stmt::Expect { left, right, line: at_start })
+                        }
+                    }
+                    _ => {
+                        self.bail(ParseError::UnexpectedToken(Token::At, "@Assert 或 @Expect".to_string()))
+                    }
+                }
+            }
             _ => {
                 let expr = self.parse_expr()?;
                 // 检查是否是赋值或复合赋值语句

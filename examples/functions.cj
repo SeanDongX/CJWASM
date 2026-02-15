@@ -88,5 +88,17 @@ main(): Int64 {
     let i = calculate2(3, 5)               // 8
     let j = calculate3(1, 2, 3)            // 6
 
+    @Assert(a, 9)
+    @Assert(b, 16)
+    @Assert(c, 45)
+    @Assert(d, 10)
+    @Assert(e, 15)
+    @Assert(f, 9)
+    @Assert(g, 10)
+    @Assert(h, 16)
+    @Assert(i, 8)
+    @Assert(j, 6)
+    @Assert(a + b + e + f + g + h + i + j, 89)
+
     return a + b + e + f + g + h + i + j  // 预期输出: 89
 }

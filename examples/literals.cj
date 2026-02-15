@@ -73,6 +73,12 @@ main(): Int64 {
     let c = binaryOperations()   // 10
     let d = typeAnnotations()    // 143
 
+    @Assert(a, 370)
+    @Assert(b, 510)
+    @Assert(c, 10)
+    @Assert(d, 143)
+    @Assert(a + b + c + d, 1033)
+
     return a + b + c + d
     // 370 + 510 + 10 + 143 = 1033
     // 预期输出: 1033

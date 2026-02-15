@@ -513,6 +513,16 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
         },
         Break => Break,
         Continue => Continue,
+        Assert { left, right, line } => Assert {
+            left: substitute_expr(left, subst, rewrites),
+            right: substitute_expr(right, subst, rewrites),
+            line,
+        },
+        Expect { left, right, line } => Expect {
+            left: substitute_expr(left, subst, rewrites),
+            right: substitute_expr(right, subst, rewrites),
+            line,
+        },
     }
 }
 

@@ -22,5 +22,7 @@ func fib(n: Int64): Int64 {
 }
 
 main(): Int64 {
+    let result = factorial(5)
+    @Assert(result, 120)
     return factorial(5)  // 预期输出: 120
 }

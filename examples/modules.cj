@@ -81,5 +81,12 @@ main(): Int64 {
     let calc2 = calc.add(50)
     let status = Status.Active
     let internal_result = internalFunc(5)
+
+    @Assert(sum, 30)
+    @Assert(p.x, 5)
+    @Assert(calc2.value, 150)
+    @Assert(internal_result, 11)
+    @Assert(sum + p.x + calc2.value + internal_result, 196)
+
     return sum + p.x + calc2.value + internal_result  // 预期输出: 196
 }

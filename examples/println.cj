@@ -66,6 +66,15 @@ main(): Int64 {
     let r4 = testPrintExpr()
     let r5 = testInterpolation()
     let r6 = testPrintEmpty()
+
+    @Assert(r1, 1)
+    @Assert(r2, 2)
+    @Assert(r3, 3)
+    @Assert(r4, 4)
+    @Assert(r5, 6)
+    @Assert(r6, 5)
+    @Assert(r1 + r2 + r3 + r4 + r5 + r6, 21)
+
     // 预期 stdout 输出:
     // 42
     // 0

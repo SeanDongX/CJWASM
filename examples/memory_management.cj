@@ -157,5 +157,14 @@ main(): Int64 {
     let rcResult = testReassignment()
     let loopResult = loopAllocation()
 
+    @Assert(pSum, 30)
+    @Assert(cVal, 100)
+    @Assert(rId, 42)
+    @Assert(sv, 75)
+    @Assert(aSum, 60)
+    @Assert(rcResult, 11)
+    @Assert(loopResult, 135)
+    @Assert(pSum + cVal + rId + sv + aSum + rcResult + loopResult, 453)
+
     return pSum + cVal + rId + sv + aSum + rcResult + loopResult  // 预期输出: 453
 }

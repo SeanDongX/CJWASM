@@ -123,6 +123,15 @@ main(): Int64 {
     let opt = doubleValue(arr, 0)
     let optVal = handleOption(opt)  // 200
 
+    @Assert(v1, 5)
+    @Assert(v2, 0)
+    @Assert(s1, 5)
+    @Assert(s2, 0)
+    @Assert(f1, 6)
+    @Assert(f2, 0)
+    @Assert(optVal, 200)
+    @Assert(v1 + s1 + s2 + f1 + f2 + optVal, 216)
+
     return v1 + s1 + s2 + f1 + f2 + optVal    // 5 + 5 + 0 + 6 + 0 + 200 = 216
     // 预期输出: 216
 }

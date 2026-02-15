@@ -15,5 +15,8 @@ func identity<T>(value: T): T {
 main(): Int64 {
     let p = Pair<Int64, Int64>(1, 2)
     let x = identity<Int64>(42)
+    @Assert(p.first, 1)
+    @Assert(x, 42)
+    @Assert(p.first + x, 43)
     return p.first + x  // 预期输出: 43
 }

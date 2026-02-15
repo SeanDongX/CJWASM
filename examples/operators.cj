@@ -90,5 +90,10 @@ main(): Int64 {
     let c = typeConversion()         // 3 + 1 = 4
     let d = compoundAssignment()     // 2
     let e = negation(5)              // -5 + 5 = 0
+    @Assert(b, 1617)
+    @Assert(c, 4)
+    @Assert(d, 2)
+    @Assert(e, 0)
+    @Assert(b + c + d, 1623)
     return b + c + d  // 预期输出: 1623
 }

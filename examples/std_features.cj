@@ -40,6 +40,9 @@ main() {
 
     // ===== Phase 7.8: 字符串操作 =====
     let s = "hello world"
+    let hasWorld = s.contains("world")
+    let hasXyz = s.contains("xyz")
+    let idx = s.indexOf("world")
     println(s.contains("world"))  // expect: 1 (true)
     println(s.contains("xyz"))    // expect: 0 (false)
     println(s.indexOf("world"))   // expect: 6
@@ -47,9 +50,16 @@ main() {
     let replaced = s.replace("world", "cangjie")
     println(replaced) // expect: hello cangjie
 
+    // 整数类型断言（字符串比较暂不支持，通过 println 验证）
+    @Assert(hasWorld, 1)
+    @Assert(hasXyz, 0)
+    @Assert(idx, 6)
+
     // ===== Phase 7.8: sort =====
     let arr = [5, 3, 8, 1, 9, 2, 7, 4, 6]
     sort(arr)
+    @Assert(arr[0], 1)
+    @Assert(arr[8], 9)
     // 打印排序结果
     let i: Int64 = 0
     while (i < 9) {
@@ -59,5 +69,6 @@ main() {
     }
     println("") // expect: 1 2 3 4 5 6 7 8 9
 
-    println("All Phase 7.4-7.8 tests passed!")
+    println("PASS")
+    // 预期输出: PASS
 }

@@ -134,6 +134,13 @@ main(): Int64 {
     let r1 = divide(20, 4)
     let v1 = handleResult(r1)  // 5
 
+    @Assert(t1, 6)
+    @Assert(t2, 0)
+    @Assert(t5, 14)
+    @Assert(t6, 0)
+    @Assert(v1, 5)
+    @Assert(t1 + t2 + t5 + t6 + v1, 25)
+
     return t1 + t2 + t5 + t6 + v1   // 6 + 0 + 14 + 0 + 5 = 25
     // 预期输出: 25
 }

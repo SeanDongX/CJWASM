@@ -63,5 +63,15 @@ main() {
     println(b.compareTo(a))  // expect: 1  (b > a)
     println(a.compareTo(c))  // expect: 0  (a == c)
 
-    println("All type_methods tests passed!")
+    // 整数类型断言（字符串比较暂不支持，通过 println 验证）
+    @Assert(fv_as_int, 7)
+    @Assert(iv, 3)
+    @Assert(val, 12345)
+    @Assert(x.abs(), 42)
+    @Assert(a.compareTo(b), -1)
+    @Assert(b.compareTo(a), 1)
+    @Assert(a.compareTo(c), 0)
+
+    println("PASS")
+    // 预期输出: PASS
 }

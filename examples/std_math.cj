@@ -71,5 +71,21 @@ func main(): Int64 {
     let total = sq_i + fl + ce + tr + ne + sin0 + cos0 + sin_hp + exp0 + exp1 + logE + p + pi_i + e_i
     println("total = ${total}")
 
+    @Assert(sq_i, 4)
+    @Assert(fl, 3)
+    @Assert(ce, 4)
+    @Assert(tr, -2)
+    @Assert(ne, 2)
+    @Assert(sin0, 0)
+    @Assert(cos0, 1)
+    @Assert(sin_hp, 1)
+    @Assert(exp0, 1)
+    @Assert(exp1, 3)
+    @Assert(logE, 1)
+    @Assert(p, 1024)
+    @Assert(pi_i, 314)
+    @Assert(e_i, 272)
+    @Assert(total, 1628)
+
     return total  // 预期输出: 1628
 }

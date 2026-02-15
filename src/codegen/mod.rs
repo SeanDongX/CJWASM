@@ -7963,7 +7963,142 @@ impl CodeGen {
                     }
                 }
             }
+            Stmt::Assert { left, right, line } => {
+                // @Assert(a, b): 如果 a != b 则打印错误信息并终止
+                self.compile_assert_expect(left, right, *line, true, locals, func, loop_ctx);
+            }
+            Stmt::Expect { left, right, line } => {
+                // @Expect(a, b): 如果 a != b 则打印错误信息但继续执行
+                self.compile_assert_expect(left, right, *line, false, locals, func, loop_ctx);
+            }
         }
+    }
+
+    /// 编译 @Assert / @Expect 语句
+    /// is_assert=true → 失败时 unreachable (fail-fast)
+    /// is_assert=false → 失败时仅打印 (continue)
+    fn compile_assert_expect(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        byte_offset: usize,
+        is_assert: bool,
+        locals: &LocalsBuilder,
+        func: &mut WasmFunc,
+        loop_ctx: Option<(u32, u32)>,
+    ) {
+        // block $ok
+        //   <compile left>
+        //   <compile right>
+        //   <compare eq>
+        //   br_if $ok       ;; 相等则跳过
+        //   ;; 失败路径
+        //   <print error message>
+        //   unreachable     ;; (仅 @Assert)
+        // end
+
+        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+
+        // 编译两个表达式并比较
+        let left_vt = self.infer_type_with_locals(left, locals);
+        let right_vt = self.infer_type_with_locals(right, locals);
+        self.compile_expr(left, locals, func, loop_ctx);
+
+        // 类型协调：如果左右类型不同，将窄类型扩展为宽类型
+        if left_vt == ValType::I32 && right_vt == ValType::I64 {
+            func.instruction(&Instruction::I64ExtendI32S);
+        }
+
+        self.compile_expr(right, locals, func, loop_ctx);
+
+        if left_vt == ValType::I64 && right_vt == ValType::I32 {
+            func.instruction(&Instruction::I64ExtendI32S);
+        }
+        if left_vt == ValType::F32 && right_vt == ValType::F64 {
+            func.instruction(&Instruction::F64PromoteF32);
+        }
+
+        // 确定最终比较类型
+        let cmp_vt = if left_vt == ValType::F64 || right_vt == ValType::F64 {
+            ValType::F64
+        } else if left_vt == ValType::F32 && right_vt == ValType::F32 {
+            ValType::F32
+        } else if left_vt == ValType::I32 && right_vt == ValType::I32 {
+            ValType::I32
+        } else {
+            ValType::I64
+        };
+
+        // 根据类型选择比较指令
+        match cmp_vt {
+            ValType::F64 => {
+                func.instruction(&Instruction::F64Eq);
+            }
+            ValType::F32 => {
+                func.instruction(&Instruction::F32Eq);
+            }
+            ValType::I32 => {
+                func.instruction(&Instruction::I32Eq);
+            }
+            _ => {
+                func.instruction(&Instruction::I64Eq);
+            }
+        }
+
+        func.instruction(&Instruction::BrIf(0)); // 相等则跳到 block 结尾
+
+        // --- 失败路径 ---
+        // 构建错误消息字符串: "ASSERT FAILED: line N\n" 或 "EXPECT FAILED: line N\n"
+        let macro_name = if is_assert { "ASSERT" } else { "EXPECT" };
+        // byte_offset 作为近似行号（实际是字节偏移，但在错误报告中足够识别位置）
+        let msg = format!("{} FAILED: offset {}\n", macro_name, byte_offset);
+        let msg_bytes = msg.as_bytes();
+        let msg_len = msg_bytes.len() as i32;
+
+        // 在内存中写入字符串: [len: i32][bytes...]
+        // 使用 WASI scratch 区域后面的空间（偏移 96 起）
+        let str_base: i32 = 96;
+        // 写入长度
+        func.instruction(&Instruction::I32Const(str_base));
+        func.instruction(&Instruction::I32Const(msg_len));
+        func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        // 写入每个字节
+        for (i, &byte) in msg_bytes.iter().enumerate() {
+            func.instruction(&Instruction::I32Const(str_base + 4 + i as i32));
+            func.instruction(&Instruction::I32Const(byte as i32));
+            func.instruction(&Instruction::I32Store8(wasm_encoder::MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: 0,
+            }));
+        }
+
+        // 调用 __println_str 或 __eprintln_str (如果有) 打印到 stderr
+        // 使用 stderr 打印: 复用 __eprintln_str 如果存在，否则用 __println_str
+        if let Some(&idx) = self.func_indices.get("__eprintln_str") {
+            func.instruction(&Instruction::I32Const(str_base));
+            func.instruction(&Instruction::Call(idx));
+        } else if let Some(&idx) = self.func_indices.get("__println_str") {
+            func.instruction(&Instruction::I32Const(str_base));
+            func.instruction(&Instruction::Call(idx));
+        }
+
+        if is_assert {
+            // @Assert: 立即终止
+            // 尝试用 proc_exit(1)，否则 unreachable
+            if let Some(&exit_idx) = self.func_indices.get("__wasi_proc_exit") {
+                func.instruction(&Instruction::I32Const(1));
+                func.instruction(&Instruction::Call(exit_idx));
+            }
+            func.instruction(&Instruction::Unreachable);
+        }
+        // @Expect: 不终止，直接 fall through 到 block end
+
+        func.instruction(&Instruction::End); // block end
     }
 
     /// 编译表达式

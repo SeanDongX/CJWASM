@@ -24,5 +24,6 @@ struct Rect {
 
 main(): Int64 {
     let r = Rect(5, 10)
+    @Assert(r.area(), 50)
     return r.area()  // 预期输出: 50
 }

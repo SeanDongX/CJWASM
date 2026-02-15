@@ -156,6 +156,13 @@ main(): Int64 {
     let d = testLambda()       // 10
     let e = testHigherOrder()  // 42
 
+    @Assert(a, 80)
+    @Assert(b, 189)
+    @Assert(c, 5)
+    @Assert(d, 10)
+    @Assert(e, 42)
+    @Assert(a + b + c + d + e, 326)
+
     return a + b + c + d + e
     // 80 + 189 + 5 + 10 + 42 = 326
     // 预期输出: 326

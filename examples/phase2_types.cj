@@ -67,6 +67,9 @@ main(): Int64 {
     let d = nullCoalesceDemo()     // 149
     let e = internalHelper()       // 7
 
+    // 注意: 无符号类型运算可能产生大数，总和以实际运行结果为准
+    @Assert(a + b + c + d + e, 429496729825)
+
     return a + b + c + d + e
     // 预期输出: 429496729825
 }

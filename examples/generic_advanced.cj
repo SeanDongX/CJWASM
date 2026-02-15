@@ -220,6 +220,16 @@ main(): Int64 {
     let g = testGenericClass()       // 142
     let h = testSpecialization()     // 10
     let i = testMixedTypes()         // 300
+    @Assert(a, 42)
+    @Assert(b, 36)
+    @Assert(c, 150)
+    @Assert(d, 15)
+    @Assert(e, 88)
+    @Assert(f, 90)
+    @Assert(g, 142)
+    @Assert(h, 10)
+    @Assert(i, 300)
+    @Assert(a + b + c + d + e + f + g + h + i, 873)
 
     println("公式: ${a} + ${b} + ${c} + ${d} + ${e} + ${f} + ${g} + ${h} + ${i}")
     println("结果: ${a + b + c + d + e + f + g + h + i}")

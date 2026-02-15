@@ -63,5 +63,10 @@ main(): Int64 {
     let peri = rect.perimeter()
     let scaled = rect.scale(2)
 
+    @Assert(dist, 25)
+    @Assert(area, 50)
+    @Assert(peri, 30)
+    @Assert(dist + area + peri, 105)
+
     return dist + area + peri  // 预期输出: 105
 }
