@@ -6092,6 +6092,7 @@ impl CodeGen {
                             // 需要重新组织栈: (obj_i64, arg) → 先取出对象
                             return false; // 回退
                         }
+                        func.instruction(&Instruction::I64Const(0)); // void → 哑值供 Stmt::Expr drop
                         true
                     }
                     "get" if args.len() == 1 => {
@@ -6105,6 +6106,7 @@ impl CodeGen {
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         self.compile_expr(&args[1], locals, func, loop_ctx);
                         func.instruction(&Instruction::Call(self.func_indices["__arraylist_set"]));
+                        func.instruction(&Instruction::I64Const(0)); // void → 哑值
                         true
                     }
                     "remove" if args.len() == 1 => {
@@ -6119,12 +6121,15 @@ impl CodeGen {
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         self.compile_expr(&args[1], locals, func, loop_ctx);
                         func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
+                        func.instruction(&Instruction::I64Const(0)); // void → 哑值
                         true
                     }
                     "containsKey" if args.len() == 1 => {
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         func.instruction(&Instruction::Call(self.func_indices["__hashmap_contains"]));
+                        // __hashmap_contains 返回 i32，扩展为 i64 以匹配 Int64 类型系统
+                        func.instruction(&Instruction::I64ExtendI32S);
                         true
                     }
                     "add" if args.len() == 1 => {
@@ -6133,6 +6138,7 @@ impl CodeGen {
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         func.instruction(&Instruction::I64Const(0)); // dummy value
                         func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
+                        func.instruction(&Instruction::I64Const(0)); // void → 哑值
                         true
                     }
                     "push" if args.len() == 1 => {
@@ -6140,6 +6146,7 @@ impl CodeGen {
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         func.instruction(&Instruction::Call(self.func_indices["__arraylist_append"]));
+                        func.instruction(&Instruction::I64Const(0)); // void → 哑值
                         true
                     }
                     "pop" if args.is_empty() => {
@@ -6174,6 +6181,7 @@ impl CodeGen {
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         func.instruction(&Instruction::Call(self.func_indices["__linkedlist_prepend"]));
+                        func.instruction(&Instruction::I64Const(0)); // void → 哑值
                         true
                     }
                     _ => false,
@@ -6597,6 +6605,10 @@ impl CodeGen {
                 for s in body {
                     self.collect_locals(s, locals);
                 }
+            }
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                self.collect_locals_from_expr(left, locals);
+                self.collect_locals_from_expr(right, locals);
             }
             _ => {}
         }
@@ -9219,6 +9231,22 @@ impl CodeGen {
                 func.instruction(&Instruction::LocalGet(tmp_local));
             }
             Expr::ConstructorCall { name, type_args, args } => {
+                // Phase 7.5: 内置集合类型构造器（首字母大写，会被解析为 ConstructorCall）
+                match name.as_str() {
+                    "ArrayList" | "ArrayStack" if args.is_empty() => {
+                        func.instruction(&Instruction::Call(self.func_indices["__arraylist_new"]));
+                        return;
+                    }
+                    "HashMap" | "HashSet" if args.is_empty() => {
+                        func.instruction(&Instruction::Call(self.func_indices["__hashmap_new"]));
+                        return;
+                    }
+                    "LinkedList" if args.is_empty() => {
+                        func.instruction(&Instruction::Call(self.func_indices["__linkedlist_new"]));
+                        return;
+                    }
+                    _ => {}
+                }
                 // abstract 类不能直接实例化
                 if let Some(ci) = self.classes.get(name) {
                     if ci.is_abstract {
