@@ -108,6 +108,12 @@ pub struct CodeGen {
     lambda_functions: Vec<FuncDef>,
     /// Lambda 计数器（使用 Cell 以支持在 &self 方法中修改）
     lambda_counter: std::cell::Cell<u32>,
+    /// P2.2: 类型别名映射 (alias_name -> actual_type)
+    type_aliases: HashMap<String, Type>,
+    /// P2.3: Lambda 函数的 Table 索引映射 (lambda_name -> table_index)
+    lambda_table_indices: HashMap<String, u32>,
+    /// P2.3: 函数类型签名到类型索引的映射 (用于 call_indirect)
+    func_type_by_sig: HashMap<(Vec<ValType>, Vec<ValType>), u32>,
 }
 
 impl CodeGen {
@@ -127,6 +133,9 @@ impl CodeGen {
             interfaces: HashMap::new(),
             lambda_functions: Vec::new(),
             lambda_counter: std::cell::Cell::new(0),
+            type_aliases: HashMap::new(),
+            lambda_table_indices: HashMap::new(),
+            func_type_by_sig: HashMap::new(),
         }
     }
 
@@ -278,9 +287,70 @@ impl CodeGen {
         }
     }
 
+    /// P2.3: 查找匹配的函数类型索引（用于 call_indirect）
+    fn find_or_create_func_type_idx(&self, params: &[ValType], results: &[ValType]) -> u32 {
+        let sig = (params.to_vec(), results.to_vec());
+        if let Some(&type_idx) = self.func_type_by_sig.get(&sig) {
+            return type_idx;
+        }
+        // fallback: 返回 0
+        0
+    }
+
+    /// P2.2: 解析类型时展开类型别名
+    fn resolve_type(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Struct(name, args) if args.is_empty() => {
+                if let Some(actual) = self.type_aliases.get(name) {
+                    self.resolve_type(actual)
+                } else {
+                    ty.clone()
+                }
+            }
+            Type::Option(inner) => Type::Option(Box::new(self.resolve_type(inner))),
+            Type::Array(inner) => Type::Array(Box::new(self.resolve_type(inner))),
+            _ => ty.clone(),
+        }
+    }
+
+    /// P2.9: 将位置参数和命名参数合并为按函数定义顺序排列的最终参数列表
+    fn resolve_named_args(&self, func_name: &str, positional: &[Expr], named: &[(String, Expr)]) -> Vec<Expr> {
+        // 查找函数参数定义
+        let func_params = self.func_params.get(func_name);
+        if func_params.is_none() {
+            // 如果找不到函数定义，按位置参数 + 命名参数值的顺序追加
+            let mut result: Vec<Expr> = positional.to_vec();
+            for (_, val) in named {
+                result.push(val.clone());
+            }
+            return result;
+        }
+        let params = func_params.unwrap();
+        let mut result = Vec::new();
+        // 先填入位置参数
+        for (i, param) in params.iter().enumerate() {
+            if i < positional.len() {
+                result.push(positional[i].clone());
+            } else if let Some((_, val)) = named.iter().find(|(n, _)| n == &param.name) {
+                result.push(val.clone());
+            } else if let Some(ref default) = param.default {
+                result.push(default.clone());
+            } else {
+                // 参数缺失，使用默认的零值
+                result.push(Expr::Integer(0));
+            }
+        }
+        result
+    }
+
     /// 编译程序生成 WASM 模块
     pub fn compile(&mut self, program: &Program) -> Vec<u8> {
         let mut module = Module::new();
+
+        // P2.2: 注册类型别名
+        for (name, ty) in &program.type_aliases {
+            self.type_aliases.insert(name.clone(), ty.clone());
+        }
 
         // 收集结构体定义（跳过未单态化的泛型结构体）
         for s in &program.structs {
@@ -351,7 +421,7 @@ impl CodeGen {
                         name: "message".to_string(),
                         ty: Type::String,
                         default: None,
-                        variadic: false,
+                        variadic: false, is_named: false,
                     }],
                     body: vec![Stmt::Assign {
                         target: AssignTarget::Field {
@@ -505,9 +575,11 @@ impl CodeGen {
             let results: Vec<ValType> = func
                 .return_type
                 .as_ref()
-                .map(|t| vec![t.to_wasm()])
+                .and_then(|t| if *t == Type::Unit { None } else { Some(vec![t.to_wasm()]) })
                 .unwrap_or_default();
-            types.ty().function(params, results);
+            types.ty().function(params.clone(), results.clone());
+            // P2.3: 记录类型签名映射
+            self.func_type_by_sig.entry((params, results)).or_insert(i as u32);
             let key = if *name_count.get(&func.name).unwrap_or(&0) > 1 {
                 Self::mangle_key(&func.name, &param_tys)
             } else {
@@ -515,7 +587,9 @@ impl CodeGen {
             };
             self.func_types.insert(key.clone(), i as u32);
             if let Some(ref ret) = func.return_type {
-                self.func_return_types.insert(key.clone(), ret.clone());
+                if *ret != Type::Unit {
+                    self.func_return_types.insert(key.clone(), ret.clone());
+                }
             }
             self.func_params.insert(key, func.params.clone());
         }
@@ -882,6 +956,13 @@ impl CodeGen {
         self.func_indices.insert("__str_substring".to_string(), rt_idx); rt_idx += 1;
         self.func_types.insert("__hashcode_i64".to_string(), ty_i32_i64);
         self.func_indices.insert("__hashcode_i64".to_string(), rt_idx); rt_idx += 1;
+        // P2.10: String 方法运行时函数
+        self.func_types.insert("__str_trim".to_string(), ty_wasi_i32_i32);
+        self.func_indices.insert("__str_trim".to_string(), rt_idx); rt_idx += 1;
+        self.func_types.insert("__str_starts_with".to_string(), ty_wasi_i32i32_i32);
+        self.func_indices.insert("__str_starts_with".to_string(), rt_idx); rt_idx += 1;
+        self.func_types.insert("__str_ends_with".to_string(), ty_wasi_i32i32_i32);
+        self.func_indices.insert("__str_ends_with".to_string(), rt_idx); rt_idx += 1;
         let _rt_idx_end = rt_idx;
 
         module.section(&types);
@@ -984,16 +1065,32 @@ impl CodeGen {
         func_section.function(ty_i32_void);           // __sort_array
         func_section.function(ty_i32i32i32_i32);     // __str_substring
         func_section.function(ty_i32_i64);            // __hashcode_i64
+        // P2.10: String 方法
+        func_section.function(ty_wasi_i32_i32);      // __str_trim
+        func_section.function(ty_wasi_i32i32_i32);   // __str_starts_with
+        func_section.function(ty_wasi_i32i32_i32);   // __str_ends_with
         module.section(&func_section);
 
-        // 3a. Table 段 (Table Section) — 用于 vtable / call_indirect
-        let vtable_size = self.vtable_entries.len() as u64;
-        if vtable_size > 0 {
+        // P2.3: 收集 Lambda 函数的 Table 索引
+        let vtable_base_len = self.vtable_entries.len() as u32;
+        let mut lambda_func_indices_for_table: Vec<u32> = Vec::new();
+        for i in 0..lambda_counter {
+            let lambda_name = format!("__lambda_{}", i);
+            if let Some(&func_idx) = self.func_indices.get(&lambda_name) {
+                let table_idx = vtable_base_len + lambda_func_indices_for_table.len() as u32;
+                self.lambda_table_indices.insert(lambda_name, table_idx);
+                lambda_func_indices_for_table.push(func_idx);
+            }
+        }
+
+        // 3a. Table 段 (Table Section) — 用于 vtable / call_indirect / lambda
+        let total_table_size = (self.vtable_entries.len() + lambda_func_indices_for_table.len()) as u64;
+        if total_table_size > 0 {
             let mut tables = TableSection::new();
             tables.table(TableType {
                 element_type: RefType::FUNCREF,
-                minimum: vtable_size,
-                maximum: Some(vtable_size),
+                minimum: total_table_size,
+                maximum: Some(total_table_size),
                 table64: false,
                 shared: false,
             });
@@ -1165,18 +1262,25 @@ impl CodeGen {
         codes.function(&self.emit_sort_array());
         codes.function(&self.emit_str_substring());
         codes.function(&self.emit_hashcode_i64());
+        // P2.10: String 方法
+        codes.function(&self.emit_str_trim());
+        codes.function(&self.emit_str_starts_with());
+        codes.function(&self.emit_str_ends_with());
 
-        // 7. Element 段 (Element Section) — vtable 函数引用
+        // 7. Element 段 (Element Section) — vtable + lambda 函数引用
         // 注意: WASM 规范要求 Element 在 Code 之前 (Type→Import→Function→Table→Memory→Global→Export→Element→Code→Data)
-        if !self.vtable_entries.is_empty() {
-            let mut elements = ElementSection::new();
-            let func_indices: Vec<u32> = self.vtable_entries.clone();
-            elements.active(
-                Some(0), // table index
-                &ConstExpr::i32_const(0),
-                Elements::Functions(std::borrow::Cow::Borrowed(&func_indices)),
-            );
-            module.section(&elements);
+        {
+            let mut all_table_entries: Vec<u32> = self.vtable_entries.clone();
+            all_table_entries.extend_from_slice(&lambda_func_indices_for_table);
+            if !all_table_entries.is_empty() {
+                let mut elements = ElementSection::new();
+                elements.active(
+                    Some(0), // table index
+                    &ConstExpr::i32_const(0),
+                    Elements::Functions(std::borrow::Cow::Borrowed(&all_table_entries)),
+                );
+                module.section(&elements);
+            }
         }
 
         module.section(&codes);
@@ -1353,6 +1457,32 @@ impl CodeGen {
         self.vtable_entries = entries;
     }
 
+    /// P2.3: 简单推断 Lambda body 的返回类型
+    fn infer_lambda_return_type(body: &Expr, params: &[(String, Type)]) -> Option<Type> {
+        match body {
+            Expr::Integer(_) => Some(Type::Int64),
+            Expr::Float(_) => Some(Type::Float64),
+            Expr::Bool(_) => Some(Type::Bool),
+            Expr::String(_) => Some(Type::String),
+            Expr::Var(name) => {
+                params.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone())
+            }
+            Expr::Binary { op, left, right } => {
+                match op {
+                    BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+                    | BinOp::LogicalAnd | BinOp::LogicalOr => Some(Type::Bool),
+                    _ => {
+                        Self::infer_lambda_return_type(left, params)
+                            .or_else(|| Self::infer_lambda_return_type(right, params))
+                    }
+                }
+            }
+            Expr::If { then_branch, .. } => Self::infer_lambda_return_type(then_branch, params),
+            Expr::Block(_, Some(tail)) => Self::infer_lambda_return_type(tail, params),
+            _ => Some(Type::Int64), // 默认推断为 Int64
+        }
+    }
+
     /// Lambda 预扫描：递归遍历所有函数体，收集 Lambda 表达式并生成匿名函数
     fn collect_lambdas_from_functions(
         functions: &[FuncDef],
@@ -1396,6 +1526,13 @@ impl CodeGen {
             Expr::Lambda { params, return_type, body } => {
                 let lambda_name = format!("__lambda_{}", *counter);
                 *counter += 1;
+                // P2.3: 推断 Lambda 返回类型（如果未显式标注）
+                let inferred_ret = if return_type.is_some() {
+                    return_type.clone()
+                } else {
+                    // 简单推断：从 body 表达式推断
+                    Self::infer_lambda_return_type(body, params)
+                };
                 // 将 Lambda body 包装为 return 语句
                 let body_stmt = vec![Stmt::Return(Some(body.as_ref().clone()))];
                 out.push(FuncDef {
@@ -1407,9 +1544,9 @@ impl CodeGen {
                         name: name.clone(),
                         ty: ty.clone(),
                         default: None,
-                        variadic: false,
+                        variadic: false, is_named: false,
                     }).collect(),
-                    return_type: return_type.clone(),
+                    return_type: inferred_ret,
                     throws: None,
                     body: body_stmt,
                     extern_import: None,
@@ -1440,6 +1577,12 @@ impl CodeGen {
             }
             Expr::Array(elems) | Expr::Tuple(elems) => {
                 for e in elems { Self::collect_lambdas_from_expr(e, counter, out); }
+            }
+            Expr::ConstructorCall { args, .. } => {
+                for a in args { Self::collect_lambdas_from_expr(a, counter, out); }
+            }
+            Expr::StructInit { fields, .. } => {
+                for (_, e) in fields { Self::collect_lambdas_from_expr(e, counter, out); }
             }
             _ => {}
         }
@@ -1481,7 +1624,7 @@ impl CodeGen {
             name: "this".to_string(),
             ty: Type::Struct(class_name.clone(), vec![]),
             default: None,
-            variadic: false,
+            variadic: false, is_named: false,
         }];
         params.extend(init_def.params.iter().cloned());
 
@@ -1512,7 +1655,7 @@ impl CodeGen {
                 name: "this".to_string(),
                 ty: Type::Struct(class_name.clone(), vec![]),
                 default: None,
-                variadic: false,
+                variadic: false, is_named: false,
             }],
             return_type: None,
             throws: None,
@@ -1768,12 +1911,12 @@ impl CodeGen {
         // 编译函数体（顶层无循环上下文）
         // 特殊处理：最后一条 Stmt::Expr 若产生值，则作为隐式返回值（不 drop）
         let body_len = func.body.len();
-        let has_return_type = func.return_type.is_some();
+        let has_return_type = func.return_type.as_ref().map_or(false, |t| *t != Type::Unit);
         for (i, stmt) in func.body.iter().enumerate() {
             let is_last = i == body_len - 1;
             if is_last && has_return_type {
                 if let Stmt::Expr(expr) = stmt {
-                    if Self::expr_produces_value(expr) {
+                    if self.expr_produces_value(expr) {
                         // 最后一条表达式语句作为隐式返回
                         self.compile_expr(expr, &locals, &mut wasm_func, None);
                         wasm_func.instruction(&Instruction::Return);
@@ -1819,7 +1962,7 @@ impl CodeGen {
         // 如果函数有返回类型，在函数末尾添加 unreachable 指令
         // 这处理了所有路径都通过 return 退出的情况（如 match 所有分支都 return）
         // 没有 unreachable，WASM 验证器会报 "nothing on stack" 错误
-        if func.return_type.is_some() && init_class_name.is_none() {
+        if func.return_type.as_ref().map_or(false, |t| *t != Type::Unit) && init_class_name.is_none() {
             wasm_func.instruction(&Instruction::Unreachable);
         }
 
@@ -5847,6 +5990,212 @@ impl CodeGen {
         f
     }
 
+    // =========== P2.10: String 方法运行时函数 ===========
+
+    /// __str_trim(str: i32) -> i32: 去除首尾空白字符
+    fn emit_str_trim(&self) -> WasmFunc {
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        // locals: 0=str, 1=len, 2=start, 3=end
+        let mut f = WasmFunc::new(vec![(3, ValType::I32)]);
+        let alloc_idx = self.func_indices["__alloc"];
+        // len = str[0]
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(mem(0, 2)));
+        f.instruction(&Instruction::LocalSet(1));
+        // start = 0
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(2));
+        // 跳过前导空白: while start < len && str[4+start] <= 32
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Load8U(mem(0, 0)));
+        f.instruction(&Instruction::I32Const(32));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::BrIf(1));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(2));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+        // end = len
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::LocalSet(3));
+        // 跳过尾部空白: while end > start && str[4+end-1] <= 32
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32LeU);
+        f.instruction(&Instruction::BrIf(1));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Load8U(mem(0, 0)));
+        f.instruction(&Instruction::I32Const(32));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::BrIf(1));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(3));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+        // 调用 __str_substring(str, start, end)
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::Call(self.func_indices["__str_substring"]));
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// __str_starts_with(str: i32, prefix: i32) -> i32 (0/1)
+    fn emit_str_starts_with(&self) -> WasmFunc {
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        // locals: 0=str, 1=prefix, 2=str_len, 3=pre_len, 4=i
+        let mut f = WasmFunc::new(vec![(3, ValType::I32)]);
+        // str_len = str[0]
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(mem(0, 2)));
+        f.instruction(&Instruction::LocalSet(2));
+        // pre_len = prefix[0]
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Load(mem(0, 2)));
+        f.instruction(&Instruction::LocalSet(3));
+        // if pre_len > str_len → return 0
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // i = 0
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(4));
+        // 逐字节比较
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1)); // done, all matched
+        // str[4+i] != prefix[4+i] → return 0
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Load8U(mem(0, 0)));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Load8U(mem(0, 0)));
+        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // i++
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(4));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// __str_ends_with(str: i32, suffix: i32) -> i32 (0/1)
+    fn emit_str_ends_with(&self) -> WasmFunc {
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        // locals: 0=str, 1=suffix, 2=str_len, 3=suf_len, 4=i, 5=offset
+        let mut f = WasmFunc::new(vec![(4, ValType::I32)]);
+        // str_len
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(mem(0, 2)));
+        f.instruction(&Instruction::LocalSet(2));
+        // suf_len
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Load(mem(0, 2)));
+        f.instruction(&Instruction::LocalSet(3));
+        // if suf_len > str_len → return 0
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // offset = str_len - suf_len
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(5));
+        // i = 0
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(4));
+        // 逐字节比较
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+        // str[4+offset+i] != suffix[4+i] → return 0
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Load8U(mem(0, 0)));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Load8U(mem(0, 0)));
+        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // i++
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(4));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::End);
+        f
+    }
+
     // =========== Phase 7.2: 内建类型方法 ===========
 
     /// 编译内建类型方法调用，返回 true 表示已处理
@@ -6087,8 +6436,165 @@ impl CodeGen {
                     func.instruction(&Instruction::Call(self.func_indices["__str_to_rune_array"]));
                     true
                 }
+                // P2.10: 新增 String 方法
+                "trim" if args.is_empty() => {
+                    self.compile_expr(object, locals, func, loop_ctx);
+                    func.instruction(&Instruction::Call(self.func_indices["__str_trim"]));
+                    true
+                }
+                "startsWith" if args.len() == 1 => {
+                    self.compile_expr(object, locals, func, loop_ctx);
+                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                    func.instruction(&Instruction::Call(self.func_indices["__str_starts_with"]));
+                    true
+                }
+                "endsWith" if args.len() == 1 => {
+                    self.compile_expr(object, locals, func, loop_ctx);
+                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                    func.instruction(&Instruction::Call(self.func_indices["__str_ends_with"]));
+                    true
+                }
+                "isBlank" if args.is_empty() => {
+                    // isBlank: trim 后长度为 0 → 等价于 trim().isEmpty()
+                    self.compile_expr(object, locals, func, loop_ctx);
+                    func.instruction(&Instruction::Call(self.func_indices["__str_trim"]));
+                    func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                        offset: 0, align: 2, memory_index: 0,
+                    }));
+                    func.instruction(&Instruction::I32Eqz);
+                    true
+                }
                 _ => false,
             },
+            // P2.8: Array 实例方法
+            Some(Type::Array(ref _elem_ty)) => {
+                let is_float_array = matches!(_elem_ty.as_ref(), Type::Float64 | Type::Float32);
+                let elem_size: i32 = 8;
+                match method {
+                    "clone" if args.is_empty() => {
+                        // clone: 分配新数组，复制内容
+                        // 需要临时变量
+                        let src_local = locals.get("__array_clone_src").unwrap_or_else(|| locals.get("__array_alloc_ptr").unwrap());
+                        let dst_local = locals.get("__array_clone_dst").unwrap_or_else(|| locals.get("__array_dyn_ptr").unwrap_or(src_local));
+                        let alloc_idx = self.func_indices["__alloc"];
+
+                        // 编译源数组
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        func.instruction(&Instruction::LocalSet(src_local));
+
+                        // 计算总大小: 4 + arr[0] * 8
+                        func.instruction(&Instruction::LocalGet(src_local));
+                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+                        func.instruction(&Instruction::I32Const(elem_size));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+
+                        // 分配新数组
+                        func.instruction(&Instruction::Call(alloc_idx));
+                        func.instruction(&Instruction::LocalSet(dst_local));
+
+                        // memory.copy(dst, src, size)
+                        func.instruction(&Instruction::LocalGet(dst_local));
+                        func.instruction(&Instruction::LocalGet(src_local));
+                        // size
+                        func.instruction(&Instruction::LocalGet(src_local));
+                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+                        func.instruction(&Instruction::I32Const(elem_size));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+                        func.instruction(&Instruction::LocalGet(dst_local));
+                        true
+                    }
+                    "isEmpty" if args.is_empty() => {
+                        // isEmpty: arr.size == 0 → i32 (Bool)
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+                        func.instruction(&Instruction::I32Eqz);
+                        true
+                    }
+                    "slice" if args.len() == 2 => {
+                        // slice(start, end): 创建新数组 [start..end)
+                        let src_local = locals.get("__array_clone_src").unwrap_or_else(|| locals.get("__array_alloc_ptr").unwrap());
+                        let alloc_idx = self.func_indices["__alloc"];
+
+                        // 源数组
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        func.instruction(&Instruction::LocalSet(src_local));
+
+                        // 计算 new_len = end - start
+                        let start_local = locals.get("__array_dyn_idx").unwrap();
+                        let end_local = locals.get("__array_dyn_size").unwrap();
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        func.instruction(&Instruction::LocalSet(start_local));
+                        self.compile_expr(&args[1], locals, func, loop_ctx);
+                        func.instruction(&Instruction::LocalSet(end_local));
+
+                        // new_len = end - start
+                        let new_len_local = locals.get("__array_dyn_ptr").unwrap();
+                        func.instruction(&Instruction::LocalGet(end_local));
+                        func.instruction(&Instruction::LocalGet(start_local));
+                        func.instruction(&Instruction::I64Sub);
+                        // 转为 i32
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::LocalSet(new_len_local));
+
+                        // 分配 4 + new_len * 8
+                        func.instruction(&Instruction::LocalGet(new_len_local));
+                        func.instruction(&Instruction::I32Const(elem_size));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::Call(alloc_idx));
+
+                        // 保存 dst
+                        let dst_local = locals.get("__array_clone_dst").unwrap_or_else(|| {
+                            locals.get("__array_alloc_ptr").unwrap()
+                        });
+                        func.instruction(&Instruction::LocalSet(dst_local));
+
+                        // 写入长度
+                        func.instruction(&Instruction::LocalGet(dst_local));
+                        func.instruction(&Instruction::LocalGet(new_len_local));
+                        func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+
+                        // memory.copy(dst+4, src+4+start*8, new_len*8)
+                        func.instruction(&Instruction::LocalGet(dst_local));
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+
+                        func.instruction(&Instruction::LocalGet(src_local));
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalGet(start_local));
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::I32Const(elem_size));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Add);
+
+                        func.instruction(&Instruction::LocalGet(new_len_local));
+                        func.instruction(&Instruction::I32Const(elem_size));
+                        func.instruction(&Instruction::I32Mul);
+
+                        func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+                        func.instruction(&Instruction::LocalGet(dst_local));
+                        true
+                    }
+                    _ => false,
+                }
+            }
             _ => {
                 // Phase 7.5: 集合类型方法分发（对象为 i32 指针）
                 // 仅当对象不是已知 struct/class 时才分发到集合运行时
@@ -6744,6 +7250,14 @@ impl CodeGen {
                     locals.add("__cmp_x", ValType::I64, None);
                     locals.add("__cmp_y", ValType::I64, None);
                 }
+                // P2.8: Array 实例方法需要临时变量
+                if matches!(method.as_str(), "clone" | "slice" | "copyTo") {
+                    locals.add("__array_clone_src", ValType::I32, None);
+                    locals.add("__array_clone_dst", ValType::I32, None);
+                    locals.add("__array_dyn_ptr", ValType::I32, None);
+                    locals.add("__array_dyn_size", ValType::I64, None);
+                    locals.add("__array_dyn_idx", ValType::I64, None);
+                }
             }
             Expr::SuperCall { args, .. } => {
                 for arg in args {
@@ -6785,9 +7299,15 @@ impl CodeGen {
                 }
                 locals.add("__struct_alloc_ptr", ValType::I32, None);
             }
-            Expr::ConstructorCall { args, .. } => {
+            Expr::ConstructorCall { name, args, .. } => {
                 for e in args {
                     self.collect_locals_from_expr(e, locals);
+                }
+                // P2.7: Array<T>(size, init) 需要临时变量
+                if name == "Array" {
+                    locals.add("__array_dyn_ptr", ValType::I32, None);
+                    locals.add("__array_dyn_size", ValType::I64, None);
+                    locals.add("__array_dyn_idx", ValType::I64, None);
                 }
             }
             Expr::Field { object, .. } => {
@@ -6919,9 +7439,16 @@ impl CodeGen {
                 .and_then(|e| self.infer_ast_type(e).map(|t| Type::Array(Box::new(t))))
                 .or(Some(Type::Array(Box::new(Type::Int64)))),
             Expr::StructInit { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
-            Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
+            Expr::ConstructorCall { name, type_args, .. } => {
+                // P2.7: Array<T>(size, init) → Array(T)
+                if name == "Array" {
+                    let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                    return Some(Type::Array(Box::new(elem)));
+                }
+                Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default()))
+            }
             Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone(), vec![])),
-            Expr::Call { name, type_args: _, args } => {
+            Expr::Call { name, type_args: _, args, .. } => {
                 // 类型构造函数：Float32(x), Float64(x), Int64(x) 等
                 match name.as_str() {
                     "Int8" => return Some(Type::Int8),
@@ -6975,6 +7502,15 @@ impl CodeGen {
                 if let Some(ret) = Self::builtin_method_return_type(obj_ty.as_ref(), method) {
                     return Some(ret);
                 }
+                // P2.4: 静态方法调用 → 对象是类名（不是局部变量）
+                if let Expr::Var(ref class_name) = object.as_ref() {
+                    if obj_ty.is_none() && (self.structs.contains_key(class_name.as_str()) || self.classes.contains_key(class_name.as_str())) {
+                        let key = format!("{}.{}", class_name, method);
+                        if let Some(ret) = self.func_return_types.get(&key) {
+                            return Some(ret.clone());
+                        }
+                    }
+                }
                 // 尝试通过对象类型 + 方法名查找 func_return_types
                 obj_ty.and_then(|ty| {
                     let type_name = match &ty {
@@ -6990,12 +7526,10 @@ impl CodeGen {
             Expr::SuperCall { .. } => None, // super 调用，需结合父类推断
             Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
             Expr::IfLet { then_branch, .. } => self.infer_ast_type(then_branch),
-            Expr::Lambda { params, return_type, .. } => {
-                let param_types = params.iter().map(|(_, t)| t.clone()).collect();
-                Some(Type::Function {
-                    params: param_types,
-                    ret: Box::new(return_type.clone()),
-                })
+            Expr::Lambda { params, return_type, body } => {
+                let param_types: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
+                let ret = if return_type.is_some() { return_type.clone() } else { Self::infer_lambda_return_type(body, params) };
+                Some(Type::Function { params: param_types, ret: Box::new(ret) })
             }
             Expr::Some(inner) => self.infer_ast_type(inner).map(|t| Type::Option(Box::new(t))),
             Expr::None => None, // 需要类型注解
@@ -7068,12 +7602,20 @@ impl CodeGen {
                 _ => None,
             },
             Some(Type::String) => match method {
-                "isEmpty" | "contains" => Some(Type::Bool),
+                "isEmpty" | "contains" | "startsWith" | "endsWith" | "isBlank" => Some(Type::Bool),
                 "toInt64" | "indexOf" => Some(Type::Int64),
                 "toFloat64" => Some(Type::Float64),
                 "size" => Some(Type::Int64),
-                "toString" | "replace" | "toArray" => Some(Type::String),
+                "toString" | "replace" | "toArray" | "trim" => Some(Type::String),
                 "split" => Some(Type::Array(Box::new(Type::String))),
+                _ => None,
+            },
+            // P2.8: Array 实例方法返回类型
+            Some(Type::Array(ref elem_ty)) => match method {
+                "clone" => obj_type.cloned(),
+                "isEmpty" => Some(Type::Bool),
+                "slice" => obj_type.cloned(),
+                "size" => Some(Type::Int64),
                 _ => None,
             },
             _ => None,
@@ -7226,9 +7768,16 @@ impl CodeGen {
                 .and_then(|e| self.infer_ast_type_with_locals(e, locals).map(|t| Type::Array(Box::new(t))))
                 .or(Some(Type::Array(Box::new(Type::Int64)))),
             Expr::StructInit { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
-            Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
+            Expr::ConstructorCall { name, type_args, .. } => {
+                // P2.7: Array<T>(size, init) → Array(T)
+                if name == "Array" {
+                    let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                    return Some(Type::Array(Box::new(elem)));
+                }
+                Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default()))
+            }
             Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone(), vec![])),
-            Expr::Call { name, type_args: _, args } => {
+            Expr::Call { name, type_args: _, args, .. } => {
                 // 类型构造函数：Float32(x), Float64(x), Int64(x) 等
                 match name.as_str() {
                     "Int8" => return Some(Type::Int8),
@@ -7281,6 +7830,15 @@ impl CodeGen {
                 let obj_ty = self.infer_ast_type_with_locals(object, locals);
                 if let Some(ret) = Self::builtin_method_return_type(obj_ty.as_ref(), method) {
                     return Some(ret);
+                }
+                // P2.4: 静态方法调用 → 对象是类名（不是局部变量）
+                if let Expr::Var(ref class_name) = object.as_ref() {
+                    if obj_ty.is_none() && (self.structs.contains_key(class_name.as_str()) || self.classes.contains_key(class_name.as_str())) {
+                        let key = format!("{}.{}", class_name, method);
+                        if let Some(ret) = self.func_return_types.get(&key) {
+                            return Some(ret.clone());
+                        }
+                    }
                 }
                 // 尝试通过对象类型 + 方法名查找 func_return_types
                 obj_ty.and_then(|ty| {
@@ -7360,12 +7918,10 @@ impl CodeGen {
                 }
             }
             Expr::Range { .. } => Some(Type::Range),
-            Expr::Lambda { params, return_type, .. } => {
-                let param_types = params.iter().map(|(_, t)| t.clone()).collect();
-                Some(Type::Function {
-                    params: param_types,
-                    ret: Box::new(return_type.clone()),
-                })
+            Expr::Lambda { params, return_type, body } => {
+                let param_types: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
+                let ret = if return_type.is_some() { return_type.clone() } else { Self::infer_lambda_return_type(body, params) };
+                Some(Type::Function { params: param_types, ret: Box::new(ret) })
             }
             Expr::Some(inner) => self.infer_ast_type_with_locals(inner, locals).map(|t| Type::Option(Box::new(t))),
             Expr::None => None,
@@ -7404,7 +7960,17 @@ impl CodeGen {
     /// 获取"对象表达式"的 AST 类型（用于字段访问、方法调用时查结构体与偏移）
     fn get_object_type(&self, expr: &Expr, locals: &LocalsBuilder) -> Option<Type> {
         match expr {
-            Expr::Var(name) => locals.get_type(name).cloned(),
+            Expr::Var(name) => {
+                // 先查局部变量
+                if let Some(ty) = locals.get_type(name) {
+                    return Some(ty.clone());
+                }
+                // P2.4: 如果是已知类名，返回 Struct 类型（用于静态方法调用）
+                if self.structs.contains_key(name.as_str()) || self.classes.contains_key(name.as_str()) {
+                    return Some(Type::Struct(name.clone(), vec![]));
+                }
+                None
+            }
             Expr::StructInit { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
             Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
             Expr::Field { object, .. } => self.get_object_type(object, locals),
@@ -7428,6 +7994,7 @@ impl CodeGen {
     /// match 表达式最后一个 arm 不匹配时的默认值（按 result_type 生成正确类型的零值）
     fn emit_match_default_value(func: &mut WasmFunc, result_type: wasm_encoder::BlockType) {
         match result_type {
+            wasm_encoder::BlockType::Empty => {} // void match 不需要默认值
             wasm_encoder::BlockType::Result(ValType::I32) => { func.instruction(&Instruction::I32Const(0)); }
             wasm_encoder::BlockType::Result(ValType::F32) => { func.instruction(&Instruction::F32Const(0.0)); }
             wasm_encoder::BlockType::Result(ValType::F64) => { func.instruction(&Instruction::F64Const(0.0)); }
@@ -7529,25 +8096,62 @@ impl CodeGen {
     }
 
     /// 判断表达式编译后是否在栈上产生一个值
-    fn expr_produces_value(expr: &Expr) -> bool {
+    fn expr_produces_value(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Block(_, result) => result.is_some(),
             // if 无 else 编译为 BlockType::Empty，不产生值
             Expr::If { else_branch: None, .. } => false,
             // if-else：只有两个分支都产生值时，整个 if-else 才产生值
             Expr::If { then_branch, else_branch: Some(else_expr), .. } => {
-                Self::expr_produces_value(then_branch) && Self::expr_produces_value(else_expr)
+                self.expr_produces_value(then_branch) && self.expr_produces_value(else_expr)
             }
             // throw 设置 __err_flag/__err_val 并跳转，不在栈上留值
             Expr::Throw(_) => false,
             // Bug B6 修复: try-catch 可以作为表达式使用（当 body 最后一条是表达式时产生值）
             Expr::TryBlock { body, .. } => {
-                body.last().map_or(false, |s| matches!(s, Stmt::Expr(e) if Self::expr_produces_value(e)))
+                body.last().map_or(false, |s| matches!(s, Stmt::Expr(e) if self.expr_produces_value(e)))
             }
             // super(args) 初始化调用不产生值（已在 compile_expr 中 drop）
             Expr::SuperCall { method, .. } => method != "init" && !method.is_empty(),
-            // I/O 函数不返回值
-            Expr::Call { name, .. } if name == "println" || name == "print" || name == "eprintln" || name == "eprint" => false,
+            // P1.2: void（返回 Unit 或无返回类型）的函数调用不在栈上产生值
+            Expr::Call { name, .. } => {
+                match self.func_return_types.get(name.as_str()) {
+                    Some(Type::Unit) | None => false,
+                    _ => true,
+                }
+            }
+            // P1.2: void 方法调用也不产生值
+            Expr::MethodCall { object, method, .. } => {
+                // 尝试推断对象类型，查找方法返回值类型
+                if let Some(obj_type) = self.infer_ast_type(object) {
+                    if let Type::Struct(class_name, _) = &obj_type {
+                        let key = format!("{}.{}", class_name, method);
+                        match self.func_return_types.get(key.as_str()) {
+                            Some(Type::Unit) | None => return false,
+                            _ => return true,
+                        }
+                    }
+                }
+                // P2.4: 静态方法调用 → 对象是类名
+                if let Expr::Var(ref class_name) = object.as_ref() {
+                    if self.structs.contains_key(class_name.as_str()) || self.classes.contains_key(class_name.as_str()) {
+                        let key = format!("{}.{}", class_name, method);
+                        match self.func_return_types.get(key.as_str()) {
+                            Some(Type::Unit) | None => return false,
+                            _ => return true,
+                        }
+                    }
+                }
+                true // 无法推断时默认产生值
+            }
+            // P2.1: match/if-let 表达式是否产生值取决于 arms 是否产生值
+            Expr::Match { arms, .. } => {
+                if arms.is_empty() { return false; }
+                self.expr_produces_value(&arms[0].body)
+            }
+            Expr::IfLet { then_branch, .. } => {
+                self.expr_produces_value(then_branch)
+            }
             _ => true,
         }
     }
@@ -7578,7 +8182,7 @@ impl CodeGen {
             Expr::NullCoalesce { default, .. } => self.infer_type(default),
             Expr::StructInit { .. } => ValType::I32,
             Expr::ConstructorCall { .. } => ValType::I32,
-            Expr::Call { name, type_args: _, args } => {
+            Expr::Call { name, type_args: _, args, .. } => {
                 if name == "println" || name == "print" || name == "eprintln" || name == "eprint" {
                     ValType::I32 // I/O 函数无返回值，返回虚拟类型
                 } else if name == "readln" {
@@ -7658,34 +8262,42 @@ impl CodeGen {
     ) {
         match stmt {
             Stmt::Let { pattern, value, .. } => {
-                self.compile_expr(value, locals, func, loop_ctx);
-                match pattern {
-                    Pattern::Binding(name) => {
-                        let idx = locals.get(name).expect("局部变量未找到");
-                        // 值类型与局部变量类型不匹配时自动转换
-                        let val_ty = self.infer_type_with_locals(value, locals);
-                        let local_ty = locals.get_valtype(name).unwrap_or(val_ty);
-                        self.emit_type_coercion(func, val_ty, local_ty);
-                        func.instruction(&Instruction::LocalSet(idx));
+                // P1.3: let _ = expr → 编译表达式后 drop 结果值
+                if matches!(pattern, Pattern::Wildcard) {
+                    self.compile_expr(value, locals, func, loop_ctx);
+                    if self.expr_produces_value(value) {
+                        func.instruction(&Instruction::Drop);
                     }
-                    Pattern::Struct { name: struct_name, fields } => {
-                        let ptr_tmp = locals.get("__let_struct_ptr").expect("__let_struct_ptr");
-                        func.instruction(&Instruction::LocalSet(ptr_tmp));
-                        let struct_def = &self.structs[struct_name];
-                        for (fname, pat) in fields {
-                            let offset = struct_def.field_offset(fname).expect("结构体字段");
-                            let fty = struct_def.field_type(fname).expect("字段类型");
-                            func.instruction(&Instruction::LocalGet(ptr_tmp));
-                            func.instruction(&Instruction::I32Const(offset as i32));
-                            func.instruction(&Instruction::I32Add);
-                            self.emit_load_by_type(func, fty);
-                            if let Pattern::Binding(bind) = pat {
-                                let idx = locals.get(bind).expect("解构绑定名");
-                                func.instruction(&Instruction::LocalSet(idx));
+                } else {
+                    self.compile_expr(value, locals, func, loop_ctx);
+                    match pattern {
+                        Pattern::Binding(name) => {
+                            let idx = locals.get(name).expect("局部变量未找到");
+                            // 值类型与局部变量类型不匹配时自动转换
+                            let val_ty = self.infer_type_with_locals(value, locals);
+                            let local_ty = locals.get_valtype(name).unwrap_or(val_ty);
+                            self.emit_type_coercion(func, val_ty, local_ty);
+                            func.instruction(&Instruction::LocalSet(idx));
+                        }
+                        Pattern::Struct { name: struct_name, fields } => {
+                            let ptr_tmp = locals.get("__let_struct_ptr").expect("__let_struct_ptr");
+                            func.instruction(&Instruction::LocalSet(ptr_tmp));
+                            let struct_def = &self.structs[struct_name];
+                            for (fname, pat) in fields {
+                                let offset = struct_def.field_offset(fname).expect("结构体字段");
+                                let fty = struct_def.field_type(fname).expect("字段类型");
+                                func.instruction(&Instruction::LocalGet(ptr_tmp));
+                                func.instruction(&Instruction::I32Const(offset as i32));
+                                func.instruction(&Instruction::I32Add);
+                                self.emit_load_by_type(func, fty);
+                                if let Pattern::Binding(bind) = pat {
+                                    let idx = locals.get(bind).expect("解构绑定名");
+                                    func.instruction(&Instruction::LocalSet(idx));
+                                }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             Stmt::Var { name, value, .. } => {
@@ -7814,7 +8426,7 @@ impl CodeGen {
             Stmt::Expr(expr) => {
                 self.compile_expr(expr, locals, func, loop_ctx);
                 // 仅当表达式会在栈上产生值时才 drop
-                if Self::expr_produces_value(expr) {
+                if self.expr_produces_value(expr) {
                     func.instruction(&Instruction::Drop);
                 }
             }
@@ -7986,7 +8598,7 @@ impl CodeGen {
                 let var_idx = locals.get(var).expect("循环变量未找到");
 
                 match iterable {
-                    Expr::Range { start, end, inclusive } => {
+                    Expr::Range { start, end, inclusive, step } => {
                         // 初始化循环变量
                         self.compile_expr(start, locals, func, loop_ctx);
                         func.instruction(&Instruction::LocalSet(var_idx));
@@ -8014,9 +8626,13 @@ impl CodeGen {
                         }
                         func.instruction(&Instruction::End); // body block end
 
-                        // 递增循环变量
+                        // 递增循环变量（P2.6: 支持步长）
                         func.instruction(&Instruction::LocalGet(var_idx));
-                        func.instruction(&Instruction::I64Const(1));
+                        if let Some(step_expr) = step {
+                            self.compile_expr(step_expr, locals, func, loop_ctx);
+                        } else {
+                            func.instruction(&Instruction::I64Const(1));
+                        }
                         func.instruction(&Instruction::I64Add);
                         func.instruction(&Instruction::LocalSet(var_idx));
 
@@ -8777,7 +9393,14 @@ impl CodeGen {
                     _ => {}
                 }
             }
-            Expr::Call { name, type_args: _, args } => {
+            Expr::Call { name, type_args: _, args, named_args, .. } => {
+                // P2.9: 合并命名参数
+                let args = if named_args.is_empty() {
+                    std::borrow::Cow::Borrowed(args)
+                } else {
+                    std::borrow::Cow::Owned(self.resolve_named_args(name, args, named_args))
+                };
+                let args: &[Expr] = &args;
                 // Phase 7: I/O 内置函数处理 (println/print/eprintln/eprint)
                 if name == "println" || name == "print" || name == "eprintln" || name == "eprint" {
                     // 确定运行时函数前缀
@@ -8922,11 +9545,33 @@ impl CodeGen {
                     // 数组指针已经是 i32，无需转换
                     self.compile_expr(&args[0], locals, func, loop_ctx);
                     func.instruction(&Instruction::Call(self.func_indices["__sort_array"]));
-                    // sort 返回 void，推哑值供语句 drop
-                    func.instruction(&Instruction::I64Const(0));
+                    // sort 返回 void，不需要推哑值（expr_produces_value 返回 false）
                 } else if Self::is_math_builtin(name) && !self.func_indices.contains_key(name) {
                     // Phase 7.3: math 内置函数（仅在用户未自定义同名函数时）
                     self.compile_math_builtin(name, args, locals, func, loop_ctx);
+                // P2.3: 检查是否为 Lambda/函数类型的局部变量调用
+                } else if locals.get(name).is_some() && matches!(locals.get_ast_type(name), Some(Type::Function { .. })) {
+                    // Lambda 调用：通过 call_indirect
+                    for arg in args {
+                        self.compile_expr(arg, locals, func, loop_ctx);
+                    }
+                    // 获取函数类型索引 — 查找 lambda 的类型
+                    // 从 AST 类型推断 lambda 的 WASM 类型签名
+                    if let Some(Type::Function { ref params, ref ret }) = locals.get_ast_type(name) {
+                        let wasm_params: Vec<ValType> = params.iter().map(|t| t.to_wasm()).collect();
+                        let wasm_results: Vec<ValType> = ret.as_ref()
+                            .as_ref()
+                            .map(|t| vec![t.to_wasm()])
+                            .unwrap_or_default();
+                        // 查找匹配的类型索引
+                        let type_idx = self.find_or_create_func_type_idx(&wasm_params, &wasm_results);
+                        let local_idx = locals.get(name).unwrap();
+                        func.instruction(&Instruction::LocalGet(local_idx));
+                        func.instruction(&Instruction::CallIndirect {
+                            type_index: type_idx,
+                            table_index: 0,
+                        });
+                    }
                 } else {
                 // 检查是否为带 init 的类构造调用
                 let init_func_name = format!("__{}_init", name);
@@ -8950,7 +9595,7 @@ impl CodeGen {
                         .fields
                         .iter()
                         .map(|f| f.name.clone())
-                        .zip(args.clone())
+                        .zip(args.iter().cloned())
                         .collect();
                     let init_expr = Expr::StructInit {
                         name: name.clone(),
@@ -9035,7 +9680,7 @@ impl CodeGen {
                 }
                 } // end else (non-println)
             }
-            Expr::SuperCall { method, args } => {
+            Expr::SuperCall { method, args, .. } => {
                 // super 调用：直接调用父类的方法（绕过 vtable）
                 // 从函数名推断当前类 → 找父类 → 调用父类方法
                 // super(args) → 调用父类 init; super.method(args) → 调用父类方法
@@ -9102,7 +9747,7 @@ impl CodeGen {
                     }
                 }
             }
-            Expr::MethodCall { object, method, args } => {
+            Expr::MethodCall { object, method, args, .. } => {
                 // Phase 7.2: 内建类型方法分发
                 // 先推断对象的 AST 类型，检查是否可以用内建方法处理
                 let obj_ast_type = self.infer_ast_type_with_locals(object, locals);
@@ -9116,7 +9761,7 @@ impl CodeGen {
                         None
                     };
                     let is_static = type_name_opt.as_ref().map_or(false, |n| {
-                        (self.structs.contains_key(n) || self.enums.contains_key(n))
+                        (self.structs.contains_key(n) || self.enums.contains_key(n) || self.classes.contains_key(n))
                             && self.func_indices.contains_key(&format!("{}.{}", n, method))
                     });
                     let key = if is_static {
@@ -9159,8 +9804,8 @@ impl CodeGen {
                 let inner_ctx = loop_ctx.map(|(b, c)| (b + 1, c + 1));
 
                 if let Some(else_expr) = else_branch {
-                    let then_produces = Self::expr_produces_value(then_branch);
-                    let else_produces = Self::expr_produces_value(else_expr);
+                    let then_produces = self.expr_produces_value(then_branch);
+                    let else_produces = self.expr_produces_value(else_expr);
                     if then_produces && else_produces {
                         // if-else 表达式：两个分支都有返回值
                         let result_type = wasm_encoder::BlockType::Result(self.infer_type_with_locals(then_branch, locals));
@@ -9185,7 +9830,7 @@ impl CodeGen {
                     // if 无 else：无返回值（语句级）
                     func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                     // then_branch 如果会产生值（非 void Block），需要 drop
-                    let produces_value = Self::expr_produces_value(then_branch);
+                    let produces_value = self.expr_produces_value(then_branch);
                     self.compile_expr(then_branch, locals, func, inner_ctx);
                     if produces_value {
                         func.instruction(&Instruction::Drop);
@@ -9439,7 +10084,7 @@ impl CodeGen {
                 // 返回对象地址
                 func.instruction(&Instruction::LocalGet(tmp_local));
             }
-            Expr::ConstructorCall { name, type_args, args } => {
+            Expr::ConstructorCall { name, type_args, args, .. } => {
                 // Phase 7.5: 内置集合类型构造器（首字母大写，会被解析为 ConstructorCall）
                 match name.as_str() {
                     "ArrayList" | "ArrayStack" if args.is_empty() => {
@@ -9452,6 +10097,105 @@ impl CodeGen {
                     }
                     "LinkedList" if args.is_empty() => {
                         func.instruction(&Instruction::Call(self.func_indices["__linkedlist_new"]));
+                        return;
+                    }
+                    // P2.7: Array<T>(size, init) 动态数组构造
+                    "Array" if args.len() == 2 => {
+                        let elem_size: i32 = 8; // i64/f64
+                        let is_float = type_args.as_ref().map_or(false, |ta| {
+                            ta.first().map_or(false, |t| matches!(t, Type::Float64 | Type::Float32))
+                        });
+                        let ptr_local = locals.get("__array_dyn_ptr").unwrap();
+                        let size_local = locals.get("__array_dyn_size").unwrap();
+                        let idx_local = locals.get("__array_dyn_idx").unwrap();
+                        let alloc_idx = self.func_indices["__alloc"];
+
+                        // 计算 size 并保存
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        func.instruction(&Instruction::LocalSet(size_local));
+
+                        // 分配内存: 4 + size * 8
+                        func.instruction(&Instruction::LocalGet(size_local));
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::I32Const(elem_size));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::Call(alloc_idx));
+                        func.instruction(&Instruction::LocalSet(ptr_local));
+
+                        // 写入长度
+                        func.instruction(&Instruction::LocalGet(ptr_local));
+                        func.instruction(&Instruction::LocalGet(size_local));
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+
+                        // 初始化元素: idx = 0
+                        func.instruction(&Instruction::I64Const(0));
+                        func.instruction(&Instruction::LocalSet(idx_local));
+
+                        // loop: while idx < size
+                        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+                        // 条件: idx >= size → break
+                        func.instruction(&Instruction::LocalGet(idx_local));
+                        func.instruction(&Instruction::LocalGet(size_local));
+                        func.instruction(&Instruction::I64GeS);
+                        func.instruction(&Instruction::BrIf(1));
+
+                        // 计算元素地址: ptr + 4 + idx * 8
+                        func.instruction(&Instruction::LocalGet(ptr_local));
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalGet(idx_local));
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::I32Const(elem_size));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Add);
+
+                        // 计算 init 值（若 init 是 lambda 则调用 init(idx)）
+                        let init_expr = &args[1];
+                        if matches!(init_expr, Expr::Lambda { .. }) {
+                            // Lambda 初始化: 先编译 lambda 使其索引上栈，然后调用 init(idx)
+                            // 简化处理: 编译 init_expr 得到 table index，然后 call_indirect(idx)
+                            func.instruction(&Instruction::LocalGet(idx_local));
+                            self.compile_expr(init_expr, locals, func, loop_ctx);
+                            // call_indirect with (i64) -> i64
+                            let wasm_params = if is_float { vec![ValType::I64] } else { vec![ValType::I64] };
+                            let wasm_results = if is_float { vec![ValType::F64] } else { vec![ValType::I64] };
+                            let type_idx = self.find_or_create_func_type_idx(&wasm_params, &wasm_results);
+                            func.instruction(&Instruction::CallIndirect { type_index: type_idx, table_index: 0 });
+                        } else {
+                            // 常量值初始化
+                            self.compile_expr(init_expr, locals, func, loop_ctx);
+                        }
+
+                        // 存储元素
+                        if is_float {
+                            func.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                        } else {
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                        }
+
+                        // idx += 1
+                        func.instruction(&Instruction::LocalGet(idx_local));
+                        func.instruction(&Instruction::I64Const(1));
+                        func.instruction(&Instruction::I64Add);
+                        func.instruction(&Instruction::LocalSet(idx_local));
+
+                        func.instruction(&Instruction::Br(0)); // continue loop
+                        func.instruction(&Instruction::End); // loop end
+                        func.instruction(&Instruction::End); // block end
+
+                        // 返回数组指针
+                        func.instruction(&Instruction::LocalGet(ptr_local));
                         return;
                     }
                     _ => {}
@@ -9573,7 +10317,7 @@ impl CodeGen {
                     self.compile_expr(expr, locals, func, loop_ctx);
                 }
             }
-            Expr::Range { start, end, inclusive } => {
+            Expr::Range { start, end, inclusive, .. } => {
                 // Phase 8: 使用 __alloc 分配 Range 内存
                 let range_size = Type::range_heap_size();
                 let alloc_idx = self.func_indices["__alloc"];
@@ -9670,6 +10414,9 @@ impl CodeGen {
                 let subject_ast_type = self.infer_ast_type_with_locals(expr, locals);
 
                 let result_type = if arms.is_empty() {
+                    wasm_encoder::BlockType::Empty
+                } else if !self.expr_produces_value(&arms[0].body) {
+                    // P2.1: match arms 为 void 表达式（如 println）时，block 不产生值
                     wasm_encoder::BlockType::Empty
                 } else {
                     wasm_encoder::BlockType::Result(self.infer_type_with_locals(&arms[0].body, locals))
@@ -10013,15 +10760,17 @@ impl CodeGen {
                 func.instruction(&Instruction::End);
             }
             Expr::Lambda { params, return_type, body } => {
-                // Lambda 编译：返回预扫描阶段生成的匿名函数的索引
+                // P2.3: Lambda 编译：返回 TABLE INDEX（用于 call_indirect）
                 let lambda_idx = self.lambda_counter.get();
                 self.lambda_counter.set(lambda_idx + 1);
                 let lambda_name = format!("__lambda_{}", lambda_idx);
 
-                if let Some(&func_idx) = self.func_indices.get(&lambda_name) {
+                if let Some(&table_idx) = self.lambda_table_indices.get(&lambda_name) {
+                    func.instruction(&Instruction::I32Const(table_idx as i32));
+                } else if let Some(&func_idx) = self.func_indices.get(&lambda_name) {
+                    // fallback: 用 function index
                     func.instruction(&Instruction::I32Const(func_idx as i32));
                 } else {
-                    // fallback：Lambda 未找到，返回 0
                     func.instruction(&Instruction::I32Const(0));
                 }
             }
@@ -10197,7 +10946,7 @@ impl CodeGen {
 
                 // 检查 try body 最后一条是否为表达式（即 try-catch 用作表达式）
                 let produces_value = body.last().map_or(false, |s| {
-                    matches!(s, Stmt::Expr(e) if Self::expr_produces_value(e))
+                    matches!(s, Stmt::Expr(e) if self.expr_produces_value(e))
                 });
 
                 // 初始化 __err_flag = 0
@@ -10326,6 +11075,11 @@ impl LocalsBuilder {
         self.names.get(name).map(|&idx| self.types[idx as usize])
     }
 
+    /// P2.3: 获取局部变量的 AST 类型
+    fn get_ast_type(&self, name: &str) -> Option<Type> {
+        self.ast_types.get(name).cloned()
+    }
+
     /// 确保临时变量存在，不存在则创建。返回 local index。
     fn ensure_temp(&mut self, name: &str, ty: ValType) -> u32 {
         if let Some(idx) = self.names.get(name) {
@@ -10360,6 +11114,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "answer".to_string(),
@@ -10406,6 +11161,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "test".to_string(),
@@ -10469,6 +11225,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "get_y".to_string(),
@@ -10514,6 +11271,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "compute".to_string(),
@@ -10547,6 +11305,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "max".to_string(),
@@ -10557,13 +11316,13 @@ mod tests {
                         name: "a".to_string(),
                         ty: Type::Int64,
                         default: None,
-                        variadic: false,
+                        variadic: false, is_named: false,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: Type::Int64,
                         default: None,
-                        variadic: false,
+                        variadic: false, is_named: false,
                     },
                 ],
                 return_type: Some(Type::Int64),
@@ -10596,6 +11355,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "first".to_string(),
@@ -10640,6 +11400,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "match_test".to_string(),
@@ -10649,7 +11410,7 @@ mod tests {
                     name: "n".to_string(),
                     ty: Type::Int64,
                     default: None,
-                    variadic: false,
+                    variadic: false, is_named: false,
                 }],
                 return_type: Some(Type::Int64),
                 throws: None,
@@ -10687,6 +11448,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "sum_range".to_string(),
@@ -10708,6 +11470,7 @@ mod tests {
                             start: Box::new(Expr::Integer(0)),
                             end: Box::new(Expr::Integer(3)),
                             inclusive: false,
+                            step: None,
                         },
                         body: vec![Stmt::Assign {
                             target: AssignTarget::Var("sum".to_string()),
@@ -10738,6 +11501,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "fadd".to_string(),
@@ -10770,6 +11534,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             extends: vec![],
+            type_aliases: vec![],
             functions: vec![
                 FuncDef {
                     visibility: Visibility::default(),
@@ -10794,6 +11559,7 @@ mod tests {
                         name: "one".to_string(),
                         type_args: None,
                         args: vec![],
+                        named_args: vec![],
                     }))],
                     extern_import: None,
                 },

@@ -129,6 +129,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             name,
             type_args: ta_opt,
             args,
+            named_args,
         } => {
             let new_name = match ta_opt.as_ref() {
                 Option::Some(tas) => rewrites
@@ -144,6 +145,10 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 args: args
                     .into_iter()
                     .map(|a| substitute_expr(a, subst, rewrites))
+                    .collect(),
+                named_args: named_args
+                    .into_iter()
+                    .map(|(n, e)| (n, substitute_expr(e, subst, rewrites)))
                     .collect(),
             }
         }
@@ -174,6 +179,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             name,
             type_args: ta_opt,
             args,
+            named_args,
         } => {
             let (new_name, new_type_args) = match ta_opt.as_ref() {
                 Option::Some(tas) => rewrites
@@ -190,6 +196,10 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 args: args
                     .into_iter()
                     .map(|a| substitute_expr(a, subst, rewrites))
+                    .collect(),
+                named_args: named_args
+                    .into_iter()
+                    .map(|(n, e)| (n, substitute_expr(e, subst, rewrites)))
                     .collect(),
             }
         }
@@ -210,6 +220,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             object,
             method,
             args,
+            named_args,
         } => MethodCall {
             object: Box::new(substitute_expr(*object, subst, rewrites)),
             method,
@@ -217,12 +228,20 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .into_iter()
                 .map(|a| substitute_expr(a, subst, rewrites))
                 .collect(),
+            named_args: named_args
+                .into_iter()
+                .map(|(n, e)| (n, substitute_expr(e, subst, rewrites)))
+                .collect(),
         },
-        SuperCall { method, args } => SuperCall {
+        SuperCall { method, args, named_args } => SuperCall {
             method,
             args: args
                 .into_iter()
                 .map(|a| substitute_expr(a, subst, rewrites))
+                .collect(),
+            named_args: named_args
+                .into_iter()
+                .map(|(n, e)| (n, substitute_expr(e, subst, rewrites)))
                 .collect(),
         },
         If {
@@ -272,10 +291,12 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             start,
             end,
             inclusive,
+            step,
         } => Range {
             start: Box::new(substitute_expr(*start, subst, rewrites)),
             end: Box::new(substitute_expr(*end, subst, rewrites)),
             inclusive,
+            step: step.map(|s| Box::new(substitute_expr(*s, subst, rewrites))),
         },
         VariantConst {
             enum_name,
@@ -1165,6 +1186,7 @@ pub fn monomorphize_program(program: &mut Program) {
                             ty: substitute_type(&p.ty, &subst),
                             default: p.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
                             variadic: p.variadic,
+                            is_named: p.is_named,
                         }).collect(),
                         return_type: m.func.return_type.as_ref().map(|t| substitute_type(t, &subst)),
                         throws: m.func.throws.clone(),
@@ -1180,6 +1202,7 @@ pub fn monomorphize_program(program: &mut Program) {
                 ty: substitute_type(&p.ty, &subst),
                 default: p.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
                 variadic: p.variadic,
+                is_named: p.is_named,
             }).collect(),
             body: i.body.iter().cloned().map(|s| substitute_stmt(s, &subst, &rewrites)).collect(),
         });
@@ -1240,6 +1263,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     .as_ref()
                     .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
                 variadic: p.variadic,
+                is_named: p.is_named,
             })
             .collect();
         let return_type = def
@@ -1361,6 +1385,7 @@ mod tests {
             enums: vec![],
             functions: vec![],
             extends: vec![],
+            type_aliases: vec![],
         };
         monomorphize_program(&mut program);
         assert!(program.functions.is_empty());
@@ -1387,6 +1412,7 @@ mod tests {
                 extern_import: None,
             }],
             extends: vec![],
+            type_aliases: vec![],
         };
         monomorphize_program(&mut program);
         assert_eq!(program.functions.len(), 1);

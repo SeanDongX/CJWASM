@@ -51,7 +51,7 @@
 | 类型 | 语法 | 描述 | 状态 |
 |------|------|------|------|
 | `String` | `String` | UTF-8 字符串 | [x] |
-| `Array<T>` | `Array<Int64>` | 固定长度数组 | [x] |
+| `Array<T>` | `Array<Int64>`, `Array<T>(size, init)` | 固定/动态长度数组 | [x] |
 | `Slice<T>` | `Slice<Int64>` | 动态切片 | [x] |
 | `Map<K, V>` | `Map<String, Int64>` | 键值映射 | [x] |
 | `Tuple` | `(Int64, String)` | 元组类型 | [x] |
@@ -311,7 +311,7 @@ match value {
 |------|------|
 | if-else | [x] |
 | while | [x] |
-| for-in（范围 0..n / 0..=n） | [x] |
+| for-in（范围 0..n / 0..=n / 0..=n : step） | [x] |
 | for-in（数组迭代） | [x] |
 | loop | [x] |
 | match | [x] |
@@ -366,7 +366,7 @@ let triple = { x: Int64 => x * 3 }
 | 基本函数 | [x] |
 | 参数 | [x] |
 | 返回类型 | [x] |
-| 默认参数 | [x] |
+| 默认参数 / 命名参数 (name!: Type = default) | [x] |
 | 可变参数 | [x] |
 | 泛型函数 | [x] |
 | Lambda | [x] |
@@ -844,19 +844,19 @@ func add(a: Int64, b: Int64): Int64 {
 
 | 功能 | 描述 | 状态 |
 |------|------|------|
-| args_get | 命令行参数 | [ ] |
-| fd_read | 文件读取 | [ ] |
-| fd_write | 文件写入 | [ ] |
-| fd_close | 文件关闭 | [ ] |
-| clock_time_get | 获取时间 | [ ] |
-| random_get | 随机数 | [ ] |
+| args_get | 命令行参数 | [x] |
+| fd_read | 文件读取 | [x] |
+| fd_write | 文件写入 | [x] |
+| fd_close | 文件关闭 | [x] |
+| clock_time_get | 获取时间 | [x] |
+| random_get | 随机数 | [x] |
 
 | 功能 | 状态 |
 |------|------|
 | @import | [x] |
 | @export | [x] (自动) |
 | foreign func | [x] |
-| WASI 基础 | [ ] (需运行时提供 fd_write 等) |
+| WASI 基础 | [x] (13 个 WASI 导入已完成) |
 
 ---
 
@@ -866,15 +866,15 @@ func add(a: Int64, b: Int64): Int64 {
 
 | 模块 | 功能 | 状态 |
 |------|------|------|
-| `std.core` | 基础类型和函数 | [ ] |
-| `std.string` | 字符串操作 | [ ] |
-| `std.array` | 数组操作 | [ ] |
-| `std.math` | 数学函数 | [ ] |
-| `std.io` | 输入输出 | [ ] |
-| `std.collections` | 集合类型 | [ ] |
-| `std.time` | 时间处理 | [ ] |
+| `std.core` | 基础类型和函数 | [x] |
+| `std.string` | 字符串操作 | [x] |
+| `std.array` | 数组操作 | [x] |
+| `std.math` | 数学函数 | [x] |
+| `std.io` | 输入输出 | [x] |
+| `std.collections` | 集合类型 | [x] |
+| `std.time` | 时间处理 | [x] |
 | `std.json` | JSON 解析 | [ ] |
-| `std.fmt` | 格式化 | [ ] |
+| `std.fmt` | 格式化 | [x] |
 
 ### 14.2 内置函数
 
@@ -908,11 +908,11 @@ pow(base, exp)
 
 | 功能 | 状态 |
 |------|------|
-| print/println | [ ] |
-| 类型转换函数 | [ ] |
-| 数组函数 | [ ] |
-| 字符串函数 | [ ] |
-| 数学函数 | [x]（min/max/abs，Int64；pow 已通过 ** 与 __pow_i64） |
+| print/println | [x] |
+| 类型转换函数 | [x] |
+| 数组函数 | [x] |
+| 字符串函数 | [x] |
+| 数学函数 | [x]（完整实现：min/max/abs/sqrt/sin/cos/exp/log/pow 等） |
 
 ---
 
@@ -920,9 +920,9 @@ pow(base, exp)
 
 *未完成特性的完整实施计划见 [docs/next_steps.md](next_steps.md)。*
 
-### 15.1 当前版本: v0.8.0
+### 15.1 当前版本: v0.9.0
 
-v0.8.0 完成了与 cjc release/1.0 分支的语法严格对齐。正文第 1–15 节各表「状态」列已与本节一致，已实现项均已标为 [x]。Phase 1-6, 8-9 全部完成，下一步计划详见 [next_steps.md](next_steps.md)。
+v0.9.0 完成了 Phase 1-10 全部阶段以及 WASI + 标准库。P2 核心语法扩展（static 成员、抽象方法、for-in 步长、动态 Array 构造、Array 实例方法、命名参数、String 方法）已完成。详见 [next_steps.md](next_steps.md)。
 
 #### 已完成功能
 
@@ -1060,9 +1060,9 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 
 #### 未来版本计划
 
-- [ ] Phase 7: WASI + 标准库（fd_write/fd_read/fd_close/args_get/clock_time_get/random_get, std.core/io/collections）
+- [x] Phase 7: WASI + 标准库（fd_write/fd_read/fd_close/args_get/clock_time_get/random_get, std.core/io/collections）
 - [x] Phase 9: 补充特性（Slice<T>, Map 字面量, 类型修饰符, 尾递归优化, 死代码消除, 函数内联）
-- [ ] 包管理
+- [x] 包管理
 
 ---
 
@@ -1123,5 +1123,5 @@ while     with
 
 ---
 
-*文档版本: 3.0.0*
-*最后更新: 2026-02-14（v0.8.0 完成，与 cjc release/1.0 语法严格对齐；Phase 1-6, 8-9 全部完成）*
+*文档版本: 3.1.0*
+*最后更新: 2026-02-15（v0.9.0 完成，Phase 1-10 + WASI + 标准库全部完成；P2 核心语法扩展部分完成）*

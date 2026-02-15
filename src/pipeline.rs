@@ -41,6 +41,7 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
         enums: vec![],
         functions: vec![],
         extends: vec![],
+        type_aliases: vec![],
     };
 
     for prog in programs {
@@ -54,6 +55,7 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
         merged.enums.extend(prog.enums);
         merged.functions.extend(prog.functions);
         merged.extends.extend(prog.extends);
+        merged.type_aliases.extend(prog.type_aliases);
     }
 
     merged

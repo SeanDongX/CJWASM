@@ -283,17 +283,23 @@ pub enum Expr {
         name: String,
         type_args: Option<Vec<Type>>,
         args: Vec<Expr>,
+        /// P2.9: 命名参数 name!: value
+        named_args: Vec<(String, Expr)>,
     },
     /// 方法调用 (obj.method(args))
     MethodCall {
         object: Box<Expr>,
         method: String,
         args: Vec<Expr>,
+        /// P2.9: 命名参数
+        named_args: Vec<(String, Expr)>,
     },
     /// super 调用：super.method(args) 或 super(args) 调用父类
     SuperCall {
         method: String,
         args: Vec<Expr>,
+        /// P2.9: 命名参数
+        named_args: Vec<(String, Expr)>,
     },
     /// if 表达式
     If {
@@ -335,17 +341,20 @@ pub enum Expr {
         name: String,
         type_args: Option<Vec<Type>>,
         args: Vec<Expr>,
+        /// P2.9: 命名参数
+        named_args: Vec<(String, Expr)>,
     },
     /// 字段访问 point.x
     Field {
         object: Box<Expr>,
         field: String,
     },
-    /// 范围表达式 0..10 或 0..=10
+    /// 范围表达式 0..10 或 0..=10，可选步长 : step
     Range {
         start: Box<Expr>,
         end: Box<Expr>,
         inclusive: bool,  // true 表示 ..=
+        step: Option<Box<Expr>>,  // P2.6: for-in 带步长 `0..=10 : 2`
     },
     /// 枚举变体构造 Color.Red 或 Result.Ok(42)（无关联值时值为 i32 判别式，有关联值为堆指针）
     VariantConst {
@@ -584,6 +593,8 @@ pub struct Param {
     pub default: Option<Expr>,
     /// 可变参数，如 sum(args: Int64...)，调用时 args 展开为数组
     pub variadic: bool,
+    /// P2.9: 命名参数 name!: Type = default
+    pub is_named: bool,
 }
 
 /// 函数定义
@@ -796,4 +807,6 @@ pub struct Program {
     pub functions: Vec<Function>,
     /// 扩展定义
     pub extends: Vec<ExtendDef>,
+    /// P2.2: 类型别名 (type Name = Type)
+    pub type_aliases: Vec<(String, Type)>,
 }

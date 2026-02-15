@@ -243,19 +243,22 @@ fn fold_expr(expr: Expr) -> Expr {
             let tail = tail.map(|e| Box::new(fold_expr(*e)));
             Block(stmts, tail)
         }
-        Call { name, type_args, args } => Call {
+        Call { name, type_args, args, named_args } => Call {
             name,
             type_args,
             args: args.into_iter().map(fold_expr).collect(),
+            named_args: named_args.into_iter().map(|(n, e)| (n, fold_expr(e))).collect(),
         },
         MethodCall {
             object,
             method,
             args,
+            named_args,
         } => MethodCall {
             object: Box::new(fold_expr(*object)),
             method,
             args: args.into_iter().map(fold_expr).collect(),
+            named_args: named_args.into_iter().map(|(n, e)| (n, fold_expr(e))).collect(),
         },
         Array(elems) => Array(elems.into_iter().map(fold_expr).collect()),
         Tuple(elems) => Tuple(elems.into_iter().map(fold_expr).collect()),
@@ -294,10 +297,11 @@ fn fold_expr(expr: Expr) -> Expr {
                 })
                 .collect(),
         },
-        Range { start, end, inclusive } => Range {
+        Range { start, end, inclusive, step } => Range {
             start: Box::new(fold_expr(*start)),
             end: Box::new(fold_expr(*end)),
             inclusive,
+            step: step.map(|s| Box::new(fold_expr(*s))),
         },
         VariantConst { enum_name, variant_name, arg } => VariantConst {
             enum_name,

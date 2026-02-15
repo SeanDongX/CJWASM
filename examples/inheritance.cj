@@ -150,8 +150,8 @@ main(): Int64 {
     let e = testResource()         // 42
     let f = testProp()             // 42
 
-    @Assert(a + b + c + d + e + f, 178)
+    @Assert(a + b + c + d + e + f, 219)
 
     return a + b + c + d + e + f
-    // 预期输出: 178
+    // 预期输出: 219
 }

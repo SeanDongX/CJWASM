@@ -60,6 +60,8 @@ pub struct Parser {
     current_type_params: Vec<String>,
     /// struct/enum 内部方法，解析完成后合并到 functions
     pending_struct_methods: Vec<Function>,
+    /// P2.2: 类型别名映射 (alias_name -> actual_type)
+    type_aliases: std::collections::HashMap<String, Type>,
 }
 
 impl Parser {
@@ -70,6 +72,7 @@ impl Parser {
             receiver_name: None,
             current_type_params: Vec::new(),
             pending_struct_methods: Vec::new(),
+            type_aliases: std::collections::HashMap::new(),
         }
     }
 
@@ -174,6 +177,7 @@ impl Parser {
         let mut functions = Vec::new();
         let mut enums = Vec::new();
         let mut extends = Vec::new();
+        let mut type_aliases: Vec<(String, Type)> = Vec::new();
 
         // 解析可选的 package 声明（cjc: package prefix.path，支持点分路径）
         if self.check(&Token::Package) {
@@ -239,6 +243,19 @@ impl Parser {
                         => classes.push(self.parse_class_with_visibility(visibility)?),
                     Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
                     Some(Token::Extend) => extends.push(self.parse_extend()?),
+                    // P2.2: type Name = Type
+                    Some(Token::TypeAlias) => {
+                        self.advance();
+                        let alias_name = match self.advance() {
+                            Some(Token::Ident(n)) => n,
+                            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类型别名名称".to_string())),
+                            None => return self.bail(ParseError::UnexpectedEof),
+                        };
+                        self.expect(Token::Assign)?;
+                        let target_ty = self.parse_type()?;
+                        self.type_aliases.insert(alias_name.clone(), target_ty.clone());
+                        type_aliases.push((alias_name, target_ty));
+                    }
                     Some(Token::Func) => functions.push(self.parse_function_with_visibility(visibility)?),
                     // cjc: main() 无需 func 关键字 (main 是保留字)
                     Some(Token::Main) => {
@@ -264,6 +281,7 @@ impl Parser {
             enums,
             functions,
             extends,
+            type_aliases,
         })
     }
 
@@ -591,7 +609,7 @@ impl Parser {
                         name: "this".to_string(),
                         ty: Type::Struct(name.clone(), type_params.iter().map(|t| Type::TypeParam(t.clone())).collect()),
                         default: None,
-                        variadic: false,
+                        variadic: false, is_named: false,
                     });
                 }
                 methods.push(func);
@@ -675,7 +693,7 @@ impl Parser {
                         name: "this".to_string(),
                         ty: Type::Struct(name.clone(), type_params.iter().map(|t| Type::TypeParam(t.clone())).collect()),
                         default: None,
-                        variadic: false,
+                        variadic: false, is_named: false,
                     });
                 }
                 self.pending_struct_methods.push(func);
@@ -994,7 +1012,7 @@ impl Parser {
                                         name: "this".to_string(),
                                         ty: Type::Struct(name.clone(), vec![]),
                                         default: None,
-                                        variadic: false,
+                                        variadic: false, is_named: false,
                                     }],
                                     return_type: Some(prop_ty.clone()),
                                     throws: None,
@@ -1029,13 +1047,13 @@ impl Parser {
                                             name: "this".to_string(),
                                             ty: Type::Struct(name.clone(), vec![]),
                                             default: None,
-                                            variadic: false,
+                                            variadic: false, is_named: false,
                                         },
                                         Param {
                                             name: val_name,
                                             ty: prop_ty.clone(),
                                             default: None,
-                                            variadic: false,
+                                            variadic: false, is_named: false,
                                         },
                                     ],
                                     return_type: None,
@@ -1059,7 +1077,9 @@ impl Parser {
                 if self.check(&Token::Open) {
                     self.advance(); // 消费 open，cjwasm 不区分 open/非 open
                 }
-                if self.check(&Token::Static) {
+                // P2.4: 记录 static 修饰符
+                let is_static = self.check(&Token::Static);
+                if is_static {
                     self.advance(); // 消费 static
                 }
                 let override_ = self.check(&Token::Override);
@@ -1082,14 +1102,14 @@ impl Parser {
                 self.expect(Token::LParen)?;
                 let mut params = self.parse_params()?;
                 self.expect(Token::RParen)?;
-                // cjc 兼容: 无 self/this 时添加隐式 this 参数
+                // cjc 兼容: 无 self/this 时添加隐式 this 参数（P2.4: static 方法除外）
                 let has_self = params.iter().any(|p| p.name == "self" || p.name == "this");
-                if !has_self {
+                if !has_self && !is_static {
                     params.insert(0, crate::ast::Param {
                         name: "this".to_string(),
                         ty: Type::Struct(name.clone(), type_params.iter().map(|t| Type::TypeParam(t.clone())).collect()),
                         default: None,
-                        variadic: false,
+                        variadic: false, is_named: false,
                     });
                 }
                 self.receiver_name = Some(params.first().map(|p| p.name.clone()).unwrap_or_else(|| "this".to_string()));
@@ -1099,9 +1119,19 @@ impl Parser {
                 } else {
                     None
                 };
-                self.expect(Token::LBrace)?;
-                let body = self.parse_stmts()?;
-                self.expect(Token::RBrace)?;
+                // P2.5: 支持抽象方法（无 body，以 ; 结尾）
+                let body = if self.check(&Token::Semicolon) || self.check(&Token::RBrace) {
+                    // 抽象方法或声明：无函数体
+                    if self.check(&Token::Semicolon) {
+                        self.advance();
+                    }
+                    vec![] // 空 body
+                } else {
+                    self.expect(Token::LBrace)?;
+                    let stmts = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    stmts
+                };
                 self.receiver_name = None;
                 self.current_type_params = prev_params;
                 methods.push(crate::ast::ClassMethod {
@@ -1277,6 +1307,13 @@ impl Parser {
                 Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string())),
                 None => return self.bail(ParseError::UnexpectedEof),
             };
+            // P2.9: 命名参数 name!: Type = default
+            let is_named = if self.check(&Token::Bang) {
+                self.advance();
+                true
+            } else {
+                false
+            };
             self.expect(Token::Colon)?;
             let ty = self.parse_type()?;
             // 检查是否为可变参数 (Type...)
@@ -1292,7 +1329,7 @@ impl Parser {
             } else {
                 None
             };
-            params.push(Param { name, ty, default, variadic });
+            params.push(Param { name, ty, default, variadic, is_named });
 
             if !self.check(&Token::Comma) {
                 break;
@@ -1303,10 +1340,16 @@ impl Parser {
         Ok(params)
     }
 
-    /// 解析类型（含 T? 和 T! 后缀）
+    /// 解析类型（含 ?T 前缀和 T? 后缀 → Option<T>）
     fn parse_type(&mut self) -> Result<Type, ParseErrorAt> {
+        // P2.1: ?T 前缀语法 → Option<T>
+        if self.check(&Token::Question) {
+            self.advance();
+            let inner = self.parse_base_type()?;
+            return Ok(Type::Option(Box::new(inner)));
+        }
         let mut ty = self.parse_base_type()?;
-        // T? 是 Option<T> 的语法糖
+        // T? 后缀也是 Option<T> 的语法糖
         while self.check(&Token::Question) {
             self.advance();
             ty = Type::Option(Box::new(ty));
@@ -1336,6 +1379,24 @@ impl Parser {
             Some(Token::TypeFloat64) => Ok(Type::Float64),
             Some(Token::TypeRune) => Ok(Type::Rune),
             Some(Token::TypeBool) => Ok(Type::Bool),
+            // P2.3: (T1, T2, ...) -> R 函数类型
+            Some(Token::LParen) => {
+                let mut param_types = Vec::new();
+                if !self.check(&Token::RParen) {
+                    param_types.push(self.parse_type()?);
+                    while self.check(&Token::Comma) {
+                        self.advance();
+                        param_types.push(self.parse_type()?);
+                    }
+                }
+                self.expect(Token::RParen)?;
+                self.expect(Token::Arrow)?;
+                let ret = self.parse_type()?;
+                Ok(Type::Function {
+                    params: param_types,
+                    ret: Box::new(Some(ret)),
+                })
+            }
             Some(Token::TypeNothing) => Ok(Type::Nothing),
             Some(Token::TypeUnit) => Ok(Type::Unit),
             Some(Token::TypeString) => Ok(Type::String),
@@ -1415,6 +1476,9 @@ impl Parser {
                     Ok(Type::Struct(name, type_args))
                 } else if self.current_type_params.contains(&name) {
                     Ok(Type::TypeParam(name))
+                } else if let Some(alias_ty) = self.type_aliases.get(&name).cloned() {
+                    // P2.2: 类型别名展开
+                    Ok(alias_ty)
                 } else {
                     Ok(Type::Struct(name, vec![]))
                 }
@@ -1470,6 +1534,19 @@ impl Parser {
         match self.peek() {
             Some(Token::Let) => {
                 self.advance();
+                // P1.3: 支持 let _ = expr 通配符赋值
+                if self.check(&Token::Underscore) {
+                    self.advance();
+                    let ty = if self.check(&Token::Colon) {
+                        self.advance();
+                        Some(self.parse_type()?)
+                    } else {
+                        None
+                    };
+                    self.expect(Token::Assign)?;
+                    let value = self.parse_expr()?;
+                    return Ok(Stmt::Let { pattern: Pattern::Wildcard, ty, value });
+                }
                 let first = match self.advance() {
                     Some(Token::Ident(name)) => name,
                     Some(tok) => {
@@ -2015,12 +2092,13 @@ impl Parser {
                     if self.check(&Token::LParen) {
                         // 方法调用 obj.method(args)
                         self.advance();
-                        let args = self.parse_args()?;
+                        let (args, named_args) = self.parse_args()?;
                         self.expect(Token::RParen)?;
                         expr = Expr::MethodCall {
                             object: Box::new(expr),
                             method: name,
                             args,
+                            named_args,
                         };
                     } else {
                         // 字段访问 obj.field
@@ -2059,10 +2137,18 @@ impl Parser {
                     let inclusive = self.check(&Token::DotDotEq);
                     self.advance();
                     let end = self.parse_primary()?;
+                    // P2.6: 可选步长 `: step`
+                    let step = if self.check(&Token::Colon) {
+                        self.advance();
+                        Some(Box::new(self.parse_primary()?))
+                    } else {
+                        None
+                    };
                     return Ok(Expr::Range {
                         start: Box::new(Expr::Integer(n)),
                         end: Box::new(end),
                         inclusive,
+                        step,
                     });
                 }
                 Ok(Expr::Integer(n))
@@ -2079,11 +2165,12 @@ impl Parser {
             Some(Token::Super) => {
                 if self.check(&Token::LParen) {
                     self.advance();
-                    let args = self.parse_args()?;
+                    let (args, named_args) = self.parse_args()?;
                     self.expect(Token::RParen)?;
                     Ok(Expr::SuperCall {
                         method: "init".to_string(),
                         args,
+                        named_args,
                     })
                 } else if self.check(&Token::Dot) {
                     self.advance();
@@ -2093,9 +2180,9 @@ impl Parser {
                         None => return self.bail(ParseError::UnexpectedEof),
                     };
                     self.expect(Token::LParen)?;
-                    let args = self.parse_args()?;
+                    let (args, named_args) = self.parse_args()?;
                     self.expect(Token::RParen)?;
-                    Ok(Expr::SuperCall { method, args })
+                    Ok(Expr::SuperCall { method, args, named_args })
                 } else {
                     self.bail(ParseError::UnexpectedToken(
                         self.peek().cloned().unwrap_or(Token::Dot),
@@ -2150,7 +2237,7 @@ impl Parser {
                         Token::TypeBool => "Bool",
                         _ => unreachable!(),
                     };
-                    Ok(Expr::Call { name: name.to_string(), type_args: None, args: vec![arg] })
+                    Ok(Expr::Call { name: name.to_string(), type_args: None, args: vec![arg], named_args: vec![] })
                 } else {
                     self.bail(ParseError::UnexpectedToken(tok, "类型转换需要 T(expr) 形式".to_string()))
                 }
@@ -2237,13 +2324,13 @@ impl Parser {
                 match self.peek() {
                     Some(Token::LParen) => {
                         self.advance();
-                        let args = self.parse_args()?;
+                        let (args, named_args) = self.parse_args()?;
                         self.expect(Token::RParen)?;
                         // 首字母大写视为构造函数调用，否则为普通函数调用
                         if looks_like_type {
-                            Ok(Expr::ConstructorCall { name, type_args, args })
+                            Ok(Expr::ConstructorCall { name, type_args, args, named_args })
                         } else {
-                            Ok(Expr::Call { name, type_args, args })
+                            Ok(Expr::Call { name, type_args, args, named_args })
                         }
                     }
                     Some(Token::LBrace) if looks_like_type => {
@@ -2331,6 +2418,30 @@ impl Parser {
                 };
                 Ok(Expr::Block(stmts, result))
             }
+            // P2.7: Array<T>(size, init) 动态数组构造
+            Some(Token::TypeArray) => {
+                self.expect(Token::Lt)?;
+                let elem_type = self.parse_type()?;
+                self.expect(Token::Gt)?;
+                self.expect(Token::LParen)?;
+                let mut args = Vec::new();
+                if !self.check(&Token::RParen) {
+                    loop {
+                        args.push(self.parse_expr()?);
+                        if !self.check(&Token::Comma) {
+                            break;
+                        }
+                        self.advance();
+                    }
+                }
+                self.expect(Token::RParen)?;
+                Ok(Expr::ConstructorCall {
+                    name: "Array".to_string(),
+                    type_args: Some(vec![elem_type]),
+                    args,
+                    named_args: vec![],
+                })
+            }
             Some(Token::LBracket) => {
                 // 数组字面量 [1, 2, 3]
                 let mut elements = Vec::new();
@@ -2373,18 +2484,24 @@ impl Parser {
                     self.expect(Token::RBrace)?;
                     let else_branch = if self.check(&Token::Else) {
                         self.advance();
-                        self.expect(Token::LBrace)?;
-                        let else_stmts = self.parse_stmts()?;
-                        let else_expr = if else_stmts.is_empty() {
-                            None
+                        // P1.1: 支持 else if 链式语法
+                        if self.check(&Token::If) {
+                            let else_if_expr = self.parse_expr()?;
+                            Some(Box::new(else_if_expr))
                         } else {
-                            match else_stmts.last() {
-                                Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
-                                _ => None,
-                            }
-                        };
-                        self.expect(Token::RBrace)?;
-                        else_expr
+                            self.expect(Token::LBrace)?;
+                            let else_stmts = self.parse_stmts()?;
+                            let else_expr = if else_stmts.is_empty() {
+                                None
+                            } else {
+                                match else_stmts.last() {
+                                    Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
+                                    _ => None,
+                                }
+                            };
+                            self.expect(Token::RBrace)?;
+                            else_expr
+                        }
                     } else {
                         None
                     };
@@ -2416,18 +2533,24 @@ impl Parser {
                     self.expect(Token::RBrace)?;
                     let else_branch = if self.check(&Token::Else) {
                         self.advance();
-                        self.expect(Token::LBrace)?;
-                        let else_stmts = self.parse_stmts()?;
-                        let else_expr = if else_stmts.is_empty() {
-                            None
+                        // P1.1: 支持 else if 链式语法
+                        if self.check(&Token::If) {
+                            let else_if_expr = self.parse_expr()?;
+                            Some(Box::new(else_if_expr))
                         } else {
-                            match else_stmts.last() {
-                                Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
-                                _ => None,
-                            }
-                        };
-                        self.expect(Token::RBrace)?;
-                        else_expr
+                            self.expect(Token::LBrace)?;
+                            let else_stmts = self.parse_stmts()?;
+                            let else_expr = if else_stmts.is_empty() {
+                                None
+                            } else {
+                                match else_stmts.last() {
+                                    Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
+                                    _ => None,
+                                }
+                            };
+                            self.expect(Token::RBrace)?;
+                            else_expr
+                        }
                     } else {
                         None
                     };
@@ -2447,11 +2570,18 @@ impl Parser {
 
                     let else_branch = if self.check(&Token::Else) {
                         self.advance();
-                        self.expect(Token::LBrace)?;
-                        let else_stmts = self.parse_stmts()?;
-                        let else_expr = Self::stmts_to_block_expr(else_stmts);
-                        self.expect(Token::RBrace)?;
-                        Some(else_expr)
+                        // P1.1: 支持 else if 链式语法
+                        if self.check(&Token::If) {
+                            // else if → 递归解析 if 表达式作为 else 分支
+                            let else_if_expr = self.parse_expr()?;
+                            Some(Box::new(else_if_expr))
+                        } else {
+                            self.expect(Token::LBrace)?;
+                            let else_stmts = self.parse_stmts()?;
+                            let else_expr = Self::stmts_to_block_expr(else_stmts);
+                            self.expect(Token::RBrace)?;
+                            Some(else_expr)
+                        }
                     } else {
                         None
                     };
@@ -2557,14 +2687,34 @@ impl Parser {
         })
     }
 
-    /// 解析函数调用参数
-    fn parse_args(&mut self) -> Result<Vec<Expr>, ParseErrorAt> {
+    /// 解析函数调用参数（支持位置参数和命名参数 name!: value）
+    fn parse_args(&mut self) -> Result<(Vec<Expr>, Vec<(String, Expr)>), ParseErrorAt> {
         let mut args = Vec::new();
+        let mut named_args = Vec::new();
         if self.check(&Token::RParen) {
-            return Ok(args);
+            return Ok((args, named_args));
         }
 
         loop {
+            // P2.9: 检查是否是命名参数 name!: value
+            if let Some(Token::Ident(_)) = self.peek() {
+                if matches!(self.peek_at(1), Some(Token::Bang)) && matches!(self.peek_at(2), Some(Token::Colon)) {
+                    // 命名参数
+                    let name = match self.advance() {
+                        Some(Token::Ident(n)) => n,
+                        _ => unreachable!(),
+                    };
+                    self.advance(); // skip !
+                    self.advance(); // skip :
+                    let value = self.parse_expr()?;
+                    named_args.push((name, value));
+                    if !self.check(&Token::Comma) {
+                        break;
+                    }
+                    self.advance();
+                    continue;
+                }
+            }
             args.push(self.parse_expr()?);
             if !self.check(&Token::Comma) {
                 break;
@@ -2572,7 +2722,7 @@ impl Parser {
             self.advance();
         }
 
-        Ok(args)
+        Ok((args, named_args))
     }
 
     /// 解析 match 的主题表达式 (不包括结构体初始化)
@@ -2595,9 +2745,9 @@ impl Parser {
                 if self.check(&Token::LParen) {
                     // 函数调用
                     self.advance();
-                    let args = self.parse_args()?;
+                    let (args, named_args) = self.parse_args()?;
                     self.expect(Token::RParen)?;
-                    Expr::Call { name, type_args: None, args }
+                    Expr::Call { name, type_args: None, args, named_args }
                 } else {
                     Expr::Var(name)
                 }
@@ -2658,10 +2808,18 @@ impl Parser {
                         Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "范围终点".to_string())),
                         None => return self.bail(ParseError::UnexpectedEof),
                     };
+                    // P2.6: 可选步长 `: step`
+                    let step = if self.check(&Token::Colon) {
+                        self.advance();
+                        Some(Box::new(self.parse_primary()?))
+                    } else {
+                        None
+                    };
                     Ok(Expr::Range {
                         start: Box::new(Expr::Integer(n)),
                         end: Box::new(end),
                         inclusive,
+                        step,
                     })
                 } else {
                     Ok(Expr::Integer(n))
@@ -2671,9 +2829,9 @@ impl Parser {
                 if self.check(&Token::LParen) {
                     // 函数调用
                     self.advance();
-                    let args = self.parse_args()?;
+                    let (args, named_args) = self.parse_args()?;
                     self.expect(Token::RParen)?;
-                    Ok(Expr::Call { name, type_args: None, args })
+                    Ok(Expr::Call { name, type_args: None, args, named_args })
                 } else if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                     // 变量开头的范围 (如 start..end)
                     let inclusive = self.check(&Token::DotDotEq);
@@ -2684,10 +2842,18 @@ impl Parser {
                         Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "范围终点".to_string())),
                         None => return self.bail(ParseError::UnexpectedEof),
                     };
+                    // P2.6: 可选步长 `: step`
+                    let step = if self.check(&Token::Colon) {
+                        self.advance();
+                        Some(Box::new(self.parse_primary()?))
+                    } else {
+                        None
+                    };
                     Ok(Expr::Range {
                         start: Box::new(Expr::Var(name)),
                         end: Box::new(end),
                         inclusive,
+                        step,
                     })
                 } else {
                     // 普通变量
