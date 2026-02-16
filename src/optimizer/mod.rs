@@ -314,6 +314,7 @@ fn fold_expr(expr: Expr) -> Expr {
         Try(inner) => Try(Box::new(fold_expr(*inner))),
         Throw(inner) => Throw(Box::new(fold_expr(*inner))),
         TryBlock {
+            resources,
             body,
             catch_var,
             catch_body,
@@ -343,6 +344,7 @@ fn fold_expr(expr: Expr) -> Expr {
                     .collect()
             });
             TryBlock {
+                resources,
                 body,
                 catch_var,
                 catch_body,
@@ -410,7 +412,7 @@ fn fold_binary_int(a: i64, b: i64, op: &BinOp) -> Option<Expr> {
         BitXor => Integer(a ^ b),
         Shl => Integer(a.shl(b as u32)),
         Shr => Integer(a.shr(b as u32)),
-        LogicalAnd | LogicalOr | Pow => return None,
+        LogicalAnd | LogicalOr | Pow | NotIn => return None,
     };
     Some(out)
 }
@@ -429,7 +431,7 @@ fn fold_binary_float(x: f64, y: f64, op: &BinOp) -> Option<Expr> {
         Gt => Bool(x > y),
         LtEq => Bool(x <= y),
         GtEq => Bool(x >= y),
-        Mod | BitAnd | BitOr | BitXor | Shl | Shr | LogicalAnd | LogicalOr | Pow => return None,
+        Mod | BitAnd | BitOr | BitXor | Shl | Shr | LogicalAnd | LogicalOr | Pow | NotIn => return None,
     };
     Some(out)
 }
@@ -667,6 +669,7 @@ mod tests {
     fn fold_try_block_recursive() {
         use crate::ast::Stmt;
         let e = Expr::TryBlock {
+            resources: vec![],
             body: vec![Stmt::Expr(Expr::Binary {
                 op: BinOp::Add,
                 left: Box::new(Expr::Integer(1)),

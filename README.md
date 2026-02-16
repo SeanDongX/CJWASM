@@ -253,17 +253,17 @@ cjwasm/
 
 | 分类 | 特性 | 状态 |
 |------|------|------|
-| **基础类型** | Int8~64, UInt8~64, Float16/32/64, Bool, Rune, String | ✅ |
+| **基础类型** | Int8~64, UInt8~64, Float16/32/64, Bool, Rune, String, const 常量 | ✅ |
 | **复合类型** | Array, Tuple, Option, Result, Struct, Enum, Class, Range, Slice, Map | ✅ |
-| **函数** | 函数定义, 递归, 默认参数, 可变参数, 命名参数(name!:), Lambda, 函数类型 | ✅ |
+| **函数** | 函数定义, 递归, 默认参数, 可变参数, 命名参数(name!:), Lambda, 尾随闭包, inout 参数, 函数类型 | ✅ |
 | **泛型** | 泛型函数/结构体/类/枚举, 类型约束, 多重约束, where 子句, 泛型特化 | ✅ |
-| **OOP** | 类, 继承(open/<:), abstract/sealed, 接口, 默认实现, 属性(prop), operator func, extend, static init | ✅ |
-| **控制流** | if/else, while, for-in（含步长）, loop, break/continue, match, while-let, spawn, synchronized | ✅ |
+| **OOP** | 类, 继承(open/<:), abstract/sealed, 主构造函数, 接口, 默认实现, 属性(prop), operator func, extend, static init | ✅ |
+| **控制流** | if/else, while, do-while, for-in（含步长）, loop, break/continue, match, while-let, spawn, synchronized | ✅ |
 | **模式匹配** | 枚举解构, 结构体解构, if-let, while-let, guard(where), 嵌套解构, match type pattern, is 表达式 | ✅ |
-| **错误处理** | try-catch-finally, throws, Result/Option, ? 运算符, 空值合并 ?? | ✅ |
+| **错误处理** | try-catch-finally, try-with-resources, throws, Result/Option, ? 运算符, 空值合并 ?? | ✅ |
 | **模块** | import, 多文件编译, 可见性修饰符(public/internal/private) | ✅ |
 | **内存** | 堆分配, 引用计数, Mark-Sweep GC, Free List 分配器 | ✅ |
-| **运算符** | 算术, 比较, 逻辑, 位运算, 幂运算(**), 字符串插值, 类型转换(as), 方法重载 | ✅ |
+| **运算符** | 算术, 比较, 逻辑, 位运算, 幂运算(**), !in, 字符串插值, 类型转换(as), 可选链(?.), 方法重载 | ✅ |
 | **集合** | HashMap(put/get/remove/containsKey/size), HashSet(add/contains/size), ArrayList, LinkedList, ArrayStack | ✅ |
 | **并发桩** | spawn(同步执行), synchronized(直通), AtomicInt64/AtomicBool, Mutex/ReentrantMutex | ✅ |
 | **标准库** | 数学函数(sin/cos/exp/log/...), 字符串操作(trim/startsWith/endsWith/contains/indexOf/replace), 数组方法(clone/isEmpty/slice), now() 时间戳 | ✅ |

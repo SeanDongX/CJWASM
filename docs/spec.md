@@ -2,6 +2,149 @@
 
 仓颉语言到 WebAssembly 编译器的完整功能规格。
 
+## CJWasm vs cjc release/1.0 特性对比
+
+> 对比基准：cjc release/1.0 分支 (gitcode.com/Cangjie/cangjie_compiler, commit 2025-06)
+>
+> 数据来源：逐项检索 cjc 编译器 AST/Parser/Sema/CHIR/Stdlib.inc 源码验证
+
+**图例**：✅ 完整支持 · ⚠️ 部分支持/桩实现 · ❌ 不支持 · — 不适用
+
+**统计**（去重后 120 项独立特性）：
+
+| | ✅ 完整 | ⚠️ 部分 | ❌ 不支持 | — 不适用 |
+|------|:------:|:------:|:--------:|:-------:|
+| cjc | 111 | 3 | 3 | 3 |
+| cjwasm | 88 | 6 | 26 | — |
+
+**cjwasm 对 cjc 覆盖率**：cjc 共 114 项特性（✅+⚠️），cjwasm 覆盖 **88 项（77.2%）**，其中完整覆盖 82 项、部分/桩覆盖 6 项、未覆盖 26 项（主要为 WASM 沙箱限制或宏/FFI/反射等重量级特性）。
+
+
+| 分类 | 特性 | cjc | cjwasm | 备注 |
+|------|------|:---:|:------:|------|
+| **类型系统** | Int8/16/32/64, UInt8/16/32/64 | ✅ | ✅ | TypeKind.inc 定义 |
+| | Float16/32/64 | ✅ | ✅ | |
+| | Bool, Rune, Unit, Nothing | ✅ | ✅ | |
+| | IntNative, UIntNative | ✅ | ✅ | cjwasm 映射为 i64 |
+| | String | ✅ | ✅ | cjc: std.core.String |
+| | Array\<T\> | ✅ | ✅ | cjc: GetCoreDecl("Array") |
+| | Slice\<T\> | ✅ | ✅ | cjc: MangleArraySliceType |
+| | Tuple | ✅ | ✅ | cjc: TupleTy |
+| | Option\<T\> | ✅ | ✅ | cjc: IsCoreOptionType() |
+| | Result\<T,E\> | ❌ | ✅ | cjc 编译器无 Result 内建类型 |
+| | Map\<K,V\> | ✅ | ✅ | cjc: std.collection.HashMap |
+| | Struct, Enum, Class, Interface | ✅ | ✅ | |
+| | VArray\<T,N\> | ✅ | ⚠️ | cjwasm 仅类型声明，可用 Array 替代 |
+| | Function 类型 `(T)->R` | ✅ | ✅ | cjc: FuncTy |
+| | This 类型 | ✅ | ✅ | cjc: ClassThisTy |
+| | 类型修饰符 (mut/ref/?/!) | ✅ | ✅ | |
+| **字面量** | 整数/浮点/布尔/字符/字符串 | ✅ | ✅ | |
+| | 字符串插值 `${}` / `#{}` | ✅ | ✅ | |
+| | 数组字面量 `[1,2,3]` | ✅ | ✅ | |
+| | 元组字面量 `(a, b)` | ✅ | ✅ | |
+| | Map 字面量 | ✅ | ✅ | |
+| | Range 字面量 `a..b` / `a..=b` | ✅ | ✅ | |
+| | JString 字面量 | ✅ | ❌ | cjc: LitConstKind::JSTRING |
+| **变量与常量** | let / var | ✅ | ✅ | |
+| | const 编译期常量 | ✅ | ✅ | cjc: isConst, TokenKind::CONST |
+| **运算符** | 算术 (+, -, *, /, %, **) | ✅ | ✅ | |
+| | 比较 (==, !=, <, >, <=, >=) | ✅ | ✅ | |
+| | 逻辑 (&&, \|\|, !) | ✅ | ✅ | |
+| | 位运算 (&, \|, ^, ~, <<, >>) | ✅ | ✅ | |
+| | 赋值运算 (=, +=, -=, ...) | ✅ | ✅ | |
+| | 类型转换 (as) / 类型检查 (is) | ✅ | ✅ | |
+| | 空值合并 (??) | ✅ | ✅ | |
+| | 可选链 (?.) | ✅ | ✅ | cjc: OptionalChainExpr |
+| | 管道 (\|>) / 组合 (~>) | ✅ | ✅ | cjc: PIPELINE / COMPOSITION tokens |
+| | in / !in | ✅ | ✅ | cjc: TokenKind::NOT_IN |
+| | 溢出策略 (@OverflowWrapping 等) | ✅ | ❌ | cjc: CJNativeGenOverflow.cpp |
+| **控制流** | if / else | ✅ | ✅ | |
+| | while | ✅ | ✅ | |
+| | do-while | ✅ | ✅ | cjc: DoWhileExpr |
+| | for-in (含步长/守卫) | ✅ | ✅ | cjc: ForInExpr.patternGuard |
+| | loop | ✅ | ✅ | |
+| | break / continue | ✅ | ✅ | |
+| | match 表达式 | ✅ | ✅ | |
+| | while-let / if-let | ✅ | ✅ | |
+| **函数** | 函数定义 / 递归 | ✅ | ✅ | |
+| | 默认参数 | ✅ | ✅ | |
+| | 可变参数 | ✅ | ✅ | |
+| | 命名参数 (name!:) | ✅ | ✅ | |
+| | Lambda 表达式 | ✅ | ✅ | |
+| | 尾随闭包 | ✅ | ✅ | cjc: TrailingClosureExpr |
+| | inout 参数（传引用） | ✅ | ✅ | cjc: FuncArg.withInout |
+| | operator func | ✅ | ✅ | cjc: Attribute::OPERATOR |
+| **面向对象** | 类与继承 (open / <:) | ✅ | ✅ | |
+| | abstract / sealed 类 | ✅ | ✅ | cjc: Attribute::SEALED/ABSTRACT |
+| | 主构造函数 `class Foo(var x: T)` | ✅ | ✅ | cjc: PrimaryCtorDecl |
+| | 接口与默认实现 | ✅ | ✅ | |
+| | 属性 (prop get/set) | ✅ | ✅ | |
+| | extend 扩展 | ✅ | ✅ | cjc: ExtendDecl |
+| | static init | ✅ | ✅ | |
+| | init / deinit | ✅ | ✅ | |
+| **泛型** | 泛型函数/类/结构体/枚举 | ✅ | ✅ | cjwasm 通过单态化实现 |
+| | 类型约束 / 多重约束 | ✅ | ✅ | |
+| | where 子句 | ✅ | ✅ | |
+| | 泛型特化 | ⚠️ | ✅ | cjc 仅 extend 特化，无用户级泛型特化语法 |
+| **模式匹配** | 枚举/结构体解构 | ✅ | ✅ | |
+| | if-let / while-let | ✅ | ✅ | |
+| | guard (where) | ✅ | ✅ | |
+| | 嵌套解构 | ✅ | ✅ | |
+| | match type pattern / is | ✅ | ✅ | cjc: TypePattern |
+| **错误处理** | try-catch-finally | ✅ | ✅ | |
+| | try-with-resources | ✅ | ✅ | cjc: DesugarTryWithResourcesExpr |
+| | throws 声明 | ✅ | ✅ | |
+| | ? 运算符 | ✅ | ✅ | |
+| **模块系统** | import / package | ✅ | ✅ | |
+| | 可见性 (public/internal/private/protected) | ✅ | ✅ | |
+| | 多文件编译 | ✅ | ✅ | |
+| **并发** | 原生多线程 / 协程 | ✅ | ❌ | cjc: SpawnExpr + ThreadContext; WASM 单线程 |
+| | spawn (语法支持) | ✅ | ⚠️ | cjwasm 同步执行桩 |
+| | synchronized (语法支持) | ✅ | ⚠️ | cjc: SynchronizedExpr; cjwasm 直通桩 |
+| | Atomic (Int64/Bool) | ✅ | ⚠️ | cjc: 运行时原子指令; cjwasm 非原子实现 |
+| | Mutex / ReentrantMutex | ✅ | ⚠️ | cjc: std.sync + MutexLock; cjwasm 空操作桩 |
+| **集合框架** | HashMap / HashSet | ✅ | ✅ | cjc: std.collection |
+| | ArrayList | ✅ | ✅ | cjc: std.collection |
+| | LinkedList | ⚠️ | ✅ | cjc 编译器源码未见 LinkedList 引用 |
+| | ArrayStack | ❌ | ✅ | cjc 无此类型，cjwasm 自实现 |
+| **标准库** | 数学函数 (sin/cos/exp/log/...) | ✅ | ✅ | cjc: std.math |
+| | 字符串操作 (trim/split/replace/...) | ✅ | ✅ | cjc: std.core.String |
+| | 排序 (sort) | ✅ | ✅ | cjc: std.sort |
+| | 时间 (DateTime/now) | ✅ | ✅ | cjc: std.time; cjwasm: WASI clock |
+| | 随机数 | ✅ | ✅ | cjc: std.random; cjwasm: WASI random |
+| | 文件系统 (std.fs) | ✅ | ❌ | WASM 沙箱限制 |
+| | 正则表达式 (std.regex) | ✅ | ❌ | cjc 有 std.regex 模块 |
+| | 加密 (std.crypto) | ✅ | ❌ | cjc 有 std.crypto 模块 |
+| | 数据库 (std.database.sql) | ✅ | ❌ | cjc 有 std.database 模块 |
+| | 网络 (std.net, TCP/TLS) | ✅ | ❌ | cjc: std.net; WASM 沙箱限制 |
+| | 进程管理 (std.process) | ✅ | ❌ | cjc: std.process; WASM 沙箱限制 |
+| | 环境变量 (std.env) | ✅ | ❌ | cjc: std.env; WASM 沙箱限制 |
+| | 控制台 (std.console) | ✅ | ⚠️ | cjwasm 通过 WASI println 实现 |
+| **测试** | @Assert / @Expect | ✅ | ✅ | cjc: 基于 unittest.testmacro 宏; cjwasm: 内建 |
+| | Mock 包 | ✅ | ❌ | cjc: std.unittest.mock + MockManager |
+| **内存管理** | GC (标记-清除) | ✅ | ✅ | cjc: LLVM GC statepoints; cjwasm: 自实现 mark-sweep |
+| | 引用计数 | ❌ | ✅ | cjc 纯 GC，无引用计数; cjwasm 自实现 RC |
+| | 堆分配 (Free List) | — | ✅ | cjwasm WASM 线性内存自管理 |
+| **WASM/WASI** | WASI (fd_write/clock/random/...) | — | ✅ | cjwasm 特有 |
+| | extern func + @import/@export | — | ✅ | cjwasm 特有 |
+| **宏系统** | macro func / quote(...) | ✅ | ❌ | cjc: MacroDecl + MacroExpansion |
+| | 条件编译 (@When) | ✅ | ❌ | cjc: AnnotationKind::WHEN |
+| **注解** | @Deprecated | ✅ | ❌ | cjc: Attribute::DEPRECATED |
+| | @Frozen | ✅ | ❌ | cjc: AnnotationKind::FROZEN |
+| | 自定义注解 (@Annotation) | ✅ | ❌ | cjc: AnnotationKind::ANNOTATION |
+| **C 互操作** | foreign 声明 / CFunc | ✅ | ❌ | cjc: TokenKind::FOREIGN + CFFICheck |
+| | CPointer / CString | ✅ | ❌ | cjc: CStringTy; WASM 沙箱无法链接 C 库 |
+| | unsafe 块 | ✅ | ❌ | cjc: Block.unsafePos; WASM 沙箱天然安全 |
+| **Python 互操作** | std.ffi.python | ✅ | ❌ | cjc 特有 |
+| **反射** | std.reflect / TypeInfo | ✅ | ❌ | cjc: std.reflect 模块 + 反射 intrinsics |
+| **自动派生** | std.deriving | ✅ | ❌ | cjc: 仅 cjnative 后端 |
+| **编译器特性** | 增量编译 | ✅ | ❌ | 编译器架构限制 |
+| | redef 修饰符 | ✅ | ❌ | cjc: TokenKind::REDEF |
+| | @IfAvailable 表达式 | ✅ | ❌ | cjc: IfAvailableExpr |
+| | 自动微分 (Autodiff) | ⚠️ | ❌ | cjc: 仅 schema 定义，sema/codegen 未完整实现 |
+
+---
+
 ## 目录
 
 1. [类型系统](#1-类型系统)
@@ -167,6 +310,7 @@ let map = {"a": 1, "b": 2}    // Map (语法糖)
 | `>` | 大于 | [x] |
 | `<=` | 小于等于 | [x] |
 | `>=` | 大于等于 | [x] |
+| `!in` | 不包含 | [x] |
 
 ### 3.3 逻辑运算
 
@@ -263,6 +407,7 @@ synchronized(lock) {
 | 类型检查 (is) | [x] |
 | spawn 块（单线程桩） | [x] |
 | synchronized 块（单线程桩） | [x] |
+| 可选链 (obj?.field) | [ ] |
 | 三元运算符 | [ ] |
 
 ---
@@ -281,6 +426,7 @@ let z: Int64 = 30       // 显式类型注解
 |------|------|
 | let 声明 | [x] |
 | var 声明 | [x] |
+| const 声明（编译期常量） | [x] |
 | 类型注解 | [x] |
 | 解构绑定 | [x] |
 
@@ -310,6 +456,11 @@ for item in collection {
     // ...
 }
 
+// do-while 循环
+do {
+    // ...
+} while (condition)
+
 // loop 无限循环
 loop {
     if done { break }
@@ -327,8 +478,10 @@ match value {
 |------|------|
 | if-else | [x] |
 | while | [x] |
+| do-while | [x] |
 | for-in（范围 0..n / 0..=n / 0..=n : step） | [x] |
 | for-in（数组迭代） | [x] |
+| for-in 守卫 (for p in collection if cond) | [ ] |
 | loop | [x] |
 | match | [x] |
 | break | [x] |
@@ -387,6 +540,8 @@ let triple = { x: Int64 => x * 3 }
 | 泛型函数 | [x] |
 | Lambda | [x] |
 | 闭包 | [x] |
+| 尾随闭包 (trailing closure) | [x] |
+| inout 参数（传引用） | [x] |
 | 递归 | [x] |
 | 尾递归优化 | [x] |
 
@@ -502,6 +657,7 @@ class Student <: Person {
 | 静态初始化块 (static init()) | [x] |
 | extend 内建类型 | [x] |
 | 方法重载（同名不同参数，名字修饰） | [x] |
+| 主构造函数 (primary constructor) | [x] |
 
 ### 6.3 运算符重载
 
@@ -859,6 +1015,7 @@ func process(): Result<Int64, String> {
 | try-catch | [x] |
 | throw | [x] |
 | finally | [x] |
+| try-with-resources | [x] |
 | Result 类型 | [x] |
 | ? 操作符 | [x] |
 | Error 基类 (<:) | [x] |
@@ -1354,10 +1511,48 @@ while     with
 | 条件分支 | if / else / end |
 | 循环 / break / continue | block + loop + br / br_if |
 
+### D. 与 cjc release/1.0 差异
+
+> 详细对比见文档开头 [CJWasm vs cjc release/1.0 特性对比](#cjwasm-vs-cjc-release10-特性对比)。
+> 以下为 cjc release/1.0 **有而 cjwasm 不支持**的特性摘要。
+
+| 分类 | 特性 | cjc 证据 | 不支持原因 |
+|------|------|---------|-----------|
+| 宏系统 | macro func / quote(...) | MacroDecl + MacroExpansion | 编译期代码生成，复杂度极高 |
+| 宏系统 | 条件编译 (@When) | AnnotationKind::WHEN | 需完整注解系统 |
+| C 互操作 | foreign / CPointer / CString | TokenKind::FOREIGN, CStringTy | WASM 沙箱无法链接 C 库 |
+| C 互操作 | unsafe 块 | Block.unsafePos | WASM 沙箱天然安全 |
+| 注解 | @Deprecated / @Frozen / 自定义 | Attribute::DEPRECATED 等 | 优先级低，需宏系统 |
+| 反射 | std.reflect / TypeInfo | std.reflect 模块 + intrinsics | 运行时开销大 |
+| 溢出策略 | @OverflowWrapping/Throwing/Saturating | CJNativeGenOverflow.cpp | 优先级低 |
+| 测试 | Mock 包 | MockManager + std.unittest.mock | 测试框架特性 |
+| 互操作 | JString (Java) | LitConstKind::JSTRING | Java 互操作专用 |
+| 互操作 | std.ffi.python | Stdlib.inc: FFI.PYTHON | cjc 特有 |
+| 类型 | VArray\<T,N\> 完整实现 | VArrayType + Sema + Codegen | cjwasm 仅类型声明 |
+| 标准库 | std.fs / std.regex / std.crypto | Stdlib.inc 注册 | WASM 沙箱/优先级 |
+| 标准库 | std.database.sql | Stdlib.inc 注册 | WASM 沙箱限制 |
+| 标准库 | std.net (TCP/TLS) | Stdlib.inc 注册 | WASM 沙箱限制 |
+| 标准库 | std.process / std.env | Stdlib.inc 注册 | WASM 沙箱限制 |
+| 编译器 | 增量编译 | 编译器架构 | 架构限制 |
+| 编译器 | redef 修饰符 | TokenKind::REDEF | 使用场景少 |
+| 编译器 | @IfAvailable | IfAvailableExpr | 仅鸿蒙平台 |
+| 编译器 | 自动微分 (Autodiff) | 仅 schema 定义 (⚠️) | 特殊场景，cjc 自身也未完整 |
+| 派生 | std.deriving | 仅 cjnative 后端 | cjc 特有 |
+
+**cjwasm 独有特性**（cjc 无对应功能）：
+
+| 特性 | 说明 |
+|------|------|
+| Result\<T,E\> 内建类型 | cjc 编译器无 Result 内建（仅 Option） |
+| WASI 互操作 | fd_write/fd_read/clock_time_get/random_get |
+| extern func + @import/@export | WASM 模块导入导出 |
+| 引用计数 (RC) | cjc 纯 GC，无引用计数 |
+| Free List 堆分配器 | WASM 线性内存自管理 |
+| ArrayStack\<T\> | cjwasm 自实现集合类型 |
+
 ---
 
-*文档版本: 4.0.0*
+*文档版本: 6.0.0*
 *最后更新: 2026-02-16*
-*变更: P3 面向对象 + P4 集合框架 + P5 并发桩全部完成*
-*新增章节: 6.3 运算符重载, 6.4 extend 扩展, 6.5 静态初始化块, 14.3 集合类型, 14.4 并发原语, 14.5 Range 属性*
-*新增特性: operator func, is 表达式, match type pattern, match where, 方法重载, 嵌套数组, extend, static init, HashMap/HashSet/ArrayList/LinkedList/ArrayStack, Range 属性, spawn/synchronized (桩), AtomicInt64/AtomicBool (桩), Mutex/ReentrantMutex (桩), now() 时间戳*
+*变更: 基于 cjc release/1.0 源码逐项验证，重写特性对比表*
+*修正: Result(cjc无) / 引用计数(cjc无) / ArrayStack(cjc无) / Autodiff(cjc仅schema) / 泛型特化(cjc仅extend) / 补充 std.fs/regex/crypto/database/ffi.python/deriving*

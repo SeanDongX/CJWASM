@@ -210,8 +210,11 @@ impl CodeGen {
                 Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
                     if Self::expr_contains_unhandled_throw(value) { return true; }
                 }
-                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } => {
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::DoWhile { body, .. } => {
                     if Self::contains_unhandled_throw(body) { return true; }
+                }
+                Stmt::Const { value, .. } => {
+                    if Self::expr_contains_unhandled_throw(value) { return true; }
                 }
                 _ => {}
             }
@@ -252,8 +255,13 @@ impl CodeGen {
                         return Some(inner);
                     }
                 }
-                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } => {
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::DoWhile { body, .. } => {
                     if let Some(inner) = Self::find_throw_inner_in_stmts(body) {
+                        return Some(inner);
+                    }
+                }
+                Stmt::Const { value, .. } => {
+                    if let Some(inner) = Self::find_throw_inner_in_expr(value) {
                         return Some(inner);
                     }
                 }
@@ -422,12 +430,13 @@ impl CodeGen {
                     default: None,
                 }],
                 static_init: None,
+                primary_ctor_params: vec![],
                 init: Some(InitDef {
                     params: vec![Param {
                         name: "message".to_string(),
                         ty: Type::String,
                         default: None,
-                        variadic: false, is_named: false,
+                        variadic: false, is_named: false, is_inout: false,
                     }],
                     body: vec![Stmt::Assign {
                         target: AssignTarget::Field {
@@ -1479,7 +1488,7 @@ impl CodeGen {
             Expr::Binary { op, left, right } => {
                 match op {
                     BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
-                    | BinOp::LogicalAnd | BinOp::LogicalOr => Some(Type::Bool),
+                    | BinOp::LogicalAnd | BinOp::LogicalOr | BinOp::NotIn => Some(Type::Bool),
                     _ => {
                         Self::infer_lambda_return_type(left, params)
                             .or_else(|| Self::infer_lambda_return_type(right, params))
@@ -1519,12 +1528,19 @@ impl CodeGen {
                 Self::collect_lambdas_from_expr(cond, counter, out);
                 for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
             }
+            Stmt::DoWhile { body, cond } => {
+                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+                Self::collect_lambdas_from_expr(cond, counter, out);
+            }
             Stmt::For { iterable, body, .. } => {
                 Self::collect_lambdas_from_expr(iterable, counter, out);
                 for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
             }
             Stmt::Loop { body, .. } => {
                 for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+            }
+            Stmt::Const { value, .. } => {
+                Self::collect_lambdas_from_expr(value, counter, out);
             }
             _ => {}
         }
@@ -1553,7 +1569,7 @@ impl CodeGen {
                         name: name.clone(),
                         ty: ty.clone(),
                         default: None,
-                        variadic: false, is_named: false,
+                        variadic: false, is_named: false, is_inout: false,
                     }).collect(),
                     return_type: inferred_ret,
                     throws: None,
@@ -1633,7 +1649,7 @@ impl CodeGen {
             name: "this".to_string(),
             ty: Type::Struct(class_name.clone(), vec![]),
             default: None,
-            variadic: false, is_named: false,
+            variadic: false, is_named: false, is_inout: false,
         }];
         params.extend(init_def.params.iter().cloned());
 
@@ -1664,7 +1680,7 @@ impl CodeGen {
                 name: "this".to_string(),
                 ty: Type::Struct(class_name.clone(), vec![]),
                 default: None,
-                variadic: false, is_named: false,
+                variadic: false, is_named: false, is_inout: false,
             }],
             return_type: None,
             throws: None,
@@ -1710,10 +1726,19 @@ impl CodeGen {
                     self.collect_strings_in_stmt(s);
                 }
             }
+            Stmt::DoWhile { body, cond } => {
+                for s in body {
+                    self.collect_strings_in_stmt(s);
+                }
+                self.collect_strings_in_expr(cond);
+            }
             Stmt::Loop { body } => {
                 for s in body {
                     self.collect_strings_in_stmt(s);
                 }
+            }
+            Stmt::Const { value, .. } => {
+                self.collect_strings_in_expr(value);
             }
             _ => {}
         }
@@ -7450,6 +7475,25 @@ impl CodeGen {
                     self.collect_locals(s, locals);
                 }
             }
+            Stmt::DoWhile { body, cond } => {
+                for s in body {
+                    self.collect_locals(s, locals);
+                }
+                self.collect_locals_from_expr(cond, locals);
+            }
+            Stmt::Const { name, ty, value } => {
+                let val_type = ty
+                    .as_ref()
+                    .map(|t| t.to_wasm())
+                    .unwrap_or_else(|| {
+                        self.infer_ast_type_with_locals(value, locals)
+                            .map(|t| t.to_wasm())
+                            .unwrap_or(ValType::I64)
+                    });
+                let ast_type = ty.clone().or_else(|| self.infer_ast_type_with_locals(value, locals));
+                locals.add(name, val_type, ast_type);
+                self.collect_locals_from_expr(value, locals);
+            }
             Stmt::WhileLet { pattern, expr, body } => {
                 self.collect_locals_from_expr(expr, locals);
                 let subject_ast_type = self.infer_ast_type_with_locals(expr, locals);
@@ -7695,7 +7739,13 @@ impl CodeGen {
                 self.collect_locals_from_expr(inner, locals);
             }
             Expr::None => {}
-            Expr::TryBlock { body, catch_body, catch_var, finally_body } => {
+            Expr::TryBlock { resources, body, catch_body, catch_var, finally_body } => {
+                // P6: try-with-resources — 注册资源变量为局部变量
+                for (res_name, res_expr) in resources {
+                    let res_type = self.infer_type(res_expr);
+                    locals.add(res_name, res_type, None);
+                    self.collect_locals_from_expr(res_expr, locals);
+                }
                 // 预分配 try-catch-finally 所需的内部局部变量
                 // 推断 throw 表达式的值类型，以确保 __err_val 类型匹配
                 let err_val_type = Self::find_throw_inner_in_stmts(body)
@@ -7739,6 +7789,15 @@ impl CodeGen {
                 for stmt in body {
                     self.collect_locals(stmt, locals);
                 }
+            }
+            Expr::OptionalChain { object, .. } => {
+                self.collect_locals_from_expr(object, locals);
+                locals.add("__match_val", ValType::I32, None);
+            }
+            Expr::TrailingClosure { callee, args, closure } => {
+                self.collect_locals_from_expr(callee, locals);
+                for a in args { self.collect_locals_from_expr(a, locals); }
+                self.collect_locals_from_expr(closure, locals);
             }
             _ => {}
         }
@@ -8354,7 +8413,7 @@ impl CodeGen {
                 use crate::ast::BinOp;
                 match op {
                     BinOp::LogicalAnd | BinOp::LogicalOr | BinOp::Eq | BinOp::NotEq
-                    | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => Some(Type::Bool),
+                    | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq | BinOp::NotIn => Some(Type::Bool),
                     BinOp::Add => {
                         // Bug B4: String + x 或 x + String 结果为 String
                         let left_ty = self.infer_ast_type_with_locals(left, locals);
@@ -8607,6 +8666,10 @@ impl CodeGen {
             // P5: spawn/synchronized 是语句级别，不产生值
             Expr::Spawn { .. } => false,
             Expr::Synchronized { .. } => false,
+            // P6: OptionalChain 产生值
+            Expr::OptionalChain { .. } => true,
+            // P6: TrailingClosure 产生值（取决于被调用函数）
+            Expr::TrailingClosure { .. } => true,
             _ => true,
         }
     }
@@ -8676,7 +8739,8 @@ impl CodeGen {
             Expr::Binary { op, left, .. } => match op {
                 BinOp::LogicalAnd | BinOp::LogicalOr
                 | BinOp::Eq | BinOp::NotEq
-                | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => ValType::I32,
+                | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
+                | BinOp::NotIn => ValType::I32,
                 _ => self.infer_type(left),
             },
             Expr::Index { .. } => ValType::I64,    // AST 推断未覆盖时的回退
@@ -9189,6 +9253,46 @@ impl CodeGen {
                 // @Expect(a, b): 如果 a != b 则打印错误信息但继续执行
                 self.compile_assert_expect(left, right, *line, false, locals, func, loop_ctx);
             }
+            Stmt::DoWhile { body, cond } => {
+                // do { body } while (cond)
+                // WASM: block { loop { body; cond; br_if 0 (loop); } }
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+                let body_ctx = Some((1u32, 0u32)); // break→block end, continue→loop start
+                for s in body {
+                    self.compile_stmt(s, locals, func, body_ctx);
+                }
+
+                self.compile_expr(cond, locals, func, loop_ctx);
+                if self.infer_type_with_locals(cond, locals) == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
+                func.instruction(&Instruction::BrIf(0)); // continue looping if true
+
+                func.instruction(&Instruction::End); // loop end
+                func.instruction(&Instruction::End); // block end
+            }
+            Stmt::Const { name, ty, value } => {
+                // const 声明语义等同于 let（不可变绑定），在 WASM 中无区别
+                self.compile_expr(value, locals, func, loop_ctx);
+                if let Some(idx) = locals.get(name) {
+                    let val_ty = self.infer_type_with_locals(value, locals);
+                    let target_ty = ty.as_ref().map(|t| t.to_wasm()).unwrap_or(val_ty);
+                    if val_ty != target_ty {
+                        if val_ty == ValType::I64 && target_ty == ValType::I32 {
+                            func.instruction(&Instruction::I32WrapI64);
+                        } else if val_ty == ValType::I32 && target_ty == ValType::I64 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
+                    }
+                    func.instruction(&Instruction::LocalSet(idx));
+                } else {
+                    if self.expr_produces_value(value) {
+                        func.instruction(&Instruction::Drop);
+                    }
+                }
+            }
         }
     }
 
@@ -9605,6 +9709,23 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(1));
                 func.instruction(&Instruction::I32Sub);
                 func.instruction(&Instruction::End);
+            }
+            // P6: !in 运算符 — 编译为 contains 方法调用 + 取反
+            Expr::Binary { op: BinOp::NotIn, left, right } => {
+                // a !in b => !(b.contains(a))
+                let contains_call = Expr::MethodCall {
+                    object: right.clone(),
+                    method: "contains".to_string(),
+                    args: vec![left.as_ref().clone()],
+                    named_args: vec![],
+                };
+                let result_type = self.infer_type_with_locals(&contains_call, locals);
+                self.compile_expr(&contains_call, locals, func, loop_ctx);
+                // contains 返回值可能是 i64（HashSet/HashMap）或 i32（String），需统一到 i32 后取反
+                if result_type == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
+                func.instruction(&Instruction::I32Eqz);
             }
             Expr::Binary { op, left, right } => {
                 // P3.1: 运算符重载 — 检查左操作数类型是否有 operator func
@@ -11630,8 +11751,17 @@ impl CodeGen {
                     func.instruction(&Instruction::Return);
                 }
             }
-            Expr::TryBlock { body, catch_var, catch_body, finally_body } => {
-                // try { body } catch(e) { catch_body } finally { finally_body }
+            Expr::TryBlock { resources, body, catch_var, catch_body, finally_body } => {
+                // try (resources) { body } catch(e) { catch_body } finally { finally_body }
+                // Compile resource initializations as let bindings before the try body
+                for (res_name, res_expr) in resources {
+                    self.compile_expr(res_expr, locals, func, loop_ctx);
+                    if let Some(idx) = locals.get(res_name) {
+                        func.instruction(&Instruction::LocalSet(idx));
+                    } else {
+                        func.instruction(&Instruction::Drop);
+                    }
+                }
                 // Bug B6 修复: 支持 try-catch 作为表达式使用
 
                 let err_flag = locals.get("__err_flag").unwrap_or(0);
@@ -11727,6 +11857,64 @@ impl CodeGen {
                 for stmt in body {
                     self.compile_stmt(stmt, locals, func, loop_ctx);
                 }
+            }
+            // P6.1: 可选链 obj?.field — 若 obj 为 0 (None 指针) 返回 0，否则访问字段
+            Expr::OptionalChain { object, field } => {
+                // 推断字段类型以确定结果 WASM 类型
+                let field_access = Expr::Field {
+                    object: object.clone(),
+                    field: field.clone(),
+                };
+                let result_type = self.infer_type_with_locals(&field_access, locals);
+
+                self.compile_expr(object, locals, func, loop_ctx);
+                let match_val = locals.get("__match_val").unwrap_or(0);
+                func.instruction(&Instruction::LocalTee(match_val));
+                func.instruction(&Instruction::LocalGet(match_val));
+                func.instruction(&Instruction::I32Eqz);
+                // If None (0), leave 0 on stack; else access field
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(result_type)));
+                match result_type {
+                    ValType::I64 => func.instruction(&Instruction::I64Const(0)),
+                    ValType::F32 => func.instruction(&Instruction::F32Const(0.0)),
+                    ValType::F64 => func.instruction(&Instruction::F64Const(0.0)),
+                    _ => func.instruction(&Instruction::I32Const(0)),
+                };
+                func.instruction(&Instruction::Else);
+                // 复用 Field 编译逻辑：构造 Var("__match_val").field 并编译
+                let field_on_ptr = Expr::Field {
+                    object: Box::new(Expr::Var("__match_val".to_string())),
+                    field: field.clone(),
+                };
+                self.compile_expr(&field_on_ptr, locals, func, loop_ctx);
+                func.instruction(&Instruction::End);
+            }
+            // P6.2: 尾随闭包 f(args) { params => body } — 展开为 f(args, closure)
+            Expr::TrailingClosure { callee, args, closure } => {
+                // Compile as a regular call with the closure appended as the last argument
+                let mut all_args = args.clone();
+                all_args.push(closure.as_ref().clone());
+                let call_expr = match callee.as_ref() {
+                    Expr::Var(name) => Expr::Call {
+                        name: name.clone(),
+                        type_args: None,
+                        args: all_args,
+                        named_args: vec![],
+                    },
+                    Expr::MethodCall { object, method, .. } => Expr::MethodCall {
+                        object: object.clone(),
+                        method: method.clone(),
+                        args: all_args,
+                        named_args: vec![],
+                    },
+                    _ => Expr::Call {
+                        name: "__trailing_closure_target".to_string(),
+                        type_args: None,
+                        args: all_args,
+                        named_args: vec![],
+                    },
+                };
+                self.compile_expr(&call_expr, locals, func, loop_ctx);
             }
         }
     }
@@ -12028,13 +12216,13 @@ mod tests {
                         name: "a".to_string(),
                         ty: Type::Int64,
                         default: None,
-                        variadic: false, is_named: false,
+                        variadic: false, is_named: false, is_inout: false,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: Type::Int64,
                         default: None,
-                        variadic: false, is_named: false,
+                        variadic: false, is_named: false, is_inout: false,
                     },
                 ],
                 return_type: Some(Type::Int64),
@@ -12122,7 +12310,7 @@ mod tests {
                     name: "n".to_string(),
                     ty: Type::Int64,
                     default: None,
-                    variadic: false, is_named: false,
+                    variadic: false, is_named: false, is_inout: false,
                 }],
                 return_type: Some(Type::Int64),
                 throws: None,

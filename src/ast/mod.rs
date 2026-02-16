@@ -236,6 +236,7 @@ pub enum BinOp {
     BitXor,      // ^
     Shl,         // <<
     Shr,         // >>
+    NotIn,       // !in (集合不包含)
 }
 
 /// 字符串插值的部分
@@ -396,8 +397,10 @@ pub enum Expr {
     Try(Box<Expr>),
     /// throw 表达式
     Throw(Box<Expr>),
-    /// try 块表达式（支持 try-catch-finally）
+    /// try 块表达式（支持 try-catch-finally 和 try-with-resources）
     TryBlock {
+        /// try-with-resources 的资源声明（变量名, 表达式）
+        resources: Vec<(String, Expr)>,
         body: Vec<Stmt>,
         catch_var: Option<String>,
         catch_body: Vec<Stmt>,
@@ -427,6 +430,17 @@ pub enum Expr {
     Synchronized {
         lock: Box<Expr>,
         body: Vec<Stmt>,
+    },
+    /// P6.1: 可选链 obj?.field — 若 obj 为 None 返回 None，否则访问字段
+    OptionalChain {
+        object: Box<Expr>,
+        field: String,
+    },
+    /// P6.2: 尾随闭包调用 f(args) { params => body }
+    TrailingClosure {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        closure: Box<Expr>,
     },
 }
 
@@ -521,6 +535,11 @@ pub enum Stmt {
         expr: Box<Expr>,
         body: Vec<Stmt>,
     },
+    /// do-while 循环：先执行 body，再检查 cond
+    DoWhile {
+        body: Vec<Stmt>,
+        cond: Expr,
+    },
     /// for 循环 (for i in 0..10 { ... })
     For {
         var: String,
@@ -544,6 +563,12 @@ pub enum Stmt {
         left: Expr,
         right: Expr,
         line: usize,
+    },
+    /// const 声明（编译期常量，语义等同于 let 但表达意图不同）
+    Const {
+        name: String,
+        ty: Option<Type>,
+        value: Expr,
     },
 }
 
@@ -614,6 +639,8 @@ pub struct Param {
     pub variadic: bool,
     /// P2.9: 命名参数 name!: Type = default
     pub is_named: bool,
+    /// P6: inout 参数（传引用）
+    pub is_inout: bool,
 }
 
 /// 函数定义
@@ -721,6 +748,9 @@ pub struct ClassDef {
     pub static_init: Option<Vec<Stmt>>,
     /// 方法（含 override 标记）
     pub methods: Vec<ClassMethod>,
+    /// P6: 主构造函数参数（如 class Foo(var x: Int64, var y: Int64)），
+    /// 若非空则自动生成对应 fields 和 init
+    pub primary_ctor_params: Vec<Param>,
 }
 
 /// 构造函数定义

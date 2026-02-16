@@ -336,11 +336,16 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
         Try(inner) => Try(Box::new(substitute_expr(*inner, subst, rewrites))),
         Throw(inner) => Throw(Box::new(substitute_expr(*inner, subst, rewrites))),
         TryBlock {
+            resources,
             body,
             catch_var,
             catch_body,
             finally_body,
         } => TryBlock {
+            resources: resources
+                .into_iter()
+                .map(|(n, e)| (n, substitute_expr(e, subst, rewrites)))
+                .collect(),
             body: body
                 .into_iter()
                 .map(|s| substitute_stmt(s, subst, rewrites))
@@ -547,6 +552,18 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
             left: substitute_expr(left, subst, rewrites),
             right: substitute_expr(right, subst, rewrites),
             line,
+        },
+        DoWhile { body, cond } => DoWhile {
+            body: body
+                .into_iter()
+                .map(|s| substitute_stmt(s, subst, rewrites))
+                .collect(),
+            cond: substitute_expr(cond, subst, rewrites),
+        },
+        Const { name, ty, value } => Const {
+            name,
+            ty: ty.map(|t| substitute_type(&t, subst)),
+            value: substitute_expr(value, subst, rewrites),
         },
     }
 }
@@ -1191,6 +1208,7 @@ pub fn monomorphize_program(program: &mut Program) {
                             default: p.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
                             variadic: p.variadic,
                             is_named: p.is_named,
+                            is_inout: p.is_inout,
                         }).collect(),
                         return_type: m.func.return_type.as_ref().map(|t| substitute_type(t, &subst)),
                         throws: m.func.throws.clone(),
@@ -1207,6 +1225,7 @@ pub fn monomorphize_program(program: &mut Program) {
                 default: p.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
                 variadic: p.variadic,
                 is_named: p.is_named,
+                is_inout: p.is_inout,
             }).collect(),
             body: i.body.iter().cloned().map(|s| substitute_stmt(s, &subst, &rewrites)).collect(),
         });
@@ -1226,6 +1245,7 @@ pub fn monomorphize_program(program: &mut Program) {
             deinit,
             static_init: def.static_init.as_ref().map(|s| s.iter().cloned().map(|st| substitute_stmt(st, &subst, &rewrites)).collect()),
             methods,
+            primary_ctor_params: vec![],
         });
     }
     program.classes.append(&mut new_classes);
@@ -1269,6 +1289,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
                 variadic: p.variadic,
                 is_named: p.is_named,
+                is_inout: p.is_inout,
             })
             .collect();
         let return_type = def

@@ -609,7 +609,7 @@ impl Parser {
                         name: "this".to_string(),
                         ty: Type::Struct(name.clone(), type_params.iter().map(|t| Type::TypeParam(t.clone())).collect()),
                         default: None,
-                        variadic: false, is_named: false,
+                        variadic: false, is_named: false, is_inout: false,
                     });
                 }
                 methods.push(func);
@@ -693,7 +693,7 @@ impl Parser {
                         name: "this".to_string(),
                         ty: Type::Struct(name.clone(), type_params.iter().map(|t| Type::TypeParam(t.clone())).collect()),
                         default: None,
-                        variadic: false, is_named: false,
+                        variadic: false, is_named: false, is_inout: false,
                     });
                 }
                 self.pending_struct_methods.push(func);
@@ -868,7 +868,7 @@ impl Parser {
                     name: "this".to_string(),
                     ty: Type::Struct(target_type.clone(), vec![]),
                     default: None,
-                    variadic: false, is_named: false,
+                    variadic: false, is_named: false, is_inout: false,
                 });
             }
             // 重命名为 TypeName.methodName 格式
@@ -934,6 +934,43 @@ impl Parser {
         } else {
             (None, Vec::new())
         };
+        // P6: Primary constructor — class Foo(var x: Int64, var y: Int64) { ... }
+        let mut primary_ctor_params = Vec::new();
+        if self.check(&Token::LParen) {
+            self.advance();
+            while !self.check(&Token::RParen) {
+                // 跳过可选的 var/let
+                if self.check(&Token::Var) || self.check(&Token::Let) {
+                    self.advance();
+                }
+                let pname = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
+                    }
+                };
+                self.expect(Token::Colon)?;
+                let pty = self.parse_type()?;
+                let pdefault = if self.check(&Token::Assign) {
+                    self.advance();
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                primary_ctor_params.push(Param {
+                    name: pname,
+                    ty: pty,
+                    default: pdefault,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
+                });
+                if !self.check(&Token::Comma) { break; }
+                self.advance();
+            }
+            self.expect(Token::RParen)?;
+        }
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         let mut init = None;
@@ -1026,7 +1063,7 @@ impl Parser {
                                         name: "this".to_string(),
                                         ty: Type::Struct(name.clone(), vec![]),
                                         default: None,
-                                        variadic: false, is_named: false,
+                                        variadic: false, is_named: false, is_inout: false,
                                     }],
                                     return_type: Some(prop_ty.clone()),
                                     throws: None,
@@ -1061,13 +1098,13 @@ impl Parser {
                                             name: "this".to_string(),
                                             ty: Type::Struct(name.clone(), vec![]),
                                             default: None,
-                                            variadic: false, is_named: false,
+                                            variadic: false, is_named: false, is_inout: false,
                                         },
                                         Param {
                                             name: val_name,
                                             ty: prop_ty.clone(),
                                             default: None,
-                                            variadic: false, is_named: false,
+                                            variadic: false, is_named: false, is_inout: false,
                                         },
                                     ],
                                     return_type: None,
@@ -1177,7 +1214,7 @@ impl Parser {
                         name: "this".to_string(),
                         ty: Type::Struct(name.clone(), type_params.iter().map(|t| Type::TypeParam(t.clone())).collect()),
                         default: None,
-                        variadic: false, is_named: false,
+                        variadic: false, is_named: false, is_inout: false,
                     });
                 }
                 self.receiver_name = Some(params.first().map(|p| p.name.clone()).unwrap_or_else(|| "this".to_string()));
@@ -1225,7 +1262,7 @@ impl Parser {
         }
         self.expect(Token::RBrace)?;
         self.current_type_params = prev_params;
-        Ok(crate::ast::ClassDef {
+        let mut class_def = crate::ast::ClassDef {
             visibility,
             name,
             type_params,
@@ -1240,7 +1277,34 @@ impl Parser {
             deinit,
             static_init: None, // P3.11: TODO - 从 class body 中解析 static init()
             methods,
-        })
+            primary_ctor_params: primary_ctor_params.clone(),
+        };
+        // P6: 展开主构造函数参数为字段 + init
+        if !primary_ctor_params.is_empty() {
+            for p in &primary_ctor_params {
+                class_def.fields.push(FieldDef {
+                    name: p.name.clone(),
+                    ty: p.ty.clone(),
+                    default: p.default.clone(),
+                });
+            }
+            if class_def.init.is_none() {
+                let init_body: Vec<Stmt> = primary_ctor_params.iter().map(|p| {
+                    Stmt::Assign {
+                        target: AssignTarget::Field {
+                            object: "this".to_string(),
+                            field: p.name.clone(),
+                        },
+                        value: Expr::Var(p.name.clone()),
+                    }
+                }).collect();
+                class_def.init = Some(InitDef {
+                    params: primary_ctor_params,
+                    body: init_body,
+                });
+            }
+        }
+        Ok(class_def)
     }
 
     /// 解析函数定义（支持方法名 StructName.methodName）
@@ -1370,6 +1434,13 @@ impl Parser {
         }
 
         loop {
+            // P6: inout 参数
+            let is_inout = if self.check(&Token::Inout) {
+                self.advance();
+                true
+            } else {
+                false
+            };
             let name = match self.advance() {
                 Some(Token::Ident(name)) => name,
                 Some(Token::This) => "this".to_string(),
@@ -1398,7 +1469,7 @@ impl Parser {
             } else {
                 None
             };
-            params.push(Param { name, ty, default, variadic, is_named });
+            params.push(Param { name, ty, default, variadic, is_named, is_inout });
 
             if !self.check(&Token::Comma) {
                 break;
@@ -1780,6 +1851,44 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 Ok(Stmt::Loop { body })
             }
+            // P6: do-while 循环
+            Some(Token::Do) => {
+                self.advance();
+                self.expect(Token::LBrace)?;
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                self.expect(Token::While)?;
+                // cjc 兼容: while (cond) 或 while cond
+                let has_paren = self.check(&Token::LParen);
+                if has_paren { self.advance(); }
+                let cond = self.parse_expr()?;
+                if has_paren { self.expect(Token::RParen)?; }
+                Ok(Stmt::DoWhile { body, cond })
+            }
+            // P6: const 声明
+            Some(Token::Const) => {
+                self.advance();
+                // const var x = ... 或 const x: Type = ...
+                if self.check(&Token::Var) || self.check(&Token::Let) {
+                    self.advance(); // skip optional var/let
+                }
+                let name = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "常量名".to_string()));
+                    }
+                };
+                let ty = if self.check(&Token::Colon) {
+                    self.advance();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                self.expect(Token::Assign)?;
+                let value = self.parse_expr()?;
+                Ok(Stmt::Const { name, ty, value })
+            }
             Some(Token::At) => {
                 let (at_start, _) = self.at();
                 self.advance(); // consume @
@@ -1954,6 +2063,20 @@ impl Parser {
                 expr: Box::new(left),
                 target_ty,
             });
+        }
+
+        // P6: `!in` 运算符 — expr !in collection
+        if self.check(&Token::Bang) {
+            if matches!(self.peek_next(), Some(Token::In)) {
+                self.advance(); // consume !
+                self.advance(); // consume in
+                let right = self.parse_bitwise_or()?;
+                return Ok(Expr::Binary {
+                    op: BinOp::NotIn,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                });
+            }
         }
 
         while let Some(op) = match self.peek() {
@@ -2158,6 +2281,22 @@ impl Parser {
                         index: Box::new(index),
                     };
                 }
+                // P6: 可选链 obj?.field / obj?.method()
+                Some(Token::Question) if matches!(self.peek_next(), Some(Token::Dot)) => {
+                    self.advance(); // consume ?
+                    self.advance(); // consume .
+                    let field = match self.advance_ident() {
+                        Some(n) => n,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
+                            return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()));
+                        }
+                    };
+                    expr = Expr::OptionalChain {
+                        object: Box::new(expr),
+                        field,
+                    };
+                }
                 Some(Token::Dot) => {
                     // 字段访问、方法调用或元组索引
                     self.advance();
@@ -2210,6 +2349,46 @@ impl Parser {
                     // ? 运算符：expr? 提前返回 Err/None
                     self.advance();
                     expr = Expr::Try(Box::new(expr));
+                }
+                // P6: Trailing closure — f(args) { params => body }
+                // Only after a Call or MethodCall, check for `{ ident =>` pattern
+                Some(Token::LBrace) if matches!(&expr, Expr::Call { .. } | Expr::MethodCall { .. }) => {
+                    // Peek ahead to check if this looks like a lambda: { ident => ... } or { => ... }
+                    let looks_like_lambda = matches!(self.peek_next(), Some(Token::FatArrow))
+                        || (matches!(self.peek_next(), Some(Token::Ident(_))) && matches!(self.peek_at(2), Some(Token::FatArrow) | Some(Token::Colon) | Some(Token::Comma)));
+                    if looks_like_lambda {
+                        // Consume { and parse the lambda body
+                        self.advance(); // consume {
+                        let closure = if self.check(&Token::FatArrow) {
+                            // { => body } — 无参 lambda
+                            self.advance();
+                            let body = self.parse_expr()?;
+                            self.expect(Token::RBrace)?;
+                            Expr::Lambda { params: vec![], return_type: None, body: Box::new(body) }
+                        } else {
+                            // { x: T, y: T => body } — 有参 lambda
+                            let params = self.parse_lambda_params()?;
+                            self.expect(Token::FatArrow)?;
+                            let body = self.parse_expr()?;
+                            self.expect(Token::RBrace)?;
+                            Expr::Lambda { params, return_type: None, body: Box::new(body) }
+                        };
+                        match expr {
+                            Expr::Call { name, type_args, args, named_args: _ } => {
+                                let mut all_args = args;
+                                all_args.push(closure);
+                                expr = Expr::Call { name, type_args, args: all_args, named_args: vec![] };
+                            }
+                            Expr::MethodCall { object, method, args, named_args: _ } => {
+                                let mut all_args = args;
+                                all_args.push(closure);
+                                expr = Expr::MethodCall { object, method, args: all_args, named_args: vec![] };
+                            }
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        break;
+                    }
                 }
                 _ => break,
             }
@@ -2337,11 +2516,53 @@ impl Parser {
                 let value = self.parse_expr()?;
                 Ok(Expr::Throw(Box::new(value)))
             }
-            // try 块（支持 try-catch-finally）
+            // try 块（支持 try-catch-finally 和 try-with-resources）
             Some(Token::Try) => {
+                // P6: try-with-resources: try (resource = expr) { ... }
+                let resources = if self.check(&Token::LParen) {
+                    let saved_pos = self.pos;
+                    self.advance();
+                    // 检查是否是 try (let/var name = expr) 形式
+                    if matches!(self.peek(), Some(Token::Let) | Some(Token::Var)) {
+                        let mut res = Vec::new();
+                        loop {
+                            self.advance(); // consume let/var
+                            let name = self.advance_ident().ok_or_else(|| ParseErrorAt {
+                                error: ParseError::UnexpectedEof,
+                                byte_start: self.at().0, byte_end: self.at().1,
+                            })?;
+                            self.expect(Token::Assign)?;
+                            let expr = self.parse_expr()?;
+                            res.push((name, expr));
+                            if !self.check(&Token::Comma) { break; }
+                            self.advance(); // consume comma
+                        }
+                        self.expect(Token::RParen)?;
+                        res
+                    } else {
+                        // Not try-with-resources, restore position
+                        self.pos = saved_pos;
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
                 self.expect(Token::LBrace)?;
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
+                // catch 是可选的（try-with-resources 或 try-finally 可无 catch）
+                if !self.check(&Token::Catch) && !self.check(&Token::Finally) {
+                    // try-with-resources without catch/finally: auto-generate empty finally
+                    return Ok(Expr::TryBlock { resources, body, catch_var: None, catch_body: vec![], finally_body: Some(vec![]) });
+                }
+                if self.check(&Token::Finally) {
+                    // try-finally without catch
+                    self.advance();
+                    self.expect(Token::LBrace)?;
+                    let finally_stmts = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    return Ok(Expr::TryBlock { resources, body, catch_var: None, catch_body: vec![], finally_body: Some(finally_stmts) });
+                }
                 self.expect(Token::Catch)?;
                 let catch_var = if self.check(&Token::LParen) {
                     self.advance();
@@ -2372,7 +2593,7 @@ impl Parser {
                 } else {
                     None
                 };
-                Ok(Expr::TryBlock { body, catch_var, catch_body, finally_body })
+                Ok(Expr::TryBlock { resources, body, catch_var, catch_body, finally_body })
             }
             Some(Token::Ident(name)) => {
                 // 仅当首字母大写时解析为枚举变体 (Color.Red)，否则 . 后续为字段/方法
