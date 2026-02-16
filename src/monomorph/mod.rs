@@ -455,6 +455,10 @@ fn substitute_pattern(
         Literal(l) => Literal(l),
         Binding(n) => Binding(n),
         Wildcard => Wildcard,
+        TypeTest { binding, ty } => TypeTest {
+            binding,
+            ty: substitute_type(&ty, subst),
+        },
     }
 }
 
@@ -1220,6 +1224,7 @@ pub fn monomorphize_program(program: &mut Program) {
             fields,
             init,
             deinit,
+            static_init: def.static_init.as_ref().map(|s| s.iter().cloned().map(|st| substitute_stmt(st, &subst, &rewrites)).collect()),
             methods,
         });
     }

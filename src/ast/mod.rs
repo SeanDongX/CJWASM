@@ -414,6 +414,20 @@ pub enum Expr {
     MapLiteral {
         entries: Vec<(Expr, Expr)>,
     },
+    /// P3.4: 类型检查 expr is Type — 返回 Bool
+    IsType {
+        expr: Box<Expr>,
+        target_ty: Type,
+    },
+    /// P5.1: spawn { block } — 单线程桩实现（直接执行）
+    Spawn {
+        body: Vec<Stmt>,
+    },
+    /// P5.2: synchronized(lock) { block } — 单线程桩实现（直接执行）
+    Synchronized {
+        lock: Box<Expr>,
+        body: Vec<Stmt>,
+    },
 }
 
 /// match 分支
@@ -454,6 +468,11 @@ pub enum Pattern {
         variant_name: String,
         /// 关联值绑定名，如 Ok(v) 的 v
         binding: Option<String>,
+    },
+    /// P3.5: 类型测试模式 x: Type — 匹配时检查对象类型，成功则绑定到 x
+    TypeTest {
+        binding: String,
+        ty: Type,
     },
 }
 
@@ -698,6 +717,8 @@ pub struct ClassDef {
     pub init: Option<InitDef>,
     /// deinit 析构函数
     pub deinit: Option<Vec<Stmt>>,
+    /// P3.11: static init() 静态初始化块
+    pub static_init: Option<Vec<Stmt>>,
     /// 方法（含 override 标记）
     pub methods: Vec<ClassMethod>,
 }

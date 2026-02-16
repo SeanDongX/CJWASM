@@ -856,7 +856,21 @@ impl Parser {
                 continue;
             }
             // 方法: func name(args): Ret { body }
-            let func = self.parse_function_with_visibility(Visibility::Public)?;
+            // P3: 设置 receiver_name 使 this 在 extend 方法中可用
+            let prev_receiver = self.receiver_name.clone();
+            self.receiver_name = Some("this".to_string());
+            let mut func = self.parse_function_with_visibility(Visibility::Public)?;
+            self.receiver_name = prev_receiver;
+            // P3: 添加隐式 this 参数（如同 struct/class 方法）
+            let has_self = func.params.iter().any(|p| p.name == "self" || p.name == "this");
+            if !has_self && !func.name.starts_with("static ") {
+                func.params.insert(0, crate::ast::Param {
+                    name: "this".to_string(),
+                    ty: Type::Struct(target_type.clone(), vec![]),
+                    default: None,
+                    variadic: false, is_named: false,
+                });
+            }
             // 重命名为 TypeName.methodName 格式
             let method_name = if func.name.contains('.') {
                 func.name.clone()
@@ -1072,8 +1086,8 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RBrace)?;
-            } else if self.check(&Token::Open) || self.check(&Token::Static) || self.check(&Token::Override) || self.check(&Token::Func) {
-                // cjc: open / static / override 修饰符在方法前
+            } else if self.check(&Token::Open) || self.check(&Token::Static) || self.check(&Token::Override) || self.check(&Token::Func) || self.check(&Token::Operator) {
+                // cjc: open / static / override / operator 修饰符在方法前
                 if self.check(&Token::Open) {
                     self.advance(); // 消费 open，cjwasm 不区分 open/非 open
                 }
@@ -1081,19 +1095,73 @@ impl Parser {
                 let is_static = self.check(&Token::Static);
                 if is_static {
                     self.advance(); // 消费 static
+                    // P3.11: static init() { ... } 静态初始化块
+                    if self.check(&Token::Init) {
+                        self.advance(); // 消费 init
+                        self.expect(Token::LParen)?;
+                        self.expect(Token::RParen)?;
+                        self.expect(Token::LBrace)?;
+                        let body = self.parse_stmts()?;
+                        self.expect(Token::RBrace)?;
+                        // 编译为类的静态初始化函数 ClassName.__static_init
+                        methods.push(crate::ast::ClassMethod {
+                            func: Function {
+                                visibility: member_vis.clone(),
+                                name: format!("{}.__static_init", name),
+                                type_params: vec![],
+                                constraints: vec![],
+                                params: vec![],
+                                return_type: None,
+                                throws: None,
+                                body,
+                                extern_import: None,
+                            },
+                            override_: false,
+                        });
+                        continue;
+                    }
                 }
                 let override_ = self.check(&Token::Override);
                 if override_ {
                     self.advance();
                 }
+                // P3.1: operator func +/-/*/==/</>/<=/>=
+                let is_operator = self.check(&Token::Operator);
+                if is_operator {
+                    self.advance(); // 消费 operator
+                }
                 self.expect(Token::Func)?;
-                let (m_name, type_params) = match self.advance() {
-                    Some(Token::Ident(n)) => {
-                        let tp = self.parse_type_params()?;
-                        (format!("{}.{}", name, n), tp)
+                let (m_name, type_params) = if is_operator {
+                    // 运算符方法名：解析运算符 token，转为 __op_xxx
+                    let op_name = match self.advance() {
+                        Some(Token::Plus) => "op_add",
+                        Some(Token::Minus) => "op_sub",
+                        Some(Token::Star) => "op_mul",
+                        Some(Token::Slash) => "op_div",
+                        Some(Token::Percent) => "op_mod",
+                        Some(Token::Eq) => "op_eq",
+                        Some(Token::NotEq) => "op_ne",
+                        Some(Token::Lt) => "op_lt",
+                        Some(Token::Gt) => "op_gt",
+                        Some(Token::LtEq) => "op_le",
+                        Some(Token::GtEq) => "op_ge",
+                        Some(Token::LBracket) => {
+                            self.expect(Token::RBracket)?;
+                            "op_index"
+                        }
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "运算符".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    (format!("{}.{}", name, op_name), vec![])
+                } else {
+                    match self.advance() {
+                        Some(Token::Ident(n)) => {
+                            let tp = self.parse_type_params()?;
+                            (format!("{}.{}", name, n), tp)
+                        }
+                        Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string())),
+                        None => return self.bail(ParseError::UnexpectedEof),
                     }
-                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string())),
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 // 合并类的泛型参数与方法自身的泛型参数，使类的 T 在方法体和返回类型中可识别为 TypeParam
                 let mut merged_type_params = self.current_type_params.clone();
@@ -1170,6 +1238,7 @@ impl Parser {
             fields,
             init,
             deinit,
+            static_init: None, // P3.11: TODO - 从 class body 中解析 static init()
             methods,
         })
     }
@@ -1379,23 +1448,34 @@ impl Parser {
             Some(Token::TypeFloat64) => Ok(Type::Float64),
             Some(Token::TypeRune) => Ok(Type::Rune),
             Some(Token::TypeBool) => Ok(Type::Bool),
-            // P2.3: (T1, T2, ...) -> R 函数类型
+            // P2.3: (T1, T2, ...) -> R 函数类型 或 (T1, T2, ...) 元组类型
             Some(Token::LParen) => {
-                let mut param_types = Vec::new();
+                let mut types = Vec::new();
                 if !self.check(&Token::RParen) {
-                    param_types.push(self.parse_type()?);
+                    types.push(self.parse_type()?);
                     while self.check(&Token::Comma) {
                         self.advance();
-                        param_types.push(self.parse_type()?);
+                        types.push(self.parse_type()?);
                     }
                 }
                 self.expect(Token::RParen)?;
-                self.expect(Token::Arrow)?;
-                let ret = self.parse_type()?;
-                Ok(Type::Function {
-                    params: param_types,
-                    ret: Box::new(Some(ret)),
-                })
+                // 如果后面跟着 ->，则为函数类型；否则为元组类型
+                if self.check(&Token::Arrow) {
+                    self.advance(); // consume ->
+                    let ret = self.parse_type()?;
+                    Ok(Type::Function {
+                        params: types,
+                        ret: Box::new(Some(ret)),
+                    })
+                } else {
+                    // 元组类型 (T1, T2, ...) 或单元素括号类型 (T)
+                    if types.len() == 1 {
+                        // (T) 是括号包裹的类型，不是元组
+                        Ok(types.into_iter().next().unwrap())
+                    } else {
+                        Ok(Type::Tuple(types))
+                    }
+                }
             }
             Some(Token::TypeNothing) => Ok(Type::Nothing),
             Some(Token::TypeUnit) => Ok(Type::Unit),
@@ -1865,6 +1945,16 @@ impl Parser {
     /// 解析比较表达式
     fn parse_comparison(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_bitwise_or()?;
+
+        // P3.4: 先检查 `is` 关键字 — expr is Type
+        if self.check(&Token::Is) {
+            self.advance();
+            let target_ty = self.parse_type()?;
+            return Ok(Expr::IsType {
+                expr: Box::new(left),
+                target_ty,
+            });
+        }
 
         while let Some(op) = match self.peek() {
             Some(Token::Eq) => Some(BinOp::Eq),
@@ -2473,13 +2563,17 @@ impl Parser {
                     self.expect(Token::RParen)?;
                     self.expect(Token::LBrace)?;
                     let then_stmts = self.parse_stmts()?;
-                    let then_expr = if then_stmts.is_empty() {
-                        Box::new(Expr::Integer(0))
-                    } else {
-                        match then_stmts.last() {
-                            Some(Stmt::Expr(e)) => Box::new(e.clone()),
-                            _ => Box::new(Expr::Integer(0)),
-                        }
+                    // P3: 将所有语句包装为 Block 表达式，保留副作用
+                    let then_expr = {
+                        let (block_stmts, block_result) = if then_stmts.is_empty() {
+                            (Vec::new(), None)
+                        } else if let Some(Stmt::Expr(e)) = then_stmts.last() {
+                            let result_expr = Box::new(e.clone());
+                            (then_stmts[..then_stmts.len() - 1].to_vec(), Some(result_expr))
+                        } else {
+                            (then_stmts.clone(), None)
+                        };
+                        Box::new(Expr::Block(block_stmts, block_result))
                     };
                     self.expect(Token::RBrace)?;
                     let else_branch = if self.check(&Token::Else) {
@@ -2491,13 +2585,16 @@ impl Parser {
                         } else {
                             self.expect(Token::LBrace)?;
                             let else_stmts = self.parse_stmts()?;
-                            let else_expr = if else_stmts.is_empty() {
-                                None
-                            } else {
-                                match else_stmts.last() {
-                                    Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
-                                    _ => None,
-                                }
+                            let else_expr = {
+                                let (block_stmts, block_result) = if else_stmts.is_empty() {
+                                    (Vec::new(), None)
+                                } else if let Some(Stmt::Expr(e)) = else_stmts.last() {
+                                    let result_expr = Box::new(e.clone());
+                                    (else_stmts[..else_stmts.len() - 1].to_vec(), Some(result_expr))
+                                } else {
+                                    (else_stmts.clone(), None)
+                                };
+                                Some(Box::new(Expr::Block(block_stmts, block_result)))
                             };
                             self.expect(Token::RBrace)?;
                             else_expr
@@ -2522,13 +2619,17 @@ impl Parser {
                     let expr = Box::new(self.parse_match_subject()?);
                     self.expect(Token::LBrace)?;
                     let then_stmts = self.parse_stmts()?;
-                    let then_expr = if then_stmts.is_empty() {
-                        Box::new(Expr::Integer(0))
-                    } else {
-                        match then_stmts.last() {
-                            Some(Stmt::Expr(e)) => Box::new(e.clone()),
-                            _ => Box::new(Expr::Integer(0)),
-                        }
+                    // P3: 将所有语句包装为 Block 表达式，保留副作用
+                    let then_expr = {
+                        let (block_stmts, block_result) = if then_stmts.is_empty() {
+                            (Vec::new(), None)
+                        } else if let Some(Stmt::Expr(e)) = then_stmts.last() {
+                            let result_expr = Box::new(e.clone());
+                            (then_stmts[..then_stmts.len() - 1].to_vec(), Some(result_expr))
+                        } else {
+                            (then_stmts.clone(), None)
+                        };
+                        Box::new(Expr::Block(block_stmts, block_result))
                     };
                     self.expect(Token::RBrace)?;
                     let else_branch = if self.check(&Token::Else) {
@@ -2540,13 +2641,16 @@ impl Parser {
                         } else {
                             self.expect(Token::LBrace)?;
                             let else_stmts = self.parse_stmts()?;
-                            let else_expr = if else_stmts.is_empty() {
-                                None
-                            } else {
-                                match else_stmts.last() {
-                                    Some(Stmt::Expr(e)) => Some(Box::new(e.clone())),
-                                    _ => None,
-                                }
+                            let else_expr = {
+                                let (block_stmts, block_result) = if else_stmts.is_empty() {
+                                    (Vec::new(), None)
+                                } else if let Some(Stmt::Expr(e)) = else_stmts.last() {
+                                    let result_expr = Box::new(e.clone());
+                                    (else_stmts[..else_stmts.len() - 1].to_vec(), Some(result_expr))
+                                } else {
+                                    (else_stmts.clone(), None)
+                                };
+                                Some(Box::new(Expr::Block(block_stmts, block_result)))
                             };
                             self.expect(Token::RBrace)?;
                             else_expr
@@ -2610,6 +2714,26 @@ impl Parser {
                 Ok(Expr::Match {
                     expr: Box::new(expr),
                     arms,
+                })
+            }
+            // P5.1: spawn { block } — 单线程桩实现
+            Some(Token::Spawn) => {
+                self.expect(Token::LBrace)?;
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                Ok(Expr::Spawn { body })
+            }
+            // P5.2: synchronized(lock) { block } — 单线程桩实现
+            Some(Token::Synchronized) => {
+                self.expect(Token::LParen)?;
+                let lock = self.parse_expr()?;
+                self.expect(Token::RParen)?;
+                self.expect(Token::LBrace)?;
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                Ok(Expr::Synchronized {
+                    lock: Box::new(lock),
+                    body,
                 })
             }
             Some(tok) => self.bail_at(ParseError::UnexpectedToken(tok, "表达式".to_string()), self.at_prev()),
@@ -3106,6 +3230,11 @@ impl Parser {
                     let fields = self.parse_pattern_fields()?;
                     self.expect(Token::RBrace)?;
                     Ok(Pattern::Struct { name, fields })
+                } else if self.check(&Token::Colon) {
+                    // P3.5: 类型测试模式 x: Type
+                    self.advance();
+                    let ty = self.parse_type()?;
+                    Ok(Pattern::TypeTest { binding: name, ty })
                 } else {
                     Ok(Pattern::Binding(name))
                 }

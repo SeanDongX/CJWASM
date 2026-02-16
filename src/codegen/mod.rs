@@ -26,6 +26,8 @@ const WASI_SCRATCH: i32 = 80;
 struct ClassInfo {
     /// 类名
     name: String,
+    /// 唯一类 ID（用于 `is` 类型检查）
+    class_id: u32,
     /// 父类名
     parent: Option<String>,
     /// 完整字段列表（先父类后子类），不含 vtable_ptr
@@ -114,6 +116,8 @@ pub struct CodeGen {
     lambda_table_indices: HashMap<String, u32>,
     /// P2.3: 函数类型签名到类型索引的映射 (用于 call_indirect)
     func_type_by_sig: HashMap<(Vec<ValType>, Vec<ValType>), u32>,
+    /// P3.4: 类 ID 计数器（用于 `is` 类型检查）
+    next_class_id: u32,
 }
 
 impl CodeGen {
@@ -136,6 +140,7 @@ impl CodeGen {
             type_aliases: HashMap::new(),
             lambda_table_indices: HashMap::new(),
             func_type_by_sig: HashMap::new(),
+            next_class_id: 0,
         }
     }
 
@@ -416,6 +421,7 @@ impl CodeGen {
                     ty: Type::String,
                     default: None,
                 }],
+                static_init: None,
                 init: Some(InitDef {
                     params: vec![Param {
                         name: "message".to_string(),
@@ -1405,8 +1411,11 @@ impl CodeGen {
                 }
             }
 
+            let cid = self.next_class_id;
+            self.next_class_id += 1;
             let info = ClassInfo {
                 name: c.name.clone(),
+                class_id: cid,
                 parent: c.extends.clone(),
                 all_fields,
                 own_fields: c.fields.clone(),
@@ -1794,7 +1803,7 @@ impl CodeGen {
             Expr::Unary { expr, .. } => {
                 self.collect_strings_in_expr(expr);
             }
-            Expr::Cast { expr, .. } => {
+            Expr::Cast { expr, .. } | Expr::IsType { expr, .. } => {
                 self.collect_strings_in_expr(expr);
             }
             Expr::Interpolate(parts) => {
@@ -1908,6 +1917,14 @@ impl CodeGen {
             }
         }
 
+        // P3.11: 在 main 函数入口调用所有 static init
+        if func.name == "main" {
+            for (fname, idx) in &self.func_indices {
+                if fname.ends_with(".__static_init") {
+                    wasm_func.instruction(&Instruction::Call(*idx));
+                }
+            }
+        }
         // 编译函数体（顶层无循环上下文）
         // 特殊处理：最后一条 Stmt::Expr 若产生值，则作为隐式返回值（不 drop）
         let body_len = func.body.len();
@@ -6592,6 +6609,182 @@ impl CodeGen {
                         func.instruction(&Instruction::LocalGet(dst_local));
                         true
                     }
+                    // Array 不匹配时，降级到集合方法分发（ArrayList 行为）
+                    _ => {
+                        let inferred = obj_type.clone();
+                        let type_name: Option<String> = None;
+                        match method {
+                            "append" if args.len() == 1 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                let vt = self.infer_type_with_locals(object, locals);
+                                if vt == ValType::I64 {
+                                    return false;
+                                }
+                                func.instruction(&Instruction::Call(self.func_indices["__arraylist_append"]));
+                                func.instruction(&Instruction::I64Const(0));
+                                return true;
+                            }
+                            "get" if args.len() == 1 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                func.instruction(&Instruction::Call(self.func_indices["__arraylist_get"]));
+                                return true;
+                            }
+                            "set" if args.len() == 2 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                self.compile_expr(&args[1], locals, func, loop_ctx);
+                                func.instruction(&Instruction::Call(self.func_indices["__arraylist_set"]));
+                                func.instruction(&Instruction::I64Const(0));
+                                return true;
+                            }
+                            "remove" if args.len() == 1 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                func.instruction(&Instruction::Call(self.func_indices["__arraylist_remove"]));
+                                return true;
+                            }
+                            "size" if args.is_empty() => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                    offset: 0, align: 2, memory_index: 0,
+                                }));
+                                func.instruction(&Instruction::I64ExtendI32S);
+                                return true;
+                            }
+                            // ArrayStack 方法
+                            "push" if args.len() == 1 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                func.instruction(&Instruction::Call(self.func_indices["__arraylist_append"]));
+                                func.instruction(&Instruction::I64Const(0));
+                                return true;
+                            }
+                            "pop" if args.is_empty() => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                // index = size - 1
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                    offset: 0, align: 2, memory_index: 0,
+                                }));
+                                func.instruction(&Instruction::I32Const(1));
+                                func.instruction(&Instruction::I32Sub);
+                                func.instruction(&Instruction::I64ExtendI32S);
+                                func.instruction(&Instruction::Call(self.func_indices["__arraylist_remove"]));
+                                return true;
+                            }
+                            "peek" if args.is_empty() => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                // index = size - 1
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                    offset: 0, align: 2, memory_index: 0,
+                                }));
+                                func.instruction(&Instruction::I32Const(1));
+                                func.instruction(&Instruction::I32Sub);
+                                func.instruction(&Instruction::I64ExtendI32S);
+                                func.instruction(&Instruction::Call(self.func_indices["__arraylist_get"]));
+                                return true;
+                            }
+                            // LinkedList 方法
+                            "prepend" if args.len() == 1 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                func.instruction(&Instruction::Call(self.func_indices["__linkedlist_prepend"]));
+                                func.instruction(&Instruction::I64Const(0));
+                                return true;
+                            }
+                            // HashMap/HashSet 方法（通过 ArrayList 类型推断的 HashMap 也可能走到这里）
+                            "put" if args.len() == 2 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                self.compile_expr(&args[1], locals, func, loop_ctx);
+                                func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
+                                func.instruction(&Instruction::I64Const(0));
+                                return true;
+                            }
+                            "containsKey" if args.len() == 1 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                func.instruction(&Instruction::Call(self.func_indices["__hashmap_contains"]));
+                                func.instruction(&Instruction::I64ExtendI32S);
+                                return true;
+                            }
+                            "add" if args.len() == 1 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                func.instruction(&Instruction::I64Const(0));
+                                func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
+                                func.instruction(&Instruction::I64Const(0));
+                                return true;
+                            }
+                            "contains" if args.len() == 1 => {
+                                self.compile_expr(object, locals, func, loop_ctx);
+                                self.compile_expr(&args[0], locals, func, loop_ctx);
+                                func.instruction(&Instruction::Call(self.func_indices["__hashmap_contains"]));
+                                func.instruction(&Instruction::I64ExtendI32S);
+                                return true;
+                            }
+                            _ => return false,
+                        }
+                    }
+                }
+            }
+            // P4: Map 类型方法分发（HashMap/HashSet）
+            Some(Type::Map(..)) => {
+                match method {
+                    "put" if args.len() == 2 => {
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        self.compile_expr(&args[1], locals, func, loop_ctx);
+                        func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
+                        func.instruction(&Instruction::I64Const(0));
+                        true
+                    }
+                    "get" if args.len() == 1 => {
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        func.instruction(&Instruction::Call(self.func_indices["__hashmap_get"]));
+                        true
+                    }
+                    "containsKey" if args.len() == 1 => {
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        func.instruction(&Instruction::Call(self.func_indices["__hashmap_contains"]));
+                        func.instruction(&Instruction::I64ExtendI32S);
+                        true
+                    }
+                    "remove" if args.len() == 1 => {
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        func.instruction(&Instruction::Call(self.func_indices["__hashmap_remove"]));
+                        true
+                    }
+                    "add" if args.len() == 1 => {
+                        // HashSet.add(elem) → hashmap_put(set, elem, 0)
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        func.instruction(&Instruction::I64Const(0));
+                        func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
+                        func.instruction(&Instruction::I64Const(0));
+                        true
+                    }
+                    "contains" if args.len() == 1 => {
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        func.instruction(&Instruction::Call(self.func_indices["__hashmap_contains"]));
+                        func.instruction(&Instruction::I64ExtendI32S);
+                        true
+                    }
+                    "size" if args.is_empty() => {
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+                        func.instruction(&Instruction::I64ExtendI32S);
+                        true
+                    }
                     _ => false,
                 }
             }
@@ -6605,6 +6798,136 @@ impl CodeGen {
                     _ => None,
                 };
                 if let Some(ref tn) = type_name {
+                    // P5: Atomic/Mutex 桩方法分发
+                    match tn.as_str() {
+                        "AtomicInt64" => {
+                            match method {
+                                "load" if args.is_empty() => {
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    return true;
+                                }
+                                "store" if args.len() == 1 => {
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    func.instruction(&Instruction::I64Const(0)); // void → 哑值供 Drop
+                                    return true;
+                                }
+                                "fetchAdd" if args.len() == 1 => {
+                                    // old = load; store(old + delta); return old
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    // old value 在栈上 — 需要保存
+                                    // 用 object 地址 + 新值存储
+                                    // stack: old_val
+                                    // 重新加载对象地址
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    // stack: old_val, obj_ptr
+                                    // 计算 old + delta
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Add);
+                                    // stack: old_val, obj_ptr, new_val
+                                    func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    // stack: old_val (returned)
+                                    return true;
+                                }
+                                "compareAndSwap" if args.len() == 2 => {
+                                    // single-threaded: if (current == expected) { store(desired); return true } else return false
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Eq);
+                                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+                                    // 匹配: 存储 desired
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    self.compile_expr(&args[1], locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    func.instruction(&Instruction::I64Const(1)); // true
+                                    func.instruction(&Instruction::Else);
+                                    func.instruction(&Instruction::I64Const(0)); // false
+                                    func.instruction(&Instruction::End);
+                                    return true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        "AtomicBool" => {
+                            match method {
+                                "load" if args.is_empty() => {
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    return true;
+                                }
+                                "store" if args.len() == 1 => {
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    func.instruction(&Instruction::I64Const(0)); // void → 哑值供 Drop
+                                    return true;
+                                }
+                                "compareAndSwap" if args.len() == 2 => {
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    self.compile_expr(&args[0], locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Eq);
+                                    func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+                                    self.compile_expr(object, locals, func, loop_ctx);
+                                    self.compile_expr(&args[1], locals, func, loop_ctx);
+                                    func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                        offset: 0, align: 3, memory_index: 0,
+                                    }));
+                                    func.instruction(&Instruction::I64Const(1));
+                                    func.instruction(&Instruction::Else);
+                                    func.instruction(&Instruction::I64Const(0));
+                                    func.instruction(&Instruction::End);
+                                    return true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        "Mutex" | "ReentrantMutex" => {
+                            match method {
+                                "lock" if args.is_empty() => {
+                                    // 单线程桩: 空操作，推哑值供 Drop
+                                    func.instruction(&Instruction::I64Const(0));
+                                    return true;
+                                }
+                                "unlock" if args.is_empty() => {
+                                    func.instruction(&Instruction::I64Const(0));
+                                    return true;
+                                }
+                                "tryLock" if args.is_empty() => {
+                                    func.instruction(&Instruction::I64Const(1)); // 单线程总是成功
+                                    return true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
                     let qualified = format!("{}.{}", tn, method);
                     if self.func_indices.contains_key(&qualified) {
                         return false; // 让正常 struct/class 方法分发处理
@@ -6633,9 +6956,15 @@ impl CodeGen {
                         true
                     }
                     "get" if args.len() == 1 => {
+                        // P3: 按对象类型分派 get —— HashMap 用 __hashmap_get，ArrayList 用 __arraylist_get
+                        let is_hashmap = matches!(&inferred, Some(Type::Map(..)));
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
-                        func.instruction(&Instruction::Call(self.func_indices["__arraylist_get"]));
+                        if is_hashmap {
+                            func.instruction(&Instruction::Call(self.func_indices["__hashmap_get"]));
+                        } else {
+                            func.instruction(&Instruction::Call(self.func_indices["__arraylist_get"]));
+                        }
                         true
                     }
                     "set" if args.len() == 2 => {
@@ -6647,9 +6976,15 @@ impl CodeGen {
                         true
                     }
                     "remove" if args.len() == 1 => {
+                        // P4: 按对象类型分派 remove
+                        let is_hashmap = matches!(&inferred, Some(Type::Map(..)));
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
-                        func.instruction(&Instruction::Call(self.func_indices["__arraylist_remove"]));
+                        if is_hashmap {
+                            func.instruction(&Instruction::Call(self.func_indices["__hashmap_remove"]));
+                        } else {
+                            func.instruction(&Instruction::Call(self.func_indices["__arraylist_remove"]));
+                        }
                         true
                     }
                     "put" if args.len() == 2 => {
@@ -6719,6 +7054,25 @@ impl CodeGen {
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         func.instruction(&Instruction::Call(self.func_indices["__linkedlist_prepend"]));
                         func.instruction(&Instruction::I64Const(0)); // void → 哑值
+                        true
+                    }
+                    // P4: 集合 size 属性方法
+                    "size" if args.is_empty() => {
+                        // ArrayList: [len: i32][cap: i32][data_ptr: i32] → len at offset 0
+                        // HashMap: [size: i32][cap: i32][...] → size at offset 0
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+                        func.instruction(&Instruction::I64ExtendI32S);
+                        true
+                    }
+                    // P4: HashSet.contains(elem)
+                    "contains" if args.len() == 1 => {
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        func.instruction(&Instruction::Call(self.func_indices["__hashmap_contains"]));
+                        func.instruction(&Instruction::I64ExtendI32S);
                         true
                     }
                     _ => false,
@@ -7158,6 +7512,7 @@ impl CodeGen {
                 self.collect_locals_from_expr(sub, locals);
                 let subject_ast_type = self.infer_ast_type_with_locals(sub, locals);
                 locals.add("__match_enum_ptr", ValType::I32, None); // 关联值枚举 match 时暂存 ptr
+                locals.add("__match_val", ValType::I32, None); // P3.5: TypeTest 暂存 subject
                 for arm in arms {
                     match &arm.pattern {
                         Pattern::Binding(name) => {
@@ -7178,6 +7533,10 @@ impl CodeGen {
                                     }
                                 }
                             }
+                        }
+                        // P3.5: TypeTest pattern
+                        Pattern::TypeTest { binding, ty } => {
+                            locals.add(binding, ty.to_wasm(), Some(ty.clone()));
                         }
                         _ => {}
                     }
@@ -7321,7 +7680,7 @@ impl CodeGen {
                 self.collect_locals_from_expr(end, locals);
                 locals.add("__range_alloc_ptr", ValType::I32, None);
             }
-            Expr::Cast { expr, .. } => {
+            Expr::Cast { expr, .. } | Expr::IsType { expr, .. } => {
                 self.collect_locals_from_expr(expr, locals);
             }
             Expr::VariantConst { arg: Some(e), .. } => {
@@ -7367,6 +7726,18 @@ impl CodeGen {
                     for stmt in finally_stmts {
                         self.collect_locals(stmt, locals);
                     }
+                }
+            }
+            // P5.1/5.2: spawn/synchronized 块中的局部变量
+            Expr::Spawn { body } => {
+                for stmt in body {
+                    self.collect_locals(stmt, locals);
+                }
+            }
+            Expr::Synchronized { lock, body } => {
+                self.collect_locals_from_expr(lock, locals);
+                for stmt in body {
+                    self.collect_locals(stmt, locals);
                 }
             }
             _ => {}
@@ -7440,15 +7811,34 @@ impl CodeGen {
                 .or(Some(Type::Array(Box::new(Type::Int64)))),
             Expr::StructInit { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
             Expr::ConstructorCall { name, type_args, .. } => {
-                // P2.7: Array<T>(size, init) → Array(T)
-                if name == "Array" {
-                    let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
-                    return Some(Type::Array(Box::new(elem)));
+                match name.as_str() {
+                    "Array" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Array(Box::new(elem)));
+                    }
+                    "ArrayList" | "LinkedList" | "ArrayStack" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Array(Box::new(elem)));
+                    }
+                    "HashMap" => {
+                        let k = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        let v = type_args.as_ref().and_then(|ta| ta.get(1).cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Map(Box::new(k), Box::new(v)));
+                    }
+                    "HashSet" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Map(Box::new(elem), Box::new(Type::Int64)));
+                    }
+                    // P5: Atomic/Mutex 桩类型（infer_ast_type）
+                    "AtomicInt64" | "AtomicBool" | "Mutex" | "ReentrantMutex" => {
+                        return Some(Type::Struct(name.clone(), vec![]));
+                    }
+                    _ => {}
                 }
                 Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default()))
             }
             Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone(), vec![])),
-            Expr::Call { name, type_args: _, args, .. } => {
+            Expr::Call { name, type_args, args, .. } => {
                 // 类型构造函数：Float32(x), Float64(x), Int64(x) 等
                 match name.as_str() {
                     "Int8" => return Some(Type::Int8),
@@ -7467,7 +7857,24 @@ impl CodeGen {
                     "now" | "randomInt64" => return Some(Type::Int64),
                     "randomFloat64" => return Some(Type::Float64),
                     "getArgs" => return Some(Type::Array(Box::new(Type::String))),
-                    "ArrayList" | "HashMap" | "HashSet" | "LinkedList" | "ArrayStack" => return Some(Type::Int64),
+                    // P4: 集合类型推断
+                    "ArrayList" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Array(Box::new(elem)));
+                    }
+                    "HashMap" => {
+                        let k = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        let v = type_args.as_ref().and_then(|ta| ta.get(1).cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Map(Box::new(k), Box::new(v)));
+                    }
+                    "HashSet" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Map(Box::new(elem), Box::new(Type::Int64)));
+                    }
+                    "LinkedList" | "ArrayStack" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Array(Box::new(elem)));
+                    }
                     _ => {}
                 }
                 if self.structs.contains_key(name) {
@@ -7525,6 +7932,7 @@ impl CodeGen {
             }
             Expr::SuperCall { .. } => None, // super 调用，需结合父类推断
             Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
+            Expr::IsType { .. } => Some(Type::Bool),
             Expr::IfLet { then_branch, .. } => self.infer_ast_type(then_branch),
             Expr::Lambda { params, return_type, body } => {
                 let param_types: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
@@ -7769,15 +8177,34 @@ impl CodeGen {
                 .or(Some(Type::Array(Box::new(Type::Int64)))),
             Expr::StructInit { name, type_args, .. } => Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default())),
             Expr::ConstructorCall { name, type_args, .. } => {
-                // P2.7: Array<T>(size, init) → Array(T)
-                if name == "Array" {
-                    let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
-                    return Some(Type::Array(Box::new(elem)));
+                match name.as_str() {
+                    "Array" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Array(Box::new(elem)));
+                    }
+                    "ArrayList" | "LinkedList" | "ArrayStack" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Array(Box::new(elem)));
+                    }
+                    "HashMap" => {
+                        let k = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        let v = type_args.as_ref().and_then(|ta| ta.get(1).cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Map(Box::new(k), Box::new(v)));
+                    }
+                    "HashSet" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Map(Box::new(elem), Box::new(Type::Int64)));
+                    }
+                    // P5: Atomic/Mutex 桩类型（infer_ast_type_with_locals）
+                    "AtomicInt64" | "AtomicBool" | "Mutex" | "ReentrantMutex" => {
+                        return Some(Type::Struct(name.clone(), vec![]));
+                    }
+                    _ => {}
                 }
                 Some(Type::Struct(name.clone(), type_args.clone().unwrap_or_default()))
             }
             Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone(), vec![])),
-            Expr::Call { name, type_args: _, args, .. } => {
+            Expr::Call { name, type_args, args, .. } => {
                 // 类型构造函数：Float32(x), Float64(x), Int64(x) 等
                 match name.as_str() {
                     "Int8" => return Some(Type::Int8),
@@ -7796,7 +8223,24 @@ impl CodeGen {
                     "now" | "randomInt64" => return Some(Type::Int64),
                     "randomFloat64" => return Some(Type::Float64),
                     "getArgs" => return Some(Type::Array(Box::new(Type::String))),
-                    "ArrayList" | "HashMap" | "HashSet" | "LinkedList" | "ArrayStack" => return Some(Type::Int64),
+                    // P4: 集合类型推断
+                    "ArrayList" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Array(Box::new(elem)));
+                    }
+                    "HashMap" => {
+                        let k = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        let v = type_args.as_ref().and_then(|ta| ta.get(1).cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Map(Box::new(k), Box::new(v)));
+                    }
+                    "HashSet" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Map(Box::new(elem), Box::new(Type::Int64)));
+                    }
+                    "LinkedList" | "ArrayStack" => {
+                        let elem = type_args.as_ref().and_then(|ta| ta.first().cloned()).unwrap_or(Type::Int64);
+                        return Some(Type::Array(Box::new(elem)));
+                    }
                     _ => {}
                 }
                 if self.structs.contains_key(name) {
@@ -7854,11 +8298,19 @@ impl CodeGen {
             }
             Expr::SuperCall { .. } => None,
             Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
+            Expr::IsType { .. } => Some(Type::Bool),
             Expr::IfLet { then_branch, .. } => self.infer_ast_type_with_locals(then_branch, locals),
             Expr::Field { object, field, .. } => {
                 // Phase 7.2: 内建类型属性
                 let obj_ty = self.infer_ast_type_with_locals(object, locals);
-                if field == "size" && (obj_ty.as_ref() == Some(&Type::String) || matches!(obj_ty.as_ref(), Some(Type::Array(_)))) {
+                if field == "size" && (obj_ty.as_ref() == Some(&Type::String)
+                    || matches!(obj_ty.as_ref(), Some(Type::Array(_)))
+                    || matches!(obj_ty.as_ref(), Some(Type::Map(..))))
+                {
+                    return Some(Type::Int64);
+                }
+                // P4: Range 属性返回类型
+                if obj_ty == Some(Type::Range) && (field == "start" || field == "end" || field == "step") {
                     return Some(Type::Int64);
                 }
                 obj_ty.and_then(|ty| {
@@ -8152,6 +8604,9 @@ impl CodeGen {
             Expr::IfLet { then_branch, .. } => {
                 self.expr_produces_value(then_branch)
             }
+            // P5: spawn/synchronized 是语句级别，不产生值
+            Expr::Spawn { .. } => false,
+            Expr::Synchronized { .. } => false,
             _ => true,
         }
     }
@@ -8228,6 +8683,7 @@ impl CodeGen {
             Expr::Field { .. } => ValType::I64,    // AST 推断未覆盖时的回退
             Expr::VariantConst { .. } => ValType::I32,
             Expr::Cast { target_ty, .. } => target_ty.to_wasm(),
+            Expr::IsType { .. } => ValType::I32, // Bool
             Expr::IfLet { then_branch, .. } => self.infer_type(then_branch),
             Expr::Lambda { .. } => ValType::I32, // 函数表索引
             Expr::Some(_) | Expr::None | Expr::Ok(_) | Expr::Err(_) => ValType::I32, // 指针
@@ -9151,6 +9607,39 @@ impl CodeGen {
                 func.instruction(&Instruction::End);
             }
             Expr::Binary { op, left, right } => {
+                // P3.1: 运算符重载 — 检查左操作数类型是否有 operator func
+                if let Some(left_ty) = self.infer_ast_type_with_locals(left, locals) {
+                    let op_name = match op {
+                        BinOp::Add => "op_add",
+                        BinOp::Sub => "op_sub",
+                        BinOp::Mul => "op_mul",
+                        BinOp::Div => "op_div",
+                        BinOp::Mod => "op_mod",
+                        BinOp::Eq => "op_eq",
+                        BinOp::NotEq => "op_ne",
+                        BinOp::Lt => "op_lt",
+                        BinOp::Gt => "op_gt",
+                        BinOp::LtEq => "op_le",
+                        BinOp::GtEq => "op_ge",
+                        _ => "",
+                    };
+                    if !op_name.is_empty() {
+                        let type_name = match &left_ty {
+                            Type::Struct(n, _) => Some(n.clone()),
+                            _ => None,
+                        };
+                        if let Some(tn) = type_name {
+                            let qualified = format!("{}.{}", tn, op_name);
+                            if let Some(&idx) = self.func_indices.get(&qualified) {
+                                // 调用 operator 方法: TypeName.op_xxx(this, other)
+                                self.compile_expr(left, locals, func, loop_ctx);
+                                self.compile_expr(right, locals, func, loop_ctx);
+                                func.instruction(&Instruction::Call(idx));
+                                return;
+                            }
+                        }
+                    }
+                }
                 if op == &BinOp::Pow {
                     self.compile_expr(left, locals, func, loop_ctx);
                     self.compile_expr(right, locals, func, loop_ctx);
@@ -9343,6 +9832,40 @@ impl CodeGen {
                             func.instruction(&Instruction::I32And);
                         }
                         _ => {}
+                    }
+                }
+            }
+            // P3.4: is 类型检查表达式
+            Expr::IsType { expr, target_ty } => {
+                let src_ty = self.infer_ast_type_with_locals(expr, locals);
+                match (&src_ty, target_ty) {
+                    // 对象类型（class）检查 vtable 中的 class_id
+                    (Some(Type::Struct(_, _)), Type::Struct(target_name, _)) => {
+                        let target_id = self.classes.get(target_name).map(|c| c.class_id).unwrap_or(u32::MAX);
+                        self.compile_expr(expr, locals, func, loop_ctx);
+                        // 从指针+0 加载 class_id (vtable 第一个字段)
+                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+                        func.instruction(&Instruction::I32Const(target_id as i32));
+                        func.instruction(&Instruction::I32Eq);
+                    }
+                    // 静态类型完全匹配
+                    _ if src_ty.as_ref() == Some(target_ty) => {
+                        // 编译表达式 (可能有副作用) 然后 drop，push true
+                        self.compile_expr(expr, locals, func, loop_ctx);
+                        if self.expr_produces_value(expr) {
+                            func.instruction(&Instruction::Drop);
+                        }
+                        func.instruction(&Instruction::I32Const(1)); // true
+                    }
+                    // 其他情况: 编译时可判断不匹配
+                    _ => {
+                        self.compile_expr(expr, locals, func, loop_ctx);
+                        if self.expr_produces_value(expr) {
+                            func.instruction(&Instruction::Drop);
+                        }
+                        func.instruction(&Instruction::I32Const(0)); // false
                     }
                 }
             }
@@ -9943,7 +10466,14 @@ impl CodeGen {
             }
             Expr::Array(elements) => {
                 // Phase 8: 使用 __alloc 分配数组内存
-                let elem_size = 8; // i64 大小
+                // P3.9: 根据元素 WASM 类型确定步长（i32/f32=4, i64/f64=8）
+                let elem_wasm_ty = elements.first()
+                    .map(|e| self.infer_type_with_locals(e, locals))
+                    .unwrap_or(ValType::I64);
+                let elem_size: i32 = match elem_wasm_ty {
+                    ValType::I32 | ValType::F32 => 4,
+                    _ => 8, // i64, f64
+                };
                 let total_size = 4 + elements.len() as i32 * elem_size; // length + elements
                 let alloc_idx = self.func_indices["__alloc"];
                 let tmp_local = locals.get("__array_alloc_ptr").expect("__array_alloc_ptr 未预注册");
@@ -9961,27 +10491,33 @@ impl CodeGen {
                     memory_index: 0,
                 }));
 
-                // 写入每个元素（检测元素类型，Float64 使用 F64Store）
-                let is_float_array = elements.first()
-                    .map(|e| self.infer_type_with_locals(e, locals) == ValType::F64)
-                    .unwrap_or(false);
+                // 写入每个元素（按 WASM 类型选择 Store 指令）
                 for (i, elem) in elements.iter().enumerate() {
                     func.instruction(&Instruction::LocalGet(tmp_local));
                     func.instruction(&Instruction::I32Const(4 + i as i32 * elem_size));
                     func.instruction(&Instruction::I32Add);
                     self.compile_expr(elem, locals, func, loop_ctx);
-                    if is_float_array {
-                        func.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
-                            offset: 0,
-                            align: 3,
-                            memory_index: 0,
-                        }));
-                    } else {
-                        func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
-                            offset: 0,
-                            align: 3,
-                            memory_index: 0,
-                        }));
+                    match elem_wasm_ty {
+                        ValType::F64 => {
+                            func.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                        }
+                        ValType::F32 => {
+                            func.instruction(&Instruction::F32Store(wasm_encoder::MemArg {
+                                offset: 0, align: 2, memory_index: 0,
+                            }));
+                        }
+                        ValType::I32 => {
+                            func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                                offset: 0, align: 2, memory_index: 0,
+                            }));
+                        }
+                        _ => {
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                        }
                     }
                 }
 
@@ -9989,32 +10525,45 @@ impl CodeGen {
                 func.instruction(&Instruction::LocalGet(tmp_local));
             }
             Expr::Index { array, index } => {
-                // arr[i] -> load from (arr + 4 + i * 8)
-                // 检测数组元素类型，Float64 数组使用 F64Load
-                let is_float_elem = match self.infer_ast_type_with_locals(array, locals) {
-                    Some(Type::Array(ref elem_ty)) => matches!(**elem_ty, Type::Float64 | Type::Float32),
-                    _ => false,
+                // arr[i] -> load from (arr + 4 + i * elem_size)
+                // P3.9: 根据元素 WASM 类型确定步长和 Load 指令
+                let elem_wasm_ty = match self.infer_ast_type_with_locals(array, locals) {
+                    Some(Type::Array(ref elem_ty)) => elem_ty.to_wasm(),
+                    _ => ValType::I64,
+                };
+                let elem_size: i32 = match elem_wasm_ty {
+                    ValType::I32 | ValType::F32 => 4,
+                    _ => 8,
                 };
                 self.compile_expr(array, locals, func, loop_ctx);
                 func.instruction(&Instruction::I32Const(4)); // 跳过长度字段
                 func.instruction(&Instruction::I32Add);
                 self.compile_expr(index, locals, func, loop_ctx);
                 func.instruction(&Instruction::I32WrapI64);
-                func.instruction(&Instruction::I32Const(8));
+                func.instruction(&Instruction::I32Const(elem_size));
                 func.instruction(&Instruction::I32Mul);
                 func.instruction(&Instruction::I32Add);
-                if is_float_elem {
-                    func.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    }));
-                } else {
-                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    }));
+                match elem_wasm_ty {
+                    ValType::F64 => {
+                        func.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                            offset: 0, align: 3, memory_index: 0,
+                        }));
+                    }
+                    ValType::F32 => {
+                        func.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+                    }
+                    ValType::I32 => {
+                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+                    }
+                    _ => {
+                        func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                            offset: 0, align: 3, memory_index: 0,
+                        }));
+                    }
                 }
             }
             Expr::StructInit { name, type_args, fields } => {
@@ -10097,6 +10646,62 @@ impl CodeGen {
                     }
                     "LinkedList" if args.is_empty() => {
                         func.instruction(&Instruction::Call(self.func_indices["__linkedlist_new"]));
+                        return;
+                    }
+                    // P5: AtomicInt64([initial]) — 单线程桩，分配 8 字节存储 i64
+                    "AtomicInt64" => {
+                        // 分配 8 字节
+                        func.instruction(&Instruction::I32Const(8));
+                        func.instruction(&Instruction::Call(self.func_indices["__alloc"]));
+                        // 存初始值
+                        if args.len() >= 1 {
+                            // 复制指针，存初始值
+                            let tmp = locals.get("__struct_alloc_ptr").unwrap_or(0);
+                            func.instruction(&Instruction::LocalTee(tmp));
+                            self.compile_expr(&args[0], locals, func, loop_ctx);
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                            func.instruction(&Instruction::LocalGet(tmp));
+                        } else {
+                            // 默认值 0
+                            let tmp = locals.get("__struct_alloc_ptr").unwrap_or(0);
+                            func.instruction(&Instruction::LocalTee(tmp));
+                            func.instruction(&Instruction::I64Const(0));
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                            func.instruction(&Instruction::LocalGet(tmp));
+                        }
+                        return;
+                    }
+                    // P5: AtomicBool([initial]) — 单线程桩，分配 8 字节存储 i64(0/1)
+                    "AtomicBool" => {
+                        func.instruction(&Instruction::I32Const(8));
+                        func.instruction(&Instruction::Call(self.func_indices["__alloc"]));
+                        if args.len() >= 1 {
+                            let tmp = locals.get("__struct_alloc_ptr").unwrap_or(0);
+                            func.instruction(&Instruction::LocalTee(tmp));
+                            self.compile_expr(&args[0], locals, func, loop_ctx);
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                            func.instruction(&Instruction::LocalGet(tmp));
+                        } else {
+                            let tmp = locals.get("__struct_alloc_ptr").unwrap_or(0);
+                            func.instruction(&Instruction::LocalTee(tmp));
+                            func.instruction(&Instruction::I64Const(0));
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                            func.instruction(&Instruction::LocalGet(tmp));
+                        }
+                        return;
+                    }
+                    // P5: Mutex() / ReentrantMutex() — 单线程桩，分配 4 字节 dummy
+                    "Mutex" | "ReentrantMutex" if args.is_empty() => {
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::Call(self.func_indices["__alloc"]));
                         return;
                     }
                     // P2.7: Array<T>(size, init) 动态数组构造
@@ -10244,13 +10849,42 @@ impl CodeGen {
                 // Phase 7.2: 内建类型属性拦截
                 let obj_ast_type = self.infer_ast_type_with_locals(object, locals);
                 let is_array_type = matches!(obj_ast_type.as_ref(), Some(Type::Array(_)));
-                if field == "size" && (obj_ast_type.as_ref() == Some(&Type::String) || is_array_type) {
-                    // String.size / Array.size → 读取指针处的 i32 长度，扩展为 i64
+                let is_collection_type = is_array_type
+                    || matches!(obj_ast_type.as_ref(), Some(Type::Map(..)))
+                    || obj_ast_type.as_ref() == Some(&Type::String);
+                if field == "size" && is_collection_type {
+                    // String.size / Array.size / HashMap.size / HashSet.size / ArrayList.size
+                    // → 读取指针处的 i32 长度字段，扩展为 i64
                     self.compile_expr(object, locals, func, loop_ctx);
                     func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                         offset: 0, align: 2, memory_index: 0,
                     }));
                     func.instruction(&Instruction::I64ExtendI32S);
+                } else if obj_ast_type == Some(Type::Range) {
+                    // P4: Range 属性 .start, .end, .step
+                    // Range 内存布局: [start: i64][end: i64][inclusive: i32] = 20 bytes
+                    self.compile_expr(object, locals, func, loop_ctx);
+                    match field.as_str() {
+                        "start" => {
+                            func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                        }
+                        "end" => {
+                            func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                offset: 8, align: 3, memory_index: 0,
+                            }));
+                        }
+                        "step" => {
+                            // Range 没有步长字段，默认返回 1
+                            func.instruction(&Instruction::Drop);
+                            func.instruction(&Instruction::I64Const(1));
+                        }
+                        _ => {
+                            func.instruction(&Instruction::Drop);
+                            func.instruction(&Instruction::I64Const(0));
+                        }
+                    }
                 } else {
                 // Bug B2 修复: 检查是否有 prop getter 方法
                 let getter_name = self.get_object_type(object, locals).and_then(|ty| {
@@ -10750,6 +11384,66 @@ impl CodeGen {
                                 }
                             }
                         }
+                        // P3.5: 类型测试模式 x: Type
+                        Pattern::TypeTest { binding, ty } => {
+                            // 将 subject 值绑定到变量
+                            if let Some(idx) = locals.get(binding) {
+                                // dup subject for binding + class_id check
+                                let tmp = locals.get("__match_val").unwrap_or(0);
+                                func.instruction(&Instruction::LocalSet(tmp));
+                                func.instruction(&Instruction::LocalGet(tmp));
+                                func.instruction(&Instruction::LocalGet(tmp));
+                            }
+                            // 类型检查：根据 target_ty 的 class_id 做对比
+                            let matched = match ty {
+                                Type::Struct(ref target_name, _) => {
+                                    if let Some(ci) = self.classes.get(target_name) {
+                                        let target_id = ci.class_id;
+                                        // 加载对象的 class_id（vtable_ptr 处，对象偏移 0）
+                                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                            offset: 0, align: 2, memory_index: 0,
+                                        }));
+                                        func.instruction(&Instruction::I32Const(target_id as i32));
+                                        func.instruction(&Instruction::I32Eq);
+                                        true
+                                    } else {
+                                        // 静态类型匹配
+                                        let src_ty = &subject_ast_type;
+                                        let target = Some(ty.clone());
+                                        func.instruction(&Instruction::Drop);
+                                        func.instruction(&Instruction::I32Const(if src_ty == &target { 1 } else { 0 }));
+                                        true
+                                    }
+                                }
+                                _ => {
+                                    // 非 class 类型：静态匹配
+                                    let src_ty = &subject_ast_type;
+                                    let target = Some(ty.clone());
+                                    func.instruction(&Instruction::Drop);
+                                    func.instruction(&Instruction::I32Const(if src_ty == &target { 1 } else { 0 }));
+                                    true
+                                }
+                            };
+                            if matched {
+                                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                                // 绑定 subject 到变量
+                                if let Some(idx) = locals.get(binding) {
+                                    func.instruction(&Instruction::LocalSet(idx));
+                                }
+                                self.compile_expr(&arm.body, locals, func, loop_ctx);
+                                func.instruction(&Instruction::Br(1));
+                                func.instruction(&Instruction::End);
+                                // 类型不匹配时: drop binding copy, reload subject for next arm
+                                if let Some(_idx) = locals.get(binding) {
+                                    func.instruction(&Instruction::Drop);
+                                }
+                                if is_last {
+                                    Self::emit_match_default_value(func, result_type);
+                                } else {
+                                    self.compile_expr(expr, locals, func, loop_ctx);
+                                }
+                            }
+                        }
                         _ => {
                             func.instruction(&Instruction::Drop);
                             self.compile_expr(&arm.body, locals, func, loop_ctx);
@@ -11015,6 +11709,24 @@ impl CodeGen {
             }
             Expr::SliceExpr { .. } | Expr::MapLiteral { .. } => {
                 todo!("SliceExpr and MapLiteral codegen not yet implemented")
+            }
+            // P5.1: spawn { block } — 单线程桩实现（直接同步执行 block）
+            Expr::Spawn { body } => {
+                for stmt in body {
+                    self.compile_stmt(stmt, locals, func, loop_ctx);
+                }
+                // spawn 不产生有意义的返回值
+            }
+            // P5.2: synchronized(lock) { block } — 单线程桩实现（直接执行 block）
+            Expr::Synchronized { lock, body } => {
+                // 编译 lock 表达式（可能有副作用），然后 drop
+                self.compile_expr(lock, locals, func, loop_ctx);
+                if self.expr_produces_value(lock) {
+                    func.instruction(&Instruction::Drop);
+                }
+                for stmt in body {
+                    self.compile_stmt(stmt, locals, func, loop_ctx);
+                }
             }
         }
     }

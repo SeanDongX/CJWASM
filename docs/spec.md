@@ -236,6 +236,19 @@ let n = value as Int32
 
 // 空值合并
 let v = maybeNull ?? defaultValue
+
+// 类型检查
+if (obj is SomeClass) { ... }
+
+// spawn 并发（单线程桩：直接同步执行）
+spawn {
+    doWork()
+}
+
+// synchronized 同步块（单线程桩：直接执行）
+synchronized(lock) {
+    criticalSection()
+}
 ```
 
 | 功能 | 状态 |
@@ -247,6 +260,9 @@ let v = maybeNull ?? defaultValue
 | 范围表达式（作为值） | [x] |
 | 类型转换 (as) | [x] |
 | 空值合并 (??) | [x] |
+| 类型检查 (is) | [x] |
+| spawn 块（单线程桩） | [x] |
+| synchronized 块（单线程桩） | [x] |
 | 三元运算符 | [ ] |
 
 ---
@@ -482,6 +498,62 @@ class Student <: Person {
 | 访问修饰符 (public/protected/internal/private) | [x] |
 | abstract 类 | [x] |
 | sealed 类 | [x] |
+| 运算符重载 (operator func) | [x] |
+| 静态初始化块 (static init()) | [x] |
+| extend 内建类型 | [x] |
+| 方法重载（同名不同参数，名字修饰） | [x] |
+
+### 6.3 运算符重载
+
+```cangjie
+class Vector {
+    var x: Int64;
+    var y: Int64;
+
+    operator func +(other: Vector): Vector {
+        return Vector { x: this.x + other.x, y: this.y + other.y }
+    }
+
+    operator func ==(other: Vector): Bool {
+        return this.x == other.x && this.y == other.y
+    }
+
+    operator func [](index: Int64): Int64 {
+        if (index == 0) { return this.x }
+        return this.y
+    }
+}
+```
+
+支持的运算符：`+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `[]`
+
+### 6.4 extend 扩展
+
+```cangjie
+// 为内建类型添加方法
+extend Int64 {
+    public static prop MAX_VALUE: Int64 {
+        get() { return 0x7fffffffffffffff }
+    }
+}
+
+// 为集合类型添加方法
+extend<E> ArrayList<E> {
+    public func find(o: E): Bool { ... }
+}
+```
+
+### 6.5 静态初始化块
+
+```cangjie
+class Registry {
+    static var items = ArrayList<String>()
+
+    static init() {
+        items.append("default")
+    }
+}
+```
 
 ---
 
@@ -563,6 +635,20 @@ if let Some(value) = maybeValue {
 while let Some(item) = iterator.next() {
     // 处理 item
 }
+
+// match type pattern（类型匹配）
+match (obj) {
+    case x: Dog => x.bark()       // 类型匹配 + 绑定
+    case x: Cat => x.meow()
+    case _ => println("unknown")
+}
+
+// match where 守卫
+match (value) {
+    case v where v > 100 => "large"
+    case v where v > 0 => "positive"
+    case _ => "other"
+}
 ```
 
 | 功能 | 状态 |
@@ -572,10 +658,11 @@ while let Some(item) = iterator.next() {
 | 范围匹配 | [x] |
 | 枚举变体匹配 (Type.Variant) | [x] |
 | 解构匹配 | [x] |
-| 守卫条件 (if) | [x] |
+| 守卫条件 (if / where) | [x] |
 | 通配符 (_) | [x] |
 | if-let | [x] |
 | while-let | [x] |
+| 类型匹配模式 (case x: Type =>) | [x] |
 
 ---
 
@@ -799,7 +886,12 @@ func process(): Result<Int64, String> {
 │   - 结构体:  [vtable_ptr?:i32][字段1][字段2]...          │
 │   - 枚举:    [discriminant:i32][payload...]              │
 │   - 元组:    [field0:i64][field1:i64]...                 │
-│   - Range:   [start:i64][end:i64][inclusive:i32]         │
+│   - Range:   [start:i64][end:i64][inclusive:i32][step:i64]│
+│   - Option:  [tag:i32][value:i64]                        │
+│   - ArrayList: [size:i32][cap:i32][data_ptr:i32][...]    │
+│   - HashMap:   [size:i32][cap:i32][keys:i32][vals:i32]...│
+│   - Atomic:    [value:i64]                               │
+│   - Mutex:     [dummy:i32]                               │
 └─────────────────────────────────────────────────────────┘
 
 Globals:
@@ -871,8 +963,9 @@ func add(a: Int64, b: Int64): Int64 {
 | `std.array` | 数组操作 | [x] |
 | `std.math` | 数学函数 | [x] |
 | `std.io` | 输入输出 | [x] |
-| `std.collections` | 集合类型 | [x] |
-| `std.time` | 时间处理 | [x] |
+| `std.collections` | 集合类型 (HashMap/HashSet/ArrayList/LinkedList/ArrayStack) | [x] |
+| `std.time` | 时间处理 (now() 纳秒时间戳) | [x] |
+| `std.sync` | 同步原语 (AtomicInt64/AtomicBool/Mutex/ReentrantMutex, 单线程桩) | [x] |
 | `std.json` | JSON 解析 | [ ] |
 | `std.fmt` | 格式化 | [x] |
 
@@ -914,15 +1007,123 @@ pow(base, exp)
 | 字符串函数 | [x] |
 | 数学函数 | [x]（完整实现：min/max/abs/sqrt/sin/cos/exp/log/pow 等） |
 
+### 14.3 集合类型 (std.collections)
+
+```cangjie
+// HashMap
+let map = HashMap<String, Int64>()
+map.put("key", 42)
+let val = map.get("key")           // 42
+map.containsKey("key")             // true
+map.remove("key")                  // 42
+map.size                           // 0
+
+// HashSet (基于 HashMap 实现)
+let set = HashSet<Int64>()
+set.add(1)
+set.add(2)
+set.contains(1)                    // true
+set.size                           // 2
+
+// ArrayList
+let list = ArrayList<Int64>()
+list.append(10)
+list.get(0)                        // 10
+list.set(0, 20)
+list.remove(0)                     // 20
+list.size                          // 0
+
+// LinkedList
+let linked = LinkedList<Int64>()
+linked.append(1)
+linked.prepend(0)
+
+// ArrayStack
+let stack = ArrayStack<Int64>()
+stack.push(1)
+stack.push(2)
+stack.peek()                       // 2
+stack.pop()                        // 2
+```
+
+| 集合类型 | 方法 | 状态 |
+|----------|------|------|
+| `HashMap<K,V>` | put, get, containsKey, remove, size | [x] |
+| `HashSet<T>` | add, contains, size | [x] |
+| `ArrayList<T>` | append, get, set, remove, size | [x] |
+| `LinkedList<T>` | append, prepend, get, size | [x] |
+| `ArrayStack<T>` | push, pop, peek, size | [x] |
+| `TreeMap<K,V>` | (有序映射) | [ ] |
+
+### 14.4 并发原语 (std.sync, 单线程桩实现)
+
+由于 WASM 不原生支持线程，并发原语采用单线程桩实现策略：
+
+```cangjie
+// spawn: 直接同步执行 block
+spawn {
+    doWork()
+}
+
+// synchronized: 直接执行 block
+let lock = Mutex()
+synchronized(lock) {
+    criticalSection()
+}
+
+// AtomicInt64: 普通变量包装
+let counter = AtomicInt64(0)
+counter.store(42)
+let val = counter.load()           // 42
+let old = counter.fetchAdd(8)      // 42 (返回旧值)
+counter.compareAndSwap(50, 100)    // true/false
+
+// AtomicBool: 普通变量包装
+let flag = AtomicBool()            // 默认 false
+flag.store(1)
+flag.load()                        // 1
+flag.compareAndSwap(1, 0)          // true
+
+// Mutex / ReentrantMutex: 空操作
+let m = Mutex()
+m.lock()                           // no-op
+m.unlock()                         // no-op
+m.tryLock()                        // 始终返回 true
+```
+
+| 并发原语 | 方法 | 实现策略 | 状态 |
+|----------|------|----------|------|
+| `spawn` | `spawn { block }` | 同步执行 block | [x] |
+| `synchronized` | `synchronized(lock) { block }` | 直接执行 block | [x] |
+| `AtomicInt64` | load, store, fetchAdd, compareAndSwap | 普通变量读写 | [x] |
+| `AtomicBool` | load, store, compareAndSwap | 普通变量读写 | [x] |
+| `Mutex` | lock, unlock, tryLock | 空操作 | [x] |
+| `ReentrantMutex` | lock, unlock, tryLock | 空操作 | [x] |
+
+### 14.5 Range 属性
+
+```cangjie
+let r = 5..10
+r.start   // 5
+r.end     // 10
+r.step    // 1 (默认)
+```
+
+| 属性 | 描述 | 状态 |
+|------|------|------|
+| `.start` | 起始值 (i64) | [x] |
+| `.end` | 结束值 (i64) | [x] |
+| `.step` | 步长 (i64) | [x] |
+
 ---
 
 ## 15. 实现状态
 
 *未完成特性的完整实施计划见 [docs/next_steps.md](next_steps.md)。*
 
-### 15.1 当前版本: v0.9.0
+### 15.1 当前版本: v1.0.0
 
-v0.9.0 完成了 Phase 1-10 全部阶段以及 WASI + 标准库。P2 核心语法扩展（static 成员、抽象方法、for-in 步长、动态 Array 构造、Array 实例方法、命名参数、String 方法）已完成。详见 [next_steps.md](next_steps.md)。
+v1.0.0 完成了 P3 面向对象扩展、P4 集合框架补全、P5 并发桩实现。36/36 系统测试通过，388 单元测试通过。详见 [next_steps.md](next_steps.md)。
 
 #### 已完成功能
 
@@ -1058,6 +1259,38 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 - [x] `open` / `static` 方法修饰符在类体内支持
 - [x] 上下文相关关键字处理（`main`、`where`、`type`、`is`、`case`、`with` 可作标识符使用）
 
+#### v1.0.0 新增完成功能 (P3-P5)
+
+**P3: 面向对象 + 类型系统扩展**
+
+- [x] 运算符重载 (`operator func +/-/*/==/</>/<=/>=/ []`)
+- [x] `is` 表达式（运行时类型检查，基于 class_id）
+- [x] match type pattern（`case x: Type => ...` 类型匹配 + 绑定）
+- [x] match where 守卫（`case v where cond => ...`）
+- [x] 方法重载（同名不同参数，基于参数类型的名字修饰）
+- [x] 嵌套数组 (`Array<Array<T>>`，动态 elem_size 判断)
+- [x] `extend` 内建类型（`extend Int64 { ... }`，方法合并为 `TypeName.methodName`）
+- [x] `static init()` 静态初始化块
+- [x] Option/Some/None、if let、??、元组、Lambda — 已有实现，验证通过
+
+**P4: 集合框架补全**
+
+- [x] HashMap<K,V>（put, get, containsKey, remove, size）
+- [x] HashSet<T>（add, contains, size，基于 HashMap）
+- [x] ArrayList<T>（append, get, set, remove, size）
+- [x] LinkedList<T>（append, prepend, get, size）
+- [x] ArrayStack<T>（push, pop, peek, size）
+- [x] Range 属性（.start, .end, .step）
+
+**P5: 并发与标准库（单线程桩）**
+
+- [x] `spawn { block }` — 同步执行 block
+- [x] `synchronized(lock) { block }` — 直接执行 block
+- [x] AtomicInt64（load, store, fetchAdd, compareAndSwap）
+- [x] AtomicBool（load, store, compareAndSwap）
+- [x] Mutex / ReentrantMutex（lock, unlock, tryLock — 空操作）
+- [x] `now()` 纳秒时间戳（基于 WASI clock_time_get）
+
 #### 未来版本计划
 
 - [x] Phase 7: WASI + 标准库（fd_write/fd_read/fd_close/args_get/clock_time_get/random_get, std.core/io/collections）
@@ -1123,5 +1356,8 @@ while     with
 
 ---
 
-*文档版本: 3.1.0*
-*最后更新: 2026-02-15（v0.9.0 完成，Phase 1-10 + WASI + 标准库全部完成；P2 核心语法扩展部分完成）*
+*文档版本: 4.0.0*
+*最后更新: 2026-02-16*
+*变更: P3 面向对象 + P4 集合框架 + P5 并发桩全部完成*
+*新增章节: 6.3 运算符重载, 6.4 extend 扩展, 6.5 静态初始化块, 14.3 集合类型, 14.4 并发原语, 14.5 Range 属性*
+*新增特性: operator func, is 表达式, match type pattern, match where, 方法重载, 嵌套数组, extend, static init, HashMap/HashSet/ArrayList/LinkedList/ArrayStack, Range 属性, spawn/synchronized (桩), AtomicInt64/AtomicBool (桩), Mutex/ReentrantMutex (桩), now() 时间戳*
