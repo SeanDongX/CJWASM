@@ -10,6 +10,12 @@ thiserror = "2.0"        # 错误处理
 ariadne = "0.4"          # 错误报告（漂亮的诊断信息）
 toml = "0.8"             # cjpm.toml 配置文件解析
 serde = { version = "1.0", features = ["derive"] }  # 序列化/反序列化
+serde_json = "1.0"                                   # JSON 序列化（宏系统 AST 交换）
+wasmtime = { version = "27", optional = true }       # 宏编译期执行引擎（可选）
+
+[features]
+default = []
+macro-system = ["wasmtime"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

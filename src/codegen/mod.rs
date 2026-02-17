@@ -9293,6 +9293,10 @@ impl CodeGen {
                     }
                 }
             }
+            Stmt::MacroExpand { .. } => {
+                // 宏展开在编译前已处理，到达 codegen 时应已替换为实际语句
+                // 若未展开则忽略（内建回退模式）
+            }
         }
     }
 
@@ -11916,6 +11920,16 @@ impl CodeGen {
                 };
                 self.compile_expr(&call_expr, locals, func, loop_ctx);
             }
+            Expr::Quote { .. } => {
+                // quote 表达式在宏编译阶段处理，不应出现在普通 codegen 中
+                // 降级为 i32(0)
+                func.instruction(&Instruction::I32Const(0));
+            }
+            Expr::MacroCall { .. } => {
+                // 宏调用在展开阶段已替换为实际 AST，到达 codegen 时应已消除
+                // 降级为 i32(0)
+                func.instruction(&Instruction::I32Const(0));
+            }
         }
     }
 }
@@ -12015,6 +12029,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "answer".to_string(),
@@ -12062,6 +12077,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "test".to_string(),
@@ -12126,6 +12142,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "get_y".to_string(),
@@ -12172,6 +12189,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "compute".to_string(),
@@ -12206,6 +12224,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "max".to_string(),
@@ -12256,6 +12275,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "first".to_string(),
@@ -12301,6 +12321,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "match_test".to_string(),
@@ -12349,6 +12370,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "sum_range".to_string(),
@@ -12402,6 +12424,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "fadd".to_string(),
@@ -12435,6 +12458,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
             functions: vec![
                 FuncDef {
                     visibility: Visibility::default(),

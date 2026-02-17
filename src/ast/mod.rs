@@ -1,7 +1,8 @@
+use serde::{Serialize, Deserialize};
 use wasm_encoder::ValType;
 
 /// 仓颉语言类型 (与 cjc release/1.0 对齐)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Type {
     Int8,
     Int16,
@@ -204,10 +205,150 @@ mod tests {
     fn test_range_heap_size() {
         assert_eq!(Type::range_heap_size(), 20);
     }
+
+    #[test]
+    fn test_type_serialize_roundtrip() {
+        let types = vec![
+            Type::Int64,
+            Type::Bool,
+            Type::String,
+            Type::Array(Box::new(Type::Float64)),
+            Type::Struct("Point".to_string(), vec![Type::Int64, Type::Float32]),
+            Type::Tuple(vec![Type::Int32, Type::String]),
+            Type::Option(Box::new(Type::Int64)),
+            Type::Result(Box::new(Type::Int64), Box::new(Type::String)),
+            Type::Function {
+                params: vec![Type::Int64, Type::Bool],
+                ret: Box::new(Some(Type::String)),
+            },
+            Type::Map(Box::new(Type::String), Box::new(Type::Int64)),
+            Type::TypeParam("T".to_string()),
+        ];
+        for ty in types {
+            let json = serde_json::to_string(&ty).unwrap();
+            let restored: Type = serde_json::from_str(&json).unwrap();
+            assert_eq!(ty, restored);
+        }
+    }
+
+    #[test]
+    fn test_expr_serialize_roundtrip() {
+        let exprs: Vec<Expr> = vec![
+            Expr::Integer(42),
+            Expr::Float(3.14),
+            Expr::Bool(true),
+            Expr::String("hello".to_string()),
+            Expr::Var("x".to_string()),
+            Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(2)),
+            },
+            Expr::Call {
+                name: "foo".to_string(),
+                type_args: None,
+                args: vec![Expr::Integer(10)],
+                named_args: vec![],
+            },
+            Expr::None,
+            Expr::Some(Box::new(Expr::Integer(99))),
+        ];
+        for expr in &exprs {
+            let json = serde_json::to_string(expr).unwrap();
+            let _restored: Expr = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_stmt_serialize_roundtrip() {
+        let stmts: Vec<Stmt> = vec![
+            Stmt::Let {
+                pattern: Pattern::Binding("x".to_string()),
+                ty: Some(Type::Int64),
+                value: Expr::Integer(42),
+            },
+            Stmt::Var {
+                name: "y".to_string(),
+                ty: None,
+                value: Expr::Bool(false),
+            },
+            Stmt::Return(Some(Expr::Integer(0))),
+            Stmt::Expr(Expr::Call {
+                name: "println".to_string(),
+                type_args: None,
+                args: vec![Expr::String("hi".to_string())],
+                named_args: vec![],
+            }),
+        ];
+        for stmt in &stmts {
+            let json = serde_json::to_string(stmt).unwrap();
+            let _restored: Stmt = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_program_serialize_roundtrip() {
+        let program = Program {
+            package_name: Some("test".to_string()),
+            imports: vec![],
+            structs: vec![StructDef {
+                visibility: Visibility::Public,
+                name: "Point".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                fields: vec![
+                    FieldDef { name: "x".to_string(), ty: Type::Int64, default: None },
+                    FieldDef { name: "y".to_string(), ty: Type::Int64, default: None },
+                ],
+            }],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: Visibility::Internal,
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            macros: vec![],
+        };
+        let json = serde_json::to_string_pretty(&program).unwrap();
+        let restored: Program = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.package_name, program.package_name);
+        assert_eq!(restored.structs.len(), 1);
+        assert_eq!(restored.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_macro_def_serialize() {
+        let macro_def = MacroDef {
+            visibility: Visibility::Public,
+            name: "Assert".to_string(),
+            params: vec![Param {
+                name: "args".to_string(),
+                ty: Type::String,
+                default: None,
+                variadic: false,
+                is_named: false,
+                is_inout: false,
+            }],
+            body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+        };
+        let json = serde_json::to_string(&macro_def).unwrap();
+        let restored: MacroDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.name, "Assert");
+    }
 }
 
 /// 一元运算符
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UnaryOp {
     Not,     // !
     Neg,     // - 负号
@@ -215,7 +356,7 @@ pub enum UnaryOp {
 }
 
 /// 二元运算符 (与 cjc release/1.0 对齐, 移除 >>>)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BinOp {
     Add,    // +
     Sub,    // -
@@ -240,7 +381,7 @@ pub enum BinOp {
 }
 
 /// 字符串插值的部分
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InterpolatePart {
     /// 字面量文本
     Literal(String),
@@ -249,7 +390,7 @@ pub enum InterpolatePart {
 }
 
 /// 表达式
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
     /// 整数字面量
     Integer(i64),
@@ -442,10 +583,22 @@ pub enum Expr {
         args: Vec<Expr>,
         closure: Box<Expr>,
     },
+    /// M2: quote 表达式 — 编译时构造 AST 片段
+    /// quote(stmts) → 将 stmts 序列化为 AST JSON
+    Quote {
+        body: Vec<Stmt>,
+        /// quote 内的 $(expr) 插值位置
+        splices: Vec<(usize, Expr)>,
+    },
+    /// M2: 宏调用 @MacroName[args] 或 @MacroName(args)
+    MacroCall {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// match 分支
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchArm {
     pub pattern: Pattern,
     pub guard: Option<Box<Expr>>,  // if 守卫条件
@@ -453,7 +606,7 @@ pub struct MatchArm {
 }
 
 /// 模式
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Pattern {
     /// 通配符 _
     Wildcard,
@@ -491,7 +644,7 @@ pub enum Pattern {
 }
 
 /// 字面量值 (用于模式匹配)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Literal {
     Integer(i64),
     Float(f64),
@@ -501,7 +654,7 @@ pub enum Literal {
 }
 
 /// 语句
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Stmt {
     /// let 绑定 (不可变)，pattern 为 Binding(name) 或 Struct 解构
     Let {
@@ -570,10 +723,15 @@ pub enum Stmt {
         ty: Option<Type>,
         value: Expr,
     },
+    /// M2: 宏展开后的语句序列（宏调用展开为此节点，再内联到 AST）
+    MacroExpand {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// 赋值目标
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AssignTarget {
     /// 变量
     Var(String),
@@ -584,7 +742,7 @@ pub enum AssignTarget {
 }
 
 /// 结构体字段定义
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDef {
     pub name: String,
     pub ty: Type,
@@ -593,7 +751,7 @@ pub struct FieldDef {
 }
 
 /// 结构体定义
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructDef {
     pub visibility: Visibility,
     pub name: String,
@@ -629,7 +787,7 @@ impl StructDef {
 }
 
 /// 函数参数（可选默认值、可变参数）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
@@ -645,7 +803,7 @@ pub struct Param {
 
 /// 函数定义
 /// 外部函数导入：WASM 从宿主导入 (module, name)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExternImport {
     /// 模块名，如 "env"、"wasi_snapshot_preview1"
     pub module: String,
@@ -653,7 +811,7 @@ pub struct ExternImport {
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Function {
     pub visibility: Visibility,
     pub name: String,
@@ -671,7 +829,7 @@ pub struct Function {
 }
 
 /// 枚举变体（可选关联类型）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnumVariant {
     pub name: String,
     /// 关联值类型，如 Ok(Int64) 的 Int64
@@ -679,7 +837,7 @@ pub struct EnumVariant {
 }
 
 /// 接口方法签名（可选默认实现）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceMethod {
     pub name: String,
     pub params: Vec<Param>,
@@ -689,13 +847,13 @@ pub struct InterfaceMethod {
 }
 
 /// 接口关联类型定义（如 type Element）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssocTypeDef {
     pub name: String,
 }
 
 /// 接口定义
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceDef {
     pub visibility: Visibility,
     pub name: String,
@@ -708,7 +866,7 @@ pub struct InterfaceDef {
 
 /// 扩展定义（为已有类型追加方法/实现接口）
 /// extend TypeName: InterfaceName { ... }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendDef {
     /// 被扩展的类型名
     pub target_type: String,
@@ -721,7 +879,7 @@ pub struct ExtendDef {
 }
 
 /// 类定义（支持继承、init、override、super、abstract、sealed）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassDef {
     pub visibility: Visibility,
     pub name: String,
@@ -754,21 +912,21 @@ pub struct ClassDef {
 }
 
 /// 构造函数定义
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitDef {
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
 }
 
 /// 类方法（含 override 标记）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassMethod {
     pub override_: bool,
     pub func: Function,
 }
 
 /// 属性定义（getter/setter）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PropDef {
     pub name: String,
     pub ty: Type,
@@ -777,7 +935,7 @@ pub struct PropDef {
 }
 
 /// 类型参数约束：<T: Comparable & Hashable>
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeConstraint {
     /// 类型参数名（如 "T"）
     pub param: String,
@@ -786,7 +944,7 @@ pub struct TypeConstraint {
 }
 
 /// 枚举定义（支持无关联值或单关联值变体，支持泛型）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnumDef {
     pub visibility: Visibility,
     pub name: String,
@@ -823,7 +981,7 @@ impl EnumDef {
 }
 
 /// 可见性修饰符 (与 cjc release/1.0 对齐)
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum Visibility {
     #[default]
     Internal,
@@ -834,7 +992,7 @@ pub enum Visibility {
 }
 
 /// 导入项
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Import {
     /// 导入的模块路径，如 "std.io"
     pub module_path: Vec<String>,
@@ -844,8 +1002,17 @@ pub struct Import {
     pub alias: Option<String>,
 }
 
+/// 宏函数定义
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MacroDef {
+    pub visibility: Visibility,
+    pub name: String,
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+}
+
 /// 程序 (包, 与 cjc release/1.0 对齐)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Program {
     /// 包名称，None 表示主包 (cjc: package)
     pub package_name: Option<String>,
@@ -860,4 +1027,6 @@ pub struct Program {
     pub extends: Vec<ExtendDef>,
     /// P2.2: 类型别名 (type Name = Type)
     pub type_aliases: Vec<(String, Type)>,
+    /// M2: 宏函数定义
+    pub macros: Vec<MacroDef>,
 }

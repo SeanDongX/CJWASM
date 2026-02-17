@@ -243,6 +243,17 @@ fn cmd_compile(args: &[String]) {
         pipeline::merge_programs(programs)
     };
 
+    // M5: 宏展开阶段
+    if cjwasm::macro_expand::program_has_macros(&program) {
+        let expander = cjwasm::macro_expand::MacroExpander::new(&program);
+        if let Err(errs) = expander.expand_program(&mut program) {
+            for e in &errs {
+                eprintln!("宏展开错误: {}", e);
+            }
+            std::process::exit(1);
+        }
+    }
+
     cjwasm::optimizer::optimize_program(&mut program);
     cjwasm::monomorph::monomorphize_program(&mut program);
 

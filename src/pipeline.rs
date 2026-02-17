@@ -42,6 +42,7 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
         functions: vec![],
         extends: vec![],
         type_aliases: vec![],
+        macros: vec![],
     };
 
     for prog in programs {
@@ -56,6 +57,7 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
         merged.functions.extend(prog.functions);
         merged.extends.extend(prog.extends);
         merged.type_aliases.extend(prog.type_aliases);
+        merged.macros.extend(prog.macros);
     }
 
     merged
@@ -118,6 +120,20 @@ pub fn collect_import_files(
 /// 完整编译流水线：源代码 -> WASM 字节码
 pub fn compile_source_to_wasm(source: &str) -> Result<Vec<u8>, String> {
     let mut program = parse_source(source)?;
+
+    // M5: 宏展开阶段 — 在优化和单态化之前执行
+    if crate::macro_expand::program_has_macros(&program) {
+        let expander = crate::macro_expand::MacroExpander::new(&program);
+        expander
+            .expand_program(&mut program)
+            .map_err(|errs| {
+                errs.iter()
+                    .map(|e| format!("{}", e))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+    }
+
     crate::optimizer::optimize_program(&mut program);
     crate::monomorph::monomorphize_program(&mut program);
     let mut codegen = CodeGen::new();
@@ -137,6 +153,19 @@ pub fn compile_files_to_wasm(files: &[&str]) -> Result<Vec<u8>, String> {
     } else {
         merge_programs(programs)
     };
+
+    // M5: 宏展开阶段
+    if crate::macro_expand::program_has_macros(&program) {
+        let expander = crate::macro_expand::MacroExpander::new(&program);
+        expander
+            .expand_program(&mut program)
+            .map_err(|errs| {
+                errs.iter()
+                    .map(|e| format!("{}", e))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })?;
+    }
 
     crate::optimizer::optimize_program(&mut program);
     crate::monomorph::monomorphize_program(&mut program);
@@ -397,5 +426,49 @@ mod tests {
         "#;
         let wasm = compile_source_to_wasm(source).unwrap();
         assert!(wasm.len() >= 8);
+    }
+
+    #[test]
+    fn test_parse_macro_def() {
+        let source = r#"
+            public macro func MyLog(args: String): String {
+                return quote(
+                    println("log")
+                )
+            }
+            func main(): Int64 { return 0 }
+        "#;
+        let program = parse_source(source).unwrap();
+        assert_eq!(program.macros.len(), 1);
+        assert_eq!(program.macros[0].name, "MyLog");
+        assert_eq!(program.macros[0].params.len(), 1);
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_macro_call_bracket() {
+        let source = r#"
+            func main(): Int64 {
+                @MyLog["hello"]
+                return 0
+            }
+        "#;
+        let program = parse_source(source).unwrap();
+        assert_eq!(program.functions.len(), 1);
+        let body = &program.functions[0].body;
+        assert!(body.len() >= 2);
+    }
+
+    #[test]
+    fn test_parse_macro_call_paren() {
+        let source = r#"
+            func main(): Int64 {
+                @MyLog("hello", 42)
+                return 0
+            }
+        "#;
+        let program = parse_source(source).unwrap();
+        let body = &program.functions[0].body;
+        assert!(body.len() >= 2);
     }
 }

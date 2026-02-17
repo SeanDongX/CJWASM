@@ -178,6 +178,7 @@ impl Parser {
         let mut enums = Vec::new();
         let mut extends = Vec::new();
         let mut type_aliases: Vec<(String, Type)> = Vec::new();
+        let mut macros = Vec::new();
 
         // 解析可选的 package 声明（cjc: package prefix.path，支持点分路径）
         if self.check(&Token::Package) {
@@ -257,6 +258,8 @@ impl Parser {
                         type_aliases.push((alias_name, target_ty));
                     }
                     Some(Token::Func) => functions.push(self.parse_function_with_visibility(visibility)?),
+                    // M2: macro func 声明
+                    Some(Token::Macro) => macros.push(self.parse_macro_def(visibility)?),
                     // cjc: main() 无需 func 关键字 (main 是保留字)
                     Some(Token::Main) => {
                         functions.push(self.parse_main_function(visibility)?);
@@ -282,6 +285,7 @@ impl Parser {
             functions,
             extends,
             type_aliases,
+            macros,
         })
     }
 
@@ -1307,6 +1311,63 @@ impl Parser {
         Ok(class_def)
     }
 
+    /// M2: 解析宏函数定义 `macro func name(params): Tokens { body }`
+    fn parse_macro_def(&mut self, visibility: Visibility) -> Result<MacroDef, ParseErrorAt> {
+        self.expect(Token::Macro)?;
+        self.expect(Token::Func)?;
+
+        let name = match self.advance_ident() {
+            Some(n) => n,
+            None => {
+                let tok = self.advance().unwrap_or(Token::Semicolon);
+                return self.bail(ParseError::UnexpectedToken(tok, "宏名称".to_string()));
+            }
+        };
+
+        self.expect(Token::LParen)?;
+        let mut params = Vec::new();
+        while !self.check(&Token::RParen) {
+            let param_name = match self.advance_ident() {
+                Some(n) => n,
+                None => break,
+            };
+            self.expect(Token::Colon)?;
+            let param_ty = self.parse_type()?;
+            params.push(Param {
+                name: param_name,
+                ty: param_ty,
+                default: None,
+                variadic: false,
+                is_named: false,
+                is_inout: false,
+            });
+            if !self.check(&Token::RParen) {
+                self.expect(Token::Comma)?;
+            }
+        }
+        self.expect(Token::RParen)?;
+
+        // 可选返回类型 `: Tokens`
+        if self.check(&Token::Colon) {
+            self.advance();
+            let _ret_ty = self.parse_type()?;
+        }
+
+        self.expect(Token::LBrace)?;
+        let mut body = Vec::new();
+        while !self.check(&Token::RBrace) {
+            body.push(self.parse_stmt()?);
+        }
+        self.expect(Token::RBrace)?;
+
+        Ok(MacroDef {
+            visibility,
+            name,
+            params,
+            body,
+        })
+    }
+
     /// 解析函数定义（支持方法名 StructName.methodName）
     fn parse_function(&mut self) -> Result<Function, ParseErrorAt> {
         self.parse_function_with_visibility(Visibility::default())
@@ -1912,8 +1973,36 @@ impl Parser {
                             Ok(Stmt::Expect { left, right, line: at_start })
                         }
                     }
+                    // M2: 用户自定义宏调用 @MacroName[args] 或 @MacroName(args)
+                    Some(Token::Ident(name)) => {
+                        let macro_name = name.clone();
+                        self.advance(); // consume macro name
+                        let mut args = Vec::new();
+                        if self.check(&Token::LBracket) {
+                            // @MacroName[arg1, arg2, ...]
+                            self.advance();
+                            while !self.check(&Token::RBracket) {
+                                args.push(self.parse_expr()?);
+                                if !self.check(&Token::RBracket) {
+                                    let _ = self.check(&Token::Comma) && { self.advance(); true };
+                                }
+                            }
+                            self.expect(Token::RBracket)?;
+                        } else if self.check(&Token::LParen) {
+                            // @MacroName(arg1, arg2, ...)
+                            self.advance();
+                            while !self.check(&Token::RParen) {
+                                args.push(self.parse_expr()?);
+                                if !self.check(&Token::RParen) {
+                                    let _ = self.check(&Token::Comma) && { self.advance(); true };
+                                }
+                            }
+                            self.expect(Token::RParen)?;
+                        }
+                        Ok(Stmt::MacroExpand { name: macro_name, args })
+                    }
                     _ => {
-                        self.bail(ParseError::UnexpectedToken(Token::At, "@Assert 或 @Expect".to_string()))
+                        self.bail(ParseError::UnexpectedToken(Token::At, "@Assert、@Expect 或 @宏名".to_string()))
                     }
                 }
             }
@@ -2943,6 +3032,20 @@ impl Parser {
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
                 Ok(Expr::Spawn { body })
+            }
+            // M2: quote(stmts) — 编译时 AST 构建
+            Some(Token::Quote) => {
+                self.expect(Token::LParen)?;
+                let mut body = Vec::new();
+                while !self.check(&Token::RParen) {
+                    body.push(self.parse_stmt()?);
+                    // 允许可选分号
+                    if self.check(&Token::Semicolon) {
+                        self.advance();
+                    }
+                }
+                self.expect(Token::RParen)?;
+                Ok(Expr::Quote { body, splices: vec![] })
             }
             // P5.2: synchronized(lock) { block } — 单线程桩实现
             Some(Token::Synchronized) => {

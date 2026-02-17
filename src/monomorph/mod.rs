@@ -565,6 +565,10 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
             ty: ty.map(|t| substitute_type(&t, subst)),
             value: substitute_expr(value, subst, rewrites),
         },
+        MacroExpand { name, args } => MacroExpand {
+            name,
+            args: args.into_iter().map(|e| substitute_expr(e, subst, rewrites)).collect(),
+        },
     }
 }
 
@@ -1412,6 +1416,7 @@ mod tests {
             functions: vec![],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
         };
         monomorphize_program(&mut program);
         assert!(program.functions.is_empty());
@@ -1439,6 +1444,7 @@ mod tests {
             }],
             extends: vec![],
             type_aliases: vec![],
+            macros: vec![],
         };
         monomorphize_program(&mut program);
         assert_eq!(program.functions.len(), 1);
