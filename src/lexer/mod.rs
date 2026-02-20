@@ -194,6 +194,7 @@ pub enum StringOrInterpolated {
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(skip r"[ \t\r\n]+")]  // 跳过空白
 #[logos(skip r"//[^\n]*")]    // 跳过单行注释
+#[logos(skip r"/\*([^*]|\*[^/])*\*/")]  // 跳过块注释 /* ... */
 pub enum Token {
     // 关键字
     #[token("func")]
@@ -401,6 +402,46 @@ pub enum Token {
         s.parse::<f32>().ok()
     })]
     Float32(f32),
+
+    // Float32 带显式后缀 f32 (如 32.099998f32)
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f32|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f32|[0-9][0-9_]*f32", priority = 4, callback = |lex| {
+        let slice = lex.slice();
+        let s: String = slice[..slice.len()-3].chars().filter(|c| *c != '_').collect();
+        s.parse::<f32>().ok()
+    })]
+    Float32Suffix(f32),
+
+    // Float16 带显式后缀 f16 (如 16.09375f16)
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f16|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f16|[0-9][0-9_]*f16", priority = 4, callback = |lex| {
+        let slice = lex.slice();
+        let s: String = slice[..slice.len()-3].chars().filter(|c| *c != '_').collect();
+        s.parse::<f32>().ok()  // 存储为 f32，后续转换
+    })]
+    Float16Suffix(f32),
+
+    // Int32 带显式后缀 i32 (如 32i32)
+    #[regex(r"[0-9][0-9_]*i32", priority = 4, callback = |lex| {
+        let slice = lex.slice();
+        let s: String = slice[..slice.len()-3].chars().filter(|c| *c != '_').collect();
+        s.parse::<i32>().ok()
+    })]
+    Int32Suffix(i32),
+
+    // Int16 带显式后缀 i16 (如 16i16)
+    #[regex(r"[0-9][0-9_]*i16", priority = 4, callback = |lex| {
+        let slice = lex.slice();
+        let s: String = slice[..slice.len()-3].chars().filter(|c| *c != '_').collect();
+        s.parse::<i16>().ok()
+    })]
+    Int16Suffix(i16),
+
+    // Int8 带显式后缀 i8 (如 8i8)
+    #[regex(r"[0-9][0-9_]*i8", priority = 4, callback = |lex| {
+        let slice = lex.slice();
+        let s: String = slice[..slice.len()-2].chars().filter(|c| *c != '_').collect();
+        s.parse::<i8>().ok()
+    })]
+    Int8Suffix(i8),
 
     #[regex(r"0x[0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*", |lex| {
         let slice = lex.slice();

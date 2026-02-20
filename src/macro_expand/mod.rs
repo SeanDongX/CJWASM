@@ -9,12 +9,20 @@
 //! 当 `macro-system` feature 未启用时，使用纯 AST 层面的内建宏展开。
 
 pub mod builtin;
+pub mod std_ast;
 
 #[cfg(feature = "macro-system")]
 pub mod runtime;
 
 use crate::ast::{Expr, MacroDef, Program, Stmt};
 use std::collections::HashMap;
+
+/// 宏间通信消息
+#[derive(Debug, Clone)]
+pub struct MacroMessage {
+    pub key: String,
+    pub value: String,
+}
 
 /// 宏展开器
 pub struct MacroExpander {
@@ -23,6 +31,8 @@ pub struct MacroExpander {
     /// 编译后的 WASM 字节码（名称 → bytes）— 仅 macro-system feature
     #[cfg(feature = "macro-system")]
     wasm_modules: HashMap<String, Vec<u8>>,
+    /// C4.3: 宏间通信消息存储（宏名 → 消息列表）
+    messages: HashMap<String, Vec<MacroMessage>>,
 }
 
 /// 宏展开错误
@@ -75,7 +85,28 @@ impl MacroExpander {
             macro_defs,
             #[cfg(feature = "macro-system")]
             wasm_modules,
+            messages: HashMap::new(),
         }
+    }
+
+    /// C4.3: 设置宏间通信消息
+    pub fn set_message(&mut self, macro_name: &str, key: &str, value: &str) {
+        let msg = MacroMessage {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        self.messages
+            .entry(macro_name.to_string())
+            .or_default()
+            .push(msg);
+    }
+
+    /// C4.3: 获取子宏消息
+    pub fn get_child_messages(&self, macro_name: &str) -> Vec<&MacroMessage> {
+        self.messages
+            .get(macro_name)
+            .map(|msgs| msgs.iter().collect())
+            .unwrap_or_default()
     }
 
     /// 展开 Program 中所有宏调用
@@ -272,7 +303,51 @@ impl MacroExpander {
                 stmts.iter().map(|s| self.substitute_stmt(s, params)).collect(),
                 tail.as_ref().map(|e| Box::new(self.substitute_expr(e, params))),
             ),
+            // C3: quote 体内递归替换
+            Expr::Quote { body, splices, raw_tokens } => Expr::Quote {
+                body: body.iter().map(|s| self.substitute_stmt(s, params)).collect(),
+                splices: splices.clone(),
+                raw_tokens: raw_tokens.clone(),
+            },
+            // C3: splice 内递归替换
+            Expr::Splice { expr: inner } => {
+                let substituted = self.substitute_expr(inner, params);
+                // 如果 splice 内的表达式求值后是一个变量引用并且已替换，直接返回
+                Expr::Splice { expr: Box::new(substituted) }
+            }
+            Expr::MethodCall { object, method, args, named_args } => Expr::MethodCall {
+                object: Box::new(self.substitute_expr(object, params)),
+                method: method.clone(),
+                args: args.iter().map(|a| self.substitute_expr(a, params)).collect(),
+                named_args: named_args.clone(),
+            },
+            Expr::Field { object, field } => Expr::Field {
+                object: Box::new(self.substitute_expr(object, params)),
+                field: field.clone(),
+            },
             _ => expr.clone(),
+        }
+    }
+
+    /// C3.4: 合并两个 Quote 表达式的 body（Tokens + 运算）
+    pub fn concat_quotes(left: &Expr, right: &Expr) -> Expr {
+        match (left, right) {
+            (Expr::Quote { body: b1, raw_tokens: r1, .. }, Expr::Quote { body: b2, raw_tokens: r2, .. }) => {
+                let mut merged_body = b1.clone();
+                merged_body.extend(b2.clone());
+                let merged_raw = match (r1, r2) {
+                    (Some(a), Some(b)) => Some(format!("{} {}", a, b)),
+                    (Some(a), None) => Some(a.clone()),
+                    (None, Some(b)) => Some(b.clone()),
+                    (None, None) => None,
+                };
+                Expr::Quote { body: merged_body, splices: vec![], raw_tokens: merged_raw }
+            }
+            _ => Expr::Binary {
+                op: crate::ast::BinOp::Add,
+                left: Box::new(left.clone()),
+                right: Box::new(right.clone()),
+            },
         }
     }
 }
@@ -308,6 +383,8 @@ mod tests {
     fn test_expander_no_macros() {
         let mut program = Program {
             package_name: None,
+            is_macro_package: false,
+            global_vars: vec![],
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -336,6 +413,8 @@ mod tests {
     fn test_expander_simple_quote_macro() {
         let mut program = Program {
             package_name: None,
+            is_macro_package: false,
+            global_vars: vec![],
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -379,6 +458,7 @@ mod tests {
                         named_args: vec![],
                     })],
                     splices: vec![],
+                    raw_tokens: None,
                 }))],
             }],
         };
@@ -406,6 +486,8 @@ mod tests {
     fn test_expander_undefined_macro() {
         let mut program = Program {
             package_name: None,
+            is_macro_package: false,
+            global_vars: vec![],
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -441,6 +523,8 @@ mod tests {
     fn test_program_has_macros_false() {
         let program = Program {
             package_name: None,
+            is_macro_package: false,
+            global_vars: vec![],
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -458,6 +542,8 @@ mod tests {
     fn test_program_has_macros_with_def() {
         let program = Program {
             package_name: None,
+            is_macro_package: false,
+            global_vars: vec![],
             imports: vec![],
             structs: vec![],
             interfaces: vec![],

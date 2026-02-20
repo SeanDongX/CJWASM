@@ -243,6 +243,19 @@ fn cmd_compile(args: &[String]) {
         pipeline::merge_programs(programs)
     };
 
+    // 注入 JSON 标准库（如果有 import stdx.encoding.json）
+    let needs_json_stdlib = program.imports.iter().any(|imp| {
+        let path = imp.module_path.join(".");
+        path.starts_with("stdx.encoding.json")
+    });
+    if needs_json_stdlib {
+        let json_stdlib = cjwasm::stdlib::json::generate_json_stdlib();
+        json_stdlib.inject_into(&mut program);
+    }
+    if program.imports.iter().any(|imp| imp.module_path.join(".").starts_with("std.time")) {
+        cjwasm::stdlib::time::generate_time_stdlib().inject_into(&mut program);
+    }
+
     // M5: 宏展开阶段
     if cjwasm::macro_expand::program_has_macros(&program) {
         let expander = cjwasm::macro_expand::MacroExpander::new(&program);

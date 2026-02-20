@@ -1,0 +1,5 @@
+[package]
+name = "cjson_test"
+version = "1.0.0"
+output-type = "executable"
+description = "CJson-style JSON serialization demo for cjwasm"

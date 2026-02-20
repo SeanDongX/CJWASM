@@ -235,6 +235,19 @@ pub fn build(opts: &BuildOptions) -> Result<BuildResult, String> {
         crate::pipeline::merge_programs(programs)
     };
 
+    // 注入 JSON 标准库（如果有 import stdx.encoding.json）
+    let needs_json_stdlib = program.imports.iter().any(|imp| {
+        let path = imp.module_path.join(".");
+        path.starts_with("stdx.encoding.json")
+    });
+    if needs_json_stdlib {
+        let json_stdlib = crate::stdlib::json::generate_json_stdlib();
+        json_stdlib.inject_into(&mut program);
+    }
+    if program.imports.iter().any(|imp| imp.module_path.join(".").starts_with("std.time")) {
+        crate::stdlib::time::generate_time_stdlib().inject_into(&mut program);
+    }
+
     // 优化 + 单态化
     crate::optimizer::optimize_program(&mut program);
     crate::monomorph::monomorphize_program(&mut program);

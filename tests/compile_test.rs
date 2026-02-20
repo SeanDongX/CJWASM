@@ -3572,3 +3572,346 @@ fn test_memory_comprehensive() {
     assert_valid_wasm(&wasm, "memory_comprehensive");
     assert_has_memory_exports(&wasm);
 }
+
+// =============================================================
+// Phase C6: CJson 支持 — 集成测试
+// =============================================================
+
+/// C1.1: internal import 解析
+#[test]
+fn test_parse_internal_import() {
+    let source = r#"
+        internal import std.ast.*
+        import std.collection.*
+        public import my.lib.utils
+        func main(): Int64 { return 0 }
+    "#;
+    let result = compile_source_result(source);
+    assert!(result.is_ok(), "internal import 解析失败: {:?}", result.err());
+}
+
+/// C1.2: static let/var 字段
+#[test]
+fn test_parse_static_fields() {
+    let source = r#"
+        class Config {
+            static var count: Int64;
+            static let MAX: Int64 = 100;
+            var name: String;
+            init(n: String) {
+                this.name = n
+            }
+        }
+        func main(): Int64 { return 0 }
+    "#;
+    let result = compile_source_result(source);
+    assert!(result.is_ok(), "static 字段解析失败: {:?}", result.err());
+}
+
+/// C1.3: 泛型 extend
+#[test]
+fn test_parse_generic_extend() {
+    let source = r#"
+        struct Box { value: Int64 }
+        extend Box <: Comparable {
+            func compareTo(other: Box): Int64 {
+                return this.value
+            }
+        }
+        func main(): Int64 { return 0 }
+    "#;
+    let result = compile_source_result(source);
+    assert!(result.is_ok(), "泛型 extend 解析失败: {:?}", result.err());
+}
+
+/// C1.4: 多类型 catch
+#[test]
+fn test_parse_multi_type_catch() {
+    let source = r#"
+        func main(): Int64 {
+            let result = try {
+                return 42
+            } catch(e: IOException | ParseException) {
+                return -1
+            } finally {
+                let x = 0
+            }
+            return 0
+        }
+    "#;
+    let result = compile_source_result(source);
+    assert!(result.is_ok(), "多类型 catch 解析失败: {:?}", result.err());
+}
+
+/// C2.1: macro package 声明
+#[test]
+fn test_parse_macro_package() {
+    let source = r#"
+        macro package cjson_serializer
+        func helper(): Int64 { return 0 }
+    "#;
+    let lexer = Lexer::new(source);
+    let tokens: Vec<_> = lexer.collect::<Result<Vec<_>, _>>().unwrap();
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse_program().unwrap();
+    assert!(program.is_macro_package);
+    assert_eq!(program.package_name.as_deref(), Some("cjson_serializer"));
+}
+
+/// C2.2: macro 函数 (无 func 关键字)
+#[test]
+fn test_parse_macro_without_func() {
+    let source = r#"
+        public macro JsonSerializable(input_Tk: String): String {
+            return quote(
+                let x = 1
+            )
+        }
+        func main(): Int64 { return 0 }
+    "#;
+    let lexer = Lexer::new(source);
+    let tokens: Vec<_> = lexer.collect::<Result<Vec<_>, _>>().unwrap();
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse_program().unwrap();
+    assert_eq!(program.macros.len(), 1);
+    assert_eq!(program.macros[0].name, "JsonSerializable");
+}
+
+/// C2.3: Tokens 参数和返回类型
+#[test]
+fn test_parse_tokens_type() {
+    let source = r#"
+        public macro MyMacro(input: Tokens): Tokens {
+            return quote(
+                let x = 1
+            )
+        }
+        func main(): Int64 { return 0 }
+    "#;
+    let lexer = Lexer::new(source);
+    let tokens: Vec<_> = lexer.collect::<Result<Vec<_>, _>>().unwrap();
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse_program().unwrap();
+    assert_eq!(program.macros.len(), 1);
+    assert_eq!(program.macros[0].params[0].ty, cjwasm::ast::Type::Tokens);
+}
+
+/// C3.1: $variable 拼接
+#[test]
+fn test_parse_dollar_splice() {
+    let source = r#"
+        func main(): Int64 {
+            let x = $myVar
+            return 0
+        }
+    "#;
+    let lexer = Lexer::new(source);
+    let tokens: Vec<_> = lexer.collect::<Result<Vec<_>, _>>().unwrap();
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse_program().unwrap();
+    let body = &program.functions[0].body;
+    match &body[0] {
+        cjwasm::ast::Stmt::Let { value, .. } => {
+            match value {
+                cjwasm::ast::Expr::Splice { expr } => {
+                    match expr.as_ref() {
+                        cjwasm::ast::Expr::Var(name) => assert_eq!(name, "myVar"),
+                        _ => panic!("Expected Var inside Splice"),
+                    }
+                }
+                _ => panic!("Expected Splice expression"),
+            }
+        }
+        _ => panic!("Expected Let statement"),
+    }
+}
+
+/// C3.2: $(expr) 表达式拼接
+#[test]
+fn test_parse_dollar_expr_splice() {
+    let source = r#"
+        func main(): Int64 {
+            let x = $(foo())
+            return 0
+        }
+    "#;
+    let lexer = Lexer::new(source);
+    let tokens: Vec<_> = lexer.collect::<Result<Vec<_>, _>>().unwrap();
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse_program().unwrap();
+    let body = &program.functions[0].body;
+    match &body[0] {
+        cjwasm::ast::Stmt::Let { value, .. } => {
+            assert!(matches!(value, cjwasm::ast::Expr::Splice { .. }));
+        }
+        _ => panic!("Expected Let with Splice"),
+    }
+}
+
+/// C4: std.ast API — Visitor 遍历
+#[test]
+fn test_std_ast_visitor_integration() {
+    use cjwasm::macro_expand::std_ast::*;
+
+    let class_def = cjwasm::ast::ClassDef {
+        visibility: cjwasm::ast::Visibility::Public,
+        name: "Person".to_string(),
+        type_params: vec![],
+        constraints: vec![],
+        is_abstract: false,
+        is_sealed: false,
+        is_open: false,
+        extends: None,
+        implements: vec![],
+        fields: vec![
+            cjwasm::ast::FieldDef {
+                name: "name".to_string(),
+                ty: cjwasm::ast::Type::String,
+                default: None,
+                is_static: false,
+            },
+            cjwasm::ast::FieldDef {
+                name: "age".to_string(),
+                ty: cjwasm::ast::Type::Int64,
+                default: None,
+                is_static: false,
+            },
+        ],
+        init: None,
+        deinit: None,
+        static_init: None,
+        methods: vec![],
+        primary_ctor_params: vec![],
+    };
+
+    let macro_class = MacroClassDecl::from_class_def(&class_def);
+    let node = AstNode::ClassDecl(macro_class);
+
+    struct FieldCollector {
+        fields: Vec<String>,
+        stopped: bool,
+    }
+    impl AstVisitor for FieldCollector {
+        fn visit_var_decl(&mut self, decl: &MacroVarDecl) -> bool {
+            self.fields.push(decl.identifier.to_string_repr());
+            !self.stopped
+        }
+        fn break_traverse(&mut self) {
+            self.stopped = true;
+        }
+    }
+
+    let mut visitor = FieldCollector {
+        fields: vec![],
+        stopped: false,
+    };
+    node.traverse(&mut visitor);
+    assert_eq!(visitor.fields, vec!["name", "age"]);
+}
+
+/// C5: JSON 标准库注入
+#[test]
+fn test_json_stdlib_injection() {
+    use cjwasm::stdlib::json::generate_json_stdlib;
+
+    let source = "func main(): Int64 { return 0 }";
+    let mut program = cjwasm::pipeline::parse_source(source).unwrap();
+    let stdlib = generate_json_stdlib();
+    stdlib.inject_into(&mut program);
+
+    assert!(program.interfaces.iter().any(|i| i.name == "JsonValue"));
+    assert!(program.interfaces.iter().any(|i| i.name == "IJsonSerializable"));
+    assert!(program.classes.iter().any(|c| c.name == "JsonObject"));
+    assert!(program.classes.iter().any(|c| c.name == "JsonArray"));
+    assert!(program.classes.iter().any(|c| c.name == "JsonString"));
+    assert!(program.classes.iter().any(|c| c.name == "JsonInt"));
+    assert!(program.classes.iter().any(|c| c.name == "JsonFloat"));
+    assert!(program.classes.iter().any(|c| c.name == "JsonBool"));
+    assert!(program.classes.iter().any(|c| c.name == "JsonNull"));
+}
+
+/// C4.3: 宏间通信
+#[test]
+fn test_macro_message_passing() {
+    let program = cjwasm::ast::Program {
+        package_name: None,
+        is_macro_package: false,
+        global_vars: vec![],
+        imports: vec![],
+        structs: vec![],
+        interfaces: vec![],
+        classes: vec![],
+        enums: vec![],
+        functions: vec![],
+        extends: vec![],
+        type_aliases: vec![],
+        macros: vec![],
+    };
+    let mut expander = cjwasm::macro_expand::MacroExpander::new(&program);
+    expander.set_message("JsonCust", "config", "skip_null=true");
+    expander.set_message("JsonCust", "config2", "format=pretty");
+    let msgs = expander.get_child_messages("JsonCust");
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].key, "config");
+    assert_eq!(msgs[0].value, "skip_null=true");
+}
+
+/// C6.3: 回归测试 — 确保所有现有功能不受影响
+#[test]
+fn test_regression_basic_features() {
+    let source = r#"
+        struct Point { x: Int64, y: Int64 }
+
+        enum Color {
+            Red
+            Green
+            Blue
+        }
+
+        interface Drawable {
+            func draw(): Int64;
+        }
+
+        extend Point <: Drawable {
+            func draw(): Int64 {
+                return this.x + this.y
+            }
+        }
+
+        func add(a: Int64, b: Int64): Int64 { return a + b }
+
+        func main(): Int64 {
+            let p = Point { x: 10, y: 20 }
+            let sum = add(p.x, p.y)
+            return sum
+        }
+    "#;
+    let wasm = compile_source(source);
+    assert_valid_wasm(&wasm, "regression_basic");
+}
+
+/// C6: 综合 — CJson 风格的宏 package 解析
+#[test]
+fn test_cjson_style_macro_package() {
+    let source = r#"
+        macro package cjson.serializer
+
+        internal import std.ast.*
+        import std.collection.*
+
+        public macro JsonSerializable(input_Tk: Tokens): Tokens {
+            return quote(
+                let x = 1
+            )
+        }
+    "#;
+    let lexer = Lexer::new(source);
+    let tokens: Vec<_> = lexer.collect::<Result<Vec<_>, _>>().unwrap();
+    let mut parser = Parser::new(tokens);
+    let program = parser.parse_program().unwrap();
+    assert!(program.is_macro_package);
+    assert_eq!(program.package_name.as_deref(), Some("cjson.serializer"));
+    assert!(!program.imports.is_empty());
+    assert_eq!(program.macros.len(), 1);
+    assert_eq!(program.macros[0].name, "JsonSerializable");
+}

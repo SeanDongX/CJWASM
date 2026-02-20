@@ -67,6 +67,7 @@ fn type_mangle_suffix(ty: &Type) -> String {
             type_mangle_suffix(k),
             type_mangle_suffix(v)
         ),
+        Type::Tokens => "Tokens".to_string(),
     }
 }
 
@@ -340,6 +341,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             body,
             catch_var,
             catch_body,
+            catch_types,
             finally_body,
         } => TryBlock {
             resources: resources
@@ -355,6 +357,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .into_iter()
                 .map(|s| substitute_stmt(s, subst, rewrites))
                 .collect(),
+            catch_types,
             finally_body: finally_body.map(|stmts| {
                 stmts
                     .into_iter()
@@ -378,8 +381,8 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
         },
         SliceExpr { array, start, end } => SliceExpr {
             array: Box::new(substitute_expr(*array, subst, rewrites)),
-            start: Box::new(substitute_expr(*start, subst, rewrites)),
-            end: Box::new(substitute_expr(*end, subst, rewrites)),
+            start: start.map(|s| Box::new(substitute_expr(*s, subst, rewrites))),
+            end: end.map(|e| Box::new(substitute_expr(*e, subst, rewrites))),
         },
         MapLiteral { entries } => MapLiteral {
             entries: entries
@@ -805,8 +808,12 @@ impl AstWalk for Expr {
             }
             SliceExpr { array, start, end } => {
                 array.walk(f);
-                start.walk(f);
-                end.walk(f);
+                if let std::option::Option::Some(ref s) = start {
+                    s.walk(f);
+                }
+                if let std::option::Option::Some(ref e) = end {
+                    e.walk(f);
+                }
             }
             MapLiteral { entries } => {
                 for (k, v) in entries {
@@ -1120,6 +1127,7 @@ pub fn monomorphize_program(program: &mut Program) {
                 name: f.name.clone(),
                 ty: substitute_type(&f.ty, &subst),
                 default: f.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                is_static: f.is_static,
             })
             .collect();
         new_structs.push(StructDef {
@@ -1128,6 +1136,17 @@ pub fn monomorphize_program(program: &mut Program) {
             type_params: vec![],
             constraints: vec![],
             fields,
+            init: def.init.as_ref().map(|i| crate::ast::InitDef {
+                params: i.params.iter().map(|p| crate::ast::Param {
+                    name: p.name.clone(),
+                    ty: substitute_type(&p.ty, &subst),
+                    default: p.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                    variadic: p.variadic,
+                    is_named: p.is_named,
+                    is_inout: p.is_inout,
+                }).collect(),
+                body: i.body.iter().map(|s| substitute_stmt(s.clone(), &subst, &rewrites)).collect(),
+            }),
         });
     }
     program.structs.append(&mut new_structs);
@@ -1187,6 +1206,7 @@ pub fn monomorphize_program(program: &mut Program) {
                 name: f.name.clone(),
                 ty: substitute_type(&f.ty, &subst),
                 default: f.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                is_static: f.is_static,
             })
             .collect();
         let methods: Vec<ClassMethod> = def
@@ -1408,6 +1428,8 @@ mod tests {
     fn test_monomorphize_empty_program() {
         let mut program = Program {
             package_name: None,
+            is_macro_package: false,
+            global_vars: vec![],
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
@@ -1426,6 +1448,8 @@ mod tests {
     fn test_monomorphize_no_generics() {
         let mut program = Program {
             package_name: None,
+            is_macro_package: false,
+            global_vars: vec![],
             imports: vec![],
             structs: vec![],
             interfaces: vec![],

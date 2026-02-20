@@ -48,6 +48,8 @@ pub enum Type {
     Map(Box<Type>, Box<Type>),
     /// 泛型类型参数 (如 T)，仅在泛型定义体内使用，单态化时替换为具体类型
     TypeParam(String),
+    /// 宏上下文中的 Tokens 类型（编译期 token 流）
+    Tokens,
 }
 
 impl Type {
@@ -69,8 +71,8 @@ impl Type {
             Type::Float64 => ValType::F64,
             Type::Rune => ValType::I32,    // Unicode code point 映射为 i32
             Type::Bool => ValType::I32,
-            Type::Nothing => panic!("Nothing 类型不能转换为 WASM 值类型"),
-            Type::Unit => panic!("Unit 类型不能转换为 WASM 值类型"),
+            Type::Nothing => ValType::I32,
+            Type::Unit => ValType::I32,
             // 复合类型都用 i32 指针表示
             Type::String => ValType::I32,
             Type::Array(_) => ValType::I32,
@@ -83,6 +85,7 @@ impl Type {
             Type::Slice(_) => ValType::I32,        // 指针
             Type::Map(_, _) => ValType::I32,       // 指针
             Type::TypeParam(_) => panic!("TypeParam 不能直接转换为 WASM，需先单态化"),
+            Type::Tokens => ValType::I32,
         }
     }
 
@@ -109,6 +112,7 @@ impl Type {
             Type::Slice(_) => 4,     // 指针大小
             Type::Map(_, _) => 4,    // 指针大小
             Type::TypeParam(_) => panic!("TypeParam 不能直接计算 size，需先单态化"),
+            Type::Tokens => 4,
         }
     }
 
@@ -151,15 +155,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Nothing 类型不能转换为 WASM")]
-    fn test_to_wasm_nothing_panic() {
-        Type::Nothing.to_wasm();
+    fn test_to_wasm_nothing_fallback() {
+        assert_eq!(Type::Nothing.to_wasm(), ValType::I32);
     }
 
     #[test]
-    #[should_panic(expected = "Unit 类型不能转换为 WASM")]
-    fn test_to_wasm_unit_panic() {
-        Type::Unit.to_wasm();
+    fn test_to_wasm_unit_fallback() {
+        assert_eq!(Type::Unit.to_wasm(), ValType::I32);
     }
 
     #[test]
@@ -290,6 +292,8 @@ mod tests {
     fn test_program_serialize_roundtrip() {
         let program = Program {
             package_name: Some("test".to_string()),
+            is_macro_package: false,
+            global_vars: vec![],
             imports: vec![],
             structs: vec![StructDef {
                 visibility: Visibility::Public,
@@ -297,8 +301,8 @@ mod tests {
                 type_params: vec![],
                 constraints: vec![],
                 fields: vec![
-                    FieldDef { name: "x".to_string(), ty: Type::Int64, default: None },
-                    FieldDef { name: "y".to_string(), ty: Type::Int64, default: None },
+                    FieldDef { name: "x".to_string(), ty: Type::Int64, default: None, is_static: false },
+                    FieldDef { name: "y".to_string(), ty: Type::Int64, default: None, is_static: false },
                 ],
             }],
             interfaces: vec![],
@@ -394,10 +398,18 @@ pub enum InterpolatePart {
 pub enum Expr {
     /// 整数字面量
     Integer(i64),
+    /// Int32 字面量 (后缀 i32, 如 32i32)
+    Int32(i32),
+    /// Int16 字面量 (后缀 i16, 如 16i16)
+    Int16(i16),
+    /// Int8 字面量 (后缀 i8, 如 8i8)
+    Int8(i8),
     /// 浮点数字面量 (Float64)
     Float(f64),
-    /// Float32 字面量 (后缀 f)
+    /// Float32 字面量 (后缀 f 或 f32)
     Float32(f32),
+    /// Float16 字面量 (后缀 f16)
+    Float16(f32),  // 存储为 f32，类型系统处理为 Float16
     /// 布尔字面量
     Bool(bool),
     /// Rune 字面量 (Unicode code point, cjc: Rune)
@@ -544,15 +556,18 @@ pub enum Expr {
         resources: Vec<(String, Expr)>,
         body: Vec<Stmt>,
         catch_var: Option<String>,
+        /// 多类型 catch: catch(e: TypeA | TypeB) — 匹配的异常类型列表
+        #[serde(default)]
+        catch_types: Vec<String>,
         catch_body: Vec<Stmt>,
         /// finally 块（无论是否异常都执行）
         finally_body: Option<Vec<Stmt>>,
     },
-    /// 切片表达式 arr[start..end]
+    /// 切片表达式 arr[start..end], arr[start..], arr[..end], arr[..]
     SliceExpr {
         array: Box<Expr>,
-        start: Box<Expr>,
-        end: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
     },
     /// Map 字面量 Map<K, V> { key1 => val1, key2 => val2 }
     MapLiteral {
@@ -585,15 +600,23 @@ pub enum Expr {
     },
     /// M2: quote 表达式 — 编译时构造 AST 片段
     /// quote(stmts) → 将 stmts 序列化为 AST JSON
+    /// C3.3: 扩展支持 QuoteContent 类型级 quote
     Quote {
         body: Vec<Stmt>,
         /// quote 内的 $(expr) 插值位置
         splices: Vec<(usize, Expr)>,
+        /// 可选的 raw tokens 内容（用于类型表达式等非语句级 quote）
+        #[serde(default)]
+        raw_tokens: Option<String>,
     },
     /// M2: 宏调用 @MacroName[args] 或 @MacroName(args)
     MacroCall {
         name: String,
         args: Vec<Expr>,
+    },
+    /// C3: quote 内的 $variable 或 $(expr) 拼接
+    Splice {
+        expr: Box<Expr>,
     },
 }
 
@@ -739,6 +762,8 @@ pub enum AssignTarget {
     Index { array: String, index: Box<Expr> },
     /// 结构体字段 obj.field
     Field { object: String, field: String },
+    /// 可选链字段 obj?.field (若 obj 为 None 则跳过赋值)
+    OptionalChainField { object: Box<Expr>, field: String },
 }
 
 /// 结构体字段定义
@@ -748,6 +773,9 @@ pub struct FieldDef {
     pub ty: Type,
     /// cjc 兼容: 字段默认值 (如 `var x: Int64 = 0`)
     pub default: Option<Expr>,
+    /// 是否为静态字段 (static let / static var)
+    #[serde(default)]
+    pub is_static: bool,
 }
 
 /// 结构体定义
@@ -760,6 +788,9 @@ pub struct StructDef {
     /// 类型约束
     pub constraints: Vec<TypeConstraint>,
     pub fields: Vec<FieldDef>,
+    /// init 构造函数（可选）
+    #[serde(default)]
+    pub init: Option<InitDef>,
 }
 
 impl StructDef {
@@ -857,7 +888,13 @@ pub struct AssocTypeDef {
 pub struct InterfaceDef {
     pub visibility: Visibility,
     pub name: String,
-    /// 父接口列表（接口继承）
+    /// 泛型类型参数
+    #[serde(default)]
+    pub type_params: Vec<String>,
+    /// 泛型约束
+    #[serde(default)]
+    pub constraints: Vec<TypeConstraint>,
+    /// 父接口列表（接口继承），支持泛型如 IJsonValueSerializable<T>
     pub parents: Vec<String>,
     pub methods: Vec<InterfaceMethod>,
     /// 关联类型列表
@@ -866,10 +903,17 @@ pub struct InterfaceDef {
 
 /// 扩展定义（为已有类型追加方法/实现接口）
 /// extend TypeName: InterfaceName { ... }
+/// 支持泛型: extend<T> Foo<T> <: Bar where T <: Baz { ... }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendDef {
     /// 被扩展的类型名
     pub target_type: String,
+    /// 泛型类型参数（如 extend<T> 的 ["T"]）
+    #[serde(default)]
+    pub type_params: Vec<String>,
+    /// 类型约束
+    #[serde(default)]
+    pub constraints: Vec<TypeConstraint>,
     /// 实现的接口（可选）
     pub interface: Option<String>,
     /// 关联类型绑定（如 type Element = Int64）
@@ -994,6 +1038,8 @@ pub enum Visibility {
 /// 导入项
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Import {
+    /// 可见性修饰符（如 internal import, public import）
+    pub visibility: Visibility,
     /// 导入的模块路径，如 "std.io"
     pub module_path: Vec<String>,
     /// 导入的具体项，None 表示 import * from module
@@ -1016,6 +1062,9 @@ pub struct MacroDef {
 pub struct Program {
     /// 包名称，None 表示主包 (cjc: package)
     pub package_name: Option<String>,
+    /// 是否为 macro package（宏包中的所有函数默认视为宏函数上下文）
+    #[serde(default)]
+    pub is_macro_package: bool,
     /// 导入列表
     pub imports: Vec<Import>,
     pub structs: Vec<StructDef>,
@@ -1029,4 +1078,7 @@ pub struct Program {
     pub type_aliases: Vec<(String, Type)>,
     /// M2: 宏函数定义
     pub macros: Vec<MacroDef>,
+    /// 包级变量声明 (let/var at package level)
+    #[serde(default)]
+    pub global_vars: Vec<FieldDef>,
 }

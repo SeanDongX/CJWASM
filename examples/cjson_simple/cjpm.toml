@@ -1,0 +1,4 @@
+[package]
+name = "cjson_simple"
+version = "1.0.0"
+output-type = "executable"

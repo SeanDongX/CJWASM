@@ -1,0 +1,6 @@
+# CJson 官方 example 的 WASM 可运行副本
+# 对应 CJson 仓库 cjc_1.1.0 分支 src/example/demo/
+[package]
+name = "cjson_cjc_example"
+version = "1.0.0"
+output-type = "executable"

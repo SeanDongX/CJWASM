@@ -43,6 +43,8 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
         extends: vec![],
         type_aliases: vec![],
         macros: vec![],
+        is_macro_package: false,
+        global_vars: vec![],
     };
 
     for prog in programs {
@@ -58,6 +60,7 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
         merged.extends.extend(prog.extends);
         merged.type_aliases.extend(prog.type_aliases);
         merged.macros.extend(prog.macros);
+        merged.global_vars.extend(prog.global_vars);
     }
 
     merged
@@ -121,6 +124,19 @@ pub fn collect_import_files(
 pub fn compile_source_to_wasm(source: &str) -> Result<Vec<u8>, String> {
     let mut program = parse_source(source)?;
 
+    // 注入 JSON 标准库（如果有 import stdx.encoding.json）
+    let needs_json_stdlib = program.imports.iter().any(|imp| {
+        let path = imp.module_path.join(".");
+        path.starts_with("stdx.encoding.json")
+    });
+    if needs_json_stdlib {
+        let json_stdlib = crate::stdlib::json::generate_json_stdlib();
+        json_stdlib.inject_into(&mut program);
+    }
+    if program.imports.iter().any(|imp| imp.module_path.join(".").starts_with("std.time")) {
+        crate::stdlib::time::generate_time_stdlib().inject_into(&mut program);
+    }
+
     // M5: 宏展开阶段 — 在优化和单态化之前执行
     if crate::macro_expand::program_has_macros(&program) {
         let expander = crate::macro_expand::MacroExpander::new(&program);
@@ -153,6 +169,19 @@ pub fn compile_files_to_wasm(files: &[&str]) -> Result<Vec<u8>, String> {
     } else {
         merge_programs(programs)
     };
+
+    // 注入 JSON 标准库（如果有 import stdx.encoding.json）
+    let needs_json_stdlib = program.imports.iter().any(|imp| {
+        let path = imp.module_path.join(".");
+        path.starts_with("stdx.encoding.json")
+    });
+    if needs_json_stdlib {
+        let json_stdlib = crate::stdlib::json::generate_json_stdlib();
+        json_stdlib.inject_into(&mut program);
+    }
+    if program.imports.iter().any(|imp| imp.module_path.join(".").starts_with("std.time")) {
+        crate::stdlib::time::generate_time_stdlib().inject_into(&mut program);
+    }
 
     // M5: 宏展开阶段
     if crate::macro_expand::program_has_macros(&program) {

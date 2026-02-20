@@ -317,6 +317,7 @@ fn fold_expr(expr: Expr) -> Expr {
             resources,
             body,
             catch_var,
+            catch_types,
             catch_body,
             finally_body,
         } => {
@@ -347,6 +348,7 @@ fn fold_expr(expr: Expr) -> Expr {
                 resources,
                 body,
                 catch_var,
+                catch_types,
                 catch_body,
                 finally_body,
             }
@@ -369,8 +371,8 @@ fn fold_expr(expr: Expr) -> Expr {
         // Phase 9: 折叠切片和 Map 字面量中的子表达式
         SliceExpr { array, start, end } => SliceExpr {
             array: Box::new(fold_expr(*array)),
-            start: Box::new(fold_expr(*start)),
-            end: Box::new(fold_expr(*end)),
+            start: start.map(|s| Box::new(fold_expr(*s))),
+            end: end.map(|e| Box::new(fold_expr(*e))),
         },
         MapLiteral { entries } => MapLiteral {
             entries: entries
@@ -676,6 +678,7 @@ mod tests {
                 right: Box::new(Expr::Integer(2)),
             })],
             catch_var: None,
+            catch_types: vec![],
             catch_body: vec![],
             finally_body: Some(vec![Stmt::Expr(Expr::Binary {
                 op: BinOp::Mul,
