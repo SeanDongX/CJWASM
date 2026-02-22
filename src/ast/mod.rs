@@ -273,6 +273,10 @@ pub enum Expr {
         op: UnaryOp,
         expr: Box<Expr>,
     },
+    /// 后缀自增 expr++（vendor 兼容）
+    PostfixIncr(Box<Expr>),
+    /// 后缀自减 expr--（vendor 兼容）
+    PostfixDecr(Box<Expr>),
     /// 二元运算
     Binary {
         op: BinOp,
@@ -317,6 +321,8 @@ pub enum Expr {
     },
     /// 代码块
     Block(Vec<Stmt>, Option<Box<Expr>>),
+    /// unsafe 块（语义可先等同普通块，Phase 4）
+    UnsafeBlock(Vec<Stmt>, Option<Box<Expr>>),
     /// 元组字面量 (a, b, c)
     Tuple(Vec<Expr>),
     /// 元组索引访问 tuple.0, tuple.1
@@ -350,10 +356,10 @@ pub enum Expr {
         object: Box<Expr>,
         field: String,
     },
-    /// 范围表达式 0..10 或 0..=10，可选步长 : step
+    /// 范围表达式 0..10、0..=10 或 start..（无 end 表示到末尾，用于 slice）
     Range {
         start: Box<Expr>,
-        end: Box<Expr>,
+        end: Option<Box<Expr>>,  // None 表示 arr[start..] 到末尾
         inclusive: bool,  // true 表示 ..=
         step: Option<Box<Expr>>,  // P2.6: for-in 带步长 `0..=10 : 2`
     },
@@ -509,11 +515,11 @@ pub enum Stmt {
         ty: Option<Type>,
         value: Expr,
     },
-    /// var 绑定 (可变)
+    /// var 绑定 (可变)；pattern 为 Binding(name) 或 Tuple 解构；value 为 None 时表示仅声明（由后续赋值）
     Var {
-        name: String,
+        pattern: Pattern,
         ty: Option<Type>,
-        value: Expr,
+        value: Option<Expr>,
     },
     /// 赋值
     Assign {
@@ -570,6 +576,8 @@ pub enum Stmt {
         ty: Option<Type>,
         value: Expr,
     },
+    /// unsafe { ... } 块（Phase 4，语义可先等同普通块）
+    UnsafeBlock(Vec<Stmt>),
 }
 
 /// 赋值目标
@@ -581,6 +589,25 @@ pub enum AssignTarget {
     Index { array: String, index: Box<Expr> },
     /// 结构体字段 obj.field
     Field { object: String, field: String },
+    /// 数组元素字段 arr[i].field（vendor: transArr[i].trans = value）
+    IndexField {
+        array: String,
+        index: Box<Expr>,
+        field: String,
+    },
+    /// 链式字段赋值 a.b.c = value（base 为变量名，fields 至少 2 个）
+    ChainField {
+        base: String,
+        fields: Vec<String>,
+    },
+    /// 链式字段取元素赋值 a.b[i] = value（fields 至少 1 个）
+    ChainFieldIndex {
+        base: String,
+        fields: Vec<String>,
+        index: Box<Expr>,
+    },
+    /// 元组解构 (a, b) = expr
+    Tuple(Vec<String>),
 }
 
 /// 结构体字段定义
@@ -699,6 +726,8 @@ pub struct AssocTypeDef {
 pub struct InterfaceDef {
     pub visibility: Visibility,
     pub name: String,
+    /// 泛型类型参数（如 interface Comparable<T> 的 ["T"]）
+    pub type_params: Vec<String>,
     /// 父接口列表（接口继承）
     pub parents: Vec<String>,
     pub methods: Vec<InterfaceMethod>,
@@ -707,11 +736,15 @@ pub struct InterfaceDef {
 }
 
 /// 扩展定义（为已有类型追加方法/实现接口）
-/// extend TypeName: InterfaceName { ... }
+/// extend [<T, ...>] TypeName [<: InterfaceName] [where ...] { ... }
 #[derive(Debug, Clone)]
 pub struct ExtendDef {
     /// 被扩展的类型名
     pub target_type: String,
+    /// 扩展的泛型类型参数（如 extend<T> StringReader<T> 的 ["T"]）
+    pub type_params: Vec<String>,
+    /// 类型约束（来自 where 子句）
+    pub constraints: Vec<TypeConstraint>,
     /// 实现的接口（可选）
     pub interface: Option<String>,
     /// 关联类型绑定（如 type Element = Int64）
@@ -851,6 +884,10 @@ pub struct Program {
     pub package_name: Option<String>,
     /// 导入列表
     pub imports: Vec<Import>,
+    /// 顶层常量 (name, optional type, value expr)，用于 std.time 等
+    pub global_constants: Vec<(String, Option<Type>, Expr)>,
+    /// 顶层 let 变量 (name, optional type, value expr)
+    pub global_vars: Vec<(String, Option<Type>, Expr)>,
     pub structs: Vec<StructDef>,
     pub interfaces: Vec<InterfaceDef>,
     pub classes: Vec<ClassDef>,

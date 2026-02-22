@@ -72,6 +72,14 @@ pub fn process_multiline_string(s: &str) -> String {
         .join("\n")
 }
 
+/// 块注释 /* ... */：从当前位（已匹配 "/*"）前进到 "*/" 之后，不返回内容
+fn block_comment_skip(lex: &mut logos::Lexer<Token>) -> Option<()> {
+    let remainder = lex.remainder();
+    let end = remainder.find("*/")?;
+    lex.bump(end + 2);
+    Some(())
+}
+
 /// 解析多行字符串 """..."""，返回内容（不含引号）和消耗的字节数
 fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
     let remainder = lex.remainder();
@@ -405,7 +413,13 @@ pub enum Token {
     #[regex(r"0x[0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*", |lex| {
         let slice = lex.slice();
         let s: String = slice.chars().filter(|c| *c != '_').collect();
-        if slice.starts_with("0x") { i64::from_str_radix(&s[2..], 16).ok() }
+        if slice.starts_with("0x") {
+            u64::from_str_radix(&s[2..], 16).ok().and_then(|u| {
+                if u <= i64::MAX as u64 { Some(u as i64) }
+                else if u == 0x8000000000000000 { Some(i64::MIN) }
+                else { None }
+            })
+        }
         else if slice.starts_with("0o") { i64::from_str_radix(&s[2..], 8).ok() }
         else if slice.starts_with("0b") { i64::from_str_radix(&s[2..], 2).ok() }
         else { s.parse::<i64>().ok() }
@@ -432,6 +446,26 @@ pub enum Token {
     })]
     CharLit(char),
 
+    // 字节字面量 b'T'（vendor 风格，与 CharLit 同形取一字符）
+    #[regex(r"b'[^'\\]'|b'\\[ntr\\0']'", |lex| {
+        let s = lex.slice();
+        let inner = &s[2..s.len()-1]; // 去掉 b' 和 '
+        if inner.starts_with('\\') {
+            match inner.chars().nth(1) {
+                Some('n') => Some('\n'),
+                Some('t') => Some('\t'),
+                Some('r') => Some('\r'),
+                Some('\\') => Some('\\'),
+                Some('0') => Some('\0'),
+                Some('\'') => Some('\''),
+                _ => None,
+            }
+        } else {
+            inner.chars().next()
+        }
+    })]
+    ByteLit(char),
+
     #[token("true")]
     True,
     #[token("false")]
@@ -455,6 +489,10 @@ pub enum Token {
     // 标识符
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
+
+    // 块注释 /* ... */（需在 / 前匹配）
+    #[token("/*", block_comment_skip)]
+    BlockComment,
 
     // 运算符 (与 cjc release/1.0 对齐)
     #[token("**")]
@@ -602,6 +640,7 @@ impl<'a> Iterator for Lexer<'a> {
         let token = self.inner.next()?;
         let span = self.inner.span();
         match token {
+            Ok(Token::BlockComment) => return self.next(), // 不向 parser 暴露块注释
             Ok(tok) => Some(Ok((span.start, tok, span.end))),
             Err(_) => Some(Err(format!(
                 "未知字符: '{}'",
@@ -948,4 +987,15 @@ mod tests {
         assert_eq!(tokens[1], Token::Integer(15));
         assert_eq!(tokens[2], Token::Integer(0xABCD));
     }
+}
+
+#[test]
+fn test_unsafe_brace_string() {
+    let source = "return unsafe { String.fromUtf8Unchecked(arr[..i]) }";
+    let lexer = Lexer::new(source);
+    let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(s, t, e)| (s, e, format!("{:?}", t))).collect();
+    for (start, end, tok) in &tokens {
+        println!("{}..{} => {}", start, end, tok);
+    }
+    assert!(tokens.iter().any(|(_, _, t)| t.contains("LBrace")), "expected LBrace in token stream");
 }

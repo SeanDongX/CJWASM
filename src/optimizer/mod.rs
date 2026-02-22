@@ -1,6 +1,6 @@
 //! 优化器：常量折叠等 AST 级优化。
 
-use crate::ast::{BinOp, Expr, Stmt, UnaryOp};
+use crate::ast::{BinOp, Expr, Pattern, Stmt, UnaryOp};
 use std::ops::{Add, Div, Mul, Rem, Shl, Shr, Sub};
 
 /// 对程序做一次常量折叠（及后续可扩展的优化）。
@@ -122,9 +122,9 @@ fn optimize_tail_recursion(func: &mut crate::ast::Function) {
         .collect();
     for (tmp_name, arg) in tmp_names.iter().zip(tail_args) {
         loop_body.push(Stmt::Var {
-            name: tmp_name.clone(),
+            pattern: Pattern::Binding(tmp_name.clone()),
             ty: None,
-            value: arg,
+            value: Some(arg),
         });
     }
     // 再从临时变量赋值给参数
@@ -146,7 +146,7 @@ fn optimize_tail_recursion(func: &mut crate::ast::Function) {
 fn fold_stmt(stmt: &mut Stmt) {
     match stmt {
         Stmt::Let { value, .. } => *value = fold_expr(value.clone()),
-        Stmt::Var { value, .. } => *value = fold_expr(value.clone()),
+        Stmt::Var { value, .. } => if let Some(v) = value { *value = Some(fold_expr(v.clone())); }
         Stmt::Assign { value, .. } => *value = fold_expr(value.clone()),
         Stmt::Expr(e) => *e = fold_expr(e.clone()),
         Stmt::Return(Some(e)) => *e = fold_expr(e.clone()),
@@ -299,7 +299,7 @@ fn fold_expr(expr: Expr) -> Expr {
         },
         Range { start, end, inclusive, step } => Range {
             start: Box::new(fold_expr(*start)),
-            end: Box::new(fold_expr(*end)),
+            end: end.map(|e| Box::new(fold_expr(*e))),
             inclusive,
             step: step.map(|s| Box::new(fold_expr(*s))),
         },

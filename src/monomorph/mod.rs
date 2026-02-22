@@ -273,6 +273,13 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .collect(),
             expr.map(|e| Box::new(substitute_expr(*e, subst, rewrites))),
         ),
+        UnsafeBlock(stmts, expr) => UnsafeBlock(
+            stmts
+                .into_iter()
+                .map(|s| substitute_stmt(s, subst, rewrites))
+                .collect(),
+            expr.map(|e| Box::new(substitute_expr(*e, subst, rewrites))),
+        ),
         Array(elems) => Array(
             elems
                 .into_iter()
@@ -294,7 +301,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             step,
         } => Range {
             start: Box::new(substitute_expr(*start, subst, rewrites)),
-            end: Box::new(substitute_expr(*end, subst, rewrites)),
+            end: end.map(|e| Box::new(substitute_expr(*e, subst, rewrites))),
             inclusive,
             step: step.map(|s| Box::new(substitute_expr(*s, subst, rewrites))),
         },
@@ -493,10 +500,10 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
             ty: ty.map(|t| substitute_type(&t, subst)),
             value: substitute_expr(value, subst, rewrites),
         },
-        Var { name, ty, value } => Var {
-            name,
+        Var { pattern, ty, value } => Var {
+            pattern: substitute_pattern(pattern, subst, rewrites),
             ty: ty.map(|t| substitute_type(&t, subst)),
-            value: substitute_expr(value, subst, rewrites),
+            value: value.map(|v| substitute_expr(v, subst, rewrites)),
         },
         Assign { target, value } => Assign {
             target,
@@ -565,6 +572,11 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
             ty: ty.map(|t| substitute_type(&t, subst)),
             value: substitute_expr(value, subst, rewrites),
         },
+        UnsafeBlock(body) => UnsafeBlock(
+            body.into_iter()
+                .map(|s| substitute_stmt(s, subst, rewrites))
+                .collect(),
+        ),
     }
 }
 
@@ -772,7 +784,9 @@ impl AstWalk for Expr {
             Field { object, .. } => object.walk(f),
             Range { start, end, .. } => {
                 start.walk(f);
-                end.walk(f);
+                if let Option::Some(e) = end.as_ref() {
+                    e.as_ref().walk(f);
+                }
             }
             VariantConst { arg, .. } => {
                 if let Option::Some(e) = arg.as_ref() {
@@ -820,7 +834,7 @@ impl AstWalk for Stmt {
         use crate::ast::Stmt::*;
         match self {
             Let { value, .. } => value.walk(f),
-            Var { value, .. } => value.walk(f),
+            Var { value, .. } => if let Some(ref v) = value { v.walk(f); },
             Expr(e) => e.walk(f),
             Assign { value, .. } => value.walk(f),
             Return(Some(e)) => e.walk(f),
@@ -861,7 +875,7 @@ impl StmtWalkExprs for Stmt {
         use crate::ast::Stmt::*;
         match self {
             Let { value, .. } => value.walk(f),
-            Var { value, .. } => value.walk(f),
+            Var { value, .. } => if let Some(ref v) = value { v.walk(f); },
             Expr(e) => e.walk(f),
             Assign { value, .. } => value.walk(f),
             Return(Some(e)) => e.walk(f),
@@ -1405,6 +1419,8 @@ mod tests {
         let mut program = Program {
             package_name: None,
             imports: vec![],
+            global_constants: vec![],
+            global_vars: vec![],
             structs: vec![],
             interfaces: vec![],
             classes: vec![],
@@ -1422,6 +1438,8 @@ mod tests {
         let mut program = Program {
             package_name: None,
             imports: vec![],
+            global_constants: vec![],
+            global_vars: vec![],
             structs: vec![],
             interfaces: vec![],
             classes: vec![],
