@@ -178,6 +178,9 @@ impl CodeGen {
                 | "CJ_CORE_FastPowerDoubleInt64"
                 // std.math overlay 调用的运行时 (f64.sqrt/ceil/floor)
                 | "__math_sqrt" | "__math_ceil" | "__math_floor"
+                | "__math_sin" | "__math_cos" | "__math_tan"
+                | "__math_exp" | "__math_log" | "__math_pow"
+                | "__math_trunc" | "__math_round"
         )
     }
 
@@ -973,6 +976,10 @@ impl CodeGen {
         self.func_indices.insert("__math_ceil".to_string(), rt_idx); rt_idx += 1;
         self.func_types.insert("__math_floor".to_string(), ty_f64_f64);
         self.func_indices.insert("__math_floor".to_string(), rt_idx); rt_idx += 1;
+        self.func_types.insert("__math_trunc".to_string(), ty_f64_f64);
+        self.func_indices.insert("__math_trunc".to_string(), rt_idx); rt_idx += 1;
+        self.func_types.insert("__math_round".to_string(), ty_f64_f64);
+        self.func_indices.insert("__math_round".to_string(), rt_idx); rt_idx += 1;
 
         // Phase 7.1 #44: readln() -> i32 (返回字符串指针)
         // () -> i32
@@ -1235,6 +1242,8 @@ impl CodeGen {
         func_section.function(ty_f64_f64);    // __math_sqrt
         func_section.function(ty_f64_f64);   // __math_ceil
         func_section.function(ty_f64_f64);   // __math_floor
+        func_section.function(ty_f64_f64);   // __math_trunc
+        func_section.function(ty_f64_f64);   // __math_round
         // Phase 7.1 #44: readln
         func_section.function(ty_void_i32);   // __readln
         // Phase 7.2: str_to_i64, str_to_f64
@@ -1555,6 +1564,8 @@ impl CodeGen {
         codes.function(&self.emit_math_sqrt());
         codes.function(&self.emit_math_ceil());
         codes.function(&self.emit_math_floor());
+        codes.function(&self.emit_math_trunc());
+        codes.function(&self.emit_math_round());
 
         // Phase 7.1 #44: readln 运行时函数
         codes.function(&self.emit_readln(heap_start));
@@ -3299,6 +3310,24 @@ impl CodeGen {
         let mut f = WasmFunc::new(vec![]);
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::F64Floor);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __math_trunc(x: f64) -> f64 (WASM f64.trunc)
+    fn emit_math_trunc(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![]);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Trunc);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __math_round(x: f64) -> f64 (WASM f64.nearest)
+    fn emit_math_round(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![]);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Nearest);
         f.instruction(&Instruction::End);
         f
     }
@@ -11003,7 +11032,11 @@ impl CodeGen {
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         func.instruction(&Instruction::I32WrapI64);
                         func.instruction(&Instruction::Call(self.func_indices["__exit"]));
-                    } else if args.is_empty() {
+                    } else {
+                        // 通用处理：编译所有参数，然后调用函数
+                        for arg in args {
+                            self.compile_expr(arg, locals, func, loop_ctx);
+                        }
                         func.instruction(&Instruction::Call(self.func_indices[name]));
                     }
                 } else if name == "randomInt64" && args.is_empty() {
@@ -12113,8 +12146,8 @@ impl CodeGen {
                 }
             }
             Expr::Range { start, end, inclusive, .. } => {
-                // Phase 8: 使用 __alloc 分配 Range 内存（仅当 end 为 Some 时用于独立 Range 值；slice [a..] 在 Index 分支处理）
-                let end = end.as_ref().expect("独立 Range 表达式必须有 end");
+                // Phase 8: 使用 __alloc 分配 Range 内存
+                // 对于开区间 [a..]，end 存储为 -1 表示到末尾
                 let range_size = Type::range_heap_size();
                 let alloc_idx = self.func_indices["__alloc"];
                 let tmp_local = locals.get("__range_alloc_ptr").expect("__range_alloc_ptr 未预注册");
@@ -12132,9 +12165,13 @@ impl CodeGen {
                     memory_index: 0,
                 }));
 
-                // 存储 end 到 offset 8
+                // 存储 end 到 offset 8（None 时存储 -1 表示开区间）
                 func.instruction(&Instruction::LocalGet(tmp_local));
-                self.compile_expr(end, locals, func, loop_ctx);
+                if let Some(ref e) = end {
+                    self.compile_expr(e, locals, func, loop_ctx);
+                } else {
+                    func.instruction(&Instruction::I64Const(-1));
+                }
                 func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
                     offset: 8,
                     align: 3,

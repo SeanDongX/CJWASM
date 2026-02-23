@@ -9,3 +9,4 @@ main
 /target/bench_reports/
 /target/criterion/
 
+third_party/

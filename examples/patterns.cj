@@ -53,9 +53,9 @@ func deconstructPoint(): Int64 {
 // 解构绑定在 match 中
 func matchPoint(p: Point): Int64 {
     match (p) {
-        case Point { x: 0, y: 0 } => 0,            // 原点
-        case Point { x: 0, y } => y,                // y 轴上
-        case Point { x, y: 0 } => x,                // x 轴上
+        case Point { x: 0, y: 0 } => 0            // 原点
+        case Point { x: 0, y } => y                // y 轴上
+        case Point { x, y: 0 } => x                // x 轴上
         case Point { x, y } => x + y                // 其他
     }
 }
@@ -64,7 +64,7 @@ func matchPoint(p: Point): Int64 {
 func matchRectangle(r: Rectangle): Int64 {
     match (r) {
         case Rectangle { topLeft: Point { x: 0, y: 0 }, width, height } =>
-            width * height,
+            width * height
         case Rectangle { topLeft, width, height } =>
             topLeft.x + topLeft.y + width + height
     }
@@ -73,11 +73,11 @@ func matchRectangle(r: Rectangle): Int64 {
 // 复杂 guard 条件 (cjc: case pattern where condition =>)
 func classifyPoint(p: Point): String {
     match (p) {
-        case Point { x, y } where x == y => "diagonal",
-        case Point { x, y } where x > 0 && y > 0 => "first quadrant",
-        case Point { x, y } where x < 0 && y > 0 => "second quadrant",
-        case Point { x, y } where x < 0 && y < 0 => "third quadrant",
-        case Point { x, y } where x > 0 && y < 0 => "fourth quadrant",
+        case Point { x, y } where x == y => "diagonal"
+        case Point { x, y } where x > 0 && y > 0 => "first quadrant"
+        case Point { x, y } where x < 0 && y > 0 => "second quadrant"
+        case Point { x, y } where x < 0 && y < 0 => "third quadrant"
+        case Point { x, y } where x > 0 && y < 0 => "fourth quadrant"
         case _ => "on axis"
     }
 }

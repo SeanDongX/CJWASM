@@ -3195,7 +3195,12 @@ impl Parser {
                 if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                     let inclusive = self.check(&Token::DotDotEq);
                     self.advance();
-                    let end = self.parse_primary()?;
+                    // 支持开区间 n.. (end 可选)
+                    let end = if self.check(&Token::RBracket) || self.check(&Token::Comma) || self.check(&Token::RParen) {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_primary()?))
+                    };
                     // P2.6: 可选步长 `: step`
                     let step = if self.check(&Token::Colon) {
                         self.advance();
@@ -3205,7 +3210,7 @@ impl Parser {
                     };
                     return Ok(Expr::Range {
                         start: Box::new(Expr::Integer(n)),
-                        end: Some(Box::new(end)),
+                        end,
                         inclusive,
                         step,
                     });
