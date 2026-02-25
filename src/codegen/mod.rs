@@ -210,7 +210,7 @@ impl CodeGen {
                 Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
                     if Self::expr_contains_unhandled_throw(value) { return true; }
                 }
-                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::DoWhile { body, .. } => {
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::DoWhile { body, .. } | Stmt::UnsafeBlock { body } => {
                     if Self::contains_unhandled_throw(body) { return true; }
                 }
                 Stmt::Const { value, .. } => {
@@ -255,7 +255,7 @@ impl CodeGen {
                         return Some(inner);
                     }
                 }
-                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::DoWhile { body, .. } => {
+                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::DoWhile { body, .. } | Stmt::UnsafeBlock { body } => {
                     if let Some(inner) = Self::find_throw_inner_in_stmts(body) {
                         return Some(inner);
                     }
@@ -1539,6 +1539,9 @@ impl CodeGen {
             Stmt::Loop { body, .. } => {
                 for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
             }
+            Stmt::UnsafeBlock { body } => {
+                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+            }
             Stmt::Const { value, .. } => {
                 Self::collect_lambdas_from_expr(value, counter, out);
             }
@@ -1737,6 +1740,11 @@ impl CodeGen {
                     self.collect_strings_in_stmt(s);
                 }
             }
+            Stmt::UnsafeBlock { body } => {
+                for s in body {
+                    self.collect_strings_in_stmt(s);
+                }
+            }
             Stmt::Const { value, .. } => {
                 self.collect_strings_in_expr(value);
             }
@@ -1812,6 +1820,11 @@ impl CodeGen {
                 self.collect_strings_in_expr(array);
                 self.collect_strings_in_expr(index);
             }
+            Expr::SliceExpr { array, start, end } => {
+                self.collect_strings_in_expr(array);
+                self.collect_strings_in_expr(start);
+                self.collect_strings_in_expr(end);
+            }
             Expr::StructInit { fields, .. } => {
                 for (_, e) in fields {
                     self.collect_strings_in_expr(e);
@@ -1830,6 +1843,9 @@ impl CodeGen {
             }
             Expr::Cast { expr, .. } | Expr::IsType { expr, .. } => {
                 self.collect_strings_in_expr(expr);
+            }
+            Expr::PostfixIncr(inner) | Expr::PostfixDecr(inner) => {
+                self.collect_strings_in_expr(inner);
             }
             Expr::Interpolate(parts) => {
                 // 收集插值字符串中的字面量和表达式
@@ -7445,19 +7461,57 @@ impl CodeGen {
                 }
                 self.collect_locals_from_expr(value, locals);
             }
-            Stmt::Var { name, ty, value } => {
-                let val_type = ty
-                    .as_ref()
-                    .map(|t| t.to_wasm())
-                    .unwrap_or_else(|| {
-                        self.infer_ast_type_with_locals(value, locals)
+            Stmt::Var { pattern, ty, value } => {
+                match pattern {
+                    Pattern::Binding(name) => {
+                        let val_type = ty
+                            .as_ref()
                             .map(|t| t.to_wasm())
-                            .unwrap_or_else(|| self.infer_type(value))
-                    });
-                let ast_type = ty.clone()
-                    .or_else(|| self.infer_ast_type_with_locals(value, locals))
-                    .or_else(|| self.infer_ast_type(value));
-                locals.add(name, val_type, ast_type);
+                            .unwrap_or_else(|| {
+                                self.infer_ast_type_with_locals(value, locals)
+                                    .map(|t| t.to_wasm())
+                                    .unwrap_or_else(|| self.infer_type(value))
+                            });
+                        let ast_type = ty.clone()
+                            .or_else(|| self.infer_ast_type_with_locals(value, locals))
+                            .or_else(|| self.infer_ast_type(value));
+                        locals.add(name, val_type, ast_type);
+                    }
+                    Pattern::Tuple(patterns) => {
+                        locals.add("__var_tuple_ptr", ValType::I32, None);
+                        let value_ty = ty.clone().or_else(|| self.infer_ast_type_with_locals(value, locals));
+                        if let Some(Type::Tuple(types)) = value_ty.as_ref() {
+                            for (i, pat) in patterns.iter().enumerate() {
+                                if let Pattern::Binding(name) = pat {
+                                    if let Some(t) = types.get(i) {
+                                        locals.add(name, t.to_wasm(), Some(t.clone()));
+                                    } else {
+                                        locals.add(name, ValType::I64, None);
+                                    }
+                                }
+                            }
+                        } else {
+                            for pat in patterns {
+                                if let Pattern::Binding(name) = pat {
+                                    locals.add(name, ValType::I64, None);
+                                }
+                            }
+                        }
+                    }
+                    Pattern::Struct { name: struct_name, fields } => {
+                        locals.add("__var_struct_ptr", ValType::I32, None);
+                        if let Some(def) = self.structs.get(struct_name) {
+                            for (fname, pat) in fields {
+                                if let Pattern::Binding(bind) = pat {
+                                    if let Some(ft) = def.field_type(fname) {
+                                        locals.add(bind, ft.to_wasm(), Some(ft.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 self.collect_locals_from_expr(value, locals);
             }
             Stmt::Assign { value, .. } => {
@@ -7525,6 +7579,11 @@ impl CodeGen {
                 }
             }
             Stmt::Loop { body } => {
+                for s in body {
+                    self.collect_locals(s, locals);
+                }
+            }
+            Stmt::UnsafeBlock { body } => {
                 for s in body {
                     self.collect_locals(s, locals);
                 }
@@ -7696,6 +7755,16 @@ impl CodeGen {
                 self.collect_locals_from_expr(array, locals);
                 self.collect_locals_from_expr(index, locals);
             }
+            Expr::SliceExpr { array, start, end } => {
+                self.collect_locals_from_expr(array, locals);
+                self.collect_locals_from_expr(start, locals);
+                self.collect_locals_from_expr(end, locals);
+                locals.add("__array_clone_src", ValType::I32, None);
+                locals.add("__array_clone_dst", ValType::I32, None);
+                locals.add("__array_dyn_ptr", ValType::I32, None);
+                locals.add("__array_dyn_size", ValType::I64, None);
+                locals.add("__array_dyn_idx", ValType::I64, None);
+            }
             Expr::StructInit { fields, .. } => {
                 for (_, e) in fields {
                     self.collect_locals_from_expr(e, locals);
@@ -7737,6 +7806,10 @@ impl CodeGen {
             }
             Expr::Some(inner) | Expr::Ok(inner) | Expr::Err(inner) | Expr::Try(inner) | Expr::Throw(inner) => {
                 self.collect_locals_from_expr(inner, locals);
+            }
+            Expr::PostfixIncr(inner) | Expr::PostfixDecr(inner) => {
+                self.collect_locals_from_expr(inner, locals);
+                locals.add("__postfix_old", ValType::I64, None);
             }
             Expr::None => {}
             Expr::TryBlock { resources, body, catch_body, catch_var, finally_body } => {
@@ -8609,7 +8682,14 @@ impl CodeGen {
     /// 判断表达式编译后是否在栈上产生一个值
     fn expr_produces_value(&self, expr: &Expr) -> bool {
         match expr {
-            Expr::Block(_, result) => result.is_some(),
+            Expr::Block(_, result) => {
+                // 仅当 result 表达式本身产生值时，block 才产生值（避免 Unit 类型导致 panic）
+                if let Some(tail) = result {
+                    self.expr_produces_value(tail)
+                } else {
+                    false
+                }
+            }
             // if 无 else 编译为 BlockType::Empty，不产生值
             Expr::If { else_branch: None, .. } => false,
             // if-else：只有两个分支都产生值时，整个 if-else 才产生值
@@ -8666,6 +8746,7 @@ impl CodeGen {
             // P5: spawn/synchronized 是语句级别，不产生值
             Expr::Spawn { .. } => false,
             Expr::Synchronized { .. } => false,
+            Expr::Break | Expr::Continue => false,
             // P6: OptionalChain 产生值
             Expr::OptionalChain { .. } => true,
             // P6: TrailingClosure 产生值（取决于被调用函数）
@@ -8695,6 +8776,7 @@ impl CodeGen {
             Expr::Rune(_) => ValType::I32,
             Expr::String(_) => ValType::I32,
             Expr::Array(_) => ValType::I32,
+            Expr::SliceExpr { .. } => ValType::I32,
             Expr::Tuple(_) => ValType::I32,
             Expr::TupleIndex { .. } => ValType::I64, // 默认假设 i64，实际由 AST 推断处理
             Expr::NullCoalesce { default, .. } => self.infer_type(default),
@@ -8746,6 +8828,8 @@ impl CodeGen {
             Expr::Index { .. } => ValType::I64,    // AST 推断未覆盖时的回退
             Expr::Field { .. } => ValType::I64,    // AST 推断未覆盖时的回退
             Expr::VariantConst { .. } => ValType::I32,
+            Expr::PostfixIncr(inner) | Expr::PostfixDecr(inner) => self.infer_type(inner),
+            Expr::Break | Expr::Continue => ValType::I32, // 不产生值，占位
             Expr::Cast { target_ty, .. } => target_ty.to_wasm(),
             Expr::IsType { .. } => ValType::I32, // Bool
             Expr::IfLet { then_branch, .. } => self.infer_type(then_branch),
@@ -8820,14 +8904,65 @@ impl CodeGen {
                     }
                 }
             }
-            Stmt::Var { name, value, .. } => {
+            Stmt::Var { pattern, value, .. } => {
                 self.compile_expr(value, locals, func, loop_ctx);
-                let idx = locals.get(name).expect("局部变量未找到");
-                // 值类型与局部变量类型不匹配时自动转换
-                let val_ty = self.infer_type_with_locals(value, locals);
-                let local_ty = locals.get_valtype(name).unwrap_or(val_ty);
-                self.emit_type_coercion(func, val_ty, local_ty);
-                func.instruction(&Instruction::LocalSet(idx));
+                match pattern {
+                    Pattern::Binding(name) => {
+                        let idx = locals.get(name).expect("局部变量未找到");
+                        let val_ty = self.infer_type_with_locals(value, locals);
+                        let local_ty = locals.get_valtype(name).unwrap_or(val_ty);
+                        self.emit_type_coercion(func, val_ty, local_ty);
+                        func.instruction(&Instruction::LocalSet(idx));
+                    }
+                    Pattern::Tuple(patterns) => {
+                        let ptr_tmp = locals.get("__var_tuple_ptr").expect("__var_tuple_ptr");
+                        func.instruction(&Instruction::LocalSet(ptr_tmp));
+                        let value_ast_ty = self.infer_ast_type_with_locals(value, locals);
+                        let elem_types: Vec<Option<Type>> = value_ast_ty
+                            .as_ref()
+                            .and_then(|t| if let Type::Tuple(ts) = t { Some(ts.iter().cloned().map(Some).collect()) } else { None })
+                            .unwrap_or_else(|| patterns.iter().map(|_| None).collect());
+                        for (i, pat) in patterns.iter().enumerate() {
+                            if let Pattern::Binding(name) = pat {
+                                let idx = locals.get(name).expect("局部变量未找到");
+                                func.instruction(&Instruction::LocalGet(ptr_tmp));
+                                func.instruction(&Instruction::I32Const(i as i32 * 8));
+                                func.instruction(&Instruction::I32Add);
+                                if let Some(Some(ty)) = elem_types.get(i) {
+                                    self.emit_load_by_type(func, ty);
+                                } else {
+                                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+                                }
+                                let local_ty = locals.get_valtype(name).unwrap_or(ValType::I64);
+                                self.emit_type_coercion(func, ValType::I64, local_ty);
+                                func.instruction(&Instruction::LocalSet(idx));
+                            }
+                            // 非 Binding 子模式（如 _）则 drop 该槽位，此处简化不处理
+                        }
+                    }
+                    Pattern::Struct { name: struct_name, fields } => {
+                        let ptr_tmp = locals.get("__var_struct_ptr").expect("__var_struct_ptr");
+                        func.instruction(&Instruction::LocalSet(ptr_tmp));
+                        let struct_def = &self.structs[struct_name];
+                        for (fname, pat) in fields {
+                            let offset = struct_def.field_offset(fname).expect("结构体字段");
+                            let fty = struct_def.field_type(fname).expect("字段类型");
+                            if let Pattern::Binding(bind) = pat {
+                                let bind_idx = locals.get(bind).expect("解构绑定名");
+                                func.instruction(&Instruction::LocalGet(ptr_tmp));
+                                func.instruction(&Instruction::I32Const(offset as i32));
+                                func.instruction(&Instruction::I32Add);
+                                self.emit_load_by_type(func, fty);
+                                let local_ty = locals.get_valtype(bind).unwrap_or(fty.to_wasm());
+                                self.emit_type_coercion(func, fty.to_wasm(), local_ty);
+                                func.instruction(&Instruction::LocalSet(bind_idx));
+                            }
+                        }
+                    }
+                    _ => {
+                        func.instruction(&Instruction::Drop);
+                    }
+                }
             }
             Stmt::Assign { target, value } => {
                 match target {
@@ -8934,6 +9069,88 @@ impl CodeGen {
                         self.compile_expr(value, locals, func, loop_ctx);
                         self.emit_store_by_type(func, &field_ty);
                     }
+                    AssignTarget::FieldPath { base, fields } => {
+                        // base.field1.field2... = value：沿链累加偏移后存储
+                        let obj_idx = locals.get(base).expect("对象未找到");
+                        let mut total_offset: i32 = 0;
+                        let mut current_ty = locals.get_type(base).cloned();
+                        for f in fields.iter() {
+                            let (off, next_ty) = current_ty
+                                .as_ref()
+                                .and_then(|ty| match ty {
+                                    Type::Struct(name, type_args) => {
+                                        let lookup_name = if !type_args.is_empty() {
+                                            let mangled = crate::monomorph::mangle_name(name, type_args);
+                                            if self.classes.contains_key(&mangled) || self.structs.contains_key(&mangled) {
+                                                mangled
+                                            } else {
+                                                name.clone()
+                                            }
+                                        } else {
+                                            name.clone()
+                                        };
+                                        if let Some(ci) = self.classes.get(&lookup_name) {
+                                            ci.field_offset(f).and_then(|off| {
+                                                ci.field_type(f).map(|ft| (off, ft.clone()))
+                                            })
+                                        } else {
+                                            self.structs.get(&lookup_name).and_then(|def| {
+                                                let off = def.field_offset(f)?;
+                                                let ft = def.field_type(f)?.clone();
+                                                Some((off, ft))
+                                            })
+                                        }
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or((0, Type::Int64));
+                            total_offset += off as i32;
+                            current_ty = Some(next_ty);
+                        }
+                        let field_ty = current_ty.unwrap_or(Type::Int64);
+                        func.instruction(&Instruction::LocalGet(obj_idx));
+                        func.instruction(&Instruction::I32Const(total_offset));
+                        func.instruction(&Instruction::I32Add);
+                        self.compile_expr(value, locals, func, loop_ctx);
+                        self.emit_store_by_type(func, &field_ty);
+                    }
+                    AssignTarget::IndexPath { base, fields, index } => {
+                        // base.field1.field2[i] = value：编译链式字段得数组指针，再 +4+index*8 后存储
+                        let mut arr_expr = Expr::Var(base.clone());
+                        for f in fields {
+                            arr_expr = Expr::Field {
+                                object: Box::new(arr_expr),
+                                field: f.clone(),
+                            };
+                        }
+                        self.compile_expr(&arr_expr, locals, func, loop_ctx);
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        self.compile_expr(index, locals, func, loop_ctx);
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::I32Const(8));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Add);
+                        self.compile_expr(value, locals, func, loop_ctx);
+                        func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                            offset: 0, align: 3, memory_index: 0,
+                        }));
+                    }
+                    AssignTarget::Tuple(ref targets) => {
+                        // (a, b) = expr：先编译 expr，栈上得到元组各元素（最后元素在栈顶），逆序赋给各目标
+                        self.compile_expr(value, locals, func, loop_ctx);
+                        for t in targets.iter().rev() {
+                            match t {
+                                AssignTarget::Var(name) => {
+                                    let idx = locals.get(name).expect("元组赋值目标变量未找到");
+                                    func.instruction(&Instruction::LocalSet(idx));
+                                }
+                                _ => {
+                                    func.instruction(&Instruction::Drop);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Stmt::Return(Some(expr)) => {
@@ -8974,6 +9191,11 @@ impl CodeGen {
                 func.instruction(&Instruction::Br(0));
                 func.instruction(&Instruction::End);
                 func.instruction(&Instruction::End);
+            }
+            Stmt::UnsafeBlock { body } => {
+                for s in body {
+                    self.compile_stmt(s, locals, func, loop_ctx);
+                }
             }
             Stmt::While { cond, body } => {
                 func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
@@ -9989,6 +10211,34 @@ impl CodeGen {
                         func.instruction(&Instruction::I32Const(0)); // false
                     }
                 }
+            }
+            Expr::PostfixIncr(inner) => {
+                self.compile_expr(inner, locals, func, loop_ctx);
+                let old_local = locals.get("__postfix_old").expect("__postfix_old");
+                func.instruction(&Instruction::LocalSet(old_local));
+                self.compile_expr(inner, locals, func, loop_ctx);
+                func.instruction(&Instruction::I64Const(1));
+                func.instruction(&Instruction::I64Add);
+                if let Expr::Var(name) = inner.as_ref() {
+                    if let Some(idx) = locals.get(name) {
+                        func.instruction(&Instruction::LocalSet(idx));
+                    }
+                }
+                func.instruction(&Instruction::LocalGet(old_local));
+            }
+            Expr::PostfixDecr(inner) => {
+                self.compile_expr(inner, locals, func, loop_ctx);
+                let old_local = locals.get("__postfix_old").expect("__postfix_old");
+                func.instruction(&Instruction::LocalSet(old_local));
+                self.compile_expr(inner, locals, func, loop_ctx);
+                func.instruction(&Instruction::I64Const(1));
+                func.instruction(&Instruction::I64Sub);
+                if let Expr::Var(name) = inner.as_ref() {
+                    if let Some(idx) = locals.get(name) {
+                        func.instruction(&Instruction::LocalSet(idx));
+                    }
+                }
+                func.instruction(&Instruction::LocalGet(old_local));
             }
             Expr::Cast { expr, target_ty } => {
                 self.compile_expr(expr, locals, func, loop_ctx);
@@ -11751,6 +12001,27 @@ impl CodeGen {
                     func.instruction(&Instruction::Return);
                 }
             }
+            Expr::Return(value) => {
+                // return 在表达式上下文（如 match arm body）
+                if let Some(expr) = value {
+                    self.compile_expr(expr, locals, func, loop_ctx);
+                }
+                func.instruction(&Instruction::Return);
+            }
+            Expr::Break => {
+                if let Some((break_depth, _)) = loop_ctx {
+                    func.instruction(&Instruction::Br(break_depth));
+                } else {
+                    func.instruction(&Instruction::Unreachable);
+                }
+            }
+            Expr::Continue => {
+                if let Some((_, continue_depth)) = loop_ctx {
+                    func.instruction(&Instruction::Br(continue_depth));
+                } else {
+                    func.instruction(&Instruction::Unreachable);
+                }
+            }
             Expr::TryBlock { resources, body, catch_var, catch_body, finally_body } => {
                 // try (resources) { body } catch(e) { catch_body } finally { finally_body }
                 // Compile resource initializations as let bindings before the try body
@@ -11837,8 +12108,65 @@ impl CodeGen {
                     func.instruction(&Instruction::LocalGet(try_result));
                 }
             }
-            Expr::SliceExpr { .. } | Expr::MapLiteral { .. } => {
-                todo!("SliceExpr and MapLiteral codegen not yet implemented")
+            Expr::SliceExpr { array, start, end } => {
+                // arr[start..end] → 新数组，与 Array.slice(start, end) 相同逻辑
+                let elem_size: i32 = 8;
+                let src_local = locals.get("__array_clone_src").unwrap_or_else(|| locals.get("__array_alloc_ptr").unwrap());
+                let alloc_idx = self.func_indices["__alloc"];
+
+                self.compile_expr(array, locals, func, loop_ctx);
+                func.instruction(&Instruction::LocalSet(src_local));
+
+                let start_local = locals.get("__array_dyn_idx").unwrap();
+                let end_local = locals.get("__array_dyn_size").unwrap();
+                self.compile_expr(start, locals, func, loop_ctx);
+                func.instruction(&Instruction::LocalSet(start_local));
+                self.compile_expr(end, locals, func, loop_ctx);
+                func.instruction(&Instruction::LocalSet(end_local));
+
+                let new_len_local = locals.get("__array_dyn_ptr").unwrap();
+                func.instruction(&Instruction::LocalGet(end_local));
+                func.instruction(&Instruction::LocalGet(start_local));
+                func.instruction(&Instruction::I64Sub);
+                func.instruction(&Instruction::I32WrapI64);
+                func.instruction(&Instruction::LocalSet(new_len_local));
+
+                func.instruction(&Instruction::LocalGet(new_len_local));
+                func.instruction(&Instruction::I32Const(elem_size));
+                func.instruction(&Instruction::I32Mul);
+                func.instruction(&Instruction::I32Const(4));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::Call(alloc_idx));
+
+                let dst_local = locals.get("__array_clone_dst").unwrap_or_else(|| locals.get("__array_alloc_ptr").unwrap());
+                func.instruction(&Instruction::LocalSet(dst_local));
+
+                func.instruction(&Instruction::LocalGet(dst_local));
+                func.instruction(&Instruction::LocalGet(new_len_local));
+                func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 0, align: 2, memory_index: 0,
+                }));
+
+                func.instruction(&Instruction::LocalGet(dst_local));
+                func.instruction(&Instruction::I32Const(4));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalGet(src_local));
+                func.instruction(&Instruction::I32Const(4));
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalGet(start_local));
+                func.instruction(&Instruction::I32WrapI64);
+                func.instruction(&Instruction::I32Const(elem_size));
+                func.instruction(&Instruction::I32Mul);
+                func.instruction(&Instruction::I32Add);
+                func.instruction(&Instruction::LocalGet(new_len_local));
+                func.instruction(&Instruction::I32Const(elem_size));
+                func.instruction(&Instruction::I32Mul);
+                func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+
+                func.instruction(&Instruction::LocalGet(dst_local));
+            }
+            Expr::MapLiteral { .. } => {
+                todo!("MapLiteral codegen not yet implemented")
             }
             // P5.1: spawn { block } — 单线程桩实现（直接同步执行 block）
             Expr::Spawn { body } => {
@@ -12015,6 +12343,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "answer".to_string(),
@@ -12062,6 +12391,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "test".to_string(),
@@ -12126,6 +12456,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "get_y".to_string(),
@@ -12172,6 +12503,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "compute".to_string(),
@@ -12206,6 +12538,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "max".to_string(),
@@ -12256,6 +12589,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "first".to_string(),
@@ -12301,6 +12635,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "match_test".to_string(),
@@ -12349,6 +12684,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "sum_range".to_string(),
@@ -12360,7 +12696,7 @@ mod tests {
                 extern_import: None,
                 body: vec![
                     Stmt::Var {
-                        name: "sum".to_string(),
+                        pattern: crate::ast::Pattern::Binding("sum".to_string()),
                         ty: Some(Type::Int64),
                         value: Expr::Integer(0),
                     },
@@ -12402,6 +12738,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![FuncDef {
                 visibility: Visibility::default(),
                 name: "fadd".to_string(),
@@ -12435,6 +12772,7 @@ mod tests {
             enums: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
             functions: vec![
                 FuncDef {
                     visibility: Visibility::default(),

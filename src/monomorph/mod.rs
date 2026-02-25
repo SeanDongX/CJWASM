@@ -381,6 +381,10 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             start: Box::new(substitute_expr(*start, subst, rewrites)),
             end: Box::new(substitute_expr(*end, subst, rewrites)),
         },
+        PostfixIncr(inner) => PostfixIncr(Box::new(substitute_expr(*inner, subst, rewrites))),
+        PostfixDecr(inner) => PostfixDecr(Box::new(substitute_expr(*inner, subst, rewrites))),
+        Break => Break,
+        Continue => Continue,
         MapLiteral { entries } => MapLiteral {
             entries: entries
                 .into_iter()
@@ -464,6 +468,7 @@ fn substitute_pattern(
             binding,
             ty: substitute_type(&ty, subst),
         },
+        Field { object, field } => Field { object, field },
     }
 }
 
@@ -493,8 +498,8 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
             ty: ty.map(|t| substitute_type(&t, subst)),
             value: substitute_expr(value, subst, rewrites),
         },
-        Var { name, ty, value } => Var {
-            name,
+        Var { pattern, ty, value } => Var {
+            pattern: substitute_pattern(pattern, subst, rewrites),
             ty: ty.map(|t| substitute_type(&t, subst)),
             value: substitute_expr(value, subst, rewrites),
         },
@@ -564,6 +569,12 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
             name,
             ty: ty.map(|t| substitute_type(&t, subst)),
             value: substitute_expr(value, subst, rewrites),
+        },
+        UnsafeBlock { body } => UnsafeBlock {
+            body: body
+                .into_iter()
+                .map(|s| substitute_stmt(s, subst, rewrites))
+                .collect(),
         },
     }
 }
@@ -804,6 +815,8 @@ impl AstWalk for Expr {
                 start.walk(f);
                 end.walk(f);
             }
+            PostfixIncr(inner) | PostfixDecr(inner) => inner.walk(f),
+            Break | Continue => {}
             MapLiteral { entries } => {
                 for (k, v) in entries {
                     k.walk(f);
@@ -1412,6 +1425,7 @@ mod tests {
             functions: vec![],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
         };
         monomorphize_program(&mut program);
         assert!(program.functions.is_empty());
@@ -1439,6 +1453,7 @@ mod tests {
             }],
             extends: vec![],
             type_aliases: vec![],
+            constants: vec![],
         };
         monomorphize_program(&mut program);
         assert_eq!(program.functions.len(), 1);

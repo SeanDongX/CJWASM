@@ -215,10 +215,17 @@ fn cmd_compile(args: &[String]) {
         programs.push(prog);
     }
 
-    // 自动解析 import 依赖
+    // 自动解析 import 依赖（含 L1 std vendor）
+    let vendor_std = pipeline::get_vendor_std_dir(&base_dir);
+    let base_dirs = [base_dir.as_path()];
     let mut import_queue = Vec::new();
     for prog in &programs {
-        import_queue.extend(pipeline::collect_import_files(prog, &base_dir, &mut visited));
+        import_queue.extend(pipeline::collect_import_files(
+            prog,
+            &base_dirs,
+            &mut visited,
+            vendor_std.as_deref(),
+        ));
     }
 
     while let Some(import_file) = import_queue.pop() {
@@ -230,7 +237,12 @@ fn cmd_compile(args: &[String]) {
                 std::process::exit(1);
             }
         };
-        let new_imports = pipeline::collect_import_files(&prog, &base_dir, &mut visited);
+        let new_imports = pipeline::collect_import_files(
+            &prog,
+            &base_dirs,
+            &mut visited,
+            vendor_std.as_deref(),
+        );
         import_queue.extend(new_imports);
         programs.push(prog);
     }

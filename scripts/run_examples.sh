@@ -246,6 +246,34 @@ if [[ -d "$MULTIFILE_DIR" && -z "$FILTER" ]]; then
   fi
 fi
 
+# ── examples/std（L1 标准库 cjpm 工程）──────────────────────────
+
+STD_DIR="$EXAMPLES_DIR/std"
+if [[ -d "$STD_DIR" && -f "$STD_DIR/cjpm.toml" && -z "$FILTER" ]]; then
+  echo ""
+  echo -e "${CYAN}[附加] L1 标准库示例: examples/std/ (cjwasm build -p examples/std)${NC}"
+
+  if compile_output=$(cd "$PROJECT_DIR" && "$CJWASM" build -p examples/std 2>&1); then
+    printf "%-30s ${GREEN}✓ 编译${NC}" "std/"
+    std_wasm="$STD_DIR/target/wasm/std_examples.wasm"
+    if ! $COMPILE_ONLY && $HAS_WASMTIME && [[ -f "$std_wasm" ]]; then
+      run_output=$(wasmtime run -W timeout=10s --invoke main "$std_wasm" 2>&1) || true
+      return_val="${run_output##*$'\n'}"
+      printf "       ${GREEN}✓ 运行${NC}       %s\n" "$return_val"
+    else
+      printf "       ${YELLOW}— 跳过${NC}\n"
+    fi
+    ((PASS++)) || true
+  else
+    printf "%-30s ${RED}✗ 编译失败${NC}\n" "std/"
+    ((FAIL++)) || true
+    ERRORS+=("std/ (编译失败)")
+    if $VERBOSE; then
+      echo -e "  ${RED}$compile_output${NC}"
+    fi
+  fi
+fi
+
 # ── 汇总 ──────────────────────────────────────────────────────
 
 echo ""

@@ -1,4 +1,8 @@
 //! 编译流水线工具函数：文件解析、AST合并、import依赖解析。
+//!
+//! L1 模块（纯 Cangjie，Vendor 优先）：std.io, std.binary, std.console,
+//! std.overflow, std.crypto, std.deriving, std.ast, std.argopt, std.sort,
+//! std.ref, std.unicode — 从 third_party/cangjie_runtime/std/libs/std 解析。
 
 use crate::ast::Program;
 use crate::codegen::CodeGen;
@@ -7,9 +11,46 @@ use crate::parser::Parser;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// L1 顶层 std 模块名（纯 Cangjie 实现，Vendor 优先）
+const L1_STD_TOP: &[&str] = &[
+    "io", "binary", "console", "overflow", "crypto", "deriving",
+    "ast", "argopt", "sort", "ref", "unicode",
+];
+
+/// 返回 L1 顶层模块名列表，供测试或工具使用
+pub fn l1_std_top_modules() -> &'static [&'static str] {
+    L1_STD_TOP
+}
+
+/// 移除源码中的块注释 /* ... */，便于解析含版权头的 vendor 文件
+fn strip_block_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    let bytes = source.as_bytes();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    out.push(' ');
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let ch = source[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// 解析源代码字符串为 Program AST
 pub fn parse_source(source: &str) -> Result<Program, String> {
-    let lexer = Lexer::new(source);
+    let source = strip_block_comments(source);
+    let lexer = Lexer::new(&source);
     let tokens: Result<Vec<_>, _> = lexer.collect();
     let tokens = tokens.map_err(|e| format!("词法错误: {}", e))?;
 
@@ -25,8 +66,7 @@ pub fn parse_source(source: &str) -> Result<Program, String> {
 pub fn parse_file(path: &str) -> Result<(Program, String), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("无法读取文件 '{}': {}", path, e))?;
-
-    let program = parse_source(&source)?;
+    let program = parse_source(&source).map_err(|e| format!("{}: {}", path, e))?;
     Ok((program, source))
 }
 
@@ -42,6 +82,7 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
         functions: vec![],
         extends: vec![],
         type_aliases: vec![],
+        constants: vec![],
     };
 
     for prog in programs {
@@ -56,31 +97,55 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
         merged.functions.extend(prog.functions);
         merged.extends.extend(prog.extends);
         merged.type_aliases.extend(prog.type_aliases);
+        merged.constants.extend(prog.constants);
     }
 
     merged
 }
 
-/// 根据 import 路径解析文件路径
-/// 例如: import math.utils -> 搜索 math/utils.cj 或 math_utils.cj
-pub fn resolve_import_path(module_path: &[String], base_dir: &Path) -> Option<PathBuf> {
-    // 策略 1: 将模块路径转为目录路径 math.utils -> math/utils.cj
+/// 判断是否为 L1 std 模块（含子包，如 std.crypto.digest）
+fn is_l1_std_module(module_path: &[String]) -> bool {
+    if module_path.is_empty() || module_path[0] != "std" {
+        return false;
+    }
+    if module_path.len() == 1 {
+        return false;
+    }
+    L1_STD_TOP.contains(&module_path[1].as_str())
+}
+
+/// 获取 vendor 标准库根目录（L1 解析用）
+/// 优先 project_dir 及其父目录下的 third_party/...，其次环境变量 CJWASM_STD_PATH
+pub fn get_vendor_std_dir(project_dir: &Path) -> Option<PathBuf> {
+    let mut dir = project_dir.to_path_buf();
+    for _ in 0..8 {
+        let vendor = dir.join("third_party/cangjie_runtime/std/libs/std");
+        if vendor.exists() && vendor.is_dir() {
+            return Some(vendor);
+        }
+        if let Some(parent) = dir.parent() {
+            dir = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    std::env::var_os("CJWASM_STD_PATH").map(PathBuf::from)
+}
+
+/// 根据 import 路径解析为单个文件（用于非 std 或非 L1）
+fn resolve_import_path_single(module_path: &[String], base_dir: &Path) -> Option<PathBuf> {
     let dir_path = base_dir
         .join(module_path.iter().cloned().collect::<Vec<_>>().join("/"))
         .with_extension("cj");
     if dir_path.exists() {
         return Some(dir_path);
     }
-
-    // 策略 2: 使用下划线连接 math.utils -> math_utils.cj
     let underscore_path = base_dir
         .join(module_path.iter().cloned().collect::<Vec<_>>().join("_"))
         .with_extension("cj");
     if underscore_path.exists() {
         return Some(underscore_path);
     }
-
-    // 策略 3: 在 src/ 子目录中查找
     let src_dir = base_dir.join("src");
     if src_dir.exists() {
         let src_path = src_dir
@@ -90,28 +155,70 @@ pub fn resolve_import_path(module_path: &[String], base_dir: &Path) -> Option<Pa
             return Some(src_path);
         }
     }
-
     None
 }
 
-/// 递归解析 import 依赖
-pub fn collect_import_files(
-    program: &Program,
-    base_dir: &Path,
-    visited: &mut HashSet<PathBuf>,
-) -> Vec<PathBuf> {
-    let mut import_files = Vec::new();
+/// 根据 import 路径解析文件路径（单文件，兼容旧逻辑）
+/// 例如: import math.utils -> 搜索 math/utils.cj 或 math_utils.cj
+pub fn resolve_import_path(module_path: &[String], base_dir: &Path) -> Option<PathBuf> {
+    resolve_import_path_single(module_path, base_dir)
+}
 
-    for import in &program.imports {
-        if let Some(resolved) = resolve_import_path(&import.module_path, base_dir) {
-            let canonical = resolved.canonicalize().unwrap_or(resolved.clone());
-            if !visited.contains(&canonical) {
-                visited.insert(canonical.clone());
-                import_files.push(resolved);
+/// L1：将 import 解析为若干文件（std L1 包可能对应目录下多个 .cj）
+pub fn resolve_import_to_files(
+    module_path: &[String],
+    base_dirs: &[&Path],
+    vendor_std_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    // L1 Vendor 优先：std.io / std.crypto.digest 等
+    if let Some(vendor) = vendor_std_dir {
+        if is_l1_std_module(module_path) && module_path.len() >= 2 {
+            let rel: PathBuf = module_path[1..].iter().cloned().collect::<Vec<_>>().join("/").into();
+            let dir = vendor.join(rel);
+            if dir.exists() && dir.is_dir() {
+                let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().map_or(false, |e| e == "cj"))
+                        .collect(),
+                    Err(_) => vec![],
+                };
+                files.sort();
+                if !files.is_empty() {
+                    return files;
+                }
             }
         }
     }
 
+    // 回退：在 base_dirs 中按单文件解析
+    for base in base_dirs {
+        if let Some(p) = resolve_import_path_single(module_path, base) {
+            return vec![p];
+        }
+    }
+    vec![]
+}
+
+/// 递归解析 import 依赖；支持 L1 vendor 多文件解析
+pub fn collect_import_files(
+    program: &Program,
+    base_dirs: &[&Path],
+    visited: &mut HashSet<PathBuf>,
+    vendor_std_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut import_files = Vec::new();
+    for import in &program.imports {
+        let resolved = resolve_import_to_files(&import.module_path, base_dirs, vendor_std_dir);
+        for path in resolved {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if !visited.contains(&canonical) {
+                visited.insert(canonical.clone());
+                import_files.push(path);
+            }
+        }
+    }
     import_files
 }
 
@@ -173,6 +280,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_extend_interface_with_type_args() {
+        let source = "package std.sort
+extend<T> Array<T> <: SortByExtension<T> {
+}
+";
+        let result = parse_source(source);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        let program = result.unwrap();
+        assert_eq!(program.extends.len(), 1);
+        assert_eq!(program.extends[0].target_type, "Array");
+        assert_eq!(program.extends[0].interface.as_deref(), Some("SortByExtension"));
+    }
+
+    #[test]
+    #[ignore] // 仅需时手动运行：cargo test --release test_parse_sort_cj -- --ignored
+    fn test_parse_sort_cj() {
+        let path = "third_party/cangjie_runtime/std/libs/std/sort/sort.cj";
+        let source = fs::read_to_string(path).unwrap();
+        let result = parse_source(&source);
+        assert!(result.is_ok(), "parse sort.cj failed: {:?}", result);
+    }
+
+    #[test]
     fn test_merge_programs_empty() {
         let merged = merge_programs(vec![]);
         assert!(merged.functions.is_empty());
@@ -225,6 +355,38 @@ mod tests {
         assert_eq!(merged.classes.len(), 1);
         assert_eq!(merged.enums.len(), 1);
         assert_eq!(merged.interfaces.len(), 1);
+    }
+
+    #[test]
+    fn test_get_vendor_std_dir_not_found() {
+        let tmp = std::env::temp_dir().join("cjwasm_no_vendor");
+        let _ = fs::create_dir_all(&tmp).ok();
+        let _out = get_vendor_std_dir(&tmp);
+        // 无 third_party 时可为 None 或由环境变量决定
+        let _ = fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_resolve_l1_std_vendor() {
+        let tmp = std::env::temp_dir().join("cjwasm_test_l1_vendor");
+        let _ = fs::remove_dir_all(&tmp).ok();
+        let vendor = tmp.join("third_party/cangjie_runtime/std/libs/std");
+        let io_dir = vendor.join("overflow");
+        let _ = fs::create_dir_all(&io_dir).ok();
+        let _ = fs::write(io_dir.join("wrapping_op.cj"), "package std.overflow\n");
+        let _ = fs::write(io_dir.join("checked_op.cj"), "package std.overflow\n");
+
+        let vendor_ref = vendor.as_path();
+        let bases: &[&Path] = &[tmp.as_path()];
+        let files = resolve_import_to_files(
+            &["std".to_string(), "overflow".to_string()],
+            bases,
+            Some(vendor_ref),
+        );
+        assert!(!files.is_empty(), "L1 std.overflow 应解析到 vendor 下多个 .cj");
+        assert!(files.iter().all(|p| p.extension().map_or(false, |e| e == "cj")));
+
+        let _ = fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -293,7 +455,8 @@ mod tests {
         let program = parse_source(source).unwrap();
         let tmp = std::env::temp_dir();
         let mut visited = HashSet::new();
-        let files = collect_import_files(&program, &tmp, &mut visited);
+        let bases = [tmp.as_path()];
+        let files = collect_import_files(&program, &bases, &mut visited, None);
         // 找不到文件时返回空
         assert!(files.is_empty());
     }
@@ -308,11 +471,12 @@ mod tests {
         let source = "import mylib\nfunc main(): Int64 { return 0 }";
         let program = parse_source(source).unwrap();
         let mut visited = HashSet::new();
-        let files = collect_import_files(&program, &tmp, &mut visited);
+        let bases = [tmp.as_path()];
+        let files = collect_import_files(&program, &bases, &mut visited, None);
         assert_eq!(files.len(), 1);
 
         // 再次收集不会重复
-        let files2 = collect_import_files(&program, &tmp, &mut visited);
+        let files2 = collect_import_files(&program, &bases, &mut visited, None);
         assert!(files2.is_empty());
 
         let _ = fs::remove_dir_all(&tmp);

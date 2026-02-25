@@ -842,6 +842,34 @@ fn test_compile_import_module() {
     assert_valid_wasm(&wasm, "import_module");
 }
 
+/// L1 模块解析：在含 third_party 的仓库中，import std.overflow 应从 vendor 解析到多个 .cj 文件
+#[test]
+fn test_l1_std_vendor_resolution() {
+    let repo = std::env::var("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let vendor = cjwasm::pipeline::get_vendor_std_dir(&repo);
+    if let Some(ref v) = vendor {
+        let module_path = ["std".to_string(), "overflow".to_string()];
+        let bases: &[&Path] = &[];
+        let files = cjwasm::pipeline::resolve_import_to_files(
+            &module_path,
+            bases,
+            Some(v.as_path()),
+        );
+        assert!(
+            !files.is_empty(),
+            "L1 std.overflow 应从 vendor 解析到至少一个 .cj 文件 (vendor={})",
+            v.display()
+        );
+        assert!(
+            files.iter().all(|p| p.extension().map_or(false, |e| e == "cj")),
+            "解析结果应均为 .cj 文件"
+        );
+    }
+    // 无 vendor 时跳过断言（如仅安装 binary 时）
+}
+
 // --- interface 继承 + 默认方法 + 关联类型 ---
 #[test]
 fn test_compile_interface_inheritance_default_assoc() {

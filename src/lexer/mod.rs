@@ -175,6 +175,106 @@ fn lex_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, Vec<String
     None // 未找到结束引号
 }
 
+/// 解析反引号字符串 `...`（支持 ${expr} 插值与 \` \n \t \\ 转义）
+/// remainder 为反引号之后的内容（开头的 ` 已由 token 消耗）
+fn lex_backtick_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, Vec<StringPart>>> {
+    let remainder = lex.remainder();
+    let bytes = remainder.as_bytes();
+    let mut pos = 0;
+    let mut parts: Vec<StringPart> = Vec::new();
+    let mut current_literal = String::new();
+    let mut has_interpolation = false;
+
+    while pos < bytes.len() {
+        let c = bytes[pos];
+
+        if c == b'\\' && pos + 1 < bytes.len() {
+            let next = bytes[pos + 1];
+            match next {
+                b'n' => current_literal.push('\n'),
+                b't' => current_literal.push('\t'),
+                b'`' => current_literal.push('`'),
+                b'\\' => current_literal.push('\\'),
+                b'$' => current_literal.push('$'),
+                _ => {
+                    current_literal.push('\\');
+                    current_literal.push(next as char);
+                }
+            }
+            pos += 2;
+        } else if c == b'$' && pos + 1 < bytes.len() && bytes[pos + 1] == b'{' {
+            has_interpolation = true;
+            if !current_literal.is_empty() {
+                parts.push(StringPart::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            pos += 2;
+            let mut brace_depth = 1;
+            let expr_start = pos;
+            while pos < bytes.len() && brace_depth > 0 {
+                match bytes[pos] {
+                    b'{' => brace_depth += 1,
+                    b'}' => brace_depth -= 1,
+                    b'"' => {
+                        pos += 1;
+                        while pos < bytes.len() && bytes[pos] != b'"' {
+                            if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
+                                pos += 2;
+                            } else {
+                                pos += 1;
+                            }
+                        }
+                    }
+                    b'`' => {
+                        pos += 1;
+                        while pos < bytes.len() && bytes[pos] != b'`' {
+                            if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
+                                pos += 2;
+                            } else {
+                                pos += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if brace_depth > 0 {
+                    pos += 1;
+                }
+            }
+            if brace_depth != 0 {
+                return None;
+            }
+            let expr_text = std::str::from_utf8(&bytes[expr_start..pos]).ok()?;
+            parts.push(StringPart::Interpolation(expr_text.to_string()));
+            pos += 1;
+        } else if c == b'`' {
+            if has_interpolation {
+                if !current_literal.is_empty() {
+                    parts.push(StringPart::Literal(current_literal));
+                }
+                lex.bump(pos + 1);
+                return Some(Err(parts));
+            } else {
+                lex.bump(pos + 1);
+                return Some(Ok(current_literal));
+            }
+        } else {
+            current_literal.push(c as char);
+            pos += 1;
+        }
+    }
+    None
+}
+
+/// 词法分析入口：反引号字符串
+fn lex_any_backtick_string(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<StringOrInterpolated, ()> {
+    match lex_backtick_string(lex) {
+        Some(Ok(s)) => logos::FilterResult::Emit(StringOrInterpolated::Plain(s)),
+        Some(Err(parts)) => logos::FilterResult::Emit(StringOrInterpolated::Interpolated(parts)),
+        None => logos::FilterResult::Error(()),
+    }
+}
+
 /// 词法分析入口：解析字符串（普通或插值）
 fn lex_any_string(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<StringOrInterpolated, ()> {
     match lex_string(lex) {
@@ -195,6 +295,9 @@ pub enum StringOrInterpolated {
 #[logos(skip r"[ \t\r\n]+")]  // 跳过空白
 #[logos(skip r"//[^\n]*")]    // 跳过单行注释
 pub enum Token {
+    // 块注释 /* ... */（在 next() 中过滤不发射，与 vendor 版权头兼容）
+    #[regex(r"/\*(?:[^*]|\*+[^*/])*\*/")]
+    BlockComment,
     // 关键字
     #[token("func")]
     Func,
@@ -402,11 +505,12 @@ pub enum Token {
     })]
     Float32(f32),
 
-    #[regex(r"0x[0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*", |lex| {
+    #[regex(r"0[xX][0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*", |lex| {
         let slice = lex.slice();
         let s: String = slice.chars().filter(|c| *c != '_').collect();
-        if slice.starts_with("0x") { i64::from_str_radix(&s[2..], 16).ok() }
-        else if slice.starts_with("0o") { i64::from_str_radix(&s[2..], 8).ok() }
+        if slice.len() >= 2 && (slice.starts_with("0x") || slice.starts_with("0X")) {
+            i64::from_str_radix(&s[2..], 16).ok()
+        } else if slice.starts_with("0o") { i64::from_str_radix(&s[2..], 8).ok() }
         else if slice.starts_with("0b") { i64::from_str_radix(&s[2..], 2).ok() }
         else { s.parse::<i64>().ok() }
     })]
@@ -451,6 +555,10 @@ pub enum Token {
     // 字符串字面量（支持 \n \t \" \\ 转义，以及 ${expr} 插值）
     #[token("\"", lex_any_string)]
     StringLit(StringOrInterpolated),
+
+    // 反引号字符串 `...`（支持 ${expr} 插值与 \` \n \t \\ 转义，与仓颉 vendor 兼容）
+    #[token("`", lex_any_backtick_string)]
+    BacktickStringLit(StringOrInterpolated),
 
     // 标识符
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
@@ -599,14 +707,17 @@ impl<'a> Iterator for Lexer<'a> {
     type Item = Result<(usize, Token, usize), String>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let token = self.inner.next()?;
-        let span = self.inner.span();
-        match token {
-            Ok(tok) => Some(Ok((span.start, tok, span.end))),
-            Err(_) => Some(Err(format!(
-                "未知字符: '{}'",
-                &self.inner.source()[span.start..span.end]
-            ))),
+        loop {
+            let token = self.inner.next()?;
+            let span = self.inner.span();
+            match token {
+                Ok(Token::BlockComment) => continue,  // 跳过块注释
+                Ok(tok) => return Some(Ok((span.start, tok, span.end))),
+                Err(_) => return Some(Err(format!(
+                    "未知字符: '{}'",
+                    &self.inner.source()[span.start..span.end]
+                ))),
+            }
         }
     }
 }

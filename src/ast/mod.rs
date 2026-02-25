@@ -397,6 +397,8 @@ pub enum Expr {
     Try(Box<Expr>),
     /// throw 表达式
     Throw(Box<Expr>),
+    /// return 在表达式上下文（如 match arm body）解析为表达式
+    Return(Option<Box<Expr>>),
     /// try 块表达式（支持 try-catch-finally 和 try-with-resources）
     TryBlock {
         /// try-with-resources 的资源声明（变量名, 表达式）
@@ -413,6 +415,14 @@ pub enum Expr {
         start: Box<Expr>,
         end: Box<Expr>,
     },
+    /// 后缀自增 expr++
+    PostfixIncr(Box<Expr>),
+    /// 后缀自减 expr--
+    PostfixDecr(Box<Expr>),
+    /// break 在表达式上下文（如 match arm body）
+    Break,
+    /// continue 在表达式上下文
+    Continue,
     /// Map 字面量 Map<K, V> { key1 => val1, key2 => val2 }
     MapLiteral {
         entries: Vec<(Expr, Expr)>,
@@ -488,6 +498,8 @@ pub enum Pattern {
         binding: String,
         ty: Type,
     },
+    /// 字段模式 obj.field（cjc 兼容，match 时匹配/绑定字段访问）
+    Field { object: String, field: String },
 }
 
 /// 字面量值 (用于模式匹配)
@@ -509,9 +521,9 @@ pub enum Stmt {
         ty: Option<Type>,
         value: Expr,
     },
-    /// var 绑定 (可变)
+    /// var 绑定 (可变)，支持单变量或解构 pattern
     Var {
-        name: String,
+        pattern: Pattern,
         ty: Option<Type>,
         value: Expr,
     },
@@ -570,6 +582,8 @@ pub enum Stmt {
         ty: Option<Type>,
         value: Expr,
     },
+    /// unsafe { ... } 块：允许不安全操作的语句块
+    UnsafeBlock { body: Vec<Stmt> },
 }
 
 /// 赋值目标
@@ -581,6 +595,12 @@ pub enum AssignTarget {
     Index { array: String, index: Box<Expr> },
     /// 结构体字段 obj.field
     Field { object: String, field: String },
+    /// 链式字段 obj.field1.field2（如 this.outputBOS.curPos）
+    FieldPath { base: String, fields: Vec<String> },
+    /// 链式字段后索引 obj.field1.field2[i]（如 this.outputBOS.outBuf[i]）
+    IndexPath { base: String, fields: Vec<String>, index: Box<Expr> },
+    /// 元组解构 (a, b) = expr
+    Tuple(Vec<AssignTarget>),
 }
 
 /// 结构体字段定义
@@ -590,6 +610,14 @@ pub struct FieldDef {
     pub ty: Type,
     /// cjc 兼容: 字段默认值 (如 `var x: Int64 = 0`)
     pub default: Option<Expr>,
+}
+
+/// 顶层常量定义 (let/var name: Type = expr)
+#[derive(Debug, Clone)]
+pub struct ConstDef {
+    pub name: String,
+    pub ty: Type,
+    pub init: Expr,
 }
 
 /// 结构体定义
@@ -860,4 +888,6 @@ pub struct Program {
     pub extends: Vec<ExtendDef>,
     /// P2.2: 类型别名 (type Name = Type)
     pub type_aliases: Vec<(String, Type)>,
+    /// 顶层常量 (let/var name: Type = expr)
+    pub constants: Vec<ConstDef>,
 }

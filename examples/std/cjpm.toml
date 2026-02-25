@@ -1,0 +1,5 @@
+[package]
+name = "std_examples"
+version = "0.1.0"
+description = "L1 标准库解析与用法示例（Vendor 优先）"
+output-type = "executable"

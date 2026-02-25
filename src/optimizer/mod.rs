@@ -122,7 +122,7 @@ fn optimize_tail_recursion(func: &mut crate::ast::Function) {
         .collect();
     for (tmp_name, arg) in tmp_names.iter().zip(tail_args) {
         loop_body.push(Stmt::Var {
-            name: tmp_name.clone(),
+            pattern: crate::ast::Pattern::Binding(tmp_name.clone()),
             ty: None,
             value: arg,
         });

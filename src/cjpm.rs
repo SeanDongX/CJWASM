@@ -200,26 +200,30 @@ pub fn build(opts: &BuildOptions) -> Result<BuildResult, String> {
         programs.push(prog);
     }
 
-    // 自动解析 import 依赖（在 src 目录和项目根目录中搜索）
+    // 自动解析 import 依赖（src/、项目根、L1 std vendor）
     let search_dirs = [src_dir.clone(), opts.project_dir.clone()];
+    let base_refs: Vec<&Path> = search_dirs.iter().map(PathBuf::as_path).collect();
+    let vendor_std = crate::pipeline::get_vendor_std_dir(&opts.project_dir);
     let mut import_queue = Vec::new();
     for prog in &programs {
-        for base in &search_dirs {
-            import_queue.extend(crate::pipeline::collect_import_files(
-                prog,
-                base,
-                &mut visited,
-            ));
-        }
+        import_queue.extend(crate::pipeline::collect_import_files(
+            prog,
+            &base_refs,
+            &mut visited,
+            vendor_std.as_deref(),
+        ));
     }
 
     while let Some(import_file) = import_queue.pop() {
         let path_str = import_file.to_string_lossy().to_string();
         let (prog, _source) = crate::pipeline::parse_file(&path_str)?;
-        for base in &search_dirs {
-            let new_imports = crate::pipeline::collect_import_files(&prog, base, &mut visited);
-            import_queue.extend(new_imports);
-        }
+        let new_imports = crate::pipeline::collect_import_files(
+            &prog,
+            &base_refs,
+            &mut visited,
+            vendor_std.as_deref(),
+        );
+        import_queue.extend(new_imports);
         programs.push(prog);
     }
 
