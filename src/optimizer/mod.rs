@@ -124,7 +124,7 @@ fn optimize_tail_recursion(func: &mut crate::ast::Function) {
         loop_body.push(Stmt::Var {
             pattern: crate::ast::Pattern::Binding(tmp_name.clone()),
             ty: None,
-            value: arg,
+            value: Some(arg),
         });
     }
     // 再从临时变量赋值给参数
@@ -146,7 +146,8 @@ fn optimize_tail_recursion(func: &mut crate::ast::Function) {
 fn fold_stmt(stmt: &mut Stmt) {
     match stmt {
         Stmt::Let { value, .. } => *value = fold_expr(value.clone()),
-        Stmt::Var { value, .. } => *value = fold_expr(value.clone()),
+        Stmt::Var { value: Some(value), .. } => *value = fold_expr(value.clone()),
+        Stmt::Var { value: None, .. } => {}
         Stmt::Assign { value, .. } => *value = fold_expr(value.clone()),
         Stmt::Expr(e) => *e = fold_expr(e.clone()),
         Stmt::Return(Some(e)) => *e = fold_expr(e.clone()),

@@ -51,18 +51,18 @@ impl CodeGen {
                             .as_ref()
                             .map(|t| t.to_wasm())
                             .unwrap_or_else(|| {
-                                self.infer_ast_type_with_locals(value, locals)
+                                value.as_ref().and_then(|v| self.infer_ast_type_with_locals(v, locals))
                                     .map(|t| t.to_wasm())
-                                    .unwrap_or_else(|| self.infer_type(value))
+                                    .unwrap_or_else(|| value.as_ref().map(|v| self.infer_type(v)).unwrap_or(ValType::I64))
                             });
                         let ast_type = ty.clone()
-                            .or_else(|| self.infer_ast_type_with_locals(value, locals))
-                            .or_else(|| self.infer_ast_type(value));
+                            .or_else(|| value.as_ref().and_then(|v| self.infer_ast_type_with_locals(v, locals)))
+                            .or_else(|| value.as_ref().and_then(|v| self.infer_ast_type(v)));
                         locals.add(name, val_type, ast_type);
                     }
                     Pattern::Tuple(patterns) => {
                         locals.add("__var_tuple_ptr", ValType::I32, None);
-                        let value_ty = ty.clone().or_else(|| self.infer_ast_type_with_locals(value, locals));
+                        let value_ty = ty.clone().or_else(|| value.as_ref().and_then(|v| self.infer_ast_type_with_locals(v, locals)));
                         if let Some(Type::Tuple(types)) = value_ty.as_ref() {
                             for (i, pat) in patterns.iter().enumerate() {
                                 if let Pattern::Binding(name) = pat {
@@ -95,7 +95,9 @@ impl CodeGen {
                     }
                     _ => {}
                 }
-                self.collect_locals_from_expr(value, locals);
+                if let Some(v) = value {
+                    self.collect_locals_from_expr(v, locals);
+                }
             }
             Stmt::Assign { value, .. } => {
                 self.collect_locals_from_expr(value, locals);
@@ -140,9 +142,11 @@ impl CodeGen {
                     Pattern::Binding(name) => {
                         locals.add(name, ValType::I64, None);
                     }
-                    Pattern::Variant { enum_name, variant_name, binding: Some(name) } => {
+                    Pattern::Variant { enum_name, variant_name, bindings } => {
                         if let Some(ty) = self.resolve_variant_payload(enum_name, variant_name, subject_ast_type.as_ref()) {
-                            locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                            if let Some(Some(name)) = bindings.first() {
+                                locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                            }
                         }
                     }
                     Pattern::Struct { name: struct_name, fields } => {
@@ -205,9 +209,11 @@ impl CodeGen {
                         Pattern::Binding(name) => {
                             locals.add(name, ValType::I64, None);
                         }
-                        Pattern::Variant { enum_name, variant_name, binding: Some(name) } => {
+                        Pattern::Variant { enum_name, variant_name, bindings } => {
                             if let Some(ty) = self.resolve_variant_payload(enum_name, variant_name, subject_ast_type.as_ref()) {
-                                locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                                if let Some(Some(name)) = bindings.first() {
+                                    locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                                }
                             }
                         }
                         Pattern::Struct { name: struct_name, fields } => {
@@ -241,9 +247,11 @@ impl CodeGen {
                     Pattern::Binding(name) => {
                         locals.add(name, ValType::I64, None);
                     }
-                    Pattern::Variant { enum_name, variant_name, binding: Some(name) } => {
+                    Pattern::Variant { enum_name, variant_name, bindings } => {
                         if let Some(ty) = self.resolve_variant_payload(enum_name, variant_name, subject_ast_type.as_ref()) {
-                            locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                            if let Some(Some(name)) = bindings.first() {
+                                locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                            }
                         }
                     }
                     Pattern::Struct { name: struct_name, fields } => {
@@ -2348,6 +2356,7 @@ impl CodeGen {
                 }
             }
             Stmt::Var { pattern, value, .. } => {
+                let value = if let Some(v) = value { v } else { return; };
                 self.compile_expr(value, locals, func, loop_ctx);
                 match pattern {
                     Pattern::Binding(name) => {
@@ -2695,7 +2704,7 @@ impl CodeGen {
                         }
                         func.instruction(&Instruction::Br(0));
                     }
-                    Pattern::Variant { enum_name, variant_name, binding } => {
+                    Pattern::Variant { enum_name, variant_name, bindings } => {
                         let enum_def = self.enums.get(enum_name).and_then(|e| e.variant_index(variant_name).map(|_| e));
                         if let Some(enum_def) = enum_def {
                             func.instruction(&Instruction::LocalSet(ptr_tmp));
@@ -2717,7 +2726,7 @@ impl CodeGen {
                             }
                             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                             if has_variant_payload {
-                                if let Some(ref bind_name) = binding {
+                                if let Some(Some(ref bind_name)) = bindings.first() {
                                     if let Some(ref payload_ty) = resolved_payload {
                                         func.instruction(&Instruction::LocalGet(ptr_tmp));
                                         func.instruction(&Instruction::I32Const(4));
@@ -5082,7 +5091,7 @@ impl CodeGen {
                         Pattern::Variant {
                             enum_name,
                             variant_name,
-                            binding,
+                            bindings,
                         } => {
                             // 判断是否为已知枚举（包含用户定义枚举 + 内建 Option/Result）
                             let handled = {
@@ -5117,7 +5126,7 @@ impl CodeGen {
 
                                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 if has_variant_payload {
-                                    if let Some(ref bind_name) = binding {
+                                    if let Some(Some(ref bind_name)) = bindings.first() {
                                         if let Some(ref payload_ty) = resolved_payload {
                                             func.instruction(&Instruction::LocalGet(ptr_tmp));
                                             func.instruction(&Instruction::I32Const(4));

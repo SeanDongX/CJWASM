@@ -1440,8 +1440,8 @@ mod tests {
 
     #[test]
     fn test_parse_error_bad_match_subject() {
-        // match 无效token
-        let err = parse_should_fail("func main(): Int64 { return match {} {} }");
+        // match 主体为无效 token（+ 不是合法的 match 主体）
+        let err = parse_should_fail("func main(): Int64 { return match + {} }");
         assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
     }
 

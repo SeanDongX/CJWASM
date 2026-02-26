@@ -106,7 +106,10 @@ impl CodeGen {
                 Stmt::Return(Some(e)) => {
                     if Self::expr_contains_unhandled_throw(e) { return true; }
                 }
-                Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+                Stmt::Let { value, .. } => {
+                    if Self::expr_contains_unhandled_throw(value) { return true; }
+                }
+                Stmt::Var { value: Some(value), .. } => {
                     if Self::expr_contains_unhandled_throw(value) { return true; }
                 }
                 Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::DoWhile { body, .. } | Stmt::UnsafeBlock { body } => {
@@ -149,7 +152,12 @@ impl CodeGen {
                         return Some(inner);
                     }
                 }
-                Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+                Stmt::Let { value, .. } => {
+                    if let Some(inner) = Self::find_throw_inner_in_expr(value) {
+                        return Some(inner);
+                    }
+                }
+                Stmt::Var { value: Some(value), .. } => {
                     if let Some(inner) = Self::find_throw_inner_in_expr(value) {
                         return Some(inner);
                     }
@@ -1235,7 +1243,10 @@ impl CodeGen {
 
     fn collect_lambdas_from_stmt(stmt: &Stmt, counter: &mut u32, out: &mut Vec<FuncDef>) {
         match stmt {
-            Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+            Stmt::Let { value, .. } => {
+                Self::collect_lambdas_from_expr(value, counter, out);
+            }
+            Stmt::Var { value: Some(value), .. } => {
                 Self::collect_lambdas_from_expr(value, counter, out);
             }
             Stmt::Assign { value, .. } => {
@@ -6472,7 +6483,7 @@ mod tests {
                     Stmt::Var {
                         pattern: crate::ast::Pattern::Binding("sum".to_string()),
                         ty: Some(Type::Int64),
-                        value: Expr::Integer(0),
+                        value: Some(Expr::Integer(0)),
                     },
                     Stmt::For {
                         var: "i".to_string(),

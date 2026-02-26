@@ -438,11 +438,11 @@ fn substitute_pattern(
         Variant {
             enum_name,
             variant_name,
-            binding,
+            bindings,
         } => Variant {
             enum_name,
             variant_name,
-            binding,
+            bindings,
         },
         Or(ps) => Or(ps
             .into_iter()
@@ -502,7 +502,7 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
         Var { pattern, ty, value } => Var {
             pattern: substitute_pattern(pattern, subst, rewrites),
             ty: ty.map(|t| substitute_type(&t, subst)),
-            value: substitute_expr(value, subst, rewrites),
+            value: value.map(|v| substitute_expr(v, subst, rewrites)),
         },
         Assign { target, value } => Assign {
             target,
@@ -860,7 +860,8 @@ impl AstWalk for Stmt {
         use crate::ast::Stmt::*;
         match self {
             Let { value, .. } => value.walk(f),
-            Var { value, .. } => value.walk(f),
+            Var { value: Some(value), .. } => value.walk(f),
+            Var { value: None, .. } => {}
             Expr(e) => e.walk(f),
             Assign { value, .. } => value.walk(f),
             Return(Some(e)) => e.walk(f),
@@ -901,7 +902,8 @@ impl StmtWalkExprs for Stmt {
         use crate::ast::Stmt::*;
         match self {
             Let { value, .. } => value.walk(f),
-            Var { value, .. } => value.walk(f),
+            Var { value: Some(value), .. } => value.walk(f),
+            Var { value: None, .. } => {}
             Expr(e) => e.walk(f),
             Assign { value, .. } => value.walk(f),
             Return(Some(e)) => e.walk(f),

@@ -112,6 +112,7 @@ impl Parser {
                             | Token::TypeInt32
                             | Token::TypeFloat64
                             | Token::TypeFloat32
+                            | Token::TypeFloat16
                             | Token::TypeBool
                             | Token::TypeString
                             | Token::TypeInt8
@@ -601,6 +602,18 @@ impl Parser {
 
     /// 解析基础表达式
     pub(crate) fn parse_primary(&mut self) -> Result<Expr, ParseErrorAt> {
+        // 处理前缀 .. 或 ..= (隐式从 0 开始的范围，如 buffer[..len])
+        if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
+            let inclusive = self.check(&Token::DotDotEq);
+            self.advance();
+            let end = self.parse_primary()?;
+            return Ok(Expr::Range {
+                start: Box::new(Expr::Integer(0)),
+                end: Box::new(end),
+                inclusive,
+                step: None,
+            });
+        }
         match self.advance() {
             Some(Token::Integer(n)) => {
                 // 可选后缀 u8/u16/...（如 0x0Au8），消费掉以便后续不把 u8 当独立 token
@@ -638,13 +651,10 @@ impl Parser {
             }
             Some(Token::Float(f)) => Ok(Expr::Float(f)),
             Some(Token::Float32(f)) => Ok(Expr::Float32(f)),
-            Some(Token::This) => match self.receiver_name.clone() {
-                Some(n) => Ok(Expr::Var(n)),
-                None => self.bail_at(
-                    ParseError::UnexpectedToken(Token::This, "this 仅可在方法体内使用".to_string()),
-                    self.at_prev(),
-                ),
-            },
+            Some(Token::This) => {
+                // this → 当前 receiver，若 receiver_name 未设置则回退为字符串 "this"（字段初始化时合法）
+                Ok(Expr::Var(self.receiver_name.clone().unwrap_or_else(|| "this".to_string())))
+            }
             Some(Token::Super) => {
                 if self.check(&Token::LParen) {
                     self.advance();
@@ -691,6 +701,12 @@ impl Parser {
             }
             // Option/Result 构造器（允许 Some(e1,e2,...) 解析为 Some(Tuple(...))）
             Some(Token::Some) => {
+                // 支持泛型参数: Some<T>(value)
+                if self.check(&Token::Lt) {
+                    self.advance();
+                    let _ = self.parse_type()?;
+                    self.expect(Token::Gt)?;
+                }
                 self.expect(Token::LParen)?;
                 let first = self.parse_expr()?;
                 let value = if self.check(&Token::Comma) {
@@ -706,8 +722,22 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(Expr::Some(Box::new(value)))
             }
-            Some(Token::None) => Ok(Expr::None),
+            Some(Token::None) => {
+                // 支持泛型参数: None<T>
+                if self.check(&Token::Lt) {
+                    self.advance();
+                    let _ = self.parse_type()?;
+                    self.expect(Token::Gt)?;
+                }
+                Ok(Expr::None)
+            }
             Some(Token::Ok) => {
+                // 支持泛型参数: Ok<T>(value)
+                if self.check(&Token::Lt) {
+                    self.advance();
+                    let _ = self.parse_type()?;
+                    self.expect(Token::Gt)?;
+                }
                 self.expect(Token::LParen)?;
                 let first = self.parse_expr()?;
                 let value = if self.check(&Token::Comma) {
@@ -724,6 +754,12 @@ impl Parser {
                 Ok(Expr::Ok(Box::new(value)))
             }
             Some(Token::Err) => {
+                // 支持泛型参数: Err<T>(value)
+                if self.check(&Token::Lt) {
+                    self.advance();
+                    let _ = self.parse_type()?;
+                    self.expect(Token::Gt)?;
+                }
                 self.expect(Token::LParen)?;
                 let first = self.parse_expr()?;
                 let value = if self.check(&Token::Comma) {
@@ -755,6 +791,7 @@ impl Parser {
                         | Token::TypeUInt8
                         | Token::TypeFloat64
                         | Token::TypeFloat32
+                        | Token::TypeFloat16
                         | Token::TypeBool
                         | Token::TypeRune
                         | Token::TypeString
@@ -773,6 +810,7 @@ impl Parser {
                     Token::TypeUInt8 => "UInt8",
                     Token::TypeFloat64 => "Float64",
                     Token::TypeFloat32 => "Float32",
+                    Token::TypeFloat16 => "Float16",
                     Token::TypeBool => "Bool",
                     Token::TypeRune => "Rune",
                     Token::TypeString => "String",
@@ -1083,10 +1121,9 @@ impl Parser {
             }
             Some(Token::LParen) => {
                 // 检查是否是 Lambda: (x: T, ...): R { body } 或 (): R { body }
-                // 当前 token 是 (，空括号用 peek_next() 判断
-                if self.peek_next() == Some(&Token::RParen) {
+                // 注意: `(` 已被外层 match self.advance() 消费，peek() 指向 `(` 之后第一个 token
+                if self.peek() == Some(&Token::RParen) {
                     // (): R { body } 或空元组
-                    self.advance(); // consume (
                     self.advance(); // consume )
                     if self.check(&Token::Colon) {
                         return self.parse_lambda_rest(vec![]);
@@ -1094,12 +1131,11 @@ impl Parser {
                     // () 空元组
                     return Ok(Expr::Tuple(vec![]));
                 }
-                // 检查是否是 (ident : 开头的 Lambda；当前 token 是 (，用 peek_next/peek_at(2) 看括号内
+                // 检查是否是 (ident : 开头的 Lambda；`(` 已消费，peek() = ident，peek_next() = :
                 // 支持两种形式: ( params ): R { body } 与 ( params ) => body（params 后直接 => 无 )）
-                if matches!(self.peek_next(), Some(Token::Ident(_)) | Some(Token::Underscore))
-                    && matches!(self.peek_at(2), Some(Token::Colon))
+                if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
+                    && matches!(self.peek_next(), Some(Token::Colon))
                 {
-                    self.advance(); // 消费 (
                     let params = self.parse_lambda_params()?;
                     if self.check(&Token::FatArrow) {
                         // ( params ) => body — params 后直接 =>，无 )
@@ -1140,14 +1176,13 @@ impl Parser {
             Some(Token::LBrace) => {
                 // 检查是否是 Lambda: { x: T => body } 或 { x => body }（单参无类型）或 { a, b => body }（多参无类型）
                 // 也支持 { _: T, x: T => body }（第一个参数为通配符）
-                // 注意：当前 token 是 {，块内第一个 token 用 peek_next()，第二个用 peek_at(2)；仅当第二个 token 为 : , 或 => 时才按 lambda 解析，否则按块解析
-                let second = self.peek_at(2);
-                let is_lambda = matches!(self.peek_next(), Some(Token::Ident(_)) | Some(Token::Underscore))
+                // 注意：{ 已被 advance() 消费，peek() 是块内第一个 token，peek_next() 是第二个
+                let second = self.peek_next();
+                let is_lambda = matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
                     && matches!(second, Some(Token::Colon) | Some(Token::Comma) | Some(Token::FatArrow));
                 if is_lambda {
-                    if matches!(second, Some(Token::Colon)) {
-                        // Lambda { x: T, y: T => body }；先消费 {，再解析参数
-                        self.advance(); // 消费 {
+                    if matches!(self.peek_next(), Some(Token::Colon)) {
+                        // Lambda { x: T, y: T => body }；{ 已消费，直接解析参数
                         let params = self.parse_lambda_params()?;
                         self.expect(Token::FatArrow)?;
                         let body = self.parse_lambda_body()?;
@@ -1156,9 +1191,8 @@ impl Parser {
                             return_type: None,
                             body: Box::new(body),
                         });
-                    } else if matches!(second, Some(Token::Comma)) {
+                    } else if matches!(self.peek_next(), Some(Token::Comma)) {
                         // 多参无类型 Lambda { a, b, c => body }
-                        self.advance(); // 消费 {
                         let mut params = Vec::new();
                         loop {
                             let name = match self.advance() {
@@ -1188,9 +1222,8 @@ impl Parser {
                             return_type: None,
                             body: Box::new(body),
                         });
-                    } else if matches!(second, Some(Token::FatArrow)) {
+                    } else if matches!(self.peek_next(), Some(Token::FatArrow)) {
                         // 单参无类型 Lambda { name => body }
-                        self.advance(); // 消费 {
                         let name = self.advance_ident().expect("Ident");
                         self.advance(); // consume =>
                         let body = self.parse_lambda_body()?;
@@ -1662,15 +1695,13 @@ impl Parser {
             Some(Token::Integer(n)) => Expr::Integer(n),
             Some(Token::Float(f)) => Expr::Float(f),
             Some(Token::Float32(f)) => Expr::Float32(f),
-            Some(Token::This) => match self.receiver_name.clone() {
-                Some(n) => Expr::Var(n),
-                None => {
-                    return self.bail(ParseError::UnexpectedToken(
-                        Token::This,
-                        "this 仅可在方法体内使用".to_string(),
-                    ))
-                }
-            },
+            Some(Token::This) => {
+                Expr::Var(self.receiver_name.clone().unwrap_or_else(|| "this".to_string()))
+            }
+            Some(Token::Super) => {
+                // super 在 match 主题中，通常用于 super.field 或 super.method()
+                Expr::Var("super".to_string())
+            }
             Some(Token::True) => Expr::Bool(true),
             Some(Token::False) => Expr::Bool(false),
             Some(Token::StringLit(s)) | Some(Token::BacktickStringLit(s)) => {
@@ -1714,7 +1745,7 @@ impl Parser {
             None => return self.bail(ParseError::UnexpectedEof),
         };
 
-        // 处理后缀表达式 (字段访问、方法调用、数组索引)
+        // 处理后缀表达式 (字段访问、方法调用、数组索引、可选链)
         loop {
             match self.peek() {
                 Some(Token::Dot) => {
@@ -1756,6 +1787,55 @@ impl Parser {
                     expr = Expr::Index {
                         array: Box::new(expr),
                         index: Box::new(index),
+                    };
+                }
+                // 可选链 obj?.field / obj?.method()
+                Some(Token::Question) if matches!(self.peek_next(), Some(Token::Dot)) => {
+                    self.advance(); // consume ?
+                    self.advance(); // consume .
+                    let field = match self.advance() {
+                        Some(Token::Ident(name)) => name,
+                        Some(tok) => {
+                            return self
+                                .bail(ParseError::UnexpectedToken(tok, "字段名".to_string()))
+                        }
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    if self.check(&Token::LParen) {
+                        self.advance();
+                        let (args, named_args) = self.parse_args()?;
+                        self.expect(Token::RParen)?;
+                        expr = Expr::MethodCall {
+                            object: Box::new(expr),
+                            method: field,
+                            args,
+                            named_args,
+                        };
+                    } else {
+                        expr = Expr::Field {
+                            object: Box::new(expr),
+                            field,
+                        };
+                    }
+                }
+                // 非空断言 obj!
+                Some(Token::Bang) => {
+                    self.advance();
+                    // 简化为 unwrap 调用
+                    expr = Expr::MethodCall {
+                        object: Box::new(expr),
+                        method: "getOrThrow".to_string(),
+                        args: vec![],
+                        named_args: vec![],
+                    };
+                }
+                // 类型转换 expr as Type
+                Some(Token::As) => {
+                    self.advance();
+                    let target_ty = self.parse_type()?;
+                    expr = Expr::Cast {
+                        expr: Box::new(expr),
+                        target_ty,
                     };
                 }
                 _ => break,
@@ -1863,6 +1943,7 @@ impl Parser {
                         | Token::TypeUInt8
                         | Token::TypeFloat64
                         | Token::TypeFloat32
+                        | Token::TypeFloat16
                         | Token::TypeBool
                         | Token::TypeRune
                         | Token::TypeString

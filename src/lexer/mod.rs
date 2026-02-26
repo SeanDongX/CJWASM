@@ -516,9 +516,11 @@ pub enum Token {
     })]
     Integer(i64),
 
-    // 字符字面量 'a' (支持转义 '\n' '\t' '\\' '\'' '\0')
-    #[regex(r"'[^'\\]'|'\\[ntr\\0']'", |lex| {
+    // 字符字面量 'a' 或 Rune 字面量 r'a'（仓颉语法，支持转义 '\n' '\t' '\\' '\'' '\0'）
+    #[regex(r"r?'[^'\\]'|r?'\\[ntr\\0']'", |lex| {
         let s = lex.slice();
+        // 跳过可选的 r 前缀
+        let s = if s.starts_with("r'") { &s[1..] } else { s };
         let inner = &s[1..s.len()-1]; // 去除引号
         if inner.starts_with('\\') {
             match inner.chars().nth(1) {

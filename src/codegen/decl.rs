@@ -315,7 +315,10 @@ impl CodeGen {
 
     pub(crate) fn collect_strings_in_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+            Stmt::Let { value, .. } => {
+                self.collect_strings_in_expr(value);
+            }
+            Stmt::Var { value: Some(value), .. } => {
                 self.collect_strings_in_expr(value);
             }
             Stmt::WhileLet { expr, body, .. } => {

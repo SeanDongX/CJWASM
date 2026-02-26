@@ -29,35 +29,74 @@ impl Parser {
         Ok(pattern)
     }
 
+    /// 解析变体绑定列表：ident | _ [: Type] (, ident | _ [: Type])* 或嵌套模式 Some(x) 等
+    fn parse_variant_bindings(&mut self) -> Result<Vec<Option<String>>, ParseErrorAt> {
+        let mut bindings = Vec::new();
+        loop {
+            let b = match self.peek() {
+                Some(Token::Ident(_)) => {
+                    let id = match self.advance() {
+                        Some(Token::Ident(id)) => id,
+                        _ => unreachable!(),
+                    };
+                    // 跳过可选类型注解 : Type（如 Some(p: PropDecl)）
+                    if self.check(&Token::Colon) {
+                        self.advance();
+                        let _ = self.parse_type()?;
+                    }
+                    Some(id)
+                }
+                Some(Token::Underscore) => {
+                    self.advance();
+                    // 跳过可选类型注解 : Type
+                    if self.check(&Token::Colon) {
+                        self.advance();
+                        let _ = self.parse_type()?;
+                    }
+                    None
+                }
+                _ => {
+                    // 复杂嵌套模式（如 Some(Some(x))），解析后丢弃绑定名
+                    let _ = self.parse_primary_pattern()?;
+                    None
+                }
+            };
+            bindings.push(b);
+            if !self.check(&Token::Comma) {
+                break;
+            }
+            self.advance();
+        }
+        Ok(bindings)
+    }
+
     /// 解析基础模式
     pub(crate) fn parse_primary_pattern(&mut self) -> Result<Pattern, ParseErrorAt> {
         match self.peek() {
             Some(Token::Underscore) => {
                 self.advance();
+                // 支持 _: Type 类型测试模式（绑定丢弃）
+                if self.check(&Token::Colon) {
+                    self.advance();
+                    let ty = self.parse_type()?;
+                    return Ok(Pattern::TypeTest { binding: "_".to_string(), ty });
+                }
                 Ok(Pattern::Wildcard)
             }
             Some(Token::Some) => {
                 self.advance();
-                let binding = if self.check(&Token::LParen) {
+                let bindings = if self.check(&Token::LParen) {
                     self.advance();
-                    let b = match self.advance() {
-                        Some(Token::Ident(id)) => Some(id),
-                        Some(Token::Underscore) => None,
-                        Some(tok) => {
-                            return self
-                                .bail(ParseError::UnexpectedToken(tok, "关联值绑定名".to_string()))
-                        }
-                        None => return self.bail(ParseError::UnexpectedEof),
-                    };
+                    let b = self.parse_variant_bindings()?;
                     self.expect(Token::RParen)?;
                     b
                 } else {
-                    None
+                    vec![]
                 };
                 Ok(Pattern::Variant {
                     enum_name: "Option".to_string(),
                     variant_name: "Some".to_string(),
-                    binding,
+                    bindings,
                 })
             }
             Some(Token::None) => {
@@ -65,55 +104,39 @@ impl Parser {
                 Ok(Pattern::Variant {
                     enum_name: "Option".to_string(),
                     variant_name: "None".to_string(),
-                    binding: None,
+                    bindings: vec![],
                 })
             }
             Some(Token::Ok) => {
                 self.advance();
-                let binding = if self.check(&Token::LParen) {
+                let bindings = if self.check(&Token::LParen) {
                     self.advance();
-                    let b = match self.advance() {
-                        Some(Token::Ident(id)) => Some(id),
-                        Some(Token::Underscore) => None,
-                        Some(tok) => {
-                            return self
-                                .bail(ParseError::UnexpectedToken(tok, "关联值绑定名".to_string()))
-                        }
-                        None => return self.bail(ParseError::UnexpectedEof),
-                    };
+                    let b = self.parse_variant_bindings()?;
                     self.expect(Token::RParen)?;
                     b
                 } else {
-                    None
+                    vec![]
                 };
                 Ok(Pattern::Variant {
                     enum_name: "Result".to_string(),
                     variant_name: "Ok".to_string(),
-                    binding,
+                    bindings,
                 })
             }
             Some(Token::Err) => {
                 self.advance();
-                let binding = if self.check(&Token::LParen) {
+                let bindings = if self.check(&Token::LParen) {
                     self.advance();
-                    let b = match self.advance() {
-                        Some(Token::Ident(id)) => Some(id),
-                        Some(Token::Underscore) => None,
-                        Some(tok) => {
-                            return self
-                                .bail(ParseError::UnexpectedToken(tok, "关联值绑定名".to_string()))
-                        }
-                        None => return self.bail(ParseError::UnexpectedEof),
-                    };
+                    let b = self.parse_variant_bindings()?;
                     self.expect(Token::RParen)?;
                     b
                 } else {
-                    None
+                    vec![]
                 };
                 Ok(Pattern::Variant {
                     enum_name: "Result".to_string(),
                     variant_name: "Err".to_string(),
-                    binding,
+                    bindings,
                 })
             }
             Some(Token::Integer(n)) => {
@@ -193,20 +216,17 @@ impl Parser {
                         };
                         if self.check(&Token::LParen) {
                             self.advance();
-                            let is_simple_binding =
+                            // ident ) or ident : Type ) or _ ) or _ : Type ) or multi-binding a, b, c
+                            let is_binding_list =
                                 matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
-                                    && matches!(self.peek_next(), Some(Token::RParen));
-                            if is_simple_binding {
-                                let b = match self.advance() {
-                                    Some(Token::Ident(id)) => Some(id),
-                                    Some(Token::Underscore) => None,
-                                    _ => unreachable!(),
-                                };
+                                    && matches!(self.peek_next(), Some(Token::RParen) | Some(Token::Colon) | Some(Token::Comma));
+                            if is_binding_list {
+                                let bindings = self.parse_variant_bindings()?;
                                 self.expect(Token::RParen)?;
                                 return Ok(Pattern::Variant {
                                     enum_name: name,
                                     variant_name: variant,
-                                    binding: b,
+                                    bindings,
                                 });
                             } else if self.check(&Token::RParen) {
                                 self.advance();
@@ -236,7 +256,7 @@ impl Parser {
                             return Ok(Pattern::Variant {
                                 enum_name: name,
                                 variant_name: variant,
-                                binding: None,
+                                bindings: vec![],
                             });
                         }
                     }
@@ -257,27 +277,16 @@ impl Parser {
                     return Ok(Pattern::Guard(Box::new(full_expr)));
                 } else if looks_like_type && self.check(&Token::LParen) {
                     self.advance();
-                    let binding = if self.check(&Token::RParen) {
-                        None
+                    let bindings = if self.check(&Token::RParen) {
+                        vec![]
                     } else {
-                        let b = match self.advance() {
-                            Some(Token::Ident(id)) => id,
-                            Some(Token::Underscore) => "_".to_string(),
-                            Some(tok) => {
-                                return self.bail(ParseError::UnexpectedToken(
-                                    tok,
-                                    "关联值绑定名".to_string(),
-                                ))
-                            }
-                            None => return self.bail(ParseError::UnexpectedEof),
-                        };
-                        Some(b)
+                        self.parse_variant_bindings()?
                     };
                     self.expect(Token::RParen)?;
                     Ok(Pattern::Variant {
                         enum_name: String::new(),
                         variant_name: name,
-                        binding,
+                        bindings,
                     })
                 } else {
                     Ok(Pattern::Binding(name))

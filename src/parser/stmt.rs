@@ -171,8 +171,12 @@ impl Parser {
                 } else {
                     None
                 };
-                self.expect(Token::Assign)?;
-                let value = self.parse_expr()?;
+                let value = if self.check(&Token::Assign) {
+                    self.advance();
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
                 Ok(Stmt::Var { pattern, ty, value })
             }
             Some(Token::Return) => {

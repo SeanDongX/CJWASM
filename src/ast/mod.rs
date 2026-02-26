@@ -283,12 +283,12 @@ pub enum Pattern {
     },
     /// 元组解构 (a, b)
     Tuple(Vec<Pattern>),
-    /// 枚举变体模式 Color.Red 或 Result.Ok(v)（匹配时用，binding 为关联值绑定名）
+    /// 枚举变体模式 Color.Red 或 Result.Ok(v)（匹配时用，bindings 为关联值绑定名列表）
     Variant {
         enum_name: String,
         variant_name: String,
-        /// 关联值绑定名，如 Ok(v) 的 v
-        binding: Option<String>,
+        /// 关联值绑定名列表，如 Ok(v) 的 [Some("v")]，多元组如 Some((a, b)) 的 [Some("a"), Some("b")]
+        bindings: Vec<Option<String>>,
     },
     /// P3.5: 类型测试模式 x: Type — 匹配时检查对象类型，成功则绑定到 x
     TypeTest {
@@ -324,7 +324,7 @@ pub enum Stmt {
     Var {
         pattern: Pattern,
         ty: Option<Type>,
-        value: Expr,
+        value: Option<Expr>,
     },
     /// 赋值
     Assign {
