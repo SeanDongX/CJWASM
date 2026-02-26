@@ -469,6 +469,7 @@ fn substitute_pattern(
             ty: substitute_type(&ty, subst),
         },
         Field { object, field } => Field { object, field },
+        Guard(expr) => Guard(Box::new(substitute_expr(*expr, subst, rewrites))),
     }
 }
 
@@ -576,6 +577,32 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .map(|s| substitute_stmt(s, subst, rewrites))
                 .collect(),
         },
+        LocalFunc(f) => LocalFunc(crate::ast::Function {
+            visibility: f.visibility.clone(),
+            name: f.name.clone(),
+            type_params: f.type_params.clone(),
+            constraints: f.constraints.clone(),
+            params: f
+                .params
+                .iter()
+                .map(|p| crate::ast::Param {
+                    name: p.name.clone(),
+                    ty: substitute_type(&p.ty, subst),
+                    default: p.default.as_ref().map(|e| substitute_expr(e.clone(), subst, rewrites)),
+                    variadic: p.variadic,
+                    is_named: p.is_named,
+                    is_inout: p.is_inout,
+                })
+                .collect(),
+            return_type: f.return_type.as_ref().map(|t| substitute_type(t, subst)),
+            throws: f.throws.clone(),
+            body: f
+                .body
+                .into_iter()
+                .map(|s| substitute_stmt(s, subst, rewrites))
+                .collect(),
+            extern_import: f.extern_import.clone(),
+        }),
     }
 }
 

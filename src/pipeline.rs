@@ -22,6 +22,74 @@ pub fn l1_std_top_modules() -> &'static [&'static str] {
     L1_STD_TOP
 }
 
+/// 将 quote(...) 宏调用内容替换为空（quote()），避免词法错误（如 \( \) 和关键字）
+/// quote 内部是原始 token 模板，cjwasm 不执行宏展开，只需保留调用外壳
+fn strip_quote_contents(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        // 检查是否以 "quote(" 开始（quote 后紧跟括号）
+        if i + 6 <= len && &bytes[i..i + 6] == b"quote(" {
+            out.push_str("quote()");
+            i += 6; // skip "quote("
+            // 消费直到匹配的 ')'，跟踪嵌套深度
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                let ch = bytes[i];
+                if ch == b'(' {
+                    depth += 1;
+                } else if ch == b')' {
+                    depth -= 1;
+                } else if ch == b'"' {
+                    // 跳过字符串字面量
+                    i += 1;
+                    while i < len {
+                        let sc = bytes[i];
+                        if sc == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if sc == b'"' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // 处理字符串字面量（跳过，防止把字符串内的 "quote(" 替换掉）
+        if bytes[i] == b'"' {
+            out.push('"');
+            i += 1;
+            while i < len {
+                let sc = bytes[i];
+                if sc == b'\\' {
+                    out.push('\\');
+                    i += 1;
+                    if i < len {
+                        out.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    continue;
+                }
+                out.push(sc as char);
+                i += 1;
+                if sc == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// 移除源码中的块注释 /* ... */，便于解析含版权头的 vendor 文件
 fn strip_block_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
@@ -50,6 +118,7 @@ fn strip_block_comments(source: &str) -> String {
 /// 解析源代码字符串为 Program AST
 pub fn parse_source(source: &str) -> Result<Program, String> {
     let source = strip_block_comments(source);
+    let source = strip_quote_contents(&source);
     let lexer = Lexer::new(&source);
     let tokens: Result<Vec<_>, _> = lexer.collect();
     let tokens = tokens.map_err(|e| format!("词法错误: {}", e))?;

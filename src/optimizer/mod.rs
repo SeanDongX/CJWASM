@@ -412,7 +412,7 @@ fn fold_binary_int(a: i64, b: i64, op: &BinOp) -> Option<Expr> {
         BitXor => Integer(a ^ b),
         Shl => Integer(a.shl(b as u32)),
         Shr => Integer(a.shr(b as u32)),
-        LogicalAnd | LogicalOr | Pow | NotIn => return None,
+        LogicalAnd | LogicalOr | Pow | NotIn | Pipeline => return None,
     };
     Some(out)
 }
@@ -431,7 +431,7 @@ fn fold_binary_float(x: f64, y: f64, op: &BinOp) -> Option<Expr> {
         Gt => Bool(x > y),
         LtEq => Bool(x <= y),
         GtEq => Bool(x >= y),
-        Mod | BitAnd | BitOr | BitXor | Shl | Shr | LogicalAnd | LogicalOr | Pow | NotIn => return None,
+        Mod | BitAnd | BitOr | BitXor | Shl | Shr | LogicalAnd | LogicalOr | Pow | NotIn | Pipeline => return None,
     };
     Some(out)
 }

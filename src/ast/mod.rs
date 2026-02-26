@@ -1,210 +1,6 @@
-use wasm_encoder::ValType;
+mod type_;
 
-/// 仓颉语言类型 (与 cjc release/1.0 对齐)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Type {
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    IntNative,
-    UInt8,
-    UInt16,
-    UInt32,
-    UInt64,
-    UIntNative,
-    Float16,
-    Float32,
-    Float64,
-    Rune,
-    Bool,
-    Nothing,
-    Unit,
-    /// 字符串类型 (指针, 在内存中存储)
-    String,
-    /// 数组类型 Array<T>
-    Array(Box<Type>),
-    /// 结构体类型 (可选类型实参，如 Point 或 Pair<Int64,String>)
-    Struct(String, Vec<Type>),
-    /// 元组类型 (T1, T2, ...)
-    Tuple(Vec<Type>),
-    /// 范围类型 (start..end 或 start..=end)
-    /// 内存布局: [start: i64][end: i64][inclusive: i32] = 20 bytes
-    Range,
-    /// 函数类型 (param_types) -> return_type，用于 Lambda
-    /// 在 WASM 中以 i32 函数表索引表示
-    Function {
-        params: Vec<Type>,
-        ret: Box<Option<Type>>,
-    },
-    /// Option<T> 类型
-    Option(Box<Type>),
-    /// Result<T, E> 类型
-    Result(Box<Type>, Box<Type>),
-    /// 切片类型 Slice<T>，引用数组子区间 [ptr, len]
-    Slice(Box<Type>),
-    /// Map 类型 Map<K, V>
-    Map(Box<Type>, Box<Type>),
-    /// 泛型类型参数 (如 T)，仅在泛型定义体内使用，单态化时替换为具体类型
-    TypeParam(String),
-}
-
-impl Type {
-    /// 转换为 WASM 值类型
-    pub fn to_wasm(&self) -> ValType {
-        match self {
-            Type::Int8 => ValType::I32,   // 小整数映射为 i32
-            Type::Int16 => ValType::I32,
-            Type::Int32 => ValType::I32,
-            Type::Int64 => ValType::I64,
-            Type::IntNative => ValType::I64,  // Native 整数映射为 i64
-            Type::UInt8 => ValType::I32,   // 无符号小整数映射为 i32
-            Type::UInt16 => ValType::I32,
-            Type::UInt32 => ValType::I32,
-            Type::UInt64 => ValType::I64,  // UInt64 映射为 i64
-            Type::UIntNative => ValType::I64, // Native 无符号映射为 i64
-            Type::Float16 => ValType::F32,  // Float16 用 f32 模拟
-            Type::Float32 => ValType::F32,
-            Type::Float64 => ValType::F64,
-            Type::Rune => ValType::I32,    // Unicode code point 映射为 i32
-            Type::Bool => ValType::I32,
-            Type::Nothing => panic!("Nothing 类型不能转换为 WASM 值类型"),
-            Type::Unit => panic!("Unit 类型不能转换为 WASM 值类型"),
-            // 复合类型都用 i32 指针表示
-            Type::String => ValType::I32,
-            Type::Array(_) => ValType::I32,
-            Type::Tuple(_) => ValType::I32,  // 堆指针
-            Type::Struct(..) => ValType::I32,
-            Type::Range => ValType::I32,    // 指针
-            Type::Function { .. } => ValType::I32, // 函数表索引
-            Type::Option(_) => ValType::I32,      // 指针
-            Type::Result(_, _) => ValType::I32,   // 指针
-            Type::Slice(_) => ValType::I32,        // 指针
-            Type::Map(_, _) => ValType::I32,       // 指针
-            Type::TypeParam(_) => panic!("TypeParam 不能直接转换为 WASM，需先单态化"),
-        }
-    }
-
-    /// 获取类型在内存中的大小 (字节)
-    pub fn size(&self) -> u32 {
-        match self {
-            Type::Int8 | Type::UInt8 => 1,
-            Type::Int16 | Type::UInt16 => 2,
-            Type::Int32 | Type::UInt32 | Type::Bool | Type::Rune => 4,
-            Type::Int64 | Type::UInt64 | Type::IntNative | Type::UIntNative => 8,
-            Type::Float16 => 2,
-            Type::Float32 => 4,
-            Type::Float64 => 8,
-            Type::Nothing => 0,
-            Type::Unit => 0,
-            Type::String => 4,      // 指针大小
-            Type::Array(_) => 4,    // 指针大小
-            Type::Tuple(_) => 4,    // 指针大小
-            Type::Struct(..) => 4,   // 指针大小
-            Type::Range => 4,       // 指针大小
-            Type::Function { .. } => 4, // 函数表索引大小
-            Type::Option(_) => 4,   // 指针大小
-            Type::Result(_, _) => 4, // 指针大小
-            Type::Slice(_) => 4,     // 指针大小
-            Type::Map(_, _) => 4,    // 指针大小
-            Type::TypeParam(_) => panic!("TypeParam 不能直接计算 size，需先单态化"),
-        }
-    }
-
-    /// 获取 Range 类型在堆上的实际大小
-    pub fn range_heap_size() -> u32 {
-        // [start: i64][end: i64][inclusive: i32] = 8 + 8 + 4 = 20 bytes
-        20
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wasm_encoder::ValType;
-
-    #[test]
-    fn test_to_wasm_all_types() {
-        assert_eq!(Type::Int8.to_wasm(), ValType::I32);
-        assert_eq!(Type::Int16.to_wasm(), ValType::I32);
-        assert_eq!(Type::Int32.to_wasm(), ValType::I32);
-        assert_eq!(Type::Int64.to_wasm(), ValType::I64);
-        assert_eq!(Type::UInt8.to_wasm(), ValType::I32);
-        assert_eq!(Type::UInt16.to_wasm(), ValType::I32);
-        assert_eq!(Type::UInt32.to_wasm(), ValType::I32);
-        assert_eq!(Type::UInt64.to_wasm(), ValType::I64);
-        assert_eq!(Type::Float32.to_wasm(), ValType::F32);
-        assert_eq!(Type::Float64.to_wasm(), ValType::F64);
-        assert_eq!(Type::Bool.to_wasm(), ValType::I32);
-        assert_eq!(Type::Rune.to_wasm(), ValType::I32);
-        assert_eq!(Type::String.to_wasm(), ValType::I32);
-        assert_eq!(Type::Array(Box::new(Type::Int64)).to_wasm(), ValType::I32);
-        assert_eq!(Type::Tuple(vec![Type::Int64, Type::Int64]).to_wasm(), ValType::I32);
-        assert_eq!(Type::Struct("Foo".to_string(), vec![]).to_wasm(), ValType::I32);
-        assert_eq!(Type::Range.to_wasm(), ValType::I32);
-        assert_eq!(Type::Function { params: vec![], ret: Box::new(Some(Type::Int64)) }.to_wasm(), ValType::I32);
-        assert_eq!(Type::Option(Box::new(Type::Int64)).to_wasm(), ValType::I32);
-        assert_eq!(Type::Result(Box::new(Type::Int64), Box::new(Type::String)).to_wasm(), ValType::I32);
-        assert_eq!(Type::Slice(Box::new(Type::Int64)).to_wasm(), ValType::I32);
-        assert_eq!(Type::Map(Box::new(Type::String), Box::new(Type::Int64)).to_wasm(), ValType::I32);
-    }
-
-    #[test]
-    #[should_panic(expected = "Nothing 类型不能转换为 WASM")]
-    fn test_to_wasm_nothing_panic() {
-        Type::Nothing.to_wasm();
-    }
-
-    #[test]
-    #[should_panic(expected = "Unit 类型不能转换为 WASM")]
-    fn test_to_wasm_unit_panic() {
-        Type::Unit.to_wasm();
-    }
-
-    #[test]
-    #[should_panic(expected = "TypeParam 不能直接转换")]
-    fn test_to_wasm_typeparam_panic() {
-        Type::TypeParam("T".to_string()).to_wasm();
-    }
-
-    #[test]
-    fn test_size_all_types() {
-        assert_eq!(Type::Int8.size(), 1);
-        assert_eq!(Type::UInt8.size(), 1);
-        assert_eq!(Type::Int16.size(), 2);
-        assert_eq!(Type::UInt16.size(), 2);
-        assert_eq!(Type::Int32.size(), 4);
-        assert_eq!(Type::UInt32.size(), 4);
-        assert_eq!(Type::Bool.size(), 4);
-        assert_eq!(Type::Rune.size(), 4);
-        assert_eq!(Type::Int64.size(), 8);
-        assert_eq!(Type::UInt64.size(), 8);
-        assert_eq!(Type::Float32.size(), 4);
-        assert_eq!(Type::Float64.size(), 8);
-        assert_eq!(Type::Unit.size(), 0);
-        assert_eq!(Type::String.size(), 4);
-        assert_eq!(Type::Array(Box::new(Type::Int64)).size(), 4);
-        assert_eq!(Type::Tuple(vec![]).size(), 4);
-        assert_eq!(Type::Struct("S".to_string(), vec![]).size(), 4);
-        assert_eq!(Type::Range.size(), 4);
-        assert_eq!(Type::Function { params: vec![], ret: Box::new(Some(Type::Int64)) }.size(), 4);
-        assert_eq!(Type::Option(Box::new(Type::Int64)).size(), 4);
-        assert_eq!(Type::Result(Box::new(Type::Int64), Box::new(Type::String)).size(), 4);
-        assert_eq!(Type::Slice(Box::new(Type::Int64)).size(), 4);
-        assert_eq!(Type::Map(Box::new(Type::String), Box::new(Type::Int64)).size(), 4);
-    }
-
-    #[test]
-    #[should_panic(expected = "TypeParam 不能直接计算 size")]
-    fn test_size_typeparam_panic() {
-        Type::TypeParam("T".to_string()).size();
-    }
-
-    #[test]
-    fn test_range_heap_size() {
-        assert_eq!(Type::range_heap_size(), 20);
-    }
-}
+pub use type_::Type;
 
 /// 一元运算符
 #[derive(Debug, Clone, PartialEq)]
@@ -237,6 +33,7 @@ pub enum BinOp {
     Shl,         // <<
     Shr,         // >>
     NotIn,       // !in (集合不包含)
+    Pipeline,    // |> 管道：left |> right 表示 right(left)
 }
 
 /// 字符串插值的部分
@@ -500,6 +297,8 @@ pub enum Pattern {
     },
     /// 字段模式 obj.field（cjc 兼容，match 时匹配/绑定字段访问）
     Field { object: String, field: String },
+    /// 表达式守卫模式（用于无主体 match { case expr => ... }）
+    Guard(Box<Expr>),
 }
 
 /// 字面量值 (用于模式匹配)
@@ -584,6 +383,8 @@ pub enum Stmt {
     },
     /// unsafe { ... } 块：允许不安全操作的语句块
     UnsafeBlock { body: Vec<Stmt> },
+    /// 块内局部函数声明（如 lambda 体内的 func putValue ...）
+    LocalFunc(Function),
 }
 
 /// 赋值目标

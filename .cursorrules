@@ -8,3 +8,6 @@
 
 <!-- End Cangjie AI for Cursor Prompt Prefix -->
 
+重要！！！
+1. 可以参考cjc编译器实现：third_party/cangjie_compiler/src， 如ast parser等功能
+2. third_party/ 为外部代码镜像，不要进行任何修改

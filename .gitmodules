@@ -1,0 +1,8 @@
+[submodule "third_party/cangjie_runtime"]
+	path = third_party/cangjie_runtime
+	url = https://gitcode.com/Cangjie/cangjie_runtime.git
+	branch = release/1.0
+[submodule "third_party/cangjie_compiler"]
+	path = third_party/cangjie_compiler
+	url = https://gitcode.com/Cangjie/cangjie_compiler.git
+	branch = release/1.0
