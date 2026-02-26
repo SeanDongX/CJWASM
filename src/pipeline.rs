@@ -12,9 +12,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// L1 顶层 std 模块名（纯 Cangjie 实现，Vendor 优先）
+/// 排除了 argopt, ast, binary, console, database, net, posix 这些复杂的命名空间
 const L1_STD_TOP: &[&str] = &[
-    "io", "binary", "console", "overflow", "crypto", "deriving",
-    "ast", "argopt", "sort", "ref", "unicode",
+    "io", "overflow", "crypto", "deriving", "sort", "ref", "unicode",
 ];
 
 /// 返回 L1 顶层模块名列表，供测试或工具使用

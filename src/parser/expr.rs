@@ -667,22 +667,31 @@ impl Parser {
                     })
                 } else if self.check(&Token::Dot) {
                     self.advance();
-                    let method = match self.advance() {
+                    let field_or_method = match self.advance() {
                         Some(Token::Ident(m)) => m,
                         Some(tok) => {
                             return self
-                                .bail(ParseError::UnexpectedToken(tok, "方法名".to_string()))
+                                .bail(ParseError::UnexpectedToken(tok, "字段或方法名".to_string()))
                         }
                         None => return self.bail(ParseError::UnexpectedEof),
                     };
-                    self.expect(Token::LParen)?;
-                    let (args, named_args) = self.parse_args()?;
-                    self.expect(Token::RParen)?;
-                    Ok(Expr::SuperCall {
-                        method,
-                        args,
-                        named_args,
-                    })
+                    // 检查是方法调用还是字段访问
+                    if self.check(&Token::LParen) {
+                        self.advance();
+                        let (args, named_args) = self.parse_args()?;
+                        self.expect(Token::RParen)?;
+                        Ok(Expr::SuperCall {
+                            method: field_or_method,
+                            args,
+                            named_args,
+                        })
+                    } else {
+                        // super.field 字段访问
+                        Ok(Expr::Field {
+                            object: Box::new(Expr::Var("super".to_string())),
+                            field: field_or_method,
+                        })
+                    }
                 } else {
                     self.bail(ParseError::UnexpectedToken(
                         self.peek().cloned().unwrap_or(Token::Dot),

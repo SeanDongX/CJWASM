@@ -460,7 +460,14 @@ impl CodeGen {
             let results: Vec<ValType> = func
                 .return_type
                 .as_ref()
-                .and_then(|t| if *t == Type::Unit { None } else { Some(vec![t.to_wasm()]) })
+                .and_then(|t| {
+                    // Unit 和 Nothing 类型都不返回值
+                    if *t == Type::Unit || *t == Type::Nothing {
+                        None
+                    } else {
+                        Some(vec![t.to_wasm()])
+                    }
+                })
                 .unwrap_or_default();
             types.ty().function(params.clone(), results.clone());
             // P2.3: 记录类型签名映射
