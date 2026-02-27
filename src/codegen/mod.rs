@@ -11,6 +11,7 @@ use wasm_encoder::{
 
 mod decl;
 mod expr;
+mod r#macro;
 mod type_;
 
 pub(crate) use decl::ClassInfo;

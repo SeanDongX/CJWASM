@@ -296,6 +296,7 @@ impl Parser {
                 Ok(Type::Tuple(types))
             }
             Some(Token::TypeRange) => Ok(Type::Range),
+            Some(Token::TypeThis) => Ok(Type::This), // P2: This 类型
             Some(Token::TypeOption) => {
                 self.expect(Token::Lt)?;
                 let inner_type = self.parse_type()?;
@@ -333,6 +334,26 @@ impl Parser {
                 Ok(Type::Map(Box::new(key_type), Box::new(val_type)))
             }
             Some(Token::Ident(name)) => {
+                // P1: 检查是否为限定类型 (pkg.Module.Type)
+                let mut path = vec![name.clone()];
+                while self.check(&Token::Dot) {
+                    self.advance();
+                    if let Some(Token::Ident(segment)) = self.advance() {
+                        path.push(segment);
+                    } else {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::Dot),
+                            "标识符".to_string(),
+                        ));
+                    }
+                }
+
+                // 如果有多个路径段，返回限定类型
+                if path.len() > 1 {
+                    return Ok(Type::Qualified(path));
+                }
+
+                // 单个标识符的处理
                 if self.check(&Token::Lt) {
                     self.advance();
                     let mut type_args = Vec::new();

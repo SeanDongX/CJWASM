@@ -49,6 +49,11 @@ pub enum Type {
     Map(Box<Type>, Box<Type>),
     /// 泛型类型参数 (如 T)，仅在泛型定义体内使用，单态化时替换为具体类型
     TypeParam(String),
+    /// P2: This 类型 - 表示当前类的类型，用于链式调用
+    /// 在类方法中，This 会被解析为当前类的类型
+    This,
+    /// P1: 限定类型 - 模块化类型引用，如 pkg.Module.Type
+    Qualified(Vec<String>), // 路径段，如 ["pkg", "Module", "Type"]
 }
 
 impl Type {
@@ -83,6 +88,8 @@ impl Type {
             Type::Slice(_) => ValType::I32,
             Type::Map(_, _) => ValType::I32,
             Type::TypeParam(_) => panic!("TypeParam 不能直接转换为 WASM，需先单态化"),
+            Type::This => ValType::I32, // This 类型表示类对象，使用指针
+            Type::Qualified(_) => ValType::I32, // 限定类型通常是类或结构体
         }
     }
 
@@ -109,6 +116,8 @@ impl Type {
             Type::Slice(_) => 4,
             Type::Map(_, _) => 4,
             Type::TypeParam(_) => panic!("TypeParam 不能直接计算 size，需先单态化"),
+            Type::This => 4, // This 类型表示类对象指针
+            Type::Qualified(_) => 4, // 限定类型通常是类或结构体指针
         }
     }
 

@@ -9,6 +9,105 @@ use wasm_encoder::{BlockType, Function as WasmFunc, Instruction, MemArg, ValType
 use super::{CodeGen, LocalsBuilder, IOVEC_OFFSET, NWRITTEN_OFFSET};
 
 impl CodeGen {
+    /// 递归收集模式中的所有绑定变量
+    fn collect_pattern_bindings(&self, pattern: &Pattern, locals: &mut LocalsBuilder, subject_type: Option<&Type>) {
+        match pattern {
+            Pattern::Binding(name) => {
+                let ty = subject_type.map(|t| t.to_wasm()).unwrap_or(ValType::I64);
+                locals.add(name, ty, subject_type.cloned());
+            }
+            Pattern::Variant { enum_name, variant_name, payload } => {
+                if let Some(payload_pattern) = payload {
+                    if let Some(payload_type) = self.resolve_variant_payload(enum_name, variant_name, subject_type) {
+                        self.collect_pattern_bindings(payload_pattern, locals, Some(&payload_type));
+                    } else {
+                        self.collect_pattern_bindings(payload_pattern, locals, None);
+                    }
+                }
+            }
+            Pattern::Tuple(patterns) => {
+                // 元组解构：尝试从 subject_type 获取元素类型
+                if let Some(Type::Tuple(elem_types)) = subject_type {
+                    for (i, pat) in patterns.iter().enumerate() {
+                        let elem_type = elem_types.get(i);
+                        self.collect_pattern_bindings(pat, locals, elem_type);
+                    }
+                } else {
+                    for pat in patterns {
+                        self.collect_pattern_bindings(pat, locals, None);
+                    }
+                }
+            }
+            Pattern::Struct { name: struct_name, fields } => {
+                if let Some(def) = self.structs.get(struct_name) {
+                    for (fname, pat) in fields {
+                        if let Some(ft) = def.field_type(fname) {
+                            self.collect_pattern_bindings(pat, locals, Some(&ft));
+                        } else {
+                            self.collect_pattern_bindings(pat, locals, None);
+                        }
+                    }
+                }
+            }
+            Pattern::Or(patterns) => {
+                // Or 模式：收集所有分支的绑定
+                for pat in patterns {
+                    self.collect_pattern_bindings(pat, locals, subject_type);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 编译模式绑定：假设值已在栈顶，将其绑定到模式中的变量
+    fn compile_pattern_binding(&self, pattern: &Pattern, value_type: &Type, locals: &LocalsBuilder, func: &mut WasmFunc) {
+        match pattern {
+            Pattern::Binding(name) => {
+                // 简单绑定：直接存储到局部变量
+                if let Some(idx) = locals.get(name) {
+                    func.instruction(&Instruction::LocalSet(idx));
+                } else {
+                    // 变量未找到，丢弃值
+                    func.instruction(&Instruction::Drop);
+                }
+            }
+            Pattern::Tuple(patterns) => {
+                // 元组解构：值是指针，需要加载每个元素
+                // 先保存指针到临时变量
+                let tuple_ptr = locals.get("__tuple_ptr").unwrap_or(0);
+                func.instruction(&Instruction::LocalSet(tuple_ptr));
+
+                if let Type::Tuple(elem_types) = value_type {
+                    let mut offset = 0u32;
+                    for (i, pat) in patterns.iter().enumerate() {
+                        if let Some(elem_ty) = elem_types.get(i) {
+                            // 加载元素
+                            func.instruction(&Instruction::LocalGet(tuple_ptr));
+                            if offset > 0 {
+                                func.instruction(&Instruction::I32Const(offset as i32));
+                                func.instruction(&Instruction::I32Add);
+                            }
+                            self.emit_load_by_type(func, elem_ty);
+
+                            // 递归绑定
+                            self.compile_pattern_binding(pat, elem_ty, locals, func);
+
+                            offset += elem_ty.size() as u32;
+                        }
+                    }
+                }
+            }
+            Pattern::Wildcard => {
+                // 通配符：丢弃值
+                func.instruction(&Instruction::Drop);
+            }
+            _ => {
+                // 其他模式暂不支持嵌套绑定，丢弃值
+                func.instruction(&Instruction::Drop);
+            }
+        }
+    }
+
     pub(crate) fn collect_locals(&self, stmt: &Stmt, locals: &mut LocalsBuilder) {
         match stmt {
             Stmt::Let { pattern, ty, value } => {
@@ -27,6 +126,29 @@ impl CodeGen {
                             .or_else(|| self.infer_ast_type_with_locals(value, locals))
                             .or_else(|| self.infer_ast_type(value));
                         locals.add(name, val_type, ast_type);
+                    }
+                    Pattern::Tuple(patterns) => {
+                        // 元组解构：let (x, y) = tuple
+                        locals.add("__let_tuple_ptr", ValType::I32, None);
+                        let value_ast_ty = self.infer_ast_type_with_locals(value, locals);
+                        if let Some(Type::Tuple(elem_types)) = value_ast_ty {
+                            for (i, pat) in patterns.iter().enumerate() {
+                                if let Pattern::Binding(name) = pat {
+                                    if let Some(elem_ty) = elem_types.get(i) {
+                                        locals.add(name, elem_ty.to_wasm(), Some(elem_ty.clone()));
+                                    } else {
+                                        locals.add(name, ValType::I64, None);
+                                    }
+                                }
+                            }
+                        } else {
+                            // 类型推断失败，使用默认类型
+                            for pat in patterns {
+                                if let Pattern::Binding(name) = pat {
+                                    locals.add(name, ValType::I64, None);
+                                }
+                            }
+                        }
                     }
                     Pattern::Struct { name: struct_name, fields } => {
                         locals.add("__let_struct_ptr", ValType::I32, None);
@@ -140,9 +262,13 @@ impl CodeGen {
                     Pattern::Binding(name) => {
                         locals.add(name, ValType::I64, None);
                     }
-                    Pattern::Variant { enum_name, variant_name, binding: Some(name) } => {
-                        if let Some(ty) = self.resolve_variant_payload(enum_name, variant_name, subject_ast_type.as_ref()) {
-                            locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                    Pattern::Variant { enum_name, variant_name, payload } => {
+                        if let Some(payload_pattern) = payload {
+                            if let Some(ty) = self.resolve_variant_payload(enum_name, variant_name, subject_ast_type.as_ref()) {
+                                self.collect_pattern_bindings(payload_pattern, locals, Some(&ty));
+                            } else {
+                                self.collect_pattern_bindings(payload_pattern, locals, None);
+                            }
                         }
                     }
                     Pattern::Struct { name: struct_name, fields } => {
@@ -200,14 +326,19 @@ impl CodeGen {
                 let subject_ast_type = self.infer_ast_type_with_locals(sub, locals);
                 locals.add("__match_enum_ptr", ValType::I32, None); // 关联值枚举 match 时暂存 ptr
                 locals.add("__match_val", ValType::I32, None); // P3.5: TypeTest 暂存 subject
+                locals.add("__tuple_ptr", ValType::I32, None); // 元组解构时暂存 ptr
                 for arm in arms {
                     match &arm.pattern {
                         Pattern::Binding(name) => {
                             locals.add(name, ValType::I64, None);
                         }
-                        Pattern::Variant { enum_name, variant_name, binding: Some(name) } => {
-                            if let Some(ty) = self.resolve_variant_payload(enum_name, variant_name, subject_ast_type.as_ref()) {
-                                locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                        Pattern::Variant { enum_name, variant_name, payload } => {
+                            if let Some(payload_pattern) = payload {
+                                if let Some(ty) = self.resolve_variant_payload(enum_name, variant_name, subject_ast_type.as_ref()) {
+                                    self.collect_pattern_bindings(payload_pattern, locals, Some(&ty));
+                                } else {
+                                    self.collect_pattern_bindings(payload_pattern, locals, None);
+                                }
                             }
                         }
                         Pattern::Struct { name: struct_name, fields } => {
@@ -241,9 +372,13 @@ impl CodeGen {
                     Pattern::Binding(name) => {
                         locals.add(name, ValType::I64, None);
                     }
-                    Pattern::Variant { enum_name, variant_name, binding: Some(name) } => {
-                        if let Some(ty) = self.resolve_variant_payload(enum_name, variant_name, subject_ast_type.as_ref()) {
-                            locals.add(name, ty.to_wasm(), Some(ty.clone()));
+                    Pattern::Variant { enum_name, variant_name, payload } => {
+                        if let Some(payload_pattern) = payload {
+                            if let Some(ty) = self.resolve_variant_payload(enum_name, variant_name, subject_ast_type.as_ref()) {
+                                self.collect_pattern_bindings(payload_pattern, locals, Some(&ty));
+                            } else {
+                                self.collect_pattern_bindings(payload_pattern, locals, None);
+                            }
                         }
                     }
                     Pattern::Struct { name: struct_name, fields } => {
@@ -395,8 +530,11 @@ impl CodeGen {
                 self.collect_locals_from_expr(inner, locals);
                 locals.add("__postfix_old", ValType::I64, None);
             }
+            Expr::PrefixIncr(inner) | Expr::PrefixDecr(inner) => {
+                self.collect_locals_from_expr(inner, locals);
+            }
             Expr::None => {}
-            Expr::TryBlock { resources, body, catch_body, catch_var, finally_body } => {
+            Expr::TryBlock { resources, body, catch_body, catch_var, catch_type, finally_body } => {
                 // P6: try-with-resources — 注册资源变量为局部变量
                 for (res_name, res_expr) in resources {
                     let res_type = self.infer_type(res_expr);
@@ -1412,7 +1550,7 @@ impl CodeGen {
             Expr::Index { .. } => ValType::I64,    // AST 推断未覆盖时的回退
             Expr::Field { .. } => ValType::I64,    // AST 推断未覆盖时的回退
             Expr::VariantConst { .. } => ValType::I32,
-            Expr::PostfixIncr(inner) | Expr::PostfixDecr(inner) => self.infer_type(inner),
+            Expr::PostfixIncr(inner) | Expr::PostfixDecr(inner) | Expr::PrefixIncr(inner) | Expr::PrefixDecr(inner) => self.infer_type(inner),
             Expr::Break | Expr::Continue => ValType::I32, // 不产生值，占位
             Expr::Cast { target_ty, .. } => target_ty.to_wasm(),
             Expr::IsType { .. } => ValType::I32, // Bool
@@ -2326,6 +2464,38 @@ impl CodeGen {
                             self.emit_type_coercion(func, val_ty, local_ty);
                             func.instruction(&Instruction::LocalSet(idx));
                         }
+                        Pattern::Tuple(patterns) => {
+                            // 元组解构：let (x, y) = tuple
+                            let ptr_tmp = locals.get("__let_tuple_ptr").expect("__let_tuple_ptr");
+                            func.instruction(&Instruction::LocalSet(ptr_tmp));
+                            let value_ast_ty = self.infer_ast_type_with_locals(value, locals);
+                            let elem_types: Vec<Option<Type>> = value_ast_ty
+                                .as_ref()
+                                .and_then(|t| if let Type::Tuple(ts) = t { Some(ts.iter().cloned().map(Some).collect()) } else { None })
+                                .unwrap_or_else(|| patterns.iter().map(|_| None).collect());
+                            let mut offset = 0u32;
+                            for (i, pat) in patterns.iter().enumerate() {
+                                if let Pattern::Binding(name) = pat {
+                                    let idx = locals.get(name).expect("局部变量未找到");
+                                    func.instruction(&Instruction::LocalGet(ptr_tmp));
+                                    if offset > 0 {
+                                        func.instruction(&Instruction::I32Const(offset as i32));
+                                        func.instruction(&Instruction::I32Add);
+                                    }
+                                    if let Some(Some(ty)) = elem_types.get(i) {
+                                        self.emit_load_by_type(func, ty);
+                                        offset += ty.size() as u32;
+                                    } else {
+                                        func.instruction(&Instruction::I64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 }));
+                                        offset += 8;
+                                    }
+                                    let local_ty = locals.get_valtype(name).unwrap_or(ValType::I64);
+                                    let val_ty = elem_types.get(i).and_then(|t| t.as_ref().map(|t| t.to_wasm())).unwrap_or(ValType::I64);
+                                    self.emit_type_coercion(func, val_ty, local_ty);
+                                    func.instruction(&Instruction::LocalSet(idx));
+                                }
+                            }
+                        }
                         Pattern::Struct { name: struct_name, fields } => {
                             let ptr_tmp = locals.get("__let_struct_ptr").expect("__let_struct_ptr");
                             func.instruction(&Instruction::LocalSet(ptr_tmp));
@@ -2695,7 +2865,7 @@ impl CodeGen {
                         }
                         func.instruction(&Instruction::Br(0));
                     }
-                    Pattern::Variant { enum_name, variant_name, binding } => {
+                    Pattern::Variant { enum_name, variant_name, payload } => {
                         let enum_def = self.enums.get(enum_name).and_then(|e| e.variant_index(variant_name).map(|_| e));
                         if let Some(enum_def) = enum_def {
                             func.instruction(&Instruction::LocalSet(ptr_tmp));
@@ -2717,14 +2887,23 @@ impl CodeGen {
                             }
                             func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                             if has_variant_payload {
-                                if let Some(ref bind_name) = binding {
+                                if let Some(ref payload_pattern) = payload {
                                     if let Some(ref payload_ty) = resolved_payload {
+                                        // 计算 payload 指针
                                         func.instruction(&Instruction::LocalGet(ptr_tmp));
                                         func.instruction(&Instruction::I32Const(4));
                                         func.instruction(&Instruction::I32Add);
-                                        self.emit_load_by_type(func, payload_ty);
-                                        let bind_idx = locals.get(bind_name).expect("关联值绑定未找到");
-                                        func.instruction(&Instruction::LocalSet(bind_idx));
+
+                                        // 对于复合类型（元组、结构体），直接传递指针
+                                        // 对于简单类型，加载值
+                                        if matches!(payload_ty, Type::Tuple(_) | Type::Struct(_, _)) {
+                                            // 复合类型：指针已在栈上
+                                            self.compile_pattern_binding(payload_pattern, payload_ty, locals, func);
+                                        } else {
+                                            // 简单类型：加载值
+                                            self.emit_load_by_type(func, payload_ty);
+                                            self.compile_pattern_binding(payload_pattern, payload_ty, locals, func);
+                                        }
                                     }
                                 }
                             }
@@ -3715,6 +3894,28 @@ impl CodeGen {
                     }
                 }
                 func.instruction(&Instruction::LocalGet(old_local));
+            }
+            Expr::PrefixIncr(inner) => {
+                // ++x: 先增加，再返回新值
+                self.compile_expr(inner, locals, func, loop_ctx);
+                func.instruction(&Instruction::I64Const(1));
+                func.instruction(&Instruction::I64Add);
+                if let Expr::Var(name) = inner.as_ref() {
+                    if let Some(idx) = locals.get(name) {
+                        func.instruction(&Instruction::LocalTee(idx));
+                    }
+                }
+            }
+            Expr::PrefixDecr(inner) => {
+                // --x: 先减少，再返回新值
+                self.compile_expr(inner, locals, func, loop_ctx);
+                func.instruction(&Instruction::I64Const(1));
+                func.instruction(&Instruction::I64Sub);
+                if let Expr::Var(name) = inner.as_ref() {
+                    if let Some(idx) = locals.get(name) {
+                        func.instruction(&Instruction::LocalTee(idx));
+                    }
+                }
             }
             Expr::Cast { expr, target_ty } => {
                 self.compile_expr(expr, locals, func, loop_ctx);
@@ -5082,7 +5283,7 @@ impl CodeGen {
                         Pattern::Variant {
                             enum_name,
                             variant_name,
-                            binding,
+                            payload,
                         } => {
                             // 判断是否为已知枚举（包含用户定义枚举 + 内建 Option/Result）
                             let handled = {
@@ -5117,14 +5318,13 @@ impl CodeGen {
 
                                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
                                 if has_variant_payload {
-                                    if let Some(ref bind_name) = binding {
+                                    if let Some(ref payload_pattern) = payload {
                                         if let Some(ref payload_ty) = resolved_payload {
                                             func.instruction(&Instruction::LocalGet(ptr_tmp));
                                             func.instruction(&Instruction::I32Const(4));
                                             func.instruction(&Instruction::I32Add);
                                             self.emit_load_by_type(func, payload_ty);
-                                            let bind_idx = locals.get(bind_name).expect("关联值绑定未找到");
-                                            func.instruction(&Instruction::LocalSet(bind_idx));
+                                            self.compile_pattern_binding(payload_pattern, payload_ty, locals, func);
                                         }
                                     }
                                 }
@@ -5294,28 +5494,29 @@ impl CodeGen {
                         }
                         // P3.5: 类型测试模式 x: Type
                         Pattern::TypeTest { binding, ty } => {
-                            // 将 subject 值绑定到变量
-                            if let Some(idx) = locals.get(binding) {
-                                // dup subject for binding + class_id check
-                                let tmp = locals.get("__match_val").unwrap_or(0);
-                                func.instruction(&Instruction::LocalSet(tmp));
-                                func.instruction(&Instruction::LocalGet(tmp));
-                                func.instruction(&Instruction::LocalGet(tmp));
-                            }
-                            // 类型检查：根据 target_ty 的 class_id 做对比
+                            // 类型检查：根据 target_ty 做静态或动态对比
                             let matched = match ty {
                                 Type::Struct(ref target_name, _) => {
                                     if let Some(ci) = self.classes.get(target_name) {
                                         let target_id = ci.class_id;
-                                        // 加载对象的 class_id（vtable_ptr 处，对象偏移 0）
-                                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                                            offset: 0, align: 2, memory_index: 0,
-                                        }));
-                                        func.instruction(&Instruction::I32Const(target_id as i32));
-                                        func.instruction(&Instruction::I32Eq);
+                                        // 对于类对象，检查 class_id（需要 i32 指针）
+                                        // 复制 subject 用于类型检查
+                                        let subject_wasm_ty = self.infer_type_with_locals(expr, locals);
+                                        if subject_wasm_ty == ValType::I32 {
+                                            // 加载对象的 class_id（vtable_ptr 处，对象偏移 0）
+                                            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                                offset: 0, align: 2, memory_index: 0,
+                                            }));
+                                            func.instruction(&Instruction::I32Const(target_id as i32));
+                                            func.instruction(&Instruction::I32Eq);
+                                        } else {
+                                            // 类型不匹配，静态检查
+                                            func.instruction(&Instruction::Drop);
+                                            func.instruction(&Instruction::I32Const(0));
+                                        }
                                         true
                                     } else {
-                                        // 静态类型匹配
+                                        // 静态类型匹配（结构体）
                                         let src_ty = &subject_ast_type;
                                         let target = Some(ty.clone());
                                         func.instruction(&Instruction::Drop);
@@ -5334,17 +5535,15 @@ impl CodeGen {
                             };
                             if matched {
                                 func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                                // 绑定 subject 到变量
+                                // 绑定 subject 到变量（重新加载）
+                                self.compile_expr(expr, locals, func, loop_ctx);
                                 if let Some(idx) = locals.get(binding) {
                                     func.instruction(&Instruction::LocalSet(idx));
                                 }
                                 self.compile_expr(&arm.body, locals, func, loop_ctx);
                                 func.instruction(&Instruction::Br(1));
                                 func.instruction(&Instruction::End);
-                                // 类型不匹配时: drop binding copy, reload subject for next arm
-                                if let Some(_idx) = locals.get(binding) {
-                                    func.instruction(&Instruction::Drop);
-                                }
+                                // 类型不匹配时: reload subject for next arm
                                 if is_last {
                                     Self::emit_match_default_value(func, result_type);
                                 } else {
@@ -5559,7 +5758,7 @@ impl CodeGen {
                     func.instruction(&Instruction::Unreachable);
                 }
             }
-            Expr::TryBlock { resources, body, catch_var, catch_body, finally_body } => {
+            Expr::TryBlock { resources, body, catch_var, catch_type, catch_body, finally_body } => {
                 // try (resources) { body } catch(e) { catch_body } finally { finally_body }
                 // Compile resource initializations as let bindings before the try body
                 for (res_name, res_expr) in resources {
@@ -5753,6 +5952,10 @@ impl CodeGen {
                 };
                 self.compile_expr(&field_on_ptr, locals, func, loop_ctx);
                 func.instruction(&Instruction::End);
+            }
+            // 宏调用 @MacroName(args)
+            Expr::Macro { name, args } => {
+                self.compile_macro_call(name, args, locals, func, loop_ctx);
             }
             // P6.2: 尾随闭包 f(args) { params => body } — 展开为 f(args, closure)
             Expr::TrailingClosure { callee, args, closure } => {

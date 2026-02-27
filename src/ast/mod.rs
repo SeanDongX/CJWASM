@@ -202,6 +202,8 @@ pub enum Expr {
         resources: Vec<(String, Expr)>,
         body: Vec<Stmt>,
         catch_var: Option<String>,
+        /// P2: 异常类型模式 catch (e: ExceptionType)
+        catch_type: Option<Type>,
         catch_body: Vec<Stmt>,
         /// finally 块（无论是否异常都执行）
         finally_body: Option<Vec<Stmt>>,
@@ -216,6 +218,10 @@ pub enum Expr {
     PostfixIncr(Box<Expr>),
     /// 后缀自减 expr--
     PostfixDecr(Box<Expr>),
+    /// 前缀自增 ++expr
+    PrefixIncr(Box<Expr>),
+    /// 前缀自减 --expr
+    PrefixDecr(Box<Expr>),
     /// break 在表达式上下文（如 match arm body）
     Break,
     /// continue 在表达式上下文
@@ -248,6 +254,11 @@ pub enum Expr {
         callee: Box<Expr>,
         args: Vec<Expr>,
         closure: Box<Expr>,
+    },
+    /// 宏调用 @MacroName(args)
+    Macro {
+        name: String,
+        args: Vec<Expr>,
     },
 }
 
@@ -283,12 +294,12 @@ pub enum Pattern {
     },
     /// 元组解构 (a, b)
     Tuple(Vec<Pattern>),
-    /// 枚举变体模式 Color.Red 或 Result.Ok(v)（匹配时用，binding 为关联值绑定名）
+    /// 枚举变体模式 Color.Red 或 Result.Ok(v)（匹配时用，payload 为关联值模式）
     Variant {
         enum_name: String,
         variant_name: String,
-        /// 关联值绑定名，如 Ok(v) 的 v
-        binding: Option<String>,
+        /// 关联值模式，如 Ok(v) 的 v，或 Some((x, y)) 的 (x, y)
+        payload: Option<Box<Pattern>>,
     },
     /// P3.5: 类型测试模式 x: Type — 匹配时检查对象类型，成功则绑定到 x
     TypeTest {

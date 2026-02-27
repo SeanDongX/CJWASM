@@ -4,6 +4,7 @@ use crate::lexer::Token;
 mod decl;
 mod error;
 mod expr;
+mod r#macro;
 mod pattern;
 mod stmt;
 mod type_;

@@ -1,0 +1,9 @@
+    OwnedPtr<AST::File> ParseTopLevel();
+    OwnedPtr<AST::Decl> ParseDecl(ScopeKind scopeKind);
+    OwnedPtr<AST::Expr> ParseExpr();
+    OwnedPtr<AST::Expr> ParseExprLibast();
+    OwnedPtr<AST::Type> ParseType();
+    OwnedPtr<AST::Pattern> ParsePattern();
+    void ParseAnnotationArguments(AST::Annotation& anno) const;
+    OwnedPtr<AST::Annotation> ParseCustomAnnotation() const;
+    std::vector<OwnedPtr<AST::Node>> ParseNodes(std::variant<ScopeKind, ExprKind> scope, AST::Node& currentMacroCall,

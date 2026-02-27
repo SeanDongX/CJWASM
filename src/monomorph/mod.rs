@@ -67,6 +67,8 @@ fn type_mangle_suffix(ty: &Type) -> String {
             type_mangle_suffix(k),
             type_mangle_suffix(v)
         ),
+        Type::This => "This".to_string(), // P2: This 类型
+        Type::Qualified(path) => path.join("_"), // P1: 限定类型
     }
 }
 
@@ -339,6 +341,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             resources,
             body,
             catch_var,
+            catch_type,
             catch_body,
             finally_body,
         } => TryBlock {
@@ -351,6 +354,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .map(|s| substitute_stmt(s, subst, rewrites))
                 .collect(),
             catch_var,
+            catch_type: catch_type.map(|t| substitute_type(&t, subst)),
             catch_body: catch_body
                 .into_iter()
                 .map(|s| substitute_stmt(s, subst, rewrites))
@@ -438,11 +442,11 @@ fn substitute_pattern(
         Variant {
             enum_name,
             variant_name,
-            binding,
+            payload,
         } => Variant {
             enum_name,
             variant_name,
-            binding,
+            payload: payload.map(|p| Box::new(substitute_pattern(*p, subst, rewrites))),
         },
         Or(ps) => Or(ps
             .into_iter()

@@ -296,6 +296,17 @@ impl Parser {
                 expr: Box::new(expr),
             });
         }
+        // 前缀自增/自减
+        if matches!(self.peek(), Some(Token::Incr)) {
+            self.advance();
+            let expr = self.parse_unary()?;
+            return Ok(Expr::PrefixIncr(Box::new(expr)));
+        }
+        if matches!(self.peek(), Some(Token::Decr)) {
+            self.advance();
+            let expr = self.parse_unary()?;
+            return Ok(Expr::PrefixDecr(Box::new(expr)));
+        }
         self.parse_postfix()
     }
 
@@ -468,7 +479,7 @@ impl Parser {
                                     }
                                     None => return self.bail(ParseError::UnexpectedEof),
                                 };
-                                params.push((name, Type::TypeParam("_".to_string())));
+                                params.push((name, Type::Int64)); // 默认使用 Int64，避免 TypeParam
                                 if self.check(&Token::FatArrow) {
                                     self.advance();
                                     break;
@@ -602,6 +613,11 @@ impl Parser {
     /// 解析基础表达式
     pub(crate) fn parse_primary(&mut self) -> Result<Expr, ParseErrorAt> {
         match self.advance() {
+            // 宏调用 @MacroName 或 @MacroName(args)
+            Some(Token::At) => {
+                self.pos -= 1; // 回退，让 parse_macro_call 重新消费 @
+                self.parse_macro_call()
+            }
             Some(Token::Integer(n)) => {
                 // 可选后缀 u8/u16/...（如 0x0Au8），消费掉以便后续不把 u8 当独立 token
                 if matches!(self.peek(), Some(Token::Ident(ref s)) if s == "u8" || s == "u16" || s == "u32" || s == "u64")
@@ -913,6 +929,7 @@ impl Parser {
                         resources,
                         body,
                         catch_var: None,
+                        catch_type: None,
                         catch_body: vec![],
                         finally_body: Some(vec![]),
                     });
@@ -927,27 +944,30 @@ impl Parser {
                         resources,
                         body,
                         catch_var: None,
+                        catch_type: None,
                         catch_body: vec![],
                         finally_body: Some(finally_stmts),
                     });
                 }
                 self.expect(Token::Catch)?;
-                let catch_var = if self.check(&Token::LParen) {
+                let (catch_var, catch_type) = if self.check(&Token::LParen) {
                     self.advance();
                     let var = match self.advance() {
                         Some(Token::Ident(v)) => Some(v),
                         Some(Token::Underscore) => None, // catch (_: Type)
                         _ => return self.bail(ParseError::UnexpectedEof),
                     };
-                    // cjc 兼容: catch (e: Exception) 可选类型注解
-                    if self.check(&Token::Colon) {
+                    // P2: catch (e: Exception) 异常类型模式
+                    let catch_type = if self.check(&Token::Colon) {
                         self.advance();
-                        let _ = self.parse_type()?;
-                    }
+                        Some(self.parse_type()?)
+                    } else {
+                        None
+                    };
                     self.expect(Token::RParen)?;
-                    var
+                    (var, catch_type)
                 } else {
-                    None
+                    (None, None)
                 };
                 self.expect(Token::LBrace)?;
                 let catch_body = self.parse_stmts()?;
@@ -966,6 +986,7 @@ impl Parser {
                     resources,
                     body,
                     catch_var,
+                    catch_type,
                     catch_body,
                     finally_body,
                 })
@@ -1169,7 +1190,7 @@ impl Parser {
                                 }
                                 None => return self.bail(ParseError::UnexpectedEof),
                             };
-                            params.push((name, Type::TypeParam("_".to_string())));
+                            params.push((name, Type::Int64)); // 默认使用 Int64
                             if self.check(&Token::FatArrow) {
                                 self.advance();
                                 break;
@@ -1195,7 +1216,7 @@ impl Parser {
                         self.advance(); // consume =>
                         let body = self.parse_lambda_body()?;
                         return Ok(Expr::Lambda {
-                            params: vec![(name, Type::TypeParam("_".to_string()))],
+                            params: vec![(name, Type::Int64)], // 默认使用 Int64
                             return_type: None,
                             body: Box::new(body),
                         });
@@ -1538,10 +1559,10 @@ impl Parser {
                 // name = default：跳过默认值，类型推断
                 self.advance();
                 let _ = self.parse_expr()?;
-                Type::TypeParam("_".to_string())
+                Type::Int64 // 默认使用 Int64
             } else if self.check(&Token::FatArrow) {
                 // 单参无类型 lambda: { name => body }，不消费 =>
-                params.push((name, Type::TypeParam("_".to_string())));
+                params.push((name, Type::Int64)); // 默认使用 Int64
                 break;
             } else {
                 return self.bail(ParseError::UnexpectedToken(

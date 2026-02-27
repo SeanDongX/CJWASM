@@ -51,6 +51,8 @@ impl CodeGen {
                 Self::type_mangle_suffix(k),
                 Self::type_mangle_suffix(v)
             ),
+            Type::This => "This".to_string(), // P2: This 类型
+            Type::Qualified(path) => path.join("_"), // P1: 限定类型，如 pkg.Module.Type
         }
     }
 
