@@ -288,14 +288,52 @@ impl Parser {
                         variant_name: name,
                         bindings,
                     })
+                } else if matches!(
+                    self.peek(),
+                    Some(Token::Lt)
+                        | Some(Token::Gt)
+                        | Some(Token::LtEq)
+                        | Some(Token::GtEq)
+                        | Some(Token::Eq)
+                        | Some(Token::NotEq)
+                        | Some(Token::Plus)
+                        | Some(Token::Minus)
+                        | Some(Token::Star)
+                        | Some(Token::Slash)
+                        | Some(Token::And)
+                        | Some(Token::Pipe)
+                        | Some(Token::AndAnd)
+                        | Some(Token::OrOr)
+                ) {
+                    // 如果后面跟着运算符，这是一个 guard 表达式
+                    let base = Expr::Var(name.clone());
+                    let full_expr = self.parse_guard_binary_rest(base)?;
+                    Ok(Pattern::Guard(Box::new(full_expr)))
                 } else {
                     Ok(Pattern::Binding(name))
                 }
             }
             Some(Token::LParen) => {
                 self.advance();
-                let mut patterns = Vec::new();
-                if !self.check(&Token::RParen) {
+
+                // 空括号 () 是单元类型模式
+                if self.check(&Token::RParen) {
+                    self.advance();
+                    return Ok(Pattern::Tuple(vec![]));
+                }
+
+                // 尝试解析第一个元素
+                // 如果看起来像表达式（包含运算符），则解析为 guard
+                // 否则解析为元组模式
+                let checkpoint = self.pos;
+
+                // 先尝试解析为模式
+                let first_result = self.parse_pattern();
+
+                // 如果成功且后面是逗号，则是元组模式
+                if first_result.is_ok() && self.check(&Token::Comma) {
+                    let mut patterns = vec![first_result.unwrap()];
+                    self.advance(); // consume comma
                     loop {
                         patterns.push(self.parse_pattern()?);
                         if !self.check(&Token::Comma) {
@@ -303,9 +341,25 @@ impl Parser {
                         }
                         self.advance();
                     }
+                    self.expect(Token::RParen)?;
+                    return Ok(Pattern::Tuple(patterns));
                 }
+
+                // 如果成功且后面是 )，可能是单元素元组或 guard
+                if first_result.is_ok() && self.check(&Token::RParen) {
+                    self.advance();
+                    // 单元素元组在 Cangjie 中不常见，通常 (x) 表示 guard
+                    // 如果模式是简单的绑定或字面量，返回元组
+                    // 否则可能需要作为 guard 处理
+                    let pattern = first_result.unwrap();
+                    return Ok(Pattern::Tuple(vec![pattern]));
+                }
+
+                // 如果解析模式失败，尝试解析为 guard 表达式
+                self.pos = checkpoint;
+                let expr = self.parse_expr()?;
                 self.expect(Token::RParen)?;
-                Ok(Pattern::Tuple(patterns))
+                Ok(Pattern::Guard(Box::new(expr)))
             }
             Some(tok) => self.bail_at(
                 ParseError::UnexpectedToken(tok.clone(), "模式".to_string()),

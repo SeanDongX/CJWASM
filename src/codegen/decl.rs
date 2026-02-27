@@ -211,9 +211,18 @@ impl CodeGen {
             }
             let base = entries.len() as u32;
             for method_fqn in &info.vtable_methods {
-                let func_idx = self.func_indices.get(method_fqn)
-                    .copied()
-                    .unwrap_or_else(|| panic!("vtable 方法 {} 未找到函数索引", method_fqn));
+                let func_idx = self.find_method_index(method_fqn)
+                    .unwrap_or_else(|| {
+                        eprintln!("错误: vtable 方法 '{}' 未找到函数索引", method_fqn);
+                        eprintln!("搜索包含 '{}' 的函数:", method_fqn.split('.').next().unwrap_or(""));
+                        let search_term = method_fqn.split('.').next().unwrap_or("");
+                        for (key, idx) in self.func_indices.iter() {
+                            if key.contains(search_term) {
+                                eprintln!("  {} -> {}", key, idx);
+                            }
+                        }
+                        panic!("vtable 方法 {} 未找到函数索引", method_fqn)
+                    });
                 entries.push(func_idx);
             }
             // 更新 vtable_base
@@ -221,6 +230,36 @@ impl CodeGen {
             info.vtable_base = base;
         }
         self.vtable_entries = entries;
+    }
+
+    /// 查找方法索引，支持多种命名格式
+    fn find_method_index(&self, method_fqn: &str) -> Option<u32> {
+        // 1. 尝试精确匹配
+        if let Some(&idx) = self.func_indices.get(method_fqn) {
+            return Some(idx);
+        }
+
+        // 2. 尝试其他命名格式
+        let candidates = vec![
+            method_fqn.replace('.', "::"),                    // "Scope::lookup"
+            method_fqn.replace('.', "_"),                     // "Scope_lookup"
+        ];
+
+        for candidate in candidates {
+            if let Some(&idx) = self.func_indices.get(&candidate) {
+                return Some(idx);
+            }
+        }
+
+        // 3. 尝试前缀匹配（处理单态化后的函数名，如 Scope.lookup$Scope$Identifier）
+        let prefix = format!("{}$", method_fqn);
+        for (key, &idx) in self.func_indices.iter() {
+            if key.starts_with(&prefix) {
+                return Some(idx);
+            }
+        }
+
+        None
     }
 
     /// 构建 init 函数：__ClassName_init(params...) -> i32 (对象指针)

@@ -558,6 +558,33 @@ impl Parser {
     /// 从已有的 postfix 表达式继续解析二元操作符（用于模式中的守卫表达式）
     /// 处理 &&、||、??、|> 等，优先级与正常表达式一致
     pub(crate) fn parse_guard_binary_rest(&mut self, mut left: Expr) -> Result<Expr, ParseErrorAt> {
+        // 首先处理比较运算符 (==, !=, <, >, <=, >=)
+        if matches!(
+            self.peek(),
+            Some(Token::Eq)
+                | Some(Token::NotEq)
+                | Some(Token::Lt)
+                | Some(Token::Gt)
+                | Some(Token::LtEq)
+                | Some(Token::GtEq)
+        ) {
+            let op = match self.advance() {
+                Some(Token::Eq) => BinOp::Eq,
+                Some(Token::NotEq) => BinOp::NotEq,
+                Some(Token::Lt) => BinOp::Lt,
+                Some(Token::Gt) => BinOp::Gt,
+                Some(Token::LtEq) => BinOp::LtEq,
+                Some(Token::GtEq) => BinOp::GtEq,
+                _ => unreachable!(),
+            };
+            let right = self.parse_additive()?;
+            left = Expr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+
         // && (比 || 优先级高)
         while self.check(&Token::AndAnd) {
             self.advance();
@@ -1851,6 +1878,26 @@ impl Parser {
             }
         }
 
+        // 处理二元运算符 (比较、逻辑运算等)
+        // 使用 parse_guard_binary_rest 来处理剩余的二元表达式
+        if matches!(
+            self.peek(),
+            Some(Token::Eq)
+                | Some(Token::NotEq)
+                | Some(Token::Lt)
+                | Some(Token::Gt)
+                | Some(Token::LtEq)
+                | Some(Token::GtEq)
+                | Some(Token::AndAnd)
+                | Some(Token::OrOr)
+                | Some(Token::Plus)
+                | Some(Token::Minus)
+                | Some(Token::Star)
+                | Some(Token::Slash)
+        ) {
+            expr = self.parse_guard_binary_rest(expr)?;
+        }
+
         Ok(expr)
     }
 
@@ -1864,7 +1911,7 @@ impl Parser {
                 if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                     let inclusive = self.check(&Token::DotDotEq);
                     self.advance();
-                    let end = self.parse_expr()?;
+                    let end = self.parse_for_range_end()?;
                     // P2.6: 可选步长 `: step`
                     let step = if self.check(&Token::Colon) {
                         self.advance();
@@ -1898,7 +1945,8 @@ impl Parser {
                     // 变量开头的范围 (如 start..end)
                     let inclusive = self.check(&Token::DotDotEq);
                     self.advance();
-                    let end = self.parse_expr()?;
+                    // 解析 end 表达式，但在遇到 where 时停止
+                    let end = self.parse_for_range_end()?;
                     // P2.6: 可选步长 `: step`
                     let step = if self.check(&Token::Colon) {
                         self.advance();
@@ -1969,6 +2017,50 @@ impl Parser {
         }
     }
 
+    /// 解析 for 循环范围表达式的 end 部分，在遇到 where 时停止
+    pub(crate) fn parse_for_range_end(&mut self) -> Result<Expr, ParseErrorAt> {
+        // 解析一个表达式，但在遇到 where 关键字时停止
+        // 这样 "0..this.size where condition" 会正确解析为范围 0..this.size
+        let mut expr = self.parse_primary()?;
+
+        // 解析后缀表达式（字段访问、方法调用等），但在 where 前停止
+        loop {
+            if self.check(&Token::Where) {
+                break;
+            }
+            if self.check(&Token::Dot) {
+                self.advance();
+                let field = match self.advance() {
+                    Some(Token::Ident(name)) => name,
+                    Some(tok) => {
+                        return self.bail(ParseError::UnexpectedToken(tok, "字段名或方法名".to_string()))
+                    }
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                if self.check(&Token::LParen) {
+                    self.advance();
+                    let (args, named_args) = self.parse_args()?;
+                    self.expect(Token::RParen)?;
+                    expr = Expr::MethodCall {
+                        object: Box::new(expr),
+                        method: field,
+                        args,
+                        named_args,
+                    };
+                } else {
+                    expr = Expr::Field {
+                        object: Box::new(expr),
+                        field,
+                    };
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(expr)
+    }
+
     /// 解析 match 分支列表
     pub(crate) fn parse_match_arms(&mut self) -> Result<Vec<MatchArm>, ParseErrorAt> {
         let mut arms = Vec::new();
@@ -1978,26 +2070,78 @@ impl Parser {
             if matches!(self.peek(), Some(Token::Case)) {
                 self.advance();
             }
-            let pattern = self.parse_pattern()?;
 
-            // 可选的守卫条件 (cjc 用 where / == expr，cjwasm 兼容 if)
-            let guard = if self.check(&Token::If) {
-                self.advance();
-                Some(Box::new(self.parse_expr()?))
-            } else if matches!(self.peek(), Some(Token::Where)) {
-                self.advance();
-                Some(Box::new(self.parse_expr()?))
-            } else if self.check(&Token::Eq) {
-                // cjc: case pattern == expr => body 表示 subject == expr
-                self.advance();
-                let right = self.parse_expr()?;
-                Some(Box::new(Expr::Binary {
-                    op: BinOp::Eq,
-                    left: Box::new(Expr::Var("__match_val".to_string())),
-                    right: Box::new(right),
-                }))
+            // 特殊处理：如果 case 后面是 ( 或看起来像表达式，解析为 guard
+            // 例如: case (x == 1) || (y == 2) => ...
+            // 或: case !isEqual(x, y) => ...
+            // 或: case Int64(x) % 2 == 0 => ...
+            let (pattern, guard) = if self.check(&Token::LParen)
+                || self.check(&Token::Bang)
+                || self.check(&Token::Minus)
+                || self.check(&Token::Tilde)
+                || matches!(
+                    self.peek(),
+                    Some(Token::TypeInt8)
+                        | Some(Token::TypeInt16)
+                        | Some(Token::TypeInt32)
+                        | Some(Token::TypeInt64)
+                        | Some(Token::TypeIntNative)
+                        | Some(Token::TypeUInt8)
+                        | Some(Token::TypeUInt16)
+                        | Some(Token::TypeUInt32)
+                        | Some(Token::TypeUInt64)
+                        | Some(Token::TypeUIntNative)
+                        | Some(Token::TypeFloat16)
+                        | Some(Token::TypeFloat32)
+                        | Some(Token::TypeFloat64)
+                        | Some(Token::TypeBool)
+                        | Some(Token::TypeRune)
+                        | Some(Token::TypeString)
+                ) {
+                // 解析为完整的 guard 表达式
+                let guard_expr = self.parse_expr()?;
+                // 使用通配符模式，guard 包含实际条件
+                (Pattern::Wildcard, Some(Box::new(guard_expr)))
             } else {
-                None
+                let pattern = self.parse_pattern()?;
+
+                // 如果解析出的是 Pattern::Guard，提取其中的表达式
+                let (pattern, guard) = match pattern {
+                    Pattern::Guard(expr) => (Pattern::Wildcard, Some(expr)),
+                    // 如果是简单绑定且后面跟着运算符，转换为 guard
+                    Pattern::Binding(name) if matches!(
+                        self.peek(),
+                        Some(Token::Eq)
+                            | Some(Token::NotEq)
+                            | Some(Token::Lt)
+                            | Some(Token::Gt)
+                            | Some(Token::LtEq)
+                            | Some(Token::GtEq)
+                            | Some(Token::AndAnd)
+                            | Some(Token::OrOr)
+                    ) => {
+                        // 将绑定转换为变量表达式，然后解析完整的二元表达式
+                        let var_expr = Expr::Var(name);
+                        let guard_expr = self.parse_guard_binary_rest(var_expr)?;
+                        (Pattern::Wildcard, Some(Box::new(guard_expr)))
+                    }
+                    other => (other, None),
+                };
+
+                // 可选的守卫条件 (cjc 用 where / == expr，cjwasm 兼容 if)
+                let guard = if guard.is_some() {
+                    guard
+                } else if self.check(&Token::If) {
+                    self.advance();
+                    Some(Box::new(self.parse_expr()?))
+                } else if matches!(self.peek(), Some(Token::Where)) {
+                    self.advance();
+                    Some(Box::new(self.parse_expr()?))
+                } else {
+                    None
+                };
+
+                (pattern, guard)
             };
 
             // cjc 兼容: case pattern => body 或 case pattern = body；跳过中间的 ++/-- 或多余的 break/continue

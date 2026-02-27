@@ -532,10 +532,12 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
         For {
             var,
             iterable,
+            filter,
             body,
         } => For {
             var,
             iterable: substitute_expr(iterable, subst, rewrites),
+            filter: filter.map(|f| Box::new(substitute_expr(*f, subst, rewrites))),
             body: body
                 .into_iter()
                 .map(|s| substitute_stmt(s, subst, rewrites))

@@ -65,6 +65,8 @@ pub struct CodeGen {
     func_type_by_sig: HashMap<(Vec<ValType>, Vec<ValType>), u32>,
     /// P3.4: 类 ID 计数器（用于 `is` 类型检查）
     next_class_id: u32,
+    /// 模块级常量 (name -> (type, value))
+    constants: HashMap<String, (Type, Expr)>,
 }
 
 impl CodeGen {
@@ -88,12 +90,26 @@ impl CodeGen {
             lambda_table_indices: HashMap::new(),
             func_type_by_sig: HashMap::new(),
             next_class_id: 0,
+            constants: HashMap::new(),
         }
     }
 
     /// 获取运行时函数的索引
     fn get_or_create_func_index(&self, name: &str) -> u32 {
         *self.func_indices.get(name).expect(&format!("运行时函数 {} 未注册", name))
+    }
+
+    /// 查找枚举变体：给定变体名，返回 (enum_name, variant_name)
+    /// 用于支持枚举变体的非限定引用，如 EAGER -> CleanupPolicy.EAGER
+    fn find_enum_variant(&self, variant_name: &str) -> Option<(String, String)> {
+        for (enum_name, enum_def) in &self.enums {
+            for variant in &enum_def.variants {
+                if variant.name == variant_name {
+                    return Some((enum_name.clone(), variant_name.to_string()));
+                }
+            }
+        }
+        None
     }
 
     /// 检查语句列表中是否包含未被 try-catch 包裹的 throw 表达式
@@ -323,6 +339,11 @@ impl CodeGen {
         // 收集字符串常量
         self.collect_strings(program);
 
+        // 注册模块级常量
+        for const_def in &program.constants {
+            self.constants.insert(const_def.name.clone(), (const_def.ty.clone(), const_def.init.clone()));
+        }
+
         // --- 接口 codegen (#29, #30, #33) ---
         // 注册接口定义（含继承合并），生成默认实现函数
         let mut interface_methods: HashMap<String, Vec<InterfaceMethod>> = HashMap::new();
@@ -409,12 +430,23 @@ impl CodeGen {
         for iface in &program.interfaces {
             for m in &iface.methods {
                 if let Some(ref body) = m.default_body {
+                    // 添加 this 参数作为第一个参数（类型为 I32 指针）
+                    let mut params = vec![Param {
+                        name: "this".to_string(),
+                        ty: Type::Int64, // 使用 Int64 作为占位符，实际是指针
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }];
+                    params.extend(m.params.clone());
+
                     functions.push(FuncDef {
                         visibility: Visibility::Public,
                         name: format!("{}.__default_{}", iface.name, m.name),
                         type_params: vec![],
                         constraints: vec![],
-                        params: m.params.clone(),
+                        params,
                         return_type: m.return_type.clone(),
                         throws: None,
                         body: body.clone(),
@@ -1269,8 +1301,11 @@ impl CodeGen {
                 for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
                 Self::collect_lambdas_from_expr(cond, counter, out);
             }
-            Stmt::For { iterable, body, .. } => {
+            Stmt::For { iterable, filter, body, .. } => {
                 Self::collect_lambdas_from_expr(iterable, counter, out);
+                if let Some(f) = filter {
+                    Self::collect_lambdas_from_expr(f, counter, out);
+                }
                 for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
             }
             Stmt::Loop { body, .. } => {
@@ -6500,6 +6535,7 @@ mod tests {
                             inclusive: false,
                             step: None,
                         },
+                        filter: None,
                         body: vec![Stmt::Assign {
                             target: AssignTarget::Var("sum".to_string()),
                             value: Expr::Binary {

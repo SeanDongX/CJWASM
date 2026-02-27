@@ -176,7 +176,7 @@ impl CodeGen {
                     self.collect_locals(s, locals);
                 }
             }
-            Stmt::For { var, iterable, body } => {
+            Stmt::For { var, iterable, filter, body } => {
                 locals.add(var, ValType::I64, self.expr_object_type(iterable)); // 循环变量：范围时为 Int64，数组时为元素类型
                 if !matches!(iterable, Expr::Range { .. }) {
                     locals.add(&format!("__{}_idx", var), ValType::I64, None);
@@ -184,6 +184,9 @@ impl CodeGen {
                     locals.add(&format!("__{}_arr", var), ValType::I32, None);
                 }
                 self.collect_locals_from_expr(iterable, locals);
+                if let Some(f) = filter {
+                    self.collect_locals_from_expr(f, locals);
+                }
                 for s in body {
                     self.collect_locals(s, locals);
                 }
@@ -2788,7 +2791,7 @@ impl CodeGen {
                 func.instruction(&Instruction::End);
                 func.instruction(&Instruction::End);
             }
-            Stmt::For { var, iterable, body } => {
+            Stmt::For { var, iterable, filter, body } => {
                 // for i in 0..10 { ... } 编译为:
                 // let i = start
                 // while i < end { ...; i = i + 1 }
@@ -2813,6 +2816,25 @@ impl CodeGen {
                             func.instruction(&Instruction::I64GeS); // i >= end
                         }
                         func.instruction(&Instruction::BrIf(1)); // 退出外层 block
+
+                        // 如果有 where 过滤条件，检查条件
+                        if let Some(filter_expr) = filter {
+                            self.compile_expr(filter_expr, locals, func, loop_ctx);
+                            // 如果条件为假，跳过循环体，直接到增量步骤
+                            func.instruction(&Instruction::I32Eqz);
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                            // 递增循环变量
+                            func.instruction(&Instruction::LocalGet(var_idx));
+                            if let Some(step_expr) = step {
+                                self.compile_expr(step_expr, locals, func, loop_ctx);
+                            } else {
+                                func.instruction(&Instruction::I64Const(1));
+                            }
+                            func.instruction(&Instruction::I64Add);
+                            func.instruction(&Instruction::LocalSet(var_idx));
+                            func.instruction(&Instruction::Br(0)); // 继续循环
+                            func.instruction(&Instruction::End); // if end
+                        }
 
                         // 循环体用 block 包裹，使 continue 跳到增量步骤
                         func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
@@ -2900,6 +2922,21 @@ impl CodeGen {
                             memory_index: 0,
                         }));
                         func.instruction(&Instruction::LocalSet(var_idx));
+
+                        // 如果有 where 过滤条件，检查条件
+                        if let Some(filter_expr) = filter {
+                            self.compile_expr(filter_expr, locals, func, loop_ctx);
+                            // 如果条件为假，跳过循环体，直接到增量步骤
+                            func.instruction(&Instruction::I32Eqz);
+                            func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                            // 递增索引
+                            func.instruction(&Instruction::LocalGet(idx_idx));
+                            func.instruction(&Instruction::I64Const(1));
+                            func.instruction(&Instruction::I64Add);
+                            func.instruction(&Instruction::LocalSet(idx_idx));
+                            func.instruction(&Instruction::Br(0)); // 继续循环
+                            func.instruction(&Instruction::End); // if end
+                        }
 
                         // 循环体用 block 包裹，使 continue 跳到增量步骤
                         func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
@@ -3281,13 +3318,56 @@ impl CodeGen {
                     _ => {
                         if let Some(idx) = locals.get(name) {
                             func.instruction(&Instruction::LocalGet(idx));
+                        } else if name == "isNative64" {
+                            // 特殊处理：WASM 平台 IntNative/UIntNative 为 64 位
+                            func.instruction(&Instruction::I32Const(1)); // true
+                        } else if let Some((const_ty, const_expr)) = self.constants.get(name) {
+                            // 模块级常量：内联编译常量表达式
+                            self.compile_expr(const_expr, locals, func, loop_ctx);
+                        } else if let Some((enum_name, variant_name)) = self.find_enum_variant(name) {
+                            // 枚举变体的非限定引用：EAGER -> CleanupPolicy.EAGER
+                            let variant_expr = Expr::VariantConst {
+                                enum_name: enum_name.clone(),
+                                variant_name: variant_name.clone(),
+                                arg: None,
+                            };
+                            self.compile_expr(&variant_expr, locals, func, loop_ctx);
                         } else if let Some(this_idx) = locals.get("this") {
                             // Bug B2 修复: 隐式 this 字段访问 — 将 `field` 解析为 `this.field`
-                            let this_field = Expr::Field {
-                                object: Box::new(Expr::Var("this".to_string())),
-                                field: name.clone(),
-                            };
-                            self.compile_expr(&this_field, locals, func, loop_ctx);
+                            // 检查是否是接口属性（prop），如果是则转换为 getter 调用
+                            let mut is_interface_prop = false;
+                            for (iface_name, methods) in &self.interfaces {
+                                for method in methods {
+                                    if method.name == format!("__get_{}", name) {
+                                        // 这是一个接口属性，转换为 this.__get_property() 调用
+                                        func.instruction(&Instruction::LocalGet(this_idx));
+                                        // 调用 getter 方法（需要通过 vtable 或直接调用）
+                                        // 这里简化处理：假设接口方法通过函数名调用
+                                        let getter_name = format!("{}.__default___get_{}", iface_name, name);
+                                        if let Some(&getter_idx) = self.func_indices.get(&getter_name) {
+                                            func.instruction(&Instruction::Call(getter_idx));
+                                            is_interface_prop = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if is_interface_prop {
+                                    break;
+                                }
+                            }
+                            if !is_interface_prop {
+                                let this_field = Expr::Field {
+                                    object: Box::new(Expr::Var("this".to_string())),
+                                    field: name.clone(),
+                                };
+                                self.compile_expr(&this_field, locals, func, loop_ctx);
+                            }
+                        } else if ["Int64", "Int32", "Int16", "Int8", "UInt64", "UInt32", "UInt16", "UInt8",
+                                    "Float64", "Float32", "Float16", "Bool", "Rune", "String", "Unit"].contains(&name.as_str()) {
+                            // 类型名作为值使用（可能是类型字面量或类型对象）
+                            // 暂时不支持，跳过或返回默认值
+                            // 这种情况通常出现在泛型或反射相关的代码中
+                            panic!("类型名 '{}' 不能作为值使用", name);
                         } else {
                             panic!("变量未找到: '{}'", name);
                         }
@@ -4001,7 +4081,7 @@ impl CodeGen {
                 {
                     self.compile_expr(&args[0], locals, func, loop_ctx);
                     func.instruction(&Instruction::Call(self.get_or_create_func_index("__abs_i64")));
-                } else if args.len() == 1 && ["Int64", "Int32", "Int16", "Int8", "UInt64", "UInt32", "UInt16", "UInt8", "Float64", "Float32", "Bool"].contains(&name.as_str()) {
+                } else if args.len() == 1 && ["Int64", "Int32", "Int16", "Int8", "UInt64", "UInt32", "UInt16", "UInt8", "Float64", "Float32", "Bool", "Rune"].contains(&name.as_str()) {
                     // 类型转换构造函数 T(e) - cjc 兼容
                     let target_ty = match name.as_str() {
                         "Int64" => Type::Int64,
@@ -4015,6 +4095,7 @@ impl CodeGen {
                         "Float64" => Type::Float64,
                         "Float32" => Type::Float32,
                         "Bool" => Type::Bool,
+                        "Rune" => Type::Rune,
                         _ => unreachable!(),
                     };
                     self.compile_expr(&Expr::Cast { expr: Box::new(args[0].clone()), target_ty }, locals, func, loop_ctx);
@@ -4030,7 +4111,9 @@ impl CodeGen {
                     } else {
                         name.to_string()
                     };
-                    let params = self.func_params.get(&key).expect("函数未找到");
+                    let params = self.func_params.get(&key).unwrap_or_else(|| {
+                        panic!("函数未找到: '{}' (key: '{}')", name, key)
+                    });
 
                     // 检查是否有可变参数
                     let variadic_idx = params.iter().position(|p| p.variadic);
@@ -4489,7 +4572,7 @@ impl CodeGen {
                 // 返回对象地址
                 func.instruction(&Instruction::LocalGet(tmp_local));
             }
-            Expr::ConstructorCall { name, type_args, args, .. } => {
+            Expr::ConstructorCall { name, type_args, args, named_args } => {
                 // Phase 7.5: 内置集合类型构造器（首字母大写，会被解析为 ConstructorCall）
                 match name.as_str() {
                     "ArrayList" | "ArrayStack" if args.is_empty() => {
@@ -4558,6 +4641,109 @@ impl CodeGen {
                     "Mutex" | "ReentrantMutex" if args.is_empty() => {
                         func.instruction(&Instruction::I32Const(4));
                         func.instruction(&Instruction::Call(self.func_indices["__alloc"]));
+                        return;
+                    }
+                    // Array<T>() 无参构造 — 创建空数组
+                    "Array" if args.is_empty() => {
+                        let alloc_idx = self.func_indices["__alloc"];
+                        // 分配 4 字节存储长度 0
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::Call(alloc_idx));
+                        // 写入长度 0
+                        func.instruction(&Instruction::I32Const(0));
+                        func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+                        // 返回指针（已在栈上）
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::Call(alloc_idx));
+                        return;
+                    }
+                    // P2.7: Array<T>(size, init) 或 Array<T>(size, repeat: value) 动态数组构造
+                    "Array" if args.len() == 1 && named_args.len() == 1 && named_args[0].0 == "repeat" => {
+                        // Array<T>(size, repeat: value) 形式
+                        let elem_size: i32 = 8; // i64/f64
+                        let is_float = type_args.as_ref().map_or(false, |ta| {
+                            ta.first().map_or(false, |t| matches!(t, Type::Float64 | Type::Float32))
+                        });
+                        let ptr_local = locals.get("__array_dyn_ptr").unwrap();
+                        let size_local = locals.get("__array_dyn_size").unwrap();
+                        let idx_local = locals.get("__array_dyn_idx").unwrap();
+                        let alloc_idx = self.func_indices["__alloc"];
+
+                        // 计算 size 并保存
+                        self.compile_expr(&args[0], locals, func, loop_ctx);
+                        func.instruction(&Instruction::LocalSet(size_local));
+
+                        // 分配内存: 4 + size * 8
+                        func.instruction(&Instruction::LocalGet(size_local));
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::I32Const(elem_size));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::Call(alloc_idx));
+                        func.instruction(&Instruction::LocalSet(ptr_local));
+
+                        // 写入长度
+                        func.instruction(&Instruction::LocalGet(ptr_local));
+                        func.instruction(&Instruction::LocalGet(size_local));
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                            offset: 0, align: 2, memory_index: 0,
+                        }));
+
+                        // 初始化元素: idx = 0
+                        func.instruction(&Instruction::I64Const(0));
+                        func.instruction(&Instruction::LocalSet(idx_local));
+
+                        // loop: while idx < size
+                        func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+                        func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+                        // 条件: idx >= size → break
+                        func.instruction(&Instruction::LocalGet(idx_local));
+                        func.instruction(&Instruction::LocalGet(size_local));
+                        func.instruction(&Instruction::I64GeS);
+                        func.instruction(&Instruction::BrIf(1));
+
+                        // 计算元素地址: ptr + 4 + idx * 8
+                        func.instruction(&Instruction::LocalGet(ptr_local));
+                        func.instruction(&Instruction::I32Const(4));
+                        func.instruction(&Instruction::I32Add);
+                        func.instruction(&Instruction::LocalGet(idx_local));
+                        func.instruction(&Instruction::I32WrapI64);
+                        func.instruction(&Instruction::I32Const(elem_size));
+                        func.instruction(&Instruction::I32Mul);
+                        func.instruction(&Instruction::I32Add);
+
+                        // 使用 repeat 值初始化
+                        let repeat_expr = &named_args[0].1;
+                        self.compile_expr(repeat_expr, locals, func, loop_ctx);
+
+                        // 存储元素
+                        if is_float {
+                            func.instruction(&Instruction::F64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                        } else {
+                            func.instruction(&Instruction::I64Store(wasm_encoder::MemArg {
+                                offset: 0, align: 3, memory_index: 0,
+                            }));
+                        }
+
+                        // idx += 1
+                        func.instruction(&Instruction::LocalGet(idx_local));
+                        func.instruction(&Instruction::I64Const(1));
+                        func.instruction(&Instruction::I64Add);
+                        func.instruction(&Instruction::LocalSet(idx_local));
+
+                        func.instruction(&Instruction::Br(0)); // continue loop
+                        func.instruction(&Instruction::End); // loop end
+                        func.instruction(&Instruction::End); // block end
+
+                        // 返回数组指针
+                        func.instruction(&Instruction::LocalGet(ptr_local));
                         return;
                     }
                     // P2.7: Array<T>(size, init) 动态数组构造
@@ -4678,7 +4864,14 @@ impl CodeGen {
                     func.instruction(&Instruction::Call(idx));
                 } else {
                     // 无 init: 回退到 StructInit
-                    let struct_def = self.structs.get(name).expect(&format!("结构体 {} 未定义", name));
+                    let struct_def = self.structs.get(name).unwrap_or_else(|| {
+                        // 检查是否是内建泛型类型
+                        if name == "Array" {
+                            panic!("Array 构造函数调用需要使用数组字面量语法 [...]，而非 Array(...)")
+                        } else {
+                            panic!("结构体 {} 未定义", name)
+                        }
+                    });
                     if args.len() != struct_def.fields.len() {
                         panic!(
                             "结构体 {} 构造函数需要 {} 个参数，得到 {} 个",

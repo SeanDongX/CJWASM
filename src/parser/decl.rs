@@ -931,29 +931,38 @@ impl Parser {
             } else {
                 self.advance();
             }
-            let _ = match self.advance() {
-                Some(Token::Ident(_)) => (),
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "协议/约束名".to_string()))
+            // 解析一个或多个接口，用 & 分隔
+            loop {
+                let _ = match self.advance() {
+                    Some(Token::Ident(_)) => (),
+                    Some(tok) => {
+                        return self.bail(ParseError::UnexpectedToken(tok, "协议/约束名".to_string()))
+                    }
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                if self.check(&Token::Lt) {
+                    self.advance();
+                    loop {
+                        let _ = self.parse_type()?;
+                        if self.check(&Token::Gt) {
+                            self.advance();
+                            break;
+                        }
+                        if self.check(&Token::Comma) {
+                            self.advance();
+                        } else {
+                            return self.bail(ParseError::UnexpectedToken(
+                                self.peek().cloned().unwrap_or(Token::Comma),
+                                "`,` 或 `>`".to_string(),
+                            ));
+                        }
+                    }
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
-            };
-            if self.check(&Token::Lt) {
-                self.advance();
-                loop {
-                    let _ = self.parse_type()?;
-                    if self.check(&Token::Gt) {
-                        self.advance();
-                        break;
-                    }
-                    if self.check(&Token::Comma) {
-                        self.advance();
-                    } else {
-                        return self.bail(ParseError::UnexpectedToken(
-                            self.peek().cloned().unwrap_or(Token::Comma),
-                            "`,` 或 `>`".to_string(),
-                        ));
-                    }
+                // 检查是否有更多接口 (用 & 分隔)
+                if self.check(&Token::And) {
+                    self.advance();
+                } else {
+                    break;
                 }
             }
         }
@@ -1188,6 +1197,11 @@ impl Parser {
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
+
+        // 解析可选的泛型类型参数 <T, U, ...>
+        let (type_params, _constraints) = self.parse_type_params_with_constraints()?;
+        let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
+
         // 解析接口继承 : Parent1, Parent2 或 <: Parent (cjc)
         let parents = if self.check(&Token::Colon) || self.check(&Token::SubType) {
             self.advance();
@@ -1352,12 +1366,13 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 continue;
             }
-            // cjc: 接口方法可有 static / public / protected / override / mut 修饰符（忽略）
+            // cjc: 接口方法可有 static / public / protected / override / operator / mut 修饰符（忽略）
             while self.check(&Token::Static)
                 || self.check(&Token::Public)
                 || self.check(&Token::Protected)
                 || self.check(&Token::Override)
                 || self.check(&Token::Open)
+                || self.check(&Token::Operator)
                 || self.check(&Token::Mut)
             {
                 self.advance();
@@ -1370,6 +1385,29 @@ impl Parser {
             self.expect(Token::Func)?;
             let m_name = match self.advance() {
                 Some(Token::Ident(n)) => n,
+                // 支持运算符方法名
+                Some(Token::Plus) => "+".to_string(),
+                Some(Token::Minus) => "-".to_string(),
+                Some(Token::Star) => "*".to_string(),
+                Some(Token::Slash) => "/".to_string(),
+                Some(Token::Percent) => "%".to_string(),
+                Some(Token::Eq) => "==".to_string(),
+                Some(Token::NotEq) => "!=".to_string(),
+                Some(Token::Lt) => "<".to_string(),
+                Some(Token::Gt) => ">".to_string(),
+                Some(Token::LtEq) => "<=".to_string(),
+                Some(Token::GtEq) => ">=".to_string(),
+                Some(Token::And) => "&".to_string(),
+                Some(Token::Pipe) => "|".to_string(),
+                Some(Token::Caret) => "^".to_string(),
+                Some(Token::Bang) => "!".to_string(),
+                Some(Token::Tilde) => "~".to_string(),
+                Some(Token::Shl) => "<<".to_string(),
+                Some(Token::Shr) => ">>".to_string(),
+                Some(Token::LBracket) => {
+                    self.expect(Token::RBracket)?;
+                    "[]".to_string()
+                }
                 Some(tok) => {
                     return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string()))
                 }
@@ -1427,6 +1465,9 @@ impl Parser {
             });
         }
         self.expect(Token::RBrace)?;
+
+        self.current_type_params = prev_params;
+
         Ok(crate::ast::InterfaceDef {
             visibility,
             name,
@@ -1463,6 +1504,7 @@ impl Parser {
             Some(Token::TypeString) => "String".to_string(),
             Some(Token::TypeBool) => "Bool".to_string(),
             Some(Token::TypeArray) => "Array".to_string(),
+            Some(Token::TypeUnit) => "Unit".to_string(),
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类型名".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
@@ -1811,16 +1853,14 @@ impl Parser {
                     self.advance();
                     loop {
                         let _ = self.parse_type()?;
-                        if self.check(&Token::Gt) {
-                            self.advance();
-                            break;
-                        }
                         if self.check(&Token::Comma) {
                             self.advance();
                         } else {
                             break;
                         }
                     }
+                    // 必须消费结束的 >
+                    self.expect(Token::Gt)?;
                 }
                 if self.check(&Token::And) {
                     self.advance();
@@ -2438,6 +2478,9 @@ impl Parser {
                         Some(Token::Gt) => "op_gt",
                         Some(Token::LtEq) => "op_le",
                         Some(Token::GtEq) => "op_ge",
+                        Some(Token::And) => "op_and",
+                        Some(Token::Pipe) => "op_or",
+                        Some(Token::Caret) => "op_xor",
                         Some(Token::LBracket) => {
                             self.expect(Token::RBracket)?;
                             "op_index"
@@ -2756,6 +2799,7 @@ impl Parser {
         // 无 body 的声明：@Intrinsic / extern 等后接 @、;、或下一成员/声明（可见性、func、extend 等）
         let body = if self.check(&Token::At)
             || self.check(&Token::Semicolon)
+            || self.peek().is_none()  // 文件末尾
             || matches!(
                 self.peek(),
                 Some(Token::Public)

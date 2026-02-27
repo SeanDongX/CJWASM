@@ -285,6 +285,13 @@ impl Parser {
                 };
                 self.expect(Token::In)?;
                 let iterable = self.parse_for_iterable()?;
+                // 解析可选的 where 过滤条件
+                let filter = if self.check(&Token::Where) {
+                    self.advance();
+                    Some(Box::new(self.parse_expr()?))
+                } else {
+                    None
+                };
                 if has_paren {
                     self.expect(Token::RParen)?;
                 }
@@ -311,6 +318,7 @@ impl Parser {
                 Ok(Stmt::For {
                     var,
                     iterable,
+                    filter,
                     body,
                 })
             }

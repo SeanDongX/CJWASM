@@ -355,6 +355,7 @@ pub enum Stmt {
     For {
         var: String,
         iterable: Expr,
+        filter: Option<Box<Expr>>,
         body: Vec<Stmt>,
     },
     /// loop 无限循环 loop { ... }

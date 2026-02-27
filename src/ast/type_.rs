@@ -82,7 +82,14 @@ impl Type {
             Type::Result(_, _) => ValType::I32,
             Type::Slice(_) => ValType::I32,
             Type::Map(_, _) => ValType::I32,
-            Type::TypeParam(_) => panic!("TypeParam 不能直接转换为 WASM，需先单态化"),
+            Type::TypeParam(name) => {
+                // 对于通配符类型参数 '_'，使用 i32 作为默认值
+                if name == "_" {
+                    ValType::I32
+                } else {
+                    panic!("TypeParam '{}' 不能直接转换为 WASM，需先单态化", name)
+                }
+            }
         }
     }
 
