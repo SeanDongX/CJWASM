@@ -255,14 +255,15 @@ impl CodeGen {
 
 ## 7. 实现优先级
 
-### P0 (立即实现)
+### P0 (已完成 ✅)
 - ✅ `@Assert(a, b)` - 测试断言
 - ✅ `@Expect(a, b)` - 期望值检查
 
-### P1 (本周实现)
-- 🟡 `@Deprecated` - 废弃警告
-- 🟡 `@sourceFile` - 文件名
-- 🟡 `@sourceLine` - 行号
+### P1 (已完成 ✅)
+- ✅ `@Deprecated` - 废弃警告
+- ✅ `@sourceFile` - 文件名
+- ✅ `@sourceLine` - 行号
+- ✅ `@sourcePackage` - 包名
 
 ### P2 (可延后)
 - ❌ `@CallingConv` - 调用约定
@@ -322,11 +323,12 @@ main(): Int64 {
 
 ## 9. 下一步行动
 
-1. ✅ 完成研究 (当前任务)
-2. 🔄 设计 AST 结构
-3. 🔄 实现 Parser
-4. 🔄 编写测试
-5. 🔄 实现 CodeGen
+1. ✅ 完成研究
+2. ✅ 设计 AST 结构
+3. ✅ 实现 Parser
+4. ✅ 编写测试
+5. ✅ 实现 CodeGen
+6. ✅ 集成测试通过
 
 ## 10. 关键发现
 

@@ -37,23 +37,26 @@
   - `test_parse_macro_with_complex_args` - 复杂表达式参数
   - `test_parse_source_file_macro` - 内建宏
 - ✅ 集成测试：`tests/fixtures/macro_test.cj`
+  - 包含 4 个宏调用（2 个 @Assert，2 个 @Expect）
+  - 测试断言相等和期望值检查功能
 
 ## 测试结果
 
 ```bash
-running 3 tests
+running 4 tests
 test parser::r#macro::tests::test_parse_macro_no_args ... ok
 test parser::r#macro::tests::test_parse_macro_with_args ... ok
 test parser::r#macro::tests::test_parse_macro_with_complex_args ... ok
+test parser::r#macro::tests::test_parse_source_file_macro ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored
+test result: ok. 4 passed; 0 failed; 0 ignored
 ```
 
 ## 代码统计
 
 - **新增文件**: 3 个
-  - `src/parser/macro.rs` (~100 行)
-  - `src/codegen/macro.rs` (~120 行)
+  - `src/parser/macro.rs` (159 行)
+  - `src/codegen/macro.rs` (125 行)
   - `tests/fixtures/macro_test.cj` (~15 行)
 
 - **修改文件**: 4 个
@@ -63,7 +66,7 @@ test result: ok. 3 passed; 0 failed; 0 ignored
   - `src/codegen/expr.rs` (+4 行)
   - `src/codegen/mod.rs` (+1 行)
 
-- **总计**: ~250 行新代码
+- **总计**: ~284 行新代码
 
 ## 实现特点
 
@@ -81,7 +84,7 @@ test result: ok. 3 passed; 0 failed; 0 ignored
 - 只支持内建宏调用
 - 编译时直接生成 WASM 代码
 - 无需宏展开机制
-- 代码量: ~250 行
+- 代码量: ~284 行
 
 ### 优势
 1. **实现简单** - 只需 250 行代码

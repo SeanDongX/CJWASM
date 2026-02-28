@@ -43,39 +43,70 @@ grep -E "OwnedPtr<.*>.*Parse" third_party/cangjie_compiler/include/cangjie/Parse
 - 类/结构体/接口
 - 泛型基础
 
-**待补充（参考 cjc）:**
+**已完成 ✅:**
 1. **宏系统** (`ParseMacro.cpp`)
-   - 参考: `third_party/cangjie_compiler/src/Parse/ParseMacro.cpp`
-   - 实现: `src/parser/macro.rs`（新建）
-   - 关键点: `@` 注解解析、宏展开
+    - 参考: `third_party/cangjie_compiler/src/Parse/ParseMacro.cpp`
+    - 实现: `src/parser/macro.rs`, `src/codegen/macro.rs`
+    - 功能: `@Assert`, `@Expect` 等内建宏
 
-2. **条件编译** (`ConditionalCompilation/`)
-   - 参考: `third_party/cangjie_compiler/src/ConditionalCompilation/`
-   - 实现: `src/parser/conditional.rs`（新建）
-   - 关键点: `#if`/`#else`/`#endif` 预处理
+2. **完整的模式匹配** (`ParsePattern.cpp`)
+    - 参考: `third_party/cangjie_compiler/src/Parse/ParsePattern.cpp`
+    - 实现: `src/parser/pattern.rs`
+    - 功能: if-let, while-let, 类型模式, 嵌套解构
 
-3. **完整的模式匹配** (`ParsePattern.cpp`)
-   - 参考: `third_party/cangjie_compiler/src/Parse/ParsePattern.cpp`
-   - 增强: `src/parser/pattern.rs`（已有，需扩展）
-   - 关键点: 嵌套解构、guard 条件、通配符
+**待补充（参考 cjc）:**
+3. **条件编译** (`ConditionalCompilation/`)
+    - 参考: `third_party/cangjie_compiler/src/ConditionalCompilation/`
+    - 实现: `src/parser/conditional.rs`（新建）
+    - 关键点: `#if`/`#else`/`#endif` 预处理
 
 #### 2.2 中优先级（P1）- 常用特性
-1. **属性系统** (`ParseAnnotations.cpp`)
-   - 参考: `third_party/cangjie_compiler/src/Parse/ParseAnnotations.cpp`
-   - 实现: `src/parser/annotation.rs`（新建）
+**已完成 ✅:**
+1. **类型别名** (`ParseDecl.cpp`)
+    - 参考: `third_party/cangjie_compiler/src/Parse/ParseDecl.cpp`
+    - 实现: `src/parser/decl.rs`
+    - 功能: `type Name = Type`
 
-2. **导入系统增强** (`ParseImports.cpp`)
-   - 参考: `third_party/cangjie_compiler/src/Parse/ParseImports.cpp`
-   - 增强: `src/parser/mod.rs` 中的 `parse_import`
+2. **可选链** (`ParseExpr.cpp`)
+    - 参考: `third_party/cangjie_compiler/src/Parse/ParseExpr.cpp`
+    - 实现: `src/parser/expr.rs`, `src/codegen/expr.rs`
+    - 功能: `obj?.field`
 
-3. **Quote 宏** (`ParseQuote.cpp`)
-   - 参考: `third_party/cangjie_compiler/src/Parse/ParseQuote.cpp`
-   - 实现: `src/parser/quote.rs`（新建）
+3. **尾随闭包** (`ParseExpr.cpp`)
+    - 参考: `third_party/cangjie_compiler/src/Parse/ParseExpr.cpp`
+    - 实现: `src/parser/expr.rs`, `src/codegen/expr.rs`
+    - 功能: `f(args) { params => body }`
+
+4. **do-while 循环** (`ParseStmt.cpp`)
+    - 参考: `third_party/cangjie_compiler/src/Parse/ParseStmt.cpp`
+    - 实现: `src/parser/stmt.rs`
+    - 功能: `do { ... } while (cond)`
+
+**待补充（参考 cjc）:**
+5. **属性系统** (`ParseAnnotations.cpp`)
+    - 参考: `third_party/cangjie_compiler/src/Parse/ParseAnnotations.cpp`
+    - 实现: `src/parser/annotation.rs`（新建）
+
+6. **导入系统增强** (`ParseImports.cpp`)
+    - 参考: `third_party/cangjie_compiler/src/Parse/ParseImports.cpp`
+    - 增强: `src/parser/mod.rs` 中的 `parse_import`
+
+7. **Quote 宏** (`ParseQuote.cppugs`)
+    - 参考: `third_party/cangjie_compiler/src/Parse/ParseQuote.cpp`
+    - 实现: `src/parser/quote.rs`（新建）
 
 #### 2.3 低优先级（P2）- 高级特性
-- LSP 支持（`AST/Query.cpp`）
-- 增量编译（`IncrementalCompilation/`）
-- AST 缓存（`AST/Cache.cpp`）
+**已完成 ✅:**
+1. **并发原语** (spawn, synchronized)
+    - 实现: `src/parser/expr.rs`, `src/codegen/expr.rs`
+    - 功能: 单线程桩实现（直接同步执行）
+
+**待补充（参考 cjc）:**
+2. **LSP 支持**（`AST/Query.cpp`）
+3. **增量编译**（`IncrementalCompilation/`）
+4. **AST 缓存**（`AST/Cache.cpp`）
+5. **指针操作**（unsafe 指针）
+6. **MapLiteral 完整实现**（codegen 待实现）
 
 ### 阶段 3: 具体迁移流程（每个功能）
 

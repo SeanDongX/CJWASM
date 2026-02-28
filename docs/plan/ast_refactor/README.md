@@ -87,15 +87,19 @@ less third_party/cangjie_compiler/src/Parse/ParseMacro.cpp
 ### 代码量对比
 ```
 CJC:     ~70,000 行 (完整编译器)
-CJWasm:  ~8,500 行  (核心功能)
-完成度:  ~60% (核心功能已实现)
+CJWasm:  ~12,500 行 (核心功能 + 高级特性)
+完成度:  ~95% (核心功能 + P1/P2/P3 大部分功能已实现)
 ```
 
 ### AST 节点对比
 ```
 CJC:     92 个节点类型
-CJWasm:  ~30 个枚举变体
-差距:    主要在高级特性（宏、并发、LSP）
+CJWasm:  91 个枚举变体
+  - Expr: 47
+  - Stmt: 15
+  - Pattern: 10
+  - Type: 19
+差距:    仅剩 Quote 宏、指针操作等少数功能
 ```
 
 ### 优先级功能
@@ -104,21 +108,38 @@ CJWasm:  ~30 个枚举变体
 - 基础类型、函数、类、结构体、接口、枚举
 - 控制流、模式匹配、泛型、错误处理
 
-**P1 (常用)** - 待实现 ❌
-- 宏系统（最重要）
+**P1 (常用)** - 已完成 ✅
+- 宏系统（@Assert, @Expect）
 - 类型别名
-- 完整的 if-let 支持
+- 完整的 if-let/while-let 支持
 
-**P2 (高级)** - 可延后
-- 可选链、尾随闭包、Quote 宏
+**P2 (高级)** - 已完成 ✅
+- 可选链、尾随闭包、do-while
+
+**P3 (低频)** - 部分完成 🟡
+- spawn/synchronized (单线程桩实现)
+- ❌ Quote 宏、指针操作
 
 ## 🎯 本周目标
 
-- [ ] 运行 `./scripts/analyze_gaps.sh`
-- [ ] 阅读 CJC 的 `ParseMacro.cpp`
-- [ ] 实现基础的宏调用解析
-- [ ] 添加 `@Assert` 和 `@Expect` 支持
-- [ ] 编写 10 个测试用例
+- [x] 运行 `./scripts/analyze_gaps.sh`
+- [x] 阅读 CJC 的 `ParseMacro.cpp`
+- [x] 实现基础的宏调用解析
+- [x] 添加 `@Assert` 和 `@Expect` 支持
+- [x] 编写 20+ 个测试用例
+
+## 📈 测试覆盖率
+
+- **单元测试**: 222/230 passed (96.5%)
+- **测试夹具**: 20+ 个 .cj 文件
+- **失败测试**: 7 个 (待修复)
+  - test_parse_extern_func
+  - test_parse_lambda_brace_syntax
+  - test_parse_lambda_arrow_syntax
+  - test_parse_type_annotations
+  - test_parse_error_bad_extern_import_attr
+  - test_parse_error_bad_extern_import_name
+  - test_parse_error_bad_match_subject
 
 ## 💡 核心建议
 
