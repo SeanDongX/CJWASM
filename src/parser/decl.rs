@@ -148,7 +148,7 @@ impl Parser {
             };
 
             let extern_import = if self.check(&Token::At) {
-                if matches!(self.peek_next(), Some(Token::Ident(ref n)) if n == "Import") {
+                if matches!(self.peek_next(), Some(Token::Import)) {
                     Some(self.parse_import_attr()?)
                 } else {
                     self.skip_optional_attributes()?;
@@ -1268,7 +1268,10 @@ impl Parser {
             // 判断有无默认实现 { body } 或者纯签名（分号可选，cjc 兼容）
             let default_body = if self.check(&Token::LBrace) {
                 self.advance();
+                let prev_receiver = self.receiver_name.clone();
+                self.receiver_name = Some("this".to_string());
                 let body = self.parse_stmts()?;
+                self.receiver_name = prev_receiver;
                 self.expect(Token::RBrace)?;
                 Some(body)
             } else {

@@ -697,6 +697,7 @@ impl Parser {
                 }
             }
             Some(Token::CharLit(c)) => Ok(Expr::Rune(c)),
+            Some(Token::RuneLit(c)) => Ok(Expr::Rune(c)),
             Some(Token::True) => Ok(Expr::Bool(true)),
             Some(Token::False) => Ok(Expr::Bool(false)),
             Some(Token::StringLit(s)) | Some(Token::BacktickStringLit(s)) => {
@@ -1104,10 +1105,9 @@ impl Parser {
             }
             Some(Token::LParen) => {
                 // 检查是否是 Lambda: (x: T, ...): R { body } 或 (): R { body }
-                // 当前 token 是 (，空括号用 peek_next() 判断
-                if self.peek_next() == Some(&Token::RParen) {
+                // 当前 token 是 (，已被 advance() 消费
+                if self.peek() == Some(&Token::RParen) {
                     // (): R { body } 或空元组
-                    self.advance(); // consume (
                     self.advance(); // consume )
                     if self.check(&Token::Colon) {
                         return self.parse_lambda_rest(vec![]);
@@ -1115,16 +1115,16 @@ impl Parser {
                     // () 空元组
                     return Ok(Expr::Tuple(vec![]));
                 }
-                // 检查是否是 (ident : 开头的 Lambda；当前 token 是 (，用 peek_next/peek_at(2) 看括号内
+                // 检查是否是 (ident : 开头的 Lambda；当前已消费 (，用 peek/peek_at(1) 看括号内
                 // 支持两种形式: ( params ): R { body } 与 ( params ) => body（params 后直接 => 无 )）
-                if matches!(self.peek_next(), Some(Token::Ident(_)) | Some(Token::Underscore))
-                    && matches!(self.peek_at(2), Some(Token::Colon))
+                if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
+                    && matches!(self.peek_at(1), Some(Token::Colon))
                 {
-                    self.advance(); // 消费 (
                     let params = self.parse_lambda_params()?;
                     if self.check(&Token::FatArrow) {
                         // ( params ) => body — params 后直接 =>，无 )
                         self.advance();
+                        self.expect(Token::LBrace)?;
                         let body = self.parse_lambda_body()?;
                         return Ok(Expr::Lambda {
                             params,
@@ -1161,14 +1161,13 @@ impl Parser {
             Some(Token::LBrace) => {
                 // 检查是否是 Lambda: { x: T => body } 或 { x => body }（单参无类型）或 { a, b => body }（多参无类型）
                 // 也支持 { _: T, x: T => body }（第一个参数为通配符）
-                // 注意：当前 token 是 {，块内第一个 token 用 peek_next()，第二个用 peek_at(2)；仅当第二个 token 为 : , 或 => 时才按 lambda 解析，否则按块解析
-                let second = self.peek_at(2);
-                let is_lambda = matches!(self.peek_next(), Some(Token::Ident(_)) | Some(Token::Underscore))
+                // 注意：当前 { 已被 advance() 消费，用 peek() 看第一个 token，peek_at(1) 看第二个；仅当第二个 token 为 : , 或 => 时才按 lambda 解析，否则按块解析
+                let second = self.peek_at(1);
+                let is_lambda = matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
                     && matches!(second, Some(Token::Colon) | Some(Token::Comma) | Some(Token::FatArrow));
                 if is_lambda {
                     if matches!(second, Some(Token::Colon)) {
-                        // Lambda { x: T, y: T => body }；先消费 {，再解析参数
-                        self.advance(); // 消费 {
+                        // Lambda { x: T, y: T => body }；{ 已消费，解析参数
                         let params = self.parse_lambda_params()?;
                         self.expect(Token::FatArrow)?;
                         let body = self.parse_lambda_body()?;
@@ -1179,7 +1178,6 @@ impl Parser {
                         });
                     } else if matches!(second, Some(Token::Comma)) {
                         // 多参无类型 Lambda { a, b, c => body }
-                        self.advance(); // 消费 {
                         let mut params = Vec::new();
                         loop {
                             let name = match self.advance() {
@@ -1211,7 +1209,6 @@ impl Parser {
                         });
                     } else if matches!(second, Some(Token::FatArrow)) {
                         // 单参无类型 Lambda { name => body }
-                        self.advance(); // 消费 {
                         let name = self.advance_ident().expect("Ident");
                         self.advance(); // consume =>
                         let body = self.parse_lambda_body()?;
@@ -1450,8 +1447,9 @@ impl Parser {
                 if has_paren {
                     self.advance();
                 }
-                let expr = if self.check(&Token::LBrace) {
+                let expr = if self.check(&Token::LBrace) && self.peek_at(1) != Some(&Token::RBrace) {
                     // match { case ... } 无主体，视为 match (()) { ... }
+                    // 但 match {} 不是有效的无主体语法（空块应该是主体）
                     Box::new(Expr::Block(vec![], None))
                 } else {
                     Box::new(self.parse_match_subject()?)
@@ -1582,7 +1580,7 @@ impl Parser {
     }
 
     /// 解析 Lambda body（含结束的 `}`）并转为 Expr。
-    /// 调用前必须已消费 `=>`；始终使用 parse_stmts 支持多语句体（if/for/while 等开头）。
+    /// 调用前必须已消费 `=>` 和开头的 `{`；始终使用 parse_stmts 支持多语句体（if/for/while 等开头）。
     pub(crate) fn parse_lambda_body(&mut self) -> Result<Expr, ParseErrorAt> {
         let stmts = self.parse_stmts()?;
         self.expect(Token::RBrace)?;
@@ -1611,8 +1609,18 @@ impl Parser {
         }
         let return_type = Some(self.parse_type()?);
         self.expect(Token::LBrace)?;
-        let body = self.parse_expr()?;
+        let stmts = self.parse_stmts()?;
         self.expect(Token::RBrace)?;
+        let body = if let Some(Stmt::Expr(e)) = stmts.last() {
+            let len = stmts.len();
+            if len == 1 {
+                e.clone()
+            } else {
+                Expr::Block(stmts[..len - 1].to_vec(), Some(Box::new(e.clone())))
+            }
+        } else {
+            Expr::Block(stmts, None)
+        };
         Ok(Expr::Lambda {
             params,
             return_type,

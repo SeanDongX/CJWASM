@@ -536,6 +536,26 @@ pub enum Token {
     })]
     CharLit(char),
 
+    // Rune 字面量 r'.' (仓颉语法，支持转义)
+    #[regex(r"r'[^'\\]'|r'\\[ntr\\0']'", |lex| {
+        let s = lex.slice();
+        let inner = &s[2..s.len()-1]; // 去除 r' 和 '
+        if inner.starts_with('\\') {
+            match inner.chars().nth(1) {
+                Some('n') => Some('\n'),
+                Some('t') => Some('\t'),
+                Some('r') => Some('\r'),
+                Some('\\') => Some('\\'),
+                Some('0') => Some('\0'),
+                Some('\'') => Some('\''),
+                _ => None,
+            }
+        } else {
+            inner.chars().next()
+        }
+    })]
+    RuneLit(char),
+
     #[token("true")]
     True,
     #[token("false")]

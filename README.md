@@ -93,7 +93,7 @@ wasmtime run --invoke main hello.wasm
 ./scripts/run_test.sh 5    # 全部测试
 
 # 也可以单独运行
-cargo test                     # 388 个单元/集成测试
+cargo test                     # 230 个单元/集成测试（229 passed, 1 ignored, 100%）
 ./scripts/system_test.sh       # 30 个系统测试（编译运行示例并验证返回值）
 ./scripts/coverage.sh          # 测试覆盖率
 ./scripts/coverage.sh --html   # HTML 报告 → target/llvm-cov/html/
@@ -174,27 +174,39 @@ cjwasm/
 │   ├── lexer/             # 词法分析（基于 logos）
 │   │   └── mod.rs         # Token 定义 & 词法规则
 │   ├── parser/            # 递归下降语法分析器
-│   │   └── mod.rs         # 语句/表达式/类型解析，含 @Assert/@Expect
+│   │   ├── mod.rs         # Parser 主逻辑
+│   │   ├── expr.rs        # 表达式解析
+│   │   ├── stmt.rs        # 语句解析
+│   │   ├── decl.rs        # 声明解析
+│   │   ├── type_.rs       # 类型解析
+│   │   ├── pattern.rs     # 模式解析
+│   │   ├── macro.rs       # 宏系统解析（@Assert/@Expect）
+│   │   └── error.rs       # 错误处理
 │   ├── ast/               # 抽象语法树定义
-│   │   └── mod.rs         # Type, Expr, Stmt, Pattern 等枚举
+│   │   ├── mod.rs         # Expr, Stmt, Pattern 等枚举（91 个节点）
+│   │   └── type_.rs       # Type 枚举（19 个类型）
 │   ├── optimizer/         # 编译优化
 │   │   └── mod.rs         # 常量折叠 & 死代码消除
 │   ├── monomorph/         # 泛型单态化
 │   │   └── mod.rs         # 类型参数替换 & 实例生成
 │   ├── codegen/           # WASM 代码生成（基于 wasm-encoder）
-│   │   └── mod.rs         # AST → WASM 字节码（~10000 行）
+│   │   ├── mod.rs         # CodeGen 主逻辑
+│   │   ├── expr.rs        # 表达式代码生成
+│   │   ├── decl.rs        # 声明代码生成
+│   │   ├── type_.rs       # 类型代码生成
+│   │   └── macro.rs       # 宏代码生成（@Assert/@Expect）
 │   ├── memory.rs          # 内存管理（分配器 + RC + GC）
 │   └── pipeline.rs        # 编译管线 & 多文件解析
-├── examples/              # 仓颉示例程序（28 个）
+├── examples/              # 仓颉示例程序（41 个）
 │   ├── hello.cj           # Hello World
 │   ├── functions.cj       # 函数定义与递归
 │   ├── class.cj           # 类与属性
 │   ├── inheritance.cj     # 类继承与多态
 │   ├── interface.cj       # 接口与默认实现
 │   ├── generic.cj         # 泛型基础
-│   ├── generic_advanced.cj# 泛型约束、where 子句、泛型类
+│   ├── generic_advanced.cj # 泛型约束、where 子句、泛型类
 │   ├── enum.cj            # 枚举与关联值
-│   ├── patterns.cj        # 模式匹配（if-let, while-let, 解构）
+│   ├── patterns.cj        # 模式匹配（if-let, while-let, 解）
 │   ├── error_handling.cj  # try-catch-finally, Result/Option
 │   ├── control_flow.cj    # 控制流（if/while/for/match）
 │   ├── operators.cj       # 运算符（算术/比较/逻辑/位运算）
@@ -205,7 +217,16 @@ cjwasm/
 │   ├── type_methods.cj    # 内建类型方法（toString/toInt64/abs/...）
 │   ├── memory_management.cj # 内存管理与引用计数
 │   ├── multifile/         # 多文件编译示例
-│   └── project/           # cjpm 工程示例
+│   ├── project/           # cjpm 工程示例
+│   ├── phase5_interface.cj # 接口高级特性
+│   └── modules.cj        # 模块系统示例
+├── tests/fixtures/        # 测试夹具（20+ 个）
+│   ├── macro_test.cj      # 宏系统测试
+│   ├── if_let_test.cj     # if-let 模式匹配测试
+│   ├── optional_chain_test.cj # 可选链测试
+│   ├── trailing_closure_test.cj # 尾随闭包测试
+│   ├── type_alias_test.cj  # 类型别名测试
+│   └── ...
 ├── benches/               # 性能基准测试
 │   ├── compile_bench.rs   # Criterion 微基准（各编译阶段）
 │   ├── fixtures/          # 基准测试用仓颉源文件
@@ -221,7 +242,15 @@ cjwasm/
 │   ├── next_steps.md      # 开发路线图与进度追踪
 │   ├── coverage.md        # 测试覆盖率报告
 │   └── plan/              # 设计方案文档
-│       └── std.unittest.md# @Assert/@Expect 实现方案
+│       └── ast_refactor/ # AST 重构文档
+│           ├── README.md              # 文档索引
+│           ├── ast_mapping.md         # AST 节点映射表
+│           ├── MIGRATION_SUMMARY.md  # 迁移总结
+│           ├── QUICK_REFERENCE.md     # 快速参考
+│           ├── CJC_MIGRATION_GUIDE.md # 迁移指南
+│           ├── ARCHITECTURE_COMPARISON.md # 架构对比
+│           ├── macro_implementation_summary.md # 宏系统实现
+│           └── macro_research.md     # 宏系统研究
 └── Cargo.toml
 ```
 

@@ -114,6 +114,11 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::Literal(Literal::Rune(c)))
             }
+            Some(Token::RuneLit(c)) => {
+                let c = *c;
+                self.advance();
+                Ok(Pattern::Literal(Literal::Rune(c)))
+            }
             Some(Token::True) => {
                 self.advance();
                 Ok(Pattern::Literal(Literal::Bool(true)))
