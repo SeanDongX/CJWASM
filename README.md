@@ -452,4 +452,4 @@ brew install wabt        # 提供 wasm2wat
 
 ## License
 
-MIT
+Apache 2.0
