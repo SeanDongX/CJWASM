@@ -1,7 +1,7 @@
 //! 语句解析：parse_stmt、parse_stmts、parse_stmts_until_case_or_rbrace、assign_target_to_expr、expr_to_assign_target。
 
 use super::{ParseError, ParseErrorAt, Parser};
-use crate::ast::{AssignTarget, BinOp, Expr, Pattern, Stmt, Visibility};
+use crate::ast::{AssignTarget, BinOp, Expr, Pattern, Stmt, Type, Visibility};
 use crate::lexer::Token;
 
 impl Parser {
@@ -146,8 +146,20 @@ impl Parser {
                 } else {
                     None
                 };
-                self.expect(Token::Assign)?;
-                let value = self.parse_expr()?;
+                // 支持无初始化的 let 声明: let x: Type（延迟赋值，常见于 try 块前）
+                let value = if self.check(&Token::Assign) {
+                    self.advance();
+                    self.parse_expr()?
+                } else {
+                    if let Some(ref t) = ty {
+                        self.default_value_for_type(t)
+                    } else {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::Assign),
+                            "类型注解或初始化值".to_string(),
+                        ));
+                    }
+                };
                 Ok(Stmt::Let { pattern, ty, value })
             }
             Some(Token::Var) => {
@@ -171,8 +183,21 @@ impl Parser {
                 } else {
                     None
                 };
-                self.expect(Token::Assign)?;
-                let value = self.parse_expr()?;
+                // 支持无初始化的变量声明: var x: Int64
+                let value = if self.check(&Token::Assign) {
+                    self.advance();
+                    self.parse_expr()?
+                } else {
+                    // 无初始化值，使用类型的默认值
+                    if let Some(ref t) = ty {
+                        self.default_value_for_type(t)
+                    } else {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::Assign),
+                            "类型注解或初始化值".to_string(),
+                        ));
+                    }
+                };
                 Ok(Stmt::Var { pattern, ty, value })
             }
             Some(Token::Return) => {
@@ -271,6 +296,9 @@ impl Parser {
                 } else {
                     let v = match self.advance() {
                         Some(Token::Ident(name)) => name,
+                        Some(Token::Underscore) => "_".to_string(),
+                        // 允许关键字作为循环变量名（如 `loop`）
+                        Some(Token::Loop) => "loop".to_string(),
                         Some(tok) => {
                             return self
                                 .bail(ParseError::UnexpectedToken(tok, "循环变量名".to_string()))
@@ -281,6 +309,11 @@ impl Parser {
                 };
                 self.expect(Token::In)?;
                 let iterable = self.parse_for_iterable()?;
+                // cjc: for (x in iter where cond) { ... } — 跳过 where 过滤子句
+                if self.check(&Token::Where) {
+                    self.advance();
+                    self.parse_expr()?; // 解析并丢弃 where 条件
+                }
                 if has_paren {
                     self.expect(Token::RParen)?;
                 }
@@ -484,6 +517,10 @@ impl Parser {
                     index: index.clone(),
                 }
             }
+            AssignTarget::ExprIndex { expr, index } => Expr::Index {
+                array: expr.clone(),
+                index: index.clone(),
+            },
             AssignTarget::Tuple(targets) => {
                 let elts = targets
                     .iter()
@@ -491,6 +528,9 @@ impl Parser {
                     .collect();
                 Expr::Tuple(elts)
             }
+            AssignTarget::SuperField { field } => Expr::SuperFieldAccess {
+                field: field.clone(),
+            },
         }
     }
 
@@ -522,10 +562,19 @@ impl Parser {
                             current = *o;
                         }
                         _ => {
-                            return self.bail(ParseError::UnexpectedToken(
-                                Token::Assign,
-                                "简单数组访问".to_string(),
-                            ))
+                            // 复杂表达式（如方法调用）作为数组
+                            // 重建表达式路径
+                            let mut expr = current;
+                            for field in path.iter().rev() {
+                                expr = Expr::Field {
+                                    object: Box::new(expr),
+                                    field: field.clone(),
+                                };
+                            }
+                            return Ok(AssignTarget::ExprIndex {
+                                expr: Box::new(expr),
+                                index,
+                            });
                         }
                     }
                 }
@@ -572,12 +621,79 @@ impl Parser {
                 }
                 Ok(AssignTarget::Tuple(targets))
             }
+            Expr::Index { array, index } => {
+                // 支持数组索引赋值: arr[i] = value 或 obj.field[i] = value
+                match *array {
+                    Expr::Var(name) => Ok(AssignTarget::Index {
+                        array: name,
+                        index,
+                    }),
+                    Expr::Field { object, field } => {
+                        // obj.field[i] = value
+                        let mut path = vec![field];
+                        let mut current = *object;
+                        loop {
+                            match current {
+                                Expr::Var(name) => {
+                                    path.reverse();
+                                    return Ok(AssignTarget::IndexPath {
+                                        base: name,
+                                        fields: path,
+                                        index,
+                                    });
+                                }
+                                Expr::Field {
+                                    object: o,
+                                    field: f,
+                                } => {
+                                    path.push(f);
+                                    current = *o;
+                                }
+                                _ => {
+                                    return self.bail(ParseError::UnexpectedToken(
+                                        Token::Assign,
+                                        "简单字段访问".to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Assign,
+                            "简单数组访问".to_string(),
+                        ))
+                    }
+                }
+            }
+            Expr::SuperFieldAccess { field } => {
+                // super.field = value
+                Ok(AssignTarget::SuperField { field })
+            }
             _ => {
                 return self.bail(ParseError::UnexpectedToken(
                     Token::Assign,
                     "可赋值的目标".to_string(),
                 ))
             }
+        }
+    }
+
+    /// 为类型生成默认值表达式
+    fn default_value_for_type(&self, ty: &Type) -> Expr {
+        match ty {
+            Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8 | Type::IntNative => {
+                Expr::Integer(0)
+            }
+            Type::UInt64 | Type::UInt32 | Type::UInt16 | Type::UInt8 | Type::UIntNative => {
+                Expr::Integer(0)
+            }
+            Type::Float64 => Expr::Float(0.0),
+            Type::Float32 => Expr::Float32(0.0),
+            Type::Bool => Expr::Bool(false),
+            Type::String => Expr::String(String::new()),
+            Type::Rune => Expr::Rune('\0'),
+            _ => Expr::Integer(0), // 其他类型默认为0
         }
     }
 }

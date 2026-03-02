@@ -15,9 +15,9 @@
 | | ✅ 完整 | ⚠️ 部分 | ❌ 不支持 | — 不适用 |
 |------|:------:|:------:|:--------:|:-------:|
 | cjc | 111 | 3 | 3 | 3 |
-| cjwasm | 88 | 6 | 26 | — |
+| cjwasm | 88 | 7 | 25 | — |
 
-**cjwasm 对 cjc 覆盖率**：cjc 共 114 项特性（✅+⚠️），cjwasm 覆盖 **88 项（77.2%）**，其中完整覆盖 82 项、部分/桩覆盖 6 项、未覆盖 26 项（主要为 WASM 沙箱限制或宏/FFI/反射等重量级特性）。
+**cjwasm 对 cjc 覆盖率**：cjc 共 114 项特性（✅+⚠️），cjwasm 覆盖 **89 项（78.1%）**，其中完整覆盖 82 项、部分/桩覆盖 7 项、未覆盖 25 项（主要为 WASM 沙箱限制或宏/FFI/反射等重量级特性）。
 
 
 | 分类 | 特性 | cjc | cjwasm | 备注 |
@@ -128,7 +128,7 @@
 | **WASM/WASI** | WASI (fd_write/clock/random/...) | — | ✅ | cjwasm 特有 |
 | | extern func + @import/@export | — | ✅ | cjwasm 特有 |
 | **宏系统** | macro func / quote(...) | ✅ | ❌ | cjc: MacroDecl + MacroExpansion |
-| | 条件编译 (@When) | ✅ | ❌ | cjc: AnnotationKind::WHEN |
+| | 条件编译 (@When) | ✅ | ⚠️ | cjwasm 解析 @When[os=="Windows"] 并跳过次声明（部分支持） |
 | **注解** | @Deprecated | ✅ | ❌ | cjc: Attribute::DEPRECATED |
 | | @Frozen | ✅ | ❌ | cjc: AnnotationKind::FROZEN |
 | | 自定义注解 (@Annotation) | ✅ | ❌ | cjc: AnnotationKind::ANNOTATION |
@@ -407,7 +407,7 @@ synchronized(lock) {
 | 类型检查 (is) | [x] |
 | spawn 块（单线程桩） | [x] |
 | synchronized 块（单线程桩） | [x] |
-| 可选链 (obj?.field) | [ ] |
+| 可选链 (obj?.field) | [x] |
 | 三元运算符 | [ ] |
 
 ---
@@ -1278,9 +1278,9 @@ r.step    // 1 (默认)
 
 *未完成特性的完整实施计划见 [docs/next_steps.md](next_steps.md)。*
 
-### 15.1 当前版本: v1.0.0
+### 15.1 当前版本: v1.1.0
 
-v1.0.0 完成了 P3 面向对象扩展、P4 集合框架补全、P5 并发桩实现。36/36 系统测试通过，388 单元测试通过。详见 [next_steps.md](next_steps.md)。
+v1.1.0 修复了 HashMap/HashSet 类型推断问题，新增类型强制转换层，改进了全局变量类型推断。37/37 系统测试通过，410 单元测试通过。
 
 #### 已完成功能
 
@@ -1448,6 +1448,27 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 - [x] Mutex / ReentrantMutex（lock, unlock, tryLock — 空操作）
 - [x] `now()` 纳秒时间戳（基于 WASI clock_time_get）
 
+#### v1.1.0 新增完成功能 (2026-03)
+
+**类型推断与代码生成修复**
+
+- [x] **方法返回类型推断完善**：`builtin_method_return_type` 扩展，正确处理 `Option<T>`（getOrThrow/getOrDefault/isNone/isSome）和 `Map<K,V>`（get/remove/put/containsKey/contains/size）方法返回类型
+- [x] **类型强制转换层**：新增 `compile_expr_with_coercion`，自动插入 i32/i64/f32/f64 类型强制转换（I64ExtendI32S、I32WrapI64、F64PromoteF32 等），消除赋值/初始化中的 WASM 类型不匹配
+- [x] **`containsKey`/`contains` 返回类型修复**：`__hashmap_contains` 返回 i32 (Bool)，移除错误的 `I64ExtendI32S` 指令，修复 HashMap 和 HashSet 布尔判断
+- [x] **`Map.get`/`Map.remove` 返回类型修复**：运行时直接返回值（i64），而非 Option 指针，类型推断与 WASM ABI 对齐
+- [x] **全局变量类型推断**：`get_object_type` 对全局 `let`/`const` 变量懒加载 init 表达式类型推导，解决全局变量方法调用类型失配
+- [x] **方法未找到哨兵值**：`resolve_method_index` 返回 `u32::MAX`，调用方根据期望返回类型选择正确零值（i32 const 0 或 i64 const 0），避免因未实现方法引起 WASM 验证错误
+- [x] **`@When` 条件编译（部分）**：解析 `@When[os == "Windows"]` 注解，跳过紧跟的下一条声明，避免平台特定代码引起编译错误
+
+**测试覆盖提升**
+
+- 系统测试：**37/37（100%）**（新增 p6_new_features.cj、p7_std_features.cj 等验证）
+- 单元测试：**410 项全部通过**
+
+**已知遗留限制**
+
+- `std/` 包 `function[66]`（`SPECIAL_UNICODE_MAP`）WASM 验证错误：复杂嵌套泛型类型 `Map<UInt32, Tuple<Array<UInt32>, Array<UInt32>, Array<UInt32>>>` 的元组索引类型推断失败，生成无效 WASM（单文件示例不受影响）
+
 #### 未来版本计划
 
 - [x] Phase 7: WASI + 标准库（fd_write/fd_read/fd_close/args_get/clock_time_get/random_get, std.core/io/collections）
@@ -1519,7 +1540,7 @@ while     with
 | 分类 | 特性 | cjc 证据 | 不支持原因 |
 |------|------|---------|-----------|
 | 宏系统 | macro func / quote(...) | MacroDecl + MacroExpansion | 编译期代码生成，复杂度极高 |
-| 宏系统 | 条件编译 (@When) | AnnotationKind::WHEN | 需完整注解系统 |
+| 宏系统 | 条件编译 (@When) | AnnotationKind::WHEN | ⚠️ 部分：解析 @When[os=="Windows"] 跳过次声明；通用条件编译不支持 |
 | C 互操作 | foreign / CPointer / CString | TokenKind::FOREIGN, CStringTy | WASM 沙箱无法链接 C 库 |
 | C 互操作 | unsafe 块 | Block.unsafePos | WASM 沙箱天然安全 |
 | 注解 | @Deprecated / @Frozen / 自定义 | Attribute::DEPRECATED 等 | 优先级低，需宏系统 |
@@ -1552,7 +1573,7 @@ while     with
 
 ---
 
-*文档版本: 6.0.0*
-*最后更新: 2026-02-16*
-*变更: 基于 cjc release/1.0 源码逐项验证，重写特性对比表*
-*修正: Result(cjc无) / 引用计数(cjc无) / ArrayStack(cjc无) / Autodiff(cjc仅schema) / 泛型特化(cjc仅extend) / 补充 std.fs/regex/crypto/database/ffi.python/deriving*
+*文档版本: 7.0.0*
+*最后更新: 2026-03-02*
+*变更: 更新 v1.1.0 实现状态（HashMap/HashSet 类型修复、类型强制转换层、@When 部分支持、37/37 测试通过）*
+*历史: v6.0.0 基于 cjc release/1.0 源码逐项验证，重写特性对比表；修正 Result/引用计数/ArrayStack/Autodiff/泛型特化/std.fs 等*

@@ -14,7 +14,7 @@ import std.sort
 import std.ref
 import std.unicode
 
-func main(): Int64 {
+main(): Int64 {
     api_std_io_used()
     api_std_binary_used()
     api_std_console_used()

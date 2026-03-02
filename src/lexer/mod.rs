@@ -267,7 +267,9 @@ fn lex_backtick_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, V
 }
 
 /// 词法分析入口：反引号字符串
-fn lex_any_backtick_string(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<StringOrInterpolated, ()> {
+fn lex_any_backtick_string(
+    lex: &mut logos::Lexer<Token>,
+) -> logos::FilterResult<StringOrInterpolated, ()> {
     match lex_backtick_string(lex) {
         Some(Ok(s)) => logos::FilterResult::Emit(StringOrInterpolated::Plain(s)),
         Some(Err(parts)) => logos::FilterResult::Emit(StringOrInterpolated::Interpolated(parts)),
@@ -292,8 +294,8 @@ pub enum StringOrInterpolated {
 }
 
 #[derive(Logos, Debug, PartialEq, Clone)]
-#[logos(skip r"[ \t\r\n]+")]  // 跳过空白
-#[logos(skip r"//[^\n]*")]    // 跳过单行注释
+#[logos(skip r"[ \t\r\n]+")] // 跳过空白
+#[logos(skip r"//[^\n]*")] // 跳过单行注释
 pub enum Token {
     // 块注释 /* ... */（在 next() 中过滤不发射，与 vendor 版权头兼容）
     #[regex(r"/\*(?:[^*]|\*+[^*/])*\*/")]
@@ -483,13 +485,13 @@ pub enum Token {
     TypeTuple,
     #[token("Range")]
     TypeRange,
-    #[token("Option")]
+    #[token("Option", priority = 1)]
     TypeOption,
-    #[token("Result")]
+    #[token("Result", priority = 1)]
     TypeResult,
-    #[token("Slice")]
+    #[token("Slice", priority = 1)]
     TypeSlice,
-    #[token("Map")]
+    #[token("Map", priority = 1)]
     TypeMap,
 
     // 字面量（Float64：小数或科学计数法；Float32 后缀 f；整型）
@@ -515,6 +517,26 @@ pub enum Token {
         else { s.parse::<i64>().ok() }
     })]
     Integer(i64),
+
+    // 字节字面量 b'x' (Cangjie 语法，支持转义)
+    #[regex(r"b'[^'\\]'|b'\\[ntr\\0']'", |lex| {
+        let s = lex.slice();
+        let inner = &s[2..s.len()-1]; // 去除 b' 和 '
+        if inner.starts_with('\\') {
+            match inner.chars().nth(1) {
+                Some('n') => Some(b'\n'),
+                Some('t') => Some(b'\t'),
+                Some('r') => Some(b'\r'),
+                Some('\\') => Some(b'\\'),
+                Some('0') => Some(b'0'),
+                Some('\'') => Some(b'\''),
+                _ => None,
+            }
+        } else {
+            inner.chars().next().map(|c| c as u8)
+        }
+    })]
+    ByteLit(u8),
 
     // 字符字面量 'a' (支持转义 '\n' '\t' '\\' '\'' '\0')
     #[regex(r"'[^'\\]'|'\\[ntr\\0']'", |lex| {
@@ -731,12 +753,14 @@ impl<'a> Iterator for Lexer<'a> {
             let token = self.inner.next()?;
             let span = self.inner.span();
             match token {
-                Ok(Token::BlockComment) => continue,  // 跳过块注释
+                Ok(Token::BlockComment) => continue, // 跳过块注释
                 Ok(tok) => return Some(Ok((span.start, tok, span.end))),
-                Err(_) => return Some(Err(format!(
-                    "未知字符: '{}'",
-                    &self.inner.source()[span.start..span.end]
-                ))),
+                Err(_) => {
+                    return Some(Err(format!(
+                        "未知字符: '{}'",
+                        &self.inner.source()[span.start..span.end]
+                    )))
+                }
             }
         }
     }
@@ -762,7 +786,10 @@ mod tests {
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 
-        assert_eq!(tokens[3], Token::StringLit(StringOrInterpolated::Plain("hello world".to_string())));
+        assert_eq!(
+            tokens[3],
+            Token::StringLit(StringOrInterpolated::Plain("hello world".to_string()))
+        );
     }
 
     #[test]
@@ -872,7 +899,10 @@ mod tests {
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 
-        assert_eq!(tokens[3], Token::MultiLineStringLit("hello\nworld".to_string()));
+        assert_eq!(
+            tokens[3],
+            Token::MultiLineStringLit("hello\nworld".to_string())
+        );
     }
 
     #[test]
@@ -881,7 +911,10 @@ mod tests {
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 
-        assert_eq!(tokens[3], Token::MultiLineStringLit("hello world".to_string()));
+        assert_eq!(
+            tokens[3],
+            Token::MultiLineStringLit("hello world".to_string())
+        );
     }
 
     #[test]
@@ -908,7 +941,10 @@ mod tests {
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 
         // \$ should be escaped to $, so this is a plain string
-        assert_eq!(tokens[3], Token::StringLit(StringOrInterpolated::Plain("Price: $100".to_string())));
+        assert_eq!(
+            tokens[3],
+            Token::StringLit(StringOrInterpolated::Plain("Price: $100".to_string()))
+        );
     }
 
     #[test]
@@ -1015,7 +1051,8 @@ mod tests {
 
     #[test]
     fn test_lexer_keyword_tokens() {
-        let source = "package import as is open abstract sealed override extend interface prop foreign";
+        let source =
+            "package import as is open abstract sealed override extend interface prop foreign";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(tokens[0], Token::Package);

@@ -1,6 +1,6 @@
 use crate::ast::Expr;
 use crate::codegen::CodeGen;
-use wasm_encoder::{Function as WasmFunc, Instruction, BlockType};
+use wasm_encoder::{BlockType, Function as WasmFunc, Instruction};
 
 // LocalsBuilder 的简化类型别名
 type LocalsBuilder = crate::codegen::LocalsBuilder;
@@ -36,7 +36,8 @@ impl CodeGen {
                 // 调用 panic 函数
                 if let Some(&panic_idx) = self.func_indices.get("__panic") {
                     // 传递错误消息 "Assertion failed"
-                    let msg_offset = self.string_pool
+                    let msg_offset = self
+                        .string_pool
                         .iter()
                         .find(|(s, _)| s == "Assertion failed")
                         .map(|(_, off)| *off)
@@ -66,7 +67,8 @@ impl CodeGen {
                 func.instruction(&Instruction::If(BlockType::Empty));
 
                 if let Some(&panic_idx) = self.func_indices.get("__panic") {
-                    let msg_offset = self.string_pool
+                    let msg_offset = self
+                        .string_pool
                         .iter()
                         .find(|(s, _)| s == "Expectation failed")
                         .map(|(_, off)| *off)
@@ -90,7 +92,8 @@ impl CodeGen {
             "sourceFile" => {
                 // 返回文件名字符串
                 let filename = "unknown.cj"; // TODO: 从编译上下文获取
-                let offset = self.string_pool
+                let offset = self
+                    .string_pool
                     .iter()
                     .find(|(s, _)| s == filename)
                     .map(|(_, off)| *off)
@@ -107,7 +110,8 @@ impl CodeGen {
             // @sourcePackage - 返回当前包名
             "sourcePackage" => {
                 let package = "main"; // TODO: 从编译上下文获取
-                let offset = self.string_pool
+                let offset = self
+                    .string_pool
                     .iter()
                     .find(|(s, _)| s == package)
                     .map(|(_, off)| *off)

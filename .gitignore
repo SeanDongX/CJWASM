@@ -1,11 +1,14 @@
-/target
+target/
 *.wasm
 *.cjo
 .DS_Store
 Cargo.lock
 main
+.opencode
+*.lock
+*.errlog
+*.outlog
 
-# 基准测试报告
-/target/bench_reports/
-/target/criterion/
+.bin-cache
+.cjpm-history
 

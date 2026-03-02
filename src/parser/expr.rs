@@ -322,23 +322,45 @@ impl Parser {
             match self.peek() {
                 Some(Token::LBracket) => {
                     self.advance();
-                    let first = self.parse_expr()?;
+                    // 支持 arr[..end] 语法（从开头到 end）
                     if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
-                        let _inclusive = self.check(&Token::DotDotEq);
-                        self.advance();
-                        let end = self.parse_expr()?;
+                        self.advance(); // consume .. or ..=
+                                        // 支持 arr[..] 语法（整个数组）
+                        let end = if self.check(&Token::RBracket) {
+                            Expr::Integer(i64::MAX)
+                        } else {
+                            self.parse_expr()?
+                        };
                         self.expect(Token::RBracket)?;
                         expr = Expr::SliceExpr {
                             array: Box::new(expr),
-                            start: Box::new(first),
+                            start: Box::new(Expr::Integer(0)),
                             end: Box::new(end),
                         };
                     } else {
-                        self.expect(Token::RBracket)?;
-                        expr = Expr::Index {
-                            array: Box::new(expr),
-                            index: Box::new(first),
-                        };
+                        let first = self.parse_expr()?;
+                        if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
+                            self.advance(); // consume .. or ..=
+                                            // 支持 arr[start..] 语法（从 start 到结尾）
+                            let end = if self.check(&Token::RBracket) {
+                                // arr[start..] - 到数组末尾
+                                Expr::Integer(i64::MAX) // 使用最大值表示到末尾
+                            } else {
+                                self.parse_expr()?
+                            };
+                            self.expect(Token::RBracket)?;
+                            expr = Expr::SliceExpr {
+                                array: Box::new(expr),
+                                start: Box::new(first),
+                                end: Box::new(end),
+                            };
+                        } else {
+                            self.expect(Token::RBracket)?;
+                            expr = Expr::Index {
+                                array: Box::new(expr),
+                                index: Box::new(first),
+                            };
+                        }
                     }
                 }
                 // P6: 可选链 obj?.field / obj?.method()
@@ -363,6 +385,7 @@ impl Parser {
                             method: field,
                             args,
                             named_args,
+                            type_args: None,
                         };
                     } else {
                         expr = Expr::OptionalChain {
@@ -397,6 +420,7 @@ impl Parser {
                         None => return self.bail(ParseError::UnexpectedEof),
                     };
 
+                    // 检查是否是方法调用
                     if self.check(&Token::LParen) {
                         // 方法调用 obj.method(args)
                         self.advance();
@@ -407,7 +431,37 @@ impl Parser {
                             method: name,
                             args,
                             named_args,
+                            type_args: None,
                         };
+                    } else if self.check(&Token::Lt) && self.looks_like_generic_method_call() {
+                        // 泛型方法调用 obj.method<T>(args)
+                        // 只有当 < 后面看起来像类型参数时才解析
+                        self.advance();
+                        let mut types = vec![self.parse_type()?];
+                        while self.check(&Token::Comma) {
+                            self.advance();
+                            types.push(self.parse_type()?);
+                        }
+                        self.expect(Token::Gt)?;
+
+                        // 泛型参数后面必须跟 (
+                        if self.check(&Token::LParen) {
+                            self.advance();
+                            let (args, named_args) = self.parse_args()?;
+                            self.expect(Token::RParen)?;
+                            expr = Expr::MethodCall {
+                                object: Box::new(expr),
+                                method: name,
+                                args,
+                                named_args,
+                                type_args: Some(types),
+                            };
+                        } else {
+                            return self.bail(ParseError::UnexpectedToken(
+                                self.peek().cloned().unwrap_or(Token::Semicolon),
+                                "( after generic type arguments".to_string(),
+                            ));
+                        }
                     } else {
                         // 字段访问 obj.field
                         expr = Expr::Field {
@@ -439,6 +493,7 @@ impl Parser {
                 }
                 // P6: Trailing closure — f(args) { params => body } 或 expr.method { params => body }
                 // 支持 Call、MethodCall、Field（如 .any { x => ... }），以及 Var（如 map { x => f(x) }）
+                // 也支持 ConstructorCall（如 Array(n) { i => ... }）
                 Some(Token::LBrace)
                     if matches!(
                         &expr,
@@ -446,6 +501,7 @@ impl Parser {
                             | Expr::MethodCall { .. }
                             | Expr::Field { .. }
                             | Expr::Var(_)
+                            | Expr::ConstructorCall { .. }
                     ) =>
                 {
                     // Peek ahead to check if this looks like a lambda: { ident => ... } or { => ... }
@@ -475,7 +531,10 @@ impl Parser {
                                     Some(Token::Ident(n)) => n,
                                     Some(Token::Underscore) => "_".to_string(),
                                     Some(tok) => {
-                                        return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
+                                        return self.bail(ParseError::UnexpectedToken(
+                                            tok,
+                                            "参数名".to_string(),
+                                        ));
                                     }
                                     None => return self.bail(ParseError::UnexpectedEof),
                                 };
@@ -530,6 +589,7 @@ impl Parser {
                                 method,
                                 args,
                                 named_args: _,
+                                type_args,
                             } => {
                                 let mut all_args = args;
                                 all_args.push(closure);
@@ -538,13 +598,18 @@ impl Parser {
                                     method,
                                     args: all_args,
                                     named_args: vec![],
+                                    type_args,
                                 }
                             }
-                            Expr::Field { object: obj, field: method_name } => Expr::MethodCall {
+                            Expr::Field {
+                                object: obj,
+                                field: method_name,
+                            } => Expr::MethodCall {
                                 object: obj,
                                 method: method_name,
                                 args: vec![closure],
                                 named_args: vec![],
+                                type_args: None,
                             },
                             Expr::Var(func_name) => Expr::Call {
                                 name: func_name,
@@ -552,6 +617,21 @@ impl Parser {
                                 args: vec![closure],
                                 named_args: vec![],
                             },
+                            Expr::ConstructorCall {
+                                name,
+                                type_args,
+                                args,
+                                named_args: _,
+                            } => {
+                                let mut all_args = args;
+                                all_args.push(closure);
+                                Expr::ConstructorCall {
+                                    name,
+                                    type_args,
+                                    args: all_args,
+                                    named_args: vec![],
+                                }
+                            }
                             _ => unreachable!(),
                         };
                     } else {
@@ -635,7 +715,16 @@ impl Parser {
                 if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                     let inclusive = self.check(&Token::DotDotEq);
                     self.advance();
-                    let end = self.parse_primary()?;
+                    // 支持开放式范围 2.. (没有结束值)
+                    let end = if self.check(&Token::RBracket)
+                        || self.check(&Token::RParen)
+                        || self.check(&Token::Comma)
+                    {
+                        // 2.. 后面是 ] 或 ) 或 , 说明是开放式范围
+                        Box::new(Expr::Integer(i64::MAX))
+                    } else {
+                        Box::new(self.parse_primary()?)
+                    };
                     // P2.6: 可选步长 `: step`
                     let step = if self.check(&Token::Colon) {
                         self.advance();
@@ -645,7 +734,7 @@ impl Parser {
                     };
                     return Ok(Expr::Range {
                         start: Box::new(Expr::Integer(n)),
-                        end: Box::new(end),
+                        end,
                         inclusive,
                         step,
                     });
@@ -673,22 +762,32 @@ impl Parser {
                     })
                 } else if self.check(&Token::Dot) {
                     self.advance();
-                    let method = match self.advance() {
+                    let field_or_method = match self.advance() {
                         Some(Token::Ident(m)) => m,
                         Some(tok) => {
-                            return self
-                                .bail(ParseError::UnexpectedToken(tok, "方法名".to_string()))
+                            return self.bail(ParseError::UnexpectedToken(
+                                tok,
+                                "字段名或方法名".to_string(),
+                            ))
                         }
                         None => return self.bail(ParseError::UnexpectedEof),
                     };
-                    self.expect(Token::LParen)?;
-                    let (args, named_args) = self.parse_args()?;
-                    self.expect(Token::RParen)?;
-                    Ok(Expr::SuperCall {
-                        method,
-                        args,
-                        named_args,
-                    })
+                    // 检查是否为方法调用 super.method(...) 或字段访问 super.field
+                    if self.check(&Token::LParen) {
+                        self.advance();
+                        let (args, named_args) = self.parse_args()?;
+                        self.expect(Token::RParen)?;
+                        Ok(Expr::SuperCall {
+                            method: field_or_method,
+                            args,
+                            named_args,
+                        })
+                    } else {
+                        // super.field 字段访问 - 转换为 Expr::SuperFieldAccess
+                        Ok(Expr::SuperFieldAccess {
+                            field: field_or_method,
+                        })
+                    }
                 } else {
                     self.bail(ParseError::UnexpectedToken(
                         self.peek().cloned().unwrap_or(Token::Dot),
@@ -696,6 +795,7 @@ impl Parser {
                     ))
                 }
             }
+            Some(Token::ByteLit(b)) => Ok(Expr::Integer(b as i64)),
             Some(Token::CharLit(c)) => Ok(Expr::Rune(c)),
             Some(Token::RuneLit(c)) => Ok(Expr::Rune(c)),
             Some(Token::True) => Ok(Expr::Bool(true)),
@@ -708,6 +808,10 @@ impl Parser {
             }
             // Option/Result 构造器（允许 Some(e1,e2,...) 解析为 Some(Tuple(...))）
             Some(Token::Some) => {
+                // 支持 Some<T>(value) 泛型语法
+                if self.check(&Token::Lt) {
+                    let _type_args = self.parse_opt_type_args()?;
+                }
                 self.expect(Token::LParen)?;
                 let first = self.parse_expr()?;
                 let value = if self.check(&Token::Comma) {
@@ -723,7 +827,14 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(Expr::Some(Box::new(value)))
             }
-            Some(Token::None) => Ok(Expr::None),
+            Some(Token::None) => {
+                // 支持 None<T> 泛型语法
+                if self.check(&Token::Lt) {
+                    let _type_args = self.parse_opt_type_args()?;
+                    // None<T> 仍然解析为 Expr::None，类型参数在类型检查时使用
+                }
+                Ok(Expr::None)
+            }
             Some(Token::Ok) => {
                 self.expect(Token::LParen)?;
                 let first = self.parse_expr()?;
@@ -772,6 +883,7 @@ impl Parser {
                         | Token::TypeUInt8
                         | Token::TypeFloat64
                         | Token::TypeFloat32
+                        | Token::TypeFloat16
                         | Token::TypeBool
                         | Token::TypeRune
                         | Token::TypeString
@@ -790,6 +902,7 @@ impl Parser {
                     Token::TypeUInt8 => "UInt8",
                     Token::TypeFloat64 => "Float64",
                     Token::TypeFloat32 => "Float32",
+                    Token::TypeFloat16 => "Float16",
                     Token::TypeBool => "Bool",
                     Token::TypeRune => "Rune",
                     Token::TypeString => "String",
@@ -892,11 +1005,18 @@ impl Parser {
                 let resources = if self.check(&Token::LParen) {
                     let saved_pos = self.pos;
                     self.advance();
-                    // 检查是否是 try (let/var name = expr) 形式
-                    if matches!(self.peek(), Some(Token::Let) | Some(Token::Var)) {
+                    // 检查是否是 try (let/var name = expr) 或 try (name = expr) 形式
+                    let has_let_var = matches!(self.peek(), Some(Token::Let) | Some(Token::Var));
+                    // 或者 name = expr（不带 let/var 的资源绑定）
+                    let has_bare_assign = matches!(self.peek(), Some(Token::Ident(_)))
+                        && matches!(self.peek_at(1), Some(Token::Assign));
+                    if has_let_var || has_bare_assign {
                         let mut res = Vec::new();
                         loop {
-                            self.advance(); // consume let/var
+                            // 跳过可选的 let/var
+                            if matches!(self.peek(), Some(Token::Let) | Some(Token::Var)) {
+                                self.advance();
+                            }
                             let name = self.advance_ident().ok_or_else(|| ParseErrorAt {
                                 error: ParseError::UnexpectedEof,
                                 byte_start: self.at().0,
@@ -958,10 +1078,16 @@ impl Parser {
                         Some(Token::Underscore) => None, // catch (_: Type)
                         _ => return self.bail(ParseError::UnexpectedEof),
                     };
-                    // P2: catch (e: Exception) 异常类型模式
+                    // P2: catch (e: Exception) 或 catch (e: E1 | E2) 异常类型模式
                     let catch_type = if self.check(&Token::Colon) {
                         self.advance();
-                        Some(self.parse_type()?)
+                        let ty = self.parse_type()?;
+                        // 跳过额外的 | Type（多异常类型 catch，取第一个类型）
+                        while self.check(&Token::Pipe) {
+                            self.advance();
+                            self.parse_type()?;
+                        }
+                        Some(ty)
                     } else {
                         None
                     };
@@ -1163,8 +1289,12 @@ impl Parser {
                 // 也支持 { _: T, x: T => body }（第一个参数为通配符）
                 // 注意：当前 { 已被 advance() 消费，用 peek() 看第一个 token，peek_at(1) 看第二个；仅当第二个 token 为 : , 或 => 时才按 lambda 解析，否则按块解析
                 let second = self.peek_at(1);
-                let is_lambda = matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
-                    && matches!(second, Some(Token::Colon) | Some(Token::Comma) | Some(Token::FatArrow));
+                let is_lambda =
+                    matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
+                        && matches!(
+                            second,
+                            Some(Token::Colon) | Some(Token::Comma) | Some(Token::FatArrow)
+                        );
                 if is_lambda {
                     if matches!(second, Some(Token::Colon)) {
                         // Lambda { x: T, y: T => body }；{ 已消费，解析参数
@@ -1184,7 +1314,10 @@ impl Parser {
                                 Some(Token::Ident(n)) => n,
                                 Some(Token::Underscore) => "_".to_string(),
                                 Some(tok) => {
-                                    return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
+                                    return self.bail(ParseError::UnexpectedToken(
+                                        tok,
+                                        "参数名".to_string(),
+                                    ));
                                 }
                                 None => return self.bail(ParseError::UnexpectedEof),
                             };
@@ -1235,16 +1368,22 @@ impl Parser {
                 Ok(Expr::Block(stmts, result))
             }
             // P2.7: Array<T>(size, init) 或 Array<T>(size, repeat: value) 动态数组构造
+            // 也支持 Array(size, repeat: value) 类型推断形式
             Some(Token::TypeArray) => {
-                self.expect(Token::Lt)?;
-                let elem_type = self.parse_type()?;
-                self.expect(Token::Gt)?;
+                let elem_type = if self.check(&Token::Lt) {
+                    self.advance();
+                    let ty = self.parse_type()?;
+                    self.expect(Token::Gt)?;
+                    Some(ty)
+                } else {
+                    None
+                };
                 self.expect(Token::LParen)?;
                 let (args, named_args) = self.parse_args()?;
                 self.expect(Token::RParen)?;
                 Ok(Expr::ConstructorCall {
                     name: "Array".to_string(),
-                    type_args: Some(vec![elem_type]),
+                    type_args: elem_type.map(|t| vec![t]),
                     args,
                     named_args,
                 })
@@ -1280,7 +1419,8 @@ impl Parser {
                         ));
                     }
                     self.advance();
-                    let expr = Box::new(self.parse_match_subject()?);
+                    // cjc: if (let pattern <- expr && extra_cond && ...) — 用 parse_expr 消费完整条件
+                    let expr = Box::new(self.parse_expr()?);
                     self.expect(Token::RParen)?;
                     self.expect(Token::LBrace)?;
                     let then_stmts = self.parse_stmts()?;
@@ -1447,7 +1587,8 @@ impl Parser {
                 if has_paren {
                     self.advance();
                 }
-                let expr = if self.check(&Token::LBrace) && self.peek_at(1) != Some(&Token::RBrace) {
+                let expr = if self.check(&Token::LBrace) && self.peek_at(1) != Some(&Token::RBrace)
+                {
                     // match { case ... } 无主体，视为 match (()) { ... }
                     // 但 match {} 不是有效的无主体语法（空块应该是主体）
                     Box::new(Expr::Block(vec![], None))
@@ -1492,6 +1633,8 @@ impl Parser {
                     None,
                 ))
             }
+            // 允许某些关键字作为变量名引用（如 `loop` 被用作变量名时）
+            Some(Token::Loop) => Ok(Expr::Var("loop".to_string())),
             Some(tok) => self.bail_at(
                 ParseError::UnexpectedToken(tok, "表达式".to_string()),
                 self.at_prev(),
@@ -1507,11 +1650,19 @@ impl Parser {
             return Ok(fields);
         }
 
+        eprintln!(
+            "DEBUG parse_struct_fields: current token = {:?}",
+            self.peek()
+        );
         loop {
             let name = match self.advance() {
                 Some(Token::Ident(name)) => name,
                 Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()))
+                    eprintln!(
+                        "DEBUG parse_struct_fields: unexpected token {:?} at position",
+                        tok
+                    );
+                    return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()));
                 }
                 None => return self.bail(ParseError::UnexpectedEof),
             };
@@ -1598,7 +1749,10 @@ impl Parser {
     }
 
     /// 解析 Lambda 表达式的剩余部分: : ReturnType { body }
-    pub(crate) fn parse_lambda_rest(&mut self, params: Vec<(String, Type)>) -> Result<Expr, ParseErrorAt> {
+    pub(crate) fn parse_lambda_rest(
+        &mut self,
+        params: Vec<(String, Type)>,
+    ) -> Result<Expr, ParseErrorAt> {
         if self.check(&Token::Colon) {
             self.advance();
         } else {
@@ -1693,13 +1847,10 @@ impl Parser {
             Some(Token::Float32(f)) => Expr::Float32(f),
             Some(Token::This) => match self.receiver_name.clone() {
                 Some(n) => Expr::Var(n),
-                None => {
-                    return self.bail(ParseError::UnexpectedToken(
-                        Token::This,
-                        "this 仅可在方法体内使用".to_string(),
-                    ))
-                }
+                None => Expr::Var("this".to_string()),
             },
+            // cjc: super.field 作为 match 主题
+            Some(Token::Super) => Expr::Var("super".to_string()),
             Some(Token::True) => Expr::Bool(true),
             Some(Token::False) => Expr::Bool(false),
             Some(Token::StringLit(s)) | Some(Token::BacktickStringLit(s)) => {
@@ -1743,7 +1894,7 @@ impl Parser {
             None => return self.bail(ParseError::UnexpectedEof),
         };
 
-        // 处理后缀表达式 (字段访问、方法调用、数组索引)
+        // 处理后缀表达式 (字段访问、方法调用、数组索引、类型转换)
         loop {
             match self.peek() {
                 Some(Token::Dot) => {
@@ -1770,6 +1921,7 @@ impl Parser {
                             method: field,
                             args,
                             named_args,
+                            type_args: None,
                         };
                     } else {
                         expr = Expr::Field {
@@ -1786,6 +1938,44 @@ impl Parser {
                         array: Box::new(expr),
                         index: Box::new(index),
                     };
+                }
+                Some(Token::As) => {
+                    self.advance();
+                    let target_ty = self.parse_type()?;
+                    expr = Expr::Cast {
+                        expr: Box::new(expr),
+                        target_ty,
+                    };
+                }
+                // 可选链 obj?.field / obj?.method()
+                Some(Token::Question) if matches!(self.peek_next(), Some(Token::Dot)) => {
+                    self.advance(); // consume ?
+                    self.advance(); // consume .
+                    let field = match self.advance_ident() {
+                        Some(n) => n,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
+                            return self
+                                .bail(ParseError::UnexpectedToken(tok, "字段名".to_string()));
+                        }
+                    };
+                    if self.check(&Token::LParen) {
+                        self.advance();
+                        let (args, named_args) = self.parse_args()?;
+                        self.expect(Token::RParen)?;
+                        expr = Expr::MethodCall {
+                            object: Box::new(expr),
+                            method: field,
+                            args,
+                            named_args,
+                            type_args: None,
+                        };
+                    } else {
+                        expr = Expr::OptionalChain {
+                            object: Box::new(expr),
+                            field,
+                        };
+                    }
                 }
                 _ => break,
             }
@@ -2031,5 +2221,55 @@ impl Parser {
 
         let mut parser = Parser::new(tokens);
         parser.parse_expr()
+    }
+
+    /// 检查 < 后面是否看起来像泛型方法调用
+    /// 用于区分 obj.method<T>() 和 obj.field < value
+    fn looks_like_generic_method_call(&self) -> bool {
+        // 启发式：区分 obj.method<Type>(args) 与比较运算符 obj.field < value
+        let next = match self.peek_at(1) {
+            Some(n) => n,
+            None => return false,
+        };
+        // 内置类型关键字（非 Ident）在表达式中不能作为比较右值，肯定是类型实参
+        if matches!(
+            next,
+            Token::TypeInt8
+                | Token::TypeInt16
+                | Token::TypeInt32
+                | Token::TypeInt64
+                | Token::TypeIntNative
+                | Token::TypeUInt8
+                | Token::TypeUInt16
+                | Token::TypeUInt32
+                | Token::TypeUInt64
+                | Token::TypeUIntNative
+                | Token::TypeFloat16
+                | Token::TypeFloat32
+                | Token::TypeFloat64
+                | Token::TypeRune
+                | Token::TypeBool
+                | Token::TypeNothing
+                | Token::TypeUnit
+                | Token::TypeString
+                | Token::TypeArray
+                | Token::TypeTuple
+                | Token::TypeRange
+                | Token::TypeOption
+                | Token::TypeResult
+                | Token::TypeSlice
+                | Token::TypeMap
+                | Token::TypeVArray
+                | Token::LParen
+                | Token::LBracket
+        ) {
+            return true;
+        }
+        // 对于标识符，只有当 <Ident> 后面紧跟 > 或 , 时才认为是泛型类型实参
+        // 否则（如 < range.start）视为比较运算符
+        if matches!(next, Token::Ident(_)) {
+            return matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
+        }
+        false
     }
 }

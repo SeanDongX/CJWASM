@@ -28,22 +28,48 @@ impl CodeGen {
             Type::Unit => "Unit".to_string(),
             Type::String => "String".to_string(),
             Type::Array(inner) => format!("Array_{}", Self::type_mangle_suffix(inner)),
-            Type::Tuple(types) => format!("Tuple_{}", types.iter().map(Self::type_mangle_suffix).collect::<Vec<_>>().join("_")),
+            Type::Tuple(types) => format!(
+                "Tuple_{}",
+                types
+                    .iter()
+                    .map(Self::type_mangle_suffix)
+                    .collect::<Vec<_>>()
+                    .join("_")
+            ),
             Type::Struct(s, args) => {
                 if args.is_empty() {
                     s.clone()
                 } else {
-                    format!("{}_{}", s, args.iter().map(Self::type_mangle_suffix).collect::<Vec<_>>().join("_"))
+                    format!(
+                        "{}_{}",
+                        s,
+                        args.iter()
+                            .map(Self::type_mangle_suffix)
+                            .collect::<Vec<_>>()
+                            .join("_")
+                    )
                 }
             }
             Type::Range => "Range".to_string(),
             Type::Function { params, ret } => {
-                let params_str = params.iter().map(Self::type_mangle_suffix).collect::<Vec<_>>().join("_");
-                let ret_str = ret.as_ref().as_ref().map(Self::type_mangle_suffix).unwrap_or_else(|| "Unit".to_string());
+                let params_str = params
+                    .iter()
+                    .map(Self::type_mangle_suffix)
+                    .collect::<Vec<_>>()
+                    .join("_");
+                let ret_str = ret
+                    .as_ref()
+                    .as_ref()
+                    .map(Self::type_mangle_suffix)
+                    .unwrap_or_else(|| "Unit".to_string());
                 format!("Fn_{}_{}", params_str, ret_str)
             }
             Type::Option(inner) => format!("Option_{}", Self::type_mangle_suffix(inner)),
-            Type::Result(ok, err) => format!("Result_{}_{}", Self::type_mangle_suffix(ok), Self::type_mangle_suffix(err)),
+            Type::Result(ok, err) => format!(
+                "Result_{}_{}",
+                Self::type_mangle_suffix(ok),
+                Self::type_mangle_suffix(err)
+            ),
             Type::TypeParam(name) => name.clone(), // 单态化前用于名字修饰的占位
             Type::Slice(inner) => format!("Slice_{}", Self::type_mangle_suffix(inner)),
             Type::Map(k, v) => format!(
@@ -74,7 +100,11 @@ impl CodeGen {
     }
 
     /// P2.3: 查找匹配的函数类型索引（用于 call_indirect）
-    pub(crate) fn find_or_create_func_type_idx(&self, params: &[ValType], results: &[ValType]) -> u32 {
+    pub(crate) fn find_or_create_func_type_idx(
+        &self,
+        params: &[ValType],
+        results: &[ValType],
+    ) -> u32 {
         let sig = (params.to_vec(), results.to_vec());
         if let Some(&type_idx) = self.func_type_by_sig.get(&sig) {
             return type_idx;

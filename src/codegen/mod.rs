@@ -1,5 +1,9 @@
-use crate::ast::{AssignTarget, BinOp, ClassDef, EnumDef, EnumVariant, Expr, FieldDef, InitDef, InterfaceDef, InterfaceMethod, InterpolatePart, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef, Type, UnaryOp, Visibility};
 use crate::ast::Function as FuncDef;
+use crate::ast::{
+    AssignTarget, BinOp, ClassDef, EnumDef, EnumVariant, Expr, FieldDef, InitDef, InterfaceDef,
+    InterfaceMethod, InterpolatePart, Literal, MatchArm, Param, Pattern, Program, Stmt, StructDef,
+    Type, UnaryOp, Visibility,
+};
 use crate::memory;
 use std::collections::HashMap;
 use wasm_encoder::{
@@ -17,7 +21,7 @@ mod type_;
 pub(crate) use decl::ClassInfo;
 
 /// 内存布局常量
-const HEAP_BASE: i32 = 1024;  // 堆起始地址
+const HEAP_BASE: i32 = 1024; // 堆起始地址
 const PAGE_SIZE: u64 = 65536; // WASM 页大小 64KB
 /// I/O 缓冲区保留大小（地址 0-127 用于 println 等 I/O 操作）
 const IO_BUFFER_RESERVE: u32 = 128;
@@ -66,6 +70,10 @@ pub struct CodeGen {
     func_type_by_sig: HashMap<(Vec<ValType>, Vec<ValType>), u32>,
     /// P3.4: 类 ID 计数器（用于 `is` 类型检查）
     next_class_id: u32,
+    /// 全局变量类型映射 (name -> Type)，用于 let/var 顶层声明的类型推断
+    global_var_types: HashMap<String, Type>,
+    /// 全局变量初始化表达式映射 (name -> Expr)，用于类型推断
+    global_var_inits: HashMap<String, Expr>,
 }
 
 impl CodeGen {
@@ -89,12 +97,17 @@ impl CodeGen {
             lambda_table_indices: HashMap::new(),
             func_type_by_sig: HashMap::new(),
             next_class_id: 0,
+            global_var_types: HashMap::new(),
+            global_var_inits: HashMap::new(),
         }
     }
 
     /// 获取运行时函数的索引
     fn get_or_create_func_index(&self, name: &str) -> u32 {
-        *self.func_indices.get(name).expect(&format!("运行时函数 {} 未注册", name))
+        *self
+            .func_indices
+            .get(name)
+            .expect(&format!("运行时函数 {} 未注册", name))
     }
 
     /// 检查语句列表中是否包含未被 try-catch 包裹的 throw 表达式
@@ -102,19 +115,33 @@ impl CodeGen {
         for stmt in stmts {
             match stmt {
                 Stmt::Expr(e) => {
-                    if Self::expr_contains_unhandled_throw(e) { return true; }
+                    if Self::expr_contains_unhandled_throw(e) {
+                        return true;
+                    }
                 }
                 Stmt::Return(Some(e)) => {
-                    if Self::expr_contains_unhandled_throw(e) { return true; }
+                    if Self::expr_contains_unhandled_throw(e) {
+                        return true;
+                    }
                 }
                 Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
-                    if Self::expr_contains_unhandled_throw(value) { return true; }
+                    if Self::expr_contains_unhandled_throw(value) {
+                        return true;
+                    }
                 }
-                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::DoWhile { body, .. } | Stmt::UnsafeBlock { body } => {
-                    if Self::contains_unhandled_throw(body) { return true; }
+                Stmt::While { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::UnsafeBlock { body } => {
+                    if Self::contains_unhandled_throw(body) {
+                        return true;
+                    }
                 }
                 Stmt::Const { value, .. } => {
-                    if Self::expr_contains_unhandled_throw(value) { return true; }
+                    if Self::expr_contains_unhandled_throw(value) {
+                        return true;
+                    }
                 }
                 _ => {}
             }
@@ -127,9 +154,15 @@ impl CodeGen {
             Expr::Throw(_) => true,
             // try-catch 包裹的 throw 不算未处理
             Expr::TryBlock { .. } => false,
-            Expr::If { then_branch, else_branch, .. } => {
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 Self::expr_contains_unhandled_throw(then_branch)
-                    || else_branch.as_ref().map_or(false, |eb| Self::expr_contains_unhandled_throw(eb))
+                    || else_branch
+                        .as_ref()
+                        .map_or(false, |eb| Self::expr_contains_unhandled_throw(eb))
             }
             Expr::Block(stmts, _) => Self::contains_unhandled_throw(stmts),
             _ => false,
@@ -155,7 +188,11 @@ impl CodeGen {
                         return Some(inner);
                     }
                 }
-                Stmt::While { body, .. } | Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::DoWhile { body, .. } | Stmt::UnsafeBlock { body } => {
+                Stmt::While { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::UnsafeBlock { body } => {
                     if let Some(inner) = Self::find_throw_inner_in_stmts(body) {
                         return Some(inner);
                     }
@@ -175,17 +212,27 @@ impl CodeGen {
         match expr {
             Expr::Throw(inner) => Some(inner),
             Expr::TryBlock { .. } => None,
-            Expr::If { then_branch, else_branch, .. } => {
-                Self::find_throw_inner_in_expr(then_branch)
-                    .or_else(|| else_branch.as_ref().and_then(|eb| Self::find_throw_inner_in_expr(eb)))
-            }
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => Self::find_throw_inner_in_expr(then_branch).or_else(|| {
+                else_branch
+                    .as_ref()
+                    .and_then(|eb| Self::find_throw_inner_in_expr(eb))
+            }),
             Expr::Block(stmts, _) => Self::find_throw_inner_in_stmts(stmts),
             _ => None,
         }
     }
 
     /// P2.9: 将位置参数和命名参数合并为按函数定义顺序排列的最终参数列表
-    fn resolve_named_args(&self, func_name: &str, positional: &[Expr], named: &[(String, Expr)]) -> Vec<Expr> {
+    fn resolve_named_args(
+        &self,
+        func_name: &str,
+        positional: &[Expr],
+        named: &[(String, Expr)],
+    ) -> Vec<Expr> {
         // 查找函数参数定义
         let func_params = self.func_params.get(func_name);
         if func_params.is_none() {
@@ -223,6 +270,16 @@ impl CodeGen {
             self.type_aliases.insert(name.clone(), ty.clone());
         }
 
+        // 注册全局变量类型（顶层 let/var 声明）
+        for c in &program.constants {
+            self.global_var_types.insert(c.name.clone(), c.ty.clone());
+        }
+
+        // 保存全局变量的初始化表达式，用于类型推断
+        self.global_var_inits = program.constants.iter()
+            .map(|c| (c.name.clone(), c.init.clone()))
+            .collect();
+
         // 收集结构体定义（跳过未单态化的泛型结构体）
         for s in &program.structs {
             if s.type_params.is_empty() {
@@ -230,10 +287,19 @@ impl CodeGen {
             }
         }
         // 注册所有类（跳过未单态化的泛型类）
-        let concrete_classes: Vec<_> = program.classes.iter()
+        let concrete_classes: Vec<_> = program
+            .classes
+            .iter()
             .filter(|c| c.type_params.is_empty())
             .cloned()
             .collect();
+        eprintln!(
+            "DEBUG: Registering {} concrete classes:",
+            concrete_classes.len()
+        );
+        for c in &concrete_classes {
+            eprintln!("  - {}", c.name);
+        }
         self.register_classes(&concrete_classes);
         // 收集枚举定义（跳过未单态化的泛型枚举）
         for e in &program.enums {
@@ -242,30 +308,52 @@ impl CodeGen {
             }
         }
 
+        // 检查是否有用户定义的 Option/Result（泛型或非泛型）
+        let has_user_option = program.enums.iter().any(|e| e.name == "Option");
+        let has_user_result = program.enums.iter().any(|e| e.name == "Result");
+
         // 注册内建 Option / Result 枚举（若用户未自定义）
-        if !self.enums.contains_key("Option") {
-            self.enums.insert("Option".to_string(), EnumDef {
-                visibility: Visibility::Public,
-                name: "Option".to_string(),
-                type_params: vec![],
-                constraints: vec![],
-                variants: vec![
-                    EnumVariant { name: "None".to_string(), payload: None },
-                    EnumVariant { name: "Some".to_string(), payload: Some(Type::Int64) },
-                ],
-            });
+        if !has_user_option && !self.enums.contains_key("Option") {
+            self.enums.insert(
+                "Option".to_string(),
+                EnumDef {
+                    visibility: Visibility::Public,
+                    name: "Option".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    variants: vec![
+                        EnumVariant {
+                            name: "None".to_string(),
+                            payload: None,
+                        },
+                        EnumVariant {
+                            name: "Some".to_string(),
+                            payload: Some(Type::Int64),
+                        },
+                    ],
+                },
+            );
         }
-        if !self.enums.contains_key("Result") {
-            self.enums.insert("Result".to_string(), EnumDef {
-                visibility: Visibility::Public,
-                name: "Result".to_string(),
-                type_params: vec![],
-                constraints: vec![],
-                variants: vec![
-                    EnumVariant { name: "Ok".to_string(), payload: Some(Type::Int64) },
-                    EnumVariant { name: "Err".to_string(), payload: Some(Type::String) },
-                ],
-            });
+        if !has_user_result && !self.enums.contains_key("Result") {
+            self.enums.insert(
+                "Result".to_string(),
+                EnumDef {
+                    visibility: Visibility::Public,
+                    name: "Result".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    variants: vec![
+                        EnumVariant {
+                            name: "Ok".to_string(),
+                            payload: Some(Type::Int64),
+                        },
+                        EnumVariant {
+                            name: "Err".to_string(),
+                            payload: Some(Type::String),
+                        },
+                    ],
+                },
+            );
         }
 
         // --- 注册内建 Error 基类 (#37) ---
@@ -294,7 +382,9 @@ impl CodeGen {
                         name: "message".to_string(),
                         ty: Type::String,
                         default: None,
-                        variadic: false, is_named: false, is_inout: false,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
                     }],
                     body: vec![Stmt::Assign {
                         target: AssignTarget::Field {
@@ -429,35 +519,48 @@ impl CodeGen {
         functions.extend(lambda_funcs);
         self.lambda_counter.set(0); // 重置，编译阶段重新计数
 
-        let name_count: HashMap<String, usize> = functions
-            .iter()
-            .map(|f| f.name.clone())
-            .fold(HashMap::new(), |mut m, n| {
-                *m.entry(n).or_default() += 1;
-                m
-            });
+        let name_count: HashMap<String, usize> =
+            functions
+                .iter()
+                .map(|f| f.name.clone())
+                .fold(HashMap::new(), |mut m, n| {
+                    *m.entry(n).or_default() += 1;
+                    m
+                });
         self.name_count = name_count.clone();
 
         // 1. 类型段 (Type Section)，重载时按参数类型名字修饰
         let mut types = TypeSection::new();
         for (i, func) in functions.iter().enumerate() {
             // 可变参数类型转为 Array<T>
-            let param_tys: Vec<Type> = func.params.iter().map(|p| {
-                if p.variadic {
-                    Type::Array(Box::new(p.ty.clone()))
-                } else {
-                    p.ty.clone()
-                }
-            }).collect();
+            let param_tys: Vec<Type> = func
+                .params
+                .iter()
+                .map(|p| {
+                    if p.variadic {
+                        Type::Array(Box::new(p.ty.clone()))
+                    } else {
+                        p.ty.clone()
+                    }
+                })
+                .collect();
             let params: Vec<ValType> = param_tys.iter().map(|p| p.to_wasm()).collect();
             let results: Vec<ValType> = func
                 .return_type
                 .as_ref()
-                .and_then(|t| if *t == Type::Unit { None } else { Some(vec![t.to_wasm()]) })
+                .and_then(|t| {
+                    if *t == Type::Unit || *t == Type::Nothing {
+                        None
+                    } else {
+                        Some(vec![t.to_wasm()])
+                    }
+                })
                 .unwrap_or_default();
             types.ty().function(params.clone(), results.clone());
             // P2.3: 记录类型签名映射
-            self.func_type_by_sig.entry((params, results)).or_insert(i as u32);
+            self.func_type_by_sig
+                .entry((params, results))
+                .or_insert(i as u32);
             let key = if *name_count.get(&func.name).unwrap_or(&0) > 1 {
                 Self::mangle_key(&func.name, &param_tys)
             } else {
@@ -465,22 +568,33 @@ impl CodeGen {
             };
             self.func_types.insert(key.clone(), i as u32);
             if let Some(ref ret) = func.return_type {
-                if *ret != Type::Unit {
+                if *ret != Type::Unit && *ret != Type::Nothing {
                     self.func_return_types.insert(key.clone(), ret.clone());
                 }
             }
             self.func_params.insert(key, func.params.clone());
         }
-        let num_user_imports = functions.iter().filter(|f| f.extern_import.is_some()).count() as u32;
+        let num_user_imports = functions
+            .iter()
+            .filter(|f| f.extern_import.is_some())
+            .count() as u32;
         let num_builtin_imports = 13u32; // WASI: fd_write, fd_read, fd_close, args_sizes_get, args_get, clock_time_get, random_get, environ_sizes_get, environ_get, proc_exit, fd_prestat_get, path_open, fd_seek
         let num_imports = num_user_imports + num_builtin_imports;
         let num_non_extern = functions.len() as u32 - num_user_imports;
         let mut import_idx = 0u32;
         let mut non_extern_idx = 0u32;
         for (_i, func) in functions.iter().enumerate() {
-            let param_tys: Vec<Type> = func.params.iter().map(|p| {
-                if p.variadic { Type::Array(Box::new(p.ty.clone())) } else { p.ty.clone() }
-            }).collect();
+            let param_tys: Vec<Type> = func
+                .params
+                .iter()
+                .map(|p| {
+                    if p.variadic {
+                        Type::Array(Box::new(p.ty.clone()))
+                    } else {
+                        p.ty.clone()
+                    }
+                })
+                .collect();
             let key = if *name_count.get(&func.name).unwrap_or(&0) > 1 {
                 Self::mangle_key(&func.name, &param_tys)
             } else {
@@ -502,76 +616,114 @@ impl CodeGen {
         let runtime_func_base = num_imports + num_non_extern;
 
         // __pow_i64(i64, i64) -> i64
-        types.ty().function([ValType::I64, ValType::I64], [ValType::I64]);
-        self.func_types.insert("__pow_i64".to_string(), runtime_type_base);
-        self.func_indices.insert("__pow_i64".to_string(), runtime_func_base);
+        types
+            .ty()
+            .function([ValType::I64, ValType::I64], [ValType::I64]);
+        self.func_types
+            .insert("__pow_i64".to_string(), runtime_type_base);
+        self.func_indices
+            .insert("__pow_i64".to_string(), runtime_func_base);
 
         // __str_concat(i32, i32) -> i32
-        types.ty().function([ValType::I32, ValType::I32], [ValType::I32]);
-        self.func_types.insert("__str_concat".to_string(), runtime_type_base + 1);
-        self.func_indices.insert("__str_concat".to_string(), runtime_func_base + 1);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
+        self.func_types
+            .insert("__str_concat".to_string(), runtime_type_base + 1);
+        self.func_indices
+            .insert("__str_concat".to_string(), runtime_func_base + 1);
 
         // __i64_to_str(i64) -> i32
         types.ty().function([ValType::I64], [ValType::I32]);
-        self.func_types.insert("__i64_to_str".to_string(), runtime_type_base + 2);
-        self.func_indices.insert("__i64_to_str".to_string(), runtime_func_base + 2);
+        self.func_types
+            .insert("__i64_to_str".to_string(), runtime_type_base + 2);
+        self.func_indices
+            .insert("__i64_to_str".to_string(), runtime_func_base + 2);
 
         // __i32_to_str(i32) -> i32
         types.ty().function([ValType::I32], [ValType::I32]);
-        self.func_types.insert("__i32_to_str".to_string(), runtime_type_base + 3);
-        self.func_indices.insert("__i32_to_str".to_string(), runtime_func_base + 3);
+        self.func_types
+            .insert("__i32_to_str".to_string(), runtime_type_base + 3);
+        self.func_indices
+            .insert("__i32_to_str".to_string(), runtime_func_base + 3);
 
         // __f64_to_str(f64) -> i32
         types.ty().function([ValType::F64], [ValType::I32]);
-        self.func_types.insert("__f64_to_str".to_string(), runtime_type_base + 4);
-        self.func_indices.insert("__f64_to_str".to_string(), runtime_func_base + 4);
+        self.func_types
+            .insert("__f64_to_str".to_string(), runtime_type_base + 4);
+        self.func_indices
+            .insert("__f64_to_str".to_string(), runtime_func_base + 4);
 
         // __f32_to_str(f32) -> i32
         types.ty().function([ValType::F32], [ValType::I32]);
-        self.func_types.insert("__f32_to_str".to_string(), runtime_type_base + 5);
-        self.func_indices.insert("__f32_to_str".to_string(), runtime_func_base + 5);
+        self.func_types
+            .insert("__f32_to_str".to_string(), runtime_type_base + 5);
+        self.func_indices
+            .insert("__f32_to_str".to_string(), runtime_func_base + 5);
 
         // __bool_to_str(i32) -> i32
         types.ty().function([ValType::I32], [ValType::I32]);
-        self.func_types.insert("__bool_to_str".to_string(), runtime_type_base + 6);
-        self.func_indices.insert("__bool_to_str".to_string(), runtime_func_base + 6);
+        self.func_types
+            .insert("__bool_to_str".to_string(), runtime_type_base + 6);
+        self.func_indices
+            .insert("__bool_to_str".to_string(), runtime_func_base + 6);
 
         // 标准库雏形：min/max/abs (Int64)
-        types.ty().function([ValType::I64, ValType::I64], [ValType::I64]);
-        self.func_types.insert("__min_i64".to_string(), runtime_type_base + 7);
-        self.func_indices.insert("__min_i64".to_string(), runtime_func_base + 7);
-        types.ty().function([ValType::I64, ValType::I64], [ValType::I64]);
-        self.func_types.insert("__max_i64".to_string(), runtime_type_base + 8);
-        self.func_indices.insert("__max_i64".to_string(), runtime_func_base + 8);
+        types
+            .ty()
+            .function([ValType::I64, ValType::I64], [ValType::I64]);
+        self.func_types
+            .insert("__min_i64".to_string(), runtime_type_base + 7);
+        self.func_indices
+            .insert("__min_i64".to_string(), runtime_func_base + 7);
+        types
+            .ty()
+            .function([ValType::I64, ValType::I64], [ValType::I64]);
+        self.func_types
+            .insert("__max_i64".to_string(), runtime_type_base + 8);
+        self.func_indices
+            .insert("__max_i64".to_string(), runtime_func_base + 8);
         types.ty().function([ValType::I64], [ValType::I64]);
-        self.func_types.insert("__abs_i64".to_string(), runtime_type_base + 9);
-        self.func_indices.insert("__abs_i64".to_string(), runtime_func_base + 9);
+        self.func_types
+            .insert("__abs_i64".to_string(), runtime_type_base + 9);
+        self.func_indices
+            .insert("__abs_i64".to_string(), runtime_func_base + 9);
 
         // Phase 8: 内存管理运行时函数
         // __alloc(size: i32) -> i32
         types.ty().function([ValType::I32], [ValType::I32]);
-        self.func_types.insert("__alloc".to_string(), runtime_type_base + 10);
-        self.func_indices.insert("__alloc".to_string(), runtime_func_base + 10);
+        self.func_types
+            .insert("__alloc".to_string(), runtime_type_base + 10);
+        self.func_indices
+            .insert("__alloc".to_string(), runtime_func_base + 10);
 
         // __free(ptr: i32)
         types.ty().function([ValType::I32], []);
-        self.func_types.insert("__free".to_string(), runtime_type_base + 11);
-        self.func_indices.insert("__free".to_string(), runtime_func_base + 11);
+        self.func_types
+            .insert("__free".to_string(), runtime_type_base + 11);
+        self.func_indices
+            .insert("__free".to_string(), runtime_func_base + 11);
 
         // __rc_inc(ptr: i32)
         types.ty().function([ValType::I32], []);
-        self.func_types.insert("__rc_inc".to_string(), runtime_type_base + 12);
-        self.func_indices.insert("__rc_inc".to_string(), runtime_func_base + 12);
+        self.func_types
+            .insert("__rc_inc".to_string(), runtime_type_base + 12);
+        self.func_indices
+            .insert("__rc_inc".to_string(), runtime_func_base + 12);
 
         // __rc_dec(ptr: i32)
         types.ty().function([ValType::I32], []);
-        self.func_types.insert("__rc_dec".to_string(), runtime_type_base + 13);
-        self.func_indices.insert("__rc_dec".to_string(), runtime_func_base + 13);
+        self.func_types
+            .insert("__rc_dec".to_string(), runtime_type_base + 13);
+        self.func_indices
+            .insert("__rc_dec".to_string(), runtime_func_base + 13);
 
         // __gc_collect() -> i32
         types.ty().function([], [ValType::I32]);
-        self.func_types.insert("__gc_collect".to_string(), runtime_type_base + 14);
-        self.func_indices.insert("__gc_collect".to_string(), runtime_func_base + 14);
+        self.func_types
+            .insert("__gc_collect".to_string(), runtime_type_base + 14);
+        self.func_indices
+            .insert("__gc_collect".to_string(), runtime_func_base + 14);
 
         // Phase 7: WASI I/O 支持 — print/println/eprint/eprintln/readln + math 运行时
         // WASI fd_write 类型: (i32, i32, i32, i32) -> i32
@@ -581,23 +733,36 @@ impl CodeGen {
             [ValType::I32],
         );
         // fd_write 是内置导入，索引在用户导入之后
-        self.func_indices.insert("__wasi_fd_write".to_string(), num_user_imports);
+        self.func_indices
+            .insert("__wasi_fd_write".to_string(), num_user_imports);
         // WASI fd_read 类型: (i32, i32, i32, i32) -> i32 (与 fd_write 相同签名)
         // fd_read 是第二个内置导入
-        self.func_indices.insert("__wasi_fd_read".to_string(), num_user_imports + 1);
+        self.func_indices
+            .insert("__wasi_fd_read".to_string(), num_user_imports + 1);
 
         // Phase 7.6: 新增 WASI 系统调用导入
-        self.func_indices.insert("__wasi_fd_close".to_string(), num_user_imports + 2);
-        self.func_indices.insert("__wasi_args_sizes_get".to_string(), num_user_imports + 3);
-        self.func_indices.insert("__wasi_args_get".to_string(), num_user_imports + 4);
-        self.func_indices.insert("__wasi_clock_time_get".to_string(), num_user_imports + 5);
-        self.func_indices.insert("__wasi_random_get".to_string(), num_user_imports + 6);
-        self.func_indices.insert("__wasi_environ_sizes_get".to_string(), num_user_imports + 7);
-        self.func_indices.insert("__wasi_environ_get".to_string(), num_user_imports + 8);
-        self.func_indices.insert("__wasi_proc_exit".to_string(), num_user_imports + 9);
-        self.func_indices.insert("__wasi_fd_prestat_get".to_string(), num_user_imports + 10);
-        self.func_indices.insert("__wasi_path_open".to_string(), num_user_imports + 11);
-        self.func_indices.insert("__wasi_fd_seek".to_string(), num_user_imports + 12);
+        self.func_indices
+            .insert("__wasi_fd_close".to_string(), num_user_imports + 2);
+        self.func_indices
+            .insert("__wasi_args_sizes_get".to_string(), num_user_imports + 3);
+        self.func_indices
+            .insert("__wasi_args_get".to_string(), num_user_imports + 4);
+        self.func_indices
+            .insert("__wasi_clock_time_get".to_string(), num_user_imports + 5);
+        self.func_indices
+            .insert("__wasi_random_get".to_string(), num_user_imports + 6);
+        self.func_indices
+            .insert("__wasi_environ_sizes_get".to_string(), num_user_imports + 7);
+        self.func_indices
+            .insert("__wasi_environ_get".to_string(), num_user_imports + 8);
+        self.func_indices
+            .insert("__wasi_proc_exit".to_string(), num_user_imports + 9);
+        self.func_indices
+            .insert("__wasi_fd_prestat_get".to_string(), num_user_imports + 10);
+        self.func_indices
+            .insert("__wasi_path_open".to_string(), num_user_imports + 11);
+        self.func_indices
+            .insert("__wasi_fd_seek".to_string(), num_user_imports + 12);
 
         // --- I/O 运行时函数类型 ---
         // (i64) -> () : 用于 *_i64 函数
@@ -611,55 +776,95 @@ impl CodeGen {
         types.ty().function([ValType::F64], [ValType::F64]);
         // (f64, f64) -> f64 : 用于二元 math 函数 (pow)
         let ty_f64f64_f64 = runtime_type_base + 19;
-        types.ty().function([ValType::F64, ValType::F64], [ValType::F64]);
+        types
+            .ty()
+            .function([ValType::F64, ValType::F64], [ValType::F64]);
 
         let mut rt_idx = runtime_func_base + 15; // 从 15 开始（0-14 是已有运行时函数）
 
         // println 变体 (fd=1, newline=true) — 与之前兼容
-        self.func_types.insert("__println_i64".to_string(), ty_i64_void);
-        self.func_indices.insert("__println_i64".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__println_str".to_string(), ty_i32_void);
-        self.func_indices.insert("__println_str".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__println_bool".to_string(), ty_i32_void);
-        self.func_indices.insert("__println_bool".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__println_i64".to_string(), ty_i64_void);
+        self.func_indices
+            .insert("__println_i64".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__println_str".to_string(), ty_i32_void);
+        self.func_indices
+            .insert("__println_str".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__println_bool".to_string(), ty_i32_void);
+        self.func_indices
+            .insert("__println_bool".to_string(), rt_idx);
+        rt_idx += 1;
 
         // print 变体 (fd=1, newline=false)
-        self.func_types.insert("__print_i64".to_string(), ty_i64_void);
-        self.func_indices.insert("__print_i64".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__print_str".to_string(), ty_i32_void);
-        self.func_indices.insert("__print_str".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__print_bool".to_string(), ty_i32_void);
-        self.func_indices.insert("__print_bool".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__print_i64".to_string(), ty_i64_void);
+        self.func_indices.insert("__print_i64".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__print_str".to_string(), ty_i32_void);
+        self.func_indices.insert("__print_str".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__print_bool".to_string(), ty_i32_void);
+        self.func_indices.insert("__print_bool".to_string(), rt_idx);
+        rt_idx += 1;
 
         // eprintln 变体 (fd=2, newline=true)
-        self.func_types.insert("__eprintln_i64".to_string(), ty_i64_void);
-        self.func_indices.insert("__eprintln_i64".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__eprintln_str".to_string(), ty_i32_void);
-        self.func_indices.insert("__eprintln_str".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__eprintln_bool".to_string(), ty_i32_void);
-        self.func_indices.insert("__eprintln_bool".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__eprintln_i64".to_string(), ty_i64_void);
+        self.func_indices
+            .insert("__eprintln_i64".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__eprintln_str".to_string(), ty_i32_void);
+        self.func_indices
+            .insert("__eprintln_str".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__eprintln_bool".to_string(), ty_i32_void);
+        self.func_indices
+            .insert("__eprintln_bool".to_string(), rt_idx);
+        rt_idx += 1;
 
         // eprint 变体 (fd=2, newline=false)
-        self.func_types.insert("__eprint_i64".to_string(), ty_i64_void);
-        self.func_indices.insert("__eprint_i64".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__eprint_str".to_string(), ty_i32_void);
-        self.func_indices.insert("__eprint_str".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__eprint_bool".to_string(), ty_i32_void);
-        self.func_indices.insert("__eprint_bool".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__eprint_i64".to_string(), ty_i64_void);
+        self.func_indices.insert("__eprint_i64".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__eprint_str".to_string(), ty_i32_void);
+        self.func_indices.insert("__eprint_str".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__eprint_bool".to_string(), ty_i32_void);
+        self.func_indices
+            .insert("__eprint_bool".to_string(), rt_idx);
+        rt_idx += 1;
 
         // math 运行时函数
         self.func_types.insert("__math_sin".to_string(), ty_f64_f64);
-        self.func_indices.insert("__math_sin".to_string(), rt_idx); rt_idx += 1;
+        self.func_indices.insert("__math_sin".to_string(), rt_idx);
+        rt_idx += 1;
         self.func_types.insert("__math_cos".to_string(), ty_f64_f64);
-        self.func_indices.insert("__math_cos".to_string(), rt_idx); rt_idx += 1;
+        self.func_indices.insert("__math_cos".to_string(), rt_idx);
+        rt_idx += 1;
         self.func_types.insert("__math_tan".to_string(), ty_f64_f64);
-        self.func_indices.insert("__math_tan".to_string(), rt_idx); rt_idx += 1;
+        self.func_indices.insert("__math_tan".to_string(), rt_idx);
+        rt_idx += 1;
         self.func_types.insert("__math_exp".to_string(), ty_f64_f64);
-        self.func_indices.insert("__math_exp".to_string(), rt_idx); rt_idx += 1;
+        self.func_indices.insert("__math_exp".to_string(), rt_idx);
+        rt_idx += 1;
         self.func_types.insert("__math_log".to_string(), ty_f64_f64);
-        self.func_indices.insert("__math_log".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__math_pow".to_string(), ty_f64f64_f64);
-        self.func_indices.insert("__math_pow".to_string(), rt_idx); rt_idx += 1;
+        self.func_indices.insert("__math_log".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__math_pow".to_string(), ty_f64f64_f64);
+        self.func_indices.insert("__math_pow".to_string(), rt_idx);
+        rt_idx += 1;
 
         // Phase 7.1 #44: readln() -> i32 (返回字符串指针)
         // () -> i32
@@ -673,7 +878,8 @@ impl CodeGen {
         // (i32) -> i64
         let ty_i32_i64 = runtime_type_base + 21;
         types.ty().function([ValType::I32], [ValType::I64]);
-        self.func_types.insert("__str_to_i64".to_string(), ty_i32_i64);
+        self.func_types
+            .insert("__str_to_i64".to_string(), ty_i32_i64);
         self.func_indices.insert("__str_to_i64".to_string(), rt_idx);
         rt_idx += 1;
 
@@ -681,7 +887,8 @@ impl CodeGen {
         // (i32) -> f64
         let ty_i32_f64 = runtime_type_base + 22;
         types.ty().function([ValType::I32], [ValType::F64]);
-        self.func_types.insert("__str_to_f64".to_string(), ty_i32_f64);
+        self.func_types
+            .insert("__str_to_f64".to_string(), ty_i32_f64);
         self.func_indices.insert("__str_to_f64".to_string(), rt_idx);
         rt_idx += 1;
 
@@ -693,18 +900,34 @@ impl CodeGen {
         types.ty().function([ValType::I32], [ValType::I32]);
         // (i32, i32) -> i32 : args_sizes_get, args_get, random_get, environ_sizes_get, environ_get, fd_prestat_get
         let ty_wasi_i32i32_i32 = runtime_type_base + 24;
-        types.ty().function([ValType::I32, ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
         // (i32, i64, i32) -> i32 : clock_time_get
         let ty_wasi_clock = runtime_type_base + 25;
-        types.ty().function([ValType::I32, ValType::I64, ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I64, ValType::I32], [ValType::I32]);
         // (i32, i64, i32, i32) -> i32 : fd_seek
         let ty_wasi_fd_seek = runtime_type_base + 26;
-        types.ty().function([ValType::I32, ValType::I64, ValType::I32, ValType::I32], [ValType::I32]);
+        types.ty().function(
+            [ValType::I32, ValType::I64, ValType::I32, ValType::I32],
+            [ValType::I32],
+        );
         // (i32, i32, i32, i32, i32, i64, i64, i32, i32) -> i32 : path_open
         let ty_wasi_path_open = runtime_type_base + 27;
         types.ty().function(
-            [ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32,
-             ValType::I64, ValType::I64, ValType::I32, ValType::I32],
+            [
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I64,
+                ValType::I64,
+                ValType::I32,
+                ValType::I32,
+            ],
             [ValType::I32],
         );
         // (i32) -> () : proc_exit (reuse ty_i32_void for runtime, but WASI needs separate)
@@ -725,10 +948,14 @@ impl CodeGen {
         // ============================================================
         // (i64, i32) -> i32 : i64_format(val, spec_ptr) -> str_ptr
         let ty_i64i32_i32 = runtime_type_base + 30;
-        types.ty().function([ValType::I64, ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I64, ValType::I32], [ValType::I32]);
         // (f64, i32) -> i32 : f64_format(val, spec_ptr) -> str_ptr
         let ty_f64i32_i32 = runtime_type_base + 31;
-        types.ty().function([ValType::F64, ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::F64, ValType::I32], [ValType::I32]);
 
         // ============================================================
         // Phase 7.5: 集合类型运行时函数类型
@@ -738,109 +965,207 @@ impl CodeGen {
         types.ty().function([ValType::I32, ValType::I64], []);
         // (i32, i64) -> i64 : arraylist_get, arraylist_remove, hashmap_get, hashmap_remove
         let ty_i32i64_i64 = runtime_type_base + 33;
-        types.ty().function([ValType::I32, ValType::I64], [ValType::I64]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I64], [ValType::I64]);
         // (i32, i64, i64) -> () : arraylist_set, hashmap_put
         let ty_i32i64i64_void = runtime_type_base + 34;
-        types.ty().function([ValType::I32, ValType::I64, ValType::I64], []);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I64, ValType::I64], []);
         // (i32, i64) -> i32 : hashmap_contains
         let ty_i32i64_i32 = runtime_type_base + 35;
-        types.ty().function([ValType::I32, ValType::I64], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I64], [ValType::I32]);
 
         // ============================================================
         // Phase 7.8: 字符串操作 / 排序函数类型
         // ============================================================
         // (i32, i32) -> i64 : str_index_of
         let ty_i32i32_i64 = runtime_type_base + 36;
-        types.ty().function([ValType::I32, ValType::I32], [ValType::I64]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I64]);
         // (i32, i32, i32) -> i32 : str_replace(str, old, new)
         let ty_i32i32i32_i32 = runtime_type_base + 37;
-        types.ty().function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
 
         // ============================================================
         // Phase 7.7: 运行时包装函数索引注册
         // ============================================================
-        self.func_types.insert("__get_time_ns".to_string(), ty_void_i64);
-        self.func_indices.insert("__get_time_ns".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__random_i64".to_string(), ty_void_i64);
-        self.func_indices.insert("__random_i64".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__random_f64".to_string(), ty_void_f64);
-        self.func_indices.insert("__random_f64".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__get_args".to_string(), ty_void_i32);
-        self.func_indices.insert("__get_args".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__get_env".to_string(), ty_wasi_i32_i32);
-        self.func_indices.insert("__get_env".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__get_time_ns".to_string(), ty_void_i64);
+        self.func_indices
+            .insert("__get_time_ns".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__random_i64".to_string(), ty_void_i64);
+        self.func_indices.insert("__random_i64".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__random_f64".to_string(), ty_void_f64);
+        self.func_indices.insert("__random_f64".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__get_args".to_string(), ty_void_i32);
+        self.func_indices.insert("__get_args".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__get_env".to_string(), ty_wasi_i32_i32);
+        self.func_indices.insert("__get_env".to_string(), rt_idx);
+        rt_idx += 1;
         self.func_types.insert("__exit".to_string(), ty_i32_void);
-        self.func_indices.insert("__exit".to_string(), rt_idx); rt_idx += 1;
+        self.func_indices.insert("__exit".to_string(), rt_idx);
+        rt_idx += 1;
 
         // ============================================================
         // Phase 7.4: 格式化函数索引注册
         // ============================================================
-        self.func_types.insert("__i64_format".to_string(), ty_i64i32_i32);
-        self.func_indices.insert("__i64_format".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__f64_format".to_string(), ty_f64i32_i32);
-        self.func_indices.insert("__f64_format".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__i64_format".to_string(), ty_i64i32_i32);
+        self.func_indices.insert("__i64_format".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__f64_format".to_string(), ty_f64i32_i32);
+        self.func_indices.insert("__f64_format".to_string(), rt_idx);
+        rt_idx += 1;
 
         // ============================================================
         // Phase 7.5: 集合类型函数索引注册
         // ============================================================
         // ArrayList
-        self.func_types.insert("__arraylist_new".to_string(), ty_void_i32);
-        self.func_indices.insert("__arraylist_new".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__arraylist_append".to_string(), ty_i32i64_void);
-        self.func_indices.insert("__arraylist_append".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__arraylist_get".to_string(), ty_i32i64_i64);
-        self.func_indices.insert("__arraylist_get".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__arraylist_set".to_string(), ty_i32i64i64_void);
-        self.func_indices.insert("__arraylist_set".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__arraylist_remove".to_string(), ty_i32i64_i64);
-        self.func_indices.insert("__arraylist_remove".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__arraylist_new".to_string(), ty_void_i32);
+        self.func_indices
+            .insert("__arraylist_new".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__arraylist_append".to_string(), ty_i32i64_void);
+        self.func_indices
+            .insert("__arraylist_append".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__arraylist_get".to_string(), ty_i32i64_i64);
+        self.func_indices
+            .insert("__arraylist_get".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__arraylist_set".to_string(), ty_i32i64i64_void);
+        self.func_indices
+            .insert("__arraylist_set".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__arraylist_remove".to_string(), ty_i32i64_i64);
+        self.func_indices
+            .insert("__arraylist_remove".to_string(), rt_idx);
+        rt_idx += 1;
         // HashMap
-        self.func_types.insert("__hashmap_new".to_string(), ty_void_i32);
-        self.func_indices.insert("__hashmap_new".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__hashmap_put".to_string(), ty_i32i64i64_void);
-        self.func_indices.insert("__hashmap_put".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__hashmap_get".to_string(), ty_i32i64_i64);
-        self.func_indices.insert("__hashmap_get".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__hashmap_contains".to_string(), ty_i32i64_i32);
-        self.func_indices.insert("__hashmap_contains".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__hashmap_remove".to_string(), ty_i32i64_i64);
-        self.func_indices.insert("__hashmap_remove".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__hashmap_new".to_string(), ty_void_i32);
+        self.func_indices
+            .insert("__hashmap_new".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__hashmap_put".to_string(), ty_i32i64i64_void);
+        self.func_indices
+            .insert("__hashmap_put".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__hashmap_get".to_string(), ty_i32i64_i64);
+        self.func_indices
+            .insert("__hashmap_get".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__hashmap_contains".to_string(), ty_i32i64_i32);
+        self.func_indices
+            .insert("__hashmap_contains".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__hashmap_remove".to_string(), ty_i32i64_i64);
+        self.func_indices
+            .insert("__hashmap_remove".to_string(), rt_idx);
+        rt_idx += 1;
         // LinkedList
-        self.func_types.insert("__linkedlist_new".to_string(), ty_void_i32);
-        self.func_indices.insert("__linkedlist_new".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__linkedlist_append".to_string(), ty_i32i64_void);
-        self.func_indices.insert("__linkedlist_append".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__linkedlist_prepend".to_string(), ty_i32i64_void);
-        self.func_indices.insert("__linkedlist_prepend".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__linkedlist_get".to_string(), ty_i32i64_i64);
-        self.func_indices.insert("__linkedlist_get".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__linkedlist_new".to_string(), ty_void_i32);
+        self.func_indices
+            .insert("__linkedlist_new".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__linkedlist_append".to_string(), ty_i32i64_void);
+        self.func_indices
+            .insert("__linkedlist_append".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__linkedlist_prepend".to_string(), ty_i32i64_void);
+        self.func_indices
+            .insert("__linkedlist_prepend".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__linkedlist_get".to_string(), ty_i32i64_i64);
+        self.func_indices
+            .insert("__linkedlist_get".to_string(), rt_idx);
+        rt_idx += 1;
 
         // ============================================================
         // Phase 7.8: 字符串操作 / 排序函数索引注册
         // ============================================================
-        self.func_types.insert("__str_contains".to_string(), ty_wasi_i32i32_i32);
-        self.func_indices.insert("__str_contains".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__str_index_of".to_string(), ty_i32i32_i64);
-        self.func_indices.insert("__str_index_of".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__str_replace".to_string(), ty_i32i32i32_i32);
-        self.func_indices.insert("__str_replace".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__str_split".to_string(), ty_wasi_i32i32_i32);
-        self.func_indices.insert("__str_split".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__str_to_rune_array".to_string(), ty_wasi_i32_i32);
-        self.func_indices.insert("__str_to_rune_array".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__sort_array".to_string(), ty_i32_void);
-        self.func_indices.insert("__sort_array".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__str_substring".to_string(), ty_i32i32i32_i32);
-        self.func_indices.insert("__str_substring".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__hashcode_i64".to_string(), ty_i32_i64);
-        self.func_indices.insert("__hashcode_i64".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__str_contains".to_string(), ty_wasi_i32i32_i32);
+        self.func_indices
+            .insert("__str_contains".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__str_index_of".to_string(), ty_i32i32_i64);
+        self.func_indices
+            .insert("__str_index_of".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__str_replace".to_string(), ty_i32i32i32_i32);
+        self.func_indices
+            .insert("__str_replace".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__str_split".to_string(), ty_wasi_i32i32_i32);
+        self.func_indices.insert("__str_split".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__str_to_rune_array".to_string(), ty_wasi_i32_i32);
+        self.func_indices
+            .insert("__str_to_rune_array".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__sort_array".to_string(), ty_i32_void);
+        self.func_indices.insert("__sort_array".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__str_substring".to_string(), ty_i32i32i32_i32);
+        self.func_indices
+            .insert("__str_substring".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__hashcode_i64".to_string(), ty_i32_i64);
+        self.func_indices
+            .insert("__hashcode_i64".to_string(), rt_idx);
+        rt_idx += 1;
         // P2.10: String 方法运行时函数
-        self.func_types.insert("__str_trim".to_string(), ty_wasi_i32_i32);
-        self.func_indices.insert("__str_trim".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__str_starts_with".to_string(), ty_wasi_i32i32_i32);
-        self.func_indices.insert("__str_starts_with".to_string(), rt_idx); rt_idx += 1;
-        self.func_types.insert("__str_ends_with".to_string(), ty_wasi_i32i32_i32);
-        self.func_indices.insert("__str_ends_with".to_string(), rt_idx); rt_idx += 1;
+        self.func_types
+            .insert("__str_trim".to_string(), ty_wasi_i32_i32);
+        self.func_indices.insert("__str_trim".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__str_starts_with".to_string(), ty_wasi_i32i32_i32);
+        self.func_indices
+            .insert("__str_starts_with".to_string(), rt_idx);
+        rt_idx += 1;
+        self.func_types
+            .insert("__str_ends_with".to_string(), ty_wasi_i32i32_i32);
+        self.func_indices
+            .insert("__str_ends_with".to_string(), rt_idx);
+        rt_idx += 1;
         let _rt_idx_end = rt_idx;
 
         module.section(&types);
@@ -868,17 +1193,61 @@ impl CodeGen {
             EntityType::Function(wasi_fd_write_type_idx), // 同 (i32,i32,i32,i32)->i32
         );
         // Phase 7.6: 新增 WASI 系统调用导入
-        imports.import("wasi_snapshot_preview1", "fd_close", EntityType::Function(ty_wasi_i32_i32));
-        imports.import("wasi_snapshot_preview1", "args_sizes_get", EntityType::Function(ty_wasi_i32i32_i32));
-        imports.import("wasi_snapshot_preview1", "args_get", EntityType::Function(ty_wasi_i32i32_i32));
-        imports.import("wasi_snapshot_preview1", "clock_time_get", EntityType::Function(ty_wasi_clock));
-        imports.import("wasi_snapshot_preview1", "random_get", EntityType::Function(ty_wasi_i32i32_i32));
-        imports.import("wasi_snapshot_preview1", "environ_sizes_get", EntityType::Function(ty_wasi_i32i32_i32));
-        imports.import("wasi_snapshot_preview1", "environ_get", EntityType::Function(ty_wasi_i32i32_i32));
-        imports.import("wasi_snapshot_preview1", "proc_exit", EntityType::Function(ty_i32_void));
-        imports.import("wasi_snapshot_preview1", "fd_prestat_get", EntityType::Function(ty_wasi_i32i32_i32));
-        imports.import("wasi_snapshot_preview1", "path_open", EntityType::Function(ty_wasi_path_open));
-        imports.import("wasi_snapshot_preview1", "fd_seek", EntityType::Function(ty_wasi_fd_seek));
+        imports.import(
+            "wasi_snapshot_preview1",
+            "fd_close",
+            EntityType::Function(ty_wasi_i32_i32),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "args_sizes_get",
+            EntityType::Function(ty_wasi_i32i32_i32),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "args_get",
+            EntityType::Function(ty_wasi_i32i32_i32),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "clock_time_get",
+            EntityType::Function(ty_wasi_clock),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "random_get",
+            EntityType::Function(ty_wasi_i32i32_i32),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "environ_sizes_get",
+            EntityType::Function(ty_wasi_i32i32_i32),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "environ_get",
+            EntityType::Function(ty_wasi_i32i32_i32),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "proc_exit",
+            EntityType::Function(ty_i32_void),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "fd_prestat_get",
+            EntityType::Function(ty_wasi_i32i32_i32),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "path_open",
+            EntityType::Function(ty_wasi_path_open),
+        );
+        imports.import(
+            "wasi_snapshot_preview1",
+            "fd_seek",
+            EntityType::Function(ty_wasi_fd_seek),
+        );
         module.section(&imports);
 
         // 3. 函数段 (Function Section)：仅非 extern 的 type 索引
@@ -892,61 +1261,62 @@ impl CodeGen {
             func_section.function(runtime_type_base + r);
         }
         // Phase 7: I/O 运行时函数 (12 个: println/print/eprintln/eprint × i64/str/bool)
-        for _ in 0..4 { // 4 variants: println, print, eprintln, eprint
-            func_section.function(ty_i64_void);  // *_i64
-            func_section.function(ty_i32_void);  // *_str
-            func_section.function(ty_i32_void);  // *_bool
+        for _ in 0..4 {
+            // 4 variants: println, print, eprintln, eprint
+            func_section.function(ty_i64_void); // *_i64
+            func_section.function(ty_i32_void); // *_str
+            func_section.function(ty_i32_void); // *_bool
         }
         // Phase 7.3: math 运行时函数 (6 个)
-        func_section.function(ty_f64_f64);    // __math_sin
-        func_section.function(ty_f64_f64);    // __math_cos
-        func_section.function(ty_f64_f64);    // __math_tan
-        func_section.function(ty_f64_f64);    // __math_exp
-        func_section.function(ty_f64_f64);    // __math_log
+        func_section.function(ty_f64_f64); // __math_sin
+        func_section.function(ty_f64_f64); // __math_cos
+        func_section.function(ty_f64_f64); // __math_tan
+        func_section.function(ty_f64_f64); // __math_exp
+        func_section.function(ty_f64_f64); // __math_log
         func_section.function(ty_f64f64_f64); // __math_pow
-        // Phase 7.1 #44: readln
-        func_section.function(ty_void_i32);   // __readln
-        // Phase 7.2: str_to_i64, str_to_f64
-        func_section.function(ty_i32_i64);    // __str_to_i64
-        func_section.function(ty_i32_f64);    // __str_to_f64
-        // Phase 7.7: 运行时包装函数
-        func_section.function(ty_void_i64);       // __get_time_ns
-        func_section.function(ty_void_i64);       // __random_i64
-        func_section.function(ty_void_f64);       // __random_f64
-        func_section.function(ty_void_i32);       // __get_args
-        func_section.function(ty_wasi_i32_i32);   // __get_env
-        func_section.function(ty_i32_void);       // __exit
-        // Phase 7.4: 格式化函数
-        func_section.function(ty_i64i32_i32);     // __i64_format
-        func_section.function(ty_f64i32_i32);     // __f64_format
-        // Phase 7.5: 集合类型函数
-        func_section.function(ty_void_i32);       // __arraylist_new
-        func_section.function(ty_i32i64_void);    // __arraylist_append
-        func_section.function(ty_i32i64_i64);     // __arraylist_get
+                                              // Phase 7.1 #44: readln
+        func_section.function(ty_void_i32); // __readln
+                                            // Phase 7.2: str_to_i64, str_to_f64
+        func_section.function(ty_i32_i64); // __str_to_i64
+        func_section.function(ty_i32_f64); // __str_to_f64
+                                           // Phase 7.7: 运行时包装函数
+        func_section.function(ty_void_i64); // __get_time_ns
+        func_section.function(ty_void_i64); // __random_i64
+        func_section.function(ty_void_f64); // __random_f64
+        func_section.function(ty_void_i32); // __get_args
+        func_section.function(ty_wasi_i32_i32); // __get_env
+        func_section.function(ty_i32_void); // __exit
+                                            // Phase 7.4: 格式化函数
+        func_section.function(ty_i64i32_i32); // __i64_format
+        func_section.function(ty_f64i32_i32); // __f64_format
+                                              // Phase 7.5: 集合类型函数
+        func_section.function(ty_void_i32); // __arraylist_new
+        func_section.function(ty_i32i64_void); // __arraylist_append
+        func_section.function(ty_i32i64_i64); // __arraylist_get
         func_section.function(ty_i32i64i64_void); // __arraylist_set
-        func_section.function(ty_i32i64_i64);     // __arraylist_remove
-        func_section.function(ty_void_i32);       // __hashmap_new
+        func_section.function(ty_i32i64_i64); // __arraylist_remove
+        func_section.function(ty_void_i32); // __hashmap_new
         func_section.function(ty_i32i64i64_void); // __hashmap_put
-        func_section.function(ty_i32i64_i64);     // __hashmap_get
-        func_section.function(ty_i32i64_i32);     // __hashmap_contains
-        func_section.function(ty_i32i64_i64);     // __hashmap_remove
-        func_section.function(ty_void_i32);       // __linkedlist_new
-        func_section.function(ty_i32i64_void);    // __linkedlist_append
-        func_section.function(ty_i32i64_void);    // __linkedlist_prepend
-        func_section.function(ty_i32i64_i64);     // __linkedlist_get
-        // Phase 7.8: 字符串操作 / 排序
-        func_section.function(ty_wasi_i32i32_i32);  // __str_contains
-        func_section.function(ty_i32i32_i64);        // __str_index_of
-        func_section.function(ty_i32i32i32_i32);     // __str_replace
-        func_section.function(ty_wasi_i32i32_i32);   // __str_split
-        func_section.function(ty_wasi_i32_i32);      // __str_to_rune_array
-        func_section.function(ty_i32_void);           // __sort_array
-        func_section.function(ty_i32i32i32_i32);     // __str_substring
-        func_section.function(ty_i32_i64);            // __hashcode_i64
-        // P2.10: String 方法
-        func_section.function(ty_wasi_i32_i32);      // __str_trim
-        func_section.function(ty_wasi_i32i32_i32);   // __str_starts_with
-        func_section.function(ty_wasi_i32i32_i32);   // __str_ends_with
+        func_section.function(ty_i32i64_i64); // __hashmap_get
+        func_section.function(ty_i32i64_i32); // __hashmap_contains
+        func_section.function(ty_i32i64_i64); // __hashmap_remove
+        func_section.function(ty_void_i32); // __linkedlist_new
+        func_section.function(ty_i32i64_void); // __linkedlist_append
+        func_section.function(ty_i32i64_void); // __linkedlist_prepend
+        func_section.function(ty_i32i64_i64); // __linkedlist_get
+                                              // Phase 7.8: 字符串操作 / 排序
+        func_section.function(ty_wasi_i32i32_i32); // __str_contains
+        func_section.function(ty_i32i32_i64); // __str_index_of
+        func_section.function(ty_i32i32i32_i32); // __str_replace
+        func_section.function(ty_wasi_i32i32_i32); // __str_split
+        func_section.function(ty_wasi_i32_i32); // __str_to_rune_array
+        func_section.function(ty_i32_void); // __sort_array
+        func_section.function(ty_i32i32i32_i32); // __str_substring
+        func_section.function(ty_i32_i64); // __hashcode_i64
+                                           // P2.10: String 方法
+        func_section.function(ty_wasi_i32_i32); // __str_trim
+        func_section.function(ty_wasi_i32i32_i32); // __str_starts_with
+        func_section.function(ty_wasi_i32i32_i32); // __str_ends_with
         module.section(&func_section);
 
         // P2.3: 收集 Lambda 函数的 Table 索引
@@ -962,7 +1332,8 @@ impl CodeGen {
         }
 
         // 3a. Table 段 (Table Section) — 用于 vtable / call_indirect / lambda
-        let total_table_size = (self.vtable_entries.len() + lambda_func_indices_for_table.len()) as u64;
+        let total_table_size =
+            (self.vtable_entries.len() + lambda_func_indices_for_table.len()) as u64;
         if total_table_size > 0 {
             let mut tables = TableSection::new();
             tables.table(TableType {
@@ -1015,9 +1386,17 @@ impl CodeGen {
             if func.extern_import.is_some() {
                 continue;
             }
-            let param_tys: Vec<Type> = func.params.iter().map(|p| {
-                if p.variadic { Type::Array(Box::new(p.ty.clone())) } else { p.ty.clone() }
-            }).collect();
+            let param_tys: Vec<Type> = func
+                .params
+                .iter()
+                .map(|p| {
+                    if p.variadic {
+                        Type::Array(Box::new(p.ty.clone()))
+                    } else {
+                        p.ty.clone()
+                    }
+                })
+                .collect();
             let key = if *name_count.get(&func.name).unwrap_or(&0) > 1 {
                 Self::mangle_key(&func.name, &param_tys)
             } else {
@@ -1041,7 +1420,11 @@ impl CodeGen {
         exports.export("__free", ExportKind::Func, self.func_indices["__free"]);
         exports.export("__rc_inc", ExportKind::Func, self.func_indices["__rc_inc"]);
         exports.export("__rc_dec", ExportKind::Func, self.func_indices["__rc_dec"]);
-        exports.export("__gc_collect", ExportKind::Func, self.func_indices["__gc_collect"]);
+        exports.export(
+            "__gc_collect",
+            ExportKind::Func,
+            self.func_indices["__gc_collect"],
+        );
         module.section(&exports);
 
         // 6. 代码段 (Code Section)：仅非 extern 函数
@@ -1186,19 +1569,23 @@ impl CodeGen {
             Expr::Float(_) => Some(Type::Float64),
             Expr::Bool(_) => Some(Type::Bool),
             Expr::String(_) => Some(Type::String),
-            Expr::Var(name) => {
-                params.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone())
-            }
-            Expr::Binary { op, left, right } => {
-                match op {
-                    BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
-                    | BinOp::LogicalAnd | BinOp::LogicalOr | BinOp::NotIn => Some(Type::Bool),
-                    _ => {
-                        Self::infer_lambda_return_type(left, params)
-                            .or_else(|| Self::infer_lambda_return_type(right, params))
-                    }
-                }
-            }
+            Expr::Var(name) => params
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.clone()),
+            Expr::Binary { op, left, right } => match op {
+                BinOp::Eq
+                | BinOp::NotEq
+                | BinOp::Lt
+                | BinOp::LtEq
+                | BinOp::Gt
+                | BinOp::GtEq
+                | BinOp::LogicalAnd
+                | BinOp::LogicalOr
+                | BinOp::NotIn => Some(Type::Bool),
+                _ => Self::infer_lambda_return_type(left, params)
+                    .or_else(|| Self::infer_lambda_return_type(right, params)),
+            },
             Expr::If { then_branch, .. } => Self::infer_lambda_return_type(then_branch, params),
             Expr::Block(_, Some(tail)) => Self::infer_lambda_return_type(tail, params),
             _ => Some(Type::Int64), // 默认推断为 Int64
@@ -1246,21 +1633,31 @@ impl CodeGen {
             Stmt::Return(Some(e)) => Self::collect_lambdas_from_expr(e, counter, out),
             Stmt::While { cond, body, .. } => {
                 Self::collect_lambdas_from_expr(cond, counter, out);
-                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+                for s in body {
+                    Self::collect_lambdas_from_stmt(s, counter, out);
+                }
             }
             Stmt::DoWhile { body, cond } => {
-                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+                for s in body {
+                    Self::collect_lambdas_from_stmt(s, counter, out);
+                }
                 Self::collect_lambdas_from_expr(cond, counter, out);
             }
             Stmt::For { iterable, body, .. } => {
                 Self::collect_lambdas_from_expr(iterable, counter, out);
-                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+                for s in body {
+                    Self::collect_lambdas_from_stmt(s, counter, out);
+                }
             }
             Stmt::Loop { body, .. } => {
-                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+                for s in body {
+                    Self::collect_lambdas_from_stmt(s, counter, out);
+                }
             }
             Stmt::UnsafeBlock { body } => {
-                for s in body { Self::collect_lambdas_from_stmt(s, counter, out); }
+                for s in body {
+                    Self::collect_lambdas_from_stmt(s, counter, out);
+                }
             }
             Stmt::Const { value, .. } => {
                 Self::collect_lambdas_from_expr(value, counter, out);
@@ -1271,7 +1668,11 @@ impl CodeGen {
 
     fn collect_lambdas_from_expr(expr: &Expr, counter: &mut u32, out: &mut Vec<FuncDef>) {
         match expr {
-            Expr::Lambda { params, return_type, body } => {
+            Expr::Lambda {
+                params,
+                return_type,
+                body,
+            } => {
                 let lambda_name = format!("__lambda_{}", *counter);
                 *counter += 1;
                 // P2.3: 推断 Lambda 返回类型（如果未显式标注）
@@ -1288,12 +1689,17 @@ impl CodeGen {
                     name: lambda_name,
                     type_params: vec![],
                     constraints: vec![],
-                    params: params.iter().map(|(name, ty)| Param {
-                        name: name.clone(),
-                        ty: ty.clone(),
-                        default: None,
-                        variadic: false, is_named: false, is_inout: false,
-                    }).collect(),
+                    params: params
+                        .iter()
+                        .map(|(name, ty)| Param {
+                            name: name.clone(),
+                            ty: ty.clone(),
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        })
+                        .collect(),
                     return_type: inferred_ret,
                     throws: None,
                     body: body_stmt,
@@ -1308,29 +1714,50 @@ impl CodeGen {
             }
             Expr::Unary { expr, .. } => Self::collect_lambdas_from_expr(expr, counter, out),
             Expr::Call { args, .. } => {
-                for a in args { Self::collect_lambdas_from_expr(a, counter, out); }
+                for a in args {
+                    Self::collect_lambdas_from_expr(a, counter, out);
+                }
             }
             Expr::MethodCall { object, args, .. } => {
                 Self::collect_lambdas_from_expr(object, counter, out);
-                for a in args { Self::collect_lambdas_from_expr(a, counter, out); }
+                for a in args {
+                    Self::collect_lambdas_from_expr(a, counter, out);
+                }
             }
-            Expr::If { cond, then_branch, else_branch, .. } => {
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 Self::collect_lambdas_from_expr(cond, counter, out);
                 Self::collect_lambdas_from_expr(then_branch, counter, out);
-                if let Some(e) = else_branch { Self::collect_lambdas_from_expr(e, counter, out); }
+                if let Some(e) = else_branch {
+                    Self::collect_lambdas_from_expr(e, counter, out);
+                }
             }
             Expr::Block(stmts, expr) => {
-                for s in stmts { Self::collect_lambdas_from_stmt(s, counter, out); }
-                if let Some(e) = expr { Self::collect_lambdas_from_expr(e, counter, out); }
+                for s in stmts {
+                    Self::collect_lambdas_from_stmt(s, counter, out);
+                }
+                if let Some(e) = expr {
+                    Self::collect_lambdas_from_expr(e, counter, out);
+                }
             }
             Expr::Array(elems) | Expr::Tuple(elems) => {
-                for e in elems { Self::collect_lambdas_from_expr(e, counter, out); }
+                for e in elems {
+                    Self::collect_lambdas_from_expr(e, counter, out);
+                }
             }
             Expr::ConstructorCall { args, .. } => {
-                for a in args { Self::collect_lambdas_from_expr(a, counter, out); }
+                for a in args {
+                    Self::collect_lambdas_from_expr(a, counter, out);
+                }
             }
             Expr::StructInit { fields, .. } => {
-                for (_, e) in fields { Self::collect_lambdas_from_expr(e, counter, out); }
+                for (_, e) in fields {
+                    Self::collect_lambdas_from_expr(e, counter, out);
+                }
             }
             _ => {}
         }
@@ -1350,7 +1777,14 @@ impl CodeGen {
         // 检查是否为 init 函数（__ClassName_init）
         let is_init = func.name.starts_with("__") && func.name.ends_with("_init");
         let init_class_name = if is_init {
-            Some(func.name.strip_prefix("__").unwrap().strip_suffix("_init").unwrap().to_string())
+            Some(
+                func.name
+                    .strip_prefix("__")
+                    .unwrap()
+                    .strip_suffix("_init")
+                    .unwrap()
+                    .to_string(),
+            )
         } else {
             None
         };
@@ -1368,7 +1802,11 @@ impl CodeGen {
 
         // init 函数额外添加 this 局部变量
         if let Some(ref class_name) = init_class_name {
-            locals.add("this", ValType::I32, Some(Type::Struct(class_name.clone(), vec![])));
+            locals.add(
+                "this",
+                ValType::I32,
+                Some(Type::Struct(class_name.clone(), vec![])),
+            );
         }
 
         // 收集函数体中的局部变量
@@ -1430,7 +1868,10 @@ impl CodeGen {
         // 编译函数体（顶层无循环上下文）
         // 特殊处理：最后一条 Stmt::Expr 若产生值，则作为隐式返回值（不 drop）
         let body_len = func.body.len();
-        let has_return_type = func.return_type.as_ref().map_or(false, |t| *t != Type::Unit);
+        let has_return_type = func
+            .return_type
+            .as_ref()
+            .map_or(false, |t| *t != Type::Unit);
         for (i, stmt) in func.body.iter().enumerate() {
             let is_last = i == body_len - 1;
             if is_last && has_return_type {
@@ -1466,9 +1907,15 @@ impl CodeGen {
             });
             for (name, &idx) in &locals.names {
                 // 跳过内部临时变量、参数、返回值
-                if name.starts_with("__") { continue; }
-                if init_class_name.is_some() && name == "this" { continue; }
-                if Some(name.as_str()) == return_var { continue; }
+                if name.starts_with("__") {
+                    continue;
+                }
+                if init_class_name.is_some() && name == "this" {
+                    continue;
+                }
+                if Some(name.as_str()) == return_var {
+                    continue;
+                }
                 if let Some(ast_ty) = locals.get_type(name) {
                     if memory::is_heap_type(ast_ty) || memory::may_hold_heap_ptr(ast_ty) {
                         wasm_func.instruction(&Instruction::LocalGet(idx));
@@ -1481,7 +1928,12 @@ impl CodeGen {
         // 如果函数有返回类型，在函数末尾添加 unreachable 指令
         // 这处理了所有路径都通过 return 退出的情况（如 match 所有分支都 return）
         // 没有 unreachable，WASM 验证器会报 "nothing on stack" 错误
-        if func.return_type.as_ref().map_or(false, |t| *t != Type::Unit) && init_class_name.is_none() {
+        if func
+            .return_type
+            .as_ref()
+            .map_or(false, |t| *t != Type::Unit)
+            && init_class_name.is_none()
+        {
             wasm_func.instruction(&Instruction::Unreachable);
         }
 
@@ -1537,12 +1989,20 @@ impl CodeGen {
 
         // len1 = mem[ptr1]
         f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::LocalSet(2));
 
         // len2 = mem[ptr2]
         f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::LocalSet(3));
 
         // total_len = len1 + len2
@@ -1562,7 +2022,11 @@ impl CodeGen {
         // mem[new_ptr] = total_len
         f.instruction(&Instruction::LocalGet(5));
         f.instruction(&Instruction::LocalGet(4));
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
 
         // 复制第一个字符串 (memory.copy new_ptr+4, ptr1+4, len1)
         f.instruction(&Instruction::LocalGet(5));
@@ -1572,7 +2036,10 @@ impl CodeGen {
         f.instruction(&Instruction::I32Const(4));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::LocalGet(2));
-        f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
 
         // 复制第二个字符串 (memory.copy new_ptr+4+len1, ptr2+4, len2)
         f.instruction(&Instruction::LocalGet(5));
@@ -1584,7 +2051,10 @@ impl CodeGen {
         f.instruction(&Instruction::I32Const(4));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::LocalGet(3));
-        f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
 
         // return new_ptr
         f.instruction(&Instruction::LocalGet(5));
@@ -1599,7 +2069,9 @@ impl CodeGen {
     fn emit_i64_to_str(&self) -> WasmFunc {
         let alloc_idx = self.func_indices["__alloc"];
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
-            offset, align, memory_index: 0,
+            offset,
+            align,
+            memory_index: 0,
         };
         // 参数: local 0 = val (i64)
         // 局部变量: local 1 = pos (i32), local 2 = is_neg (i32), local 3 = len (i32), local 4 = ptr (i32)
@@ -1711,10 +2183,13 @@ impl CodeGen {
         // memory.copy(ptr + 4, pos, len)  — 将 buf[pos..pos+len] 复制到 ptr+4
         f.instruction(&Instruction::LocalGet(4));
         f.instruction(&Instruction::I32Const(4));
-        f.instruction(&Instruction::I32Add);  // dst = ptr + 4
+        f.instruction(&Instruction::I32Add); // dst = ptr + 4
         f.instruction(&Instruction::LocalGet(1)); // src = pos
         f.instruction(&Instruction::LocalGet(3)); // len
-        f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
 
         // return ptr
         f.instruction(&Instruction::LocalGet(4));
@@ -1745,15 +2220,21 @@ impl CodeGen {
         let i64_to_str_idx = self.func_indices["__i64_to_str"];
         let str_concat_idx = self.func_indices["__str_concat"];
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
-            offset, align, memory_index: 0,
+            offset,
+            align,
+            memory_index: 0,
         };
         // 参数: local 0 = val (f64)
         // 局部变量: local 1 = int_str (i32), local 2 = frac_str (i32),
         //          local 3 = result (i32), local 4 = frac_val (i64),
         //          local 5 = dot_str (i32), local 6 = is_neg (i32)
         let mut f = WasmFunc::new(vec![
-            (1, ValType::I32), (1, ValType::I32), (1, ValType::I32),
-            (1, ValType::I64), (1, ValType::I32), (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I64),
+            (1, ValType::I32),
+            (1, ValType::I32),
         ]);
 
         // 整数部分字符串: __i64_to_str(trunc(val))
@@ -1830,7 +2311,9 @@ impl CodeGen {
         // if val == 0 return "false" else return "true"
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I32Eqz);
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I32,
+        )));
 
         // "false" (5 bytes) - Phase 8: 使用 __alloc
         let alloc_idx = self.func_indices["__alloc"];
@@ -1839,13 +2322,25 @@ impl CodeGen {
         f.instruction(&Instruction::LocalSet(1));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(5));
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(0x736C6166)); // "fals"
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 4, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(0x65)); // "e"
-        f.instruction(&Instruction::I32Store8(wasm_encoder::MemArg { offset: 8, align: 0, memory_index: 0 }));
+        f.instruction(&Instruction::I32Store8(wasm_encoder::MemArg {
+            offset: 8,
+            align: 0,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::LocalGet(1));
 
         f.instruction(&Instruction::Else);
@@ -1856,10 +2351,18 @@ impl CodeGen {
         f.instruction(&Instruction::LocalSet(1));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(4));
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(0x65757274)); // "true"
-        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg { offset: 4, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::LocalGet(1));
 
         f.instruction(&Instruction::End);
@@ -1874,7 +2377,9 @@ impl CodeGen {
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I64LtS);
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I64,
+        )));
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::Else);
         f.instruction(&Instruction::LocalGet(1));
@@ -1890,7 +2395,9 @@ impl CodeGen {
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I64GtS);
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I64,
+        )));
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::Else);
         f.instruction(&Instruction::LocalGet(1));
@@ -1906,7 +2413,9 @@ impl CodeGen {
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I64Const(0));
         f.instruction(&Instruction::I64LtS);
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I64,
+        )));
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I64Const(-1));
         f.instruction(&Instruction::I64Mul);
@@ -1929,7 +2438,9 @@ impl CodeGen {
     fn emit_output_i64(&self, fd: i32, newline: bool) -> WasmFunc {
         let fd_write_idx = self.func_indices["__wasi_fd_write"];
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
-            offset, align, memory_index: 0,
+            offset,
+            align,
+            memory_index: 0,
         };
 
         let end_pos: i32 = if newline { 23 } else { 22 }; // 23 留给 '\n'，22 为数字末尾
@@ -2038,7 +2549,9 @@ impl CodeGen {
     fn emit_output_str(&self, fd: i32, newline: bool) -> WasmFunc {
         let fd_write_idx = self.func_indices["__wasi_fd_write"];
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
-            offset, align, memory_index: 0,
+            offset,
+            align,
+            memory_index: 0,
         };
 
         let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
@@ -2095,7 +2608,9 @@ impl CodeGen {
     fn emit_output_bool(&self, fd: i32, newline: bool) -> WasmFunc {
         let fd_write_idx = self.func_indices["__wasi_fd_write"];
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
-            offset, align, memory_index: 0,
+            offset,
+            align,
+            memory_index: 0,
         };
 
         let mut f = WasmFunc::new(vec![]);
@@ -2166,13 +2681,18 @@ impl CodeGen {
     /// 生成 __math_sin(x: f64) -> f64 (泰勒级数, 17 项)
     fn emit_math_sin(&self) -> WasmFunc {
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
-            offset, align, memory_index: 0,
+            offset,
+            align,
+            memory_index: 0,
         };
         let _ = mem; // 不需要内存操作
-        // local 0 = x (f64), local 1 = term (f64), local 2 = sum (f64),
-        // local 3 = x_sq (f64), local 4 = i (f64, 循环计数器)
+                     // local 0 = x (f64), local 1 = term (f64), local 2 = sum (f64),
+                     // local 3 = x_sq (f64), local 4 = i (f64, 循环计数器)
         let mut f = WasmFunc::new(vec![
-            (1, ValType::F64), (1, ValType::F64), (1, ValType::F64), (1, ValType::F64),
+            (1, ValType::F64),
+            (1, ValType::F64),
+            (1, ValType::F64),
+            (1, ValType::F64),
         ]);
 
         // 先将 x 归约到 [-π, π] 范围: x = x - round(x / (2*PI)) * (2*PI)
@@ -2221,7 +2741,7 @@ impl CodeGen {
             f.instruction(&Instruction::F64Mul); // (2i) * (2i+1)
             f.instruction(&Instruction::F64Div);
             f.instruction(&Instruction::LocalSet(1)); // term = result
-            // sum += term
+                                                      // sum += term
             f.instruction(&Instruction::LocalGet(2));
             f.instruction(&Instruction::LocalGet(1));
             f.instruction(&Instruction::F64Add);
@@ -2268,7 +2788,9 @@ impl CodeGen {
     fn emit_math_exp(&self) -> WasmFunc {
         // local 0 = x, local 1 = term, local 2 = sum, local 3 = i
         let mut f = WasmFunc::new(vec![
-            (1, ValType::F64), (1, ValType::F64), (1, ValType::F64),
+            (1, ValType::F64),
+            (1, ValType::F64),
+            (1, ValType::F64),
         ]);
 
         // sum = 1, term = 1, i = 1
@@ -2307,8 +2829,11 @@ impl CodeGen {
         // local 0 = x, local 1 = y = (x-1)/(x+1), local 2 = y_sq, local 3 = term
         // local 4 = sum, local 5 = i
         let mut f = WasmFunc::new(vec![
-            (1, ValType::F64), (1, ValType::F64), (1, ValType::F64),
-            (1, ValType::F64), (1, ValType::F64),
+            (1, ValType::F64),
+            (1, ValType::F64),
+            (1, ValType::F64),
+            (1, ValType::F64),
+            (1, ValType::F64),
         ]);
 
         // y = (x - 1) / (x + 1)
@@ -2356,7 +2881,7 @@ impl CodeGen {
             f.instruction(&Instruction::F64Div);
             f.instruction(&Instruction::F64Add);
             f.instruction(&Instruction::LocalSet(4)); // sum += term / (2i+1)
-            // i += 1
+                                                      // i += 1
             f.instruction(&Instruction::LocalGet(5));
             f.instruction(&Instruction::F64Const(1.0));
             f.instruction(&Instruction::F64Add);
@@ -2394,7 +2919,9 @@ impl CodeGen {
         let fd_read_idx = self.func_indices["__wasi_fd_read"];
         let alloc_idx = self.func_indices["__alloc"];
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
-            offset, align, memory_index: 0,
+            offset,
+            align,
+            memory_index: 0,
         };
 
         // 临时缓冲区: 使用内存低位区域 (偏移 128-1024，最多 896 字节输入)
@@ -2406,7 +2933,10 @@ impl CodeGen {
         // local 0 = pos (i32, 当前写入位置), local 1 = nread (i32), local 2 = byte (i32)
         // local 3 = result_ptr (i32)
         let mut f = WasmFunc::new(vec![
-            (1, ValType::I32), (1, ValType::I32), (1, ValType::I32), (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
         ]);
 
         // pos = 0
@@ -2415,7 +2945,7 @@ impl CodeGen {
 
         // loop: 逐字节读取
         f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // outer block for break
-        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));  // loop start
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // loop start
         {
             // 检查缓冲区溢出: if pos >= BUF_MAX then break
             f.instruction(&Instruction::LocalGet(0));
@@ -2584,15 +3114,21 @@ impl CodeGen {
 
     /// __get_time_ns() -> i64: 调用 clock_time_get(0=realtime, 1=precision, scratch) 返回纳秒
     fn emit_get_time_ns(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![]);
         // clock_time_get(clock_id=0(realtime), precision=1, buf=WASI_SCRATCH)
-        f.instruction(&Instruction::I32Const(0));            // clock_id = realtime
-        f.instruction(&Instruction::I64Const(1));            // precision = 1ns
+        f.instruction(&Instruction::I32Const(0)); // clock_id = realtime
+        f.instruction(&Instruction::I64Const(1)); // precision = 1ns
         f.instruction(&Instruction::I32Const(WASI_SCRATCH)); // output buffer
-        f.instruction(&Instruction::Call(self.func_indices["__wasi_clock_time_get"]));
-        f.instruction(&Instruction::Drop);                   // drop errno
-        // 读取 i64 时间戳
+        f.instruction(&Instruction::Call(
+            self.func_indices["__wasi_clock_time_get"],
+        ));
+        f.instruction(&Instruction::Drop); // drop errno
+                                           // 读取 i64 时间戳
         f.instruction(&Instruction::I32Const(WASI_SCRATCH));
         f.instruction(&Instruction::I64Load(mem(0, 3)));
         f.instruction(&Instruction::End);
@@ -2601,7 +3137,11 @@ impl CodeGen {
 
     /// __random_i64() -> i64: 调用 random_get(buf, 8) 返回随机 i64
     fn emit_random_i64(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![]);
         f.instruction(&Instruction::I32Const(WASI_SCRATCH));
         f.instruction(&Instruction::I32Const(8));
@@ -2631,7 +3171,11 @@ impl CodeGen {
     /// __get_args() -> i32: 调用 args_sizes_get + args_get, 返回 Array<String> 指针
     /// 数组布局: [len: i32][str_ptr0: i64][str_ptr1: i64]...
     fn emit_get_args(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0 无参数; 1=argc(i32), 2=buf_size(i32), 3=argv_ptrs(i32),
         //         4=argv_buf(i32), 5=result(i32), 6=i(i32), 7=str_ptr(i32)
         let mut f = WasmFunc::new(vec![
@@ -2646,9 +3190,11 @@ impl CodeGen {
         ]);
 
         // 调用 args_sizes_get(&argc, &buf_size)
-        f.instruction(&Instruction::I32Const(WASI_SCRATCH));      // argc 存储位置
-        f.instruction(&Instruction::I32Const(WASI_SCRATCH + 4));  // buf_size 存储位置
-        f.instruction(&Instruction::Call(self.func_indices["__wasi_args_sizes_get"]));
+        f.instruction(&Instruction::I32Const(WASI_SCRATCH)); // argc 存储位置
+        f.instruction(&Instruction::I32Const(WASI_SCRATCH + 4)); // buf_size 存储位置
+        f.instruction(&Instruction::Call(
+            self.func_indices["__wasi_args_sizes_get"],
+        ));
         f.instruction(&Instruction::Drop);
         // 读取 argc 和 buf_size
         f.instruction(&Instruction::I32Const(WASI_SCRATCH));
@@ -2765,13 +3311,13 @@ impl CodeGen {
             // 我们需要把它们交换然后加 len
             // 使用 WASI_SCRATCH 临时保存
             f.instruction(&Instruction::I32Store(mem(WASI_SCRATCH as u64 + 8, 2))); // 临时保存 dest
-            // stack: c_str
+                                                                                    // stack: c_str
             f.instruction(&Instruction::I32Const(WASI_SCRATCH + 8));
             f.instruction(&Instruction::I32Load(mem(0, 2))); // dest
-            // stack: c_str, dest → 不对。Let me restructure.
-            // 实际上 memory.copy 需要 (dest, src, len)
-            // 使用本地变量更简洁:
-            // 用一个简单的循环复制字节代替 memory.copy
+                                                             // stack: c_str, dest → 不对。Let me restructure.
+                                                             // 实际上 memory.copy 需要 (dest, src, len)
+                                                             // 使用本地变量更简洁:
+                                                             // 用一个简单的循环复制字节代替 memory.copy
             f.instruction(&Instruction::Drop); // 丢弃 dest
             f.instruction(&Instruction::Drop); // 丢弃 c_str
 
@@ -2856,7 +3402,11 @@ impl CodeGen {
 
     /// __get_env(key_ptr: i32) -> i32: 简化版——返回空字符串
     fn emit_get_env(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // 简化: 分配空字符串并返回
         let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
         f.instruction(&Instruction::I32Const(4));
@@ -2871,7 +3421,11 @@ impl CodeGen {
 
     /// __get_env 完整版(禁用)
     fn emit_get_env_DISABLED(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=key_ptr, 1=env_count(i32), 2=buf_size(i32), 3=env_ptrs(i32),
         //         4=env_buf(i32), 5=i(i32), 6=c_str(i32), 7=key_len(i32),
         //         8=j(i32), 9=matched(i32), 10=val_ptr(i32)
@@ -2896,7 +3450,9 @@ impl CodeGen {
         // 调用 environ_sizes_get
         f.instruction(&Instruction::I32Const(WASI_SCRATCH));
         f.instruction(&Instruction::I32Const(WASI_SCRATCH + 4));
-        f.instruction(&Instruction::Call(self.func_indices["__wasi_environ_sizes_get"]));
+        f.instruction(&Instruction::Call(
+            self.func_indices["__wasi_environ_sizes_get"],
+        ));
         f.instruction(&Instruction::Drop);
 
         f.instruction(&Instruction::I32Const(WASI_SCRATCH));
@@ -2910,7 +3466,9 @@ impl CodeGen {
         // 如果 env_count == 0，直接返回 0
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Eqz);
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I32,
+        )));
         f.instruction(&Instruction::I32Const(0));
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
@@ -2936,7 +3494,9 @@ impl CodeGen {
         f.instruction(&Instruction::I32Const(0));
         f.instruction(&Instruction::LocalSet(5)); // i = 0
 
-        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+            ValType::I32,
+        )));
         f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
         {
             f.instruction(&Instruction::LocalGet(5));
@@ -3056,9 +3616,9 @@ impl CodeGen {
                     // 复制字节 (简单循环)
                     f.instruction(&Instruction::I32Const(0));
                     f.instruction(&Instruction::LocalSet(8)); // 复用 j/val_len 为 copy index，重置
-                    // 需要重新计算 val_len，先保存到 scratch
-                    // 实际上我们已经存了 val_len 在 local 8，但刚刚重置了...
-                    // 用 result_ptr 的长度字段读取
+                                                              // 需要重新计算 val_len，先保存到 scratch
+                                                              // 实际上我们已经存了 val_len 在 local 8，但刚刚重置了...
+                                                              // 用 result_ptr 的长度字段读取
                     f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
                     f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
                     {
@@ -3124,7 +3684,11 @@ impl CodeGen {
     /// __i64_format(val: i64, spec_ptr: i32) -> i32
     /// 简化实现: 委托给 __i64_to_str (忽略 spec，后续迭代添加进制支持)
     fn emit_i64_format(&self) -> WasmFunc {
-        let _mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let _mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![]);
         // 暂时忽略 spec，直接用 __i64_to_str 转换
         f.instruction(&Instruction::LocalGet(0)); // val
@@ -3146,7 +3710,11 @@ impl CodeGen {
     // (保留完整格式化实现计划，后续迭代支持进制/宽度/精度)
     #[allow(dead_code)]
     fn emit_i64_format_FULL_PLACEHOLDER(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=val(i64), 1=spec_ptr(i32), 2=base(i32), 3=spec_len(i32),
         //         4=abs_val(i64), 5=buf_pos(i32), 6=is_neg(i32), 7=digit(i32),
         //         8=result_len(i32), 9=result_ptr(i32), 10=i(i32), 11=last_char(i32)
@@ -3368,7 +3936,9 @@ impl CodeGen {
                 f.instruction(&Instruction::LocalGet(8));
                 f.instruction(&Instruction::I32Const(10));
                 f.instruction(&Instruction::I32LtU);
-                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                    ValType::I32,
+                )));
                 f.instruction(&Instruction::LocalGet(8));
                 f.instruction(&Instruction::I32Const(48)); // '0'
                 f.instruction(&Instruction::I32Add);
@@ -3564,7 +4134,11 @@ impl CodeGen {
 
     #[allow(dead_code)]
     fn emit_f64_format_FULL_PLACEHOLDER(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=val(f64), 1=spec_ptr(i32),
         // 2=precision(i32), 3=spec_len(i32)
         let mut f = WasmFunc::new(vec![
@@ -3706,12 +4280,14 @@ impl CodeGen {
         // 这里简化: 如果 is_neg，int_part 前加 '-'
         // int_str = __i64_to_str(int_part)
         f.instruction(&Instruction::LocalSet(5)); // frac_int 暂存到 local 5 (覆盖 int_part)
-        // 重新计算 int_part
+                                                  // 重新计算 int_part
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I64TruncF64S);
         // 如果 is_neg，取负
         f.instruction(&Instruction::LocalGet(4));
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I64,
+        )));
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I64TruncF64S);
         f.instruction(&Instruction::I64Const(-1));
@@ -3732,7 +4308,9 @@ impl CodeGen {
         f.instruction(&Instruction::LocalGet(0)); // abs(val)
         f.instruction(&Instruction::I64TruncF64S);
         f.instruction(&Instruction::LocalGet(4)); // is_neg
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I64,
+        )));
         f.instruction(&Instruction::I64Const(-1));
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I64TruncF64S);
@@ -3747,7 +4325,9 @@ impl CodeGen {
         f.instruction(&Instruction::Drop);
         // 重新获取带符号的整数部分
         f.instruction(&Instruction::LocalGet(4)); // is_neg
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I64,
+        )));
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I64TruncF64S);
         f.instruction(&Instruction::I64Const(-1));
@@ -3767,7 +4347,9 @@ impl CodeGen {
         // 如果 precision == 0，返回 int_str
         f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::I32Eqz);
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I32,
+        )));
         f.instruction(&Instruction::LocalGet(7));
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
@@ -3802,8 +4384,8 @@ impl CodeGen {
             // 填零
             f.instruction(&Instruction::I32Const(0));
             f.instruction(&Instruction::LocalSet(10)); // 复用为 loop i
-            // 需要保存 alloc 结果...由于 LocalTee 后被覆盖了
-            // 重新分配
+                                                       // 需要保存 alloc 结果...由于 LocalTee 后被覆盖了
+                                                       // 重新分配
             f.instruction(&Instruction::LocalGet(2));
             f.instruction(&Instruction::I32Const(4));
             f.instruction(&Instruction::I32Add);
@@ -3916,7 +4498,11 @@ impl CodeGen {
 
     /// __arraylist_new() -> i32: 创建空 ArrayList (初始容量 8)
     fn emit_arraylist_new(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![
             (1, ValType::I32), // 0: list_ptr
             (1, ValType::I32), // 1: data_ptr
@@ -3946,7 +4532,11 @@ impl CodeGen {
 
     /// __arraylist_append(list: i32, elem: i64): 追加元素，必要时扩容
     fn emit_arraylist_append(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=list, 1=elem(i64), 2=len(i32), 3=cap(i32), 4=data(i32),
         //         5=new_data(i32), 6=new_cap(i32), 7=i(i32)
         let mut f = WasmFunc::new(vec![
@@ -4048,7 +4638,11 @@ impl CodeGen {
 
     /// __arraylist_get(list: i32, index: i64) -> i64
     fn emit_arraylist_get(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![]);
         // data = list.data_ptr
         f.instruction(&Instruction::LocalGet(0));
@@ -4066,7 +4660,11 @@ impl CodeGen {
 
     /// __arraylist_set(list: i32, index: i64, elem: i64)
     fn emit_arraylist_set(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![]);
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I32Load(mem(8, 2))); // data
@@ -4083,7 +4681,11 @@ impl CodeGen {
 
     /// __arraylist_remove(list: i32, index: i64) -> i64: 移除并返回元素，后面的元素前移
     fn emit_arraylist_remove(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=list, 1=index(i64), 2=result(i64), 3=data(i32), 4=len(i32), 5=i(i32), 6=idx_i32(i32)
         let mut f = WasmFunc::new(vec![
             (1, ValType::I64), // 2: result
@@ -4162,7 +4764,11 @@ impl CodeGen {
     /// Bucket: [occupied: i32][key: i64][val: i64] (20 bytes per bucket)
 
     fn emit_hashmap_new(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![
             (1, ValType::I32), // 0: map_ptr
             (1, ValType::I32), // 1: buckets
@@ -4222,7 +4828,11 @@ impl CodeGen {
 
     /// __hashmap_put(map: i32, key: i64, val: i64): 插入或更新键值对
     fn emit_hashmap_put(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=map, 1=key(i64), 2=val(i64), 3=cap(i32), 4=buckets(i32),
         //         5=hash(i32), 6=idx(i32), 7=bucket_addr(i32)
         let mut f = WasmFunc::new(vec![
@@ -4326,7 +4936,11 @@ impl CodeGen {
 
     /// __hashmap_get(map: i32, key: i64) -> i64
     fn emit_hashmap_get(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![
             (1, ValType::I32), // 2: cap
             (1, ValType::I32), // 3: buckets
@@ -4357,7 +4971,9 @@ impl CodeGen {
         f.instruction(&Instruction::I32Const(0));
         f.instruction(&Instruction::LocalSet(7)); // probes = 0
 
-        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+            ValType::I64,
+        )));
         f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
         {
             f.instruction(&Instruction::LocalGet(7));
@@ -4417,10 +5033,17 @@ impl CodeGen {
 
     /// __hashmap_contains(map: i32, key: i64) -> i32 (0/1)
     fn emit_hashmap_contains(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![
-            (1, ValType::I32), (1, ValType::I32), (1, ValType::I32),
-            (1, ValType::I32), (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
         ]);
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I32Load(mem(4, 2)));
@@ -4442,7 +5065,9 @@ impl CodeGen {
         f.instruction(&Instruction::I32Const(0));
         f.instruction(&Instruction::LocalSet(5)); // probes
 
-        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+            ValType::I32,
+        )));
         f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
         {
             f.instruction(&Instruction::LocalGet(5));
@@ -4498,10 +5123,17 @@ impl CodeGen {
 
     /// __hashmap_remove(map: i32, key: i64) -> i64
     fn emit_hashmap_remove(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![
-            (1, ValType::I32), (1, ValType::I32), (1, ValType::I32),
-            (1, ValType::I32), (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
+            (1, ValType::I32),
         ]);
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I32Load(mem(4, 2)));
@@ -4523,7 +5155,9 @@ impl CodeGen {
         f.instruction(&Instruction::I32Const(0));
         f.instruction(&Instruction::LocalSet(5));
 
-        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+            ValType::I64,
+        )));
         f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
         {
             f.instruction(&Instruction::LocalGet(5));
@@ -4595,7 +5229,11 @@ impl CodeGen {
     /// Node: [prev: i32][next: i32][val: i64] (16 bytes)
 
     fn emit_linkedlist_new(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
         f.instruction(&Instruction::I32Const(12));
         f.instruction(&Instruction::Call(self.func_indices["__alloc"]));
@@ -4615,7 +5253,11 @@ impl CodeGen {
     }
 
     fn emit_linkedlist_append(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=list, 1=elem(i64), 2=node(i32), 3=tail(i32)
         let mut f = WasmFunc::new(vec![
             (1, ValType::I32), // 2: node
@@ -4670,7 +5312,11 @@ impl CodeGen {
     }
 
     fn emit_linkedlist_prepend(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![
             (1, ValType::I32), // 2: node
             (1, ValType::I32), // 3: head
@@ -4717,7 +5363,11 @@ impl CodeGen {
     }
 
     fn emit_linkedlist_get(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=list, 1=index(i64), 2=cur(i32), 3=i(i32)
         let mut f = WasmFunc::new(vec![
             (1, ValType::I32), // 2: cur
@@ -4761,7 +5411,11 @@ impl CodeGen {
 
     /// __str_contains(str: i32, sub: i32) -> i32 (0/1)
     fn emit_str_contains(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // 简单实现: indexOf >= 0
         let mut f = WasmFunc::new(vec![]);
         f.instruction(&Instruction::LocalGet(0));
@@ -4776,7 +5430,11 @@ impl CodeGen {
 
     /// __str_index_of(str: i32, sub: i32) -> i64 (-1 if not found)
     fn emit_str_index_of(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=str, 1=sub, 2=str_len(i32), 3=sub_len(i32), 4=i(i32),
         //         5=j(i32), 6=matched(i32)
         let mut f = WasmFunc::new(vec![
@@ -4804,7 +5462,9 @@ impl CodeGen {
         f.instruction(&Instruction::I32Const(0));
         f.instruction(&Instruction::LocalSet(4)); // i = 0
 
-        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(ValType::I64)));
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Result(
+            ValType::I64,
+        )));
         f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
         {
             // if i > str_len - sub_len → not found
@@ -4883,7 +5543,11 @@ impl CodeGen {
     /// __str_replace(str: i32, old: i32, new: i32) -> i32
     /// 找到第一个匹配并替换
     fn emit_str_replace(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=str, 1=old, 2=new, 3=idx(i64), 4=left(i32), 5=right(i32)
         let mut f = WasmFunc::new(vec![
             (1, ValType::I64), // 3: idx
@@ -4938,7 +5602,11 @@ impl CodeGen {
     /// __str_split(str: i32, sep: i32) -> i32 (Array<String>)
     /// 简化实现: 返回包含原字符串的单元素数组（完整版后续迭代）
     fn emit_str_split(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![(1, ValType::I32)]);
         // 分配单元素数组: [len=1][str_ptr as i64]
         f.instruction(&Instruction::I32Const(12)); // 4 + 8
@@ -4957,7 +5625,11 @@ impl CodeGen {
 
     #[allow(dead_code)]
     fn emit_str_split_FULL_PLACEHOLDER(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // 简化实现: 最多分 64 段
         // locals: 0=str, 1=sep, 2=str_len, 3=sep_len, 4=count, 5=pos,
         //         6=result, 7=idx, 8=start
@@ -4988,7 +5660,9 @@ impl CodeGen {
         // 如果 sep_len == 0, 返回只含原字符串的数组
         f.instruction(&Instruction::LocalGet(3));
         f.instruction(&Instruction::I32Eqz);
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+            ValType::I32,
+        )));
         {
             // 返回单元素数组
             f.instruction(&Instruction::I32Const(12)); // 4 + 8
@@ -5172,12 +5846,12 @@ impl CodeGen {
                 // stack: substring, dest_addr → 需要交换
                 // 用临时变量
                 f.instruction(&Instruction::I32Store(mem(WASI_SCRATCH as u64, 2))); // 保存 dest_addr
-                // stack: substring
+                                                                                    // stack: substring
                 f.instruction(&Instruction::I64ExtendI32S);
                 f.instruction(&Instruction::I32Const(WASI_SCRATCH));
                 f.instruction(&Instruction::I32Load(mem(0, 2))); // dest_addr
-                // stack: substring_i64, dest_addr → 需要交换
-                // 使用另一种方式
+                                                                 // stack: substring_i64, dest_addr → 需要交换
+                                                                 // 使用另一种方式
                 f.instruction(&Instruction::Drop); // drop dest_addr
                 f.instruction(&Instruction::Drop); // drop substring
 
@@ -5244,7 +5918,11 @@ impl CodeGen {
 
     /// __str_to_rune_array(str: i32) -> i32 (Array<Int64> where each elem is a byte/rune)
     fn emit_str_to_rune_array(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![
             (1, ValType::I32), // 1: str_len
             (1, ValType::I32), // 2: result
@@ -5304,7 +5982,11 @@ impl CodeGen {
 
     /// __sort_array(arr: i32): 原地插入排序 (i64 元素)
     fn emit_sort_array(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // 数组布局: [len: i32][elem0: i64]...
         // locals: 0=arr, 1=len(i32), 2=i(i32), 3=key(i64), 4=j(i32), 5=data_base(i32)
         let mut f = WasmFunc::new(vec![
@@ -5421,7 +6103,11 @@ impl CodeGen {
 
     /// __str_substring(str: i32, start: i32, end: i32) -> i32
     fn emit_str_substring(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=str, 1=start, 2=end, 3=len(i32), 4=result(i32), 5=i(i32)
         let mut f = WasmFunc::new(vec![
             (1, ValType::I32), // 3: len
@@ -5499,7 +6185,11 @@ impl CodeGen {
 
     /// __hashcode_i64(val_ptr: i32) -> i64: 简单哈希（直接返回值本身）
     fn emit_hashcode_i64(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         let mut f = WasmFunc::new(vec![]);
         // val_ptr 指向 i32 类型的指针
         f.instruction(&Instruction::LocalGet(0));
@@ -5513,7 +6203,11 @@ impl CodeGen {
 
     /// __str_trim(str: i32) -> i32: 去除首尾空白字符
     fn emit_str_trim(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=str, 1=len, 2=start, 3=end
         let mut f = WasmFunc::new(vec![(3, ValType::I32)]);
         let alloc_idx = self.func_indices["__alloc"];
@@ -5586,7 +6280,11 @@ impl CodeGen {
 
     /// __str_starts_with(str: i32, prefix: i32) -> i32 (0/1)
     fn emit_str_starts_with(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=str, 1=prefix, 2=str_len, 3=pre_len, 4=i
         let mut f = WasmFunc::new(vec![(3, ValType::I32)]);
         // str_len = str[0]
@@ -5615,7 +6313,7 @@ impl CodeGen {
         f.instruction(&Instruction::LocalGet(3));
         f.instruction(&Instruction::I32GeU);
         f.instruction(&Instruction::BrIf(1)); // done, all matched
-        // str[4+i] != prefix[4+i] → return 0
+                                              // str[4+i] != prefix[4+i] → return 0
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I32Const(4));
         f.instruction(&Instruction::I32Add);
@@ -5648,7 +6346,11 @@ impl CodeGen {
 
     /// __str_ends_with(str: i32, suffix: i32) -> i32 (0/1)
     fn emit_str_ends_with(&self) -> WasmFunc {
-        let mem = |offset: u64, align: u32| wasm_encoder::MemArg { offset, align, memory_index: 0 };
+        let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
+            offset,
+            align,
+            memory_index: 0,
+        };
         // locals: 0=str, 1=suffix, 2=str_len, 3=suf_len, 4=i, 5=offset
         let mut f = WasmFunc::new(vec![(4, ValType::I32)]);
         // str_len
@@ -5729,15 +6431,17 @@ impl CodeGen {
     /// 字符串布局: [len: i32][bytes...]
     fn emit_str_to_i64(&self) -> WasmFunc {
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
-            offset, align, memory_index: 0,
+            offset,
+            align,
+            memory_index: 0,
         };
         // locals: 0=str_ptr, 1=result(i64), 2=sign(i64), 3=i(i32), 4=len(i32), 5=byte(i32)
         let mut f = WasmFunc::new(vec![
-            (1, ValType::I64),  // result
-            (1, ValType::I64),  // sign
-            (1, ValType::I32),  // i (index)
-            (1, ValType::I32),  // len
-            (1, ValType::I32),  // byte
+            (1, ValType::I64), // result
+            (1, ValType::I64), // sign
+            (1, ValType::I32), // i (index)
+            (1, ValType::I32), // len
+            (1, ValType::I32), // byte
         ]);
 
         // result = 0
@@ -5792,7 +6496,7 @@ impl CodeGen {
 
         // while i < len
         f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // block for break
-        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));  // loop
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // loop
         {
             // if i >= len: break
             f.instruction(&Instruction::LocalGet(3));
@@ -5855,19 +6559,21 @@ impl CodeGen {
     /// 字符串布局: [len: i32][bytes...]
     fn emit_str_to_f64(&self) -> WasmFunc {
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
-            offset, align, memory_index: 0,
+            offset,
+            align,
+            memory_index: 0,
         };
         // locals: 0=str_ptr, 1=result(f64), 2=sign(f64), 3=i(i32), 4=len(i32),
         //         5=byte(i32), 6=frac_divisor(f64), 7=in_frac(i32), 8=digit(f64)
         let mut f = WasmFunc::new(vec![
-            (1, ValType::F64),  // 1: result
-            (1, ValType::F64),  // 2: sign
-            (1, ValType::I32),  // 3: i
-            (1, ValType::I32),  // 4: len
-            (1, ValType::I32),  // 5: byte
-            (1, ValType::F64),  // 6: frac_divisor
-            (1, ValType::I32),  // 7: in_frac (0=integer part, 1=fractional part)
-            (1, ValType::F64),  // 8: digit
+            (1, ValType::F64), // 1: result
+            (1, ValType::F64), // 2: sign
+            (1, ValType::I32), // 3: i
+            (1, ValType::I32), // 4: len
+            (1, ValType::I32), // 5: byte
+            (1, ValType::F64), // 6: frac_divisor
+            (1, ValType::I32), // 7: in_frac (0=integer part, 1=fractional part)
+            (1, ValType::F64), // 8: digit
         ]);
 
         // result = 0.0
@@ -5952,7 +6658,7 @@ impl CodeGen {
             {
                 f.instruction(&Instruction::I32Const(1));
                 f.instruction(&Instruction::LocalSet(7)); // in_frac = 1
-                // i++
+                                                          // i++
                 f.instruction(&Instruction::LocalGet(3));
                 f.instruction(&Instruction::I32Const(1));
                 f.instruction(&Instruction::I32Add);
@@ -6324,13 +7030,17 @@ mod tests {
                         name: "a".to_string(),
                         ty: Type::Int64,
                         default: None,
-                        variadic: false, is_named: false, is_inout: false,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
                     },
                     Param {
                         name: "b".to_string(),
                         ty: Type::Int64,
                         default: None,
-                        variadic: false, is_named: false, is_inout: false,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
                     },
                 ],
                 return_type: Some(Type::Int64),
@@ -6420,7 +7130,9 @@ mod tests {
                     name: "n".to_string(),
                     ty: Type::Int64,
                     default: None,
-                    variadic: false, is_named: false, is_inout: false,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
                 }],
                 return_type: Some(Type::Int64),
                 throws: None,
@@ -6623,7 +7335,10 @@ mod tests {
             "Point"
         );
         assert_eq!(
-            CodeGen::type_mangle_suffix(&Type::Struct("Pair".to_string(), vec![Type::Int64, Type::String])),
+            CodeGen::type_mangle_suffix(&Type::Struct(
+                "Pair".to_string(),
+                vec![Type::Int64, Type::String]
+            )),
             "Pair_Int64_String"
         );
         assert_eq!(
@@ -6645,7 +7360,10 @@ mod tests {
             "Option_Int64"
         );
         assert_eq!(
-            CodeGen::type_mangle_suffix(&Type::Result(Box::new(Type::Int64), Box::new(Type::String))),
+            CodeGen::type_mangle_suffix(&Type::Result(
+                Box::new(Type::Int64),
+                Box::new(Type::String)
+            )),
             "Result_Int64_String"
         );
         assert_eq!(

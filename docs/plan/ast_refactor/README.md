@@ -36,6 +36,14 @@
    - 中间表示 (IR) 的差异
    - 性能对比和建议
 
+### 性能优化
+
+10. **MONOMORPHIZATION_PLAN.md** - 全单态化支持实现计划
+    - Phase 1: 完善实例化收集 (2-3 天)
+    - Phase 2: 泛型方法单态化 (2 天)
+    - Phase 3: 标准库支持 (2-3 天)
+    - Phase 4: 优化与测试 (1-2 天)
+
 ### 数据文件
 
 6. **cjc_ast_nodes_list.txt** - CJC AST 节点列表

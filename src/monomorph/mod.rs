@@ -1,8 +1,11 @@
 //! 泛型单态化：将泛型函数与结构体按类型实参生成特化版本。
 
-use crate::ast::{ClassDef, ClassMethod, EnumDef, EnumVariant, Expr, FieldDef, Function, InitDef, MatchArm, Param, Pattern, Program, Stmt, StructDef};
-use std::collections::{HashMap, HashSet};
 use crate::ast::Type;
+use crate::ast::{
+    ClassDef, ClassMethod, EnumDef, EnumVariant, Expr, FieldDef, Function, InitDef, MatchArm,
+    Param, Pattern, Program, Stmt, StructDef,
+};
+use std::collections::{HashMap, HashSet};
 
 /// 类型实参到名字修饰后缀
 fn type_mangle_suffix(ty: &Type) -> String {
@@ -26,7 +29,14 @@ fn type_mangle_suffix(ty: &Type) -> String {
         Type::Unit => "Unit".to_string(),
         Type::String => "String".to_string(),
         Type::Array(inner) => format!("Array_{}", type_mangle_suffix(inner)),
-        Type::Tuple(types) => format!("Tuple_{}", types.iter().map(type_mangle_suffix).collect::<Vec<_>>().join("_")),
+        Type::Tuple(types) => format!(
+            "Tuple_{}",
+            types
+                .iter()
+                .map(type_mangle_suffix)
+                .collect::<Vec<_>>()
+                .join("_")
+        ),
         Type::Struct(s, args) => {
             if args.is_empty() {
                 s.clone()
@@ -34,7 +44,10 @@ fn type_mangle_suffix(ty: &Type) -> String {
                 format!(
                     "{}_{}",
                     s,
-                    args.iter().map(type_mangle_suffix).collect::<Vec<_>>().join("_")
+                    args.iter()
+                        .map(type_mangle_suffix)
+                        .collect::<Vec<_>>()
+                        .join("_")
                 )
             }
         }
@@ -62,12 +75,8 @@ fn type_mangle_suffix(ty: &Type) -> String {
         }
         Type::TypeParam(name) => name.clone(),
         Type::Slice(inner) => format!("Slice_{}", type_mangle_suffix(inner)),
-        Type::Map(k, v) => format!(
-            "Map_{}_{}",
-            type_mangle_suffix(k),
-            type_mangle_suffix(v)
-        ),
-        Type::This => "This".to_string(), // P2: This 类型
+        Type::Map(k, v) => format!("Map_{}_{}", type_mangle_suffix(k), type_mangle_suffix(v)),
+        Type::This => "This".to_string(),        // P2: This 类型
         Type::Qualified(path) => path.join("_"), // P1: 限定类型
     }
 }
@@ -92,12 +101,11 @@ pub fn mangle_name(name: &str, type_args: &[Type]) -> String {
 /// 在类型中替换 TypeParam
 fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
     match ty {
-        Type::TypeParam(name) => subst
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| ty.clone()),
+        Type::TypeParam(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Array(inner) => Type::Array(Box::new(substitute_type(inner, subst))),
-        Type::Tuple(types) => Type::Tuple(types.iter().map(|t| substitute_type(t, subst)).collect()),
+        Type::Tuple(types) => {
+            Type::Tuple(types.iter().map(|t| substitute_type(t, subst)).collect())
+        }
         Type::Struct(name, args) => Type::Struct(
             name.clone(),
             args.iter().map(|t| substitute_type(t, subst)).collect(),
@@ -209,11 +217,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             op,
             expr: Box::new(substitute_expr(*expr, subst, rewrites)),
         },
-        Binary {
-            op,
-            left,
-            right,
-        } => Binary {
+        Binary { op, left, right } => Binary {
             op,
             left: Box::new(substitute_expr(*left, subst, rewrites)),
             right: Box::new(substitute_expr(*right, subst, rewrites)),
@@ -223,6 +227,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             method,
             args,
             named_args,
+            type_args,
         } => MethodCall {
             object: Box::new(substitute_expr(*object, subst, rewrites)),
             method,
@@ -234,8 +239,14 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .into_iter()
                 .map(|(n, e)| (n, substitute_expr(e, subst, rewrites)))
                 .collect(),
+            type_args: type_args
+                .map(|ta| ta.into_iter().map(|t| substitute_type(&t, subst)).collect()),
         },
-        SuperCall { method, args, named_args } => SuperCall {
+        SuperCall {
+            method,
+            args,
+            named_args,
+        } => SuperCall {
             method,
             args: args
                 .into_iter()
@@ -253,8 +264,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
         } => If {
             cond: Box::new(substitute_expr(*cond, subst, rewrites)),
             then_branch: Box::new(substitute_expr(*then_branch, subst, rewrites)),
-            else_branch: else_branch
-                .map(|e| Box::new(substitute_expr(*e, subst, rewrites))),
+            else_branch: else_branch.map(|e| Box::new(substitute_expr(*e, subst, rewrites))),
         },
         IfLet {
             pattern,
@@ -265,8 +275,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             pattern: substitute_pattern(pattern, subst, rewrites),
             expr: Box::new(substitute_expr(*expr, subst, rewrites)),
             then_branch: Box::new(substitute_expr(*then_branch, subst, rewrites)),
-            else_branch: else_branch
-                .map(|e| Box::new(substitute_expr(*e, subst, rewrites))),
+            else_branch: else_branch.map(|e| Box::new(substitute_expr(*e, subst, rewrites))),
         },
         Block(stmts, expr) => Block(
             stmts
@@ -392,7 +401,12 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
         MapLiteral { entries } => MapLiteral {
             entries: entries
                 .into_iter()
-                .map(|(k, v)| (substitute_expr(k, subst, rewrites), substitute_expr(v, subst, rewrites)))
+                .map(|(k, v)| {
+                    (
+                        substitute_expr(k, subst, rewrites),
+                        substitute_expr(v, subst, rewrites),
+                    )
+                })
                 .collect(),
         },
         Rune(c) => Rune(c),
@@ -406,10 +420,12 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             parts
                 .into_iter()
                 .map(|p| match p {
-                    crate::ast::InterpolatePart::Literal(s) => crate::ast::InterpolatePart::Literal(s),
-                    crate::ast::InterpolatePart::Expr(e) => {
-                        crate::ast::InterpolatePart::Expr(Box::new(substitute_expr(*e, subst, rewrites)))
+                    crate::ast::InterpolatePart::Literal(s) => {
+                        crate::ast::InterpolatePart::Literal(s)
                     }
+                    crate::ast::InterpolatePart::Expr(e) => crate::ast::InterpolatePart::Expr(
+                        Box::new(substitute_expr(*e, subst, rewrites)),
+                    ),
                 })
                 .collect(),
         ),
@@ -452,10 +468,11 @@ fn substitute_pattern(
             .into_iter()
             .map(|p| substitute_pattern(p, subst, rewrites))
             .collect()),
-        Tuple(ps) => Tuple(ps
-            .into_iter()
-            .map(|p| substitute_pattern(p, subst, rewrites))
-            .collect()),
+        Tuple(ps) => Tuple(
+            ps.into_iter()
+                .map(|p| substitute_pattern(p, subst, rewrites))
+                .collect(),
+        ),
         Range {
             start,
             end,
@@ -494,11 +511,7 @@ fn substitute_match_arm(
 fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &RewriteMap) -> Stmt {
     use crate::ast::Stmt::*;
     match stmt {
-        Let {
-            pattern,
-            ty,
-            value,
-        } => Let {
+        Let { pattern, ty, value } => Let {
             pattern: substitute_pattern(pattern, subst, rewrites),
             ty: ty.map(|t| substitute_type(&t, subst)),
             value: substitute_expr(value, subst, rewrites),
@@ -592,7 +605,10 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .map(|p| crate::ast::Param {
                     name: p.name.clone(),
                     ty: substitute_type(&p.ty, subst),
-                    default: p.default.as_ref().map(|e| substitute_expr(e.clone(), subst, rewrites)),
+                    default: p
+                        .default
+                        .as_ref()
+                        .map(|e| substitute_expr(e.clone(), subst, rewrites)),
                     variadic: p.variadic,
                     is_named: p.is_named,
                     is_inout: p.is_inout,
@@ -618,7 +634,9 @@ struct RewriteMap {
 }
 
 /// 收集所有需要的泛型实例化
-fn collect_instantiations(program: &Program) -> (
+fn collect_instantiations(
+    program: &Program,
+) -> (
     HashSet<(String, Vec<Type>)>,
     HashSet<(String, Vec<Type>)>,
     HashSet<(String, Vec<Type>)>,
@@ -670,7 +688,9 @@ fn collect_instantiations(program: &Program) -> (
     ) {
         use crate::ast::Expr::*;
         match expr {
-            Call { name, type_args, .. } => {
+            Call {
+                name, type_args, ..
+            } => {
                 if let Option::Some(tas) = type_args.as_ref() {
                     if let Option::Some(n) = gf.get(name) {
                         if *n == tas.len() {
@@ -679,7 +699,9 @@ fn collect_instantiations(program: &Program) -> (
                     }
                 }
             }
-            StructInit { name, type_args, .. } => {
+            StructInit {
+                name, type_args, ..
+            } => {
                 if let Option::Some(tas) = type_args.as_ref() {
                     if let Option::Some(n) = gs.get(name) {
                         if *n == tas.len() {
@@ -694,7 +716,9 @@ fn collect_instantiations(program: &Program) -> (
                     }
                 }
             }
-            ConstructorCall { name, type_args, .. } => {
+            ConstructorCall {
+                name, type_args, ..
+            } => {
                 if let Option::Some(tas) = type_args.as_ref() {
                     if let Option::Some(n) = gs.get(name) {
                         if *n == tas.len() {
@@ -721,7 +745,19 @@ fn collect_instantiations(program: &Program) -> (
 
     for func in &program.functions {
         for stmt in &func.body {
-            let mut visit = |e: &Expr| visit_expr(e, &generic_functions, &generic_structs, &generic_enums, &generic_classes, &mut func_insts, &mut struct_insts, &mut enum_insts, &mut class_insts);
+            let mut visit = |e: &Expr| {
+                visit_expr(
+                    e,
+                    &generic_functions,
+                    &generic_structs,
+                    &generic_enums,
+                    &generic_classes,
+                    &mut func_insts,
+                    &mut struct_insts,
+                    &mut enum_insts,
+                    &mut class_insts,
+                )
+            };
             stmt.walk(&mut visit);
         }
     }
@@ -833,7 +869,9 @@ impl AstWalk for Expr {
             Cast { expr, .. } => expr.walk(f),
             Lambda { body, .. } => body.walk(f),
             Some(e) | Ok(e) | Err(e) | Try(e) | Throw(e) => e.as_ref().walk(f),
-            TryBlock { body, catch_body, .. } => {
+            TryBlock {
+                body, catch_body, ..
+            } => {
                 for s in body {
                     s.walk(f);
                 }
@@ -985,7 +1023,11 @@ fn check_constraints(
     type_args: &[Type],
     type_impls: &HashMap<String, HashSet<String>>,
 ) -> Vec<String> {
-    let subst: HashMap<_, _> = type_params.iter().cloned().zip(type_args.iter().cloned()).collect();
+    let subst: HashMap<_, _> = type_params
+        .iter()
+        .cloned()
+        .zip(type_args.iter().cloned())
+        .collect();
     let mut violations = Vec::new();
 
     for constraint in constraints {
@@ -1014,20 +1056,31 @@ fn check_constraints(
 
             // 内建类型隐含实现常见接口
             let builtin_impls: HashSet<&str> = match type_name {
-                "Int8" | "Int16" | "Int32" | "Int64" |
-                "UInt8" | "UInt16" | "UInt32" | "UInt64" |
-                "Float32" | "Float64" =>
+                "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64"
+                | "Float32" | "Float64" => {
                     ["Comparable", "Hashable", "Equatable", "ToString", "Numeric"]
-                        .iter().copied().collect(),
-                "Bool" =>
-                    ["Comparable", "Hashable", "Equatable", "ToString"]
-                        .iter().copied().collect(),
-                "Char" =>
-                    ["Comparable", "Hashable", "Equatable", "ToString"]
-                        .iter().copied().collect(),
-                "String" =>
-                    ["Comparable", "Hashable", "Equatable", "ToString", "Collection"]
-                        .iter().copied().collect(),
+                        .iter()
+                        .copied()
+                        .collect()
+                }
+                "Bool" => ["Comparable", "Hashable", "Equatable", "ToString"]
+                    .iter()
+                    .copied()
+                    .collect(),
+                "Char" => ["Comparable", "Hashable", "Equatable", "ToString"]
+                    .iter()
+                    .copied()
+                    .collect(),
+                "String" => [
+                    "Comparable",
+                    "Hashable",
+                    "Equatable",
+                    "ToString",
+                    "Collection",
+                ]
+                .iter()
+                .copied()
+                .collect(),
                 _ => HashSet::new(),
             };
 
@@ -1058,9 +1111,14 @@ pub fn monomorphize_program(program: &mut Program) {
 
     // 约束检查：泛型函数
     for (name, type_args) in &func_insts {
-        if let Some(def) = program.functions.iter().find(|f| &f.name == name && f.type_params.len() == type_args.len()) {
+        if let Some(def) = program
+            .functions
+            .iter()
+            .find(|f| &f.name == name && f.type_params.len() == type_args.len())
+        {
             if !def.constraints.is_empty() {
-                let violations = check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
+                let violations =
+                    check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
                 for v in &violations {
                     eprintln!("⚠ 泛型约束警告 (函数 {}): {}", name, v);
                 }
@@ -1070,9 +1128,14 @@ pub fn monomorphize_program(program: &mut Program) {
 
     // 约束检查：泛型结构体
     for (name, type_args) in &struct_insts {
-        if let Some(def) = program.structs.iter().find(|s| &s.name == name && s.type_params.len() == type_args.len()) {
+        if let Some(def) = program
+            .structs
+            .iter()
+            .find(|s| &s.name == name && s.type_params.len() == type_args.len())
+        {
             if !def.constraints.is_empty() {
-                let violations = check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
+                let violations =
+                    check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
                 for v in &violations {
                     eprintln!("⚠ 泛型约束警告 (结构体 {}): {}", name, v);
                 }
@@ -1082,9 +1145,14 @@ pub fn monomorphize_program(program: &mut Program) {
 
     // 约束检查：泛型枚举
     for (name, type_args) in &enum_insts {
-        if let Some(def) = program.enums.iter().find(|e| &e.name == name && e.type_params.len() == type_args.len()) {
+        if let Some(def) = program
+            .enums
+            .iter()
+            .find(|e| &e.name == name && e.type_params.len() == type_args.len())
+        {
             if !def.constraints.is_empty() {
-                let violations = check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
+                let violations =
+                    check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
                 for v in &violations {
                     eprintln!("⚠ 泛型约束警告 (枚举 {}): {}", name, v);
                 }
@@ -1094,9 +1162,14 @@ pub fn monomorphize_program(program: &mut Program) {
 
     // 约束检查：泛型类
     for (name, type_args) in &class_insts {
-        if let Some(def) = program.classes.iter().find(|c| &c.name == name && c.type_params.len() == type_args.len()) {
+        if let Some(def) = program
+            .classes
+            .iter()
+            .find(|c| &c.name == name && c.type_params.len() == type_args.len())
+        {
             if !def.constraints.is_empty() {
-                let violations = check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
+                let violations =
+                    check_constraints(&def.constraints, &def.type_params, type_args, &type_impls);
                 for v in &violations {
                     eprintln!("⚠ 泛型约束警告 (类 {}): {}", name, v);
                 }
@@ -1159,7 +1232,10 @@ pub fn monomorphize_program(program: &mut Program) {
             .map(|f| FieldDef {
                 name: f.name.clone(),
                 ty: substitute_type(&f.ty, &subst),
-                default: f.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                default: f
+                    .default
+                    .as_ref()
+                    .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
             })
             .collect();
         new_structs.push(StructDef {
@@ -1226,7 +1302,10 @@ pub fn monomorphize_program(program: &mut Program) {
             .map(|f| FieldDef {
                 name: f.name.clone(),
                 ty: substitute_type(&f.ty, &subst),
-                default: f.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                default: f
+                    .default
+                    .as_ref()
+                    .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
             })
             .collect();
         let methods: Vec<ClassMethod> = def
@@ -1246,34 +1325,72 @@ pub fn monomorphize_program(program: &mut Program) {
                         name: method_name,
                         type_params: vec![],
                         constraints: vec![],
-                        params: m.func.params.iter().map(|p| Param {
-                            name: p.name.clone(),
-                            ty: substitute_type(&p.ty, &subst),
-                            default: p.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
-                            variadic: p.variadic,
-                            is_named: p.is_named,
-                            is_inout: p.is_inout,
-                        }).collect(),
-                        return_type: m.func.return_type.as_ref().map(|t| substitute_type(t, &subst)),
+                        params: m
+                            .func
+                            .params
+                            .iter()
+                            .map(|p| Param {
+                                name: p.name.clone(),
+                                ty: substitute_type(&p.ty, &subst),
+                                default: p
+                                    .default
+                                    .as_ref()
+                                    .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                                variadic: p.variadic,
+                                is_named: p.is_named,
+                                is_inout: p.is_inout,
+                            })
+                            .collect(),
+                        return_type: m
+                            .func
+                            .return_type
+                            .as_ref()
+                            .map(|t| substitute_type(t, &subst)),
                         throws: m.func.throws.clone(),
-                        body: m.func.body.iter().cloned().map(|s| substitute_stmt(s, &subst, &rewrites)).collect(),
+                        body: m
+                            .func
+                            .body
+                            .iter()
+                            .cloned()
+                            .map(|s| substitute_stmt(s, &subst, &rewrites))
+                            .collect(),
                         extern_import: None,
                     },
                 }
             })
             .collect();
         let init = def.init.as_ref().map(|i| InitDef {
-            params: i.params.iter().map(|p| Param {
-                name: p.name.clone(),
-                ty: substitute_type(&p.ty, &subst),
-                default: p.default.as_ref().map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
-                variadic: p.variadic,
-                is_named: p.is_named,
-                is_inout: p.is_inout,
-            }).collect(),
-            body: i.body.iter().cloned().map(|s| substitute_stmt(s, &subst, &rewrites)).collect(),
+            params: i
+                .params
+                .iter()
+                .map(|p| Param {
+                    name: p.name.clone(),
+                    ty: substitute_type(&p.ty, &subst),
+                    default: p
+                        .default
+                        .as_ref()
+                        .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                    variadic: p.variadic,
+                    is_named: p.is_named,
+                    is_inout: p.is_inout,
+                })
+                .collect(),
+            body: i
+                .body
+                .iter()
+                .cloned()
+                .map(|s| substitute_stmt(s, &subst, &rewrites))
+                .collect(),
         });
-        let deinit = def.deinit.as_ref().map(|d| d.iter().cloned().map(|s| substitute_stmt(s, &subst, &rewrites)).collect());
+        let deinit = def.deinit.as_ref().map(|d| {
+            d.iter()
+                .cloned()
+                .map(|s| substitute_stmt(s, &subst, &rewrites))
+                .collect()
+        });
+        // 注意：单态化后的方法通过 new_classes 的 methods 字段传递给 codegen，
+        // 不需要再单独加入 program.functions（否则会导致重复导出）。
+
         new_classes.push(ClassDef {
             visibility: def.visibility.clone(),
             name: mangled_name,
@@ -1287,7 +1404,12 @@ pub fn monomorphize_program(program: &mut Program) {
             fields,
             init,
             deinit,
-            static_init: def.static_init.as_ref().map(|s| s.iter().cloned().map(|st| substitute_stmt(st, &subst, &rewrites)).collect()),
+            static_init: def.static_init.as_ref().map(|s| {
+                s.iter()
+                    .cloned()
+                    .map(|st| substitute_stmt(st, &subst, &rewrites))
+                    .collect()
+            }),
             methods,
             primary_ctor_params: vec![],
         });
@@ -1312,7 +1434,11 @@ pub fn monomorphize_program(program: &mut Program) {
         let def = program
             .functions
             .iter()
-            .find(|f| &f.name == name && f.type_params.len() == type_args.len() && f.extern_import.is_none())
+            .find(|f| {
+                &f.name == name
+                    && f.type_params.len() == type_args.len()
+                    && f.extern_import.is_none()
+            })
             .expect("泛型函数定义未找到");
         let subst: HashMap<_, _> = def
             .type_params
@@ -1336,10 +1462,7 @@ pub fn monomorphize_program(program: &mut Program) {
                 is_inout: p.is_inout,
             })
             .collect();
-        let return_type = def
-            .return_type
-            .as_ref()
-            .map(|t| substitute_type(t, &subst));
+        let return_type = def.return_type.as_ref().map(|t| substitute_type(t, &subst));
         let body: Vec<Stmt> = def
             .body
             .iter()
@@ -1413,7 +1536,10 @@ mod tests {
             "Foo"
         );
         assert_eq!(
-            type_mangle_suffix(&Type::Struct("Pair".to_string(), vec![Type::Int64, Type::String])),
+            type_mangle_suffix(&Type::Struct(
+                "Pair".to_string(),
+                vec![Type::Int64, Type::String]
+            )),
             "Pair_Int64_String"
         );
         assert_eq!(
@@ -1431,16 +1557,16 @@ mod tests {
             }),
             "Fn_Int64_Bool"
         );
-        assert_eq!(
-            type_mangle_suffix(&Type::TypeParam("T".to_string())),
-            "T"
-        );
+        assert_eq!(type_mangle_suffix(&Type::TypeParam("T".to_string())), "T");
     }
 
     #[test]
     fn test_mangle_name() {
         assert_eq!(mangle_name("foo", &[Type::Int64]), "foo$Int64");
-        assert_eq!(mangle_name("bar", &[Type::Int64, Type::String]), "bar$Int64$String");
+        assert_eq!(
+            mangle_name("bar", &[Type::Int64, Type::String]),
+            "bar$Int64$String"
+        );
         assert_eq!(mangle_name("baz", &[]), "baz$_");
     }
 

@@ -133,6 +133,10 @@ impl Parser {
                 self.advance();
                 Some("_".to_string())
             }
+            Some(Token::Loop) => {
+                self.advance();
+                Some("loop".to_string())
+            }
             _ => None,
         }
     }
@@ -178,22 +182,69 @@ impl Parser {
     }
 
     /// 跳过可选的属性注解 @Ident [ ... ]（如 @Deprecated[message: "..."]]），不解析内容
-    fn skip_optional_attributes(&mut self) -> Result<(), ParseErrorAt> {
+    /// Skip `@Attr` or `@Attr[...]` annotations.
+    /// Returns `true` if the following declaration should be skipped
+    /// (i.e. a `@When[os == "Windows"]` condition was encountered that
+    /// does not apply when targeting WASM/non-Windows platforms).
+    fn skip_optional_attributes(&mut self) -> Result<bool, ParseErrorAt> {
+        use crate::lexer::StringOrInterpolated;
+        let mut should_skip_next = false;
         while self.check(&Token::At) {
             self.advance(); // @
-            if self.advance_ident().is_none() {
-                return self.bail_at(ParseError::UnexpectedEof, self.at_prev());
-            }
+            let attr_name = match self.advance_ident() {
+                Some(n) => n,
+                None => return self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
+            };
             if self.check(&Token::LBracket) {
                 self.advance();
+                // For @When[...], collect tokens to evaluate the condition
+                let mut collected: Vec<Token> = Vec::new();
                 let mut depth = 1u32;
                 while depth > 0 {
                     match self.advance() {
-                        Some(Token::LBracket) => depth += 1,
-                        Some(Token::RBracket) => depth -= 1,
+                        Some(Token::LBracket) => { depth += 1; collected.push(Token::LBracket); }
+                        Some(Token::RBracket) => {
+                            depth -= 1;
+                            if depth > 0 { collected.push(Token::RBracket); }
+                        }
                         None => return self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
-                        _ => {}
+                        Some(tok) => collected.push(tok),
                     }
+                }
+                // Check for @When[os == "Windows"] — skip following decl on non-Windows
+                if attr_name == "When" {
+                    // Pattern: [Ident("os"), Eq, StringLit("Windows")]
+                    let is_os_eq_windows = matches!(
+                        collected.as_slice(),
+                        [Token::Ident(k), Token::Eq,
+                         Token::StringLit(StringOrInterpolated::Plain(v)), ..]
+                        if k == "os" && v == "Windows"
+                    );
+                    if is_os_eq_windows {
+                        should_skip_next = true;
+                    }
+                }
+            }
+        }
+        Ok(should_skip_next)
+    }
+
+    /// Skip the next top-level declaration (function/class/struct/enum/interface body)
+    /// by consuming tokens until the matching `}` is found.
+    fn skip_next_top_level_decl(&mut self) -> Result<(), ParseErrorAt> {
+        // Skip leading modifiers/keywords/idents until we hit `{`
+        while self.peek().is_some() && !self.check(&Token::LBrace) {
+            self.advance();
+        }
+        if self.check(&Token::LBrace) {
+            self.advance();
+            let mut depth = 1u32;
+            while depth > 0 {
+                match self.advance() {
+                    Some(Token::LBrace) => depth += 1,
+                    Some(Token::RBrace) => depth -= 1,
+                    None => return self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
+                    _ => {}
                 }
             }
         }

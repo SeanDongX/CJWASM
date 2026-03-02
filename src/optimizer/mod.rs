@@ -254,11 +254,13 @@ fn fold_expr(expr: Expr) -> Expr {
             method,
             args,
             named_args,
+            type_args,
         } => MethodCall {
             object: Box::new(fold_expr(*object)),
             method,
             args: args.into_iter().map(fold_expr).collect(),
             named_args: named_args.into_iter().map(|(n, e)| (n, fold_expr(e))).collect(),
+            type_args,
         },
         Array(elems) => Array(elems.into_iter().map(fold_expr).collect()),
         Tuple(elems) => Tuple(elems.into_iter().map(fold_expr).collect()),

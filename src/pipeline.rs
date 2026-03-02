@@ -90,7 +90,62 @@ fn strip_quote_contents(source: &str) -> String {
     out
 }
 
+/// 计算 bytes[start..end] 中未匹配的 " 数量（跳过 \" 转义）
+fn count_unmatched_quotes(bytes: &[u8], start: usize, end: usize) -> usize {
+    let mut count = 0usize;
+    let mut i = start;
+    while i < end {
+        if bytes[i] == b'\\' && i + 1 < end {
+            i += 2;
+        } else if bytes[i] == b'"' {
+            count += 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+/// 找到块注释的关闭位置（返回 */ 之后的位置）
+///
+/// 处理两种特殊情况：
+/// 1. `/*  "synchronized */`：`"` 未闭合，但 `*/` 是真正的注释关闭符
+/// 2. `/*  e.g. "/*xx*/" */`：`*/` 出现在字符串字面量内，外层 `*/` 才是注释关闭符
+///
+/// 算法：当 `*/` 前有奇数个 `"` 时（可能在字符串内）：
+///   - 若 `*/` 后紧跟 `"` → 此 `*/` 确实在字符串内（如 `"/*xx*/"`），跳过
+///   - 若 `*/` 后不是 `"` → 此 `*/` 是真正的注释关闭（如 `"synchronized */`），关闭注释
+fn find_comment_close(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    let mut first_skip_close = None;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            let q = count_unmatched_quotes(bytes, start, i);
+            if q % 2 == 0 {
+                // 偶数个引号：不在字符串内，关闭注释
+                return i + 2;
+            } else {
+                // 奇数个引号：可能在字符串内
+                let after = i + 2;
+                if after < bytes.len() && bytes[after] == b'"' {
+                    // */ 后紧跟 "，说明此 */ 在字符串内（如 "/*xx*/"），跳过
+                    first_skip_close.get_or_insert(i + 2);
+                    i += 2;
+                    continue;
+                } else {
+                    // */ 后不是 "，说明 " 只是注释内容（如 "synchronized），关闭注释
+                    return i + 2;
+                }
+            }
+        }
+        i += 1;
+    }
+    first_skip_close.unwrap_or(bytes.len())
+}
+
 /// 移除源码中的块注释 /* ... */，便于解析含版权头的 vendor 文件
+/// 通过引号计数正确处理注释内含 */ 的字符串（如 /* e.g. "/*xx*/" */）
 fn strip_block_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut i = 0;
@@ -98,14 +153,9 @@ fn strip_block_comments(source: &str) -> String {
     while i < bytes.len() {
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
             i += 2;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                    i += 2;
-                    out.push(' ');
-                    break;
-                }
-                i += 1;
-            }
+            let close = find_comment_close(bytes, i);
+            i = close;
+            out.push(' ');
             continue;
         }
         let ch = source[i..].chars().next().unwrap_or(' ');

@@ -2,7 +2,7 @@
 
 use super::{ParseError, ParseErrorAt, Parser};
 use crate::ast::{Expr, Literal, Pattern};
-use crate::lexer::{Token, StringOrInterpolated};
+use crate::lexer::{StringOrInterpolated, Token};
 
 impl Parser {
     /// 解析模式
@@ -34,7 +34,17 @@ impl Parser {
         match self.peek() {
             Some(Token::Underscore) => {
                 self.advance();
-                Ok(Pattern::Wildcard)
+                // cjc: 支持匿名类型测试模式 case _: Type =>
+                if self.check(&Token::Colon) {
+                    self.advance();
+                    let ty = self.parse_type()?;
+                    Ok(Pattern::TypeTest {
+                        binding: "_".to_string(),
+                        ty,
+                    })
+                } else {
+                    Ok(Pattern::Wildcard)
+                }
             }
             Some(Token::Some) => {
                 self.advance();
@@ -108,6 +118,11 @@ impl Parser {
                     }
                 }
                 Ok(Pattern::Literal(Literal::Integer(n)))
+            }
+            Some(Token::ByteLit(b)) => {
+                let b = *b;
+                self.advance();
+                Ok(Pattern::Literal(Literal::Integer(b as i64)))
             }
             Some(Token::CharLit(c)) => {
                 let c = *c;
@@ -186,13 +201,23 @@ impl Parser {
                                 });
                             }
 
-                            // 尝试解析为模式
-                            let pattern = self.parse_pattern()?;
+                            // 解析一个或多个模式（逗号分隔，多个时包成 Tuple）
+                            let first = self.parse_pattern()?;
+                            let payload = if self.check(&Token::Comma) {
+                                let mut patterns = vec![first];
+                                while self.check(&Token::Comma) {
+                                    self.advance();
+                                    patterns.push(self.parse_pattern()?);
+                                }
+                                Pattern::Tuple(patterns)
+                            } else {
+                                first
+                            };
                             self.expect(Token::RParen)?;
                             return Ok(Pattern::Variant {
                                 enum_name: name,
                                 variant_name: variant,
-                                payload: Some(Box::new(pattern)),
+                                payload: Some(Box::new(payload)),
                             });
                         } else {
                             return Ok(Pattern::Variant {
@@ -222,8 +247,18 @@ impl Parser {
                     let payload = if self.check(&Token::RParen) {
                         None
                     } else {
-                        let pattern = self.parse_pattern()?;
-                        Some(Box::new(pattern))
+                        // cjc: 变体可以有多个关联值，如 Short(r, _) 或 Full(s, r, _, _)
+                        let first = self.parse_pattern()?;
+                        if self.check(&Token::Comma) {
+                            let mut patterns = vec![first];
+                            while self.check(&Token::Comma) {
+                                self.advance();
+                                patterns.push(self.parse_pattern()?);
+                            }
+                            Some(Box::new(Pattern::Tuple(patterns)))
+                        } else {
+                            Some(Box::new(first))
+                        }
                     };
                     self.expect(Token::RParen)?;
                     Ok(Pattern::Variant {
@@ -269,7 +304,11 @@ impl Parser {
             let name = match self.advance() {
                 Some(Token::Ident(name)) => name,
                 Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()))
+                    eprintln!(
+                        "DEBUG pattern parse_struct_fields: unexpected token {:?}",
+                        tok
+                    );
+                    return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()));
                 }
                 None => return self.bail(ParseError::UnexpectedEof),
             };

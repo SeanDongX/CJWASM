@@ -295,7 +295,17 @@ impl Parser {
                 }
                 Ok(Type::Tuple(types))
             }
-            Some(Token::TypeRange) => Ok(Type::Range),
+            Some(Token::TypeRange) => {
+                // Range 可以是 Range 或 Range<T>
+                if self.check(&Token::Lt) {
+                    self.advance();
+                    let elem_type = self.parse_type()?;
+                    self.expect(Token::Gt)?;
+                    Ok(Type::Struct("Range".to_string(), vec![elem_type]))
+                } else {
+                    Ok(Type::Range)
+                }
+            }
             Some(Token::TypeThis) => Ok(Type::This), // P2: This 类型
             Some(Token::TypeOption) => {
                 self.expect(Token::Lt)?;

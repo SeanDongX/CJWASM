@@ -87,7 +87,10 @@ impl Type {
             Type::Result(_, _) => ValType::I32,
             Type::Slice(_) => ValType::I32,
             Type::Map(_, _) => ValType::I32,
-            Type::TypeParam(_) => panic!("TypeParam 不能直接转换为 WASM，需先单态化"),
+            Type::TypeParam(_) => {
+                eprintln!("警告: TypeParam 转换为 i64（需要单态化）");
+                ValType::I64
+            }
             Type::This => ValType::I32, // This 类型表示类对象，使用指针
             Type::Qualified(_) => ValType::I32, // 限定类型通常是类或结构体
         }
@@ -115,8 +118,8 @@ impl Type {
             Type::Result(_, _) => 4,
             Type::Slice(_) => 4,
             Type::Map(_, _) => 4,
-            Type::TypeParam(_) => panic!("TypeParam 不能直接计算 size，需先单态化"),
-            Type::This => 4, // This 类型表示类对象指针
+            Type::TypeParam(_) => 8, // 默认指针大小（单态化前使用）
+            Type::This => 4,         // This 类型表示类对象指针
             Type::Qualified(_) => 4, // 限定类型通常是类或结构体指针
         }
     }
@@ -156,9 +159,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "TypeParam 不能直接转换")]
-    fn test_to_wasm_typeparam_panic() {
-        Type::TypeParam("T".to_string()).to_wasm();
+    fn test_to_wasm_typeparam() {
+        assert_eq!(Type::TypeParam("T".to_string()).to_wasm(), ValType::I64);
     }
 
     #[test]
@@ -171,9 +173,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "TypeParam 不能直接计算 size")]
-    fn test_size_typeparam_panic() {
-        Type::TypeParam("T".to_string()).size();
+    fn test_size_typeparam_default() {
+        // TypeParam returns default pointer size (8) without panicking
+        assert_eq!(Type::TypeParam("T".to_string()).size(), 8);
     }
 
     #[test]

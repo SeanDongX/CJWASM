@@ -84,13 +84,15 @@ pub enum Expr {
         /// P2.9: 命名参数 name!: value
         named_args: Vec<(String, Expr)>,
     },
-    /// 方法调用 (obj.method(args))
+    /// 方法调用 (obj.method(args) 或 obj.method<T>(args))
     MethodCall {
         object: Box<Expr>,
         method: String,
         args: Vec<Expr>,
         /// P2.9: 命名参数
         named_args: Vec<(String, Expr)>,
+        /// 泛型类型参数 (如 obj.method<T, U>(args))
+        type_args: Option<Vec<Type>>,
     },
     /// super 调用：super.method(args) 或 super(args) 调用父类
     SuperCall {
@@ -98,6 +100,10 @@ pub enum Expr {
         args: Vec<Expr>,
         /// P2.9: 命名参数
         named_args: Vec<(String, Expr)>,
+    },
+    /// super 字段访问：super.field
+    SuperFieldAccess {
+        field: String,
     },
     /// if 表达式
     If {
@@ -411,8 +417,12 @@ pub enum AssignTarget {
     FieldPath { base: String, fields: Vec<String> },
     /// 链式字段后索引 obj.field1.field2[i]（如 this.outputBOS.outBuf[i]）
     IndexPath { base: String, fields: Vec<String>, index: Box<Expr> },
+    /// 复杂表达式索引 expr[i]（如 obj.method()[i]）
+    ExprIndex { expr: Box<Expr>, index: Box<Expr> },
     /// 元组解构 (a, b) = expr
     Tuple(Vec<AssignTarget>),
+    /// super 字段访问 super.field
+    SuperField { field: String },
 }
 
 /// 结构体字段定义
