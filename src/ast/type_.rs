@@ -88,8 +88,7 @@ impl Type {
             Type::Slice(_) => ValType::I32,
             Type::Map(_, _) => ValType::I32,
             Type::TypeParam(_) => {
-                eprintln!("警告: TypeParam 转换为 i64（需要单态化）");
-                ValType::I64
+                ValType::I64 // 单态化前默认 i64（宽类型，避免信息丢失）
             }
             Type::This => ValType::I32, // This 类型表示类对象，使用指针
             Type::Qualified(_) => ValType::I32, // 限定类型通常是类或结构体

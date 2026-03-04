@@ -1087,6 +1087,22 @@ impl CodeGen {
                 "size" => Some(Type::Int64),
                 _ => None,
             },
+            // InputStream/Reader/Stream 方法返回类型
+            // 只声明有意义的非 Unit 返回类型（read 返回 Int64 字节数）
+            // write/flush/close 等 void 方法不在此声明，由 stub 生成 i32.const 0 占位
+            Some(Type::Struct(ref name, _))
+                if name.contains("InputStream")
+                    || name.contains("Reader")
+                    || name.contains("Stream") =>
+            {
+                match method {
+                    "read" | "readByte" | "readBytes" | "readLine" => Some(Type::Int64),
+                    _ => None,
+                }
+            }
+            // getOrThrow/unwrap on non-Option type: pass-through semantics
+            // (Our HashMap.get() returns V directly, not Option<V>, so getOrThrow is a no-op)
+            Some(ty) if matches!(method, "getOrThrow" | "unwrap") => Some(ty.clone()),
             _ => None,
         }
     }
@@ -1780,6 +1796,16 @@ impl CodeGen {
     }
 
     /// 当值类型与目标类型不匹配时，生成自动类型转换指令
+    /// 在布尔上下文中，判断表达式是否需要 I32WrapI64。
+    /// 仅当 AST 类型确认为 Int64/UInt64/IntNative/UIntNative 时才 wrap；
+    /// TypeParam 即使 to_wasm() = I64，也可能已单态化为 i32，保守不 wrap。
+    fn needs_i64_to_i32_wrap(&self, expr: &Expr, locals: &LocalsBuilder) -> bool {
+        matches!(
+            self.infer_ast_type_with_locals(expr, locals).as_ref(),
+            Some(Type::Int64 | Type::UInt64 | Type::IntNative | Type::UIntNative)
+        )
+    }
+
     fn emit_type_coercion(&self, func: &mut WasmFunc, src: ValType, dst: ValType) {
         if src == dst {
             return;
@@ -1827,7 +1853,13 @@ impl CodeGen {
 
     /// 按 AST 类型生成 load 指令（栈顶为 i32 地址）
     fn emit_load_by_type(&self, func: &mut WasmFunc, ty: &Type) {
-        let instr = match ty.to_wasm() {
+        // 泛型类型参数 (TypeParam) 在运行时通常是引用类型（i32 指针）
+        let wasm_ty = if matches!(ty, Type::TypeParam(_)) {
+            ValType::I32
+        } else {
+            ty.to_wasm()
+        };
+        let instr = match wasm_ty {
             ValType::I32 => Instruction::I32Load(wasm_encoder::MemArg {
                 offset: 0,
                 align: 2,
@@ -2013,10 +2045,19 @@ impl CodeGen {
 
     /// 类型推断（含局部变量上下文），优先使用 AST 类型推断结果
     fn infer_type_with_locals(&self, expr: &Expr, locals: &LocalsBuilder) -> ValType {
-        self.infer_ast_type_with_locals(expr, locals)
+        if let Some(ast_ty) = self
+            .infer_ast_type_with_locals(expr, locals)
             .filter(|t| t != &Type::Unit && t != &Type::Nothing)
-            .map(|t| t.to_wasm())
-            .unwrap_or_else(|| self.infer_type(expr))
+        {
+            return ast_ty.to_wasm();
+        }
+        // Fallback: for Var, use the actual WASM type from locals (avoids incorrect I64 default)
+        if let Expr::Var(name) = expr {
+            if let Some(vt) = locals.get_valtype(name) {
+                return vt;
+            }
+        }
+        self.infer_type(expr)
     }
 
     /// 简单的类型推断
@@ -2244,6 +2285,20 @@ impl CodeGen {
                 }
                 _ => false,
             },
+            Some(Type::UInt32) => match method {
+                "toString" => {
+                    self.compile_expr(object, locals, func, loop_ctx);
+                    func.instruction(&Instruction::Call(self.func_indices["__u32_to_str"]));
+                    true
+                }
+                "toFloat64" => {
+                    self.compile_expr(object, locals, func, loop_ctx);
+                    func.instruction(&Instruction::I64ExtendI32U);
+                    func.instruction(&Instruction::F64ConvertI64U);
+                    true
+                }
+                _ => false,
+            },
             Some(Type::Float64) => match method {
                 "toString" => {
                     self.compile_expr(object, locals, func, loop_ctx);
@@ -2286,9 +2341,8 @@ impl CodeGen {
                 "toString" => {
                     self.compile_expr(object, locals, func, loop_ctx);
                     // Bool 在 WASM 中是 i32，需要传给 __bool_to_str
-                    // 但如果是 i64（某些代码路径），需要 wrap
-                    let vt = self.infer_type_with_locals(object, locals);
-                    if vt == ValType::I64 {
+                    // 仅当 AST 类型确认为 i64 时才 wrap
+                    if self.needs_i64_to_i32_wrap(object, locals) {
                         func.instruction(&Instruction::I32WrapI64);
                     }
                     func.instruction(&Instruction::Call(self.func_indices["__bool_to_str"]));
@@ -2652,10 +2706,19 @@ impl CodeGen {
                                 return true;
                             }
                             // HashMap/HashSet 方法（通过 ArrayList 类型推断的 HashMap 也可能走到这里）
+                            // 注意：此处无 Map 类型信息，通过表达式推断 key/val 的 WASM 类型
                             "put" if args.len() == 2 => {
                                 self.compile_expr(object, locals, func, loop_ctx);
                                 self.compile_expr(&args[0], locals, func, loop_ctx);
+                                let k_ty = self.infer_type_with_locals(&args[0], locals);
+                                if k_ty == wasm_encoder::ValType::I32 {
+                                    func.instruction(&Instruction::I64ExtendI32S);
+                                }
                                 self.compile_expr(&args[1], locals, func, loop_ctx);
+                                let v_ty = self.infer_type_with_locals(&args[1], locals);
+                                if v_ty == wasm_encoder::ValType::I32 {
+                                    func.instruction(&Instruction::I64ExtendI32S);
+                                }
                                 func.instruction(&Instruction::Call(
                                     self.func_indices["__hashmap_put"],
                                 ));
@@ -2665,15 +2728,22 @@ impl CodeGen {
                             "containsKey" if args.len() == 1 => {
                                 self.compile_expr(object, locals, func, loop_ctx);
                                 self.compile_expr(&args[0], locals, func, loop_ctx);
+                                let k_ty = self.infer_type_with_locals(&args[0], locals);
+                                if k_ty == wasm_encoder::ValType::I32 {
+                                    func.instruction(&Instruction::I64ExtendI32S);
+                                }
                                 func.instruction(&Instruction::Call(
                                     self.func_indices["__hashmap_contains"],
                                 ));
-                                // __hashmap_contains 返回 i32 (Bool)，不需要扩展
                                 return true;
                             }
                             "add" if args.len() == 1 => {
                                 self.compile_expr(object, locals, func, loop_ctx);
                                 self.compile_expr(&args[0], locals, func, loop_ctx);
+                                let k_ty = self.infer_type_with_locals(&args[0], locals);
+                                if k_ty == wasm_encoder::ValType::I32 {
+                                    func.instruction(&Instruction::I64ExtendI32S);
+                                }
                                 func.instruction(&Instruction::I64Const(0));
                                 func.instruction(&Instruction::Call(
                                     self.func_indices["__hashmap_put"],
@@ -2684,10 +2754,13 @@ impl CodeGen {
                             "contains" if args.len() == 1 => {
                                 self.compile_expr(object, locals, func, loop_ctx);
                                 self.compile_expr(&args[0], locals, func, loop_ctx);
+                                let k_ty = self.infer_type_with_locals(&args[0], locals);
+                                if k_ty == wasm_encoder::ValType::I32 {
+                                    func.instruction(&Instruction::I64ExtendI32S);
+                                }
                                 func.instruction(&Instruction::Call(
                                     self.func_indices["__hashmap_contains"],
                                 ));
-                                // __hashmap_contains 返回 i32 (Bool)，不需要扩展
                                 return true;
                             }
                             _ => return false,
@@ -2696,12 +2769,22 @@ impl CodeGen {
                 }
             }
             // P4: Map 类型方法分发（HashMap/HashSet）
-            Some(Type::Map(..)) => {
+            Some(Type::Map(ref key_ty, ref val_ty)) => {
+                // __hashmap_* 运行时函数均以 i64 传递 key（和 val）
+                // 当 key/val 的 WASM 类型为 i32（如 UInt32、Rune、Int32 等）时需要先扩展
+                let key_wasm = key_ty.to_wasm();
+                let val_wasm = val_ty.to_wasm();
                 match method {
                     "put" if args.len() == 2 => {
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
+                        if key_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         self.compile_expr(&args[1], locals, func, loop_ctx);
+                        if val_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
                         func.instruction(&Instruction::I64Const(0));
                         true
@@ -2709,28 +2792,47 @@ impl CodeGen {
                     "get" if args.len() == 1 => {
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
+                        if key_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         func.instruction(&Instruction::Call(self.func_indices["__hashmap_get"]));
+                        // __hashmap_get 返回 i64；若 val 类型本为 i32（指针），则截断回 i32
+                        if val_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I32WrapI64);
+                        }
                         true
                     }
                     "containsKey" if args.len() == 1 => {
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
+                        if key_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         func.instruction(&Instruction::Call(
                             self.func_indices["__hashmap_contains"],
                         ));
-                        // __hashmap_contains 返回 i32 (Bool)，不需要扩展
+                        // __hashmap_contains 返回 i32 (Bool)，不需要进一步处理
                         true
                     }
                     "remove" if args.len() == 1 => {
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
+                        if key_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         func.instruction(&Instruction::Call(self.func_indices["__hashmap_remove"]));
+                        if val_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I32WrapI64);
+                        }
                         true
                     }
                     "add" if args.len() == 1 => {
-                        // HashSet.add(elem) → hashmap_put(set, elem, 0)
+                        // HashSet.add(elem) → hashmap_put(set, elem_as_i64, 0)
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
+                        if key_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         func.instruction(&Instruction::I64Const(0));
                         func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
                         func.instruction(&Instruction::I64Const(0));
@@ -2739,10 +2841,13 @@ impl CodeGen {
                     "contains" if args.len() == 1 => {
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
+                        if key_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         func.instruction(&Instruction::Call(
                             self.func_indices["__hashmap_contains"],
                         ));
-                        // __hashmap_contains 返回 i32 (Bool)，不需要扩展
+                        // __hashmap_contains 返回 i32 (Bool)，不需要进一步处理
                         true
                     }
                     "size" if args.is_empty() => {
@@ -2966,12 +3071,23 @@ impl CodeGen {
                     "get" if args.len() == 1 => {
                         // P3: 按对象类型分派 get —— HashMap 用 __hashmap_get，ArrayList 用 __arraylist_get
                         let is_hashmap = matches!(&inferred, Some(Type::Map(..)));
+                        let (key_wasm, val_wasm) = if let Some(Type::Map(ref k, ref v)) = inferred {
+                            (k.to_wasm(), v.to_wasm())
+                        } else {
+                            (wasm_encoder::ValType::I64, wasm_encoder::ValType::I64)
+                        };
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         if is_hashmap {
+                            if key_wasm == wasm_encoder::ValType::I32 {
+                                func.instruction(&Instruction::I64ExtendI32S);
+                            }
                             func.instruction(&Instruction::Call(
                                 self.func_indices["__hashmap_get"],
                             ));
+                            if val_wasm == wasm_encoder::ValType::I32 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
                         } else {
                             func.instruction(&Instruction::Call(
                                 self.func_indices["__arraylist_get"],
@@ -2990,12 +3106,23 @@ impl CodeGen {
                     "remove" if args.len() == 1 => {
                         // P4: 按对象类型分派 remove
                         let is_hashmap = matches!(&inferred, Some(Type::Map(..)));
+                        let (key_wasm, val_wasm) = if let Some(Type::Map(ref k, ref v)) = inferred {
+                            (k.to_wasm(), v.to_wasm())
+                        } else {
+                            (wasm_encoder::ValType::I64, wasm_encoder::ValType::I64)
+                        };
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
                         if is_hashmap {
+                            if key_wasm == wasm_encoder::ValType::I32 {
+                                func.instruction(&Instruction::I64ExtendI32S);
+                            }
                             func.instruction(&Instruction::Call(
                                 self.func_indices["__hashmap_remove"],
                             ));
+                            if val_wasm == wasm_encoder::ValType::I32 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
                         } else {
                             func.instruction(&Instruction::Call(
                                 self.func_indices["__arraylist_remove"],
@@ -3005,16 +3132,36 @@ impl CodeGen {
                     }
                     "put" if args.len() == 2 => {
                         // HashMap.put(key, val)
+                        // 提取 key 和 val 类型以进行类型转换
+                        let (key_wasm, val_wasm) = if let Some(Type::Map(ref k, ref v)) = inferred {
+                            (k.to_wasm(), v.to_wasm())
+                        } else {
+                            (wasm_encoder::ValType::I64, wasm_encoder::ValType::I64)
+                        };
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
+                        if key_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         self.compile_expr(&args[1], locals, func, loop_ctx);
+                        if val_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
                         func.instruction(&Instruction::I64Const(0)); // void → 哑值
                         true
                     }
                     "containsKey" if args.len() == 1 => {
+                        let (key_wasm, _) = if let Some(Type::Map(ref k, ref v)) = inferred {
+                            (k.to_wasm(), v.to_wasm())
+                        } else {
+                            (wasm_encoder::ValType::I64, wasm_encoder::ValType::I64)
+                        };
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
+                        if key_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         func.instruction(&Instruction::Call(
                             self.func_indices["__hashmap_contains"],
                         ));
@@ -3024,8 +3171,16 @@ impl CodeGen {
                     }
                     "add" if args.len() == 1 => {
                         // HashSet.add(elem) → hashmap_put(set, elem, 0)
+                        let (key_wasm, _) = if let Some(Type::Map(ref k, ref v)) = inferred {
+                            (k.to_wasm(), v.to_wasm())
+                        } else {
+                            (wasm_encoder::ValType::I64, wasm_encoder::ValType::I64)
+                        };
                         self.compile_expr(object, locals, func, loop_ctx);
                         self.compile_expr(&args[0], locals, func, loop_ctx);
+                        if key_wasm == wasm_encoder::ValType::I32 {
+                            func.instruction(&Instruction::I64ExtendI32S);
+                        }
                         func.instruction(&Instruction::I64Const(0)); // dummy value
                         func.instruction(&Instruction::Call(self.func_indices["__hashmap_put"]));
                         func.instruction(&Instruction::I64Const(0)); // void → 哑值
@@ -3341,7 +3496,9 @@ impl CodeGen {
                             func.instruction(&Instruction::I32Const(4)); // 跳过长度字段
                             func.instruction(&Instruction::I32Add);
                             self.compile_expr(index, locals, func, loop_ctx);
-                            func.instruction(&Instruction::I32WrapI64);
+                            if self.infer_type_with_locals(index, locals) == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
                             func.instruction(&Instruction::I32Const(8)); // 元素大小
                             func.instruction(&Instruction::I32Mul);
                             func.instruction(&Instruction::I32Add);
@@ -3366,10 +3523,16 @@ impl CodeGen {
                                 field: array.clone(),
                             };
                             self.compile_expr(&arr_expr, locals, func, loop_ctx);
+                            // 如果字段返回 I64（TypeParam），需要 wrap 为 I32
+                            if self.infer_type_with_locals(&arr_expr, locals) == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
                             func.instruction(&Instruction::I32Const(4));
                             func.instruction(&Instruction::I32Add);
                             self.compile_expr(index, locals, func, loop_ctx);
-                            func.instruction(&Instruction::I32WrapI64);
+                            if self.infer_type_with_locals(index, locals) == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
                             func.instruction(&Instruction::I32Const(8));
                             func.instruction(&Instruction::I32Mul);
                             func.instruction(&Instruction::I32Add);
@@ -3486,10 +3649,16 @@ impl CodeGen {
                             };
                         }
                         self.compile_expr(&arr_expr, locals, func, loop_ctx);
+                        // 如果数组基址是 I64（TypeParam），需要 wrap 为 I32
+                        if self.infer_type_with_locals(&arr_expr, locals) == ValType::I64 {
+                            func.instruction(&Instruction::I32WrapI64);
+                        }
                         func.instruction(&Instruction::I32Const(4));
                         func.instruction(&Instruction::I32Add);
                         self.compile_expr(index, locals, func, loop_ctx);
-                        func.instruction(&Instruction::I32WrapI64);
+                        if self.infer_type_with_locals(index, locals) == ValType::I64 {
+                            func.instruction(&Instruction::I32WrapI64);
+                        }
                         func.instruction(&Instruction::I32Const(8));
                         func.instruction(&Instruction::I32Mul);
                         func.instruction(&Instruction::I32Add);
@@ -3503,10 +3672,16 @@ impl CodeGen {
                     AssignTarget::ExprIndex { expr, index } => {
                         // expr[i] = value：编译表达式得数组指针，再 +4+index*8 后存储
                         self.compile_expr(expr, locals, func, loop_ctx);
+                        // 如果数组基址是 I64（TypeParam），需要 wrap 为 I32
+                        if self.infer_type_with_locals(expr, locals) == ValType::I64 {
+                            func.instruction(&Instruction::I32WrapI64);
+                        }
                         func.instruction(&Instruction::I32Const(4));
                         func.instruction(&Instruction::I32Add);
                         self.compile_expr(index, locals, func, loop_ctx);
-                        func.instruction(&Instruction::I32WrapI64);
+                        if self.infer_type_with_locals(index, locals) == ValType::I64 {
+                            func.instruction(&Instruction::I32WrapI64);
+                        }
                         func.instruction(&Instruction::I32Const(8));
                         func.instruction(&Instruction::I32Mul);
                         func.instruction(&Instruction::I32Add);
@@ -3608,9 +3783,31 @@ impl CodeGen {
             }
             Stmt::Return(Some(expr)) => {
                 self.compile_expr(expr, locals, func, loop_ctx);
-                // 类型协调：确保返回值类型与函数返回类型匹配
-                // 注意：这里需要从上下文获取函数返回类型，暂时跳过
-                // TODO: 在 compile_function 中传递 expected_return_type
+                // 类型协调：仅对能确定实际类型的表达式做协调，避免误推断
+                if let Some(expected) = self.current_return_wasm_type.get() {
+                    let actual = match expr {
+                        // Integer 字面量始终产生 I64
+                        Expr::Integer(_) => Some(ValType::I64),
+                        // Var：用 locals 中的实际 WASM 类型
+                        Expr::Var(name) => locals.get_valtype(name),
+                        // Bool 始终产生 I32
+                        Expr::Bool(_) => Some(ValType::I32),
+                        // 其他：通过完整推断但仅在 AST 类型可信时使用
+                        _ => {
+                            let inferred = self.infer_type_with_locals(expr, locals);
+                            // 只在推断结果不是"最终回退 I64"时使用，
+                            // 通过检查 AST 类型是否真正存在来判断
+                            if self.infer_ast_type_with_locals(expr, locals).is_some() {
+                                Some(inferred)
+                            } else {
+                                None // 跳过不确定的情况，避免误插入 I32WrapI64
+                            }
+                        }
+                    };
+                    if let Some(actual) = actual {
+                        self.emit_type_coercion(func, actual, expected);
+                    }
+                }
                 func.instruction(&Instruction::Return);
             }
             Stmt::Return(None) => {
@@ -3658,8 +3855,8 @@ impl CodeGen {
                 func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
 
                 self.compile_expr(cond, locals, func, loop_ctx);
-                // 条件必须是 i32；仅当条件表达式结果是 i64 时才 wrap
-                if self.infer_type_with_locals(cond, locals) == ValType::I64 {
+                // 条件必须是 i32；仅当 AST 类型确认为 i64 时才 wrap（TypeParam 保守不 wrap）
+                if self.needs_i64_to_i32_wrap(cond, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -3992,7 +4189,7 @@ impl CodeGen {
                 }
 
                 self.compile_expr(cond, locals, func, loop_ctx);
-                if self.infer_type_with_locals(cond, locals) == ValType::I64 {
+                if self.needs_i64_to_i32_wrap(cond, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::BrIf(0)); // continue looping if true
@@ -4373,7 +4570,7 @@ impl CodeGen {
                 expr,
             } => {
                 self.compile_expr(expr, locals, func, loop_ctx);
-                if self.infer_type_with_locals(expr, locals) == ValType::I64 {
+                if self.needs_i64_to_i32_wrap(expr, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -4432,7 +4629,7 @@ impl CodeGen {
             } => {
                 // 短路与：left && right，结果为 i32 (0/1)
                 self.compile_expr(left, locals, func, loop_ctx);
-                if self.infer_type_with_locals(left, locals) == ValType::I64 {
+                if self.needs_i64_to_i32_wrap(left, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -4442,7 +4639,7 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(0));
                 func.instruction(&Instruction::Else);
                 self.compile_expr(right, locals, func, loop_ctx);
-                if self.infer_type_with_locals(right, locals) == ValType::I64 {
+                if self.needs_i64_to_i32_wrap(right, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -4458,7 +4655,7 @@ impl CodeGen {
                 // 短路或：left || right，用 __logical_tmp 保存 left，结果为 i32 (0/1)
                 let tmp = locals.get("__logical_tmp").expect("__logical_tmp 未找到");
                 self.compile_expr(left, locals, func, loop_ctx);
-                if self.infer_type_with_locals(left, locals) == ValType::I64 {
+                if self.needs_i64_to_i32_wrap(left, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::LocalSet(tmp));
@@ -4468,7 +4665,7 @@ impl CodeGen {
                     ValType::I32,
                 )));
                 self.compile_expr(right, locals, func, loop_ctx);
-                if self.infer_type_with_locals(right, locals) == ValType::I64 {
+                if self.needs_i64_to_i32_wrap(right, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -4495,10 +4692,9 @@ impl CodeGen {
                     named_args: vec![],
                     type_args: None,
                 };
-                let result_type = self.infer_type_with_locals(&contains_call, locals);
                 self.compile_expr(&contains_call, locals, func, loop_ctx);
                 // contains 返回值可能是 i64（HashSet/HashMap）或 i32（String），需统一到 i32 后取反
-                if result_type == ValType::I64 {
+                if self.needs_i64_to_i32_wrap(&contains_call, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -4607,11 +4803,13 @@ impl CodeGen {
                 self.compile_expr(left, locals, func, loop_ctx);
                 self.compile_expr(right, locals, func, loop_ctx);
 
-                // 类型匹配修正：如果左侧是 i32 但右侧推断为 i64（常见于整数字面量 `1`），
+                // 类型匹配修正：如果左侧是 i32 但右侧确认为 i64（整数字面量或 Int64/UInt64 类型），
                 // 在右值后插入 i32.wrap_i64；反之插入 i64.extend_i32_s。
+                // 注意：TypeParam 在 infer_type_with_locals 中返回 I64 但实际为 I32，
+                // 必须使用 needs_i64_to_i32_wrap 来确认是否真正为 I64（避免在 I32 上调 I32WrapI64）。
                 let left_wasm_ty = self.infer_type_with_locals(left, locals);
                 let right_wasm_ty = self.infer_type_with_locals(right, locals);
-                if left_wasm_ty == ValType::I32 && right_wasm_ty == ValType::I64 {
+                if left_wasm_ty == ValType::I32 && self.needs_i64_to_i32_wrap(right, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 } else if left_wasm_ty == ValType::I64 && right_wasm_ty == ValType::I32 {
                     func.instruction(&Instruction::I64ExtendI32S);
@@ -4896,9 +5094,19 @@ impl CodeGen {
                 let src = self.infer_type_with_locals(expr, locals);
                 let dst = target_ty.to_wasm();
                 if src != dst {
+                    // 获取源表达式的 AST 类型以区分有符号/无符号
+                    let src_ast_ty = self.infer_ast_type_with_locals(expr, locals);
                     let conv = match (src, dst) {
                         (ValType::I64, ValType::I32) => Instruction::I32WrapI64,
-                        (ValType::I32, ValType::I64) => Instruction::I64ExtendI32S,
+                        (ValType::I32, ValType::I64) => {
+                            // 根据源类型选择有符号或无符号扩展
+                            match src_ast_ty {
+                                Some(Type::UInt8) | Some(Type::UInt16) | Some(Type::UInt32) => {
+                                    Instruction::I64ExtendI32U
+                                }
+                                _ => Instruction::I64ExtendI32S,
+                            }
+                        }
                         (ValType::I64, ValType::F64) => Instruction::F64ConvertI64S,
                         (ValType::F64, ValType::I64) => Instruction::I64TruncF64S,
                         (ValType::I32, ValType::F64) => Instruction::F64ConvertI32S,
@@ -5601,7 +5809,13 @@ impl CodeGen {
                     } else {
                         let obj_type = self.get_object_type(object, locals);
                         let struct_ty = obj_type.and_then(|ty| match ty {
-                            Type::Struct(s, _) => Some(s),
+                            Type::Struct(s, type_args) => {
+                                if type_args.is_empty() {
+                                    Some(s)
+                                } else {
+                                    Some(crate::monomorph::mangle_name(&s, &type_args))
+                                }
+                            }
                             Type::Option(_) => Some("Option".to_string()),
                             Type::Result(_, _) => Some("Result".to_string()),
                             Type::Map(_, _) => Some("Map".to_string()),
@@ -5621,23 +5835,33 @@ impl CodeGen {
                     // 查找方法索引，支持继承链向上查找
                     let idx = self.resolve_method_index(&key, method);
                     if idx == u32::MAX {
-                        // 方法未找到：生成桩代码（丢弃所有参数，压入默认值 0）
-                        // 此时栈上已经有 object（如果非静态）+ args
-                        if !is_static {
-                            func.instruction(&Instruction::Drop);
-                        }
-                        for _ in args.iter() {
-                            func.instruction(&Instruction::Drop);
-                        }
-                        // 根据方法调用推断返回类型，压入对应默认值
-                        let ret_ast_ty = self.infer_ast_type_with_locals(expr, locals);
-                        // Unit 类型不产生值，不需要压入任何东西
-                        if ret_ast_ty.as_ref() != Some(&Type::Unit) {
-                            let ret_wasm_ty = ret_ast_ty.as_ref().map(|t| t.to_wasm()).unwrap_or(ValType::I32);
-                            if ret_wasm_ty == ValType::I32 {
-                                func.instruction(&Instruction::I32Const(0));
-                            } else {
-                                func.instruction(&Instruction::I64Const(0));
+                        // 特殊情况：getOrThrow/unwrap 在非 Option 类型上是 pass-through
+                        // 我们的 HashMap.get() 直接返回 V，所以 getOrThrow 是空操作
+                        let is_passthrough = matches!(method.as_str(), "getOrThrow" | "unwrap")
+                            && !matches!(obj_ast_type, Some(Type::Option(_)))
+                            && !is_static
+                            && args.is_empty();
+                        if is_passthrough {
+                            // object 已在栈上，保持不变（pass-through）
+                        } else {
+                            // 方法未找到：生成桩代码（丢弃所有参数，压入默认值 0）
+                            // 此时栈上已经有 object（如果非静态）+ args
+                            if !is_static {
+                                func.instruction(&Instruction::Drop);
+                            }
+                            for _ in args.iter() {
+                                func.instruction(&Instruction::Drop);
+                            }
+                            // 根据方法调用推断返回类型，压入对应默认值
+                            let ret_ast_ty = self.infer_ast_type_with_locals(expr, locals);
+                            // Unit 类型不产生值，不需要压入任何东西
+                            if ret_ast_ty.as_ref() != Some(&Type::Unit) {
+                                let ret_wasm_ty = ret_ast_ty.as_ref().map(|t| t.to_wasm()).unwrap_or(ValType::I32);
+                                if ret_wasm_ty == ValType::I32 {
+                                    func.instruction(&Instruction::I32Const(0));
+                                } else {
+                                    func.instruction(&Instruction::I64Const(0));
+                                }
                             }
                         }
                     } else {
@@ -5651,8 +5875,8 @@ impl CodeGen {
                 else_branch,
             } => {
                 self.compile_expr(cond, locals, func, loop_ctx);
-                // 条件必须是 i32；仅当条件表达式结果是 i64 时才 wrap
-                if self.infer_type_with_locals(cond, locals) == ValType::I64 {
+                // 条件必须是 i32；仅当 AST 类型确认为 i64 时才 wrap（TypeParam 保守不 wrap）
+                if self.needs_i64_to_i32_wrap(cond, locals) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
 
@@ -5954,52 +6178,100 @@ impl CodeGen {
                 func.instruction(&Instruction::LocalGet(tmp_local));
             }
             Expr::Index { array, index } => {
-                // arr[i] -> load from (arr + 4 + i * elem_size)
-                // P3.9: 根据元素 WASM 类型确定步长和 Load 指令
-                let elem_wasm_ty = match self.infer_ast_type_with_locals(array, locals) {
-                    Some(Type::Array(ref elem_ty)) => elem_ty.to_wasm(),
-                    _ => ValType::I64, // 默认使用 i64
-                };
-                let elem_size: i32 = match elem_wasm_ty {
-                    ValType::I32 | ValType::F32 => 4,
-                    _ => 8,
-                };
-                self.compile_expr(array, locals, func, loop_ctx);
-                func.instruction(&Instruction::I32Const(4)); // 跳过长度字段
-                func.instruction(&Instruction::I32Add);
-                self.compile_expr(index, locals, func, loop_ctx);
-                func.instruction(&Instruction::I32WrapI64);
-                func.instruction(&Instruction::I32Const(elem_size));
-                func.instruction(&Instruction::I32Mul);
-                func.instruction(&Instruction::I32Add);
-                match elem_wasm_ty {
-                    ValType::F64 => {
-                        func.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                            offset: 0,
-                            align: 3,
-                            memory_index: 0,
-                        }));
+                let array_ast_ty = self.infer_ast_type_with_locals(array, locals);
+                // 提前提取 Tuple 字段的 WASM 类型（避免后续借用冲突）
+                let tuple_field_wasm_ty: Option<ValType> =
+                    if let Some(Type::Tuple(ref fields)) = array_ast_ty {
+                        let fty = if let Expr::Integer(n) = index.as_ref() {
+                            fields
+                                .get(*n as usize)
+                                .map(|t| t.to_wasm())
+                                .unwrap_or(ValType::I64)
+                        } else {
+                            ValType::I64
+                        };
+                        Some(fty)
+                    } else {
+                        None
+                    };
+
+                if let Some(field_wasm_ty) = tuple_field_wasm_ty {
+                    // Tuple 索引: 无长度字段头，步长固定 8 字节（i64 存储）
+                    // tuple[i] -> load from (tuple_ptr + i * 8)
+                    self.compile_expr(array, locals, func, loop_ctx);
+                    // 如果 tuple 基址是 I64（TypeParam），需要 wrap 为 I32
+                    if self.infer_type_with_locals(array, locals) == ValType::I64 {
+                        func.instruction(&Instruction::I32WrapI64);
                     }
-                    ValType::F32 => {
-                        func.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
-                            offset: 0,
-                            align: 2,
-                            memory_index: 0,
-                        }));
+                    self.compile_expr(index, locals, func, loop_ctx);
+                    if self.infer_type_with_locals(index, locals) == ValType::I64 {
+                        func.instruction(&Instruction::I32WrapI64);
                     }
-                    ValType::I32 => {
-                        func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                            offset: 0,
-                            align: 2,
-                            memory_index: 0,
-                        }));
+                    func.instruction(&Instruction::I32Const(8));
+                    func.instruction(&Instruction::I32Mul);
+                    func.instruction(&Instruction::I32Add);
+                    func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                    if field_wasm_ty == ValType::I32 {
+                        func.instruction(&Instruction::I32WrapI64);
                     }
-                    _ => {
-                        func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
-                            offset: 0,
-                            align: 3,
-                            memory_index: 0,
-                        }));
+                } else {
+                    // arr[i] -> load from (arr + 4 + i * elem_size)
+                    // P3.9: 根据元素 WASM 类型确定步长和 Load 指令
+                    let elem_wasm_ty = match array_ast_ty {
+                        Some(Type::Array(ref elem_ty)) => elem_ty.to_wasm(),
+                        _ => ValType::I64, // 默认使用 i64
+                    };
+                    let elem_size: i32 = match elem_wasm_ty {
+                        ValType::I32 | ValType::F32 => 4,
+                        _ => 8,
+                    };
+                    self.compile_expr(array, locals, func, loop_ctx);
+                    // 如果数组基址是 I64（TypeParam），需要 wrap 为 I32
+                    if self.infer_type_with_locals(array, locals) == ValType::I64 {
+                        func.instruction(&Instruction::I32WrapI64);
+                    }
+                    func.instruction(&Instruction::I32Const(4)); // 跳过长度字段
+                    func.instruction(&Instruction::I32Add);
+                    self.compile_expr(index, locals, func, loop_ctx);
+                    if self.infer_type_with_locals(index, locals) == ValType::I64 {
+                        func.instruction(&Instruction::I32WrapI64);
+                    }
+                    func.instruction(&Instruction::I32Const(elem_size));
+                    func.instruction(&Instruction::I32Mul);
+                    func.instruction(&Instruction::I32Add);
+                    match elem_wasm_ty {
+                        ValType::F64 => {
+                            func.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 3,
+                                memory_index: 0,
+                            }));
+                        }
+                        ValType::F32 => {
+                            func.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                        }
+                        ValType::I32 => {
+                            func.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                        }
+                        _ => {
+                            func.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 3,
+                                memory_index: 0,
+                            }));
+                        }
                     }
                 }
             }
@@ -6064,6 +6336,7 @@ impl CodeGen {
                     func.instruction(&Instruction::I32Add);
                     self.compile_expr(value, locals, func, loop_ctx);
                     // 根据字段值类型选择正确的 store 指令
+                    // 优先使用实际表达式的 WASM 类型（处理泛型 TypeParam 场景）
                     let field_val_type = self.infer_type_with_locals(value, locals);
                     match field_val_type {
                         ValType::I32 => {
@@ -6472,7 +6745,21 @@ impl CodeGen {
                                 }
                                 _ => None,
                             })
-                            .unwrap_or((0, Type::Int64)); // 回退：偏移 0，按 i64 加载
+                            .unwrap_or_else(|| {
+                                // 回退：尝试从字段名推断类型
+                                // 常见的数组/集合字段名通常是复数或包含特定关键词
+                                let is_likely_array = field.ends_with("s")
+                                    || field.contains("list")
+                                    || field.contains("array")
+                                    || field.contains("items")
+                                    || field.contains("elements")
+                                    || field.contains("Interfaces"); // supportedInterfaces
+                                if is_likely_array {
+                                    (0, Type::Array(Box::new(Type::Int64))) // 假设是数组指针
+                                } else {
+                                    (0, Type::Int64) // 默认 i64
+                                }
+                            });
                         func.instruction(&Instruction::I32Const(offset as i32));
                         func.instruction(&Instruction::I32Add);
                         self.emit_load_by_type(func, &field_ty);
@@ -6573,14 +6860,27 @@ impl CodeGen {
                     }));
 
                     if let Some(ref payload_expr) = arg {
+                        // 克隆 payload_ty 以避免 enum_def 借用冲突
                         let payload_ty = enum_def
                             .variant_payload(variant_name)
-                            .expect("带关联值变体需提供参数");
+                            .expect("带关联值变体需提供参数")
+                            .clone();
                         func.instruction(&Instruction::LocalGet(tmp_local));
                         func.instruction(&Instruction::I32Const(4));
                         func.instruction(&Instruction::I32Add);
                         self.compile_expr(payload_expr, locals, func, loop_ctx);
-                        self.emit_store_by_type(func, payload_ty);
+
+                        // 当 payload 是泛型类型参数 (TypeParam) 时，假设是引用类型（i32 指针）
+                        // 这是最常见的情况，因为泛型通常用于对象/结构体
+                        if matches!(payload_ty, Type::TypeParam(_)) {
+                            func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                        } else {
+                            self.emit_store_by_type(func, &payload_ty);
+                        }
                     }
 
                     // 返回枚举地址
@@ -6606,9 +6906,13 @@ impl CodeGen {
                     // P2.1: match arms 为 void 表达式（如 println）时，block 不产生值
                     wasm_encoder::BlockType::Empty
                 } else {
-                    wasm_encoder::BlockType::Result(
-                        self.infer_type_with_locals(&arms[0].body, locals),
-                    )
+                    // 优先使用 AST 类型推断：TypeParam 视为 I32（对象引用指针）
+                    let wasm_ty = match self.infer_ast_type_with_locals(&arms[0].body, locals).as_ref() {
+                        Some(Type::TypeParam(_)) => ValType::I32,
+                        Some(t) if !matches!(t, Type::Unit | Type::Nothing) => t.to_wasm(),
+                        _ => self.infer_type_with_locals(&arms[0].body, locals),
+                    };
+                    wasm_encoder::BlockType::Result(wasm_ty)
                 };
 
                 func.instruction(&Instruction::Block(result_type));
@@ -6707,8 +7011,13 @@ impl CodeGen {
                         Pattern::Literal(lit) => {
                             match lit {
                                 Literal::Integer(n) => {
-                                    func.instruction(&Instruction::I64Const(*n));
-                                    func.instruction(&Instruction::I64Eq);
+                                    if subject_ty == ValType::I32 {
+                                        func.instruction(&Instruction::I32Const(*n as i32));
+                                        func.instruction(&Instruction::I32Eq);
+                                    } else {
+                                        func.instruction(&Instruction::I64Const(*n));
+                                        func.instruction(&Instruction::I64Eq);
+                                    }
                                 }
                                 Literal::Bool(b) => {
                                     func.instruction(&Instruction::I32Const(if *b {
@@ -6984,8 +7293,13 @@ impl CodeGen {
                                     if j > 0 {
                                         self.compile_expr(expr, locals, func, loop_ctx);
                                     }
-                                    func.instruction(&Instruction::I64Const(*n));
-                                    func.instruction(&Instruction::I64Eq);
+                                    if subject_ty == ValType::I32 {
+                                        func.instruction(&Instruction::I32Const(*n as i32));
+                                        func.instruction(&Instruction::I32Eq);
+                                    } else {
+                                        func.instruction(&Instruction::I64Const(*n));
+                                        func.instruction(&Instruction::I64Eq);
+                                    }
                                     if j > 0 {
                                         func.instruction(&Instruction::I32Or);
                                     }
@@ -7270,13 +7584,10 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Add);
                 self.compile_expr(inner, locals, func, loop_ctx);
                 // 根据内部值类型选择正确的 store 指令
-                Self::emit_store_by_wasm_type(
-                    func,
-                    inner_ast_type
-                        .as_ref()
-                        .map(|t| t.to_wasm())
-                        .unwrap_or(ValType::I64),
-                );
+                // 使用 infer_type_with_locals 而非 infer_ast_type_with_locals
+                // 以更好地处理方法链等复杂表达式
+                let inner_wasm_ty = self.infer_type_with_locals(inner, locals);
+                Self::emit_store_by_wasm_type(func, inner_wasm_ty);
 
                 func.instruction(&Instruction::GlobalGet(0));
                 func.instruction(&Instruction::I32Const(total_size as i32));
@@ -7285,12 +7596,8 @@ impl CodeGen {
             }
             Expr::Err(inner) => {
                 // Result::Err(e) -> 堆分配 [tag=1: i32][error]
-                let inner_ast_type = self.infer_ast_type_with_locals(inner, locals);
-                let value_size = match &inner_ast_type {
-                    Some(t) => t.size(),
-                    None => 8,
-                };
-                let total_size = 4 + value_size;
+                // Exception 总是对象指针 (i32)
+                let total_size = 4 + 4; // tag (4 bytes) + pointer (4 bytes)
 
                 func.instruction(&Instruction::GlobalGet(0));
 
@@ -7306,17 +7613,15 @@ impl CodeGen {
                 func.instruction(&Instruction::I32Const(4));
                 func.instruction(&Instruction::I32Add);
                 self.compile_expr(inner, locals, func, loop_ctx);
-                // 根据内部值类型选择正确的 store 指令
-                Self::emit_store_by_wasm_type(
-                    func,
-                    inner_ast_type
-                        .as_ref()
-                        .map(|t| t.to_wasm())
-                        .unwrap_or(ValType::I64),
-                );
+                // Exception 对象总是 i32 指针
+                func.instruction(&Instruction::I32Store(wasm_encoder::MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
 
                 func.instruction(&Instruction::GlobalGet(0));
-                func.instruction(&Instruction::I32Const(total_size as i32));
+                func.instruction(&Instruction::I32Const(8)); // 固定 8 字节 (tag + ptr)
                 func.instruction(&Instruction::I32Add);
                 func.instruction(&Instruction::GlobalSet(0));
             }
