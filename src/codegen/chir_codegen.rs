@@ -113,17 +113,21 @@ impl CHIRCodeGen {
 
         // ── 6. 导出段 ─────────────────────────────────────────────────
         exports.export("memory", ExportKind::Memory, 0);
-        // 导出所有用户函数
+        // 导出所有用户函数（用 HashSet 去重，防止同名函数多次导出导致 duplicate export 错误）
+        let mut exported_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for func in &program.functions {
             let idx = self.func_indices[&func.name];
-            exports.export(&func.name, ExportKind::Func, idx);
+            if exported_names.insert(func.name.clone()) {
+                exports.export(&func.name, ExportKind::Func, idx);
+            }
         }
-        // 兼容 WASI: _start = main
-        if let Some(&main_idx) = self.func_indices.get("main") {
-            // 仅当 main 返回 Unit 时才导出 _start
-            if let Some(main_func) = program.functions.iter().find(|f| f.name == "main") {
-                if main_func.return_ty == Type::Unit {
-                    exports.export("_start", ExportKind::Func, main_idx);
+        // 兼容 WASI: _start = main（仅在用户未定义 _start 时添加）
+        if !exported_names.contains("_start") {
+            if let Some(&main_idx) = self.func_indices.get("main") {
+                if let Some(main_func) = program.functions.iter().find(|f| f.name == "main") {
+                    if main_func.return_ty == Type::Unit {
+                        exports.export("_start", ExportKind::Func, main_idx);
+                    }
                 }
             }
         }
@@ -162,11 +166,15 @@ impl CHIRCodeGen {
 
         let has_result = !wasm_result_tys(&func.return_ty, func.return_wasm_ty).is_empty();
 
-        self.emit_block(&func.body, &mut wasm_func);
-
-        // 函数末尾若无显式 return 也无隐式 result 表达式，补默认返回值
-        if has_result && !block_has_return(&func.body) && func.body.result.is_none() {
-            emit_zero(func.return_wasm_ty, &mut wasm_func);
+        if has_result && !block_has_return(&func.body) {
+            // 有返回值的函数：用 emit_block_with_ty 确保函数末尾推入正确类型的值
+            self.emit_block_with_ty(&func.body, func.return_wasm_ty, &mut wasm_func);
+        } else if !has_result {
+            // Unit 函数：用 emit_block_void 确保不会在栈上留下残余值
+            self.emit_block_void(&func.body, &mut wasm_func);
+        } else {
+            // 函数有显式 return（block_has_return=true）：直接 emit，return 已处理返回值
+            self.emit_block(&func.body, &mut wasm_func);
         }
 
         wasm_func.instruction(&Instruction::End);
@@ -179,6 +187,42 @@ impl CHIRCodeGen {
         }
         if let Some(result) = &block.result {
             self.emit_expr(result, func);
+        }
+    }
+
+    /// void 上下文的块 emit（Unit If 分支），对产生的 result 主动 Drop
+    fn emit_block_void(&self, block: &CHIRBlock, func: &mut wasm_encoder::Function) {
+        for stmt in &block.stmts {
+            self.emit_stmt(stmt, func);
+        }
+        if let Some(result) = &block.result {
+            self.emit_expr(result, func);
+            // 若 result 产生了值，在 Unit 上下文中需要丢弃
+            if !matches!(result.ty, Type::Unit | Type::Nothing) {
+                func.instruction(&Instruction::Drop);
+            }
+        }
+    }
+
+    /// 带期望返回类型的块 emit（用于 If 分支，确保类型一致）
+    fn emit_block_with_ty(&self, block: &CHIRBlock, expected_ty: ValType, func: &mut wasm_encoder::Function) {
+        for stmt in &block.stmts {
+            self.emit_stmt(stmt, func);
+        }
+        if let Some(result) = &block.result {
+            if matches!(result.ty, Type::Unit | Type::Nothing) {
+                // 结果是 Unit（不产生值），补零值满足期望类型
+                emit_zero(expected_ty, func);
+            } else {
+                self.emit_expr(result, func);
+                // 若结果类型与期望不符，插入转换指令
+                if result.wasm_ty != expected_ty {
+                    self.emit_cast(result.wasm_ty, expected_ty, func);
+                }
+            }
+        } else {
+            // 块无显式结果时补零值，保持 If 分支类型一致
+            emit_zero(expected_ty, func);
         }
     }
 
@@ -221,6 +265,10 @@ impl CHIRCodeGen {
             }
             CHIRExprKind::Unary { op, expr: inner } => {
                 self.emit_expr(inner, func);
+                // Not(!): eqz 期望 I32；若内层是 I64，先截断
+                if matches!(op, UnaryOp::Not) && inner.wasm_ty == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
                 self.emit_unary_op(op, expr.wasm_ty, func);
             }
 
@@ -242,8 +290,15 @@ impl CHIRCodeGen {
             }
 
             CHIRExprKind::Cast { expr: inner, from_ty, to_ty } => {
-                self.emit_expr(inner, func);
-                self.emit_cast(*from_ty, *to_ty, func);
+                if matches!(inner.ty, Type::Unit | Type::Nothing) {
+                    // 内层表达式不产生值（Unit/Nothing），直接推零值作为目标类型
+                    emit_zero(*to_ty, func);
+                } else {
+                    self.emit_expr(inner, func);
+                    if from_ty != to_ty {
+                        self.emit_cast(*from_ty, *to_ty, func);
+                    }
+                }
             }
 
             CHIRExprKind::If { cond, then_block, else_block } => {
@@ -257,16 +312,34 @@ impl CHIRCodeGen {
                     BlockType::Result(expr.wasm_ty)
                 };
                 func.instruction(&Instruction::If(block_type));
-                self.emit_block(then_block, func);
+                if matches!(block_type, BlockType::Empty) {
+                    // Unit If：分支不得产生值；用 emit_block_void 确保栈干净
+                    self.emit_block_void(then_block, func);
+                } else {
+                    // 有期望类型的 If，用 emit_block_with_ty 确保分支结果类型一致
+                    self.emit_block_with_ty(then_block, expr.wasm_ty, func);
+                }
                 if let Some(else_blk) = else_block {
                     func.instruction(&Instruction::Else);
-                    self.emit_block(else_blk, func);
+                    if matches!(block_type, BlockType::Empty) {
+                        self.emit_block_void(else_blk, func);
+                    } else {
+                        self.emit_block_with_ty(else_blk, expr.wasm_ty, func);
+                    }
+                } else if !matches!(block_type, BlockType::Empty) {
+                    // 有返回类型但缺少 else 分支：补零值，保持栈平衡
+                    func.instruction(&Instruction::Else);
+                    emit_zero(expr.wasm_ty, func);
                 }
                 func.instruction(&Instruction::End);
             }
 
             CHIRExprKind::Block(block) => {
-                self.emit_block(block, func);
+                if matches!(expr.ty, Type::Unit | Type::Nothing) {
+                    self.emit_block_void(block, func);
+                } else {
+                    self.emit_block_with_ty(block, expr.wasm_ty, func);
+                }
             }
 
             CHIRExprKind::FieldGet { object, field_offset, .. } => {
@@ -330,8 +403,8 @@ impl CHIRCodeGen {
 
             CHIRStmt::Expr(expr) => {
                 self.emit_expr(expr, func);
-                // 非 Unit 表达式丢弃结果
-                if !matches!(expr.ty, Type::Unit) && !matches!(expr.kind, CHIRExprKind::Nop) {
+                // 非 Unit 表达式丢弃结果（Nop 若返回非 Unit 类型也会推入零值，同样需要 Drop）
+                if !matches!(expr.ty, Type::Unit | Type::Nothing) {
                     func.instruction(&Instruction::Drop);
                 }
             }
@@ -351,6 +424,10 @@ impl CHIRCodeGen {
                 func.instruction(&Instruction::Block(BlockType::Empty));
                 func.instruction(&Instruction::Loop(BlockType::Empty));
                 self.emit_expr(cond, func);
+                // 条件可能是 I64，需先截断到 I32，再用 I32Eqz 实现 `!cond`
+                if cond.wasm_ty == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
                 func.instruction(&Instruction::I32Eqz);
                 func.instruction(&Instruction::BrIf(1));
                 self.emit_block(body, func);
@@ -579,6 +656,10 @@ fn collect_locals_from_block(block: &CHIRBlock, param_count: u32, out: &mut Vec<
     for stmt in &block.stmts {
         collect_locals_from_stmt(stmt, param_count, out);
     }
+    // 遍历 block.result，其中的嵌套 Block 可能含有 Let 语句
+    if let Some(result) = &block.result {
+        collect_locals_from_expr(result, param_count, out);
+    }
 }
 
 fn collect_locals_from_stmt(stmt: &CHIRStmt, param_count: u32, out: &mut Vec<(u32, ValType)>) {
@@ -614,21 +695,42 @@ fn collect_locals_from_expr(expr: &CHIRExpr, param_count: u32, out: &mut Vec<(u3
 }
 
 /// 将 (idx, wasm_ty) 列表压缩为 wasm_encoder 的 run-length 格式 (count, ValType)
+/// 处理索引空洞：在不连续的索引间插入 I32 占位，保证 WASM locals 声明与实际使用的索引一致
 fn run_length_encode_locals(locals: &[(u32, ValType)]) -> Vec<(u32, ValType)> {
     if locals.is_empty() {
         return vec![];
     }
-    // locals 已按 idx 排序，但 idx 可能不连续。
-    // wasm_encoder 需要 (连续数量, 类型) 的分组，我们用最简单的按类型分组。
     let mut result: Vec<(u32, ValType)> = Vec::new();
-    for &(_, ty) in locals {
+    let mut prev_idx: Option<u32> = None;
+
+    for &(idx, ty) in locals {
+        // 计算与上一个索引之间的空洞大小
+        let gap = match prev_idx {
+            Some(p) => idx.saturating_sub(p + 1),
+            None => 0,
+        };
+        // 用 I32 填充空洞，保证索引连续
+        if gap > 0 {
+            if let Some(last) = result.last_mut() {
+                if last.1 == ValType::I32 {
+                    last.0 += gap;
+                } else {
+                    result.push((gap, ValType::I32));
+                }
+            } else {
+                result.push((gap, ValType::I32));
+            }
+        }
+        // 追加当前局部变量（尝试合并相邻同类型）
         if let Some(last) = result.last_mut() {
             if last.1 == ty {
                 last.0 += 1;
+                prev_idx = Some(idx);
                 continue;
             }
         }
         result.push((1, ty));
+        prev_idx = Some(idx);
     }
     result
 }

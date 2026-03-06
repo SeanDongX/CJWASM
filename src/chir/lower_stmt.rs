@@ -22,7 +22,8 @@ impl<'a> LoweringContext<'a> {
 
                 match pattern {
                     Pattern::Binding(name) => {
-                        let local_idx = self.alloc_local(name.clone());
+                        // 记录局部变量类型，供赋值时进行类型强制转换
+                        let local_idx = self.alloc_local_typed(name.clone(), value_chir.wasm_ty);
                         Ok(CHIRStmt::Let {
                             local_idx,
                             value: value_chir,
@@ -49,7 +50,7 @@ impl<'a> LoweringContext<'a> {
 
                 match pattern {
                     Pattern::Binding(name) => {
-                        let local_idx = self.alloc_local(name.clone());
+                        let local_idx = self.alloc_local_typed(name.clone(), value_chir.wasm_ty);
                         Ok(CHIRStmt::Let {
                             local_idx,
                             value: value_chir,
@@ -63,8 +64,15 @@ impl<'a> LoweringContext<'a> {
 
             // 赋值语句
             Stmt::Assign { target, value } => {
-                let value_chir = self.lower_expr(value)?;
+                let mut value_chir = self.lower_expr(value)?;
                 let target_chir = self.lower_assign_target(target)?;
+
+                // 若赋值目标是已知类型的局部变量，插入类型强制转换，防止 local.set 类型不匹配
+                if let crate::chir::CHIRLValue::Local(idx) = &target_chir {
+                    if let Some(expected_ty) = self.get_local_ty(*idx) {
+                        value_chir = self.insert_cast_if_needed(value_chir, expected_ty);
+                    }
+                }
 
                 Ok(CHIRStmt::Assign {
                     target: target_chir,
