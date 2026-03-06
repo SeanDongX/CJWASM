@@ -743,6 +743,61 @@ fn collect_instantiations(
         }
     }
 
+    // P2: 从类型注解中收集泛型实例化
+    fn collect_from_type(
+        ty: &Type,
+        gs: &std::collections::HashMap<String, usize>,
+        ge: &std::collections::HashMap<String, usize>,
+        gc: &std::collections::HashMap<String, usize>,
+        si: &mut HashSet<(String, Vec<Type>)>,
+        ei: &mut HashSet<(String, Vec<Type>)>,
+        ci: &mut HashSet<(String, Vec<Type>)>,
+    ) {
+        match ty {
+            Type::Struct(name, args) if !args.is_empty() => {
+                if let Some(n) = gs.get(name) {
+                    if *n == args.len() {
+                        si.insert((name.clone(), args.clone()));
+                    }
+                }
+                if let Some(n) = gc.get(name) {
+                    if *n == args.len() {
+                        ci.insert((name.clone(), args.clone()));
+                    }
+                }
+                // 递归处理类型参数
+                for arg in args {
+                    collect_from_type(arg, gs, ge, gc, si, ei, ci);
+                }
+            }
+            Type::Array(inner) | Type::Option(inner) | Type::Slice(inner) => {
+                collect_from_type(inner, gs, ge, gc, si, ei, ci);
+            }
+            Type::Map(k, v) => {
+                collect_from_type(k, gs, ge, gc, si, ei, ci);
+                collect_from_type(v, gs, ge, gc, si, ei, ci);
+            }
+            Type::Result(ok, err) => {
+                collect_from_type(ok, gs, ge, gc, si, ei, ci);
+                collect_from_type(err, gs, ge, gc, si, ei, ci);
+            }
+            Type::Tuple(types) => {
+                for t in types {
+                    collect_from_type(t, gs, ge, gc, si, ei, ci);
+                }
+            }
+            Type::Function { params, ret } => {
+                for p in params {
+                    collect_from_type(p, gs, ge, gc, si, ei, ci);
+                }
+                if let Some(r) = ret.as_ref() {
+                    collect_from_type(r, gs, ge, gc, si, ei, ci);
+                }
+            }
+            _ => {}
+        }
+    }
+
     for func in &program.functions {
         for stmt in &func.body {
             let mut visit = |e: &Expr| {
@@ -757,6 +812,258 @@ fn collect_instantiations(
                     &mut enum_insts,
                     &mut class_insts,
                 )
+            };
+            stmt.walk(&mut visit);
+        }
+    }
+
+    // P2.1: 扫描函数参数和返回类型
+    for func in &program.functions {
+        for param in &func.params {
+            collect_from_type(
+                &param.ty,
+                &generic_structs,
+                &generic_enums,
+                &generic_classes,
+                &mut struct_insts,
+                &mut enum_insts,
+                &mut class_insts,
+            );
+        }
+        if let Some(ret) = &func.return_type {
+            collect_from_type(
+                ret,
+                &generic_structs,
+                &generic_enums,
+                &generic_classes,
+                &mut struct_insts,
+                &mut enum_insts,
+                &mut class_insts,
+            );
+        }
+    }
+
+    // P2.1: 扫描结构体字段类型
+    for st in &program.structs {
+        for field in &st.fields {
+            collect_from_type(
+                &field.ty,
+                &generic_structs,
+                &generic_enums,
+                &generic_classes,
+                &mut struct_insts,
+                &mut enum_insts,
+                &mut class_insts,
+            );
+        }
+    }
+
+    // P2.1: 扫描类字段类型
+    for cls in &program.classes {
+        for field in &cls.fields {
+            collect_from_type(
+                &field.ty,
+                &generic_structs,
+                &generic_enums,
+                &generic_classes,
+                &mut struct_insts,
+                &mut enum_insts,
+                &mut class_insts,
+            );
+        }
+    }
+
+    // P3.1: 从无显式 type_args 的调用点推断泛型函数实例化
+
+    /// 类型统一：将 pattern 中的 TypeParam 绑定到 concrete 中的具体类型
+    fn unify_type(pattern: &Type, concrete: &Type, bindings: &mut HashMap<String, Type>) {
+        match (pattern, concrete) {
+            (Type::TypeParam(name), ty) if !matches!(ty, Type::TypeParam(_)) => {
+                bindings.entry(name.clone()).or_insert_with(|| ty.clone());
+            }
+            (Type::Array(p), Type::Array(c)) => unify_type(p, c, bindings),
+            (Type::Option(p), Type::Option(c)) => unify_type(p, c, bindings),
+            (Type::Slice(p), Type::Slice(c)) => unify_type(p, c, bindings),
+            (Type::Struct(pn, pa), Type::Struct(cn, ca)) if pn == cn => {
+                for (p, c) in pa.iter().zip(ca.iter()) {
+                    unify_type(p, c, bindings);
+                }
+            }
+            (Type::Map(pk, pv), Type::Map(ck, cv)) => {
+                unify_type(pk, ck, bindings);
+                unify_type(pv, cv, bindings);
+            }
+            (Type::Result(po, pe), Type::Result(co, ce)) => {
+                unify_type(po, co, bindings);
+                unify_type(pe, ce, bindings);
+            }
+            (Type::Tuple(pts), Type::Tuple(cts)) => {
+                for (p, c) in pts.iter().zip(cts.iter()) {
+                    unify_type(p, c, bindings);
+                }
+            }
+            (
+                Type::Function { params: pp, ret: pr },
+                Type::Function { params: cp, ret: cr },
+            ) => {
+                for (p, c) in pp.iter().zip(cp.iter()) {
+                    unify_type(p, c, bindings);
+                }
+                if let (Some(pr_inner), Some(cr_inner)) =
+                    (pr.as_ref().as_ref(), cr.as_ref().as_ref())
+                {
+                    unify_type(pr_inner, cr_inner, bindings);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 简单表达式类型推断（仅处理字面量/变量/构造器等常见情况）
+    fn infer_expr_type(expr: &Expr, locals: &HashMap<String, Type>) -> Option<Type> {
+        match expr {
+            Expr::Integer(_) => Some(Type::Int64),
+            Expr::Float(_) => Some(Type::Float64),
+            Expr::Float32(_) => Some(Type::Float32),
+            Expr::Bool(_) => Some(Type::Bool),
+            Expr::Rune(_) => Some(Type::Rune),
+            Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
+            Expr::Var(name) => locals.get(name).cloned(),
+            Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(
+                name.clone(),
+                type_args.clone().unwrap_or_default(),
+            )),
+            Expr::StructInit { name, type_args, .. } => Some(Type::Struct(
+                name.clone(),
+                type_args.clone().unwrap_or_default(),
+            )),
+            Expr::Array(elems) => elems
+                .first()
+                .and_then(|e| infer_expr_type(e, locals))
+                .map(|t| Type::Array(Box::new(t))),
+            Expr::Some(e) => {
+                infer_expr_type(e.as_ref(), locals).map(|t| Type::Option(Box::new(t)))
+            }
+            Expr::Lambda { params, return_type, .. } => {
+                let param_types: Vec<Type> = params.iter().map(|(_, ty)| ty.clone()).collect();
+                Some(Type::Function {
+                    params: param_types,
+                    ret: Box::new(return_type.clone()),
+                })
+            }
+            Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
+            _ => None,
+        }
+    }
+
+    /// 从语句列表中提取变量类型注解，用于后续的类型推断
+    fn collect_p3_locals(stmts: &[Stmt], locals: &mut HashMap<String, Type>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { pattern, ty: Some(ty), .. }
+                | Stmt::Var { pattern, ty: Some(ty), .. } => {
+                    if !matches!(ty, Type::TypeParam(_)) {
+                        if let Pattern::Binding(name) = pattern {
+                            locals.insert(name.clone(), ty.clone());
+                        }
+                    }
+                }
+                Stmt::Const { name, ty: Some(ty), .. } => {
+                    if !matches!(ty, Type::TypeParam(_)) {
+                        locals.insert(name.clone(), ty.clone());
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::UnsafeBlock { body } => {
+                    collect_p3_locals(body, locals);
+                }
+                Stmt::WhileLet { body, .. } => {
+                    collect_p3_locals(body, locals);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // P3.1: 预构建泛型函数定义缓存（克隆所需数据，避免与后续借用冲突）
+    let gf_defs: Vec<(String, Vec<String>, Vec<Param>)> = program
+        .functions
+        .iter()
+        .filter(|f| !f.type_params.is_empty() && f.extern_import.is_none())
+        .map(|f| (f.name.clone(), f.type_params.clone(), f.params.clone()))
+        .collect();
+
+    for func in &program.functions {
+        // 收集函数参数与局部变量的类型注解
+        let mut locals: HashMap<String, Type> = HashMap::new();
+        for param in &func.params {
+            if !matches!(param.ty, Type::TypeParam(_)) {
+                locals.insert(param.name.clone(), param.ty.clone());
+            }
+        }
+        collect_p3_locals(&func.body, &mut locals);
+
+        // 扫描所有调用点，推断无显式 type_args 的泛型调用
+        for stmt in &func.body {
+            let mut visit = |e: &Expr| {
+                let (name, args) = match e {
+                    Expr::Call {
+                        name,
+                        type_args: None,
+                        args,
+                        ..
+                    } => (name, args),
+                    _ => return,
+                };
+                let n_tp = match generic_functions.get(name) {
+                    Some(n) => *n,
+                    None => return,
+                };
+                let (_, type_params, params) =
+                    match gf_defs.iter().find(|(n, tp, _)| n == name && tp.len() == n_tp) {
+                        Some(d) => d,
+                        None => return,
+                    };
+
+                let mut bindings: HashMap<String, Type> = HashMap::new();
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    // P3.3: Lambda 参数 — 从 lambda 的参数类型与函数型参数统一
+                    if let Expr::Lambda {
+                        params: lambda_params,
+                        ..
+                    } = arg
+                    {
+                        if let Type::Function {
+                            params: fp_types, ..
+                        } = &param.ty
+                        {
+                            for ((_, lp_ty), fpt) in
+                                lambda_params.iter().zip(fp_types.iter())
+                            {
+                                if !matches!(lp_ty, Type::TypeParam(_)) {
+                                    unify_type(fpt, lp_ty, &mut bindings);
+                                }
+                            }
+                        }
+                    }
+                    // 从实参类型推断
+                    if let Some(ty) = infer_expr_type(arg, &locals) {
+                        unify_type(&param.ty, &ty, &mut bindings);
+                    }
+                }
+
+                let type_args: Option<Vec<Type>> = type_params
+                    .iter()
+                    .map(|p| bindings.get(p).cloned())
+                    .collect();
+                if let Some(type_args) = type_args {
+                    if !type_args.iter().any(|t| matches!(t, Type::TypeParam(_))) {
+                        func_insts.insert((name.clone(), type_args));
+                    }
+                }
             };
             stmt.walk(&mut visit);
         }
@@ -1483,6 +1790,15 @@ pub fn monomorphize_program(program: &mut Program) {
         });
     }
     program.functions.append(&mut new_functions);
+
+    // P3.2: 移除已特化的泛型函数原始定义，避免 codegen 编译含 TypeParam 的重复代码
+    // 未特化的泛型函数保留（可能有未推断的调用点）
+    let specialized_names: HashSet<String> = func_insts.iter().map(|(n, _)| n.clone()).collect();
+    program.functions.retain(|f| {
+        f.type_params.is_empty()
+            || f.extern_import.is_some()
+            || !specialized_names.contains(&f.name)
+    });
 
     for func in &mut program.functions {
         if func.extern_import.is_some() {

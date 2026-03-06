@@ -88,7 +88,7 @@ impl Type {
             Type::Slice(_) => ValType::I32,
             Type::Map(_, _) => ValType::I32,
             Type::TypeParam(_) => {
-                ValType::I64 // 单态化前默认 i64（宽类型，避免信息丢失）
+                ValType::I32 // 未单态化的泛型参数视为对象引用（i32 指针）
             }
             Type::This => ValType::I32, // This 类型表示类对象，使用指针
             Type::Qualified(_) => ValType::I32, // 限定类型通常是类或结构体
@@ -117,7 +117,7 @@ impl Type {
             Type::Result(_, _) => 4,
             Type::Slice(_) => 4,
             Type::Map(_, _) => 4,
-            Type::TypeParam(_) => 8, // 默认指针大小（单态化前使用）
+            Type::TypeParam(_) => 4, // 未单态化泛型参数视为对象指针（4 字节）
             Type::This => 4,         // This 类型表示类对象指针
             Type::Qualified(_) => 4, // 限定类型通常是类或结构体指针
         }
@@ -159,7 +159,8 @@ mod tests {
 
     #[test]
     fn test_to_wasm_typeparam() {
-        assert_eq!(Type::TypeParam("T".to_string()).to_wasm(), ValType::I64);
+        // 未单态化的 TypeParam 视为对象指针 (i32)
+        assert_eq!(Type::TypeParam("T".to_string()).to_wasm(), ValType::I32);
     }
 
     #[test]
@@ -173,8 +174,8 @@ mod tests {
 
     #[test]
     fn test_size_typeparam_default() {
-        // TypeParam returns default pointer size (8) without panicking
-        assert_eq!(Type::TypeParam("T".to_string()).size(), 8);
+        // 未单态化的 TypeParam 视为对象指针（4 字节）
+        assert_eq!(Type::TypeParam("T".to_string()).size(), 4);
     }
 
     #[test]

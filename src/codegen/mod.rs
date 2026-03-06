@@ -76,6 +76,9 @@ pub struct CodeGen {
     global_var_inits: HashMap<String, Expr>,
     /// 当前正在编译的函数的 WASM 返回类型（供 Stmt::Return 类型协调使用）
     current_return_wasm_type: std::cell::Cell<Option<ValType>>,
+    /// P5.1: 每个函数的 WASM 返回类型（来自编译的函数签名，权威类型信息）
+    /// key 与 func_indices 一致（可能是限定名或修饰名），None 表示 void 函数
+    func_return_wasm_types: HashMap<String, Option<ValType>>,
 }
 
 impl CodeGen {
@@ -102,6 +105,7 @@ impl CodeGen {
             global_var_types: HashMap::new(),
             global_var_inits: HashMap::new(),
             current_return_wasm_type: std::cell::Cell::new(None),
+            func_return_wasm_types: HashMap::new(),
         }
     }
 
@@ -267,6 +271,14 @@ impl CodeGen {
     /// 编译程序生成 WASM 模块
     pub fn compile(&mut self, program: &Program) -> Vec<u8> {
         let mut module = Module::new();
+
+        // P3: 语义预分析 — 推断无标注函数的返回类型，提前注册到 func_return_types
+        let sema_ctx = crate::sema::analyze(program);
+        for (name, ret_ty) in &sema_ctx.inferred_return_types {
+            self.func_return_types
+                .entry(name.clone())
+                .or_insert_with(|| ret_ty.clone());
+        }
 
         // P2.2: 注册类型别名
         for (name, ty) in &program.type_aliases {
@@ -443,6 +455,21 @@ impl CodeGen {
         }
         self.interfaces = interface_methods;
 
+        // P1: 将接口抽象方法/属性的返回类型注册到 func_return_types
+        // 这样类型推断可以找到 `obj.method()` 或 `obj.prop` 的返回类型
+        // 例如: Deriving.__get_supportedInterfaces → Array<QualifiedName>
+        for (iface_name, methods) in &self.interfaces {
+            for method in methods {
+                if let Some(ref ret) = method.return_type {
+                    if *ret != Type::Unit && *ret != Type::Nothing {
+                        let key = format!("{}.{}", iface_name, method.name);
+                        // 使用 entry().or_insert() 避免覆盖已有的具体实现
+                        self.func_return_types.entry(key).or_insert(ret.clone());
+                    }
+                }
+            }
+        }
+
         // --- extends 处理 (#32) ---
         // 合并 extend 中的方法到 functions 列表
         let mut extend_functions: Vec<FuncDef> = Vec::new();
@@ -522,6 +549,19 @@ impl CodeGen {
         functions.extend(lambda_funcs);
         self.lambda_counter.set(0); // 重置，编译阶段重新计数
 
+        // P5.6: 将 sema 推断的返回类型回写到 functions vec，使 WASM 函数签名与 func_return_types 一致
+        // 如果 func.return_type = None 但 sema 推断出类型，更新 func.return_type，
+        // 避免 WASM 函数被编译为 void 但 func_return_types 说它有返回值（导致 call 后栈不一致）
+        for func in functions.iter_mut() {
+            if func.return_type.is_none() || func.return_type == Some(Type::Unit) {
+                if let Some(inferred) = sema_ctx.inferred_return_types.get(&func.name) {
+                    if *inferred != Type::Unit && *inferred != Type::Nothing {
+                        func.return_type = Some(inferred.clone());
+                    }
+                }
+            }
+        }
+
         let name_count: HashMap<String, usize> =
             functions
                 .iter()
@@ -575,6 +615,15 @@ impl CodeGen {
                     self.func_return_types.insert(key.clone(), ret.clone());
                 }
             }
+            // P5.1: 记录每个函数的 WASM 返回类型（权威类型信息，用于推断回退）
+            let ret_wasm_ty: Option<ValType> = func.return_type.as_ref().and_then(|t| {
+                if *t == Type::Unit || *t == Type::Nothing {
+                    None
+                } else {
+                    Some(t.to_wasm())
+                }
+            });
+            self.func_return_wasm_types.insert(key.clone(), ret_wasm_ty);
             self.func_params.insert(key, func.params.clone());
         }
         let num_user_imports = functions
@@ -1792,6 +1841,15 @@ impl CodeGen {
             }
         });
         self.current_return_wasm_type.set(ret_wasm_ty);
+
+        // --- Pass 5: 预解析每个局部变量的精确 WASM 类型 ---
+        let type_global = crate::typeck::FunctionTypeGlobal {
+            func_return_wasm_types: &self.func_return_wasm_types,
+            structs: &self.structs,
+            classes: &self.classes,
+            global_var_types: &self.global_var_types,
+        };
+        let type_ctx = crate::typeck::FunctionTypeContext::resolve(func, &type_global);
 
         let mut locals = LocalsBuilder::new();
 
@@ -6834,6 +6892,23 @@ impl LocalsBuilder {
             self.names.insert(name.to_string(), idx);
             self.types.push(ty);
             idx
+        }
+    }
+
+    /// Pass 5: 将 FunctionTypeContext 中的精确类型应用到已注册的局部变量。
+    /// 仅做 I64 → I32 的降级修正（当 type_ctx 确认该变量应为 I32 时）。
+    /// 不做 I32 → I64 的升级（避免引入新的类型错误）。
+    pub(crate) fn apply_type_corrections(
+        &mut self,
+        type_ctx: &crate::typeck::FunctionTypeContext,
+    ) {
+        for (name, &idx) in &self.names {
+            if let Some(&ctx_ty) = type_ctx.local_types.get(name.as_str()) {
+                let existing = self.types[idx as usize];
+                if existing == ValType::I64 && ctx_ty == ValType::I32 {
+                    self.types[idx as usize] = ValType::I32;
+                }
+            }
         }
     }
 }
