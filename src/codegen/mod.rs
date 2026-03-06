@@ -17,6 +17,7 @@ mod decl;
 mod expr;
 mod r#macro;
 mod type_;
+pub mod chir_codegen;
 
 pub(crate) use decl::ClassInfo;
 

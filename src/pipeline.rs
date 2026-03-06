@@ -346,8 +346,18 @@ pub fn compile_source_to_wasm(source: &str) -> Result<Vec<u8>, String> {
     let mut program = parse_source(source)?;
     crate::optimizer::optimize_program(&mut program);
     crate::monomorph::monomorphize_program(&mut program);
-    let mut codegen = CodeGen::new();
-    Ok(codegen.compile(&program))
+
+    // 检查是否使用 CHIR 路径
+    if std::env::var("USE_CHIR").is_ok() {
+        // 新路径: AST → CHIR → WASM
+        let chir_program = crate::chir::lower_program(&program)?;
+        let mut codegen = crate::codegen::chir_codegen::CHIRCodeGen::new();
+        Ok(codegen.generate(&chir_program))
+    } else {
+        // 旧路径: AST → WASM
+        let mut codegen = CodeGen::new();
+        Ok(codegen.compile(&program))
+    }
 }
 
 /// 多文件编译流水线
@@ -366,8 +376,18 @@ pub fn compile_files_to_wasm(files: &[&str]) -> Result<Vec<u8>, String> {
 
     crate::optimizer::optimize_program(&mut program);
     crate::monomorph::monomorphize_program(&mut program);
-    let mut codegen = CodeGen::new();
-    Ok(codegen.compile(&program))
+
+    // 检查是否使用 CHIR 路径
+    if std::env::var("USE_CHIR").is_ok() {
+        // 新路径: AST → CHIR → WASM
+        let chir_program = crate::chir::lower_program(&program)?;
+        let mut codegen = crate::codegen::chir_codegen::CHIRCodeGen::new();
+        Ok(codegen.generate(&chir_program))
+    } else {
+        // 旧路径: AST → WASM
+        let mut codegen = CodeGen::new();
+        Ok(codegen.compile(&program))
+    }
 }
 
 #[cfg(test)]
