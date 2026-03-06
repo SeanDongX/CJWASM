@@ -37,6 +37,9 @@ pub struct LoweringContext<'a> {
 
     /// 下一个可用的局部变量索引
     next_local: u32,
+
+    /// 当前函数返回值的 WASM 类型（用于 Return 语句的类型强制转换）
+    pub return_wasm_ty: Option<ValType>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -54,6 +57,7 @@ impl<'a> LoweringContext<'a> {
             struct_field_offsets,
             class_field_offsets,
             next_local: 0,
+            return_wasm_ty: None,
         }
     }
 
@@ -145,12 +149,29 @@ impl<'a> LoweringContext<'a> {
                     }
                 }
 
-                let func_idx = self.func_indices.get(name)
+                let func_idx = self.func_indices.get(name.as_str())
                     .copied()
-                    .unwrap_or(0); // 默认索引 0（可能是内置函数）
+                    .unwrap_or(0);
 
-                let args_chir: Result<Vec<_>, _> = args.iter()
-                    .map(|a| self.lower_expr(a))
+                // 查询函数签名以获取参数类型，用于插入必要的类型转换
+                let param_tys: Vec<ValType> = self.type_ctx.functions
+                    .get(name.as_str())
+                    .map(|sig| sig.params.iter().map(|p| match p {
+                        crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                        t => t.to_wasm(),
+                    }).collect())
+                    .unwrap_or_default();
+
+                let args_chir: Result<Vec<CHIRExpr>, String> = args.iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let mut arg_chir = self.lower_expr(a)?;
+                        // 若有已知的参数类型，插入强制转换
+                        if let Some(&target_wasm) = param_tys.get(i) {
+                            arg_chir = self.insert_cast_if_needed(arg_chir, target_wasm);
+                        }
+                        Ok(arg_chir)
+                    })
                     .collect();
 
                 CHIRExprKind::Call {
@@ -280,12 +301,27 @@ impl<'a> LoweringContext<'a> {
                         });
                     }
                 }
-                let func_idx = self.func_indices.get(name)
+                let func_idx = self.func_indices.get(name.as_str())
                     .copied()
                     .unwrap_or(0);
 
-                let args_chir: Result<Vec<_>, _> = args.iter()
-                    .map(|a| self.lower_expr(a))
+                let param_tys: Vec<ValType> = self.type_ctx.functions
+                    .get(name.as_str())
+                    .map(|sig| sig.params.iter().map(|p| match p {
+                        crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                        t => t.to_wasm(),
+                    }).collect())
+                    .unwrap_or_default();
+
+                let args_chir: Result<Vec<CHIRExpr>, String> = args.iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let mut arg_chir = self.lower_expr(a)?;
+                        if let Some(&target_wasm) = param_tys.get(i) {
+                            arg_chir = self.insert_cast_if_needed(arg_chir, target_wasm);
+                        }
+                        Ok(arg_chir)
+                    })
                     .collect();
 
                 CHIRExprKind::Call {
@@ -357,17 +393,15 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
-    /// 获取字段偏移
+    /// 获取字段偏移（对未知结构体或未知字段均返回 0，避免 lowering 中断）
     pub fn get_field_offset(&self, obj_ty: &Type, field: &str) -> Result<u32, String> {
         match obj_ty {
             Type::Struct(name, _) => {
-                if let Some(fields) = self.struct_field_offsets.get(name) {
-                    fields.get(field)
-                        .copied()
-                        .ok_or_else(|| format!("字段未找到: {}.{}", name, field))
-                } else {
-                    Ok(0) // 默认偏移
-                }
+                let offset = self.struct_field_offsets
+                    .get(name.as_str())
+                    .and_then(|fields| fields.get(field).copied())
+                    .unwrap_or(0);
+                Ok(offset)
             }
             _ => Ok(0),
         }

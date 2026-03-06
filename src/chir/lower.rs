@@ -22,21 +22,32 @@ pub fn lower_function(
     // 预扫描函数体中的 let/var 声明类型
     type_ctx.collect_locals_from_function(func);
 
+    let return_ty = func.return_type.clone().unwrap_or(crate::ast::Type::Unit);
+    let return_wasm = match &return_ty {
+        crate::ast::Type::Unit | crate::ast::Type::Nothing => None,
+        t => Some(t.to_wasm()),
+    };
+
     let mut ctx = LoweringContext::new(
         &type_ctx,
         func_indices,
         struct_field_offsets,
         class_field_offsets,
     );
+    ctx.return_wasm_ty = return_wasm;
 
     // 处理参数（分配局部变量索引）
     let mut params = Vec::new();
     for param in &func.params {
         let local_idx = ctx.alloc_local(param.name.clone());
+        let wasm_ty = match &param.ty {
+            crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+            t => t.to_wasm(),
+        };
         params.push(CHIRParam {
             name: param.name.clone(),
             ty: param.ty.clone(),
-            wasm_ty: param.ty.to_wasm(),
+            wasm_ty,
             local_idx,
         });
     }
@@ -46,7 +57,10 @@ pub fn lower_function(
 
     // 返回类型
     let return_ty = func.return_type.clone().unwrap_or(Type::Unit);
-    let return_wasm_ty = return_ty.to_wasm();
+    let return_wasm_ty = match &return_ty {
+        Type::Unit | Type::Nothing => wasm_encoder::ValType::I32, // 占位，Unit 函数无返回值
+        t => t.to_wasm(),
+    };
 
     Ok(CHIRFunction {
         name: func.name.clone(),

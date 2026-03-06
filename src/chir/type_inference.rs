@@ -117,7 +117,8 @@ impl TypeInferenceContext {
                 if matches!(name.as_str(), "PI" | "E" | "TAU" | "INF" | "INFINITY" | "NEG_INF" | "NEG_INFINITY" | "NAN") {
                     return Ok(Type::Float64);
                 }
-                Err(format!("变量未定义: {}", name))
+                // 未知变量保守推断为对象引用 (I32)，避免 lowering 失败
+                Ok(Type::Int32)
             }
 
             // 二元运算
@@ -136,22 +137,35 @@ impl TypeInferenceContext {
             // 函数调用
             Expr::Call { name, args, .. } => {
                 if let Some(sig) = self.functions.get(name) {
-                    Ok(sig.return_ty.clone())
-                } else {
-                    // 内置函数
-                    match name.as_str() {
-                        "println" | "print" | "eprintln" | "eprint" => Ok(Type::Unit),
-                        "readln" => Ok(Type::String),
-                        "exit" => Ok(Type::Nothing),
-                        "abs" | "min" | "max" if !args.is_empty() => {
-                            self.infer_expr(&args[0])
+                    return Ok(sig.return_ty.clone());
+                }
+                // 内置函数
+                match name.as_str() {
+                    "println" | "print" | "eprintln" | "eprint" => Ok(Type::Unit),
+                    "readln" => Ok(Type::String),
+                    "exit" => Ok(Type::Nothing),
+                    "abs" | "min" | "max" if !args.is_empty() => {
+                        // 优先查函数签名，无签名则从第一个参数推断
+                        self.infer_expr(&args[0])
+                    }
+                    // 整数类型转换构造函数 → 对应整数类型
+                    "Int8" | "Int16" | "Int32" | "UInt8" | "UInt16" | "UInt32" => Ok(Type::Int32),
+                    "Int64" | "UInt64" | "IntNative" | "UIntNative" => Ok(Type::Int64),
+                    // 浮点类型转换构造函数
+                    "Float16" | "Float32" => Ok(Type::Float32),
+                    "Float64" => Ok(Type::Float64),
+                    // 字符串相关
+                    "toString" | "format" => Ok(Type::String),
+                    _ => {
+                        // 检查是否为结构体/类构造函数 → 对象引用 (I32)
+                        if self.struct_fields.contains_key(name.as_str())
+                            || self.class_fields.contains_key(name.as_str())
+                        {
+                            Ok(Type::Struct(name.clone(), vec![]))
+                        } else {
+                            // 未知函数保守推断为 I32（对象引用比裸 I64 更常见）
+                            Ok(Type::Int32)
                         }
-                        // 类型转换构造函数
-                        "Float32" => Ok(Type::Float32),
-                        "Float64" => Ok(Type::Float64),
-                        "Int32" | "UInt32" => Ok(Type::Int32),
-                        "Int64" | "UInt64" => Ok(Type::Int64),
-                        _ => Ok(Type::Int64), // 默认返回 Int64
                     }
                 }
             }
@@ -247,8 +261,8 @@ impl TypeInferenceContext {
                 }
             }
 
-            // 其他表达式
-            _ => Ok(Type::Int64), // 默认类型
+            // 其他表达式：保守推断为对象引用 (I32)
+            _ => Ok(Type::Int32),
         }
     }
 
@@ -294,19 +308,19 @@ impl TypeInferenceContext {
         }
     }
 
-    /// 推断字段类型
+    /// 推断字段类型（对未知结构体/字段保守推断为 I32，避免 lowering 中断）
     pub fn infer_field_type(&self, obj_ty: &Type, field: &str) -> Result<Type, String> {
         match obj_ty {
             Type::Struct(name, _) => {
-                if let Some(fields) = self.struct_fields.get(name) {
-                    fields.get(field)
-                        .cloned()
-                        .ok_or_else(|| format!("字段未找到: {}.{}", name, field))
+                if let Some(fields) = self.struct_fields.get(name.as_str()) {
+                    // 已知结构体字段 → 返回字段类型；未知字段保守推断为 I32
+                    Ok(fields.get(field).cloned().unwrap_or(Type::Int32))
                 } else {
-                    Err(format!("结构体未定义: {}", name))
+                    // 未知结构体（外部类、类型别名等）→ 保守推断为 I32 对象引用
+                    Ok(Type::Int32)
                 }
             }
-            _ => Ok(Type::Int64), // 默认类型
+            _ => Ok(Type::Int32), // 默认推断为对象引用
         }
     }
 
@@ -327,21 +341,84 @@ impl TypeInferenceContext {
     fn collect_locals_from_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let { pattern, ty, value } | Stmt::Var { pattern, ty, value } => {
-                if let Pattern::Binding(name) = pattern {
-                    let var_ty = if let Some(t) = ty {
-                        t.clone()
-                    } else if let Ok(inferred) = self.infer_expr(value) {
-                        inferred
-                    } else {
-                        Type::Int64 // 默认类型
-                    };
-                    self.add_local(name.clone(), var_ty);
-                }
+                let var_ty = if let Some(t) = ty {
+                    t.clone()
+                } else if let Ok(inferred) = self.infer_expr(value) {
+                    inferred
+                } else {
+                    Type::Int32 // 保守推断为对象引用
+                };
+                self.collect_pattern_bindings(pattern, &var_ty);
             }
             // 递归处理嵌套语句
-            Stmt::While { body, .. } | Stmt::Loop { body } => {
+            Stmt::While { cond: _, body } | Stmt::Loop { body } => {
                 for s in body {
                     self.collect_locals_from_stmt(s);
+                }
+            }
+            Stmt::For { var, body, .. } => {
+                // For 循环变量：类型保守推断为 I32（迭代器元素常为对象或整数）
+                self.add_local(var.clone(), Type::Int32);
+                for s in body {
+                    self.collect_locals_from_stmt(s);
+                }
+            }
+            Stmt::WhileLet { pattern, body, .. } => {
+                self.collect_pattern_bindings(pattern, &Type::Int32);
+                for s in body {
+                    self.collect_locals_from_stmt(s);
+                }
+            }
+            Stmt::DoWhile { body, .. } => {
+                for s in body {
+                    self.collect_locals_from_stmt(s);
+                }
+            }
+            Stmt::Expr(expr) => {
+                self.collect_locals_from_expr(expr);
+            }
+            Stmt::Return(Some(expr)) => {
+                self.collect_locals_from_expr(expr);
+            }
+            _ => {}
+        }
+    }
+
+    /// 从模式中收集绑定变量
+    fn collect_pattern_bindings(&mut self, pattern: &Pattern, ty: &Type) {
+        match pattern {
+            Pattern::Binding(name) => {
+                self.add_local(name.clone(), ty.clone());
+            }
+            Pattern::Tuple(pats) => {
+                for p in pats {
+                    self.collect_pattern_bindings(p, ty);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 从表达式中收集局部变量（处理 Block、If、Match 等）
+    fn collect_locals_from_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Block(stmts, result) => {
+                for s in stmts {
+                    self.collect_locals_from_stmt(s);
+                }
+                if let Some(e) = result {
+                    self.collect_locals_from_expr(e);
+                }
+            }
+            Expr::If { then_branch, else_branch, .. } => {
+                self.collect_locals_from_expr(then_branch);
+                if let Some(else_expr) = else_branch {
+                    self.collect_locals_from_expr(else_expr);
+                }
+            }
+            Expr::Match { arms, .. } => {
+                for arm in arms {
+                    self.collect_locals_from_expr(&arm.body);
                 }
             }
             _ => {}

@@ -81,7 +81,12 @@ impl<'a> LoweringContext<'a> {
             // Return 语句
             Stmt::Return(expr_opt) => {
                 let chir_opt = if let Some(expr) = expr_opt {
-                    Some(self.lower_expr(expr)?)
+                    let mut val = self.lower_expr(expr)?;
+                    // 确保返回值类型与函数签名一致
+                    if let Some(ret_ty) = self.return_wasm_ty {
+                        val = self.insert_cast_if_needed(val, ret_ty);
+                    }
+                    Some(val)
                 } else {
                     None
                 };
