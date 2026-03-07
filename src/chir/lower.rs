@@ -268,7 +268,7 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Expr, Stmt, Param};
+    use crate::ast::{ClassDef, ClassMethod, Expr, FieldDef, Param, Stmt, Visibility};
 
     fn make_func(name: &str, params: Vec<Param>, body: Vec<Stmt>) -> Function {
         Function {
@@ -381,5 +381,130 @@ mod tests {
 
         assert_eq!(chir_program.functions.len(), 1);
         assert_eq!(chir_program.functions[0].name, "main");
+    }
+
+    #[test]
+    fn test_lower_function_class_method() {
+        // Class method with this param and class fields in context
+        let this_param = Param {
+            name: "this".to_string(),
+            ty: Type::Struct("Counter".to_string(), vec![]),
+            default: None,
+            variadic: false,
+            is_named: false,
+            is_inout: false,
+        };
+        let func = make_func(
+            "Counter.getN",
+            vec![this_param],
+            vec![Stmt::Return(Some(Expr::Field {
+                object: Box::new(Expr::Var("this".to_string())),
+                field: "n".to_string(),
+            }))],
+        );
+
+        let type_ctx = TypeInferenceContext::new();
+        let func_indices = HashMap::new();
+        let func_params = HashMap::new();
+        let struct_offsets = HashMap::new();
+        let mut class_offsets = HashMap::new();
+        class_offsets.insert("Counter".to_string(), [("n".to_string(), 8u32)].into_iter().collect());
+        let mut class_field_info: HashMap<String, HashMap<String, (u32, Type)>> = HashMap::new();
+        let mut info = HashMap::new();
+        info.insert("n".to_string(), (8, Type::Int64));
+        class_field_info.insert("Counter".to_string(), info);
+
+        let chir_func = lower_function(
+            &func,
+            &type_ctx,
+            &func_indices,
+            &func_params,
+            &struct_offsets,
+            &class_offsets,
+            &class_field_info,
+            Some("Counter"),
+        ).unwrap();
+
+        assert_eq!(chir_func.name, "Counter.getN");
+        assert_eq!(chir_func.params[0].name, "this");
+    }
+
+    #[test]
+    fn test_lower_program_with_class() {
+        let class_method_func = make_func(
+            "Counter.inc",
+            vec![Param {
+                name: "this".to_string(),
+                ty: Type::Struct("Counter".to_string(), vec![]),
+                default: None,
+                variadic: false,
+                is_named: false,
+                is_inout: false,
+            }],
+            vec![Stmt::Return(Some(Expr::Integer(1)))],
+        );
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "Counter".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: None,
+            implements: vec![],
+            fields: vec![FieldDef {
+                name: "n".to_string(),
+                ty: Type::Int64,
+                default: None,
+            }],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: false,
+                func: class_method_func,
+            }],
+            primary_ctor_params: vec![],
+        };
+
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let chir_program = lower_program(&program).unwrap();
+        assert_eq!(chir_program.functions.len(), 2); // main + Counter.inc
+        assert!(chir_program.classes.len() == 1);
+        assert_eq!(chir_program.classes[0].name, "Counter");
+    }
+
+    #[test]
+    fn test_lower_program_function_fails_placeholder() {
+        // Function that triggers lower error (assign to undefined var) -> Err path
+        // lower_program pushes empty placeholder on Err
+        use crate::ast::AssignTarget;
+        let bad_func = make_func(
+            "bad",
+            vec![],
+            vec![Stmt::Assign {
+                target: AssignTarget::Var("__nonexistent_var__".to_string()),
+                value: Expr::Integer(0),
+            }],
+        );
+        let program = make_program(vec![bad_func]);
+        let chir_program = lower_program(&program).unwrap();
+        // Should still succeed (placeholder), function count 1
+        assert_eq!(chir_program.functions.len(), 1);
+        assert_eq!(chir_program.functions[0].name, "bad");
+        assert!(chir_program.functions[0].body.stmts.is_empty());
     }
 }

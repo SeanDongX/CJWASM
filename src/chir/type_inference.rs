@@ -575,39 +575,616 @@ impl Default for TypeInferenceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Param, Function, StructDef, ClassDef, ClassMethod, FieldDef,
+                     MatchArm as AstMatchArm, Visibility};
+
+    fn empty_program() -> Program {
+        Program {
+            functions: vec![],
+            structs: vec![],
+            classes: vec![],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            imports: vec![],
+            package_name: None,
+        }
+    }
+
+    fn make_param(name: &str, ty: Type) -> Param {
+        Param { name: name.into(), ty, default: None, variadic: false, is_named: false, is_inout: false }
+    }
+
+    fn make_field(name: &str, ty: Type) -> FieldDef {
+        FieldDef { name: name.into(), ty, default: None }
+    }
+
+    fn make_function(name: &str, params: Vec<Param>, return_type: Option<Type>, body: Vec<Stmt>) -> Function {
+        Function {
+            visibility: Visibility::Public,
+            name: name.into(),
+            type_params: vec![],
+            constraints: vec![],
+            params,
+            return_type,
+            throws: None,
+            body,
+            extern_import: None,
+        }
+    }
+
+    // ─── 字面量推断 ───
 
     #[test]
     fn test_infer_literal() {
         let ctx = TypeInferenceContext::new();
-
         assert_eq!(ctx.infer_expr(&Expr::Integer(42)).unwrap(), Type::Int64);
         assert_eq!(ctx.infer_expr(&Expr::Bool(true)).unwrap(), Type::Bool);
-        assert_eq!(ctx.infer_expr(&Expr::String("hello".to_string())).unwrap(), Type::String);
+        assert_eq!(ctx.infer_expr(&Expr::String("hello".into())).unwrap(), Type::String);
     }
 
     #[test]
-    fn test_infer_binary() {
+    fn test_infer_float_literals() {
         let ctx = TypeInferenceContext::new();
+        assert_eq!(ctx.infer_expr(&Expr::Float(3.14)).unwrap(), Type::Float64);
+        assert_eq!(ctx.infer_expr(&Expr::Float32(1.0)).unwrap(), Type::Float32);
+        assert_eq!(ctx.infer_expr(&Expr::Rune('A')).unwrap(), Type::Rune);
+    }
 
+    #[test]
+    fn test_infer_interpolate() {
+        let ctx = TypeInferenceContext::new();
+        assert_eq!(ctx.infer_expr(&Expr::Interpolate(vec![])).unwrap(), Type::String);
+    }
+
+    // ─── 变量推断 ───
+
+    #[test]
+    fn test_infer_var_local() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local("x".into(), Type::Float64);
+        assert_eq!(ctx.infer_expr(&Expr::Var("x".into())).unwrap(), Type::Float64);
+    }
+
+    #[test]
+    fn test_infer_var_global() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.globals.insert("G".into(), Type::Bool);
+        assert_eq!(ctx.infer_expr(&Expr::Var("G".into())).unwrap(), Type::Bool);
+    }
+
+    #[test]
+    fn test_infer_var_math_constants() {
+        let ctx = TypeInferenceContext::new();
+        for name in &["PI", "E", "TAU", "INF", "NAN"] {
+            assert_eq!(ctx.infer_expr(&Expr::Var(name.to_string())).unwrap(), Type::Float64);
+        }
+    }
+
+    #[test]
+    fn test_infer_var_unknown() {
+        let ctx = TypeInferenceContext::new();
+        assert_eq!(ctx.infer_expr(&Expr::Var("unknown".into())).unwrap(), Type::Int32);
+    }
+
+    // ─── 二元运算推断 ───
+
+    #[test]
+    fn test_infer_binary_arithmetic() {
+        let ctx = TypeInferenceContext::new();
         let expr = Expr::Binary {
             op: BinOp::Add,
             left: Box::new(Expr::Integer(1)),
             right: Box::new(Expr::Integer(2)),
         };
-
         assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
     }
 
     #[test]
-    fn test_infer_comparison() {
+    fn test_infer_binary_comparison() {
         let ctx = TypeInferenceContext::new();
+        for op in &[BinOp::Lt, BinOp::Gt, BinOp::Eq, BinOp::NotEq, BinOp::LtEq, BinOp::GtEq] {
+            let expr = Expr::Binary {
+                op: op.clone(),
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(2)),
+            };
+            assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Bool);
+        }
+    }
 
+    #[test]
+    fn test_infer_binary_logical() {
+        let ctx = TypeInferenceContext::new();
         let expr = Expr::Binary {
-            op: BinOp::Lt,
-            left: Box::new(Expr::Integer(1)),
-            right: Box::new(Expr::Integer(2)),
+            op: BinOp::LogicalAnd,
+            left: Box::new(Expr::Bool(true)),
+            right: Box::new(Expr::Bool(false)),
         };
-
         assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Bool);
+    }
+
+    #[test]
+    fn test_infer_binary_bitwise() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Binary {
+            op: BinOp::BitAnd,
+            left: Box::new(Expr::Integer(0xFF)),
+            right: Box::new(Expr::Integer(0x0F)),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    // ─── 一元运算推断 ───
+
+    #[test]
+    fn test_infer_unary_not() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(Expr::Bool(true)),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Bool);
+    }
+
+    #[test]
+    fn test_infer_unary_neg() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(Expr::Integer(42)),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    // ─── 函数调用推断 ───
+
+    #[test]
+    fn test_infer_call_known_function() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.functions.insert("foo".into(), FunctionSignature {
+            name: "foo".into(),
+            params: vec![Type::Int64],
+            return_ty: Type::Float64,
+        });
+        let expr = Expr::Call {
+            name: "foo".into(), args: vec![Expr::Integer(1)],
+            type_args: None, named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Float64);
+    }
+
+    #[test]
+    fn test_infer_call_mangled() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.functions.insert("foo$2".into(), FunctionSignature {
+            name: "foo".into(), params: vec![Type::Int64, Type::Int64], return_ty: Type::Bool,
+        });
+        let expr = Expr::Call {
+            name: "foo".into(), args: vec![Expr::Integer(1), Expr::Integer(2)],
+            type_args: None, named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Bool);
+    }
+
+    #[test]
+    fn test_infer_call_builtins() {
+        let ctx = TypeInferenceContext::new();
+        let println_expr = Expr::Call { name: "println".into(), args: vec![], type_args: None, named_args: vec![] };
+        assert_eq!(ctx.infer_expr(&println_expr).unwrap(), Type::Unit);
+
+        let readln_expr = Expr::Call { name: "readln".into(), args: vec![], type_args: None, named_args: vec![] };
+        assert_eq!(ctx.infer_expr(&readln_expr).unwrap(), Type::String);
+
+        let exit_expr = Expr::Call { name: "exit".into(), args: vec![], type_args: None, named_args: vec![] };
+        assert_eq!(ctx.infer_expr(&exit_expr).unwrap(), Type::Nothing);
+    }
+
+    #[test]
+    fn test_infer_call_type_conversion() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Call { name: "Int32".into(), args: vec![Expr::Integer(42)], type_args: None, named_args: vec![] };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int32);
+
+        let expr = Expr::Call { name: "Float64".into(), args: vec![Expr::Integer(42)], type_args: None, named_args: vec![] };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Float64);
+
+        let expr = Expr::Call { name: "toString".into(), args: vec![], type_args: None, named_args: vec![] };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
+    }
+
+    #[test]
+    fn test_infer_call_constructor() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.struct_fields.insert("Point".into(), HashMap::new());
+        let expr = Expr::Call { name: "Point".into(), args: vec![], type_args: None, named_args: vec![] };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Struct("Point".into(), vec![]));
+    }
+
+    // ─── 方法调用推断 ───
+
+    #[test]
+    fn test_infer_method_return_user_defined() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local("obj".into(), Type::Struct("MyClass".into(), vec![]));
+        let mut methods = HashMap::new();
+        methods.insert("getValue".into(), Type::Float64);
+        ctx.class_method_returns.insert("MyClass".into(), methods);
+
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("obj".into())),
+            method: "getValue".into(),
+            args: vec![], type_args: None, named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Float64);
+    }
+
+    #[test]
+    fn test_infer_method_return_array_builtin() {
+        let ctx = TypeInferenceContext::new();
+        let arr = Expr::Array(vec![Expr::Integer(1)]);
+        let expr = Expr::MethodCall {
+            object: Box::new(arr),
+            method: "size".into(),
+            args: vec![], type_args: None, named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    #[test]
+    fn test_infer_method_return_tostring() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::Integer(42)),
+            method: "toString".into(),
+            args: vec![], type_args: None, named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
+    }
+
+    // ─── 字段推断 ───
+
+    #[test]
+    fn test_infer_field_type_struct() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut fields = HashMap::new();
+        fields.insert("x".into(), Type::Float64);
+        fields.insert("y".into(), Type::Float64);
+        ctx.struct_fields.insert("Point".into(), fields);
+
+        let result = ctx.infer_field_type(&Type::Struct("Point".into(), vec![]), "x").unwrap();
+        assert_eq!(result, Type::Float64);
+    }
+
+    #[test]
+    fn test_infer_field_type_class() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut fields = HashMap::new();
+        fields.insert("count".into(), Type::Int64);
+        ctx.class_fields.insert("Counter".into(), fields);
+
+        let result = ctx.infer_field_type(&Type::Struct("Counter".into(), vec![]), "count").unwrap();
+        assert_eq!(result, Type::Int64);
+    }
+
+    #[test]
+    fn test_infer_field_type_unknown() {
+        let ctx = TypeInferenceContext::new();
+        let result = ctx.infer_field_type(&Type::Struct("Unknown".into(), vec![]), "x").unwrap();
+        assert_eq!(result, Type::Int32);
+    }
+
+    #[test]
+    fn test_infer_field_expr() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local("p".into(), Type::Struct("Point".into(), vec![]));
+        let mut fields = HashMap::new();
+        fields.insert("x".into(), Type::Float64);
+        ctx.struct_fields.insert("Point".into(), fields);
+
+        let expr = Expr::Field {
+            object: Box::new(Expr::Var("p".into())),
+            field: "x".into(),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Float64);
+    }
+
+    // ─── 数组/元组推断 ───
+
+    #[test]
+    fn test_infer_array() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Array(vec![Expr::Integer(1), Expr::Integer(2)]);
+        let ty = ctx.infer_expr(&expr).unwrap();
+        assert_eq!(ty, Type::Array(Box::new(Type::Int64)));
+    }
+
+    #[test]
+    fn test_infer_empty_array() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Array(vec![]);
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Array(Box::new(Type::Int64)));
+    }
+
+    #[test]
+    fn test_infer_index() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Index {
+            array: Box::new(Expr::Array(vec![Expr::Float(1.0)])),
+            index: Box::new(Expr::Integer(0)),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Float64);
+    }
+
+    #[test]
+    fn test_infer_tuple() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Tuple(vec![Expr::Integer(1), Expr::Bool(true)]);
+        let ty = ctx.infer_expr(&expr).unwrap();
+        assert_eq!(ty, Type::Tuple(vec![Type::Int64, Type::Bool]));
+    }
+
+    // ─── 结构体/构造函数推断 ───
+
+    #[test]
+    fn test_infer_struct_init() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::StructInit {
+            name: "Point".into(),
+            fields: vec![],
+            type_args: None,
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Struct("Point".into(), vec![]));
+    }
+
+    #[test]
+    fn test_infer_constructor_call() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::ConstructorCall {
+            name: "Array".into(), args: vec![],
+            type_args: Some(vec![Type::Bool]), named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Array(Box::new(Type::Bool)));
+    }
+
+    #[test]
+    fn test_infer_constructor_numeric_cast() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::ConstructorCall {
+            name: "Float32".into(), args: vec![Expr::Integer(42)],
+            type_args: None, named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Float32);
+    }
+
+    // ─── If/Match 推断 ───
+
+    #[test]
+    fn test_infer_if_with_else() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::If {
+            cond: Box::new(Expr::Bool(true)),
+            then_branch: Box::new(Expr::Integer(1)),
+            else_branch: Some(Box::new(Expr::Integer(2))),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    #[test]
+    fn test_infer_if_without_else() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::If {
+            cond: Box::new(Expr::Bool(true)),
+            then_branch: Box::new(Expr::Integer(1)),
+            else_branch: None,
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Unit);
+    }
+
+    #[test]
+    fn test_infer_match() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Integer(1)),
+            arms: vec![AstMatchArm {
+                pattern: Pattern::Binding("x".into()),
+                guard: None,
+                body: Box::new(Expr::String("hello".into())),
+            }],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
+    }
+
+    #[test]
+    fn test_infer_match_empty() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Integer(1)),
+            arms: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Unit);
+    }
+
+    // ─── add_local / get_local ───
+
+    #[test]
+    fn test_add_get_local() {
+        let mut ctx = TypeInferenceContext::new();
+        assert!(ctx.get_local("x").is_none());
+        ctx.add_local("x".into(), Type::Bool);
+        assert_eq!(ctx.get_local("x").unwrap(), &Type::Bool);
+    }
+
+    // ─── from_program ───
+
+    #[test]
+    fn test_from_program_functions() {
+        let mut prog = empty_program();
+        prog.functions.push(make_function("add", vec![
+            make_param("a", Type::Int64), make_param("b", Type::Int64),
+        ], Some(Type::Int64), vec![]));
+        let ctx = TypeInferenceContext::from_program(&prog);
+        assert!(ctx.functions.contains_key("add"));
+        assert!(ctx.functions.contains_key("add$2"));
+    }
+
+    #[test]
+    fn test_from_program_structs() {
+        let mut prog = empty_program();
+        prog.structs.push(StructDef {
+            visibility: Visibility::Public,
+            name: "Point".into(),
+            type_params: vec![], constraints: vec![],
+            fields: vec![make_field("x", Type::Float64), make_field("y", Type::Float64)],
+        });
+        let ctx = TypeInferenceContext::from_program(&prog);
+        let fields = ctx.struct_fields.get("Point").unwrap();
+        assert_eq!(fields.get("x").unwrap(), &Type::Float64);
+        assert_eq!(fields.get("y").unwrap(), &Type::Float64);
+    }
+
+    #[test]
+    fn test_from_program_classes_with_methods() {
+        let mut prog = empty_program();
+        prog.classes.push(ClassDef {
+            visibility: Visibility::Public,
+            name: "Counter".into(),
+            type_params: vec![], constraints: vec![],
+            is_abstract: false, is_sealed: false, is_open: false,
+            extends: None, implements: vec![],
+            fields: vec![make_field("count", Type::Int64)],
+            init: None, deinit: None, static_init: None,
+            primary_ctor_params: vec![],
+            methods: vec![ClassMethod {
+                override_: false,
+                func: make_function("Counter.get", vec![
+                    make_param("this", Type::Struct("Counter".into(), vec![])),
+                ], Some(Type::Int64), vec![]),
+            }],
+        });
+        let ctx = TypeInferenceContext::from_program(&prog);
+        assert!(ctx.class_fields.contains_key("Counter"));
+        let methods = ctx.class_method_returns.get("Counter").unwrap();
+        assert_eq!(methods.get("get").unwrap(), &Type::Int64);
+        assert!(ctx.functions.contains_key("Counter.get"));
+    }
+
+    #[test]
+    fn test_from_program_inheritance() {
+        let mut prog = empty_program();
+        let base_class = ClassDef {
+            visibility: Visibility::Public, name: "Base".into(),
+            type_params: vec![], constraints: vec![],
+            is_abstract: false, is_sealed: false, is_open: true,
+            extends: None, implements: vec![],
+            fields: vec![make_field("id", Type::Int64)],
+            init: None, deinit: None, static_init: None,
+            primary_ctor_params: vec![], methods: vec![],
+        };
+        let child_class = ClassDef {
+            visibility: Visibility::Public, name: "Child".into(),
+            type_params: vec![], constraints: vec![],
+            is_abstract: false, is_sealed: false, is_open: false,
+            extends: Some("Base".into()), implements: vec![],
+            fields: vec![make_field("name", Type::String)],
+            init: None, deinit: None, static_init: None,
+            primary_ctor_params: vec![], methods: vec![],
+        };
+        prog.classes.push(base_class);
+        prog.classes.push(child_class);
+        let ctx = TypeInferenceContext::from_program(&prog);
+        let child_fields = ctx.class_fields.get("Child").unwrap();
+        assert_eq!(child_fields.get("name").unwrap(), &Type::String);
+        assert_eq!(child_fields.get("id").unwrap(), &Type::Int64);
+    }
+
+    // ─── collect_locals_from_function ───
+
+    #[test]
+    fn test_collect_locals_from_function() {
+        let mut ctx = TypeInferenceContext::new();
+        let func = make_function("test", vec![make_param("a", Type::Int64)], Some(Type::Bool), vec![
+            Stmt::Let {
+                pattern: Pattern::Binding("x".into()),
+                ty: Some(Type::Float64),
+                value: Expr::Float(1.0),
+            },
+            Stmt::Var {
+                pattern: Pattern::Binding("y".into()),
+                ty: None,
+                value: Expr::Integer(0),
+            },
+        ]);
+        ctx.collect_locals_from_function(&func);
+        assert_eq!(ctx.get_local("a").unwrap(), &Type::Int64);
+        assert_eq!(ctx.get_local("x").unwrap(), &Type::Float64);
+        assert_eq!(ctx.get_local("y").unwrap(), &Type::Int64);
+    }
+
+    #[test]
+    fn test_collect_locals_nested() {
+        let mut ctx = TypeInferenceContext::new();
+        let func = make_function("test", vec![], None, vec![
+            Stmt::While {
+                cond: Expr::Bool(true),
+                body: vec![Stmt::Let {
+                    pattern: Pattern::Binding("inner".into()),
+                    ty: Some(Type::Bool),
+                    value: Expr::Bool(false),
+                }],
+            },
+            Stmt::For {
+                var: "i".into(),
+                iterable: Expr::Integer(0),
+                body: vec![],
+            },
+        ]);
+        ctx.collect_locals_from_function(&func);
+        assert_eq!(ctx.get_local("inner").unwrap(), &Type::Bool);
+        assert!(ctx.get_local("i").is_some());
+    }
+
+    // ─── infer_return_type_from_body ───
+
+    #[test]
+    fn test_infer_return_type_from_body() {
+        let ctx = TypeInferenceContext::new();
+        let body = vec![
+            Stmt::Expr(Expr::Integer(0)),
+            Stmt::Return(Some(Expr::Float(3.14))),
+        ];
+        let result = infer_return_type_from_body(&body, &ctx);
+        assert_eq!(result, Some(Type::Float64));
+    }
+
+    #[test]
+    fn test_infer_return_type_from_body_none() {
+        let ctx = TypeInferenceContext::new();
+        let body = vec![Stmt::Expr(Expr::Integer(0))];
+        assert_eq!(infer_return_type_from_body(&body, &ctx), None);
+    }
+
+    #[test]
+    fn test_infer_return_type_nested_in_loop() {
+        let ctx = TypeInferenceContext::new();
+        let body = vec![
+            Stmt::While {
+                cond: Expr::Bool(true),
+                body: vec![Stmt::Return(Some(Expr::String("done".into())))],
+            },
+        ];
+        let result = infer_return_type_from_body(&body, &ctx);
+        assert_eq!(result, Some(Type::String));
+    }
+
+    // ─── Default trait ───
+
+    #[test]
+    fn test_default() {
+        let ctx = TypeInferenceContext::default();
+        assert!(ctx.locals.is_empty());
+        assert!(ctx.functions.is_empty());
     }
 }

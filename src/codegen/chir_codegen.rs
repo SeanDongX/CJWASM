@@ -1411,13 +1411,10 @@ fn run_length_encode_locals(locals: &[(u32, ValType)], param_count: u32) -> Vec<
     let mut prev_idx: Option<u32> = None;
 
     for &(idx, ty) in locals {
-        // 计算与上一个索引之间的空洞大小
-        // 首次：从 param_count 到首个 local 索引之间可能存在空洞（双重 lower 等情况）
         let gap = match prev_idx {
             Some(p) => idx.saturating_sub(p + 1),
             None => idx.saturating_sub(param_count),
         };
-        // 用 I32 填充空洞，保证索引连续
         if gap > 0 {
             if let Some(last) = result.last_mut() {
                 if last.1 == ValType::I32 {
@@ -1429,7 +1426,6 @@ fn run_length_encode_locals(locals: &[(u32, ValType)], param_count: u32) -> Vec<
                 result.push((gap, ValType::I32));
             }
         }
-        // 追加当前局部变量（尝试合并相邻同类型）
         if let Some(last) = result.last_mut() {
             if last.1 == ty {
                 last.0 += 1;
@@ -1441,4 +1437,674 @@ fn run_length_encode_locals(locals: &[(u32, ValType)], param_count: u32) -> Vec<
         prev_idx = Some(idx);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chir::{CHIRFunction, CHIRBlock, CHIRParam, CHIRProgram, CHIRGlobal, CHIRMatchArm, CHIRPattern, CHIRLValue};
+
+    fn make_func(name: &str, params: Vec<CHIRParam>, return_ty: Type, body: CHIRBlock) -> CHIRFunction {
+        let return_wasm_ty = match &return_ty {
+            Type::Unit | Type::Nothing => ValType::I32,
+            t => t.to_wasm(),
+        };
+        CHIRFunction {
+            name: name.into(),
+            params,
+            return_ty,
+            return_wasm_ty,
+            locals: vec![],
+            body,
+            local_wasm_types: HashMap::new(),
+        }
+    }
+
+    fn make_program(functions: Vec<CHIRFunction>) -> CHIRProgram {
+        CHIRProgram {
+            functions,
+            structs: vec![],
+            classes: vec![],
+            enums: vec![],
+            globals: vec![],
+        }
+    }
+
+    fn validate_wasm(bytes: &[u8]) -> bool {
+        // WASM magic number: \0asm (0x00 0x61 0x73 0x6d)
+        bytes.len() >= 8 && bytes[0..4] == [0x00, 0x61, 0x73, 0x6d]
+    }
+
+    // ─── run_length_encode_locals ───
+
+    #[test]
+    fn test_rle_empty() {
+        assert!(run_length_encode_locals(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn test_rle_consecutive_same_type() {
+        let locals = vec![(0, ValType::I32), (1, ValType::I32), (2, ValType::I32)];
+        let result = run_length_encode_locals(&locals, 0);
+        assert_eq!(result, vec![(3, ValType::I32)]);
+    }
+
+    #[test]
+    fn test_rle_different_types() {
+        let locals = vec![(0, ValType::I32), (1, ValType::I64), (2, ValType::F64)];
+        let result = run_length_encode_locals(&locals, 0);
+        assert_eq!(result, vec![(1, ValType::I32), (1, ValType::I64), (1, ValType::F64)]);
+    }
+
+    #[test]
+    fn test_rle_with_gap() {
+        let locals = vec![(0, ValType::I64), (3, ValType::F64)];
+        let result = run_length_encode_locals(&locals, 0);
+        assert_eq!(result, vec![(1, ValType::I64), (2, ValType::I32), (1, ValType::F64)]);
+    }
+
+    #[test]
+    fn test_rle_with_param_offset() {
+        let locals = vec![(2, ValType::I64)];
+        let result = run_length_encode_locals(&locals, 2);
+        assert_eq!(result, vec![(1, ValType::I64)]);
+    }
+
+    // ─── collect_locals ───
+
+    #[test]
+    fn test_collect_locals_let() {
+        let block = CHIRBlock {
+            stmts: vec![
+                CHIRStmt::Let {
+                    local_idx: 1,
+                    value: CHIRExpr::int_const(42, Type::Int64),
+                },
+            ],
+            result: None,
+        };
+        let mut out = vec![];
+        collect_locals_from_block(&block, 1, &mut out);
+        assert_eq!(out, vec![(1, ValType::I64)]);
+    }
+
+    #[test]
+    fn test_collect_locals_nested_while() {
+        let block = CHIRBlock {
+            stmts: vec![
+                CHIRStmt::While {
+                    cond: CHIRExpr::bool_const(true),
+                    body: CHIRBlock {
+                        stmts: vec![CHIRStmt::Let {
+                            local_idx: 2,
+                            value: CHIRExpr::new(CHIRExprKind::Float(1.0), Type::Float64, ValType::F64),
+                        }],
+                        result: None,
+                    },
+                },
+            ],
+            result: None,
+        };
+        let mut out = vec![];
+        collect_locals_from_block(&block, 0, &mut out);
+        assert!(out.iter().any(|&(idx, ty)| idx == 2 && ty == ValType::F64));
+    }
+
+    // ─── expr_produces_wasm_value ───
+
+    #[test]
+    fn test_expr_produces_value_integer() {
+        assert!(CHIRCodeGen::expr_produces_wasm_value(
+            &CHIRExpr::int_const(42, Type::Int64)
+        ));
+    }
+
+    #[test]
+    fn test_expr_produces_value_unit() {
+        let expr = CHIRExpr::new(CHIRExprKind::Nop, Type::Unit, ValType::I32);
+        assert!(!CHIRCodeGen::expr_produces_wasm_value(&expr));
+    }
+
+    #[test]
+    fn test_expr_produces_value_print() {
+        let expr = CHIRExpr::new(
+            CHIRExprKind::Print { arg: None, newline: true, fd: 1 },
+            Type::Unit, ValType::I32,
+        );
+        assert!(!CHIRCodeGen::expr_produces_wasm_value(&expr));
+    }
+
+    // ─── expr_produces_wasm_value_ctx ───
+
+    #[test]
+    fn test_expr_produces_value_ctx_void_call() {
+        let mut gen = CHIRCodeGen::new();
+        gen.func_void_map.insert(5, true);
+
+        let call = CHIRExpr::new(
+            CHIRExprKind::Call { func_idx: 5, args: vec![] },
+            Type::Unit, ValType::I32,
+        );
+        assert!(!gen.expr_produces_wasm_value_ctx(&call));
+    }
+
+    #[test]
+    fn test_expr_produces_value_ctx_non_void_call() {
+        let mut gen = CHIRCodeGen::new();
+        gen.func_void_map.insert(6, false);
+
+        let call = CHIRExpr::new(
+            CHIRExprKind::Call { func_idx: 6, args: vec![] },
+            Type::Int64, ValType::I64,
+        );
+        assert!(gen.expr_produces_wasm_value_ctx(&call));
+    }
+
+    #[test]
+    fn test_expr_produces_value_ctx_if() {
+        let mut gen = CHIRCodeGen::new();
+        let if_expr = CHIRExpr::new(
+            CHIRExprKind::If {
+                cond: Box::new(CHIRExpr::bool_const(true)),
+                then_block: CHIRBlock::from_expr(CHIRExpr::int_const(1, Type::Int64)),
+                else_block: Some(CHIRBlock::from_expr(CHIRExpr::int_const(2, Type::Int64))),
+            },
+            Type::Int64, ValType::I64,
+        );
+        assert!(gen.expr_produces_wasm_value_ctx(&if_expr));
+    }
+
+    #[test]
+    fn test_expr_produces_value_ctx_block() {
+        let mut gen = CHIRCodeGen::new();
+        let block_expr = CHIRExpr::new(
+            CHIRExprKind::Block(CHIRBlock::from_expr(CHIRExpr::bool_const(true))),
+            Type::Bool, ValType::I32,
+        );
+        assert!(gen.expr_produces_wasm_value_ctx(&block_expr));
+    }
+
+    #[test]
+    fn test_expr_produces_value_ctx_empty_block() {
+        let mut gen = CHIRCodeGen::new();
+        let block_expr = CHIRExpr::new(
+            CHIRExprKind::Block(CHIRBlock::empty()),
+            Type::Bool, ValType::I32,
+        );
+        assert!(!gen.expr_produces_wasm_value_ctx(&block_expr));
+    }
+
+    // ─── 端到端生成 ───
+
+    #[test]
+    fn test_generate_empty_program() {
+        let prog = make_program(vec![]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_simple_return() {
+        let body = CHIRBlock {
+            stmts: vec![CHIRStmt::Return(Some(CHIRExpr::int_const(42, Type::Int64)))],
+            result: None,
+        };
+        let func = make_func("main", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_void_function() {
+        let body = CHIRBlock {
+            stmts: vec![CHIRStmt::Return(None)],
+            result: None,
+        };
+        let func = make_func("doNothing", vec![], Type::Unit, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_with_locals() {
+        let body = CHIRBlock {
+            stmts: vec![
+                CHIRStmt::Let {
+                    local_idx: 0,
+                    value: CHIRExpr::int_const(10, Type::Int64),
+                },
+                CHIRStmt::Return(Some(CHIRExpr::new(
+                    CHIRExprKind::Local(0), Type::Int64, ValType::I64,
+                ))),
+            ],
+            result: None,
+        };
+        let func = make_func("test", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_binary_expr() {
+        let body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::Binary {
+                    op: BinOp::Add,
+                    left: Box::new(CHIRExpr::int_const(1, Type::Int64)),
+                    right: Box::new(CHIRExpr::int_const(2, Type::Int64)),
+                },
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let func = make_func("add", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_if_expr() {
+        let body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::If {
+                    cond: Box::new(CHIRExpr::bool_const(true)),
+                    then_block: CHIRBlock::from_expr(CHIRExpr::int_const(1, Type::Int64)),
+                    else_block: Some(CHIRBlock::from_expr(CHIRExpr::int_const(2, Type::Int64))),
+                },
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let func = make_func("test_if", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_void_if_in_void_func() {
+        let body = CHIRBlock {
+            stmts: vec![CHIRStmt::Expr(CHIRExpr::new(
+                CHIRExprKind::If {
+                    cond: Box::new(CHIRExpr::bool_const(true)),
+                    then_block: CHIRBlock::from_expr(CHIRExpr::int_const(1, Type::Int64)),
+                    else_block: Some(CHIRBlock::from_expr(CHIRExpr::int_const(2, Type::Int64))),
+                },
+                Type::Int64, ValType::I64,
+            ))],
+            result: None,
+        };
+        let func = make_func("test", vec![], Type::Unit, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_while_loop() {
+        let body = CHIRBlock {
+            stmts: vec![CHIRStmt::While {
+                cond: CHIRExpr::bool_const(false),
+                body: CHIRBlock { stmts: vec![CHIRStmt::Break], result: None },
+            }],
+            result: None,
+        };
+        let func = make_func("test_while", vec![], Type::Unit, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_with_params() {
+        let body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::Binary {
+                    op: BinOp::Add,
+                    left: Box::new(CHIRExpr::new(CHIRExprKind::Local(0), Type::Int64, ValType::I64)),
+                    right: Box::new(CHIRExpr::new(CHIRExprKind::Local(1), Type::Int64, ValType::I64)),
+                },
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let func = make_func("add", vec![
+            CHIRParam { name: "a".into(), ty: Type::Int64, wasm_ty: ValType::I64, local_idx: 0 },
+            CHIRParam { name: "b".into(), ty: Type::Int64, wasm_ty: ValType::I64, local_idx: 1 },
+        ], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_cast() {
+        let body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::Cast {
+                    expr: Box::new(CHIRExpr::int_const(42, Type::Int64)),
+                    from_ty: ValType::I64,
+                    to_ty: ValType::I32,
+                },
+                Type::Int32, ValType::I32,
+            ))),
+        };
+        let func = make_func("cast_test", vec![], Type::Int32, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_unary() {
+        let body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(CHIRExpr::int_const(42, Type::Int64)),
+                },
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let func = make_func("neg_test", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_multiple_funcs() {
+        let f1 = make_func("foo", vec![], Type::Int64, CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::int_const(1, Type::Int64))),
+        });
+        let f2_body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::Call {
+                    func_idx: 2, // foo is at IMPORT_COUNT + 0 = 2
+                    args: vec![],
+                },
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let f2 = make_func("bar", vec![], Type::Int64, f2_body);
+        let prog = make_program(vec![f1, f2]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_print() {
+        let body = CHIRBlock {
+            stmts: vec![CHIRStmt::Expr(CHIRExpr::new(
+                CHIRExprKind::Print {
+                    arg: Some(Box::new(CHIRExpr::int_const(42, Type::Int64))),
+                    newline: true,
+                    fd: 1,
+                },
+                Type::Unit, ValType::I32,
+            ))],
+            result: None,
+        };
+        let func = make_func("test_print", vec![], Type::Unit, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_intern_string() {
+        let mut gen = CHIRCodeGen::new();
+        let addr1 = gen.intern_string("hello");
+        let addr2 = gen.intern_string("hello");
+        let addr3 = gen.intern_string("world");
+        assert_eq!(addr1, addr2);
+        assert_ne!(addr1, addr3);
+    }
+
+    #[test]
+    fn test_generate_assign_local() {
+        let body = CHIRBlock {
+            stmts: vec![
+                CHIRStmt::Let { local_idx: 0, value: CHIRExpr::int_const(0, Type::Int64) },
+                CHIRStmt::Assign {
+                    target: CHIRLValue::Local(0),
+                    value: CHIRExpr::int_const(42, Type::Int64),
+                },
+                CHIRStmt::Return(Some(CHIRExpr::new(CHIRExprKind::Local(0), Type::Int64, ValType::I64))),
+            ],
+            result: None,
+        };
+        let func = make_func("test_assign", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_block_expr() {
+        let body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::Block(CHIRBlock {
+                    stmts: vec![],
+                    result: Some(Box::new(CHIRExpr::int_const(99, Type::Int64))),
+                }),
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let func = make_func("block_test", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_comparison_ops() {
+        for op in &[BinOp::Lt, BinOp::Gt, BinOp::Eq, BinOp::NotEq, BinOp::LtEq, BinOp::GtEq] {
+            let body = CHIRBlock {
+                stmts: vec![],
+                result: Some(Box::new(CHIRExpr::new(
+                    CHIRExprKind::Binary {
+                        op: op.clone(),
+                        left: Box::new(CHIRExpr::int_const(1, Type::Int64)),
+                        right: Box::new(CHIRExpr::int_const(2, Type::Int64)),
+                    },
+                    Type::Bool, ValType::I32,
+                ))),
+            };
+            let func = make_func("cmp", vec![], Type::Bool, body);
+            let prog = make_program(vec![func]);
+            let mut gen = CHIRCodeGen::new();
+            let bytes = gen.generate(&prog);
+            assert!(validate_wasm(&bytes), "Failed for op {:?}", op);
+        }
+    }
+
+    #[test]
+    fn test_generate_match_expr_multiple_arms() {
+        let body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::Match {
+                    subject: Box::new(CHIRExpr::int_const(1, Type::Int64)),
+                    arms: vec![
+                        CHIRMatchArm { pattern: CHIRPattern::Wildcard, guard: None, body: CHIRBlock {
+                            stmts: vec![],
+                            result: Some(Box::new(CHIRExpr::int_const(10, Type::Int64))),
+                        }},
+                    ],
+                },
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let func = make_func("m", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_while_with_range_like_cond() {
+        let body = CHIRBlock {
+            stmts: vec![
+                CHIRStmt::Let {
+                    local_idx: 1,
+                    value: CHIRExpr::int_const(0, Type::Int64),
+                },
+                CHIRStmt::While {
+                    cond: CHIRExpr::new(
+                        CHIRExprKind::Binary {
+                            op: BinOp::Lt,
+                            left: Box::new(CHIRExpr::new(CHIRExprKind::Local(1), Type::Int64, ValType::I64)),
+                            right: Box::new(CHIRExpr::int_const(5, Type::Int64)),
+                        },
+                        Type::Bool, ValType::I32,
+                    ),
+                    body: CHIRBlock {
+                        stmts: vec![
+                            CHIRStmt::Assign {
+                                target: CHIRLValue::Local(1),
+                                value: CHIRExpr::new(
+                                    CHIRExprKind::Binary {
+                                        op: BinOp::Add,
+                                        left: Box::new(CHIRExpr::new(CHIRExprKind::Local(1), Type::Int64, ValType::I64)),
+                                        right: Box::new(CHIRExpr::int_const(1, Type::Int64)),
+                                    },
+                                    Type::Int64, ValType::I64,
+                                ),
+                            },
+                        ],
+                        result: None,
+                    },
+                },
+            ],
+            result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Local(1), Type::Int64, ValType::I64))),
+        };
+        let func = make_func("loop_range", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_nested_if_else() {
+        let body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::If {
+                    cond: Box::new(CHIRExpr::bool_const(true)),
+                    then_block: CHIRBlock {
+                        stmts: vec![],
+                        result: Some(Box::new(CHIRExpr::new(
+                            CHIRExprKind::If {
+                                cond: Box::new(CHIRExpr::bool_const(false)),
+                                then_block: CHIRBlock {
+                                    stmts: vec![],
+                                    result: Some(Box::new(CHIRExpr::int_const(1, Type::Int64))),
+                                },
+                                else_block: Some(CHIRBlock {
+                                    stmts: vec![],
+                                    result: Some(Box::new(CHIRExpr::int_const(2, Type::Int64))),
+                                }),
+                            },
+                            Type::Int64, ValType::I64,
+                        ))),
+                    },
+                    else_block: Some(CHIRBlock {
+                        stmts: vec![],
+                        result: Some(Box::new(CHIRExpr::int_const(3, Type::Int64))),
+                    }),
+                },
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let func = make_func("nested_if", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_method_call() {
+        let body = CHIRBlock {
+            stmts: vec![],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::MethodCall {
+                    func_idx: Some(1),
+                    vtable_offset: None,
+                    receiver: Box::new(CHIRExpr::new(CHIRExprKind::Local(0), Type::Int32, ValType::I32)),
+                    args: vec![CHIRExpr::int_const(10, Type::Int64)],
+                },
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let func = make_func("m", vec![CHIRParam { name: "this".into(), ty: Type::Int32, wasm_ty: ValType::I32, local_idx: 0 }], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
+
+    #[test]
+    fn test_generate_complex_block_locals_result() {
+        let body = CHIRBlock {
+            stmts: vec![
+                CHIRStmt::Let {
+                    local_idx: 1,
+                    value: CHIRExpr::int_const(5, Type::Int64),
+                },
+                CHIRStmt::Let {
+                    local_idx: 2,
+                    value: CHIRExpr::int_const(10, Type::Int64),
+                },
+                CHIRStmt::Expr(CHIRExpr::new(
+                    CHIRExprKind::Binary {
+                        op: BinOp::Add,
+                        left: Box::new(CHIRExpr::new(CHIRExprKind::Local(1), Type::Int64, ValType::I64)),
+                        right: Box::new(CHIRExpr::new(CHIRExprKind::Local(2), Type::Int64, ValType::I64)),
+                    },
+                    Type::Int64, ValType::I64,
+                )),
+            ],
+            result: Some(Box::new(CHIRExpr::new(
+                CHIRExprKind::Binary {
+                    op: BinOp::Mul,
+                    left: Box::new(CHIRExpr::new(CHIRExprKind::Local(1), Type::Int64, ValType::I64)),
+                    right: Box::new(CHIRExpr::new(CHIRExprKind::Local(2), Type::Int64, ValType::I64)),
+                },
+                Type::Int64, ValType::I64,
+            ))),
+        };
+        let func = make_func("complex", vec![], Type::Int64, body);
+        let prog = make_program(vec![func]);
+        let mut gen = CHIRCodeGen::new();
+        let bytes = gen.generate(&prog);
+        assert!(validate_wasm(&bytes));
+    }
 }

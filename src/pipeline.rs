@@ -701,4 +701,135 @@ extend<T> Array<T> <: SortByExtension<T> {
         let wasm = compile_source_to_wasm(source).unwrap();
         assert!(wasm.len() >= 8);
     }
+
+    #[test]
+    fn test_l1_std_top_modules() {
+        let modules = l1_std_top_modules();
+        assert!(!modules.is_empty());
+        assert!(modules.contains(&"io"));
+        assert!(modules.contains(&"console"));
+    }
+
+    #[test]
+    fn test_compile_if_else() {
+        let source = "func main(): Int64 { let x = 10; return if x > 5 { 1 } else { 0 } }";
+        let result = compile_source_to_wasm(source);
+        assert!(result.is_ok());
+        assert!(result.unwrap().len() >= 8);
+    }
+
+    #[test]
+    fn test_compile_while_loop() {
+        let source = r#"
+            func main(): Int64 {
+                var i = 0
+                while i < 5 { i = i + 1 }
+                return i
+            }
+        "#;
+        let result = compile_source_to_wasm(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_for_range() {
+        let source = r#"
+            func main(): Int64 {
+                var sum = 0
+                for i in 0..5 { sum = sum + i }
+                return sum
+            }
+        "#;
+        let result = compile_source_to_wasm(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_match_expr() {
+        let source = r#"
+            func main(): Int64 {
+                let n = 2
+                return match n {
+                    case 0 => 10
+                    case 1 => 20
+                    case _ => 30
+                }
+            }
+        "#;
+        let result = compile_source_to_wasm(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_try_catch() {
+        let source = r#"
+            func main(): Int64 {
+                return try { 42 } catch { 0 }
+            }
+        "#;
+        let result = compile_source_to_wasm(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_interface_and_extend() {
+        let source = r#"
+            struct Point { x: Int64, y: Int64 }
+            interface Printable { func print(): Unit; }
+            extend Point: Printable {
+                func print(): Unit { }
+            }
+            func main(): Int64 { return 0 }
+        "#;
+        let result = compile_source_to_wasm(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_class_inheritance() {
+        let source = r#"
+            class Base { var id: Int64; init(i: Int64) { this.id = i } }
+            class Derived <: Base { init(i: Int64) { super(i) } }
+            func main(): Int64 {
+                let d = Derived(1)
+                return d.id
+            }
+        "#;
+        let result = compile_source_to_wasm(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_string_interpolation() {
+        let source = r#"
+            func main(): Int64 {
+                let x = 42
+                let s = "value: ${x}"
+                return 0
+            }
+        "#;
+        let result = compile_source_to_wasm(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_tuple_and_array() {
+        let source = r#"
+            func main(): Int64 {
+                let t = (1, 2)
+                let arr = [10, 20, 30]
+                return t.0 + arr[0]
+            }
+        "#;
+        let result = compile_source_to_wasm(source);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_source_with_block_comment() {
+        let source = "/* comment */ func main(): Int64 { return 0 }";
+        let result = parse_source(source);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().functions.len(), 1);
+    }
 }

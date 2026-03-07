@@ -6838,7 +6838,7 @@ pub(crate) struct LocalsBuilder {
 }
 
 impl LocalsBuilder {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             names: HashMap::new(),
             types: Vec::new(),
@@ -6923,7 +6923,10 @@ impl Default for CodeGen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{AssignTarget, FieldDef, Param, Visibility};
+    use crate::ast::{
+        AssignTarget, ClassMethod, EnumVariant, FieldDef, InitDef, InterfaceDef, InterfaceMethod,
+        Param, Visibility,
+    };
 
     #[test]
     fn test_compile_simple_function() {
@@ -7482,5 +7485,1171 @@ mod tests {
             CodeGen::type_mangle_suffix(&Type::TypeParam("T".to_string())),
             "T"
         );
+    }
+
+    #[test]
+    fn test_type_mangle_suffix_slice() {
+        let result = CodeGen::type_mangle_suffix(&Type::Slice(Box::new(Type::Int32)));
+        assert_eq!(result, "Slice_Int32");
+    }
+
+    #[test]
+    fn test_type_mangle_suffix_map() {
+        let result = CodeGen::type_mangle_suffix(&Type::Map(
+            Box::new(Type::String),
+            Box::new(Type::Int64),
+        ));
+        assert_eq!(result, "Map_String_Int64");
+    }
+
+    #[test]
+    fn test_type_mangle_suffix_this() {
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::This), "This");
+    }
+
+    #[test]
+    fn test_type_mangle_suffix_qualified() {
+        assert_eq!(
+            CodeGen::type_mangle_suffix(&Type::Qualified(vec![
+                "std".to_string(),
+                "io".to_string(),
+                "File".to_string()
+            ])),
+            "std_io_File"
+        );
+    }
+
+    #[test]
+    fn test_type_mangle_suffix_rare() {
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Float16), "Float16");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::IntNative), "IntNative");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::UIntNative), "UIntNative");
+        assert_eq!(CodeGen::type_mangle_suffix(&Type::Nothing), "Nothing");
+    }
+
+    #[test]
+    fn test_mangle_key_with_params() {
+        let result = CodeGen::mangle_key("myFunc", &[Type::Int64, Type::String]);
+        assert!(result.starts_with("myFunc$"));
+    }
+
+    #[test]
+    fn test_mangle_key_empty_params() {
+        let result = CodeGen::mangle_key("noArgs", &[]);
+        assert_eq!(result, "noArgs$_");
+    }
+
+    #[test]
+    fn test_find_or_create_func_type_idx_fallback() {
+        use wasm_encoder::ValType;
+        let codegen = CodeGen::new();
+        let idx = codegen.find_or_create_func_type_idx(&[ValType::I64], &[ValType::I64]);
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_resolve_type_alias() {
+        let mut codegen = CodeGen::new();
+        codegen.type_aliases.insert("MyInt".to_string(), Type::Int64);
+        let resolved = codegen.resolve_type(&Type::Struct("MyInt".to_string(), vec![]));
+        assert_eq!(resolved, Type::Int64);
+    }
+
+    #[test]
+    fn test_resolve_type_option() {
+        let codegen = CodeGen::new();
+        let resolved = codegen.resolve_type(&Type::Option(Box::new(Type::String)));
+        assert_eq!(resolved, Type::Option(Box::new(Type::String)));
+    }
+
+    #[test]
+    fn test_resolve_type_array() {
+        let codegen = CodeGen::new();
+        let resolved = codegen.resolve_type(&Type::Array(Box::new(Type::Int64)));
+        assert_eq!(resolved, Type::Array(Box::new(Type::Int64)));
+    }
+
+    #[test]
+    fn test_resolve_type_no_change() {
+        let codegen = CodeGen::new();
+        assert_eq!(codegen.resolve_type(&Type::Int64), Type::Int64);
+        assert_eq!(codegen.resolve_type(&Type::Bool), Type::Bool);
+    }
+
+    // --- Additional codegen path tests for coverage ---
+
+    #[test]
+    fn test_compile_enum_with_variants() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![EnumDef {
+                visibility: Visibility::default(),
+                name: "Color".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                variants: vec![
+                    EnumVariant {
+                        name: "Red".to_string(),
+                        payload: None,
+                    },
+                    EnumVariant {
+                        name: "Green".to_string(),
+                        payload: None,
+                    },
+                ],
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::VariantConst {
+                    enum_name: "Color".to_string(),
+                    variant_name: "Red".to_string(),
+                    arg: None,
+                }))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_init_and_methods() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![ClassDef {
+                visibility: Visibility::default(),
+                name: "Box".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                is_abstract: false,
+                is_sealed: false,
+                is_open: false,
+                extends: None,
+                implements: vec![],
+                fields: vec![FieldDef {
+                    name: "size".to_string(),
+                    ty: Type::Int64,
+                    default: None,
+                }],
+                init: Some(InitDef {
+                    params: vec![Param {
+                        name: "s".to_string(),
+                        ty: Type::Int64,
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    body: vec![Stmt::Assign {
+                        target: AssignTarget::Field {
+                            object: "this".to_string(),
+                            field: "size".to_string(),
+                        },
+                        value: Expr::Var("s".to_string()),
+                    }],
+                }),
+                deinit: None,
+                static_init: None,
+                methods: vec![ClassMethod {
+                    override_: false,
+                    func: FuncDef {
+                        visibility: Visibility::default(),
+                        name: "get_size".to_string(),
+                        type_params: vec![],
+                        constraints: vec![],
+                        params: vec![],
+                        return_type: Some(Type::Int64),
+                        throws: None,
+                        body: vec![Stmt::Return(Some(Expr::Field {
+                            object: Box::new(Expr::Var("this".to_string())),
+                            field: "size".to_string(),
+                        }))],
+                        extern_import: None,
+                    },
+                }],
+                primary_ctor_params: vec![],
+            }],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![
+                    Stmt::Let {
+                        pattern: Pattern::Binding("b".to_string()),
+                        ty: Some(Type::Struct("Box".to_string(), vec![])),
+                        value: Expr::Call {
+                            name: "Box".to_string(),
+                            type_args: None,
+                            args: vec![Expr::Integer(42)],
+                            named_args: vec![],
+                        },
+                    },
+                    Stmt::Return(Some(Expr::MethodCall {
+                        object: Box::new(Expr::Var("b".to_string())),
+                        method: "get_size".to_string(),
+                        args: vec![],
+                        named_args: vec![],
+                        type_args: None,
+                    })),
+                ],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_while_loop() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![
+                    Stmt::Var {
+                        pattern: Pattern::Binding("i".to_string()),
+                        ty: Some(Type::Int64),
+                        value: Expr::Integer(0),
+                    },
+                    Stmt::While {
+                        cond: Expr::Binary {
+                            op: BinOp::Lt,
+                            left: Box::new(Expr::Var("i".to_string())),
+                            right: Box::new(Expr::Integer(5)),
+                        },
+                        body: vec![Stmt::Assign {
+                            target: AssignTarget::Var("i".to_string()),
+                            value: Expr::Binary {
+                                op: BinOp::Add,
+                                left: Box::new(Expr::Var("i".to_string())),
+                                right: Box::new(Expr::Integer(1)),
+                            },
+                        }],
+                    },
+                    Stmt::Return(Some(Expr::Var("i".to_string()))),
+                ],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_unary_ops() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![Param {
+                    name: "x".to_string(),
+                    ty: Type::Int64,
+                    default: None,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
+                }],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(Expr::Var("x".to_string())),
+                }))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_unary_not() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![Param {
+                    name: "b".to_string(),
+                    ty: Type::Bool,
+                    default: None,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
+                }],
+                return_type: Some(Type::Bool),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(Expr::Var("b".to_string())),
+                }))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_string_literal() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int32),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::String("hello".to_string())))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_tuple_creation_and_access() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![
+                    Stmt::Let {
+                        pattern: Pattern::Binding("t".to_string()),
+                        ty: Some(Type::Tuple(vec![Type::Int64, Type::Int64])),
+                        value: Expr::Tuple(vec![Expr::Integer(1), Expr::Integer(2)]),
+                    },
+                    Stmt::Return(Some(Expr::TupleIndex {
+                        object: Box::new(Expr::Var("t".to_string())),
+                        index: 0,
+                    })),
+                ],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_cast_expr() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Float64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Cast {
+                    expr: Box::new(Expr::Integer(42)),
+                    target_ty: Type::Float64,
+                }))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_block_expr() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Block(
+                    vec![Stmt::Let {
+                        pattern: Pattern::Binding("x".to_string()),
+                        ty: Some(Type::Int64),
+                        value: Expr::Integer(10),
+                    }],
+                    Some(Box::new(Expr::Var("x".to_string()))),
+                )))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_return_void() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Unit),
+                throws: None,
+                body: vec![Stmt::Return(None)],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_let_var_declarations() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![
+                    Stmt::Let {
+                        pattern: Pattern::Binding("a".to_string()),
+                        ty: Some(Type::Int64),
+                        value: Expr::Integer(1),
+                    },
+                    Stmt::Var {
+                        pattern: Pattern::Binding("b".to_string()),
+                        ty: Some(Type::Int64),
+                        value: Expr::Integer(2),
+                    },
+                    Stmt::Return(Some(Expr::Binary {
+                        op: BinOp::Add,
+                        left: Box::new(Expr::Var("a".to_string())),
+                        right: Box::new(Expr::Var("b".to_string())),
+                    })),
+                ],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_interface_definition() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![InterfaceDef {
+                visibility: Visibility::default(),
+                name: "Drawable".to_string(),
+                parents: vec![],
+                methods: vec![InterfaceMethod {
+                    name: "draw".to_string(),
+                    params: vec![],
+                    return_type: Some(Type::Int64),
+                    default_body: Some(vec![Stmt::Return(Some(Expr::Integer(0)))]),
+                }],
+                assoc_types: vec![],
+            }],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_extend_definition() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![StructDef {
+                visibility: Visibility::default(),
+                name: "Point".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                fields: vec![
+                    FieldDef {
+                        name: "x".to_string(),
+                        ty: Type::Int64,
+                        default: None,
+                    },
+                    FieldDef {
+                        name: "y".to_string(),
+                        ty: Type::Int64,
+                        default: None,
+                    },
+                ],
+            }],
+            interfaces: vec![InterfaceDef {
+                visibility: Visibility::default(),
+                name: "Printable".to_string(),
+                parents: vec![],
+                methods: vec![InterfaceMethod {
+                    name: "print".to_string(),
+                    params: vec![],
+                    return_type: Some(Type::Unit),
+                    default_body: None,
+                }],
+                assoc_types: vec![],
+            }],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![crate::ast::ExtendDef {
+                target_type: "Point".to_string(),
+                interface: Some("Printable".to_string()),
+                assoc_type_bindings: vec![],
+                methods: vec![FuncDef {
+                    visibility: Visibility::default(),
+                    name: "print".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: Some(Type::Unit),
+                    throws: None,
+                    body: vec![],
+                    extern_import: None,
+                }],
+            }],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_inheritance() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![
+                ClassDef {
+                    visibility: Visibility::default(),
+                    name: "Base".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    is_abstract: false,
+                    is_sealed: false,
+                    is_open: true,
+                    extends: None,
+                    implements: vec![],
+                    fields: vec![FieldDef {
+                        name: "id".to_string(),
+                        ty: Type::Int64,
+                        default: None,
+                    }],
+                    init: Some(InitDef {
+                        params: vec![Param {
+                            name: "id".to_string(),
+                            ty: Type::Int64,
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        }],
+                        body: vec![Stmt::Assign {
+                            target: AssignTarget::Field {
+                                object: "this".to_string(),
+                                field: "id".to_string(),
+                            },
+                            value: Expr::Var("id".to_string()),
+                        }],
+                    }),
+                    deinit: None,
+                    static_init: None,
+                    methods: vec![],
+                    primary_ctor_params: vec![],
+                },
+                ClassDef {
+                    visibility: Visibility::default(),
+                    name: "Derived".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    is_abstract: false,
+                    is_sealed: false,
+                    is_open: false,
+                    extends: Some("Base".to_string()),
+                    implements: vec![],
+                    fields: vec![],
+                    init: Some(InitDef {
+                        params: vec![Param {
+                            name: "id".to_string(),
+                            ty: Type::Int64,
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        }],
+                        body: vec![Stmt::Expr(Expr::SuperCall {
+                            method: "init".to_string(),
+                            args: vec![Expr::Var("id".to_string())],
+                            named_args: vec![],
+                        })],
+                    }),
+                    deinit: None,
+                    static_init: None,
+                    methods: vec![],
+                    primary_ctor_params: vec![],
+                },
+            ],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![
+                    Stmt::Let {
+                        pattern: Pattern::Binding("d".to_string()),
+                        ty: Some(Type::Struct("Derived".to_string(), vec![])),
+                        value: Expr::Call {
+                            name: "Derived".to_string(),
+                            type_args: None,
+                            args: vec![Expr::Integer(1)],
+                            named_args: vec![],
+                        },
+                    },
+                    Stmt::Return(Some(Expr::Field {
+                        object: Box::new(Expr::Var("d".to_string())),
+                        field: "id".to_string(),
+                    })),
+                ],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_lambda_expression() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![
+                FuncDef {
+                    visibility: Visibility::default(),
+                    name: "apply".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![
+                        Param {
+                            name: "f".to_string(),
+                            ty: Type::Function {
+                                params: vec![Type::Int64],
+                                ret: Box::new(Some(Type::Int64)),
+                            },
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        },
+                        Param {
+                            name: "x".to_string(),
+                            ty: Type::Int64,
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        },
+                    ],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Call {
+                        name: "f".to_string(),
+                        type_args: None,
+                        args: vec![Expr::Var("x".to_string())],
+                        named_args: vec![],
+                    }))],
+                    extern_import: None,
+                },
+                FuncDef {
+                    visibility: Visibility::default(),
+                    name: "main".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Call {
+                        name: "apply".to_string(),
+                        type_args: None,
+                        args: vec![
+                            Expr::Lambda {
+                                params: vec![("x".to_string(), Type::Int64)],
+                                return_type: Some(Type::Int64),
+                                body: Box::new(Expr::Binary {
+                                    op: BinOp::Mul,
+                                    left: Box::new(Expr::Var("x".to_string())),
+                                    right: Box::new(Expr::Integer(2)),
+                                }),
+                            },
+                            Expr::Integer(21),
+                        ],
+                        named_args: vec![],
+                    }))],
+                    extern_import: None,
+                },
+            ],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_pipeline_expression() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![
+                FuncDef {
+                    visibility: Visibility::default(),
+                    name: "double".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: Type::Int64,
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Binary {
+                        op: BinOp::Mul,
+                        left: Box::new(Expr::Var("x".to_string())),
+                        right: Box::new(Expr::Integer(2)),
+                    }))],
+                    extern_import: None,
+                },
+                FuncDef {
+                    visibility: Visibility::default(),
+                    name: "main".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Binary {
+                        op: BinOp::Pipeline,
+                        left: Box::new(Expr::Integer(21)),
+                        right: Box::new(Expr::Call {
+                            name: "double".to_string(),
+                            type_args: None,
+                            args: vec![],
+                            named_args: vec![],
+                        }),
+                    }))],
+                    extern_import: None,
+                },
+            ],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_range_inclusive() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![
+                    Stmt::Var {
+                        pattern: Pattern::Binding("sum".to_string()),
+                        ty: Some(Type::Int64),
+                        value: Expr::Integer(0),
+                    },
+                    Stmt::For {
+                        var: "i".to_string(),
+                        iterable: Expr::Range {
+                            start: Box::new(Expr::Integer(0)),
+                            end: Box::new(Expr::Integer(2)),
+                            inclusive: true,
+                            step: None,
+                        },
+                        body: vec![Stmt::Assign {
+                            target: AssignTarget::Var("sum".to_string()),
+                            value: Expr::Binary {
+                                op: BinOp::Add,
+                                left: Box::new(Expr::Var("sum".to_string())),
+                                right: Box::new(Expr::Var("i".to_string())),
+                            },
+                        }],
+                    },
+                    Stmt::Return(Some(Expr::Var("sum".to_string()))),
+                ],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_println_statement() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![
+                    Stmt::Expr(Expr::Call {
+                        name: "println".to_string(),
+                        type_args: None,
+                        args: vec![Expr::String("hello".to_string())],
+                        named_args: vec![],
+                    }),
+                    Stmt::Return(Some(Expr::Integer(0))),
+                ],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_is_type_expr() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![ClassDef {
+                visibility: Visibility::default(),
+                name: "A".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                is_abstract: false,
+                is_sealed: false,
+                is_open: false,
+                extends: None,
+                implements: vec![],
+                fields: vec![],
+                init: None,
+                deinit: None,
+                static_init: None,
+                methods: vec![],
+                primary_ctor_params: vec![],
+            }],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Bool),
+                throws: None,
+                body: vec![
+                    Stmt::Let {
+                        pattern: Pattern::Binding("obj".to_string()),
+                        ty: Some(Type::Struct("A".to_string(), vec![])),
+                        value: Expr::Call {
+                            name: "A".to_string(),
+                            type_args: None,
+                            args: vec![],
+                            named_args: vec![],
+                        },
+                    },
+                    Stmt::Return(Some(Expr::IsType {
+                        expr: Box::new(Expr::Var("obj".to_string())),
+                        target_ty: Type::Struct("A".to_string(), vec![]),
+                    })),
+                ],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_binary_ops_variety() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Binary {
+                    op: BinOp::Sub,
+                    left: Box::new(Expr::Integer(10)),
+                    right: Box::new(Expr::Integer(3)),
+                }))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_compile_try_block() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![FuncDef {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::TryBlock {
+                    resources: vec![],
+                    body: vec![Stmt::Return(Some(Expr::Integer(42)))],
+                    catch_var: None,
+                    catch_type: None,
+                    catch_body: vec![],
+                    finally_body: None,
+                }))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let wasm = codegen.compile(&program);
+        assert!(!wasm.is_empty());
     }
 }

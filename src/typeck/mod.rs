@@ -636,4 +636,171 @@ mod tests {
         let result = FunctionTypeContext::resolve(&func, &global);
         assert_eq!(result.local_types.get("FLAG"), Some(&ValType::I32));
     }
+
+    #[test]
+    fn test_var_from_local_types_resolves() {
+        let frwt = HashMap::new();
+        let structs = HashMap::new();
+        let classes = HashMap::new();
+        let mut gvt = HashMap::new();
+        gvt.insert("g".to_string(), Type::Int64);
+        let global = empty_global(&frwt, &structs, &classes, &gvt);
+        let func = FuncDef {
+            visibility: crate::ast::Visibility::Private,
+            name: "f".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            params: vec![crate::ast::Param {
+                name: "x".to_string(),
+                ty: Type::Int64,
+                default: None,
+                variadic: false,
+                is_named: false,
+                is_inout: false,
+            }],
+            return_type: None,
+            body: vec![Stmt::Let {
+                pattern: Pattern::Binding("y".to_string()),
+                ty: None,
+                value: Expr::Var("x".to_string()),
+            }],
+            extern_import: None,
+            throws: None,
+        };
+        let result = FunctionTypeContext::resolve(&func, &global);
+        assert_eq!(result.local_types.get("y"), Some(&ValType::I64));
+    }
+
+    #[test]
+    fn test_let_with_tuple_pattern() {
+        let frwt = HashMap::new();
+        let structs = HashMap::new();
+        let classes = HashMap::new();
+        let gvt = HashMap::new();
+        let global = empty_global(&frwt, &structs, &classes, &gvt);
+        let func = FuncDef {
+            visibility: crate::ast::Visibility::Private,
+            name: "f".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            params: vec![],
+            return_type: None,
+            body: vec![Stmt::Let {
+                pattern: Pattern::Tuple(vec![
+                    Pattern::Binding("a".to_string()),
+                    Pattern::Binding("b".to_string()),
+                ]),
+                ty: None,
+                value: Expr::Tuple(vec![Expr::Integer(1), Expr::Integer(2)]),
+            }],
+            extern_import: None,
+            throws: None,
+        };
+        let result = FunctionTypeContext::resolve(&func, &global);
+        assert_eq!(result.local_types.get("a"), Some(&ValType::I64));
+        assert_eq!(result.local_types.get("b"), Some(&ValType::I64));
+    }
+
+    #[test]
+    fn test_for_with_array_iterable() {
+        let frwt = HashMap::new();
+        let structs = HashMap::new();
+        let classes = HashMap::new();
+        let gvt = HashMap::new();
+        let global = empty_global(&frwt, &structs, &classes, &gvt);
+        let func = FuncDef {
+            visibility: crate::ast::Visibility::Private,
+            name: "f".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            params: vec![],
+            return_type: None,
+            body: vec![Stmt::For {
+                var: "x".to_string(),
+                iterable: Expr::Array(vec![Expr::Integer(1), Expr::Integer(2)]),
+                body: vec![],
+            }],
+            extern_import: None,
+            throws: None,
+        };
+        let result = FunctionTypeContext::resolve(&func, &global);
+        assert_eq!(result.local_types.get("x"), Some(&ValType::I64));
+        assert_eq!(result.local_types.get("__x_idx"), Some(&ValType::I64));
+        assert_eq!(result.local_types.get("__x_len"), Some(&ValType::I64));
+        assert_eq!(result.local_types.get("__x_arr"), Some(&ValType::I32));
+    }
+
+    #[test]
+    fn test_resolve_expr_call_int64_constructor() {
+        let frwt = HashMap::new();
+        let structs = HashMap::new();
+        let classes = HashMap::new();
+        let gvt = HashMap::new();
+        let global = empty_global(&frwt, &structs, &classes, &gvt);
+        let ctx = FunctionTypeContext::default();
+        let call = Expr::Call {
+            name: "Int64".to_string(),
+            type_args: None,
+            args: vec![Expr::Integer(42)],
+            named_args: vec![],
+        };
+        assert_eq!(resolve_expr_type(&call, &ctx, &global), ValType::I64);
+    }
+
+    #[test]
+    fn test_resolve_expr_call_println() {
+        let frwt = HashMap::new();
+        let structs = HashMap::new();
+        let classes = HashMap::new();
+        let gvt = HashMap::new();
+        let global = empty_global(&frwt, &structs, &classes, &gvt);
+        let ctx = FunctionTypeContext::default();
+        let call = Expr::Call {
+            name: "println".to_string(),
+            type_args: None,
+            args: vec![Expr::Integer(1)],
+            named_args: vec![],
+        };
+        assert_eq!(resolve_expr_type(&call, &ctx, &global), ValType::I32);
+    }
+
+    #[test]
+    fn test_resolve_expr_binary_add_i64() {
+        let frwt = HashMap::new();
+        let structs = HashMap::new();
+        let classes = HashMap::new();
+        let gvt = HashMap::new();
+        let global = empty_global(&frwt, &structs, &classes, &gvt);
+        let ctx = FunctionTypeContext::default();
+        let bin = Expr::Binary {
+            op: crate::ast::BinOp::Add,
+            left: Box::new(Expr::Integer(1)),
+            right: Box::new(Expr::Integer(2)),
+        };
+        assert_eq!(resolve_expr_type(&bin, &ctx, &global), ValType::I64);
+    }
+
+    #[test]
+    fn test_resolve_expr_struct_name_in_global() {
+        let frwt = HashMap::new();
+        let mut structs = HashMap::new();
+        structs.insert(
+            "Point".to_string(),
+            crate::ast::StructDef {
+                visibility: crate::ast::Visibility::default(),
+                name: "Point".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                fields: vec![],
+            },
+        );
+        let classes = HashMap::new();
+        let gvt = HashMap::new();
+        let global = empty_global(&frwt, &structs, &classes, &gvt);
+        let ctx = FunctionTypeContext::default();
+        assert_eq!(
+            resolve_expr_type(&Expr::Var("Point".to_string()), &ctx, &global),
+            ValType::I32
+        );
+    }
 }

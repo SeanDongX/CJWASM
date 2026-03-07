@@ -786,7 +786,7 @@ impl<'a> LoweringContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Program, BinOp};
+    use crate::ast::{Program, BinOp, Stmt, Type};
 
     #[test]
     fn test_lower_integer() {
@@ -861,14 +861,780 @@ mod tests {
             &class_field_info,
         );
 
-        // 创建一个需要类型转换的表达式
         let expr = Expr::Integer(42);
         let chir = ctx.lower_expr(&expr).unwrap();
-
-        // 插入转换
         let casted = ctx.insert_cast_if_needed(chir, ValType::I32);
 
         assert!(matches!(casted.kind, CHIRExprKind::Cast { .. }));
         assert_eq!(casted.wasm_ty, ValType::I32);
+    }
+
+    fn make_ctx<'a>(
+        type_ctx: &'a TypeInferenceContext,
+        func_indices: &'a HashMap<String, u32>,
+        func_params: &'a HashMap<String, Vec<crate::ast::Param>>,
+        struct_offsets: &'a HashMap<String, HashMap<String, u32>>,
+        class_offsets: &'a HashMap<String, HashMap<String, u32>>,
+        class_field_info: &'a HashMap<String, HashMap<String, (u32, crate::ast::Type)>>,
+    ) -> LoweringContext<'a> {
+        LoweringContext::new(type_ctx, func_indices, func_params, struct_offsets, class_offsets, class_field_info)
+    }
+
+    #[test]
+    fn test_lower_float() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let chir = ctx.lower_expr(&Expr::Float(3.14)).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Float(_)));
+        assert_eq!(chir.wasm_ty, ValType::F64);
+    }
+
+    #[test]
+    fn test_lower_float32() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let chir = ctx.lower_expr(&Expr::Float32(1.5)).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Float32(_)));
+        assert_eq!(chir.wasm_ty, ValType::F32);
+    }
+
+    #[test]
+    fn test_lower_bool() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let chir = ctx.lower_expr(&Expr::Bool(true)).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Bool(true)));
+        assert_eq!(chir.wasm_ty, ValType::I32);
+    }
+
+    #[test]
+    fn test_lower_string() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let chir = ctx.lower_expr(&Expr::String("hello".into())).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::String(_)));
+        assert_eq!(chir.wasm_ty, ValType::I32);
+    }
+
+    #[test]
+    fn test_lower_rune() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let chir = ctx.lower_expr(&Expr::Rune('A')).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Rune('A')));
+    }
+
+    #[test]
+    fn test_lower_var_local() {
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("x".into(), Type::Float64);
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        ctx.alloc_local_typed("x".into(), ValType::F64);
+        let chir = ctx.lower_expr(&Expr::Var("x".into())).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Local(0)));
+        assert_eq!(chir.wasm_ty, ValType::F64);
+    }
+
+    #[test]
+    fn test_lower_var_global() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let chir = ctx.lower_expr(&Expr::Var("unknown_global".into())).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Global(_)));
+    }
+
+    #[test]
+    fn test_lower_unary() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr: Box::new(Expr::Integer(42)),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Unary { .. }));
+        assert_eq!(chir.wasm_ty, ValType::I64);
+    }
+
+    #[test]
+    fn test_lower_call_known() {
+        let type_ctx = TypeInferenceContext::new();
+        let mut fi = HashMap::new();
+        fi.insert("myFunc".into(), 5u32);
+        fi.insert("myFunc$1".into(), 5u32);
+        let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Call {
+            name: "myFunc".into(), args: vec![Expr::Integer(1)],
+            type_args: None, named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Call { func_idx: 5, .. }));
+    }
+
+    #[test]
+    fn test_lower_call_println() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Call {
+            name: "println".into(), args: vec![Expr::String("hello".into())],
+            type_args: None, named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Print { .. }));
+    }
+
+    #[test]
+    fn test_lower_call_exit() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Call {
+            name: "exit".into(), args: vec![Expr::Integer(1)],
+            type_args: None, named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Unreachable));
+    }
+
+    #[test]
+    fn test_lower_call_unknown() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Call {
+            name: "unknownFunc".into(), args: vec![],
+            type_args: None, named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+    }
+
+    #[test]
+    fn test_lower_if_expr() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::If {
+            cond: Box::new(Expr::Bool(true)),
+            then_branch: Box::new(Expr::Integer(1)),
+            else_branch: Some(Box::new(Expr::Integer(2))),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::If { .. }));
+    }
+
+    #[test]
+    fn test_lower_if_without_else() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::If {
+            cond: Box::new(Expr::Bool(true)),
+            then_branch: Box::new(Expr::Integer(1)),
+            else_branch: None,
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::If { .. }));
+    }
+
+    #[test]
+    fn test_lower_array() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Array(vec![Expr::Integer(1), Expr::Integer(2)]);
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::ArrayNew { .. }));
+    }
+
+    #[test]
+    fn test_lower_tuple() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Tuple(vec![Expr::Integer(1), Expr::Bool(true)]);
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::TupleNew { .. }));
+    }
+
+    #[test]
+    fn test_lower_index() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Index {
+            array: Box::new(Expr::Array(vec![Expr::Integer(10)])),
+            index: Box::new(Expr::Integer(0)),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::ArrayGet { .. }));
+    }
+
+    #[test]
+    fn test_lower_field_get() {
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("p".into(), Type::Struct("Point".into(), vec![]));
+        let mut struct_fields = HashMap::new();
+        struct_fields.insert("x".into(), Type::Float64);
+        type_ctx.struct_fields.insert("Point".into(), struct_fields);
+
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let mut so = HashMap::new();
+        let mut point_offsets = HashMap::new();
+        point_offsets.insert("x".into(), 8u32);
+        so.insert("Point".into(), point_offsets);
+        let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("p".into(), ValType::I32);
+
+        let expr = Expr::Field {
+            object: Box::new(Expr::Var("p".into())),
+            field: "x".into(),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::FieldGet { field_offset: 8, .. }));
+        assert_eq!(chir.wasm_ty, ValType::F64);
+    }
+
+    #[test]
+    fn test_lower_pipeline_nop() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Binary {
+            op: crate::ast::BinOp::Pipeline,
+            left: Box::new(Expr::Integer(1)),
+            right: Box::new(Expr::Var("f".into())),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+    }
+
+    #[test]
+    fn test_lower_struct_init() {
+        let mut type_ctx = TypeInferenceContext::new();
+        let mut sf = HashMap::new();
+        sf.insert("x".into(), Type::Float64);
+        type_ctx.struct_fields.insert("Point".into(), sf);
+
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let mut so = HashMap::new();
+        let mut po = HashMap::new();
+        po.insert("x".into(), 8u32);
+        so.insert("Point".into(), po);
+        let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::StructInit {
+            name: "Point".into(),
+            fields: vec![("x".into(), Expr::Float(1.0))],
+            type_args: None,
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::StructNew { .. }));
+    }
+
+    #[test]
+    fn test_lower_block_expr() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Block(
+            vec![Stmt::Expr(Expr::Integer(1))],
+            Some(Box::new(Expr::Integer(42))),
+        );
+        let chir = ctx.lower_expr(&expr).unwrap();
+        // Block lowering 成功即可
+        assert!(!matches!(chir.kind, CHIRExprKind::Unreachable));
+    }
+
+    #[test]
+    fn test_insert_cast_same_type() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Integer(42);
+        let chir = ctx.lower_expr(&expr).unwrap();
+        let same = ctx.insert_cast_if_needed(chir, ValType::I64);
+        assert!(matches!(same.kind, CHIRExprKind::Integer(42)));
+    }
+
+    #[test]
+    fn test_alloc_local_typed() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let idx = ctx.alloc_local_typed("x".into(), ValType::F64);
+        assert_eq!(idx, 0);
+        assert_eq!(ctx.get_local_ty(idx), Some(ValType::F64));
+        assert_eq!(ctx.get_local("x"), Some(0));
+    }
+
+    #[test]
+    fn test_lower_method_call() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("obj".into())),
+            method: "doSomething".into(),
+            args: vec![], type_args: None, named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        // MethodCall without known func_idx falls back
+        assert!(!matches!(chir.kind, CHIRExprKind::Unreachable));
+    }
+
+    #[test]
+    fn test_lower_match_multi_arms() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Integer(1)),
+            arms: vec![
+                crate::ast::MatchArm {
+                    pattern: crate::ast::Pattern::Literal(crate::ast::Literal::Integer(0)),
+                    guard: None,
+                    body: Box::new(Expr::Integer(10)),
+                },
+                crate::ast::MatchArm {
+                    pattern: crate::ast::Pattern::Literal(crate::ast::Literal::Integer(1)),
+                    guard: None,
+                    body: Box::new(Expr::Integer(20)),
+                },
+                crate::ast::MatchArm {
+                    pattern: crate::ast::Pattern::Wildcard,
+                    guard: None,
+                    body: Box::new(Expr::Integer(0)),
+                },
+            ],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Match { .. }));
+        assert_eq!(chir.wasm_ty, ValType::I64);
+    }
+
+    #[test]
+    fn test_lower_tuple_index() {
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("t".into(), Type::Tuple(vec![Type::Int64, Type::Float64]));
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("t".into(), ValType::I64);
+
+        let expr = Expr::TupleIndex {
+            object: Box::new(Expr::Var("t".into())),
+            index: 1,
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::TupleGet { index: 1, .. }));
+    }
+
+    #[test]
+    fn test_lower_constructor_call_type_cast() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::ConstructorCall {
+            name: "Int64".into(),
+            type_args: None,
+            args: vec![Expr::Float(3.14)],
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Cast { .. }));
+        assert_eq!(chir.wasm_ty, ValType::I64);
+    }
+
+    #[test]
+    fn test_lower_constructor_call_same_type() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::ConstructorCall {
+            name: "Int64".into(),
+            type_args: None,
+            args: vec![Expr::Integer(42)],
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Integer(42)));
+    }
+
+    #[test]
+    fn test_lower_method_call_known_struct() {
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("p".into(), Type::Struct("Point".into(), vec![]));
+        let mut sf = HashMap::new();
+        sf.insert("x".into(), Type::Float64);
+        type_ctx.struct_fields.insert("Point".into(), sf);
+
+        let mut fi = HashMap::new();
+        fi.insert("Point.mag$1".into(), 10u32);
+        let fp = HashMap::new();
+        let mut so = HashMap::new();
+        let mut point_offsets = HashMap::new();
+        point_offsets.insert("x".into(), 8u32);
+        so.insert("Point".into(), point_offsets);
+        let co = HashMap::new();
+        let mut ci = HashMap::new();
+        let mut point_fields = HashMap::new();
+        point_fields.insert("x".into(), (8u32, Type::Float64));
+        ci.insert("Point".into(), point_fields);
+
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("p".into(), ValType::I32);
+
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("p".into())),
+            method: "mag".into(),
+            args: vec![],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Call { func_idx: 10, .. }));
+    }
+
+    #[test]
+    fn test_lower_array_mixed_elems() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Array(vec![
+            Expr::Integer(1),
+            Expr::Integer(2),
+            Expr::Float(3.0),
+        ]);
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::ArrayNew { .. }));
+    }
+
+    #[test]
+    fn test_lower_call_readln() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Call {
+            name: "readln".into(),
+            args: vec![],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+        assert_eq!(chir.ty, Type::String);
+    }
+
+    #[test]
+    fn test_lower_call_panic() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Call {
+            name: "panic".into(),
+            args: vec![Expr::String("err".into())],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Unreachable));
+    }
+
+    #[test]
+    fn test_lower_binary_complex() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Binary {
+            op: BinOp::LogicalAnd,
+            left: Box::new(Expr::Bool(true)),
+            right: Box::new(Expr::Bool(false)),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Binary { .. }));
+    }
+
+    #[test]
+    fn test_lower_tuple_get_index_0() {
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("t".into(), Type::Tuple(vec![Type::Int64, Type::Bool]));
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("t".into(), ValType::I64);
+
+        let expr = Expr::TupleIndex {
+            object: Box::new(Expr::Var("t".into())),
+            index: 0,
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::TupleGet { index: 0, .. }));
+    }
+
+    #[test]
+    fn test_lower_get_field_offset_unknown() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let offset = ctx.get_field_offset(&Type::Struct("Unknown".into(), vec![]), "x");
+        assert!(offset.is_ok());
+        assert_eq!(offset.unwrap(), 0);
+    }
+
+    #[test]
+    fn test_lower_expr_to_block_simple() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Integer(99);
+        let block = ctx.lower_expr_to_block(&expr).unwrap();
+        assert!(block.stmts.is_empty());
+        assert!(block.result.is_some());
+        if let Some(ref r) = block.result {
+            assert!(matches!(r.kind, CHIRExprKind::Integer(99)));
+        }
+    }
+
+    #[test]
+    fn test_lower_call_eprintln() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Call {
+            name: "eprintln".into(),
+            args: vec![Expr::String("err".into())],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Print { fd: 2, .. }));
+    }
+
+    #[test]
+    fn test_lower_constructor_unknown_returns_nop() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::ConstructorCall {
+            name: "UnknownType".into(),
+            type_args: None,
+            args: vec![Expr::Integer(1)],
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+    }
+
+    #[test]
+    fn test_lower_range_expr() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Range {
+            start: Box::new(Expr::Integer(0)),
+            end: Box::new(Expr::Integer(10)),
+            inclusive: false,
+            step: None,
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+    }
+
+    #[test]
+    fn test_lower_interpolate_expr() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Interpolate(vec![
+            crate::ast::InterpolatePart::Literal("hi ".into()),
+            crate::ast::InterpolatePart::Expr(Box::new(Expr::Integer(42))),
+        ]);
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+    }
+
+    #[test]
+    fn test_lower_null_coalesce_expr() {
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("opt".into(), Type::Int32);
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("opt".into(), ValType::I32);
+
+        let expr = Expr::NullCoalesce {
+            option: Box::new(Expr::Var("opt".into())),
+            default: Box::new(Expr::Integer(0)),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+    }
+
+    #[test]
+    fn test_lower_try_expr() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Try(Box::new(Expr::Integer(42)));
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+    }
+
+    #[test]
+    fn test_lower_is_type_expr() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::IsType {
+            expr: Box::new(Expr::Integer(42)),
+            target_ty: Type::Int64,
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+    }
+
+    #[test]
+    fn test_lower_try_block_with_finally() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::TryBlock {
+            resources: vec![],
+            body: vec![Stmt::Expr(Expr::Integer(1))],
+            catch_var: None,
+            catch_type: None,
+            catch_body: vec![],
+            finally_body: Some(vec![Stmt::Expr(Expr::Integer(2))]),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Block(..)));
+    }
+
+    #[test]
+    fn test_lower_cast_expr_fallback() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::Integer(1000)),
+            target_ty: Type::Int32,
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+    }
+
+    #[test]
+    fn test_lower_binary_chain_mul_add() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Binary {
+            op: BinOp::Add,
+            left: Box::new(Expr::Binary {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Integer(2)),
+                right: Box::new(Expr::Integer(3)),
+            }),
+            right: Box::new(Expr::Integer(4)),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Binary { .. }));
+        if let CHIRExprKind::Binary { left, right, .. } = &chir.kind {
+            assert!(matches!(left.kind, CHIRExprKind::Binary { .. }));
+            assert!(matches!(right.kind, CHIRExprKind::Integer(4)));
+        }
     }
 }

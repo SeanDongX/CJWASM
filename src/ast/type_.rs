@@ -182,4 +182,78 @@ mod tests {
     fn test_range_heap_size() {
         assert_eq!(Type::range_heap_size(), 20);
     }
+
+    #[test]
+    fn test_to_wasm_more_types() {
+        assert_eq!(Type::Int16.to_wasm(), ValType::I32);
+        assert_eq!(Type::Int32.to_wasm(), ValType::I32);
+        assert_eq!(Type::IntNative.to_wasm(), ValType::I64);
+        assert_eq!(Type::UInt8.to_wasm(), ValType::I32);
+        assert_eq!(Type::UInt64.to_wasm(), ValType::I64);
+        assert_eq!(Type::Float16.to_wasm(), ValType::F32);
+        assert_eq!(Type::Rune.to_wasm(), ValType::I32);
+        assert_eq!(Type::Bool.to_wasm(), ValType::I32);
+        assert_eq!(Type::Tuple(vec![Type::Int64, Type::Float64]).to_wasm(), ValType::I32);
+        assert_eq!(Type::Struct("Point".to_string(), vec![]).to_wasm(), ValType::I32);
+        assert_eq!(Type::Range.to_wasm(), ValType::I32);
+        assert_eq!(
+            Type::Function {
+                params: vec![Type::Int64],
+                ret: Box::new(Some(Type::Bool)),
+            }
+            .to_wasm(),
+            ValType::I32
+        );
+        assert_eq!(
+            Type::Result(Box::new(Type::Int64), Box::new(Type::String)).to_wasm(),
+            ValType::I32
+        );
+        assert_eq!(Type::Slice(Box::new(Type::Int64)).to_wasm(), ValType::I32);
+        assert_eq!(
+            Type::Map(Box::new(Type::String), Box::new(Type::Int64)).to_wasm(),
+            ValType::I32
+        );
+        assert_eq!(Type::This.to_wasm(), ValType::I32);
+        assert_eq!(
+            Type::Qualified(vec!["pkg".to_string(), "Mod".to_string()]).to_wasm(),
+            ValType::I32
+        );
+    }
+
+    #[test]
+    fn test_size_more_types() {
+        assert_eq!(Type::Int16.size(), 2);
+        assert_eq!(Type::UInt16.size(), 2);
+        assert_eq!(Type::Int32.size(), 4);
+        assert_eq!(Type::UInt32.size(), 4);
+        assert_eq!(Type::Bool.size(), 4);
+        assert_eq!(Type::Rune.size(), 4);
+        assert_eq!(Type::Float16.size(), 2);
+        assert_eq!(Type::Float32.size(), 4);
+        assert_eq!(Type::Nothing.size(), 0);
+        assert_eq!(Type::Array(Box::new(Type::Int64)).size(), 4);
+        assert_eq!(Type::Tuple(vec![Type::Int64, Type::Int64]).size(), 4);
+        assert_eq!(Type::Struct("Point".to_string(), vec![]).size(), 4);
+        assert_eq!(Type::Range.size(), 4);
+        assert_eq!(
+            Type::Function {
+                params: vec![],
+                ret: Box::new(None),
+            }
+            .size(),
+            4
+        );
+        assert_eq!(Type::Option(Box::new(Type::Int64)).size(), 4);
+        assert_eq!(
+            Type::Result(Box::new(Type::Int64), Box::new(Type::String)).size(),
+            4
+        );
+        assert_eq!(Type::Slice(Box::new(Type::Int64)).size(), 4);
+        assert_eq!(
+            Type::Map(Box::new(Type::String), Box::new(Type::Int64)).size(),
+            4
+        );
+        assert_eq!(Type::This.size(), 4);
+        assert_eq!(Type::Qualified(vec!["a".to_string()]).size(), 4);
+    }
 }

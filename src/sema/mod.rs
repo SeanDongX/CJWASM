@@ -303,3 +303,536 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{
+        BinOp, ClassDef, ClassMethod, Expr, Function, InterpolatePart, MatchArm, Param, Pattern,
+        Program, Stmt, Type, UnaryOp, Visibility,
+    };
+    use std::collections::HashMap;
+
+    fn make_param(name: &str, ty: Type) -> Param {
+        Param {
+            name: name.to_string(),
+            ty,
+            default: None,
+            variadic: false,
+            is_named: false,
+            is_inout: false,
+        }
+    }
+
+    // ─── infer_expr: literals ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_integer() {
+        let known = HashMap::new();
+        assert_eq!(
+            infer_expr(&Expr::Integer(42), &known),
+            Some(Type::Int64)
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_float() {
+        let known = HashMap::new();
+        assert_eq!(
+            infer_expr(&Expr::Float(3.14), &known),
+            Some(Type::Float64)
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_float32() {
+        let known = HashMap::new();
+        assert_eq!(
+            infer_expr(&Expr::Float32(1.0f32), &known),
+            Some(Type::Float32)
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_bool() {
+        let known = HashMap::new();
+        assert_eq!(infer_expr(&Expr::Bool(true), &known), Some(Type::Bool));
+    }
+
+    #[test]
+    fn test_infer_expr_rune() {
+        let known = HashMap::new();
+        assert_eq!(infer_expr(&Expr::Rune('x'), &known), Some(Type::Rune));
+    }
+
+    #[test]
+    fn test_infer_expr_string() {
+        let known = HashMap::new();
+        assert_eq!(
+            infer_expr(&Expr::String("hello".to_string()), &known),
+            Some(Type::String)
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_interpolate() {
+        let known = HashMap::new();
+        let expr = Expr::Interpolate(vec![InterpolatePart::Literal("hi".to_string())]);
+        assert_eq!(infer_expr(&expr, &known), Some(Type::String));
+    }
+
+    // ─── infer_expr: Cast, IsType ────────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_cast() {
+        let known = HashMap::new();
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::Integer(1)),
+            target_ty: Type::Float64,
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Float64));
+    }
+
+    #[test]
+    fn test_infer_expr_is_type() {
+        let known = HashMap::new();
+        let expr = Expr::IsType {
+            expr: Box::new(Expr::Var("x".to_string())),
+            target_ty: Type::String,
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Bool));
+    }
+
+    // ─── infer_expr: Some, Ok, Err, None ─────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_some() {
+        let known = HashMap::new();
+        let expr = Expr::Some(Box::new(Expr::Integer(1)));
+        assert_eq!(
+            infer_expr(&expr, &known),
+            Some(Type::Option(Box::new(Type::Int64)))
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_ok() {
+        let known = HashMap::new();
+        let expr = Expr::Ok(Box::new(Expr::String("ok".to_string())));
+        assert_eq!(
+            infer_expr(&expr, &known),
+            Some(Type::Result(
+                Box::new(Type::String),
+                Box::new(Type::String),
+            ))
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_err() {
+        let known = HashMap::new();
+        let expr = Expr::Err(Box::new(Expr::String("err".to_string())));
+        assert_eq!(
+            infer_expr(&expr, &known),
+            Some(Type::Result(
+                Box::new(Type::Int64),
+                Box::new(Type::String),
+            ))
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_none() {
+        let known = HashMap::new();
+        assert_eq!(infer_expr(&Expr::None, &known), None);
+    }
+
+    // ─── infer_expr: StructInit, ConstructorCall ───────────────────────────────
+
+    #[test]
+    fn test_infer_expr_struct_init() {
+        let known = HashMap::new();
+        let expr = Expr::StructInit {
+            name: "Point".to_string(),
+            type_args: Some(vec![Type::Int64, Type::Int64]),
+            fields: vec![
+                ("x".to_string(), Expr::Integer(1)),
+                ("y".to_string(), Expr::Integer(2)),
+            ],
+        };
+        assert_eq!(
+            infer_expr(&expr, &known),
+            Some(Type::Struct(
+                "Point".to_string(),
+                vec![Type::Int64, Type::Int64],
+            ))
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_constructor_call() {
+        let known = HashMap::new();
+        let expr = Expr::ConstructorCall {
+            name: "Pair".to_string(),
+            type_args: Some(vec![Type::Int64, Type::String]),
+            args: vec![],
+            named_args: vec![],
+        };
+        assert_eq!(
+            infer_expr(&expr, &known),
+            Some(Type::Struct(
+                "Pair".to_string(),
+                vec![Type::Int64, Type::String],
+            ))
+        );
+    }
+
+    // ─── infer_expr: Call ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_call_known_function() {
+        let mut known = HashMap::new();
+        known.insert("foo".to_string(), Type::Int64);
+        let expr = Expr::Call {
+            name: "foo".to_string(),
+            type_args: None,
+            args: vec![],
+            named_args: vec![],
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
+    }
+
+    #[test]
+    fn test_infer_expr_call_uppercase_constructor() {
+        let known = HashMap::new();
+        let expr = Expr::Call {
+            name: "Point".to_string(),
+            type_args: Some(vec![Type::Int64]),
+            args: vec![],
+            named_args: vec![],
+        };
+        assert_eq!(
+            infer_expr(&expr, &known),
+            Some(Type::Struct("Point".to_string(), vec![Type::Int64]))
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_call_unknown() {
+        let known = HashMap::new();
+        let expr = Expr::Call {
+            name: "unknownFunc".to_string(),
+            type_args: None,
+            args: vec![],
+            named_args: vec![],
+        };
+        assert_eq!(infer_expr(&expr, &known), None);
+    }
+
+    // ─── infer_expr: Var ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_var_known() {
+        let mut known = HashMap::new();
+        known.insert("x".to_string(), Type::String);
+        assert_eq!(
+            infer_expr(&Expr::Var("x".to_string()), &known),
+            Some(Type::String)
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_var_unknown() {
+        let known = HashMap::new();
+        assert_eq!(infer_expr(&Expr::Var("y".to_string()), &known), None);
+    }
+
+    // ─── infer_expr: Binary ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_binary_comparison() {
+        let known = HashMap::new();
+        let expr = Expr::Binary {
+            op: BinOp::Eq,
+            left: Box::new(Expr::Integer(1)),
+            right: Box::new(Expr::Integer(2)),
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Bool));
+    }
+
+    #[test]
+    fn test_infer_expr_binary_add_string() {
+        let known = HashMap::new();
+        let expr = Expr::Binary {
+            op: BinOp::Add,
+            left: Box::new(Expr::String("a".to_string())),
+            right: Box::new(Expr::String("b".to_string())),
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::String));
+    }
+
+    #[test]
+    fn test_infer_expr_binary_add_integers() {
+        let known = HashMap::new();
+        let expr = Expr::Binary {
+            op: BinOp::Add,
+            left: Box::new(Expr::Integer(1)),
+            right: Box::new(Expr::Integer(2)),
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
+    }
+
+    // ─── infer_expr: Unary ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_unary_not() {
+        let known = HashMap::new();
+        let expr = Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(Expr::Bool(true)),
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Bool));
+    }
+
+    #[test]
+    fn test_infer_expr_unary_neg() {
+        let known = HashMap::new();
+        let expr = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(Expr::Integer(1)),
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
+    }
+
+    // ─── infer_expr: If, Block, Match ──────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_if() {
+        let known = HashMap::new();
+        let expr = Expr::If {
+            cond: Box::new(Expr::Bool(true)),
+            then_branch: Box::new(Expr::Integer(1)),
+            else_branch: Some(Box::new(Expr::Integer(2))),
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
+    }
+
+    #[test]
+    fn test_infer_expr_block_with_trailing() {
+        let known = HashMap::new();
+        let expr = Expr::Block(
+            vec![Stmt::Expr(Expr::Integer(0))],
+            Some(Box::new(Expr::String("result".to_string()))),
+        );
+        assert_eq!(infer_expr(&expr, &known), Some(Type::String));
+    }
+
+    #[test]
+    fn test_infer_expr_match() {
+        let known = HashMap::new();
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Integer(1)),
+            arms: vec![MatchArm {
+                pattern: Pattern::Wildcard,
+                guard: None,
+                body: Box::new(Expr::String("matched".to_string())),
+            }],
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::String));
+    }
+
+    // ─── infer_expr: Tuple, Array ──────────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_tuple() {
+        let known = HashMap::new();
+        let expr = Expr::Tuple(vec![
+            Expr::Integer(1),
+            Expr::String("two".to_string()),
+        ]);
+        assert_eq!(
+            infer_expr(&expr, &known),
+            Some(Type::Tuple(vec![Type::Int64, Type::String]))
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_array() {
+        let known = HashMap::new();
+        let expr = Expr::Array(vec![
+            Expr::Integer(1),
+            Expr::Integer(2),
+        ]);
+        assert_eq!(
+            infer_expr(&expr, &known),
+            Some(Type::Array(Box::new(Type::Int64)))
+        );
+    }
+
+    // ─── infer_expr: Lambda ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_lambda() {
+        let known = HashMap::new();
+        let expr = Expr::Lambda {
+            params: vec![("x".to_string(), Type::Int64)],
+            return_type: Some(Type::Int64),
+            body: Box::new(Expr::Var("x".to_string())),
+        };
+        assert_eq!(
+            infer_expr(&expr, &known),
+            Some(Type::Function {
+                params: vec![Type::Int64],
+                ret: Box::new(Some(Type::Int64)),
+            })
+        );
+    }
+
+    // ─── infer_expr: Try, NullCoalesce ─────────────────────────────────────────
+
+    #[test]
+    fn test_infer_expr_try() {
+        let known = HashMap::new();
+        let expr = Expr::Try(Box::new(Expr::Integer(42)));
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
+    }
+
+    #[test]
+    fn test_infer_expr_null_coalesce() {
+        let known = HashMap::new();
+        let expr = Expr::NullCoalesce {
+            option: Box::new(Expr::None),
+            default: Box::new(Expr::Integer(0)),
+        };
+        assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
+    }
+
+    // ─── analyze ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_analyze_simple_program_with_return_types() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![
+                Function {
+                    visibility: Visibility::default(),
+                    name: "annotated".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![make_param("x", Type::Int64)],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![],
+                    extern_import: None,
+                },
+                Function {
+                    visibility: Visibility::default(),
+                    name: "inferred".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: None,
+                    throws: None,
+                    body: vec![Stmt::Expr(Expr::Integer(42))],
+                    extern_import: None,
+                },
+            ],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        let ctx = analyze(&program);
+        assert!(ctx.inferred_return_types.contains_key("inferred"));
+        assert_eq!(
+            ctx.inferred_return_types.get("inferred"),
+            Some(&Type::Int64)
+        );
+    }
+
+    #[test]
+    fn test_analyze_function_with_return_stmt() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "with_return".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: None,
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::String("hello".to_string())))],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        let ctx = analyze(&program);
+        assert_eq!(
+            ctx.inferred_return_types.get("with_return"),
+            Some(&Type::String)
+        );
+    }
+
+    #[test]
+    fn test_analyze_class_method_inference() {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![ClassDef {
+                visibility: Visibility::default(),
+                name: "Foo".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                is_abstract: false,
+                is_sealed: false,
+                is_open: false,
+                extends: None,
+                implements: vec![],
+                fields: vec![],
+                init: None,
+                deinit: None,
+                static_init: None,
+                primary_ctor_params: vec![],
+                methods: vec![ClassMethod {
+                    override_: false,
+                    func: Function {
+                        visibility: Visibility::default(),
+                        name: "Foo.getVal".to_string(),
+                        type_params: vec![],
+                        constraints: vec![],
+                        params: vec![],
+                        return_type: None,
+                        throws: None,
+                        body: vec![Stmt::Expr(Expr::Bool(true))],
+                        extern_import: None,
+                    },
+                }],
+            }],
+            enums: vec![],
+            functions: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        let ctx = analyze(&program);
+        assert!(ctx.inferred_return_types.contains_key("Foo.getVal"));
+        assert_eq!(
+            ctx.inferred_return_types.get("Foo.getVal"),
+            Some(&Type::Bool)
+        );
+    }
+}

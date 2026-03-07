@@ -279,3 +279,460 @@ pub fn stdlib_constructor_type(name: &str, type_args: &[Type]) -> Option<Type> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::Type;
+
+    // ─── stdlib_method_return_type ────────────────────────────────────────────
+
+    #[test]
+    fn test_arraylist_methods() {
+        let type_args = vec![Type::String];
+        assert_eq!(
+            stdlib_method_return_type("ArrayList", &type_args, "get"),
+            Some(Type::String)
+        );
+        assert_eq!(
+            stdlib_method_return_type("ArrayList", &type_args, "add"),
+            None
+        );
+        assert_eq!(
+            stdlib_method_return_type("ArrayList", &type_args, "size"),
+            Some(Type::Int64)
+        );
+        assert_eq!(
+            stdlib_method_return_type("ArrayList", &type_args, "isEmpty"),
+            Some(Type::Bool)
+        );
+        assert_eq!(
+            stdlib_method_return_type("ArrayList", &type_args, "toArray"),
+            Some(Type::Array(Box::new(Type::String)))
+        );
+        assert_eq!(
+            stdlib_method_return_type("ArrayList", &type_args, "toString"),
+            Some(Type::String)
+        );
+        assert_eq!(
+            stdlib_method_return_type("ArrayList", &type_args, "iterator"),
+            Some(Type::Struct("Iterator".to_string(), type_args.clone()))
+        );
+    }
+
+    #[test]
+    fn test_hashmap_methods() {
+        let type_args = vec![Type::String, Type::Int64];
+        assert_eq!(
+            stdlib_method_return_type("HashMap", &type_args, "get"),
+            Some(Type::Option(Box::new(Type::Int64)))
+        );
+        assert_eq!(
+            stdlib_method_return_type("HashMap", &type_args, "put"),
+            None
+        );
+        assert_eq!(
+            stdlib_method_return_type("HashMap", &type_args, "containsKey"),
+            Some(Type::Bool)
+        );
+        assert_eq!(
+            stdlib_method_return_type("HashMap", &type_args, "size"),
+            Some(Type::Int64)
+        );
+        assert_eq!(
+            stdlib_method_return_type("HashMap", &type_args, "keys"),
+            Some(Type::Array(Box::new(Type::String)))
+        );
+        assert_eq!(
+            stdlib_method_return_type("HashMap", &type_args, "values"),
+            Some(Type::Array(Box::new(Type::Int64)))
+        );
+        assert_eq!(
+            stdlib_method_return_type("HashMap", &type_args, "entries"),
+            Some(Type::Array(Box::new(Type::Tuple(vec![
+                Type::String,
+                Type::Int64,
+            ]))))
+        );
+    }
+
+    #[test]
+    fn test_hashset_methods() {
+        let type_args = vec![Type::Int64];
+        assert_eq!(
+            stdlib_method_return_type("HashSet", &type_args, "add"),
+            None
+        );
+        assert_eq!(
+            stdlib_method_return_type("HashSet", &type_args, "contains"),
+            Some(Type::Bool)
+        );
+        assert_eq!(
+            stdlib_method_return_type("HashSet", &type_args, "size"),
+            Some(Type::Int64)
+        );
+    }
+
+    #[test]
+    fn test_stringbuilder_methods() {
+        assert_eq!(
+            stdlib_method_return_type("StringBuilder", &[], "append"),
+            Some(Type::Struct("StringBuilder".to_string(), vec![]))
+        );
+        assert_eq!(
+            stdlib_method_return_type("StringBuilder", &[], "toString"),
+            Some(Type::String)
+        );
+        assert_eq!(
+            stdlib_method_return_type("StringBuilder", &[], "length"),
+            Some(Type::Int64)
+        );
+    }
+
+    #[test]
+    fn test_path_methods() {
+        assert_eq!(
+            stdlib_method_return_type("Path", &[], "join"),
+            Some(Type::Struct("Path".to_string(), vec![]))
+        );
+        assert_eq!(
+            stdlib_method_return_type("Path", &[], "toString"),
+            Some(Type::String)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Path", &[], "parent"),
+            Some(Type::Option(Box::new(Type::Struct(
+                "Path".to_string(),
+                vec![],
+            ))))
+        );
+        assert_eq!(
+            stdlib_method_return_type("Path", &[], "exists"),
+            Some(Type::Bool)
+        );
+    }
+
+    #[test]
+    fn test_duration_methods() {
+        assert_eq!(
+            stdlib_method_return_type("Duration", &[], "toNanoseconds"),
+            Some(Type::Int64)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Duration", &[], "add"),
+            Some(Type::Struct("Duration".to_string(), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_datetime_methods() {
+        assert_eq!(
+            stdlib_method_return_type("DateTime", &[], "timestamp"),
+            Some(Type::Int64)
+        );
+        assert_eq!(
+            stdlib_method_return_type("DateTime", &[], "format"),
+            Some(Type::String)
+        );
+        assert_eq!(
+            stdlib_method_return_type("DateTime", &[], "isBefore"),
+            Some(Type::Bool)
+        );
+    }
+
+    #[test]
+    fn test_thread_methods() {
+        assert_eq!(stdlib_method_return_type("Thread", &[], "join"), None);
+        assert_eq!(
+            stdlib_method_return_type("Thread", &[], "id"),
+            Some(Type::Int64)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Thread", &[], "name"),
+            Some(Type::String)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Thread", &[], "isAlive"),
+            Some(Type::Bool)
+        );
+    }
+
+    #[test]
+    fn test_channel_methods() {
+        let type_args = vec![Type::String];
+        assert_eq!(
+            stdlib_method_return_type("Channel", &type_args, "send"),
+            None
+        );
+        assert_eq!(
+            stdlib_method_return_type("Channel", &type_args, "receive"),
+            Some(Type::String)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Channel", &type_args, "isClosed"),
+            Some(Type::Bool)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Channel", &type_args, "size"),
+            Some(Type::Int64)
+        );
+    }
+
+    #[test]
+    fn test_file_methods() {
+        assert_eq!(
+            stdlib_method_return_type("File", &[], "readToString"),
+            Some(Type::String)
+        );
+        assert_eq!(stdlib_method_return_type("File", &[], "write"), None);
+        assert_eq!(
+            stdlib_method_return_type("File", &[], "exists"),
+            Some(Type::Bool)
+        );
+        assert_eq!(
+            stdlib_method_return_type("File", &[], "listFiles"),
+            Some(Type::Array(Box::new(Type::Struct("File".to_string(), vec![]))))
+        );
+        assert_eq!(
+            stdlib_method_return_type("File", &[], "openRead"),
+            Some(Type::Struct("FileReader".to_string(), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_random_methods() {
+        assert_eq!(
+            stdlib_method_return_type("Random", &[], "nextInt64"),
+            Some(Type::Int64)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Random", &[], "nextFloat64"),
+            Some(Type::Float64)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Random", &[], "nextBool"),
+            Some(Type::Bool)
+        );
+    }
+
+    #[test]
+    fn test_regex_methods() {
+        assert_eq!(
+            stdlib_method_return_type("Regex", &[], "matches"),
+            Some(Type::Bool)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Regex", &[], "find"),
+            Some(Type::Option(Box::new(Type::String)))
+        );
+        assert_eq!(
+            stdlib_method_return_type("Regex", &[], "split"),
+            Some(Type::Array(Box::new(Type::String)))
+        );
+    }
+
+    #[test]
+    fn test_queue_stack_methods() {
+        let type_args = vec![Type::Int64];
+        assert_eq!(
+            stdlib_method_return_type("Queue", &type_args, "enqueue"),
+            None
+        );
+        assert_eq!(
+            stdlib_method_return_type("Queue", &type_args, "dequeue"),
+            Some(Type::Option(Box::new(Type::Int64)))
+        );
+        assert_eq!(
+            stdlib_method_return_type("Stack", &type_args, "pop"),
+            Some(Type::Option(Box::new(Type::Int64)))
+        );
+    }
+
+    #[test]
+    fn test_iterator_methods() {
+        let type_args = vec![Type::String];
+        assert_eq!(
+            stdlib_method_return_type("Iterator", &type_args, "next"),
+            Some(Type::Option(Box::new(Type::String)))
+        );
+        assert_eq!(
+            stdlib_method_return_type("Iterator", &type_args, "hasNext"),
+            Some(Type::Bool)
+        );
+        assert_eq!(
+            stdlib_method_return_type("Iterator", &type_args, "toArray"),
+            Some(Type::Array(Box::new(Type::String)))
+        );
+        assert_eq!(
+            stdlib_method_return_type("Iterator", &type_args, "map"),
+            Some(Type::Struct("Iterator".to_string(), type_args.clone()))
+        );
+    }
+
+    #[test]
+    fn test_treemap_treeset_methods() {
+        let map_args = vec![Type::String, Type::Int64];
+        assert_eq!(
+            stdlib_method_return_type("TreeMap", &map_args, "get"),
+            Some(Type::Option(Box::new(Type::Int64)))
+        );
+        assert_eq!(
+            stdlib_method_return_type("TreeSet", &[Type::Int64], "contains"),
+            Some(Type::Bool)
+        );
+    }
+
+    #[test]
+    fn test_unknown_type_method_returns_none() {
+        assert_eq!(
+            stdlib_method_return_type("UnknownType", &[], "foo"),
+            None
+        );
+    }
+
+    // ─── stdlib_field_type ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_duration_fields() {
+        assert_eq!(
+            stdlib_field_type("Duration", &[], "nanoseconds"),
+            Some(Type::Int64)
+        );
+    }
+
+    #[test]
+    fn test_datetime_fields() {
+        assert_eq!(
+            stdlib_field_type("DateTime", &[], "year"),
+            Some(Type::Int64)
+        );
+    }
+
+    #[test]
+    fn test_thread_fields() {
+        assert_eq!(
+            stdlib_field_type("Thread", &[], "id"),
+            Some(Type::Int64)
+        );
+        assert_eq!(
+            stdlib_field_type("Thread", &[], "name"),
+            Some(Type::String)
+        );
+    }
+
+    #[test]
+    fn test_file_fields() {
+        assert_eq!(
+            stdlib_field_type("File", &[], "name"),
+            Some(Type::String)
+        );
+    }
+
+    #[test]
+    fn test_generic_error_fields() {
+        assert_eq!(
+            stdlib_field_type("MyError", &[], "message"),
+            Some(Type::String)
+        );
+        assert_eq!(
+            stdlib_field_type("AnyType", &[], "cause"),
+            Some(Type::Option(Box::new(Type::String)))
+        );
+        assert_eq!(
+            stdlib_field_type("SomeError", &[], "code"),
+            Some(Type::Int64)
+        );
+    }
+
+    #[test]
+    fn test_unknown_field_returns_none() {
+        assert_eq!(stdlib_field_type("ArrayList", &[], "unknownField"), None);
+    }
+
+    // ─── stdlib_constructor_type ──────────────────────────────────────────────
+
+    #[test]
+    fn test_constructor_stringbuilder() {
+        assert_eq!(
+            stdlib_constructor_type("StringBuilder", &[]),
+            Some(Type::Struct("StringBuilder".to_string(), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_constructor_path() {
+        assert_eq!(
+            stdlib_constructor_type("Path", &[]),
+            Some(Type::Struct("Path".to_string(), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_constructor_duration() {
+        assert_eq!(
+            stdlib_constructor_type("Duration", &[]),
+            Some(Type::Struct("Duration".to_string(), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_constructor_file() {
+        assert_eq!(
+            stdlib_constructor_type("File", &[]),
+            Some(Type::Struct("File".to_string(), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_constructor_random() {
+        assert_eq!(
+            stdlib_constructor_type("Random", &[]),
+            Some(Type::Struct("Random".to_string(), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_constructor_regex() {
+        assert_eq!(
+            stdlib_constructor_type("Regex", &[]),
+            Some(Type::Struct("Regex".to_string(), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_constructor_queue_stack() {
+        let type_args = vec![Type::Int64];
+        assert_eq!(
+            stdlib_constructor_type("Queue", &type_args),
+            Some(Type::Struct("Queue".to_string(), type_args.clone()))
+        );
+        assert_eq!(
+            stdlib_constructor_type("Stack", &type_args),
+            Some(Type::Struct("Stack".to_string(), type_args))
+        );
+    }
+
+    #[test]
+    fn test_constructor_treemap_channel() {
+        let map_args = vec![Type::String, Type::Int64];
+        assert_eq!(
+            stdlib_constructor_type("TreeMap", &map_args),
+            Some(Type::Map(
+                Box::new(Type::String),
+                Box::new(Type::Int64),
+            ))
+        );
+        assert_eq!(
+            stdlib_constructor_type("Channel", &[Type::String]),
+            Some(Type::Struct(
+                "Channel".to_string(),
+                vec![Type::String],
+            ))
+        );
+    }
+
+    #[test]
+    fn test_constructor_unknown_returns_none() {
+        assert_eq!(stdlib_constructor_type("UnknownConstructor", &[]), None);
+    }
+}

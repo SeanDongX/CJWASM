@@ -315,3 +315,133 @@ impl CHIRBlock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chir_expr_new() {
+        let expr = CHIRExpr::new(CHIRExprKind::Integer(42), Type::Int64, ValType::I64);
+        assert!(matches!(expr.kind, CHIRExprKind::Integer(42)));
+        assert_eq!(expr.ty, Type::Int64);
+        assert_eq!(expr.wasm_ty, ValType::I64);
+        assert!(expr.span.is_none());
+    }
+
+    #[test]
+    fn test_chir_expr_int_const() {
+        let expr = CHIRExpr::int_const(100, Type::Int64);
+        assert!(matches!(expr.kind, CHIRExprKind::Integer(100)));
+        assert_eq!(expr.wasm_ty, ValType::I64);
+
+        let expr32 = CHIRExpr::int_const(42, Type::Int32);
+        assert_eq!(expr32.wasm_ty, ValType::I32);
+    }
+
+    #[test]
+    fn test_chir_expr_bool_const() {
+        let t = CHIRExpr::bool_const(true);
+        assert!(matches!(t.kind, CHIRExprKind::Bool(true)));
+        assert_eq!(t.ty, Type::Bool);
+        assert_eq!(t.wasm_ty, ValType::I32);
+
+        let f = CHIRExpr::bool_const(false);
+        assert!(matches!(f.kind, CHIRExprKind::Bool(false)));
+    }
+
+    #[test]
+    fn test_chir_block_empty() {
+        let block = CHIRBlock::empty();
+        assert!(block.stmts.is_empty());
+        assert!(block.result.is_none());
+    }
+
+    #[test]
+    fn test_chir_block_from_expr() {
+        let expr = CHIRExpr::int_const(42, Type::Int64);
+        let block = CHIRBlock::from_expr(expr);
+        assert!(block.stmts.is_empty());
+        assert!(block.result.is_some());
+        let result = block.result.unwrap();
+        assert!(matches!(result.kind, CHIRExprKind::Integer(42)));
+    }
+
+    #[test]
+    fn test_chir_stmt_variants() {
+        let let_stmt = CHIRStmt::Let {
+            local_idx: 0,
+            value: CHIRExpr::int_const(1, Type::Int64),
+        };
+        assert!(matches!(let_stmt, CHIRStmt::Let { local_idx: 0, .. }));
+
+        let ret_stmt = CHIRStmt::Return(Some(CHIRExpr::bool_const(true)));
+        assert!(matches!(ret_stmt, CHIRStmt::Return(Some(_))));
+
+        let break_stmt = CHIRStmt::Break;
+        assert!(matches!(break_stmt, CHIRStmt::Break));
+
+        let cont_stmt = CHIRStmt::Continue;
+        assert!(matches!(cont_stmt, CHIRStmt::Continue));
+    }
+
+    #[test]
+    fn test_chir_lvalue_variants() {
+        let local = CHIRLValue::Local(3);
+        assert!(matches!(local, CHIRLValue::Local(3)));
+
+        let field = CHIRLValue::Field {
+            object: Box::new(CHIRExpr::int_const(0, Type::Int32)),
+            offset: 8,
+        };
+        assert!(matches!(field, CHIRLValue::Field { offset: 8, .. }));
+    }
+
+    #[test]
+    fn test_chir_function_fields() {
+        let func = CHIRFunction {
+            name: "test".into(),
+            params: vec![CHIRParam {
+                name: "x".into(),
+                ty: Type::Int64,
+                wasm_ty: ValType::I64,
+                local_idx: 0,
+            }],
+            return_ty: Type::Bool,
+            return_wasm_ty: ValType::I32,
+            locals: vec![],
+            body: CHIRBlock::empty(),
+            local_wasm_types: std::collections::HashMap::new(),
+        };
+        assert_eq!(func.name, "test");
+        assert_eq!(func.params.len(), 1);
+        assert_eq!(func.return_wasm_ty, ValType::I32);
+    }
+
+    #[test]
+    fn test_chir_program() {
+        let prog = CHIRProgram {
+            functions: vec![],
+            structs: vec![],
+            classes: vec![],
+            enums: vec![],
+            globals: vec![],
+        };
+        assert!(prog.functions.is_empty());
+    }
+
+    #[test]
+    fn test_chir_pattern_variants() {
+        let wildcard = CHIRPattern::Wildcard;
+        assert!(matches!(wildcard, CHIRPattern::Wildcard));
+
+        let binding = CHIRPattern::Binding(5);
+        assert!(matches!(binding, CHIRPattern::Binding(5)));
+
+        let literal = CHIRPattern::Literal(CHIRLiteral::Integer(42));
+        assert!(matches!(literal, CHIRPattern::Literal(CHIRLiteral::Integer(42))));
+
+        let range = CHIRPattern::Range { start: 1, end: 10, inclusive: true };
+        assert!(matches!(range, CHIRPattern::Range { start: 1, end: 10, inclusive: true }));
+    }
+}

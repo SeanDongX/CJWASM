@@ -261,7 +261,6 @@ mod tests {
     fn test_builder_function() {
         let mut builder = CHIRBuilder::new();
 
-        // 创建函数: func test(): Int64 { return 42; }
         let expr = builder.int_const(42, Type::Int64);
         let stmt = builder.return_stmt(Some(expr));
         let block = builder.block_from_stmts(vec![stmt]);
@@ -276,5 +275,134 @@ mod tests {
         assert_eq!(func.name, "test");
         assert_eq!(func.return_wasm_ty, ValType::I64);
         assert_eq!(func.body.stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_builder_bool_const() {
+        let builder = CHIRBuilder::new();
+        let t = builder.bool_const(true);
+        assert!(matches!(t.kind, CHIRExprKind::Bool(true)));
+        assert_eq!(t.wasm_ty, ValType::I32);
+    }
+
+    #[test]
+    fn test_builder_string_const() {
+        let builder = CHIRBuilder::new();
+        let s = builder.string_const("hello".into());
+        assert!(matches!(s.kind, CHIRExprKind::String(_)));
+        assert_eq!(s.wasm_ty, ValType::I32);
+    }
+
+    #[test]
+    fn test_builder_local_get() {
+        let builder = CHIRBuilder::new();
+        let local = builder.local_get(3, Type::Float64);
+        assert!(matches!(local.kind, CHIRExprKind::Local(3)));
+        assert_eq!(local.wasm_ty, ValType::F64);
+    }
+
+    #[test]
+    fn test_builder_unary() {
+        let builder = CHIRBuilder::new();
+        let expr = builder.int_const(42, Type::Int64);
+        let neg = builder.unary(UnaryOp::Neg, expr, Type::Int64);
+        assert!(matches!(neg.kind, CHIRExprKind::Unary { .. }));
+        assert_eq!(neg.wasm_ty, ValType::I64);
+    }
+
+    #[test]
+    fn test_builder_call() {
+        let builder = CHIRBuilder::new();
+        let arg = builder.int_const(1, Type::Int64);
+        let call = builder.call(5, vec![arg], Type::Bool);
+        assert!(matches!(call.kind, CHIRExprKind::Call { func_idx: 5, .. }));
+        assert_eq!(call.wasm_ty, ValType::I32);
+    }
+
+    #[test]
+    fn test_builder_cast_same_type() {
+        let builder = CHIRBuilder::new();
+        let expr = builder.int_const(42, Type::Int64);
+        let casted = builder.cast(expr, Type::Int64);
+        assert!(matches!(casted.kind, CHIRExprKind::Integer(42)));
+    }
+
+    #[test]
+    fn test_builder_if_expr() {
+        let builder = CHIRBuilder::new();
+        let cond = builder.bool_const(true);
+        let then_block = CHIRBlock::from_expr(builder.int_const(1, Type::Int64));
+        let else_block = CHIRBlock::from_expr(builder.int_const(2, Type::Int64));
+        let if_expr = builder.if_expr(cond, then_block, Some(else_block), Type::Int64);
+        assert!(matches!(if_expr.kind, CHIRExprKind::If { .. }));
+        assert_eq!(if_expr.wasm_ty, ValType::I64);
+    }
+
+    #[test]
+    fn test_builder_block_expr() {
+        let builder = CHIRBuilder::new();
+        let block = CHIRBlock::from_expr(builder.int_const(99, Type::Int64));
+        let block_expr = builder.block(block, Type::Int64);
+        assert!(matches!(block_expr.kind, CHIRExprKind::Block(_)));
+    }
+
+    #[test]
+    fn test_builder_alloc_local() {
+        let mut builder = CHIRBuilder::new();
+        assert_eq!(builder.alloc_local(), 0);
+        assert_eq!(builder.alloc_local(), 1);
+        assert_eq!(builder.alloc_local(), 2);
+        builder.reset_locals();
+        assert_eq!(builder.alloc_local(), 0);
+    }
+
+    #[test]
+    fn test_builder_let_stmt() {
+        let mut builder = CHIRBuilder::new();
+        let expr = builder.int_const(42, Type::Int64);
+        let (idx, stmt) = builder.let_stmt(expr);
+        assert_eq!(idx, 0);
+        assert!(matches!(stmt, CHIRStmt::Let { local_idx: 0, .. }));
+    }
+
+    #[test]
+    fn test_builder_assign() {
+        let builder = CHIRBuilder::new();
+        let value = builder.int_const(10, Type::Int64);
+        let target = CHIRLValue::Local(0);
+        let stmt = builder.assign(target, value);
+        assert!(matches!(stmt, CHIRStmt::Assign { .. }));
+    }
+
+    #[test]
+    fn test_builder_expr_stmt() {
+        let builder = CHIRBuilder::new();
+        let expr = builder.int_const(42, Type::Int64);
+        let stmt = builder.expr_stmt(expr);
+        assert!(matches!(stmt, CHIRStmt::Expr(_)));
+    }
+
+    #[test]
+    fn test_builder_empty_block() {
+        let builder = CHIRBuilder::new();
+        let block = builder.empty_block();
+        assert!(block.stmts.is_empty());
+        assert!(block.result.is_none());
+    }
+
+    #[test]
+    fn test_builder_block_from_stmts_and_result() {
+        let builder = CHIRBuilder::new();
+        let stmt = builder.return_stmt(None);
+        let result = builder.int_const(42, Type::Int64);
+        let block = builder.block_from_stmts_and_result(vec![stmt], result);
+        assert_eq!(block.stmts.len(), 1);
+        assert!(block.result.is_some());
+    }
+
+    #[test]
+    fn test_builder_default() {
+        let builder = CHIRBuilder::default();
+        assert_eq!(builder.next_local, 0);
     }
 }
