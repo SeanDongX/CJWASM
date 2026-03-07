@@ -127,6 +127,17 @@ pub enum CHIRExprKind {
         value: Box<CHIRExpr>,
     },
 
+    // I/O 输出
+    /// println / print / eprintln / eprint 内置输出
+    Print {
+        /// 输出参数（None 表示空行）
+        arg: Option<Box<CHIRExpr>>,
+        /// true = 输出后加 '\n'
+        newline: bool,
+        /// 文件描述符（1=stdout, 2=stderr）
+        fd: i32,
+    },
+
     // 特殊
     Nop,                     // 无操作
     Unreachable,             // 不可达代码

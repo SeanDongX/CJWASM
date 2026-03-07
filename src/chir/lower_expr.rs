@@ -31,12 +31,21 @@ pub struct LoweringContext<'a> {
     /// 函数名 → 函数索引
     func_indices: &'a HashMap<String, u32>,
 
+    /// 函数名（含修饰名）→ 参数列表（含默认值），用于命名参数 default 补全
+    func_params: &'a HashMap<String, Vec<crate::ast::Param>>,
+
     /// 结构体字段偏移
     struct_field_offsets: &'a HashMap<String, HashMap<String, u32>>,
 
     /// 类字段偏移
-    #[allow(dead_code)]
     class_field_offsets: &'a HashMap<String, HashMap<String, u32>>,
+
+    /// 类字段完整信息（字段名 → 偏移 + 类型），用于隐式 this 字段访问
+    /// class_name → field_name → (offset, field_type)
+    pub class_field_info: &'a HashMap<String, HashMap<String, (u32, crate::ast::Type)>>,
+
+    /// 当前类上下文（仅在类实例方法中非 None）：类名 + `this` 局部变量索引
+    pub current_class: Option<(String, u32)>,
 
     /// 下一个可用的局部变量索引
     next_local: u32,
@@ -50,16 +59,21 @@ impl<'a> LoweringContext<'a> {
     pub fn new(
         type_ctx: &'a TypeInferenceContext,
         func_indices: &'a HashMap<String, u32>,
+        func_params: &'a HashMap<String, Vec<crate::ast::Param>>,
         struct_field_offsets: &'a HashMap<String, HashMap<String, u32>>,
         class_field_offsets: &'a HashMap<String, HashMap<String, u32>>,
+        class_field_info: &'a HashMap<String, HashMap<String, (u32, crate::ast::Type)>>,
     ) -> Self {
         LoweringContext {
             type_ctx,
             local_map: HashMap::new(),
             local_wasm_tys: HashMap::new(),
             func_indices,
+            func_params,
             struct_field_offsets,
             class_field_offsets,
+            class_field_info,
+            current_class: None,
             next_local: 0,
             return_wasm_ty: None,
         }
@@ -113,10 +127,38 @@ impl<'a> LoweringContext<'a> {
             Expr::Var(name) => {
                 if let Some(local_idx) = self.local_map.get(name) {
                     CHIRExprKind::Local(*local_idx)
+                } else if let Some((class_name, this_idx)) = self.current_class.clone() {
+                    // 隐式 this 字段访问：类方法内直接引用字段名（等价于 this.field）
+                    if let Some(fields) = self.class_field_info.get(&class_name) {
+                        if let Some((offset, field_ty)) = fields.get(name) {
+                            let this_expr = CHIRExpr::new(
+                                CHIRExprKind::Local(this_idx),
+                                crate::ast::Type::Struct(class_name.clone(), vec![]),
+                                ValType::I32,
+                            );
+                            return Ok(CHIRExpr::new(
+                                CHIRExprKind::FieldGet {
+                                    object: Box::new(this_expr),
+                                    field_offset: *offset,
+                                    field_ty: field_ty.clone(),
+                                },
+                                field_ty.clone(),
+                                field_ty.to_wasm(),
+                            ));
+                        }
+                    }
+                    // 不是类字段，视为全局
+                    CHIRExprKind::Global(name.clone())
                 } else {
                     // 全局变量或未定义
                     CHIRExprKind::Global(name.clone())
                 }
+            }
+
+            // 管道操作符 a |> f：语义等同 f(a)，但涉及 iterator/closure 等尚不支持的特性
+            // 不展开 left/right 以避免孤值堆积在栈上，直接返回结果类型的 Nop 零值占位
+            Expr::Binary { op: crate::ast::BinOp::Pipeline, .. } => {
+                CHIRExprKind::Nop
             }
 
             // 二元运算
@@ -150,6 +192,17 @@ impl<'a> LoweringContext<'a> {
                 if let Some(to_wasm) = type_cast_wasm(name) {
                     if let Some(arg) = args.first() {
                         let inner = self.lower_expr(arg)?;
+                        // 若 inner 是 Unit/Nothing Nop，直接返回目标类型的零值，
+                        // 避免 Cast 包住空栈 Nop 导致 i64.extend_i32_s 空栈错误
+                        if matches!(inner.ty, crate::ast::Type::Unit | crate::ast::Type::Nothing) {
+                            let sub_ty = match to_wasm {
+                                ValType::I64 => crate::ast::Type::Int64,
+                                ValType::F32 => crate::ast::Type::Float32,
+                                ValType::F64 => crate::ast::Type::Float64,
+                                _ => crate::ast::Type::Int32,
+                            };
+                            return Ok(CHIRExpr::new(CHIRExprKind::Nop, sub_ty, to_wasm));
+                        }
                         let from_ty = inner.wasm_ty;
                         let to_ty = to_wasm;
                         if from_ty == to_ty {
@@ -165,12 +218,18 @@ impl<'a> LoweringContext<'a> {
                     }
                 }
 
-                // 内置 I/O 函数：无法在 CHIR 最小运行时中实现，生成 Nop 占位
-                // 避免 func_idx 回退为 0（fd_write 需要 4 个 i32 参数）导致类型错误
+                // 内置 I/O 函数：生成 Print 节点，由 chir_codegen 负责发射 WASM fd_write 调用
                 match name.as_str() {
                     "println" | "print" | "eprintln" | "eprint" => {
+                        let newline = matches!(name.as_str(), "println" | "eprintln");
+                        let fd = if matches!(name.as_str(), "eprint" | "eprintln") { 2 } else { 1 };
+                        let arg = if args.is_empty() {
+                            None
+                        } else {
+                            Some(Box::new(self.lower_expr(&args[0])?))
+                        };
                         return Ok(CHIRExpr::new(
-                            CHIRExprKind::Nop,
+                            CHIRExprKind::Print { arg, newline, fd },
                             crate::ast::Type::Unit,
                             ValType::I32,
                         ));
@@ -193,9 +252,23 @@ impl<'a> LoweringContext<'a> {
                     _ => {}
                 }
 
-                // 对于未注册的用户函数，若 func_idx 会回退为 0（fd_write），
-                // 且函数不在已知的用户函数表中，则生成类型安全的 Nop
-                let func_idx_opt = self.func_indices.get(name.as_str()).copied();
+                // 函数查找：优先按 "name$arity" 修饰名（支持重载），fallback 原名
+                // 对 "ClassName.method" 形式，也尝试 arity+1（含 this 参数）
+                let mangled = format!("{}${}", name, args.len());
+                let mangled_plus_this = format!("{}${}", name, args.len() + 1);
+                let (func_idx_opt, needs_this) = if let Some(&idx) = self.func_indices.get(mangled.as_str()) {
+                    (Some(idx), false)
+                } else if name.contains('.') {
+                    if let Some(&idx) = self.func_indices.get(mangled_plus_this.as_str()) {
+                        (Some(idx), true)
+                    } else if let Some(&idx) = self.func_indices.get(name.as_str()) {
+                        (Some(idx), false)
+                    } else {
+                        (None, false)
+                    }
+                } else {
+                    (self.func_indices.get(name.as_str()).copied(), false)
+                };
                 let func_idx = match func_idx_opt {
                     Some(idx) => idx,
                     None => {
@@ -207,26 +280,46 @@ impl<'a> LoweringContext<'a> {
                         ));
                     }
                 };
-                // func_idx 确认有效，继续正常处理
-                let _ = func_idx; // suppress unused warning if shadowed
 
                 // 查询函数签名以获取参数类型，用于插入必要的类型转换
-                let param_tys: Vec<ValType> = self.type_ctx.functions
-                    .get(name.as_str())
-                    .map(|sig| sig.params.iter().map(|p| match p {
-                        crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
-                        t => t.to_wasm(),
-                    }).collect())
-                    .unwrap_or_default();
+                // 优先用与实际 arity 匹配的签名（含 this 时 arity+1）
+                let actual_arity = if needs_this { args.len() + 1 } else { args.len() };
+                let param_tys: Vec<ValType> = {
+                    let mangled_key = format!("{}${}", name, actual_arity);
+                    self.type_ctx.functions
+                        .get(mangled_key.as_str())
+                        .or_else(|| self.type_ctx.functions.get(name.as_str()))
+                        .map(|sig| sig.params.iter().map(|p| match p {
+                            crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                            t => t.to_wasm(),
+                        }).collect())
+                        .unwrap_or_default()
+                };
 
-                let args_chir: Result<Vec<CHIRExpr>, String> = args.iter()
+                // 如果需要隐式 this 参数（类方法调用通过 Expr::Call），前插 this
+                let mut args_chir: Vec<CHIRExpr> = Vec::new();
+                if needs_this {
+                    if let Some((ref class_name, this_idx)) = self.current_class {
+                        let this_expr = CHIRExpr::new(
+                            CHIRExprKind::Local(this_idx),
+                            crate::ast::Type::Struct(class_name.clone(), vec![]),
+                            ValType::I32,
+                        );
+                        args_chir.push(this_expr);
+                    } else {
+                        args_chir.push(CHIRExpr::new(CHIRExprKind::Nop, crate::ast::Type::Int32, ValType::I32));
+                    }
+                }
+                let this_offset = args_chir.len();
+
+                // lower 位置参数
+                let positional_args: Vec<CHIRExpr> = args.iter()
                     .enumerate()
                     .map(|(i, a)| {
+                        let param_idx = this_offset + i;
                         let mut arg_chir = self.lower_expr(a)?;
-                        if let Some(&target_wasm) = param_tys.get(i) {
+                        if let Some(&target_wasm) = param_tys.get(param_idx) {
                             if matches!(arg_chir.ty, crate::ast::Type::Unit | crate::ast::Type::Nothing) {
-                                // Unit/Nothing 参数不产生值，但调用方需要一个实际值；
-                                // 用对应类型的零值 Nop 替代（Nop 在非 Unit 类型时会 emit_zero）
                                 let sub_ty = match target_wasm {
                                     ValType::I64 => crate::ast::Type::Int64,
                                     ValType::F32 => crate::ast::Type::Float32,
@@ -238,27 +331,135 @@ impl<'a> LoweringContext<'a> {
                                 arg_chir = self.insert_cast_if_needed(arg_chir, target_wasm);
                             }
                         } else if matches!(arg_chir.ty, crate::ast::Type::Unit | crate::ast::Type::Nothing) {
-                            // 参数类型未知时，Unit 参数用 I32 零值替代，避免空栈
                             arg_chir = CHIRExpr::new(CHIRExprKind::Nop, crate::ast::Type::Int32, ValType::I32);
                         }
                         Ok(arg_chir)
                     })
-                    .collect();
+                    .collect::<Result<Vec<CHIRExpr>, String>>()?;
+                args_chir.extend(positional_args);
+
+                // 补充缺失的命名参数（有默认值的参数）
+                // 先处理 named_args（按名称匹配），再为完全缺失的参数补零值
+                let Expr::Call { named_args, .. } = expr else { unreachable!() };
+                if args_chir.len() < param_tys.len() {
+                    // 查找函数定义中的参数（含默认值）
+                    let mangled_key = format!("{}${}", name, param_tys.len());
+                    let func_param_defs = self.func_params
+                        .get(mangled_key.as_str())
+                        .or_else(|| self.func_params.get(name.as_str()));
+                    if let Some(param_defs) = func_param_defs {
+                        for param_def in param_defs.iter().skip(args_chir.len()) {
+                            // 先查 named_args 中是否有此参数的值
+                            let named_val = named_args.iter()
+                                .find(|(n, _)| n == &param_def.name)
+                                .map(|(_, v)| v);
+                            let arg_chir = if let Some(val_expr) = named_val {
+                                self.lower_expr(val_expr)?
+                            } else if let Some(default_expr) = &param_def.default {
+                                // 使用参数的默认值
+                                self.lower_expr(default_expr)?
+                            } else {
+                                // 无默认值：生成对应类型零值
+                                let wt = param_def.ty.to_wasm();
+                                let sub_ty = match wt {
+                                    ValType::I64 => crate::ast::Type::Int64,
+                                    ValType::F32 => crate::ast::Type::Float32,
+                                    ValType::F64 => crate::ast::Type::Float64,
+                                    _ => crate::ast::Type::Int32,
+                                };
+                                CHIRExpr::new(CHIRExprKind::Nop, sub_ty, wt)
+                            };
+                            let target_wasm = param_tys[args_chir.len()];
+                            let arg_chir = self.insert_cast_if_needed(arg_chir, target_wasm);
+                            args_chir.push(arg_chir);
+                        }
+                    } else {
+                        // 函数定义未找到：用零值填充缺失参数
+                        for &target_wasm in &param_tys[args_chir.len()..] {
+                            let sub_ty = match target_wasm {
+                                ValType::I64 => crate::ast::Type::Int64,
+                                ValType::F32 => crate::ast::Type::Float32,
+                                ValType::F64 => crate::ast::Type::Float64,
+                                _ => crate::ast::Type::Int32,
+                            };
+                            args_chir.push(CHIRExpr::new(CHIRExprKind::Nop, sub_ty, target_wasm));
+                        }
+                    }
+                }
 
                 CHIRExprKind::Call {
                     func_idx,
-                    args: args_chir?,
+                    args: args_chir,
                 }
             }
 
-            // 方法调用：CHIR 暂不支持 vtable 调用解析
-            // 不 lower receiver/args（避免在栈上积累无法消费的值），直接返回 Nop 零值占位
-            Expr::MethodCall { .. } => {
-                if matches!(ty, crate::ast::Type::Unit | crate::ast::Type::Nothing) {
-                    CHIRExprKind::Nop
-                } else {
-                    CHIRExprKind::Nop // 产生与返回类型匹配的零值，由 emit_expr 的 Nop 分支处理
+            // 方法调用：解析为 ClassName.methodName 的直接调用
+            Expr::MethodCall { object, method, args, named_args, .. } => {
+                // 推断 receiver 类型以确定类名
+                let obj_ty = self.type_ctx.infer_expr(object)?;
+                let class_name = match &obj_ty {
+                    crate::ast::Type::Struct(name, _) => Some(name.clone()),
+                    crate::ast::Type::Qualified(parts) => parts.last().cloned(),
+                    _ => None,
+                };
+
+                if let Some(cls) = class_name {
+                    let mangled_method = format!("{}.{}", cls, method);
+                    // 尝试精确匹配（arity = 1 + args.len()，含 this）
+                    let arity = 1 + args.len() + named_args.len();
+                    let mangled_with_arity = format!("{}${}", mangled_method, arity);
+                    let func_idx = self.func_indices.get(&mangled_with_arity)
+                        .or_else(|| self.func_indices.get(&mangled_method))
+                        .copied();
+
+                    if let Some(func_idx) = func_idx {
+                        // 查询方法签名以获取参数 WASM 类型（含 this）
+                        let param_tys: Vec<ValType> = {
+                            let mangled_key = format!("{}${}", mangled_method, arity);
+                            self.type_ctx.functions
+                                .get(mangled_key.as_str())
+                                .or_else(|| self.type_ctx.functions.get(mangled_method.as_str()))
+                                .map(|sig| sig.params.iter().map(|p| match p {
+                                    crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                                    t => t.to_wasm(),
+                                }).collect())
+                                .unwrap_or_default()
+                        };
+
+                        // receiver 作为第一个参数（this）
+                        let receiver_chir = self.lower_expr(object)?;
+                        let receiver_chir = self.insert_cast_if_needed(receiver_chir, ValType::I32);
+                        let mut call_args = vec![receiver_chir];
+
+                        // 普通参数（带类型对齐）
+                        for (i, arg) in args.iter().enumerate() {
+                            let mut arg_chir = self.lower_expr(arg)?;
+                            // param_tys[0] 是 this，所以偏移 1
+                            if let Some(&target_wasm) = param_tys.get(i + 1) {
+                                arg_chir = self.insert_cast_if_needed(arg_chir, target_wasm);
+                            }
+                            call_args.push(arg_chir);
+                        }
+                        // 命名参数
+                        for (j, (_, val)) in named_args.iter().enumerate() {
+                            let mut val_chir = self.lower_expr(val)?;
+                            let param_idx = 1 + args.len() + j;
+                            if let Some(&target_wasm) = param_tys.get(param_idx) {
+                                val_chir = self.insert_cast_if_needed(val_chir, target_wasm);
+                            }
+                            call_args.push(val_chir);
+                        }
+
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx, args: call_args },
+                            ty.clone(),
+                            wasm_ty,
+                        ));
+                    }
                 }
+
+                // 未能解析：返回 Nop（方法不在已知类中，或 vtable 调用等待后续实现）
+                CHIRExprKind::Nop
             }
 
             // 字段访问
@@ -357,6 +558,15 @@ impl<'a> LoweringContext<'a> {
                 if let Some(to_wasm) = type_cast_wasm(name) {
                     if let Some(arg) = args.first() {
                         let inner = self.lower_expr(arg)?;
+                        if matches!(inner.ty, crate::ast::Type::Unit | crate::ast::Type::Nothing) {
+                            let sub_ty = match to_wasm {
+                                ValType::I64 => crate::ast::Type::Int64,
+                                ValType::F32 => crate::ast::Type::Float32,
+                                ValType::F64 => crate::ast::Type::Float64,
+                                _ => crate::ast::Type::Int32,
+                            };
+                            return Ok(CHIRExpr::new(CHIRExprKind::Nop, sub_ty, to_wasm));
+                        }
                         let from_ty = inner.wasm_ty;
                         let to_ty = to_wasm;
                         if from_ty == to_ty {
@@ -445,6 +655,42 @@ impl<'a> LoweringContext<'a> {
                 CHIRExprKind::Match {
                     subject: Box::new(subject_chir),
                     arms: arms_chir?,
+                }
+            }
+
+            // try-catch-finally：
+            // - 有 catch block 时不执行 try body（避免 throw Nop 后继续执行引发 trap）
+            //   仅执行 finally body（如有）
+            // - 无 catch block（纯 try-finally）时，顺序执行 try body + finally body
+            Expr::TryBlock { body, catch_body, catch_var, finally_body, resources, .. } => {
+                let has_catch = catch_var.is_some() || !catch_body.is_empty() || !resources.is_empty();
+                let mut stmts: Vec<crate::chir::CHIRStmt> = Vec::new();
+
+                if !has_catch {
+                    // 纯 try-finally：执行 try body
+                    for stmt in body {
+                        if let Ok(s) = self.lower_stmt(stmt) {
+                            stmts.push(s);
+                        }
+                    }
+                }
+                // finally body（无论如何都执行）
+                if let Some(fin_stmts) = finally_body {
+                    for stmt in fin_stmts {
+                        if let Ok(s) = self.lower_stmt(stmt) {
+                            stmts.push(s);
+                        }
+                    }
+                }
+                if stmts.is_empty() {
+                    // 没有任何语句需要执行：返回 Nop
+                    CHIRExprKind::Nop
+                } else {
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: None }),
+                        ty.clone(),
+                        wasm_ty,
+                    ));
                 }
             }
 
@@ -548,12 +794,16 @@ mod tests {
         let func_indices = HashMap::new();
         let struct_offsets = HashMap::new();
         let class_offsets = HashMap::new();
+        let class_field_info = HashMap::new();
 
+        let func_params = HashMap::new();
         let mut ctx = LoweringContext::new(
             &type_ctx,
             &func_indices,
+            &func_params,
             &struct_offsets,
             &class_offsets,
+            &class_field_info,
         );
 
         let expr = Expr::Integer(42);
@@ -569,12 +819,16 @@ mod tests {
         let func_indices = HashMap::new();
         let struct_offsets = HashMap::new();
         let class_offsets = HashMap::new();
+        let class_field_info = HashMap::new();
 
+        let func_params = HashMap::new();
         let mut ctx = LoweringContext::new(
             &type_ctx,
             &func_indices,
+            &func_params,
             &struct_offsets,
             &class_offsets,
+            &class_field_info,
         );
 
         let expr = Expr::Binary {
@@ -595,12 +849,16 @@ mod tests {
         let func_indices = HashMap::new();
         let struct_offsets = HashMap::new();
         let class_offsets = HashMap::new();
+        let class_field_info = HashMap::new();
 
+        let func_params = HashMap::new();
         let mut ctx = LoweringContext::new(
             &type_ctx,
             &func_indices,
+            &func_params,
             &struct_offsets,
             &class_offsets,
+            &class_field_info,
         );
 
         // 创建一个需要类型转换的表达式

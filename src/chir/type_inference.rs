@@ -3,6 +3,34 @@
 use crate::ast::{Expr, Stmt, Type, Function, Program, BinOp, UnaryOp, Pattern};
 use std::collections::HashMap;
 
+/// 从函数体推断返回类型：找第一个 Stmt::Return(Some(expr)) 并推断 expr 类型
+/// 用于处理没有显式返回类型注解的函数（如 Cangjie 隐式类型推断函数）
+pub fn infer_return_type_from_body(body: &[Stmt], ctx: &TypeInferenceContext) -> Option<Type> {
+    for stmt in body {
+        if let Some(ty) = infer_return_type_from_stmt(stmt, ctx) {
+            return Some(ty);
+        }
+    }
+    None
+}
+
+fn infer_return_type_from_stmt(stmt: &Stmt, ctx: &TypeInferenceContext) -> Option<Type> {
+    match stmt {
+        Stmt::Return(Some(expr)) => {
+            ctx.infer_expr(expr).ok().filter(|t| !matches!(t, Type::Unit | Type::Nothing))
+        }
+        Stmt::While { body, .. } | Stmt::Loop { body } | Stmt::For { body, .. } => {
+            for s in body {
+                if let Some(ty) = infer_return_type_from_stmt(s, ctx) {
+                    return Some(ty);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// 函数签名
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
@@ -26,6 +54,9 @@ pub struct TypeInferenceContext {
     /// 类字段类型
     pub class_fields: HashMap<String, HashMap<String, Type>>,
 
+    /// 类方法返回类型：class_name → method_name → return_type
+    pub class_method_returns: HashMap<String, HashMap<String, Type>>,
+
     /// 当前函数返回类型
     pub current_return_ty: Option<Type>,
 
@@ -41,6 +72,7 @@ impl TypeInferenceContext {
             functions: HashMap::new(),
             struct_fields: HashMap::new(),
             class_fields: HashMap::new(),
+            class_method_returns: HashMap::new(),
             current_return_ty: None,
             globals: HashMap::new(),
         }
@@ -50,14 +82,31 @@ impl TypeInferenceContext {
     pub fn from_program(program: &Program) -> Self {
         let mut ctx = Self::new();
 
-        // 收集函数签名
+        // 收集函数签名（支持重载：用 name$arity 修饰名额外注册一份）
         for func in &program.functions {
             let sig = FunctionSignature {
                 name: func.name.clone(),
                 params: func.params.iter().map(|p| p.ty.clone()).collect(),
                 return_ty: func.return_type.clone().unwrap_or(Type::Unit),
             };
-            ctx.functions.insert(func.name.clone(), sig);
+            // 修饰名（精确匹配重载版本）
+            let mangled = format!("{}${}", func.name, func.params.len());
+            ctx.functions.insert(mangled, sig.clone());
+            // 原名（保留，供非重载场景使用）
+            ctx.functions.entry(func.name.clone()).or_insert(sig);
+
+            // 如果函数名包含 "."，说明是 struct/class 方法（如 "Point.distance"）
+            // 注册到 class_method_returns 供 infer_method_return 使用
+            if let Some(dot_pos) = func.name.find('.') {
+                let type_name = &func.name[..dot_pos];
+                let method_name = &func.name[dot_pos + 1..];
+                let ret_ty = func.return_type.clone().unwrap_or(Type::Unit);
+                ctx.class_method_returns
+                    .entry(type_name.to_string())
+                    .or_default()
+                    .entry(method_name.to_string())
+                    .or_insert(ret_ty);
+            }
         }
 
         // 收集结构体字段
@@ -69,13 +118,63 @@ impl TypeInferenceContext {
             ctx.struct_fields.insert(struct_def.name.clone(), fields);
         }
 
-        // 收集类字段
+        // 收集类字段 + 类方法签名
         for class_def in &program.classes {
             let mut fields = HashMap::new();
             for field in &class_def.fields {
                 fields.insert(field.name.clone(), field.ty.clone());
             }
             ctx.class_fields.insert(class_def.name.clone(), fields);
+
+            let mut method_returns = HashMap::new();
+            for method in &class_def.methods {
+                let full_name = &method.func.name; // "ClassName.methodName"
+                let short_name = full_name.strip_prefix(&format!("{}.", class_def.name))
+                    .unwrap_or(full_name);
+                let ret_ty = method.func.return_type.clone().unwrap_or(Type::Unit);
+                method_returns.insert(short_name.to_string(), ret_ty);
+
+                // 注册完整签名到 functions（含 this 参数）
+                let sig = FunctionSignature {
+                    name: full_name.clone(),
+                    params: method.func.params.iter().map(|p| p.ty.clone()).collect(),
+                    return_ty: method.func.return_type.clone().unwrap_or(Type::Unit),
+                };
+                let mangled = format!("{}${}", full_name, method.func.params.len());
+                ctx.functions.insert(mangled, sig.clone());
+                ctx.functions.entry(full_name.clone()).or_insert(sig);
+            }
+            ctx.class_method_returns.insert(class_def.name.clone(), method_returns);
+        }
+
+        // 继承合并：将父类字段 + 方法签名传播到子类（多轮直到稳定）
+        let class_extends: HashMap<String, Option<String>> = program.classes.iter()
+            .map(|c| (c.name.clone(), c.extends.clone()))
+            .collect();
+        for _ in 0..10 {
+            let mut changed = false;
+            for class_def in &program.classes {
+                let mut parent = class_def.extends.clone();
+                while let Some(ref parent_name) = parent {
+                    if let Some(parent_fields) = ctx.class_fields.get(parent_name).cloned() {
+                        let child_fields = ctx.class_fields.get_mut(&class_def.name).unwrap();
+                        for (name, ty) in parent_fields {
+                            if !child_fields.contains_key(&name) {
+                                child_fields.insert(name, ty);
+                                changed = true;
+                            }
+                        }
+                    }
+                    if let Some(parent_methods) = ctx.class_method_returns.get(parent_name).cloned() {
+                        let child_methods = ctx.class_method_returns.get_mut(&class_def.name).unwrap();
+                        for (name, ret_ty) in parent_methods {
+                            child_methods.entry(name).or_insert(ret_ty);
+                        }
+                    }
+                    parent = class_extends.get(parent_name).and_then(|p| p.clone());
+                }
+            }
+            if !changed { break; }
         }
 
         ctx
@@ -136,7 +235,11 @@ impl TypeInferenceContext {
 
             // 函数调用
             Expr::Call { name, args, .. } => {
-                if let Some(sig) = self.functions.get(name) {
+                // 优先按 name$arity 修饰名查找（支持重载函数精确匹配）
+                let mangled = format!("{}${}", name, args.len());
+                if let Some(sig) = self.functions.get(mangled.as_str())
+                    .or_else(|| self.functions.get(name.as_str()))
+                {
                     return Ok(sig.return_ty.clone());
                 }
                 // 内置函数
@@ -297,30 +400,67 @@ impl TypeInferenceContext {
     }
 
     /// 推断方法返回类型
-    fn infer_method_return(&self, _obj_ty: &Type, method: &str, _args: &[Expr]) -> Result<Type, String> {
-        // 简化实现：根据方法名推断
+    fn infer_method_return(&self, obj_ty: &Type, method: &str, _args: &[Expr]) -> Result<Type, String> {
+        // 优先按对象类型分派
+        let obj_type_name = match obj_ty {
+            Type::Struct(n, _) => n.as_str(),
+            Type::Array(_) => "Array",
+            _ => "",
+        };
+
+        // 优先查找用户定义的类方法真实返回类型
+        if !obj_type_name.is_empty() {
+            if let Some(methods) = self.class_method_returns.get(obj_type_name) {
+                if let Some(ret_ty) = methods.get(method) {
+                    return Ok(ret_ty.clone());
+                }
+            }
+        }
+
+        match (obj_type_name, method) {
+            // ArrayList
+            ("ArrayList", "append" | "set" | "clear") => return Ok(Type::Unit),
+            ("ArrayList", "get" | "remove" | "size") => return Ok(Type::Int64),
+            ("ArrayList", "isEmpty") => return Ok(Type::Bool),
+            // HashMap
+            ("HashMap", "put" | "clear") => return Ok(Type::Unit),
+            ("HashMap", "get" | "remove" | "size") => return Ok(Type::Int64),
+            ("HashMap", "containsKey") => return Ok(Type::Int64),
+            // HashSet
+            ("HashSet", "add" | "clear") => return Ok(Type::Unit),
+            ("HashSet", "size") => return Ok(Type::Int64),
+            ("HashSet", "contains") => return Ok(Type::Int64),
+            // Array
+            ("Array", "push" | "append" | "set" | "clear") => return Ok(Type::Unit),
+            ("Array", "get" | "size" | "length") => return Ok(Type::Int64),
+            ("Array", "isEmpty") => return Ok(Type::Bool),
+            _ => {}
+        }
+        // 通用方法名推断（fallback）
+        // 原则：宁可返回 Int64（emit 一个零值），也不能错误地返回 Unit（导致 empty-stack）
+        // 只有确定对任何对象类型都是 void 的方法才返回 Unit
         match method {
             "toString" => Ok(Type::String),
-            "size" | "length" => Ok(Type::Int64),
-            "get" => Ok(Type::Int64), // 简化
-            "append" | "remove" | "clear" => Ok(Type::Unit),
+            // 默认返回 Int64（保守推断，避免 empty-stack 错误）
             _ => Ok(Type::Int64),
         }
     }
 
-    /// 推断字段类型（对未知结构体/字段保守推断为 I32，避免 lowering 中断）
+    /// 推断字段类型（查 struct_fields + class_fields，未知保守推断为 I32）
     pub fn infer_field_type(&self, obj_ty: &Type, field: &str) -> Result<Type, String> {
         match obj_ty {
             Type::Struct(name, _) => {
+                // 先查 struct_fields
                 if let Some(fields) = self.struct_fields.get(name.as_str()) {
-                    // 已知结构体字段 → 返回字段类型；未知字段保守推断为 I32
-                    Ok(fields.get(field).cloned().unwrap_or(Type::Int32))
-                } else {
-                    // 未知结构体（外部类、类型别名等）→ 保守推断为 I32 对象引用
-                    Ok(Type::Int32)
+                    return Ok(fields.get(field).cloned().unwrap_or(Type::Int32));
                 }
+                // 再查 class_fields
+                if let Some(fields) = self.class_fields.get(name.as_str()) {
+                    return Ok(fields.get(field).cloned().unwrap_or(Type::Int32));
+                }
+                Ok(Type::Int32)
             }
-            _ => Ok(Type::Int32), // 默认推断为对象引用
+            _ => Ok(Type::Int32),
         }
     }
 

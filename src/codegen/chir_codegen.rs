@@ -33,26 +33,183 @@ const IMPORT_COUNT: u32 = 2;
 const MEMORY_PAGES_MIN: u64 = 4;
 const MEMORY_PAGES_MAX: u64 = 64;
 
+// ─── I/O 内存布局 ─────────────────────────────────────────────────────────────
+
+/// iovec 结构体偏移（8 字节：buf_ptr[0..4] + buf_len[4..8]）
+const IOVEC_OFFSET: i32 = 64;
+/// fd_write nwritten 输出指针偏移
+const NWRITTEN_OFFSET: i32 = 72;
+/// 数据段起始地址（前 128 字节保留给 I/O 缓冲区）
+const DATA_SECTION_BASE: u32 = 128;
+
+// ─── 运行时助手函数名 ─────────────────────────────────────────────────────────
+
+const RT_PRINTLN_I64:   &str = "__rt_println_i64";
+const RT_PRINT_I64:     &str = "__rt_print_i64";
+const RT_PRINTLN_STR:   &str = "__rt_println_str";
+const RT_PRINT_STR:     &str = "__rt_print_str";
+const RT_PRINTLN_BOOL:  &str = "__rt_println_bool";
+const RT_PRINT_BOOL:    &str = "__rt_print_bool";
+const RT_PRINTLN_EMPTY: &str = "__rt_println_empty";
+const RT_NAMES: &[&str] = &[
+    RT_PRINTLN_I64, RT_PRINT_I64,
+    RT_PRINTLN_STR, RT_PRINT_STR,
+    RT_PRINTLN_BOOL, RT_PRINT_BOOL,
+    RT_PRINTLN_EMPTY,
+];
+
 // ─── CHIRCodeGen ──────────────────────────────────────────────────────────────
 
 /// CHIR 代码生成器
 pub struct CHIRCodeGen {
     /// 用户函数名 → WASM 函数索引（已加 IMPORT_COUNT 偏移）
     func_indices: HashMap<String, u32>,
+    /// 函数索引 → 是否为 void（无返回值）函数
+    func_void_map: HashMap<u32, bool>,
+    /// 当前循环上下文中 break 所需的 Br 深度
+    /// 0 = 不在循环内；1 = 直接在 loop body 内；每进入一个 if/block +1
+    loop_break_depth: std::cell::Cell<u32>,
+    /// 字符串常量池：(内容, 内存地址)
+    string_data: Vec<(String, u32)>,
+    /// 字符串内容 → 内存地址快速查找
+    string_addresses: HashMap<String, u32>,
+    /// 数据段当前写入位置
+    data_offset: u32,
 }
 
 impl CHIRCodeGen {
     pub fn new() -> Self {
         CHIRCodeGen {
             func_indices: HashMap::new(),
+            func_void_map: HashMap::new(),
+            loop_break_depth: std::cell::Cell::new(0),
+            string_data: Vec::new(),
+            string_addresses: HashMap::new(),
+            data_offset: DATA_SECTION_BASE,
+        }
+    }
+
+    /// 注册字符串到字符串池，返回内存地址（格式：[len:i32][bytes...]）
+    fn intern_string(&mut self, s: &str) -> u32 {
+        if let Some(&addr) = self.string_addresses.get(s) {
+            return addr;
+        }
+        let addr = self.data_offset;
+        self.string_addresses.insert(s.to_string(), addr);
+        self.string_data.push((s.to_string(), addr));
+        // 格式：[length: 4 bytes][utf8 bytes]，8字节对齐
+        let total = 4 + s.len() as u32;
+        let aligned = (total + 7) & !7; // 对齐到 8 字节
+        self.data_offset += aligned;
+        addr
+    }
+
+    /// 遍历 CHIR 程序，预先收集所有字符串字面量
+    fn collect_strings_from_program(&mut self, program: &CHIRProgram) {
+        for func in &program.functions {
+            self.collect_strings_from_block(&func.body);
+        }
+    }
+
+    fn collect_strings_from_block(&mut self, block: &CHIRBlock) {
+        for stmt in &block.stmts {
+            self.collect_strings_from_stmt(stmt);
+        }
+        if let Some(r) = &block.result {
+            self.collect_strings_from_expr(r);
+        }
+    }
+
+    fn collect_strings_from_stmt(&mut self, stmt: &CHIRStmt) {
+        match stmt {
+            CHIRStmt::Let { value, .. } => self.collect_strings_from_expr(value),
+            CHIRStmt::Assign { value, .. } => self.collect_strings_from_expr(value),
+            CHIRStmt::Expr(e) => self.collect_strings_from_expr(e),
+            CHIRStmt::Return(Some(e)) => self.collect_strings_from_expr(e),
+            CHIRStmt::While { cond, body } => {
+                self.collect_strings_from_expr(cond);
+                self.collect_strings_from_block(body);
+            }
+            CHIRStmt::Loop { body } => self.collect_strings_from_block(body),
+            _ => {}
+        }
+    }
+
+    fn collect_strings_from_expr(&mut self, expr: &CHIRExpr) {
+        match &expr.kind {
+            CHIRExprKind::String(s) => { self.intern_string(s); }
+            CHIRExprKind::Print { arg, .. } => {
+                if let Some(a) = arg { self.collect_strings_from_expr(a); }
+            }
+            CHIRExprKind::Binary { left, right, .. } => {
+                self.collect_strings_from_expr(left);
+                self.collect_strings_from_expr(right);
+            }
+            CHIRExprKind::Unary { expr: inner, .. } => self.collect_strings_from_expr(inner),
+            CHIRExprKind::Call { args, .. } => {
+                for a in args { self.collect_strings_from_expr(a); }
+            }
+            CHIRExprKind::MethodCall { receiver, args, .. } => {
+                self.collect_strings_from_expr(receiver);
+                for a in args { self.collect_strings_from_expr(a); }
+            }
+            CHIRExprKind::If { cond, then_block, else_block } => {
+                self.collect_strings_from_expr(cond);
+                self.collect_strings_from_block(then_block);
+                if let Some(b) = else_block { self.collect_strings_from_block(b); }
+            }
+            CHIRExprKind::Block(b) => self.collect_strings_from_block(b),
+            CHIRExprKind::Cast { expr: inner, .. } => self.collect_strings_from_expr(inner),
+            CHIRExprKind::FieldGet { object, .. } => self.collect_strings_from_expr(object),
+            CHIRExprKind::FieldSet { object, value, .. } => {
+                self.collect_strings_from_expr(object);
+                self.collect_strings_from_expr(value);
+            }
+            CHIRExprKind::ArrayGet { array, index } => {
+                self.collect_strings_from_expr(array);
+                self.collect_strings_from_expr(index);
+            }
+            CHIRExprKind::ArraySet { array, index, value } => {
+                self.collect_strings_from_expr(array);
+                self.collect_strings_from_expr(index);
+                self.collect_strings_from_expr(value);
+            }
+            CHIRExprKind::ArrayNew { len, init } => {
+                self.collect_strings_from_expr(len);
+                self.collect_strings_from_expr(init);
+            }
+            CHIRExprKind::TupleGet { tuple, .. } => self.collect_strings_from_expr(tuple),
+            CHIRExprKind::TupleNew { elements } => {
+                for e in elements { self.collect_strings_from_expr(e); }
+            }
+            CHIRExprKind::StructNew { fields, .. } => {
+                for (_, v) in fields { self.collect_strings_from_expr(v); }
+            }
+            _ => {}
         }
     }
 
     /// 生成完整 WASM 模块
     pub fn generate(&mut self, program: &CHIRProgram) -> Vec<u8> {
-        // 用户函数索引 = 导入数量 + 用户序号
+        // ── 0. 预处理：收集字符串字面量，分配内存地址 ────────────────
+        self.collect_strings_from_program(program);
+
+        // ── 用户函数索引 = 导入数量 + 用户序号 ─────────────────────────
+        // 支持重载：用 "name$arity" 修饰名精确匹配；原名作为 fallback
         for (i, func) in program.functions.iter().enumerate() {
-            self.func_indices.insert(func.name.clone(), IMPORT_COUNT + i as u32);
+            let idx = IMPORT_COUNT + i as u32;
+            let mangled = format!("{}${}", func.name, func.params.len());
+            self.func_indices.insert(mangled, idx);
+            self.func_indices.entry(func.name.clone()).or_insert(idx);
+            // 记录函数是否为 void（Unit 返回）
+            let is_void = matches!(func.return_ty, Type::Unit | Type::Nothing);
+            self.func_void_map.insert(idx, is_void);
+        }
+
+        // ── 预注册运行时助手函数索引（在用户函数之后）─────────────────
+        let user_count = program.functions.len() as u32;
+        for (i, name) in RT_NAMES.iter().enumerate() {
+            self.func_indices.insert(name.to_string(), IMPORT_COUNT + user_count + i as u32);
         }
 
         let mut types = TypeSection::new();
@@ -94,6 +251,8 @@ impl CHIRCodeGen {
         for &type_idx in &user_type_indices {
             functions.function(type_idx);
         }
+        // 运行时助手函数的类型索引（在用户函数之后添加）
+        let rt_type_indices = self.register_rt_func_types(&mut types, &mut functions);
 
         // ── 4. 内存段 ─────────────────────────────────────────────────
         memories.memory(MemoryType {
@@ -105,10 +264,11 @@ impl CHIRCodeGen {
         });
 
         // ── 5. 全局段：堆指针 ─────────────────────────────────────────
-        // global 0: heap_ptr (可变 i32，初始指向页起始 64KiB)
+        // global 0: heap_ptr (可变 i32，初始指向字符串数据之后)
+        let heap_start = (self.data_offset + 7) & !7; // 对齐
         globals.global(
             GlobalType { val_type: ValType::I32, mutable: true, shared: false },
-            &ConstExpr::i32_const(65536), // 1 page offset
+            &ConstExpr::i32_const(heap_start as i32),
         );
 
         // ── 6. 导出段 ─────────────────────────────────────────────────
@@ -136,6 +296,22 @@ impl CHIRCodeGen {
         for func in &program.functions {
             self.emit_function(func, &mut codes);
         }
+        // 运行时助手函数代码
+        self.emit_rt_functions(&rt_type_indices, &mut codes);
+
+        // ── 8. 数据段：字符串常量 ─────────────────────────────────────
+        let data_section = if !self.string_data.is_empty() {
+            let mut data = wasm_encoder::DataSection::new();
+            for (s, addr) in &self.string_data {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(s.len() as i32).to_le_bytes());
+                bytes.extend_from_slice(s.as_bytes());
+                data.active(0, &ConstExpr::i32_const(*addr as i32), bytes);
+            }
+            Some(data)
+        } else {
+            None
+        };
 
         // ── 组装（WASM 段顺序必须按规范） ─────────────────────────────
         let mut module = Module::new();
@@ -146,7 +322,300 @@ impl CHIRCodeGen {
         module.section(&globals);
         module.section(&exports);
         module.section(&codes);
+        if let Some(ds) = &data_section {
+            module.section(ds);
+        }
         module.finish()
+    }
+
+    // ─── 运行时助手函数注册 ────────────────────────────────────────────────
+
+    /// 为运行时助手注册类型/函数段，返回每个助手的 (type_idx, wasm_func_idx) 对
+    fn register_rt_func_types(
+        &self,
+        types: &mut TypeSection,
+        functions: &mut FunctionSection,
+    ) -> Vec<u32> {
+        let mut rt_type_indices = Vec::new();
+        // i64 → void: __rt_println_i64, __rt_print_i64
+        let ty_i64_void = types.len();
+        types.ty().function(vec![ValType::I64], vec![]);
+        functions.function(ty_i64_void);
+        rt_type_indices.push(ty_i64_void); // println_i64
+        functions.function(ty_i64_void);
+        rt_type_indices.push(ty_i64_void); // print_i64
+        // i32 → void: __rt_println_str, __rt_print_str, __rt_println_bool, __rt_print_bool
+        let ty_i32_void = types.len();
+        types.ty().function(vec![ValType::I32], vec![]);
+        functions.function(ty_i32_void);
+        rt_type_indices.push(ty_i32_void); // println_str
+        functions.function(ty_i32_void);
+        rt_type_indices.push(ty_i32_void); // print_str
+        functions.function(ty_i32_void);
+        rt_type_indices.push(ty_i32_void); // println_bool
+        functions.function(ty_i32_void);
+        rt_type_indices.push(ty_i32_void); // print_bool
+        // () → void: __rt_println_empty
+        let ty_void_void = types.len();
+        types.ty().function(vec![], vec![]);
+        functions.function(ty_void_void);
+        rt_type_indices.push(ty_void_void); // println_empty
+        rt_type_indices
+    }
+
+    /// 生成所有运行时助手函数的 WASM 代码
+    fn emit_rt_functions(&self, _rt_type_indices: &[u32], codes: &mut CodeSection) {
+        // 0: __rt_println_i64
+        codes.function(&self.build_rt_print_i64(true, 1));
+        // 1: __rt_print_i64
+        codes.function(&self.build_rt_print_i64(false, 1));
+        // 2: __rt_println_str
+        codes.function(&self.build_rt_print_str(true, 1));
+        // 3: __rt_print_str
+        codes.function(&self.build_rt_print_str(false, 1));
+        // 4: __rt_println_bool
+        codes.function(&self.build_rt_print_bool(true, 1));
+        // 5: __rt_print_bool
+        codes.function(&self.build_rt_print_bool(false, 1));
+        // 6: __rt_println_empty
+        codes.function(&self.build_rt_println_empty(1));
+    }
+
+    /// 生成 I/O 辅助 MemArg
+    fn mem(offset: u64, align: u32) -> MemArg {
+        MemArg { offset, align, memory_index: 0 }
+    }
+
+    /// 生成 fd_write 调用（iovec 已设置好，直接调用）
+    fn emit_fd_write_call(fd: i32, f: &mut wasm_encoder::Function) {
+        f.instruction(&Instruction::I32Const(fd));
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Const(NWRITTEN_OFFSET));
+        f.instruction(&Instruction::Call(IDX_FD_WRITE));
+        f.instruction(&Instruction::Drop);
+    }
+
+    /// 设置 iovec 并调用 fd_write 输出指定内存区域
+    fn emit_write_buf(buf_ptr_expr: impl Fn(&mut wasm_encoder::Function), buf_len_expr: impl Fn(&mut wasm_encoder::Function), fd: i32, f: &mut wasm_encoder::Function) {
+        // iovec.buf_ptr = buf_ptr
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        buf_ptr_expr(f);
+        f.instruction(&Instruction::I32Store(Self::mem(0, 2)));
+        // iovec.buf_len = buf_len
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        buf_len_expr(f);
+        f.instruction(&Instruction::I32Store(Self::mem(4, 2)));
+        Self::emit_fd_write_call(fd, f);
+    }
+
+    /// 生成换行符输出指令（直接用 mem[0] 暂存 '\n'）
+    fn emit_newline(fd: i32, f: &mut wasm_encoder::Function) {
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Const(10)); // '\n'
+        f.instruction(&Instruction::I32Store8(Self::mem(0, 0)));
+        Self::emit_write_buf(
+            |f| { f.instruction(&Instruction::I32Const(0)); },
+            |f| { f.instruction(&Instruction::I32Const(1)); },
+            fd, f
+        );
+    }
+
+    /// 生成 __rt_println_i64 / __rt_print_i64 函数体
+    /// 参数 local 0: i64 (val)，局部 local 1: i32 (pos), local 2: i32 (is_neg)
+    fn build_rt_print_i64(&self, newline: bool, fd: i32) -> wasm_encoder::Function {
+        let mut f = wasm_encoder::Function::new(vec![(2, ValType::I32)]);
+        // end_pos / buf_len_base
+        let end_pos: i32 = if newline { 23 } else { 22 };
+        let buf_len_base: i32 = if newline { 24 } else { 22 };
+
+        // pos = end_pos
+        f.instruction(&Instruction::I32Const(end_pos));
+        f.instruction(&Instruction::LocalSet(1));
+
+        if newline {
+            // mem[23] = '\n'
+            f.instruction(&Instruction::I32Const(23));
+            f.instruction(&Instruction::I32Const(10));
+            f.instruction(&Instruction::I32Store8(Self::mem(0, 0)));
+        }
+
+        // if val == 0
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64Eqz);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        {
+            let zero_pos = end_pos - 1;
+            f.instruction(&Instruction::I32Const(zero_pos));
+            f.instruction(&Instruction::LocalSet(1));
+            f.instruction(&Instruction::I32Const(zero_pos));
+            f.instruction(&Instruction::I32Const(48)); // '0'
+            f.instruction(&Instruction::I32Store8(Self::mem(0, 0)));
+        }
+        f.instruction(&Instruction::Else);
+        {
+            // is_neg = val < 0
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64Const(0));
+            f.instruction(&Instruction::I64LtS);
+            f.instruction(&Instruction::LocalSet(2));
+            // if is_neg: val = -val
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::If(BlockType::Empty));
+            f.instruction(&Instruction::I64Const(0));
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I64Sub);
+            f.instruction(&Instruction::LocalSet(0));
+            f.instruction(&Instruction::End);
+            // loop: digits
+            f.instruction(&Instruction::Block(BlockType::Empty));
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            {
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Eqz);
+                f.instruction(&Instruction::BrIf(1));
+                f.instruction(&Instruction::LocalGet(1));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Sub);
+                f.instruction(&Instruction::LocalSet(1));
+                f.instruction(&Instruction::LocalGet(1));
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Const(10));
+                f.instruction(&Instruction::I64RemU);
+                f.instruction(&Instruction::I32WrapI64);
+                f.instruction(&Instruction::I32Const(48));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::I32Store8(Self::mem(0, 0)));
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Const(10));
+                f.instruction(&Instruction::I64DivU);
+                f.instruction(&Instruction::LocalSet(0));
+                f.instruction(&Instruction::Br(0));
+            }
+            f.instruction(&Instruction::End);
+            f.instruction(&Instruction::End);
+            // if is_neg: prepend '-'
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::If(BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Sub);
+            f.instruction(&Instruction::LocalSet(1));
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::I32Const(45)); // '-'
+            f.instruction(&Instruction::I32Store8(Self::mem(0, 0)));
+            f.instruction(&Instruction::End);
+        }
+        f.instruction(&Instruction::End);
+
+        // iovec.buf = pos, iovec.len = buf_len_base - pos
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Store(Self::mem(0, 2)));
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::I32Const(buf_len_base));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Store(Self::mem(4, 2)));
+        Self::emit_fd_write_call(fd, &mut f);
+
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __rt_println_str / __rt_print_str 函数体
+    /// 参数 local 0: i32 (string ptr, 格式: [len:i32][bytes...])
+    /// 局部变量 local 1: i32 (len)
+    fn build_rt_print_str(&self, newline: bool, fd: i32) -> wasm_encoder::Function {
+        let mut f = wasm_encoder::Function::new(vec![(1, ValType::I32)]);
+
+        // len = mem[ptr]
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(Self::mem(0, 2)));
+        f.instruction(&Instruction::LocalSet(1));
+
+        // iovec.buf = ptr + 4
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Store(Self::mem(0, 2)));
+
+        // iovec.len = len
+        f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Store(Self::mem(4, 2)));
+
+        Self::emit_fd_write_call(fd, &mut f);
+
+        if newline {
+            Self::emit_newline(fd, &mut f);
+        }
+
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __rt_println_bool / __rt_print_bool 函数体
+    /// 参数 local 0: i32 (bool value, 0=false, 非0=true)
+    fn build_rt_print_bool(&self, newline: bool, fd: i32) -> wasm_encoder::Function {
+        let mut f = wasm_encoder::Function::new(vec![]);
+
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::If(BlockType::Empty));
+        {
+            // "true"
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Const(0x65757274_u32 as i32)); // "true" LE
+            f.instruction(&Instruction::I32Store(Self::mem(0, 2)));
+            let len = if newline {
+                f.instruction(&Instruction::I32Const(4));
+                f.instruction(&Instruction::I32Const(10));
+                f.instruction(&Instruction::I32Store8(Self::mem(0, 0)));
+                5
+            } else { 4 };
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Store(Self::mem(0, 2)));
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(len));
+            f.instruction(&Instruction::I32Store(Self::mem(4, 2)));
+            Self::emit_fd_write_call(fd, &mut f);
+        }
+        f.instruction(&Instruction::Else);
+        {
+            // "false"
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Const(0x736C6166_u32 as i32)); // "fals" LE
+            f.instruction(&Instruction::I32Store(Self::mem(0, 2)));
+            f.instruction(&Instruction::I32Const(4));
+            f.instruction(&Instruction::I32Const(101)); // 'e'
+            f.instruction(&Instruction::I32Store8(Self::mem(0, 0)));
+            let len = if newline {
+                f.instruction(&Instruction::I32Const(5));
+                f.instruction(&Instruction::I32Const(10));
+                f.instruction(&Instruction::I32Store8(Self::mem(0, 0)));
+                6
+            } else { 5 };
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Store(Self::mem(0, 2)));
+            f.instruction(&Instruction::I32Const(IOVEC_OFFSET));
+            f.instruction(&Instruction::I32Const(len));
+            f.instruction(&Instruction::I32Store(Self::mem(4, 2)));
+            Self::emit_fd_write_call(fd, &mut f);
+        }
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __rt_println_empty() 函数体：仅输出换行符
+    fn build_rt_println_empty(&self, fd: i32) -> wasm_encoder::Function {
+        let mut f = wasm_encoder::Function::new(vec![]);
+        Self::emit_newline(fd, &mut f);
+        f.instruction(&Instruction::End);
+        f
     }
 
     // ─── 函数 ──────────────────────────────────────────────────────────────
@@ -161,7 +630,7 @@ impl CHIRCodeGen {
         locals_map.dedup_by_key(|l| l.0);
 
         // wasm_encoder 的 locals 格式：(count, ValType) 的 run-length
-        let locals_for_encoder = run_length_encode_locals(&locals_map);
+        let locals_for_encoder = run_length_encode_locals(&locals_map, param_count);
         let mut wasm_func = wasm_encoder::Function::new(locals_for_encoder);
 
         let has_result = !wasm_result_tys(&func.return_ty, func.return_wasm_ty).is_empty();
@@ -190,6 +659,62 @@ impl CHIRCodeGen {
         }
     }
 
+    /// 判断 CHIRExpr 是否会在 WASM 栈上留下一个值
+    /// 与 emit_expr 的实际行为保持一致，避免错误的 drop/local.set
+    fn expr_produces_wasm_value_ctx(&self, expr: &CHIRExpr) -> bool {
+        if matches!(expr.ty, Type::Unit | Type::Nothing) {
+            return false;
+        }
+        match &expr.kind {
+            // If 表达式：检查 then 分支的 result 是否真正产出值
+            CHIRExprKind::If { then_block, .. } => {
+                if let Some(result) = &then_block.result {
+                    self.expr_produces_wasm_value_ctx(result)
+                } else {
+                    then_block.stmts.iter().any(|s| matches!(s, CHIRStmt::Return(_)))
+                }
+            }
+            // Block：检查 result 是否真正产出值
+            CHIRExprKind::Block(block) => {
+                if let Some(result) = &block.result {
+                    self.expr_produces_wasm_value_ctx(result)
+                } else {
+                    false
+                }
+            }
+            // Call：检查被调用函数的实际返回类型
+            CHIRExprKind::Call { func_idx, .. } => {
+                if let Some(&is_void) = self.func_void_map.get(func_idx) {
+                    !is_void
+                } else {
+                    true
+                }
+            }
+            // Cast：内层表达式产出值时才产出值
+            CHIRExprKind::Cast { expr: inner, .. } => {
+                matches!(inner.ty, Type::Unit | Type::Nothing) || self.expr_produces_wasm_value_ctx(inner)
+            }
+            CHIRExprKind::Print { .. } => false,
+            _ => true,
+        }
+    }
+
+    /// 静态版本（不需要 self 的场景，兼容旧调用）
+    fn expr_produces_wasm_value(expr: &CHIRExpr) -> bool {
+        if matches!(expr.ty, Type::Unit | Type::Nothing) {
+            return false;
+        }
+        match &expr.kind {
+            CHIRExprKind::If { then_block, .. } => {
+                then_block.result.is_some()
+                    || then_block.stmts.iter().any(|s| matches!(s, CHIRStmt::Return(_)))
+            }
+            CHIRExprKind::Block(block) => block.result.is_some(),
+            CHIRExprKind::Print { .. } => false,
+            _ => true,
+        }
+    }
+
     /// void 上下文的块 emit（Unit If 分支），对产生的 result 主动 Drop
     fn emit_block_void(&self, block: &CHIRBlock, func: &mut wasm_encoder::Function) {
         for stmt in &block.stmts {
@@ -197,8 +722,7 @@ impl CHIRCodeGen {
         }
         if let Some(result) = &block.result {
             self.emit_expr(result, func);
-            // 若 result 产生了值，在 Unit 上下文中需要丢弃
-            if !matches!(result.ty, Type::Unit | Type::Nothing) {
+            if self.expr_produces_wasm_value_ctx(result) {
                 func.instruction(&Instruction::Drop);
             }
         }
@@ -210,18 +734,16 @@ impl CHIRCodeGen {
             self.emit_stmt(stmt, func);
         }
         if let Some(result) = &block.result {
-            if matches!(result.ty, Type::Unit | Type::Nothing) {
-                // 结果是 Unit（不产生值），补零值满足期望类型
+            if !self.expr_produces_wasm_value_ctx(result) {
+                self.emit_expr(result, func);
                 emit_zero(expected_ty, func);
             } else {
                 self.emit_expr(result, func);
-                // 若结果类型与期望不符，插入转换指令
                 if result.wasm_ty != expected_ty {
                     self.emit_cast(result.wasm_ty, expected_ty, func);
                 }
             }
         } else {
-            // 块无显式结果时补零值，保持 If 分支类型一致
             emit_zero(expected_ty, func);
         }
     }
@@ -245,9 +767,10 @@ impl CHIRCodeGen {
             CHIRExprKind::Rune(c) => {
                 func.instruction(&Instruction::I32Const(*c as i32));
             }
-            CHIRExprKind::String(_s) => {
-                // 字符串字面量简化：返回 0（完整实现需数据段）
-                func.instruction(&Instruction::I32Const(0));
+            CHIRExprKind::String(s) => {
+                // 字符串字面量：返回数据段中的内存地址
+                let addr = self.string_addresses.get(s).copied().unwrap_or(0);
+                func.instruction(&Instruction::I32Const(addr as i32));
             }
 
             CHIRExprKind::Local(idx) => {
@@ -259,14 +782,36 @@ impl CHIRCodeGen {
             }
 
             CHIRExprKind::Binary { op, left, right } => {
+                // 确定操作所需的操作数类型：
+                // - 算术/位操作：使用结果类型（expr.wasm_ty）
+                // - 比较操作：使用操作数类型（left.wasm_ty），结果为 I32 (bool)
+                let operand_ty = match op {
+                    BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq
+                    | BinOp::Gt | BinOp::GtEq => left.wasm_ty,
+                    _ => expr.wasm_ty,
+                };
                 self.emit_expr(left, func);
+                // 若操作数为 void（Unit/Nothing），补零值作为默认值
+                if !Self::expr_produces_wasm_value(left) {
+                    emit_zero(operand_ty, func);
+                } else if left.wasm_ty != operand_ty {
+                    self.emit_cast(left.wasm_ty, operand_ty, func);
+                }
                 self.emit_expr(right, func);
-                self.emit_binary_op(op, expr.wasm_ty, func);
+                if !Self::expr_produces_wasm_value(right) {
+                    emit_zero(operand_ty, func);
+                } else if right.wasm_ty != operand_ty {
+                    self.emit_cast(right.wasm_ty, operand_ty, func);
+                }
+                self.emit_binary_op(op, operand_ty, func);
             }
             CHIRExprKind::Unary { op, expr: inner } => {
                 self.emit_expr(inner, func);
-                // Not(!): eqz 期望 I32；若内层是 I64，先截断
-                if matches!(op, UnaryOp::Not) && inner.wasm_ty == ValType::I64 {
+                if !Self::expr_produces_wasm_value(inner) {
+                    // 内层为 void，补零值（对于 Not：!void = !0 = true）
+                    emit_zero(ValType::I32, func);
+                } else if matches!(op, UnaryOp::Not) && inner.wasm_ty == ValType::I64 {
+                    // Not(!): eqz 期望 I32；若内层是 I64，先截断
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 self.emit_unary_op(op, expr.wasm_ty, func);
@@ -275,6 +820,9 @@ impl CHIRCodeGen {
             CHIRExprKind::Call { func_idx, args } => {
                 for arg in args {
                     self.emit_expr(arg, func);
+                    if !self.expr_produces_wasm_value_ctx(arg) {
+                        emit_zero(arg.wasm_ty, func);
+                    }
                 }
                 func.instruction(&Instruction::Call(*func_idx));
             }
@@ -283,6 +831,9 @@ impl CHIRCodeGen {
                 self.emit_expr(receiver, func);
                 for arg in args {
                     self.emit_expr(arg, func);
+                    if !self.expr_produces_wasm_value_ctx(arg) {
+                        emit_zero(arg.wasm_ty, func);
+                    }
                 }
                 if let Some(idx) = func_idx {
                     func.instruction(&Instruction::Call(*idx));
@@ -291,7 +842,10 @@ impl CHIRCodeGen {
 
             CHIRExprKind::Cast { expr: inner, from_ty, to_ty } => {
                 if matches!(inner.ty, Type::Unit | Type::Nothing) {
-                    // 内层表达式不产生值（Unit/Nothing），直接推零值作为目标类型
+                    emit_zero(*to_ty, func);
+                } else if !self.expr_produces_wasm_value_ctx(inner) {
+                    // 内部表达式有副作用但不产生值（如 void Call）
+                    self.emit_expr(inner, func);
                     emit_zero(*to_ty, func);
                 } else {
                     self.emit_expr(inner, func);
@@ -303,6 +857,12 @@ impl CHIRCodeGen {
 
             CHIRExprKind::If { cond, then_block, else_block } => {
                 self.emit_expr(cond, func);
+                // 若条件为 void（Unit Call），WASM if 指令需要 i32，补 0（false）
+                if !Self::expr_produces_wasm_value(cond) {
+                    func.instruction(&Instruction::I32Const(0));
+                } else if cond.wasm_ty == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
                 // 仅当 then/else 两侧都会产出值时，才用 Result block type
                 let then_produces = then_block.result.is_some()
                     || then_block.stmts.iter().any(|s| matches!(s, CHIRStmt::Return(_)));
@@ -312,6 +872,11 @@ impl CHIRCodeGen {
                     BlockType::Result(expr.wasm_ty)
                 };
                 func.instruction(&Instruction::If(block_type));
+                // if 指令创建新的 WASM 标签层级，break 深度 +1
+                let prev_depth = self.loop_break_depth.get();
+                if prev_depth > 0 {
+                    self.loop_break_depth.set(prev_depth + 1);
+                }
                 if matches!(block_type, BlockType::Empty) {
                     // Unit If：分支不得产生值；用 emit_block_void 确保栈干净
                     self.emit_block_void(then_block, func);
@@ -332,6 +897,8 @@ impl CHIRCodeGen {
                     emit_zero(expr.wasm_ty, func);
                 }
                 func.instruction(&Instruction::End);
+                // 退出 if 块，恢复 break 深度
+                self.loop_break_depth.set(prev_depth);
             }
 
             CHIRExprKind::Block(block) => {
@@ -344,6 +911,10 @@ impl CHIRCodeGen {
 
             CHIRExprKind::FieldGet { object, field_offset, .. } => {
                 self.emit_expr(object, func);
+                // 内存地址计算需要 i32，若 object 是 i64 则截断
+                if object.wasm_ty == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
                 func.instruction(&Instruction::I32Const(*field_offset as i32));
                 func.instruction(&Instruction::I32Add);
                 emit_load(expr.wasm_ty, func);
@@ -373,6 +944,59 @@ impl CHIRCodeGen {
                 emit_load(expr.wasm_ty, func);
             }
 
+            CHIRExprKind::Print { arg, newline, fd } => {
+                if let Some(arg_expr) = arg {
+                    // 若参数是 Nop（如未实现的字符串插值），跳过输出（但仍输出换行）
+                    let is_nop = matches!(&arg_expr.kind, CHIRExprKind::Nop);
+                    if is_nop {
+                        if *newline {
+                            if let Some(&idx) = self.func_indices.get(RT_PRINTLN_EMPTY) {
+                                func.instruction(&Instruction::Call(idx));
+                            }
+                        }
+                    } else {
+                        self.emit_expr(arg_expr, func);
+                        // 根据参数类型选择运行时助手函数
+                        let rt_name = match (&arg_expr.ty, arg_expr.wasm_ty) {
+                            (Type::Bool, _) => {
+                                if *newline { RT_PRINTLN_BOOL } else { RT_PRINT_BOOL }
+                            }
+                            (Type::String, _) => {
+                                if *newline { RT_PRINTLN_STR } else { RT_PRINT_STR }
+                            }
+                            (_, ValType::I64) => {
+                                if *newline { RT_PRINTLN_I64 } else { RT_PRINT_I64 }
+                            }
+                            (_, ValType::F64) => {
+                                // Float64：暂时用 i64 版本（截断取整后打印）
+                                func.instruction(&Instruction::I64TruncF64S);
+                                if *newline { RT_PRINTLN_I64 } else { RT_PRINT_I64 }
+                            }
+                            (_, ValType::F32) => {
+                                // Float32：先提升到 f64，再截断到 i64
+                                func.instruction(&Instruction::F64PromoteF32);
+                                func.instruction(&Instruction::I64TruncF64S);
+                                if *newline { RT_PRINTLN_I64 } else { RT_PRINT_I64 }
+                            }
+                            _ => {
+                                // I32 整型：扩展到 I64 后使用 i64 版本
+                                func.instruction(&Instruction::I64ExtendI32S);
+                                if *newline { RT_PRINTLN_I64 } else { RT_PRINT_I64 }
+                            }
+                        };
+                        if let Some(&idx) = self.func_indices.get(rt_name) {
+                            func.instruction(&Instruction::Call(idx));
+                        }
+                    }
+                } else if *newline {
+                    // 空 println：仅输出换行符
+                    if let Some(&idx) = self.func_indices.get(RT_PRINTLN_EMPTY) {
+                        func.instruction(&Instruction::Call(idx));
+                    }
+                }
+                // Print 是 Unit 类型，不产生 WASM 栈值
+            }
+
             CHIRExprKind::Nop => {
                 // 非 Unit 类型的 Nop 需要推入占位零值，否则返回/调用时栈不匹配
                 if !matches!(expr.ty, Type::Unit | Type::Nothing) {
@@ -394,6 +1018,10 @@ impl CHIRCodeGen {
         match stmt {
             CHIRStmt::Let { local_idx, value } => {
                 self.emit_expr(value, func);
+                // 若 value 为 void 表达式（Unit Call 等），补零值保证 local.set 有操作数
+                if !self.expr_produces_wasm_value_ctx(value) {
+                    emit_zero(value.wasm_ty, func);
+                }
                 func.instruction(&Instruction::LocalSet(*local_idx));
             }
 
@@ -403,8 +1031,7 @@ impl CHIRCodeGen {
 
             CHIRStmt::Expr(expr) => {
                 self.emit_expr(expr, func);
-                // 非 Unit 表达式丢弃结果（Nop 若返回非 Unit 类型也会推入零值，同样需要 Drop）
-                if !matches!(expr.ty, Type::Unit | Type::Nothing) {
+                if self.expr_produces_wasm_value_ctx(expr) {
                     func.instruction(&Instruction::Drop);
                 }
             }
@@ -416,16 +1043,26 @@ impl CHIRCodeGen {
                 func.instruction(&Instruction::Return);
             }
 
-            CHIRStmt::Break => { func.instruction(&Instruction::Br(1)); }
+            CHIRStmt::Break => {
+                // 使用当前 break 深度：直接在 loop body 内为 1，每嵌套一层 if/block +1
+                let depth = self.loop_break_depth.get();
+                func.instruction(&Instruction::Br(if depth > 0 { depth } else { 1 }));
+            }
             CHIRStmt::Continue => { func.instruction(&Instruction::Br(0)); }
 
             CHIRStmt::While { cond, body } => {
                 // block { loop { break_if(!cond); body; br 0 } }
+                // break 直接在 loop body 内时深度为 1（退出 block）
+                let prev_depth = self.loop_break_depth.get();
+                self.loop_break_depth.set(1);
                 func.instruction(&Instruction::Block(BlockType::Empty));
                 func.instruction(&Instruction::Loop(BlockType::Empty));
                 self.emit_expr(cond, func);
-                // 条件可能是 I64，需先截断到 I32，再用 I32Eqz 实现 `!cond`
-                if cond.wasm_ty == ValType::I64 {
+                // 条件可能是 void（Unit Call），需补零值（false）避免 i32.eqz 空栈错误
+                if !Self::expr_produces_wasm_value(cond) {
+                    func.instruction(&Instruction::I32Const(0));
+                } else if cond.wasm_ty == ValType::I64 {
+                    // 条件可能是 I64，需先截断到 I32，再用 I32Eqz 实现 `!cond`
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -434,15 +1071,19 @@ impl CHIRCodeGen {
                 func.instruction(&Instruction::Br(0));
                 func.instruction(&Instruction::End); // loop
                 func.instruction(&Instruction::End); // block
+                self.loop_break_depth.set(prev_depth);
             }
 
             CHIRStmt::Loop { body } => {
+                let prev_depth = self.loop_break_depth.get();
+                self.loop_break_depth.set(1);
                 func.instruction(&Instruction::Block(BlockType::Empty));
                 func.instruction(&Instruction::Loop(BlockType::Empty));
                 self.emit_block(body, func);
                 func.instruction(&Instruction::Br(0));
                 func.instruction(&Instruction::End); // loop
                 func.instruction(&Instruction::End); // block
+                self.loop_break_depth.set(prev_depth);
             }
         }
     }
@@ -451,10 +1092,16 @@ impl CHIRCodeGen {
         match target {
             CHIRLValue::Local(idx) => {
                 self.emit_expr(value, func);
+                if !self.expr_produces_wasm_value_ctx(value) {
+                    emit_zero(value.wasm_ty, func);
+                }
                 func.instruction(&Instruction::LocalSet(*idx));
             }
             CHIRLValue::Field { object, offset } => {
                 self.emit_expr(object, func);
+                if object.wasm_ty == ValType::I64 {
+                    func.instruction(&Instruction::I32WrapI64);
+                }
                 func.instruction(&Instruction::I32Const(*offset as i32));
                 func.instruction(&Instruction::I32Add);
                 self.emit_expr(value, func);
@@ -690,13 +1337,19 @@ fn collect_locals_from_expr(expr: &CHIRExpr, param_count: u32, out: &mut Vec<(u3
         CHIRExprKind::Block(b) => {
             collect_locals_from_block(b, param_count, out);
         }
+        CHIRExprKind::Print { arg, .. } => {
+            if let Some(a) = arg {
+                collect_locals_from_expr(a, param_count, out);
+            }
+        }
         _ => {}
     }
 }
 
 /// 将 (idx, wasm_ty) 列表压缩为 wasm_encoder 的 run-length 格式 (count, ValType)
 /// 处理索引空洞：在不连续的索引间插入 I32 占位，保证 WASM locals 声明与实际使用的索引一致
-fn run_length_encode_locals(locals: &[(u32, ValType)]) -> Vec<(u32, ValType)> {
+/// param_count：函数参数数量，用于计算首个 local 之前的初始间隙
+fn run_length_encode_locals(locals: &[(u32, ValType)], param_count: u32) -> Vec<(u32, ValType)> {
     if locals.is_empty() {
         return vec![];
     }
@@ -705,9 +1358,10 @@ fn run_length_encode_locals(locals: &[(u32, ValType)]) -> Vec<(u32, ValType)> {
 
     for &(idx, ty) in locals {
         // 计算与上一个索引之间的空洞大小
+        // 首次：从 param_count 到首个 local 索引之间可能存在空洞（双重 lower 等情况）
         let gap = match prev_idx {
             Some(p) => idx.saturating_sub(p + 1),
-            None => 0,
+            None => idx.saturating_sub(param_count),
         };
         // 用 I32 填充空洞，保证索引连续
         if gap > 0 {

@@ -140,9 +140,27 @@ impl<'a> LoweringContext<'a> {
     fn lower_assign_target(&mut self, target: &AssignTarget) -> Result<CHIRLValue, String> {
         match target {
             AssignTarget::Var(name) => {
-                let local_idx = self.get_local(name)
-                    .ok_or_else(|| format!("变量未定义: {}", name))?;
-                Ok(CHIRLValue::Local(local_idx))
+                if let Some(local_idx) = self.get_local(name) {
+                    Ok(CHIRLValue::Local(local_idx))
+                } else if let Some((class_name, this_idx)) = self.current_class.clone() {
+                    // 隐式 this 字段赋值
+                    if let Some(fields) = self.class_field_info.get(&class_name) {
+                        if let Some((offset, _)) = fields.get(name) {
+                            let this_expr = crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(this_idx),
+                                crate::ast::Type::Struct(class_name.clone(), vec![]),
+                                wasm_encoder::ValType::I32,
+                            );
+                            return Ok(crate::chir::CHIRLValue::Field {
+                                object: Box::new(this_expr),
+                                offset: *offset,
+                            });
+                        }
+                    }
+                    Err(format!("变量未定义: {}", name))
+                } else {
+                    Err(format!("变量未定义: {}", name))
+                }
             }
 
             AssignTarget::Field { object, field } => {
@@ -168,8 +186,53 @@ impl<'a> LoweringContext<'a> {
                 })
             }
 
+            AssignTarget::FieldPath { base, fields } => {
+                // 链式字段：base.f1.f2...fN → 逐级 FieldGet 到倒数第二层，最后一层作为 offset
+                let mut obj_expr = crate::ast::Expr::Var(base.clone());
+                for field in &fields[..fields.len() - 1] {
+                    obj_expr = crate::ast::Expr::Field {
+                        object: Box::new(obj_expr),
+                        field: field.clone(),
+                    };
+                }
+                let obj_chir = self.lower_expr(&obj_expr)?;
+                let obj_ty = self.type_ctx.infer_expr(&obj_expr)?;
+                let last_field = fields.last().unwrap();
+                let offset = self.get_field_offset(&obj_ty, last_field)?;
+                Ok(CHIRLValue::Field {
+                    object: Box::new(obj_chir),
+                    offset,
+                })
+            }
+
+            AssignTarget::IndexPath { base, fields, index } => {
+                // 链式字段后索引：base.f1.f2[i]
+                let mut obj_expr = crate::ast::Expr::Var(base.clone());
+                for field in fields {
+                    obj_expr = crate::ast::Expr::Field {
+                        object: Box::new(obj_expr),
+                        field: field.clone(),
+                    };
+                }
+                let array_chir = self.lower_expr(&obj_expr)?;
+                let index_chir = self.lower_expr(index)?;
+                Ok(CHIRLValue::Index {
+                    array: Box::new(array_chir),
+                    index: Box::new(index_chir),
+                })
+            }
+
+            AssignTarget::ExprIndex { expr, index } => {
+                let array_chir = self.lower_expr(expr)?;
+                let index_chir = self.lower_expr(index)?;
+                Ok(CHIRLValue::Index {
+                    array: Box::new(array_chir),
+                    index: Box::new(index_chir),
+                })
+            }
+
             _ => {
-                // 其他赋值目标暂不支持
+                // SuperField, Tuple 等暂不支持
                 Err("不支持的赋值目标".to_string())
             }
         }
@@ -183,15 +246,19 @@ impl<'a> LoweringContext<'a> {
         for (i, stmt) in stmts.iter().enumerate() {
             let is_last = i == stmts.len() - 1;
 
-            // 如果是最后一个语句且是表达式，作为块的结果
+            // 如果是最后一个语句且是表达式，尝试作为块的结果值
+            // 必须复用已 lower 的 expr_chir，避免二次调用 lower_expr 导致 local 索引翻倍
             if is_last {
                 if let Stmt::Expr(expr) = stmt {
                     let expr_chir = self.lower_expr(expr)?;
-                    // 检查是否产生值
                     if !matches!(expr_chir.ty, crate::ast::Type::Unit) {
+                        // 产生非 Unit 值：作为块的结果（调用者负责消费）
                         result = Some(Box::new(expr_chir));
-                        continue;
+                    } else {
+                        // Unit 表达式：作为语句保留（不作为结果），避免再次 lower
+                        chir_stmts.push(crate::chir::CHIRStmt::Expr(expr_chir));
                     }
+                    continue; // 无论哪种情况都不再调用 lower_stmt
                 }
             }
 
@@ -217,14 +284,18 @@ mod tests {
     fn test_lower_let() {
         let type_ctx = TypeInferenceContext::new();
         let func_indices = HashMap::new();
+        let func_params = HashMap::new();
         let struct_offsets = HashMap::new();
         let class_offsets = HashMap::new();
+        let class_field_info = HashMap::new();
 
         let mut ctx = LoweringContext::new(
             &type_ctx,
             &func_indices,
+            &func_params,
             &struct_offsets,
             &class_offsets,
+            &class_field_info,
         );
 
         let stmt = Stmt::Let {
@@ -242,14 +313,18 @@ mod tests {
     fn test_lower_return() {
         let type_ctx = TypeInferenceContext::new();
         let func_indices = HashMap::new();
+        let func_params = HashMap::new();
         let struct_offsets = HashMap::new();
         let class_offsets = HashMap::new();
+        let class_field_info = HashMap::new();
 
         let mut ctx = LoweringContext::new(
             &type_ctx,
             &func_indices,
+            &func_params,
             &struct_offsets,
             &class_offsets,
+            &class_field_info,
         );
 
         let stmt = Stmt::Return(Some(Expr::Integer(42)));
@@ -264,14 +339,18 @@ mod tests {
         // 预先注册局部变量类型，以便 infer_expr 能识别
         type_ctx.add_local("x".to_string(), Type::Int64);
         let func_indices = HashMap::new();
+        let func_params = HashMap::new();
         let struct_offsets = HashMap::new();
         let class_offsets = HashMap::new();
+        let class_field_info = HashMap::new();
 
         let mut ctx = LoweringContext::new(
             &type_ctx,
             &func_indices,
+            &func_params,
             &struct_offsets,
             &class_offsets,
+            &class_field_info,
         );
 
         let stmts = vec![

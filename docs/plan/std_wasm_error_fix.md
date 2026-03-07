@@ -251,14 +251,56 @@ WASM 验证错误: 61 条（1 个文件，仅 std/）
 
 ---
 
-## 剩余工作
+## 第二轮修复：3277 → 8（根治方案）
 
-61 条剩余错误均集中在 `std/` 库，主要问题：
+在实现类方法 lowering 后，`examples/std/` 的 WASM 验证错误从 61 暴涨到 3277（因为 1359 个类方法首次被编译生成代码）。以下为系统性根治修复：
 
-1. **type mismatch in drop**（10条）：某些函数调用的 CHIRExpr 声明为非 Unit 类型但 WASM 层实际不产生返回值，需要更精确的函数返回类型对照（WASM 函数签名 vs CHIR 类型推断）。
+### 根因分析
 
-2. **type mismatch in local.set**（7条）：剩余赋值类型不匹配，通常来自更复杂的表达式路径（嵌套 if-else、pattern 赋值等）。
+| 根因 | 影响 | 错误数估算 |
+|------|------|-----------|
+| `infer_field_type` 不查 `class_fields` | 类字段全部推断为 I32 | ~1000 |
+| 类方法内字段名不在 type_ctx locals | `infer_expr(Var("field"))` 返回 I32 | ~1500 |
+| 类方法签名不注册到 `functions` map | MethodCall 参数无法类型对齐 | ~200 |
+| Call void 检测缺失 | 调用 void 方法后误认栈上有值 | ~170 |
+| 继承字段缺失 | 父类字段 `currentIndent` 等 81 处未定义 | ~80 |
+| `Expr::Call` 缺 this 隐式参数 | 类方法内直接调用同类方法缺参 | ~8 |
 
-3. **type mismatch in call**（7条）：函数参数类型差异，通常涉及参数是 Int64 但 WASM 函数签名为 i32 的情况。
+### 修复详情
 
-这些问题需要更完整的类型推断系统（如双向类型推断或从 WASM 函数签名反向补全参数类型）才能彻底消除。
+1. **`type_inference.rs::infer_field_type`**：增加 `class_fields` 查找路径
+2. **`lower.rs::lower_function`**：类方法内，将类字段注册到 type_ctx.locals
+3. **`type_inference.rs::from_program`**：将类方法签名注册到 `ctx.functions`
+4. **`lower.rs` + `type_inference.rs`**：多轮继承合并——将父类字段/方法签名传播到子类
+5. **`lower_expr.rs::MethodCall`**：根据方法签名做参数 WASM 类型对齐
+6. **`lower_expr.rs::Expr::Call`**：检测带 `.` 的函数名，自动尝试 arity+1 并前插 this
+7. **`chir_codegen.rs`**：新增 `func_void_map` + `expr_produces_wasm_value_ctx()`
+   - 根据函数实际返回类型判断 Call 后是否有栈值
+   - Let/Assign/Expr 语句中正确补零值或 Drop
+   - If/Block/Cast 表达式中递归检查内层表达式是否产出值
+8. **`lower_stmt.rs`**：支持 `FieldPath`/`IndexPath`/`ExprIndex` 赋值目标
+
+### 最终结果
+
+| 阶段 | WASM 验证错误 | lower 成功率 |
+|------|-------------|-------------|
+| 修复前 | **3277** | 1813/1900 (95.4%) |
+| infer_field_type + class fields locals | 392 | 1813/1900 |
+| MethodCall 参数对齐 | 186 | 1813/1900 |
+| func_void_map + void Call 检测 | 17 | 1817/1900 |
+| 继承字段合并 | 17 | 1899/1900 (99.95%) |
+| Call 参数 void 值补零 | 9 | 1899/1900 |
+| 递归 expr_produces_wasm_value_ctx | **8** | 1899/1900 |
+
+---
+
+## 剩余 8 个错误
+
+| 错误类型 | 数量 | 原因 |
+|---------|------|------|
+| `i32.wrap_i64` | 3 | 极少数类型推断返回 I64 但实际值为 I32 |
+| `i64.add` | 2 | Binary 表达式操作数类型不一致 |
+| `end of function` | 2 | void 函数残余栈值（复杂控制流路径） |
+| `if false branch` | 1 | if-else 分支 void Call 产值判断 |
+
+这些是非常边角的类型推断精度问题，需要完整的双向类型推断系统或函数签名反向传播才能彻底消除。
