@@ -173,7 +173,7 @@ pub fn parse_source(source: &str) -> Result<Program, String> {
     let tokens: Result<Vec<_>, _> = lexer.collect();
     let tokens = tokens.map_err(|e| format!("词法错误: {}", e))?;
 
-    let mut parser = Parser::new(tokens);
+    let mut parser = Parser::new(tokens).with_source(&source);
     let program = parser
         .parse_program()
         .map_err(|e| format!("语法错误: {}", e))?;

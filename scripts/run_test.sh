@@ -9,8 +9,9 @@
 #   ./scripts/run_test.sh 1        # 直接运行 cargo test
 #   ./scripts/run_test.sh 2        # 直接运行 system test
 #   ./scripts/run_test.sh 3        # 直接运行 performance test
-#   ./scripts/run_test.sh 4        # cargo test + system test
-#   ./scripts/run_test.sh 5        # 全部运行
+#   ./scripts/run_test.sh 4        # std 标准库 L1 兼容性测试
+#   ./scripts/run_test.sh 5        # cargo test + system test + std L1
+#   ./scripts/run_test.sh 6        # 全部运行 (1 + 2 + 3 + 4)
 # ============================================================
 
 set -euo pipefail
@@ -78,6 +79,24 @@ run_performance_test() {
     fi
 }
 
+run_std_test() {
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━ [4] Std L1 Test (标准库兼容性测试) ━━━${NC}"
+    echo ""
+    if [[ -f "$SCRIPT_DIR/std_test.sh" ]]; then
+        if bash "$SCRIPT_DIR/std_test.sh"; then
+            ((TOTAL_PASS++)) || true
+            RESULTS+=("${GREEN}✓ Std L1 Test${NC}")
+        else
+            ((TOTAL_FAIL++)) || true
+            RESULTS+=("${RED}✗ Std L1 Test${NC}")
+        fi
+    else
+        echo -e "${YELLOW}⚠ std_test.sh 不存在，跳过${NC}"
+        RESULTS+=("${YELLOW}○ Std L1 Test (跳过)${NC}")
+    fi
+}
+
 # ── 构建编译器（共享） ──
 
 build_compiler() {
@@ -118,10 +137,11 @@ show_menu() {
     echo -e "  ${BOLD}1${NC}  Cargo Test          ${DIM}单元测试 + 集成测试${NC}"
     echo -e "  ${BOLD}2${NC}  System Test         ${DIM}编译运行所有 .cj 示例${NC}"
     echo -e "  ${BOLD}3${NC}  Performance Test    ${DIM}性能基准测试${NC}"
-    echo -e "  ${BOLD}4${NC}  Cargo + System      ${DIM}运行 1 + 2${NC}"
-    echo -e "  ${BOLD}5${NC}  All                 ${DIM}运行 1 + 2 + 3${NC}"
+    echo -e "  ${BOLD}4${NC}  Std L1 Test         ${DIM}标准库 L1 兼容性测试${NC}"
+    echo -e "  ${BOLD}5${NC}  Cargo + System + L1 ${DIM}运行 1 + 2 + 4${NC}"
+    echo -e "  ${BOLD}6${NC}  All                 ${DIM}运行 1 + 2 + 3 + 4${NC}"
     echo ""
-    echo -ne "  请选择 [1-5]: "
+    echo -ne "  请选择 [1-6]: "
 }
 
 # ── 主逻辑 ──
@@ -146,19 +166,24 @@ case "$CHOICE" in
         run_performance_test
         ;;
     4)
-        run_cargo_test
-        build_compiler
-        run_system_test
+        run_std_test
         ;;
     5)
         run_cargo_test
         build_compiler
         run_system_test
+        run_std_test
+        ;;
+    6)
+        run_cargo_test
+        build_compiler
+        run_system_test
         run_performance_test
+        run_std_test
         ;;
     *)
         echo -e "${RED}无效选项: $CHOICE${NC}" >&2
-        echo "用法: $0 [1|2|3|4|5]" >&2
+        echo "用法: $0 [1|2|3|4|5|6]" >&2
         exit 1
         ;;
 esac

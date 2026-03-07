@@ -26,6 +26,8 @@ pub struct Parser {
     type_aliases: std::collections::HashMap<String, Type>,
     /// 下一处解析的 func 为 operator func（用于 enum 体）
     parsing_operator_func: bool,
+    /// 原始源码（用于检测跨行表达式边界）
+    source: String,
 }
 
 impl Parser {
@@ -39,7 +41,30 @@ impl Parser {
             pending_struct_methods: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
             parsing_operator_func: false,
+            source: String::new(),
         }
+    }
+
+    pub fn with_source(mut self, source: &str) -> Self {
+        self.source = source.to_string();
+        self
+    }
+
+    /// 检查前一个 token 的结束位置到当前 token 的开始位置之间是否有换行
+    fn newline_before_current(&self) -> bool {
+        if self.source.is_empty() {
+            return false;
+        }
+        let prev_end = if self.pos > 0 {
+            self.tokens[self.pos - 1].2
+        } else {
+            return false;
+        };
+        let cur_start = self.tokens.get(self.pos).map(|t| t.0).unwrap_or(prev_end);
+        if cur_start <= prev_end || cur_start > self.source.len() {
+            return false;
+        }
+        self.source[prev_end..cur_start].contains('\n')
     }
 
     fn at(&self) -> (usize, usize) {
@@ -1485,8 +1510,7 @@ mod tests {
 
     #[test]
     fn test_parse_error_bad_for_iterable() {
-        // for i in 123.456 {} - float as iterable
-        let err = parse_should_fail("func main() { for i in {} {} }");
+        let err = parse_should_fail("func main() { for i in ) {} }");
         assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
     }
 

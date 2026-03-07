@@ -160,7 +160,7 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::Literal(Literal::String(s_str)))
             }
-            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => {
+            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => {
                 let s = s.clone();
                 self.advance();
                 Ok(Pattern::Literal(Literal::String(s)))

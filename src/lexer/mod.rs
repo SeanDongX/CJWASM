@@ -277,6 +277,33 @@ fn lex_any_backtick_string(
     }
 }
 
+/// 解析 #"..."#, ##"..."##, ###"..."### 定界符原始字符串
+fn lex_hash_raw_string(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<String, ()> {
+    let slice = lex.slice();
+    let hash_count = slice.len() - 1; // 去掉末尾的 "
+    let remainder = lex.remainder();
+    // 构造结束标记: " + N个#
+    let end_marker_char = '"';
+    let mut pos = 0;
+    let bytes = remainder.as_bytes();
+    while pos < bytes.len() {
+        if bytes[pos] == end_marker_char as u8 {
+            // 检查后面是否有 hash_count 个 #
+            let end_start = pos + 1;
+            if end_start + hash_count <= bytes.len() {
+                let hashes = &remainder[end_start..end_start + hash_count];
+                if hashes.chars().all(|c| c == '#') {
+                    let content = &remainder[..pos];
+                    lex.bump(pos + 1 + hash_count); // 跳过内容 + " + ###
+                    return logos::FilterResult::Emit(content.to_string());
+                }
+            }
+        }
+        pos += 1;
+    }
+    logos::FilterResult::Error(())
+}
+
 /// 词法分析入口：解析字符串（普通或插值）
 fn lex_any_string(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<StringOrInterpolated, ()> {
     match lex_string(lex) {
@@ -494,15 +521,25 @@ pub enum Token {
     #[token("Map", priority = 1)]
     TypeMap,
 
-    // 字面量（Float64：小数或科学计数法；Float32 后缀 f；整型）
+    // Float64：小数或科学计数法（无后缀）
     #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
         s.parse::<f64>().ok()
     })]
     Float(f64),
 
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
-        let s: String = lex.slice().chars().filter(|c| *c != '_' && *c != 'f').collect();
+    // Float64 带 f64 后缀
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f64|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f64|[0-9][0-9_]*f64", priority = 4, callback = |lex| {
+        let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
+        let s = s.trim_end_matches("f64");
+        s.parse::<f64>().ok()
+    })]
+    Float64Suffix(f64),
+
+    // Float32：f 或 f32 后缀
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f32|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f32|[0-9][0-9_]*f32|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
+        let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
+        let s = s.trim_end_matches("f32").trim_end_matches('f');
         s.parse::<f32>().ok()
     })]
     Float32(f32),
@@ -511,10 +548,10 @@ pub enum Token {
         let slice = lex.slice();
         let s: String = slice.chars().filter(|c| *c != '_').collect();
         if slice.len() >= 2 && (slice.starts_with("0x") || slice.starts_with("0X")) {
-            i64::from_str_radix(&s[2..], 16).ok()
-        } else if slice.starts_with("0o") { i64::from_str_radix(&s[2..], 8).ok() }
-        else if slice.starts_with("0b") { i64::from_str_radix(&s[2..], 2).ok() }
-        else { s.parse::<i64>().ok() }
+            i64::from_str_radix(&s[2..], 16).ok().or_else(|| u64::from_str_radix(&s[2..], 16).ok().map(|v| v as i64))
+        } else if slice.starts_with("0o") { i64::from_str_radix(&s[2..], 8).ok().or_else(|| u64::from_str_radix(&s[2..], 8).ok().map(|v| v as i64)) }
+        else if slice.starts_with("0b") { i64::from_str_radix(&s[2..], 2).ok().or_else(|| u64::from_str_radix(&s[2..], 2).ok().map(|v| v as i64)) }
+        else { s.parse::<i64>().ok().or_else(|| s.parse::<u64>().ok().map(|v| v as i64)) }
     })]
     Integer(i64),
 
@@ -538,8 +575,8 @@ pub enum Token {
     })]
     ByteLit(u8),
 
-    // 字符字面量 'a' (支持转义 '\n' '\t' '\\' '\'' '\0')
-    #[regex(r"'[^'\\]'|'\\[ntr\\0']'", |lex| {
+    // 字符字面量 'a' (支持转义 '\n' '\t' '\\' '\'' '\0' '\u{XXXX}')
+    #[regex(r"'[^'\\]'|'\\[ntr\\0'u]'|'\\u\{[0-9a-fA-F]+\}'", |lex| {
         let s = lex.slice();
         let inner = &s[1..s.len()-1]; // 去除引号
         if inner.starts_with('\\') {
@@ -550,6 +587,11 @@ pub enum Token {
                 Some('\\') => Some('\\'),
                 Some('0') => Some('\0'),
                 Some('\'') => Some('\''),
+                Some('u') => {
+                    // \u{XXXX} unicode escape
+                    let hex = &inner[3..inner.len()-1]; // extract hex digits from \u{XXXX}
+                    u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                }
                 _ => None,
             }
         } else {
@@ -558,8 +600,8 @@ pub enum Token {
     })]
     CharLit(char),
 
-    // Rune 字面量 r'.' (仓颉语法，支持转义)
-    #[regex(r"r'[^'\\]'|r'\\[ntr\\0']'", |lex| {
+    // Rune 字面量 r'.' (仓颉语法：r'x' 为原始字符，不处理转义)
+    #[regex(r"r'[^'\\]'|r'\\[ntr\\0'u]'|r'\\u\{[0-9a-fA-F]+\}'", |lex| {
         let s = lex.slice();
         let inner = &s[2..s.len()-1]; // 去除 r' 和 '
         if inner.starts_with('\\') {
@@ -577,6 +619,17 @@ pub enum Token {
         }
     })]
     RuneLit(char),
+
+    // 多字符或空单引号字符串 '...'（cjc 兼容: 0 或 2+ 字符时视为 String）
+    #[regex(r"''|'[^'\\]{2,}'|'([^'\\]|\\.){2,}'", priority = 1, callback = |lex| {
+        let s = lex.slice();
+        if s == "''" {
+            return Some(String::new());
+        }
+        let inner = &s[1..s.len()-1];
+        Some(unescape_string(inner))
+    })]
+    SingleQuoteStringLit(String),
 
     #[token("true")]
     True,
@@ -691,6 +744,9 @@ pub enum Token {
     DotDotEq,
     #[token("...")]
     DotDotDot,
+    // 定界符原始字符串 #"..."#, ##"..."##, ###"..."### (不处理转义/插值)
+    #[regex(r#"#+""#, lex_hash_raw_string)]
+    HashRawStringLit(String),
     #[token("#")]
     Hash,
     #[token("@!")]
@@ -1115,5 +1171,34 @@ mod tests {
         assert_eq!(tokens[0], Token::Integer(255));
         assert_eq!(tokens[1], Token::Integer(15));
         assert_eq!(tokens[2], Token::Integer(0xABCD));
+    }
+
+    #[test]
+    fn test_uint64_large_literal() {
+        let source = "18446744073709551615 0xFFFFFFFFFFFFFFFF 0x8000000000000000";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Integer(u64::MAX as i64));
+        assert_eq!(tokens[1], Token::Integer(u64::MAX as i64));
+        assert_eq!(tokens[2], Token::Integer(0x8000000000000000u64 as i64));
+    }
+
+    #[test]
+    fn test_hash_raw_string() {
+        let source = r####"#"hello"# ##"world"## ###"raw###string"###"####;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::HashRawStringLit("hello".to_string()));
+        assert_eq!(tokens[1], Token::HashRawStringLit("world".to_string()));
+        assert_eq!(tokens[2], Token::HashRawStringLit("raw###string".to_string()));
+    }
+
+    #[test]
+    fn test_rune_literal() {
+        let source = "r'A' r'\\n'";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::RuneLit('A'));
+        assert_eq!(tokens[1], Token::RuneLit('\n'));
     }
 }

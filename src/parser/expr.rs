@@ -420,8 +420,8 @@ impl Parser {
                         None => return self.bail(ParseError::UnexpectedEof),
                     };
 
-                    // 检查是否是方法调用
-                    if self.check(&Token::LParen) {
+                    // 检查是否是方法调用（跨行的 ( 不视为方法调用，避免 Int8.Max\n(a,b) 误解析）
+                    if self.check(&Token::LParen) && !self.newline_before_current() {
                         // 方法调用 obj.method(args)
                         self.advance();
                         let (args, named_args) = self.parse_args()?;
@@ -725,10 +725,10 @@ impl Parser {
                     } else {
                         Box::new(self.parse_primary()?)
                     };
-                    // P2.6: 可选步长 `: step`
+                    // P2.6: 可选步长 `: step`（支持负步长 -1）
                     let step = if self.check(&Token::Colon) {
                         self.advance();
-                        Some(Box::new(self.parse_primary()?))
+                        Some(Box::new(self.parse_unary()?))
                     } else {
                         None
                     };
@@ -741,7 +741,7 @@ impl Parser {
                 }
                 Ok(Expr::Integer(n))
             }
-            Some(Token::Float(f)) => Ok(Expr::Float(f)),
+            Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Ok(Expr::Float(f)),
             Some(Token::Float32(f)) => Ok(Expr::Float32(f)),
             Some(Token::This) => match self.receiver_name.clone() {
                 Some(n) => Ok(Expr::Var(n)),
@@ -803,7 +803,7 @@ impl Parser {
             Some(Token::StringLit(s)) | Some(Token::BacktickStringLit(s)) => {
                 self.parse_string_or_interpolated(s)
             }
-            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => {
+            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => {
                 Ok(Expr::String(s))
             }
             // Option/Result 构造器（允许 Some(e1,e2,...) 解析为 Some(Tuple(...))）
@@ -1285,6 +1285,16 @@ impl Parser {
                 }
             }
             Some(Token::LBrace) => {
+                // { => body } — 无参 lambda 简写
+                if self.check(&Token::FatArrow) {
+                    self.advance(); // consume =>
+                    let body = self.parse_lambda_body()?;
+                    return Ok(Expr::Lambda {
+                        params: vec![],
+                        return_type: None,
+                        body: Box::new(body),
+                    });
+                }
                 // 检查是否是 Lambda: { x: T => body } 或 { x => body }（单参无类型）或 { a, b => body }（多参无类型）
                 // 也支持 { _: T, x: T => body }（第一个参数为通配符）
                 // 注意：当前 { 已被 advance() 消费，用 peek() 看第一个 token，peek_at(1) 看第二个；仅当第二个 token 为 : , 或 => 时才按 lambda 解析，否则按块解析
@@ -1843,7 +1853,7 @@ impl Parser {
         // 不解析结构体初始化 (因为 { 会被误认为 match body)
         let mut expr = match self.advance() {
             Some(Token::Integer(n)) => Expr::Integer(n),
-            Some(Token::Float(f)) => Expr::Float(f),
+            Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Expr::Float(f),
             Some(Token::Float32(f)) => Expr::Float32(f),
             Some(Token::This) => match self.receiver_name.clone() {
                 Some(n) => Expr::Var(n),
@@ -1856,7 +1866,7 @@ impl Parser {
             Some(Token::StringLit(s)) | Some(Token::BacktickStringLit(s)) => {
                 self.parse_string_or_interpolated(s)?
             }
-            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) => Expr::String(s),
+            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => Expr::String(s),
             Some(Token::Ident(name)) => {
                 if self.check(&Token::LParen) {
                     // 函数调用
@@ -1984,117 +1994,27 @@ impl Parser {
         Ok(expr)
     }
 
-    /// 解析 for 循环的可迭代表达式 (不包括结构体初始化)
+    /// 解析 for 循环的可迭代表达式（支持范围 expr..expr : step）
     pub(crate) fn parse_for_iterable(&mut self) -> Result<Expr, ParseErrorAt> {
-        // 支持: 变量、范围表达式、函数调用、数组字面量
-        // 不支持: 结构体初始化 (因为 { 会被误认为 for body)
-        match self.advance() {
-            Some(Token::Integer(n)) => {
-                // 检查是否是范围表达式
-                if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
-                    let inclusive = self.check(&Token::DotDotEq);
-                    self.advance();
-                    let end = self.parse_expr()?;
-                    // P2.6: 可选步长 `: step`
-                    let step = if self.check(&Token::Colon) {
-                        self.advance();
-                        Some(Box::new(self.parse_primary()?))
-                    } else {
-                        None
-                    };
-                    Ok(Expr::Range {
-                        start: Box::new(Expr::Integer(n)),
-                        end: Box::new(end),
-                        inclusive,
-                        step,
-                    })
-                } else {
-                    Ok(Expr::Integer(n))
-                }
-            }
-            Some(Token::Ident(name)) => {
-                if self.check(&Token::LParen) {
-                    // 函数调用
-                    self.advance();
-                    let (args, named_args) = self.parse_args()?;
-                    self.expect(Token::RParen)?;
-                    Ok(Expr::Call {
-                        name,
-                        type_args: None,
-                        args,
-                        named_args,
-                    })
-                } else if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
-                    // 变量开头的范围 (如 start..end)
-                    let inclusive = self.check(&Token::DotDotEq);
-                    self.advance();
-                    let end = self.parse_expr()?;
-                    // P2.6: 可选步长 `: step`
-                    let step = if self.check(&Token::Colon) {
-                        self.advance();
-                        Some(Box::new(self.parse_primary()?))
-                    } else {
-                        None
-                    };
-                    Ok(Expr::Range {
-                        start: Box::new(Expr::Var(name)),
-                        end: Box::new(end),
-                        inclusive,
-                        step,
-                    })
-                } else {
-                    // 可能是 name.runes() 等后缀表达式，回退后按完整表达式解析
-                    self.pushback = Some(Token::Ident(name));
-                    self.parse_expr()
-                }
-            }
-            Some(Token::LBracket) => {
-                // 数组字面量 [1, 2, 3]
-                let mut elements = Vec::new();
-                if !self.check(&Token::RBracket) {
-                    loop {
-                        elements.push(self.parse_expr()?);
-                        if !self.check(&Token::Comma) {
-                            break;
-                        }
-                        self.advance();
-                    }
-                }
-                self.expect(Token::RBracket)?;
-                Ok(Expr::Array(elements))
-            }
-            Some(tok @ Token::This) => {
-                self.pushback = Some(tok);
-                self.parse_expr()
-            }
-            Some(tok)
-                if matches!(
-                    tok,
-                    Token::TypeInt64
-                        | Token::TypeInt32
-                        | Token::TypeInt16
-                        | Token::TypeInt8
-                        | Token::TypeIntNative
-                        | Token::TypeUIntNative
-                        | Token::TypeUInt64
-                        | Token::TypeUInt32
-                        | Token::TypeUInt16
-                        | Token::TypeUInt8
-                        | Token::TypeFloat64
-                        | Token::TypeFloat32
-                        | Token::TypeBool
-                        | Token::TypeRune
-                        | Token::TypeString
-                ) =>
-            {
-                self.pushback = Some(tok.clone());
-                self.parse_expr()
-            }
-            Some(tok) => self.bail_at(
-                ParseError::UnexpectedToken(tok, "for 循环可迭代表达式".to_string()),
-                self.at_prev(),
-            ),
-            None => self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
+        let start = self.parse_expr()?;
+        if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
+            let inclusive = self.check(&Token::DotDotEq);
+            self.advance();
+            let end = self.parse_expr()?;
+            let step = if self.check(&Token::Colon) {
+                self.advance();
+                Some(Box::new(self.parse_expr()?))
+            } else {
+                None
+            };
+            Ok(Expr::Range {
+                start: Box::new(start),
+                end: Box::new(end),
+                inclusive,
+                step,
+            })
+        } else {
+            Ok(start)
         }
     }
 
