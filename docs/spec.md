@@ -1278,9 +1278,9 @@ r.step    // 1 (默认)
 
 *未完成特性的完整实施计划见 [docs/next_steps.md](next_steps.md)。*
 
-### 15.1 当前版本: v1.1.0
+### 15.1 当前版本: v1.2.0
 
-v1.1.0 修复了 HashMap/HashSet 类型推断问题，新增类型强制转换层，改进了全局变量类型推断。37/37 系统测试通过，410 单元测试通过。
+v1.2.0 引入 CHIR 中间表示层、语义分析（sema）、类型检查（typeck）和标准库元数据（metadata）模块，编译管线从 5 阶段扩展至 8 阶段。代码覆盖率 **80.15%**（行）/ **89.93%**（区域），1,317 个测试全部通过（672 单元 + 631 集成 + 14 标准库）。
 
 #### 已完成功能
 
@@ -1381,7 +1381,7 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 - [x] 类型修饰符（`mut T`、`ref T`、`T?` → `Option<T>` 语法糖、`T!` 非空断言）
 - [x] 尾递归优化（检测尾调用位置，将递归转为 loop + 参数重赋值）
 - [x] 死代码消除（移除 return/break/continue 后不可达语句）
-- [x] 优化器扩展（函数内联基础）
+- [ ] 优化器扩展（函数内联，未实现）
 
 #### v0.3.0 ~ v0.6.0 已完成
 
@@ -1394,7 +1394,7 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 
 #### v0.7.0 已完成
 
-- [x] Phase 9: 补充特性（Slice<T>, Map<K,V>, 类型修饰符 mut/ref/?/!, 尾递归优化, 死代码消除, 函数内联）
+- [x] Phase 9: 补充特性（Slice<T>, Map<K,V>, 类型修饰符 mut/ref/?/!, 尾递归优化, 死代码消除）
 
 #### v0.8.0 新增完成功能
 
@@ -1463,16 +1463,39 @@ v0.2.0 全部功能已实现，包括 Lambda codegen（WASM Table + call_indirec
 **测试覆盖提升**
 
 - 系统测试：**37/37（100%）**（新增 p6_new_features.cj、p7_std_features.cj 等验证）
-- 单元测试：**410 项全部通过**
+- 单元测试：**672 项全部通过**
+- 集成测试：**631 项全部通过**
 
 **已知遗留限制**
 
 - `std/` 包 `function[66]`（`SPECIAL_UNICODE_MAP`）WASM 验证错误：复杂嵌套泛型类型 `Map<UInt32, Tuple<Array<UInt32>, Array<UInt32>, Array<UInt32>>>` 的元组索引类型推断失败，生成无效 WASM（单文件示例不受影响）
 
+#### v1.2.0 新增完成功能 (2026-03)
+
+**编译管线扩展**
+
+- [x] **CHIR 中间表示层**（`src/chir/`）：AST → CHIR 降级，引入显式类型标注的中间 IR，分离前端语义与后端代码生成
+  - `lower.rs`：程序/函数级 AST→CHIR 降级入口
+  - `lower_expr.rs`：表达式降级（方法调用、模式匹配、构造器、内建函数等）
+  - `lower_stmt.rs`：语句降级（赋值、循环、控制流、try/catch 等）
+  - `builder.rs`：CHIR 节点构建器
+  - `types.rs`：CHIR 类型定义
+  - `type_inference.rs`：CHIR 层类型推断
+  - `chir_codegen.rs`（在 codegen/ 中）：CHIR → WASM 代码生成后端
+- [x] **语义分析模块**（`src/sema/mod.rs`）：表达式类型推断、函数签名分析
+- [x] **类型检查模块**（`src/typeck/mod.rs`）：变量解析、类型一致性检查
+- [x] **标准库元数据模块**（`src/metadata/mod.rs`）：内建类型方法/字段/构造函数的静态类型信息
+
+**测试覆盖率达标**
+
+- [x] **代码覆盖率**: 行覆盖率 **80.15%**，区域覆盖率 **89.93%**
+- [x] **总测试数**: 1,317 个（672 单元测试 + 631 集成测试 + 14 标准库测试），全部通过
+- [x] 各模块覆盖率：ast 98%、lexer 91%、parser 74%、optimizer 96%、monomorph 86%、codegen 77%、chir 91%、typeck 95%、sema 94%、metadata 94%、pipeline 90%、memory 100%
+
 #### 未来版本计划
 
 - [x] Phase 7: WASI + 标准库（fd_write/fd_read/fd_close/args_get/clock_time_get/random_get, std.core/io/collections）
-- [x] Phase 9: 补充特性（Slice<T>, Map 字面量, 类型修饰符, 尾递归优化, 死代码消除, 函数内联）
+- [x] Phase 9: 补充特性（Slice<T>, Map 字面量, 类型修饰符, 尾递归优化, 死代码消除）
 - [x] 包管理
 
 ---
@@ -1573,7 +1596,7 @@ while     with
 
 ---
 
-*文档版本: 7.0.0*
-*最后更新: 2026-03-02*
-*变更: 更新 v1.1.0 实现状态（HashMap/HashSet 类型修复、类型强制转换层、@When 部分支持、37/37 测试通过）*
-*历史: v6.0.0 基于 cjc release/1.0 源码逐项验证，重写特性对比表；修正 Result/引用计数/ArrayStack/Autodiff/泛型特化/std.fs 等*
+*文档版本: 8.0.0*
+*最后更新: 2026-03-06*
+*变更: 更新 v1.2.0 实现状态（新增 CHIR/sema/typeck/metadata 模块，代码覆盖率 80.15%，1,317 测试全部通过）*
+*历史: v7.0.0 更新 v1.1.0（HashMap/HashSet 类型修复、类型强制转换层、@When 部分支持）; v6.0.0 基于 cjc release/1.0 源码逐项验证，重写特性对比表*
