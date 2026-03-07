@@ -56,7 +56,7 @@ fn main() {
 fn cmd_build(args: &[String]) {
     let mut output: Option<String> = None;
     let mut verbose = false;
-    let mut use_chir = false;
+    let mut use_chir = true;
     let mut project_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let mut i = 0;
@@ -84,6 +84,10 @@ fn cmd_build(args: &[String]) {
                     std::process::exit(1);
                 }
             }
+            "--no-chir" => {
+                use_chir = false;
+                i += 1;
+            }
             "--use-chir" => {
                 use_chir = true;
                 i += 1;
@@ -97,7 +101,7 @@ fn cmd_build(args: &[String]) {
                 eprintln!("  -o, --output <文件>    指定输出文件名");
                 eprintln!("  -p, --path <目录>      指定项目目录（默认当前目录）");
                 eprintln!("  -v, --verbose          显示详细编译信息");
-                eprintln!("  --use-chir             使用 CHIR 中间表示编译（实验性）");
+                eprintln!("  --no-chir              使用旧版代码生成（不经过 CHIR）");
                 eprintln!("  -h, --help             显示帮助");
                 std::process::exit(0);
             }
@@ -109,9 +113,9 @@ fn cmd_build(args: &[String]) {
         }
     }
 
-    if use_chir {
+    if !use_chir {
         // SAFETY: 单线程调用，env var 设置后立即 build，结束后清理
-        unsafe { env::set_var("USE_CHIR", "1") };
+        unsafe { env::set_var("NO_CHIR", "1") };
     }
 
     let opts = cjwasm::cjpm::BuildOptions {
@@ -180,12 +184,15 @@ fn cmd_compile(args: &[String]) {
     // 解析命令行参数
     let mut input_files: Vec<String> = Vec::new();
     let mut output_path: Option<String> = None;
-    let mut use_chir = false;
+    let mut use_chir = true;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "-o" && i + 1 < args.len() {
             output_path = Some(args[i + 1].clone());
             i += 2;
+        } else if args[i] == "--no-chir" {
+            use_chir = false;
+            i += 1;
         } else if args[i] == "--use-chir" {
             use_chir = true;
             i += 1;
@@ -198,8 +205,8 @@ fn cmd_compile(args: &[String]) {
         }
     }
 
-    if use_chir {
-        unsafe { env::set_var("USE_CHIR", "1") };
+    if !use_chir {
+        unsafe { env::set_var("NO_CHIR", "1") };
     }
 
     if input_files.is_empty() {

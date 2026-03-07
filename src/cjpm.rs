@@ -243,8 +243,8 @@ pub fn build(opts: &BuildOptions) -> Result<BuildResult, String> {
     crate::optimizer::optimize_program(&mut program);
     crate::monomorph::monomorphize_program(&mut program);
 
-    // 代码生成
-    let wasm = if std::env::var("USE_CHIR").is_ok() {
+    // 默认使用 CHIR 路径，设置 NO_CHIR=1 可回退到旧路径
+    let wasm = if std::env::var("NO_CHIR").is_err() {
         match crate::chir::lower_program(&program) {
             Ok(chir_program) => {
                 let mut chir_codegen = crate::codegen::chir_codegen::CHIRCodeGen::new();

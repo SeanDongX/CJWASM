@@ -347,8 +347,8 @@ pub fn compile_source_to_wasm(source: &str) -> Result<Vec<u8>, String> {
     crate::optimizer::optimize_program(&mut program);
     crate::monomorph::monomorphize_program(&mut program);
 
-    // 检查是否使用 CHIR 路径
-    if std::env::var("USE_CHIR").is_ok() {
+    // 默认使用 CHIR 路径，设置 NO_CHIR=1 可回退到旧路径
+    if std::env::var("NO_CHIR").is_err() {
         // 新路径: AST → CHIR → WASM
         let chir_program = crate::chir::lower_program(&program)?;
         let mut codegen = crate::codegen::chir_codegen::CHIRCodeGen::new();
@@ -377,8 +377,8 @@ pub fn compile_files_to_wasm(files: &[&str]) -> Result<Vec<u8>, String> {
     crate::optimizer::optimize_program(&mut program);
     crate::monomorph::monomorphize_program(&mut program);
 
-    // 检查是否使用 CHIR 路径
-    if std::env::var("USE_CHIR").is_ok() {
+    // 默认使用 CHIR 路径，设置 NO_CHIR=1 可回退到旧路径
+    if std::env::var("NO_CHIR").is_err() {
         // 新路径: AST → CHIR → WASM
         let chir_program = crate::chir::lower_program(&program)?;
         let mut codegen = crate::codegen::chir_codegen::CHIRCodeGen::new();
