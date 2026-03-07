@@ -6,3 +6,7 @@
 	path = third_party/cangjie_compiler
 	url = https://gitcode.com/Cangjie/cangjie_compiler.git
 	branch = release/1.0
+[submodule "third_party/cangjie_test"]
+	path = third_party/cangjie_test
+	url = https://gitcode.com/Cangjie/cangjie_test.git
+	branch = release/1.0
