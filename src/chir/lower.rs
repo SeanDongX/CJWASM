@@ -97,8 +97,9 @@ pub fn lower_function(
         params,
         return_ty,
         return_wasm_ty,
-        locals: Vec::new(), // 局部变量在 lower 过程中已分配
+        locals: Vec::new(),
         body,
+        local_wasm_types: ctx.local_wasm_tys.clone(),
     })
 }
 
@@ -241,6 +242,7 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
                 chir_functions.push(CHIRFunction {
                     name: func.name.clone(), params, return_ty, return_wasm_ty,
                     locals: vec![], body: empty_body,
+                    local_wasm_types: std::collections::HashMap::new(),
                 });
             }
         }

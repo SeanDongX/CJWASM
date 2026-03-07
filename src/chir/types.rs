@@ -230,6 +230,8 @@ pub struct CHIRFunction {
     pub return_wasm_ty: ValType,
     pub locals: Vec<CHIRLocal>,
     pub body: CHIRBlock,
+    /// lowering 阶段记录的局部变量 WASM 类型（idx → wasm_ty）
+    pub local_wasm_types: std::collections::HashMap<u32, ValType>,
 }
 
 /// CHIR 参数

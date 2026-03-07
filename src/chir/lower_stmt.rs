@@ -11,26 +11,36 @@ impl<'a> LoweringContext<'a> {
             // Let 语句
             Stmt::Let { pattern, ty, value } => {
                 let mut value_chir = self.lower_expr(value)?;
-                // 如果有显式类型注解，确保值类型匹配（插入类型转换）
-                if let Some(decl_ty) = ty {
+                // 确定 local 的 WASM 类型：显式注解 > type_ctx 推断 > value 的 wasm_ty
+                let local_wasm_ty = if let Some(decl_ty) = ty {
                     let decl_wasm = match decl_ty {
                         crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
                         t => t.to_wasm(),
                     };
                     value_chir = self.insert_cast_if_needed(value_chir, decl_wasm);
-                }
+                    decl_wasm
+                } else if let Pattern::Binding(name) = pattern {
+                    // 无注解时从 type_ctx 获取推断类型
+                    self.type_ctx.locals.get(name.as_str())
+                        .map(|t| match t {
+                            crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                            t => t.to_wasm(),
+                        })
+                        .unwrap_or(value_chir.wasm_ty)
+                } else {
+                    value_chir.wasm_ty
+                };
 
                 match pattern {
                     Pattern::Binding(name) => {
-                        // 记录局部变量类型，供赋值时进行类型强制转换
-                        let local_idx = self.alloc_local_typed(name.clone(), value_chir.wasm_ty);
+                        let local_idx = self.alloc_local_typed(name.clone(), local_wasm_ty);
+                        value_chir = self.insert_cast_if_needed(value_chir, local_wasm_ty);
                         Ok(CHIRStmt::Let {
                             local_idx,
                             value: value_chir,
                         })
                     }
                     _ => {
-                        // 其他模式暂不支持
                         Ok(CHIRStmt::Expr(value_chir))
                     }
                 }
@@ -39,18 +49,28 @@ impl<'a> LoweringContext<'a> {
             // Var 语句
             Stmt::Var { pattern, ty, value } => {
                 let mut value_chir = self.lower_expr(value)?;
-                // 如果有显式类型注解，确保值类型匹配（插入类型转换）
-                if let Some(decl_ty) = ty {
+                let local_wasm_ty = if let Some(decl_ty) = ty {
                     let decl_wasm = match decl_ty {
                         crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
                         t => t.to_wasm(),
                     };
                     value_chir = self.insert_cast_if_needed(value_chir, decl_wasm);
-                }
+                    decl_wasm
+                } else if let Pattern::Binding(name) = pattern {
+                    self.type_ctx.locals.get(name.as_str())
+                        .map(|t| match t {
+                            crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                            t => t.to_wasm(),
+                        })
+                        .unwrap_or(value_chir.wasm_ty)
+                } else {
+                    value_chir.wasm_ty
+                };
 
                 match pattern {
                     Pattern::Binding(name) => {
-                        let local_idx = self.alloc_local_typed(name.clone(), value_chir.wasm_ty);
+                        let local_idx = self.alloc_local_typed(name.clone(), local_wasm_ty);
+                        value_chir = self.insert_cast_if_needed(value_chir, local_wasm_ty);
                         Ok(CHIRStmt::Let {
                             local_idx,
                             value: value_chir,

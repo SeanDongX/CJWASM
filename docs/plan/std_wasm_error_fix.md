@@ -294,13 +294,94 @@ WASM 验证错误: 61 条（1 个文件，仅 std/）
 
 ---
 
-## 剩余 8 个错误
+## 第三轮修复：8 → 0（最终清零）
 
-| 错误类型 | 数量 | 原因 |
-|---------|------|------|
-| `i32.wrap_i64` | 3 | 极少数类型推断返回 I64 但实际值为 I32 |
-| `i64.add` | 2 | Binary 表达式操作数类型不一致 |
-| `end of function` | 2 | void 函数残余栈值（复杂控制流路径） |
-| `if false branch` | 1 | if-else 分支 void Call 产值判断 |
+剩余 8 个错误分布在 4 个函数中：
 
-这些是非常边角的类型推断精度问题，需要完整的双向类型推断系统或函数签名反向传播才能彻底消除。
+| 函数 | 错误类型 | 数量 |
+|------|---------|------|
+| `sort` (func[28]) | `end of function, expected [] but got [i32]` | 1 |
+| `tokenToString` (func[320]) | `if false branch, expected [] but got [i32]` | 1 |
+| `createImportList` (func[399]) | `end of function, expected [] but got [i32]` | 1 |
+| `ParserHelper.doLongParser` (func[1878]) | `i32.wrap_i64` ×3 + `i64.add` ×2 | 5 |
+
+### Fix A — void 上下文 If 表达式强制 Empty block type
+
+**问题**：`emit_expr` 中 If 的 `block_type` 使用 `then_block.result.is_some()` 判断，而 `expr_produces_wasm_value_ctx` 递归检查 result 内容。当 result 是一个 void Call 时，两者不一致：If 以 `BlockType::Result(I32)` 发射（WASM 认为它产出 i32），但 `expr_produces_wasm_value_ctx` 返回 false（不 Drop），导致值残留栈上。
+
+**修复**（`src/codegen/chir_codegen.rs`）：
+
+1. 新增 `emit_expr_void()` — void 上下文中 If 始终用 `BlockType::Empty`，Block 走 `emit_block_void`，其他表达式产值时自动 Drop
+2. 新增 `emit_stmt_void()` — void 上下文语句的 `Expr` 分支走 `emit_expr_void`
+3. `emit_block_void()` 调用链改为使用 void 版本（`emit_stmt_void` + `emit_expr_void`）
+4. `emit_expr()` 中 If 的 `block_type` 判断统一使用 `expr_produces_wasm_value_ctx`，与 stmt 层一致
+
+```rust
+// emit_expr 中 If block_type 统一判断
+let block_type = if self.expr_produces_wasm_value_ctx(expr) {
+    BlockType::Result(expr.wasm_ty)
+} else {
+    BlockType::Empty
+};
+```
+
+**效果**：消除 sort、tokenToString、createImportList 的 3 个错误。
+
+### Fix B — Let/Var 局部变量类型优先从 type_ctx 推断
+
+**问题**：`let x = someExpr()` 中 `someExpr()` 被 lowered 为 Nop（wasm_ty=I32），`alloc_local_typed` 记录 local 为 I32。但 `type_ctx.infer_expr(Expr::Var("x"))` 返回 I64（正确的语义类型）。后续读取 x 时 CHIRExpr 标记为 I64，codegen 在 I32 值上插入 `i32.wrap_i64`，产生类型不匹配。
+
+**修复**（`src/chir/lower_stmt.rs` + `src/chir/types.rs` + `src/codegen/chir_codegen.rs`）：
+
+1. `CHIRFunction` 新增 `local_wasm_types: HashMap<u32, ValType>` 字段，从 lowering 阶段传递精确类型
+2. `Stmt::Let` / `Stmt::Var` 中确定 local WASM 类型的优先级：**显式注解 > `type_ctx.locals` 推断 > `value.wasm_ty`**
+3. 同时对初始值插入类型转换（`insert_cast_if_needed`），确保声明和初始值类型一致
+4. `emit_function` 优先使用 `func.local_wasm_types` 声明局部变量，而非 `collect_locals_from_block` 从值推断
+
+```rust
+// Let/Var 语句中确定 local 的 WASM 类型
+let local_wasm_ty = if let Some(decl_ty) = ty {
+    // 有显式类型注解
+    decl_ty.to_wasm()
+} else if let Pattern::Binding(name) = pattern {
+    // 无注解时从 type_ctx 获取推断类型
+    self.type_ctx.locals.get(name.as_str())
+        .map(|t| t.to_wasm())
+        .unwrap_or(value_chir.wasm_ty)
+} else {
+    value_chir.wasm_ty
+};
+```
+
+**效果**：消除 ParserHelper.doLongParser 的 5 个错误（3× `i32.wrap_i64` + 2× `i64.add`）。
+
+### 最终结果
+
+| 阶段 | WASM 验证错误 |
+|------|-------------|
+| 第二轮修复后 | **8** |
+| Fix A（void If Empty block type） | 5 |
+| Fix B（local 类型从 type_ctx 推断） | **0** |
+
+---
+
+## 总结
+
+| 指标 | 最终结果 |
+|------|---------|
+| `examples/std/` WASM 验证错误 | **0**（从 3277 → 0） |
+| `examples/` 37 个示例 | **37/37 通过**（编译 + 验证 + 运行） |
+| 单元测试 | **431 通过**，0 失败 |
+| 总错误消除历程 | 1286 → 61 → 3277 → 8 → **0** |
+
+### 变更文件总览
+
+| 文件 | 第一轮 | 第二轮 | 第三轮 |
+|------|--------|--------|--------|
+| `src/chir/lower_expr.rs` | IO/MethodCall→Nop, 未知函数→Nop | MethodCall 参数对齐, Call this 注入 | — |
+| `src/chir/lower_stmt.rs` | alloc_local_typed | FieldPath/IndexPath 赋值 | Let/Var 类型优先级重构 |
+| `src/chir/lower.rs` | — | 类字段注入 locals, 继承合并 | local_wasm_types 传递 |
+| `src/chir/type_inference.rs` | — | infer_field_type, 方法签名注册, 继承合并 | — |
+| `src/chir/types.rs` | — | — | CHIRFunction 新增 local_wasm_types |
+| `src/chir/builder.rs` | — | — | CHIRFunction 构造适配 |
+| `src/codegen/chir_codegen.rs` | collect_locals, run_length, 导出去重, emit_block_void/with_ty | func_void_map, expr_produces_wasm_value_ctx | emit_expr_void, emit_stmt_void, If block_type 统一, local 类型优先 |

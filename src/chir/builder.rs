@@ -207,6 +207,7 @@ impl CHIRBuilder {
             return_wasm_ty,
             locals: Vec::new(),
             body,
+            local_wasm_types: std::collections::HashMap::new(),
         }
     }
 }
