@@ -648,8 +648,12 @@ impl Parser {
                 continue;
             }
 
-            // cjc 兼容: init 构造函数 — 解析并忽略 body（cjwasm 通过字段顺序构造）
-            if self.check(&Token::Init) {
+            // cjc 兼容: [const] init 构造函数 — 解析并忽略 body（cjwasm 通过字段顺序构造）
+            let is_const_init = self.check(&Token::Const) && matches!(self.peek_next(), Some(Token::Init));
+            if self.check(&Token::Init) || is_const_init {
+                if is_const_init {
+                    self.advance(); // consume 'const'
+                }
                 self.advance(); // consume 'init'
                 self.expect(Token::LParen)?;
                 let _params = self.parse_params()?;
@@ -2533,10 +2537,64 @@ impl Parser {
                         extern_import: None,
                     },
                 });
+            } else if self.check(&Token::Const) {
+                self.advance(); // consume const
+                if self.check(&Token::Init) {
+                    // const init() { ... } — 编译期常量构造函数，按普通 init 处理
+                    self.advance();
+                    self.expect(Token::LParen)?;
+                    let params = self.parse_params()?;
+                    self.expect(Token::RParen)?;
+                    let _ = self.parse_where_clause()?;
+                    self.receiver_name = Some("this".to_string());
+                    self.expect(Token::LBrace)?;
+                    let body = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    self.receiver_name = None;
+                    init = Some(crate::ast::InitDef { params, body });
+                } else {
+                    // const FIELD_NAME: Type = value — 类级别常量，当作字段处理
+                    let f_name = match self.advance() {
+                        Some(Token::Ident(n)) => n,
+                        Some(tok) => {
+                            return self
+                                .bail(ParseError::UnexpectedToken(tok, "常量名或 init".to_string()))
+                        }
+                        None => return self.bail(ParseError::UnexpectedEof),
+                    };
+                    let (ty, default) = if self.check(&Token::Assign) {
+                        self.advance();
+                        (Type::TypeParam("_".to_string()), Some(self.parse_expr()?))
+                    } else if self.check(&Token::Colon) {
+                        self.advance();
+                        let ty = self.parse_type()?;
+                        let default = if self.check(&Token::Assign) {
+                            self.advance();
+                            Some(self.parse_expr()?)
+                        } else {
+                            None
+                        };
+                        (ty, default)
+                    } else {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(
+                            tok,
+                            "常量: 期望 : 类型 或 = 值".to_string(),
+                        ));
+                    };
+                    if self.check(&Token::Semicolon) {
+                        self.advance();
+                    }
+                    fields.push(crate::ast::FieldDef {
+                        name: f_name,
+                        ty,
+                        default,
+                    });
+                }
             } else {
                 return self.bail(ParseError::UnexpectedToken(
                     self.peek().cloned().unwrap_or(Token::Semicolon),
-                    "var、let、init、~init 或 func".to_string(),
+                    "var、let、const、init、~init 或 func".to_string(),
                 ));
             }
         }

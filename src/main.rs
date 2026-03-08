@@ -14,13 +14,19 @@ fn print_usage() {
     eprintln!("直接编译:");
     eprintln!("  cjwasm <源文件.cj> [更多文件.cj...] [-o 输出文件.wasm]");
     eprintln!();
+    eprintln!("选项:");
+    eprintln!("  -o <文件>        指定输出文件名");
+    eprintln!("  --use-chir       使用 CHIR 中间表示编译（实验性）");
+    eprintln!();
     eprintln!("示例:");
     eprintln!("  cjwasm build                       # 编译 cjpm 工程");
     eprintln!("  cjwasm build -o app.wasm            # 指定输出文件");
     eprintln!("  cjwasm build -v                     # 显示详细信息");
+    eprintln!("  cjwasm build --use-chir             # 使用 CHIR 路径编译");
     eprintln!("  cjwasm init myproject               # 初始化新项目");
     eprintln!("  cjwasm hello.cj                     # 编译单文件");
     eprintln!("  cjwasm hello.cj -o hello.wasm       # 指定输出文件");
+    eprintln!("  cjwasm hello.cj --use-chir          # 使用 CHIR 路径编译");
     eprintln!("  cjwasm main.cj lib.cj -o app.wasm   # 多文件编译");
 }
 
@@ -50,6 +56,7 @@ fn main() {
 fn cmd_build(args: &[String]) {
     let mut output: Option<String> = None;
     let mut verbose = false;
+    let mut use_chir = true;
     let mut project_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let mut i = 0;
@@ -77,6 +84,14 @@ fn cmd_build(args: &[String]) {
                     std::process::exit(1);
                 }
             }
+            "--no-chir" => {
+                use_chir = false;
+                i += 1;
+            }
+            "--use-chir" => {
+                use_chir = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!("用法: cjwasm build [选项]");
                 eprintln!();
@@ -86,6 +101,7 @@ fn cmd_build(args: &[String]) {
                 eprintln!("  -o, --output <文件>    指定输出文件名");
                 eprintln!("  -p, --path <目录>      指定项目目录（默认当前目录）");
                 eprintln!("  -v, --verbose          显示详细编译信息");
+                eprintln!("  --no-chir              使用旧版代码生成（不经过 CHIR）");
                 eprintln!("  -h, --help             显示帮助");
                 std::process::exit(0);
             }
@@ -95,6 +111,11 @@ fn cmd_build(args: &[String]) {
                 std::process::exit(1);
             }
         }
+    }
+
+    if !use_chir {
+        // SAFETY: 单线程调用，env var 设置后立即 build，结束后清理
+        unsafe { env::set_var("NO_CHIR", "1") };
     }
 
     let opts = cjwasm::cjpm::BuildOptions {
@@ -163,11 +184,18 @@ fn cmd_compile(args: &[String]) {
     // 解析命令行参数
     let mut input_files: Vec<String> = Vec::new();
     let mut output_path: Option<String> = None;
+    let mut use_chir = true;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "-o" && i + 1 < args.len() {
             output_path = Some(args[i + 1].clone());
             i += 2;
+        } else if args[i] == "--no-chir" {
+            use_chir = false;
+            i += 1;
+        } else if args[i] == "--use-chir" {
+            use_chir = true;
+            i += 1;
         } else if args[i].ends_with(".wasm") && input_files.len() == 1 && output_path.is_none() {
             output_path = Some(args[i].clone());
             i += 1;
@@ -175,6 +203,10 @@ fn cmd_compile(args: &[String]) {
             input_files.push(args[i].clone());
             i += 1;
         }
+    }
+
+    if !use_chir {
+        unsafe { env::set_var("NO_CHIR", "1") };
     }
 
     if input_files.is_empty() {
@@ -258,8 +290,21 @@ fn cmd_compile(args: &[String]) {
     cjwasm::optimizer::optimize_program(&mut program);
     cjwasm::monomorph::monomorphize_program(&mut program);
 
-    let mut codegen = cjwasm::codegen::CodeGen::new();
-    let wasm = codegen.compile(&program);
+    let wasm = if use_chir {
+        match cjwasm::chir::lower_program(&program) {
+            Ok(chir_program) => {
+                let mut codegen = cjwasm::codegen::chir_codegen::CHIRCodeGen::new();
+                codegen.generate(&chir_program)
+            }
+            Err(e) => {
+                eprintln!("CHIR 转换失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let mut codegen = cjwasm::codegen::CodeGen::new();
+        codegen.compile(&program)
+    };
 
     match fs::write(&output, &wasm) {
         Ok(_) => {
@@ -268,7 +313,8 @@ fn cmd_compile(args: &[String]) {
             } else {
                 input_files[0].clone()
             };
-            println!("编译成功: {} -> {}", files_desc, output);
+            let backend = if use_chir { " [CHIR]" } else { "" };
+            println!("编译成功{}: {} -> {}", backend, files_desc, output);
             println!("  大小: {} 字节", wasm.len());
         }
         Err(e) => {

@@ -187,29 +187,27 @@ for filepath in "${FILES[@]}"; do
   exit_code=0
   stderr_file=$(mktemp)
   run_output=$(wasmtime run -W timeout=10s --invoke main "$wasm_file" 2>"$stderr_file") || exit_code=$?
-  # 如果 stdout 为空但 stderr 有内容（如 wasmtime warning），合并以便错误检测
-  if [[ -z "$run_output" && -s "$stderr_file" ]]; then
-    run_output=$(cat "$stderr_file")
-  fi
+  run_stderr=$(cat "$stderr_file")
   rm -f "$stderr_file"
 
   # 提取返回值（最后一行）
   actual=""
   is_error=false
 
-  if echo "$run_output" | grep -qi "error\|trap\|unreachable\|timed out\|failed to"; then
+  # 仅根据 exit code 和 stderr 判断运行错误（避免 stdout 内容误匹配）
+  if [[ $exit_code -ne 0 ]] || echo "$run_stderr" | grep -qi "trap\|unreachable\|timed out\|failed to"; then
     is_error=true
-    if echo "$run_output" | grep -qi "timed out"; then
+    if echo "$run_stderr" | grep -qi "timed out"; then
       actual="TIMEOUT"
-    elif echo "$run_output" | grep -qi "unreachable"; then
+    elif echo "$run_stderr" | grep -qi "unreachable"; then
       actual="UNREACHABLE"
-    elif echo "$run_output" | grep -qi "trap"; then
+    elif echo "$run_stderr" | grep -qi "trap"; then
       actual="TRAP"
     else
       actual="ERROR"
     fi
   else
-    # 从输出中提取最后一行作为返回值
+    # 从 stdout 中提取最后一行作为返回值
     actual=$(echo "$run_output" | tail -1 | tr -d '[:space:]')
   fi
 

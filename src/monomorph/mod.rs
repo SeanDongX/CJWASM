@@ -743,6 +743,66 @@ fn collect_instantiations(
         }
     }
 
+    // P2: 从类型注解中收集泛型实例化
+    fn collect_from_type(
+        ty: &Type,
+        gs: &std::collections::HashMap<String, usize>,
+        ge: &std::collections::HashMap<String, usize>,
+        gc: &std::collections::HashMap<String, usize>,
+        si: &mut HashSet<(String, Vec<Type>)>,
+        ei: &mut HashSet<(String, Vec<Type>)>,
+        ci: &mut HashSet<(String, Vec<Type>)>,
+    ) {
+        match ty {
+            Type::Struct(name, args) if !args.is_empty() => {
+                if let Some(n) = gs.get(name) {
+                    if *n == args.len() {
+                        si.insert((name.clone(), args.clone()));
+                    }
+                }
+                if let Some(n) = ge.get(name) {
+                    if *n == args.len() {
+                        ei.insert((name.clone(), args.clone()));
+                    }
+                }
+                if let Some(n) = gc.get(name) {
+                    if *n == args.len() {
+                        ci.insert((name.clone(), args.clone()));
+                    }
+                }
+                // 递归处理类型参数
+                for arg in args {
+                    collect_from_type(arg, gs, ge, gc, si, ei, ci);
+                }
+            }
+            Type::Array(inner) | Type::Option(inner) | Type::Slice(inner) => {
+                collect_from_type(inner, gs, ge, gc, si, ei, ci);
+            }
+            Type::Map(k, v) => {
+                collect_from_type(k, gs, ge, gc, si, ei, ci);
+                collect_from_type(v, gs, ge, gc, si, ei, ci);
+            }
+            Type::Result(ok, err) => {
+                collect_from_type(ok, gs, ge, gc, si, ei, ci);
+                collect_from_type(err, gs, ge, gc, si, ei, ci);
+            }
+            Type::Tuple(types) => {
+                for t in types {
+                    collect_from_type(t, gs, ge, gc, si, ei, ci);
+                }
+            }
+            Type::Function { params, ret } => {
+                for p in params {
+                    collect_from_type(p, gs, ge, gc, si, ei, ci);
+                }
+                if let Some(r) = ret.as_ref() {
+                    collect_from_type(r, gs, ge, gc, si, ei, ci);
+                }
+            }
+            _ => {}
+        }
+    }
+
     for func in &program.functions {
         for stmt in &func.body {
             let mut visit = |e: &Expr| {
@@ -757,6 +817,258 @@ fn collect_instantiations(
                     &mut enum_insts,
                     &mut class_insts,
                 )
+            };
+            stmt.walk(&mut visit);
+        }
+    }
+
+    // P2.1: 扫描函数参数和返回类型
+    for func in &program.functions {
+        for param in &func.params {
+            collect_from_type(
+                &param.ty,
+                &generic_structs,
+                &generic_enums,
+                &generic_classes,
+                &mut struct_insts,
+                &mut enum_insts,
+                &mut class_insts,
+            );
+        }
+        if let Some(ret) = &func.return_type {
+            collect_from_type(
+                ret,
+                &generic_structs,
+                &generic_enums,
+                &generic_classes,
+                &mut struct_insts,
+                &mut enum_insts,
+                &mut class_insts,
+            );
+        }
+    }
+
+    // P2.1: 扫描结构体字段类型
+    for st in &program.structs {
+        for field in &st.fields {
+            collect_from_type(
+                &field.ty,
+                &generic_structs,
+                &generic_enums,
+                &generic_classes,
+                &mut struct_insts,
+                &mut enum_insts,
+                &mut class_insts,
+            );
+        }
+    }
+
+    // P2.1: 扫描类字段类型
+    for cls in &program.classes {
+        for field in &cls.fields {
+            collect_from_type(
+                &field.ty,
+                &generic_structs,
+                &generic_enums,
+                &generic_classes,
+                &mut struct_insts,
+                &mut enum_insts,
+                &mut class_insts,
+            );
+        }
+    }
+
+    // P3.1: 从无显式 type_args 的调用点推断泛型函数实例化
+
+    /// 类型统一：将 pattern 中的 TypeParam 绑定到 concrete 中的具体类型
+    fn unify_type(pattern: &Type, concrete: &Type, bindings: &mut HashMap<String, Type>) {
+        match (pattern, concrete) {
+            (Type::TypeParam(name), ty) if !matches!(ty, Type::TypeParam(_)) => {
+                bindings.entry(name.clone()).or_insert_with(|| ty.clone());
+            }
+            (Type::Array(p), Type::Array(c)) => unify_type(p, c, bindings),
+            (Type::Option(p), Type::Option(c)) => unify_type(p, c, bindings),
+            (Type::Slice(p), Type::Slice(c)) => unify_type(p, c, bindings),
+            (Type::Struct(pn, pa), Type::Struct(cn, ca)) if pn == cn => {
+                for (p, c) in pa.iter().zip(ca.iter()) {
+                    unify_type(p, c, bindings);
+                }
+            }
+            (Type::Map(pk, pv), Type::Map(ck, cv)) => {
+                unify_type(pk, ck, bindings);
+                unify_type(pv, cv, bindings);
+            }
+            (Type::Result(po, pe), Type::Result(co, ce)) => {
+                unify_type(po, co, bindings);
+                unify_type(pe, ce, bindings);
+            }
+            (Type::Tuple(pts), Type::Tuple(cts)) => {
+                for (p, c) in pts.iter().zip(cts.iter()) {
+                    unify_type(p, c, bindings);
+                }
+            }
+            (
+                Type::Function { params: pp, ret: pr },
+                Type::Function { params: cp, ret: cr },
+            ) => {
+                for (p, c) in pp.iter().zip(cp.iter()) {
+                    unify_type(p, c, bindings);
+                }
+                if let (Some(pr_inner), Some(cr_inner)) =
+                    (pr.as_ref().as_ref(), cr.as_ref().as_ref())
+                {
+                    unify_type(pr_inner, cr_inner, bindings);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 简单表达式类型推断（仅处理字面量/变量/构造器等常见情况）
+    fn infer_expr_type(expr: &Expr, locals: &HashMap<String, Type>) -> Option<Type> {
+        match expr {
+            Expr::Integer(_) => Some(Type::Int64),
+            Expr::Float(_) => Some(Type::Float64),
+            Expr::Float32(_) => Some(Type::Float32),
+            Expr::Bool(_) => Some(Type::Bool),
+            Expr::Rune(_) => Some(Type::Rune),
+            Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
+            Expr::Var(name) => locals.get(name).cloned(),
+            Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(
+                name.clone(),
+                type_args.clone().unwrap_or_default(),
+            )),
+            Expr::StructInit { name, type_args, .. } => Some(Type::Struct(
+                name.clone(),
+                type_args.clone().unwrap_or_default(),
+            )),
+            Expr::Array(elems) => elems
+                .first()
+                .and_then(|e| infer_expr_type(e, locals))
+                .map(|t| Type::Array(Box::new(t))),
+            Expr::Some(e) => {
+                infer_expr_type(e.as_ref(), locals).map(|t| Type::Option(Box::new(t)))
+            }
+            Expr::Lambda { params, return_type, .. } => {
+                let param_types: Vec<Type> = params.iter().map(|(_, ty)| ty.clone()).collect();
+                Some(Type::Function {
+                    params: param_types,
+                    ret: Box::new(return_type.clone()),
+                })
+            }
+            Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
+            _ => None,
+        }
+    }
+
+    /// 从语句列表中提取变量类型注解，用于后续的类型推断
+    fn collect_p3_locals(stmts: &[Stmt], locals: &mut HashMap<String, Type>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let { pattern, ty: Some(ty), .. }
+                | Stmt::Var { pattern, ty: Some(ty), .. } => {
+                    if !matches!(ty, Type::TypeParam(_)) {
+                        if let Pattern::Binding(name) = pattern {
+                            locals.insert(name.clone(), ty.clone());
+                        }
+                    }
+                }
+                Stmt::Const { name, ty: Some(ty), .. } => {
+                    if !matches!(ty, Type::TypeParam(_)) {
+                        locals.insert(name.clone(), ty.clone());
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::For { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::UnsafeBlock { body } => {
+                    collect_p3_locals(body, locals);
+                }
+                Stmt::WhileLet { body, .. } => {
+                    collect_p3_locals(body, locals);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // P3.1: 预构建泛型函数定义缓存（克隆所需数据，避免与后续借用冲突）
+    let gf_defs: Vec<(String, Vec<String>, Vec<Param>)> = program
+        .functions
+        .iter()
+        .filter(|f| !f.type_params.is_empty() && f.extern_import.is_none())
+        .map(|f| (f.name.clone(), f.type_params.clone(), f.params.clone()))
+        .collect();
+
+    for func in &program.functions {
+        // 收集函数参数与局部变量的类型注解
+        let mut locals: HashMap<String, Type> = HashMap::new();
+        for param in &func.params {
+            if !matches!(param.ty, Type::TypeParam(_)) {
+                locals.insert(param.name.clone(), param.ty.clone());
+            }
+        }
+        collect_p3_locals(&func.body, &mut locals);
+
+        // 扫描所有调用点，推断无显式 type_args 的泛型调用
+        for stmt in &func.body {
+            let mut visit = |e: &Expr| {
+                let (name, args) = match e {
+                    Expr::Call {
+                        name,
+                        type_args: None,
+                        args,
+                        ..
+                    } => (name, args),
+                    _ => return,
+                };
+                let n_tp = match generic_functions.get(name) {
+                    Some(n) => *n,
+                    None => return,
+                };
+                let (_, type_params, params) =
+                    match gf_defs.iter().find(|(n, tp, _)| n == name && tp.len() == n_tp) {
+                        Some(d) => d,
+                        None => return,
+                    };
+
+                let mut bindings: HashMap<String, Type> = HashMap::new();
+                for (param, arg) in params.iter().zip(args.iter()) {
+                    // P3.3: Lambda 参数 — 从 lambda 的参数类型与函数型参数统一
+                    if let Expr::Lambda {
+                        params: lambda_params,
+                        ..
+                    } = arg
+                    {
+                        if let Type::Function {
+                            params: fp_types, ..
+                        } = &param.ty
+                        {
+                            for ((_, lp_ty), fpt) in
+                                lambda_params.iter().zip(fp_types.iter())
+                            {
+                                if !matches!(lp_ty, Type::TypeParam(_)) {
+                                    unify_type(fpt, lp_ty, &mut bindings);
+                                }
+                            }
+                        }
+                    }
+                    // 从实参类型推断
+                    if let Some(ty) = infer_expr_type(arg, &locals) {
+                        unify_type(&param.ty, &ty, &mut bindings);
+                    }
+                }
+
+                let type_args: Option<Vec<Type>> = type_params
+                    .iter()
+                    .map(|p| bindings.get(p).cloned())
+                    .collect();
+                if let Some(type_args) = type_args {
+                    if !type_args.iter().any(|t| matches!(t, Type::TypeParam(_))) {
+                        func_insts.insert((name.clone(), type_args));
+                    }
+                }
             };
             stmt.walk(&mut visit);
         }
@@ -1484,6 +1796,15 @@ pub fn monomorphize_program(program: &mut Program) {
     }
     program.functions.append(&mut new_functions);
 
+    // P3.2: 移除已特化的泛型函数原始定义，避免 codegen 编译含 TypeParam 的重复代码
+    // 未特化的泛型函数保留（可能有未推断的调用点）
+    let specialized_names: HashSet<String> = func_insts.iter().map(|(n, _)| n.clone()).collect();
+    program.functions.retain(|f| {
+        f.type_params.is_empty()
+            || f.extern_import.is_some()
+            || !specialized_names.contains(&f.name)
+    });
+
     for func in &mut program.functions {
         if func.extern_import.is_some() {
             continue;
@@ -1500,7 +1821,7 @@ pub fn monomorphize_program(program: &mut Program) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::Type;
+    use crate::ast::{Expr, Param, Stmt, StructDef, Type, Visibility};
 
     #[test]
     fn test_type_mangle_suffix_basic() {
@@ -1614,5 +1935,744 @@ mod tests {
         };
         monomorphize_program(&mut program);
         assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_monomorphize_generic_function_multi_type_params() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![
+                Function {
+                    visibility: Visibility::default(),
+                    name: "pair".to_string(),
+                    type_params: vec!["T".to_string(), "U".to_string()],
+                    constraints: vec![],
+                    params: vec![
+                        Param {
+                            name: "a".to_string(),
+                            ty: Type::TypeParam("T".to_string()),
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        },
+                        Param {
+                            name: "b".to_string(),
+                            ty: Type::TypeParam("U".to_string()),
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        },
+                    ],
+                    return_type: Some(Type::Tuple(vec![
+                        Type::TypeParam("T".to_string()),
+                        Type::TypeParam("U".to_string()),
+                    ])),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Tuple(vec![
+                        Expr::Var("a".to_string()),
+                        Expr::Var("b".to_string()),
+                    ])))],
+                    extern_import: None,
+                },
+                Function {
+                    visibility: Visibility::default(),
+                    name: "main".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![
+                        Stmt::Expr(Expr::Call {
+                            name: "pair".to_string(),
+                            type_args: Some(vec![Type::Int64, Type::String]),
+                            args: vec![Expr::Integer(1), Expr::String("hi".to_string())],
+                            named_args: vec![],
+                        }),
+                        Stmt::Return(Some(Expr::Integer(0))),
+                    ],
+                    extern_import: None,
+                },
+            ],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let mangled = mangle_name("pair", &[Type::Int64, Type::String]);
+        assert!(
+            program.functions.iter().any(|f| f.name == mangled),
+            "expected monomorphized pair$Int64$String"
+        );
+    }
+
+    #[test]
+    fn test_monomorphize_struct_with_generic_params() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![StructDef {
+                visibility: Visibility::default(),
+                name: "Pair".to_string(),
+                type_params: vec!["T".to_string(), "U".to_string()],
+                constraints: vec![],
+                fields: vec![
+                    crate::ast::FieldDef {
+                        name: "first".to_string(),
+                        ty: Type::TypeParam("T".to_string()),
+                        default: None,
+                    },
+                    crate::ast::FieldDef {
+                        name: "second".to_string(),
+                        ty: Type::TypeParam("U".to_string()),
+                        default: None,
+                    },
+                ],
+            }],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::StructInit {
+                    name: "Pair".to_string(),
+                    type_args: Some(vec![Type::Int64, Type::String]),
+                    fields: vec![
+                        ("first".to_string(), Expr::Integer(1)),
+                        ("second".to_string(), Expr::String("x".to_string())),
+                    ],
+                }))],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let mangled = mangle_name("Pair", &[Type::Int64, Type::String]);
+        assert!(
+            program.structs.iter().any(|s| s.name == mangled),
+            "expected monomorphized Pair$Int64$String struct"
+        );
+    }
+
+    #[test]
+    fn test_monomorphize_nested_generics() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![StructDef {
+                visibility: Visibility::default(),
+                name: "Pair".to_string(),
+                type_params: vec!["A".to_string(), "B".to_string()],
+                constraints: vec![],
+                fields: vec![
+                    crate::ast::FieldDef {
+                        name: "x".to_string(),
+                        ty: Type::TypeParam("A".to_string()),
+                        default: None,
+                    },
+                    crate::ast::FieldDef {
+                        name: "y".to_string(),
+                        ty: Type::TypeParam("B".to_string()),
+                        default: None,
+                    },
+                ],
+            }],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![Param {
+                    name: "arr".to_string(),
+                    ty: Type::Array(Box::new(Type::Struct(
+                        "Pair".to_string(),
+                        vec![Type::Int64, Type::String],
+                    ))),
+                    default: None,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
+                }],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let pair_mangled = mangle_name("Pair", &[Type::Int64, Type::String]);
+        assert!(
+            program.structs.iter().any(|s| s.name == pair_mangled),
+            "expected Pair<Int64,String> from Array<Pair<Int64,String>> param"
+        );
+    }
+
+    #[test]
+    fn test_monomorphize_pass_through_no_instantiations() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![StructDef {
+                visibility: Visibility::default(),
+                name: "Point".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                fields: vec![crate::ast::FieldDef {
+                    name: "x".to_string(),
+                    ty: Type::Int64,
+                    default: None,
+                }],
+            }],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::StructInit {
+                    name: "Point".to_string(),
+                    type_args: None,
+                    fields: vec![("x".to_string(), Expr::Integer(0))],
+                }))],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        let orig_struct_count = program.structs.len();
+        let orig_func_count = program.functions.len();
+        monomorphize_program(&mut program);
+        assert_eq!(program.structs.len(), orig_struct_count);
+        assert_eq!(program.functions.len(), orig_func_count);
+    }
+
+    #[test]
+    fn test_monomorphize_generic_func_multi_call_sites() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![
+                Function {
+                    visibility: Visibility::default(),
+                    name: "id".to_string(),
+                    type_params: vec!["T".to_string()],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: Type::TypeParam("T".to_string()),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::TypeParam("T".to_string())),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Var("x".to_string())))],
+                    extern_import: None,
+                },
+                Function {
+                    visibility: Visibility::default(),
+                    name: "main".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![
+                        Stmt::Expr(Expr::Call {
+                            name: "id".to_string(),
+                            type_args: Some(vec![Type::Int64]),
+                            args: vec![Expr::Integer(1)],
+                            named_args: vec![],
+                        }),
+                        Stmt::Expr(Expr::Call {
+                            name: "id".to_string(),
+                            type_args: Some(vec![Type::String]),
+                            args: vec![Expr::String("hi".to_string())],
+                            named_args: vec![],
+                        }),
+                        Stmt::Return(Some(Expr::Integer(0))),
+                    ],
+                    extern_import: None,
+                },
+            ],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let i64_mangled = mangle_name("id", &[Type::Int64]);
+        let str_mangled = mangle_name("id", &[Type::String]);
+        assert!(program.functions.iter().any(|f| f.name == i64_mangled));
+        assert!(program.functions.iter().any(|f| f.name == str_mangled));
+    }
+
+    #[test]
+    fn test_monomorphize_generic_struct_as_param() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![StructDef {
+                visibility: Visibility::default(),
+                name: "Box".to_string(),
+                type_params: vec!["T".to_string()],
+                constraints: vec![],
+                fields: vec![crate::ast::FieldDef {
+                    name: "value".to_string(),
+                    ty: Type::TypeParam("T".to_string()),
+                    default: None,
+                }],
+            }],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "get".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![Param {
+                    name: "b".to_string(),
+                    ty: Type::Struct("Box".to_string(), vec![Type::Int64]),
+                    default: None,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
+                }],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Field {
+                    object: Box::new(Expr::Var("b".to_string())),
+                    field: "value".to_string(),
+                }))],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let box_mangled = mangle_name("Box", &[Type::Int64]);
+        assert!(program.structs.iter().any(|s| s.name == box_mangled));
+    }
+
+    #[test]
+    fn test_monomorphize_generic_class_with_methods() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![
+                ClassDef {
+                    visibility: Visibility::default(),
+                    name: "Wrapper".to_string(),
+                    type_params: vec!["T".to_string()],
+                    constraints: vec![],
+                    is_abstract: false,
+                    is_sealed: false,
+                    is_open: false,
+                    extends: None,
+                    implements: vec![],
+                    fields: vec![crate::ast::FieldDef {
+                        name: "data".to_string(),
+                        ty: Type::TypeParam("T".to_string()),
+                        default: None,
+                    }],
+                    init: Some(InitDef {
+                        params: vec![crate::ast::Param {
+                            name: "d".to_string(),
+                            ty: Type::TypeParam("T".to_string()),
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        }],
+                        body: vec![Stmt::Assign {
+                            target: crate::ast::AssignTarget::Field {
+                                object: "this".to_string(),
+                                field: "data".to_string(),
+                            },
+                            value: Expr::Var("d".to_string()),
+                        }],
+                    }),
+                    deinit: None,
+                    static_init: None,
+                    methods: vec![crate::ast::ClassMethod {
+                        override_: false,
+                        func: Function {
+                            visibility: Visibility::default(),
+                            name: "Wrapper.get".to_string(),
+                            type_params: vec![],
+                            constraints: vec![],
+                            params: vec![crate::ast::Param {
+                                name: "self".to_string(),
+                                ty: Type::Struct("Wrapper".to_string(), vec![Type::TypeParam("T".to_string())]),
+                                default: None,
+                                variadic: false,
+                                is_named: false,
+                                is_inout: false,
+                            }],
+                            return_type: Some(Type::TypeParam("T".to_string())),
+                            throws: None,
+                            body: vec![Stmt::Return(Some(Expr::Var("data".to_string())))],
+                            extern_import: None,
+                        },
+                    }],
+                    primary_ctor_params: vec![],
+                },
+            ],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![
+                    Stmt::Let {
+                        pattern: crate::ast::Pattern::Binding("w".to_string()),
+                        ty: Some(Type::Struct("Wrapper".to_string(), vec![Type::Int64])),
+                        value: Expr::ConstructorCall {
+                            name: "Wrapper".to_string(),
+                            type_args: Some(vec![Type::Int64]),
+                            args: vec![Expr::Integer(42)],
+                            named_args: vec![],
+                        },
+                    },
+                    Stmt::Return(Some(Expr::MethodCall {
+                        object: Box::new(Expr::Var("w".to_string())),
+                        method: "get".to_string(),
+                        args: vec![],
+                        named_args: vec![],
+                        type_args: None,
+                    })),
+                ],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let wrapper_mangled = mangle_name("Wrapper", &[Type::Int64]);
+        assert!(program.classes.iter().any(|c| c.name == wrapper_mangled));
+    }
+
+    #[test]
+    fn test_monomorphize_array_of_pair() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![StructDef {
+                visibility: Visibility::default(),
+                name: "Pair".to_string(),
+                type_params: vec!["A".to_string(), "B".to_string()],
+                constraints: vec![],
+                fields: vec![
+                    crate::ast::FieldDef {
+                        name: "a".to_string(),
+                        ty: Type::TypeParam("A".to_string()),
+                        default: None,
+                    },
+                    crate::ast::FieldDef {
+                        name: "b".to_string(),
+                        ty: Type::TypeParam("B".to_string()),
+                        default: None,
+                    },
+                ],
+            }],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![Param {
+                    name: "arr".to_string(),
+                    ty: Type::Array(Box::new(Type::Struct(
+                        "Pair".to_string(),
+                        vec![Type::Int64, Type::String],
+                    ))),
+                    default: None,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
+                }],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let pair_mangled = mangle_name("Pair", &[Type::Int64, Type::String]);
+        assert!(program.structs.iter().any(|s| s.name == pair_mangled));
+    }
+
+    #[test]
+    fn test_monomorphize_type_param_in_return() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![
+                Function {
+                    visibility: Visibility::default(),
+                    name: "wrap".to_string(),
+                    type_params: vec!["T".to_string()],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: Type::TypeParam("T".to_string()),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::Option(Box::new(Type::TypeParam("T".to_string())))),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Some(Box::new(Expr::Var("x".to_string())))))],
+                    extern_import: None,
+                },
+                Function {
+                    visibility: Visibility::default(),
+                    name: "main".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![
+                        Stmt::Let {
+                            pattern: crate::ast::Pattern::Binding("o".to_string()),
+                            ty: None,
+                            value: Expr::Call {
+                                name: "wrap".to_string(),
+                                type_args: Some(vec![Type::Int64]),
+                                args: vec![Expr::Integer(7)],
+                                named_args: vec![],
+                            },
+                        },
+                        Stmt::Return(Some(Expr::Integer(0))),
+                    ],
+                    extern_import: None,
+                },
+            ],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let wrap_mangled = mangle_name("wrap", &[Type::Int64]);
+        assert!(program.functions.iter().any(|f| f.name == wrap_mangled));
+    }
+
+    #[test]
+    fn test_monomorphize_generic_enum() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![
+                EnumDef {
+                    visibility: Visibility::default(),
+                    name: "Maybe".to_string(),
+                    type_params: vec!["T".to_string()],
+                    constraints: vec![],
+                    variants: vec![
+                        EnumVariant {
+                            name: "Just".to_string(),
+                            payload: Some(Type::TypeParam("T".to_string())),
+                        },
+                        EnumVariant {
+                            name: "Nothing".to_string(),
+                            payload: None,
+                        },
+                    ],
+                },
+            ],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "unwrap".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![Param {
+                    name: "m".to_string(),
+                    ty: Type::Struct("Maybe".to_string(), vec![Type::Int64]),
+                    default: None,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
+                }],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let maybe_mangled = mangle_name("Maybe", &[Type::Int64]);
+        assert!(program.enums.iter().any(|e| e.name == maybe_mangled));
+    }
+
+    #[test]
+    fn test_monomorphize_inferred_type_args() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![
+                Function {
+                    visibility: Visibility::default(),
+                    name: "id".to_string(),
+                    type_params: vec!["T".to_string()],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "x".to_string(),
+                        ty: Type::TypeParam("T".to_string()),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::TypeParam("T".to_string())),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Var("x".to_string())))],
+                    extern_import: None,
+                },
+                Function {
+                    visibility: Visibility::default(),
+                    name: "main".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![
+                        Stmt::Let {
+                            pattern: crate::ast::Pattern::Binding("a".to_string()),
+                            ty: None,
+                            value: Expr::Call {
+                                name: "id".to_string(),
+                                type_args: None,
+                                args: vec![Expr::Integer(42)],
+                                named_args: vec![],
+                            },
+                        },
+                        Stmt::Return(Some(Expr::Var("a".to_string()))),
+                    ],
+                    extern_import: None,
+                },
+            ],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let id_mangled = mangle_name("id", &[Type::Int64]);
+        assert!(program.functions.iter().any(|f| f.name == id_mangled));
+    }
+
+    #[test]
+    fn test_monomorphize_multiple_struct_instances() {
+        let mut program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![StructDef {
+                visibility: Visibility::default(),
+                name: "Cell".to_string(),
+                type_params: vec!["T".to_string()],
+                constraints: vec![],
+                fields: vec![crate::ast::FieldDef {
+                    name: "v".to_string(),
+                    ty: Type::TypeParam("T".to_string()),
+                    default: None,
+                }],
+            }],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![
+                    Stmt::Expr(Expr::StructInit {
+                        name: "Cell".to_string(),
+                        type_args: Some(vec![Type::Int64]),
+                        fields: vec![("v".to_string(), Expr::Integer(1))],
+                    }),
+                    Stmt::Expr(Expr::StructInit {
+                        name: "Cell".to_string(),
+                        type_args: Some(vec![Type::String]),
+                        fields: vec![("v".to_string(), Expr::String("x".to_string()))],
+                    }),
+                    Stmt::Return(Some(Expr::Integer(0))),
+                ],
+                extern_import: None,
+            }],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+        monomorphize_program(&mut program);
+        let cell_i64 = mangle_name("Cell", &[Type::Int64]);
+        let cell_str = mangle_name("Cell", &[Type::String]);
+        assert!(program.structs.iter().any(|s| s.name == cell_i64));
+        assert!(program.structs.iter().any(|s| s.name == cell_str));
     }
 }

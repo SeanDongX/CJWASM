@@ -127,3 +127,138 @@ impl CodeGen {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{Expr, Function, Program, Stmt, Type, Visibility};
+    use crate::codegen::{CodeGen, LocalsBuilder};
+
+    fn codegen_with_main() -> CodeGen {
+        let program = Program {
+            package_name: None,
+            imports: vec![],
+            structs: vec![],
+            interfaces: vec![],
+            classes: vec![],
+            enums: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+            functions: vec![Function {
+                visibility: Visibility::default(),
+                name: "main".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                throws: None,
+                body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+                extern_import: None,
+            }],
+        };
+        let mut codegen = CodeGen::new();
+        let _ = codegen.compile(&program);
+        codegen
+    }
+
+    #[test]
+    fn test_macro_assert_two_args() {
+        let codegen = codegen_with_main();
+        let locals = LocalsBuilder::new();
+        let mut wasm_func = WasmFunc::new(vec![]);
+        codegen.compile_macro_call(
+            "Assert",
+            &[Expr::Integer(1), Expr::Integer(1)],
+            &locals,
+            &mut wasm_func,
+            None,
+        );
+        // Should have generated instructions (I64Const x2, I64Ne, If, End)
+        assert!(wasm_func.byte_len() > 0);
+    }
+
+    #[test]
+    fn test_macro_assert_wrong_args() {
+        let codegen = codegen_with_main();
+        let locals = LocalsBuilder::new();
+        let mut wasm_func = WasmFunc::new(vec![]);
+        let before = wasm_func.byte_len();
+        codegen.compile_macro_call("Assert", &[Expr::Integer(1)], &locals, &mut wasm_func, None);
+        // Wrong arg count - returns early without compiling (no extra instructions)
+        assert_eq!(wasm_func.byte_len(), before);
+    }
+
+    #[test]
+    fn test_macro_expect_two_args() {
+        let codegen = codegen_with_main();
+        let locals = LocalsBuilder::new();
+        let mut wasm_func = WasmFunc::new(vec![]);
+        codegen.compile_macro_call(
+            "Expect",
+            &[Expr::Integer(42), Expr::Integer(42)],
+            &locals,
+            &mut wasm_func,
+            None,
+        );
+        assert!(wasm_func.byte_len() > 0);
+    }
+
+    #[test]
+    fn test_macro_expect_wrong_args() {
+        let codegen = codegen_with_main();
+        let locals = LocalsBuilder::new();
+        let mut wasm_func = WasmFunc::new(vec![]);
+        let before = wasm_func.byte_len();
+        codegen.compile_macro_call("Expect", &[Expr::Integer(1)], &locals, &mut wasm_func, None);
+        // Wrong arg count - early return without compiling
+        assert_eq!(wasm_func.byte_len(), before);
+    }
+
+    #[test]
+    fn test_macro_deprecated() {
+        let codegen = codegen_with_main();
+        let locals = LocalsBuilder::new();
+        let mut wasm_func = WasmFunc::new(vec![]);
+        let before = wasm_func.byte_len();
+        codegen.compile_macro_call("Deprecated", &[], &locals, &mut wasm_func, None);
+        assert_eq!(wasm_func.byte_len(), before, "Deprecated should not emit code");
+    }
+
+    #[test]
+    fn test_macro_source_file() {
+        let codegen = codegen_with_main();
+        let locals = LocalsBuilder::new();
+        let mut wasm_func = WasmFunc::new(vec![]);
+        codegen.compile_macro_call("sourceFile", &[], &locals, &mut wasm_func, None);
+        assert!(wasm_func.byte_len() > 0);
+    }
+
+    #[test]
+    fn test_macro_source_line() {
+        let codegen = codegen_with_main();
+        let locals = LocalsBuilder::new();
+        let mut wasm_func = WasmFunc::new(vec![]);
+        codegen.compile_macro_call("sourceLine", &[], &locals, &mut wasm_func, None);
+        assert!(wasm_func.byte_len() > 0);
+    }
+
+    #[test]
+    fn test_macro_source_package() {
+        let codegen = codegen_with_main();
+        let locals = LocalsBuilder::new();
+        let mut wasm_func = WasmFunc::new(vec![]);
+        codegen.compile_macro_call("sourcePackage", &[], &locals, &mut wasm_func, None);
+        assert!(wasm_func.byte_len() > 0);
+    }
+
+    #[test]
+    fn test_macro_unknown() {
+        let codegen = codegen_with_main();
+        let locals = LocalsBuilder::new();
+        let mut wasm_func = WasmFunc::new(vec![]);
+        let before = wasm_func.byte_len();
+        codegen.compile_macro_call("UnknownMacro", &[], &locals, &mut wasm_func, None);
+        assert_eq!(wasm_func.byte_len(), before, "Unknown macro should not emit code");
+    }
+}

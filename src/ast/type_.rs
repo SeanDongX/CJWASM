@@ -88,7 +88,7 @@ impl Type {
             Type::Slice(_) => ValType::I32,
             Type::Map(_, _) => ValType::I32,
             Type::TypeParam(_) => {
-                ValType::I64 // 单态化前默认 i64（宽类型，避免信息丢失）
+                ValType::I32 // 未单态化的泛型参数视为对象引用（i32 指针）
             }
             Type::This => ValType::I32, // This 类型表示类对象，使用指针
             Type::Qualified(_) => ValType::I32, // 限定类型通常是类或结构体
@@ -117,7 +117,7 @@ impl Type {
             Type::Result(_, _) => 4,
             Type::Slice(_) => 4,
             Type::Map(_, _) => 4,
-            Type::TypeParam(_) => 8, // 默认指针大小（单态化前使用）
+            Type::TypeParam(_) => 4, // 未单态化泛型参数视为对象指针（4 字节）
             Type::This => 4,         // This 类型表示类对象指针
             Type::Qualified(_) => 4, // 限定类型通常是类或结构体指针
         }
@@ -159,7 +159,8 @@ mod tests {
 
     #[test]
     fn test_to_wasm_typeparam() {
-        assert_eq!(Type::TypeParam("T".to_string()).to_wasm(), ValType::I64);
+        // 未单态化的 TypeParam 视为对象指针 (i32)
+        assert_eq!(Type::TypeParam("T".to_string()).to_wasm(), ValType::I32);
     }
 
     #[test]
@@ -173,12 +174,86 @@ mod tests {
 
     #[test]
     fn test_size_typeparam_default() {
-        // TypeParam returns default pointer size (8) without panicking
-        assert_eq!(Type::TypeParam("T".to_string()).size(), 8);
+        // 未单态化的 TypeParam 视为对象指针（4 字节）
+        assert_eq!(Type::TypeParam("T".to_string()).size(), 4);
     }
 
     #[test]
     fn test_range_heap_size() {
         assert_eq!(Type::range_heap_size(), 20);
+    }
+
+    #[test]
+    fn test_to_wasm_more_types() {
+        assert_eq!(Type::Int16.to_wasm(), ValType::I32);
+        assert_eq!(Type::Int32.to_wasm(), ValType::I32);
+        assert_eq!(Type::IntNative.to_wasm(), ValType::I64);
+        assert_eq!(Type::UInt8.to_wasm(), ValType::I32);
+        assert_eq!(Type::UInt64.to_wasm(), ValType::I64);
+        assert_eq!(Type::Float16.to_wasm(), ValType::F32);
+        assert_eq!(Type::Rune.to_wasm(), ValType::I32);
+        assert_eq!(Type::Bool.to_wasm(), ValType::I32);
+        assert_eq!(Type::Tuple(vec![Type::Int64, Type::Float64]).to_wasm(), ValType::I32);
+        assert_eq!(Type::Struct("Point".to_string(), vec![]).to_wasm(), ValType::I32);
+        assert_eq!(Type::Range.to_wasm(), ValType::I32);
+        assert_eq!(
+            Type::Function {
+                params: vec![Type::Int64],
+                ret: Box::new(Some(Type::Bool)),
+            }
+            .to_wasm(),
+            ValType::I32
+        );
+        assert_eq!(
+            Type::Result(Box::new(Type::Int64), Box::new(Type::String)).to_wasm(),
+            ValType::I32
+        );
+        assert_eq!(Type::Slice(Box::new(Type::Int64)).to_wasm(), ValType::I32);
+        assert_eq!(
+            Type::Map(Box::new(Type::String), Box::new(Type::Int64)).to_wasm(),
+            ValType::I32
+        );
+        assert_eq!(Type::This.to_wasm(), ValType::I32);
+        assert_eq!(
+            Type::Qualified(vec!["pkg".to_string(), "Mod".to_string()]).to_wasm(),
+            ValType::I32
+        );
+    }
+
+    #[test]
+    fn test_size_more_types() {
+        assert_eq!(Type::Int16.size(), 2);
+        assert_eq!(Type::UInt16.size(), 2);
+        assert_eq!(Type::Int32.size(), 4);
+        assert_eq!(Type::UInt32.size(), 4);
+        assert_eq!(Type::Bool.size(), 4);
+        assert_eq!(Type::Rune.size(), 4);
+        assert_eq!(Type::Float16.size(), 2);
+        assert_eq!(Type::Float32.size(), 4);
+        assert_eq!(Type::Nothing.size(), 0);
+        assert_eq!(Type::Array(Box::new(Type::Int64)).size(), 4);
+        assert_eq!(Type::Tuple(vec![Type::Int64, Type::Int64]).size(), 4);
+        assert_eq!(Type::Struct("Point".to_string(), vec![]).size(), 4);
+        assert_eq!(Type::Range.size(), 4);
+        assert_eq!(
+            Type::Function {
+                params: vec![],
+                ret: Box::new(None),
+            }
+            .size(),
+            4
+        );
+        assert_eq!(Type::Option(Box::new(Type::Int64)).size(), 4);
+        assert_eq!(
+            Type::Result(Box::new(Type::Int64), Box::new(Type::String)).size(),
+            4
+        );
+        assert_eq!(Type::Slice(Box::new(Type::Int64)).size(), 4);
+        assert_eq!(
+            Type::Map(Box::new(Type::String), Box::new(Type::Int64)).size(),
+            4
+        );
+        assert_eq!(Type::This.size(), 4);
+        assert_eq!(Type::Qualified(vec!["a".to_string()]).size(), 4);
     }
 }
