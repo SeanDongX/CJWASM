@@ -47,11 +47,23 @@ pub struct LoweringContext<'a> {
     /// 当前类上下文（仅在类实例方法中非 None）：类名 + `this` 局部变量索引
     pub current_class: Option<(String, u32)>,
 
+    /// 类继承关系：class_name → parent_class_name
+    pub class_extends: HashMap<String, String>,
+
+    /// 函数返回类型：func_name → return Type
+    pub func_return_types: HashMap<String, crate::ast::Type>,
+
+    /// 枚举定义（用于 variant 模式匹配的判别值查找）
+    pub enum_defs: Vec<crate::ast::EnumDef>,
+
     /// 下一个可用的局部变量索引
     next_local: u32,
 
     /// 当前函数返回值的 WASM 类型（用于 Return 语句的类型强制转换）
     pub return_wasm_ty: Option<ValType>,
+
+    /// 局部变量的 AST 类型（用于内置方法推断）
+    pub local_ast_types: HashMap<String, crate::ast::Type>,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -74,8 +86,12 @@ impl<'a> LoweringContext<'a> {
             class_field_offsets,
             class_field_info,
             current_class: None,
+            class_extends: HashMap::new(),
+            func_return_types: HashMap::new(),
+            enum_defs: Vec::new(),
             next_local: 0,
             return_wasm_ty: None,
+            local_ast_types: HashMap::new(),
         }
     }
 
@@ -111,7 +127,26 @@ impl<'a> LoweringContext<'a> {
         // Unit/Nothing 不映射到 WASM 值类型，用 I32 占位（不会被实际使用）
         let wasm_ty = match &ty {
             crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
-            t => t.to_wasm(),
+            t => {
+                let inferred_wasm = t.to_wasm();
+                // 对于 Var 表达式，如果 type_ctx 推断为 Int32 但 lowering 阶段分配了
+                // 不同类型（如 For 循环变量），以 lowering 阶段的类型为准
+                if let Expr::Var(name) = expr {
+                    if let Some(local_ty) = self.local_map.get(name)
+                        .and_then(|&idx| self.get_local_ty(idx))
+                    {
+                        if local_ty != inferred_wasm && matches!(ty, crate::ast::Type::Int32) {
+                            local_ty
+                        } else {
+                            inferred_wasm
+                        }
+                    } else {
+                        inferred_wasm
+                    }
+                } else {
+                    inferred_wasm
+                }
+            }
         };
 
         let kind = match expr {
@@ -125,6 +160,22 @@ impl<'a> LoweringContext<'a> {
 
             // 变量
             Expr::Var(name) => {
+                // 数学常量
+                let math_const = match name.as_str() {
+                    "PI" => Some(std::f64::consts::PI),
+                    "E" => Some(std::f64::consts::E),
+                    "TAU" => Some(std::f64::consts::TAU),
+                    "INF" | "INFINITY" => Some(f64::INFINITY),
+                    "NEG_INF" | "NEG_INFINITY" => Some(f64::NEG_INFINITY),
+                    "NAN" => Some(f64::NAN),
+                    _ => None,
+                };
+                if let Some(val) = math_const {
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Float(val),
+                        crate::ast::Type::Float64, ValType::F64,
+                    ));
+                }
                 if let Some(local_idx) = self.local_map.get(name) {
                     CHIRExprKind::Local(*local_idx)
                 } else if let Some((class_name, this_idx)) = self.current_class.clone() {
@@ -156,9 +207,27 @@ impl<'a> LoweringContext<'a> {
             }
 
             // 管道操作符 a |> f：语义等同 f(a)，但涉及 iterator/closure 等尚不支持的特性
-            // 不展开 left/right 以避免孤值堆积在栈上，直接返回结果类型的 Nop 零值占位
             Expr::Binary { op: crate::ast::BinOp::Pipeline, .. } => {
                 CHIRExprKind::Nop
+            }
+
+            // !in 运算符：a !in b → !(b.contains(a))
+            Expr::Binary { op: crate::ast::BinOp::NotIn, left, right } => {
+                let contains_call = Expr::MethodCall {
+                    object: right.clone(),
+                    method: "contains".to_string(),
+                    args: vec![left.as_ref().clone()],
+                    named_args: vec![],
+                    type_args: None,
+                };
+                let contains_chir = self.lower_expr(&contains_call)?;
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Unary {
+                        op: crate::ast::UnaryOp::Not,
+                        expr: Box::new(contains_chir),
+                    },
+                    crate::ast::Type::Bool, wasm_encoder::ValType::I32,
+                ));
             }
 
             // 二元运算
@@ -166,9 +235,57 @@ impl<'a> LoweringContext<'a> {
                 let left_chir = self.lower_expr(left)?;
                 let right_chir = self.lower_expr(right)?;
 
-                // 插入类型转换（如果需要）
-                let left_chir = self.insert_cast_if_needed(left_chir, wasm_ty);
-                let right_chir = self.insert_cast_if_needed(right_chir, wasm_ty);
+                let is_comparison = matches!(op,
+                    crate::ast::BinOp::Eq | crate::ast::BinOp::NotEq
+                    | crate::ast::BinOp::Lt | crate::ast::BinOp::LtEq
+                    | crate::ast::BinOp::Gt | crate::ast::BinOp::GtEq
+                );
+
+                // For arithmetic ops, if actual operand types are wider than
+                // what type inference says, promote the result to match
+                let effective_wasm_ty = if !is_comparison {
+                    if left_chir.wasm_ty == ValType::F64 || right_chir.wasm_ty == ValType::F64 {
+                        ValType::F64
+                    } else if left_chir.wasm_ty == ValType::I64 || right_chir.wasm_ty == ValType::I64 {
+                        ValType::I64
+                    } else {
+                        wasm_ty
+                    }
+                } else {
+                    wasm_ty
+                };
+
+                let (left_chir, right_chir) = if is_comparison {
+                    let operand_ty = if left_chir.wasm_ty == ValType::I64 || right_chir.wasm_ty == ValType::I64 {
+                        ValType::I64
+                    } else if left_chir.wasm_ty == ValType::F64 || right_chir.wasm_ty == ValType::F64 {
+                        ValType::F64
+                    } else {
+                        left_chir.wasm_ty
+                    };
+                    (self.insert_cast_if_needed(left_chir, operand_ty),
+                     self.insert_cast_if_needed(right_chir, operand_ty))
+                } else {
+                    (self.insert_cast_if_needed(left_chir, effective_wasm_ty),
+                     self.insert_cast_if_needed(right_chir, effective_wasm_ty))
+                };
+
+                // Update result types if promoted
+                if effective_wasm_ty != wasm_ty {
+                    let promoted_ty = match effective_wasm_ty {
+                        ValType::I64 => crate::ast::Type::Int64,
+                        ValType::F64 => crate::ast::Type::Float64,
+                        _ => ty.clone(),
+                    };
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Binary {
+                            op: op.clone(),
+                            left: Box::new(left_chir),
+                            right: Box::new(right_chir),
+                        },
+                        promoted_ty, effective_wasm_ty,
+                    ));
+                }
 
                 CHIRExprKind::Binary {
                     op: op.clone(),
@@ -242,11 +359,49 @@ impl<'a> LoweringContext<'a> {
                         ));
                     }
                     "readln" => {
-                        // 返回 I32（字符串指针），用零值占位
                         return Ok(CHIRExpr::new(
                             CHIRExprKind::Nop,
                             crate::ast::Type::String,
                             ValType::I32,
+                        ));
+                    }
+                    "min" | "max" if args.len() == 2 => {
+                        let a = self.lower_expr(&args[0])?;
+                        let b = self.lower_expr(&args[1])?;
+                        let cmp_op = if name == "min" { crate::ast::BinOp::Lt } else { crate::ast::BinOp::Gt };
+                        let cond = CHIRExpr::new(
+                            CHIRExprKind::Binary { op: cmp_op, left: Box::new(a.clone()), right: Box::new(b.clone()) },
+                            crate::ast::Type::Bool, ValType::I32,
+                        );
+                        let then_block = crate::chir::CHIRBlock { stmts: vec![], result: Some(Box::new(a.clone())) };
+                        let else_block = crate::chir::CHIRBlock { stmts: vec![], result: Some(Box::new(b.clone())) };
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::If { cond: Box::new(cond), then_block, else_block: Some(else_block) },
+                            a.ty.clone(), a.wasm_ty,
+                        ));
+                    }
+                    // WASM 原生数学内置函数（f64 → f64），仅当无用户自定义函数时
+                    "sqrt" | "floor" | "ceil" | "trunc" | "nearest" | "abs"
+                    | "sin" | "cos" | "exp" | "log" if args.len() == 1
+                        && !self.func_indices.contains_key(name.as_str())
+                        && !self.func_indices.contains_key(&format!("{}$1", name)) => {
+                        let a = self.lower_expr(&args[0])?;
+                        let a = self.insert_cast_if_needed(a, ValType::F64);
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::MathUnary { op: name.clone(), arg: Box::new(a) },
+                            crate::ast::Type::Float64, ValType::F64,
+                        ));
+                    }
+                    "pow" if args.len() == 2
+                        && !self.func_indices.contains_key("pow")
+                        && !self.func_indices.contains_key("pow$2") => {
+                        let a = self.lower_expr(&args[0])?;
+                        let a = self.insert_cast_if_needed(a, ValType::F64);
+                        let b = self.lower_expr(&args[1])?;
+                        let b = self.insert_cast_if_needed(b, ValType::F64);
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::MathBinary { op: "pow".into(), left: Box::new(a), right: Box::new(b) },
+                            crate::ast::Type::Float64, ValType::F64,
                         ));
                     }
                     _ => {}
@@ -395,8 +550,52 @@ impl<'a> LoweringContext<'a> {
 
             // 方法调用：解析为 ClassName.methodName 的直接调用
             Expr::MethodCall { object, method, args, named_args, .. } => {
-                // 推断 receiver 类型以确定类名
-                let obj_ty = self.type_ctx.infer_expr(object)?;
+                // ── 静态方法调用：ClassName.method(args) ──
+                if let Expr::Var(cls_name) = object.as_ref() {
+                    let is_class = self.class_field_info.contains_key(cls_name.as_str())
+                        || self.struct_field_offsets.contains_key(cls_name.as_str());
+                    if is_class {
+                        let mangled = format!("{}.{}", cls_name, method);
+                        let arity_mangled = format!("{}${}", mangled, args.len() + named_args.len());
+                        let func_idx = self.func_indices.get(&arity_mangled)
+                            .or_else(|| self.func_indices.get(&mangled))
+                            .copied();
+                        if let Some(func_idx) = func_idx {
+                            let mut call_args = Vec::new();
+                            for arg in args.iter() {
+                                call_args.push(self.lower_expr(arg)?);
+                            }
+                            for (_, val) in named_args.iter() {
+                                call_args.push(self.lower_expr(val)?);
+                            }
+                            let ret_ty = self.func_return_types.get(&mangled)
+                                .cloned()
+                                .unwrap_or(ty.clone());
+                            let ret_wasm = match &ret_ty {
+                                crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                                t => t.to_wasm(),
+                            };
+                            return Ok(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: call_args },
+                                ret_ty, ret_wasm,
+                            ));
+                        }
+                    }
+                }
+
+                // 推断 receiver 类型：优先使用局部 AST 类型映射，再用 type_ctx
+                let obj_ty = if let Expr::Var(name) = object.as_ref() {
+                    self.local_ast_types.get(name).cloned()
+                        .unwrap_or_else(|| self.type_ctx.infer_expr(object).unwrap_or(crate::ast::Type::Int32))
+                } else {
+                    self.type_ctx.infer_expr(object)?
+                };
+
+                // ── 内置类型方法处理 ──
+                if let Some(result) = self.try_lower_builtin_method(object, &obj_ty, method, args)? {
+                    return Ok(result);
+                }
+
                 let class_name = match &obj_ty {
                     crate::ast::Type::Struct(name, _) => Some(name.clone()),
                     crate::ast::Type::Qualified(parts) => parts.last().cloned(),
@@ -404,13 +603,30 @@ impl<'a> LoweringContext<'a> {
                 };
 
                 if let Some(cls) = class_name {
-                    let mangled_method = format!("{}.{}", cls, method);
-                    // 尝试精确匹配（arity = 1 + args.len()，含 this）
                     let arity = 1 + args.len() + named_args.len();
-                    let mangled_with_arity = format!("{}${}", mangled_method, arity);
-                    let func_idx = self.func_indices.get(&mangled_with_arity)
-                        .or_else(|| self.func_indices.get(&mangled_method))
-                        .copied();
+                    // 查找方法：先在当前类，再沿继承链向上查找
+                    let mut search_cls = cls.clone();
+                    let mut func_idx = None;
+                    let mut resolved_method = String::new();
+                    loop {
+                        let mangled_method = format!("{}.{}", search_cls, method);
+                        let mangled_with_arity = format!("{}${}", mangled_method, arity);
+                        func_idx = self.func_indices.get(&mangled_with_arity)
+                            .or_else(|| self.func_indices.get(&mangled_method))
+                            .copied();
+                        if func_idx.is_some() {
+                            resolved_method = mangled_method;
+                            break;
+                        }
+                        // 向父类查找
+                        if let Some(parent) = self.class_extends.get(&search_cls) {
+                            search_cls = parent.clone();
+                        } else {
+                            resolved_method = format!("{}.{}", cls, method);
+                            break;
+                        }
+                    }
+                    let mangled_method = resolved_method;
 
                     if let Some(func_idx) = func_idx {
                         // 查询方法签名以获取参数 WASM 类型（含 this）
@@ -462,16 +678,91 @@ impl<'a> LoweringContext<'a> {
                 CHIRExprKind::Nop
             }
 
+            // super() 调用：在 init 函数中调用父类 init → 直接设置父类字段
+            Expr::SuperCall { method, args, .. } => {
+                if (method == "init" || method.is_empty()) && self.current_class.is_some() {
+                    let (class_name, this_idx) = self.current_class.clone().unwrap();
+                    if let Some(parent) = self.class_extends.get(&class_name).cloned() {
+                        if let Some(fields) = self.class_field_info.get(&parent) {
+                            let mut sorted_fields: Vec<_> = fields.iter().collect();
+                            sorted_fields.sort_by_key(|(_, (off, _))| *off);
+                            let this_expr = CHIRExpr::new(
+                                CHIRExprKind::Local(this_idx),
+                                crate::ast::Type::Struct(class_name.clone(), vec![]),
+                                ValType::I32,
+                            );
+                            let mut stmts = Vec::new();
+                            for (i, arg) in args.iter().enumerate() {
+                                if let Some((_, (offset, _))) = sorted_fields.get(i) {
+                                    let arg_chir = self.lower_expr(arg)?;
+                                    stmts.push(crate::chir::CHIRStmt::Assign {
+                                        target: crate::chir::CHIRLValue::Field {
+                                            object: Box::new(this_expr.clone()),
+                                            offset: *offset,
+                                        },
+                                        value: arg_chir,
+                                    });
+                                }
+                            }
+                            let block = crate::chir::CHIRBlock { stmts, result: None };
+                            return Ok(CHIRExpr::new(
+                                CHIRExprKind::Block(block),
+                                crate::ast::Type::Unit, ValType::I32,
+                            ));
+                        }
+                    }
+                }
+                CHIRExprKind::Nop
+            }
+
             // 字段访问
             Expr::Field { object, field } => {
-                let obj_chir = self.lower_expr(object)?;
-                let obj_ty = self.type_ctx.infer_expr(object)?;
+                let obj_ty = if let Expr::Var(name) = object.as_ref() {
+                    self.local_ast_types.get(name).cloned()
+                        .unwrap_or_else(|| self.type_ctx.infer_expr(object).unwrap_or(crate::ast::Type::Int32))
+                } else {
+                    self.type_ctx.infer_expr(object)?
+                };
 
-                // 获取字段偏移
+                // String.size → load i32 length at offset 0, then extend to i64
+                if matches!(obj_ty, crate::ast::Type::String) && field == "size" {
+                    let obj_chir = self.lower_expr(object)?;
+                    let obj_chir = self.insert_cast_if_needed(obj_chir, ValType::I32);
+                    let i32_load = CHIRExpr::new(
+                        CHIRExprKind::FieldGet {
+                            object: Box::new(obj_chir),
+                            field_offset: 0,
+                            field_ty: crate::ast::Type::Int32,
+                        },
+                        crate::ast::Type::Int32, ValType::I32,
+                    );
+                    return Ok(self.insert_cast_if_needed(i32_load, ValType::I64));
+                }
+
+                // 先检查是否是 property getter（ClassName.__get_propName）
+                let class_name = match &obj_ty {
+                    crate::ast::Type::Struct(name, _) => Some(name.clone()),
+                    _ => None,
+                };
+                if let Some(ref cls) = class_name {
+                    let getter_name = format!("{}.__get_{}", cls, field);
+                    if let Some(&func_idx) = self.func_indices.get(&getter_name) {
+                        let obj_chir = self.lower_expr(object)?;
+                        let obj_chir = self.insert_cast_if_needed(obj_chir, ValType::I32);
+                        let ret_ty = self.func_return_types.get(&getter_name)
+                            .cloned()
+                            .unwrap_or(crate::ast::Type::Int64);
+                        let ret_wasm = ret_ty.to_wasm();
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx, args: vec![obj_chir] },
+                            ret_ty, ret_wasm,
+                        ));
+                    }
+                }
+
+                let obj_chir = self.lower_expr(object)?;
                 let offset = self.get_field_offset(&obj_ty, field)?;
                 let field_ty = self.type_ctx.infer_field_type(&obj_ty, field)?;
-
-                // 对象指针必须是 I32，否则 I32Add 会类型不匹配
                 let obj_chir = self.insert_cast_if_needed(obj_chir, ValType::I32);
 
                 CHIRExprKind::FieldGet {
@@ -483,29 +774,42 @@ impl<'a> LoweringContext<'a> {
 
             // 数组
             Expr::Array(elems) => {
-                // 简化：转换为 ArrayNew
-                let len = CHIRExpr::new(
-                    CHIRExprKind::Integer(elems.len() as i64),
-                    Type::Int64,
-                    ValType::I64,
-                );
-
-                // 默认初始化为 0
-                let init = CHIRExpr::new(
-                    CHIRExprKind::Integer(0),
-                    Type::Int64,
-                    ValType::I64,
-                );
-
-                CHIRExprKind::ArrayNew {
-                    len: Box::new(len),
-                    init: Box::new(init),
-                }
+                let elements: Vec<CHIRExpr> = elems.iter()
+                    .map(|e| self.lower_expr(e))
+                    .collect::<Result<Vec<_>, _>>()?;
+                CHIRExprKind::ArrayLiteral { elements }
             }
 
             // 数组索引
             Expr::Index { array, index } => {
-                // 数组指针必须是 I32
+                // Check if this is tuple indexing (pair[0]) vs array indexing
+                let obj_ast_ty = if let Expr::Var(name) = array.as_ref() {
+                    self.local_ast_types.get(name).cloned()
+                        .or_else(|| self.type_ctx.locals.get(name.as_str()).cloned())
+                } else {
+                    None
+                };
+
+                if let Some(crate::ast::Type::Tuple(elem_types)) = &obj_ast_ty {
+                    let tuple_chir = self.lower_expr(array)?;
+                    let idx = match index.as_ref() {
+                        Expr::Integer(n) => *n as usize,
+                        _ => 0,
+                    };
+                    let elem_ty = elem_types.get(idx).cloned().unwrap_or(crate::ast::Type::Int64);
+                    let elem_wasm = match &elem_ty {
+                        crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                        t => t.to_wasm(),
+                    };
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::TupleGet {
+                            tuple: Box::new(tuple_chir),
+                            index: idx,
+                        },
+                        elem_ty, elem_wasm,
+                    ));
+                }
+
                 let array_chir_raw = self.lower_expr(array)?;
                 let array_chir = self.insert_cast_if_needed(array_chir_raw, ValType::I32);
                 let index_chir = self.lower_expr(index)?;
@@ -531,10 +835,30 @@ impl<'a> LoweringContext<'a> {
             Expr::TupleIndex { object, index } => {
                 let tuple_chir = self.lower_expr(object)?;
 
-                CHIRExprKind::TupleGet {
-                    tuple: Box::new(tuple_chir),
-                    index: *index as usize,
-                }
+                // Determine element type from the tuple's AST type
+                let elem_ty = if let Expr::Var(name) = object.as_ref() {
+                    self.local_ast_types.get(name)
+                        .and_then(|t| if let crate::ast::Type::Tuple(types) = t {
+                            types.get(*index as usize).cloned()
+                        } else {
+                            None
+                        })
+                        .unwrap_or(crate::ast::Type::Int64)
+                } else {
+                    crate::ast::Type::Int64
+                };
+                let elem_wasm = match &elem_ty {
+                    crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                    t => t.to_wasm(),
+                };
+
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::TupleGet {
+                        tuple: Box::new(tuple_chir),
+                        index: *index as usize,
+                    },
+                    elem_ty, elem_wasm,
+                ));
             }
 
             // 结构体初始化
@@ -581,16 +905,51 @@ impl<'a> LoweringContext<'a> {
                         });
                     }
                 }
-                // 未知构造函数：返回 Nop（避免 func_idx 回退为 0 即 fd_write）
-                let func_idx = match self.func_indices.get(name.as_str()).copied() {
+                // 查找 __ClassName_init（类构造函数）或直接同名函数（struct 等）
+                let init_name = format!("__{}_init", name);
+                let mangled_init = format!("{}${}", init_name, args.len());
+                let func_idx = self.func_indices.get(mangled_init.as_str()).copied()
+                    .or_else(|| self.func_indices.get(init_name.as_str()).copied())
+                    .or_else(|| self.func_indices.get(name.as_str()).copied());
+                let func_idx = match func_idx {
                     Some(idx) => idx,
                     None => {
+                        // 如果是已知的 struct，生成 StructNew
+                        if self.struct_field_offsets.contains_key(name.as_str())
+                            || self.class_field_offsets.contains_key(name.as_str()) {
+                            // 按字段定义顺序获取字段名
+                            let field_names: Vec<String> = self.struct_field_offsets.get(name.as_str())
+                                .or_else(|| self.class_field_offsets.get(name.as_str()))
+                                .map(|m| {
+                                    let mut entries: Vec<(&String, &u32)> = m.iter().collect();
+                                    entries.sort_by_key(|(_, off)| **off);
+                                    entries.iter().map(|(n, _)| (*n).clone()).collect()
+                                })
+                                .unwrap_or_default();
+                            let args_chir: Vec<(String, CHIRExpr)> = args.iter().enumerate()
+                                .map(|(i, a)| {
+                                    let arg = self.lower_expr(a).unwrap_or_else(|_| CHIRExpr::new(CHIRExprKind::Nop, crate::ast::Type::Int32, ValType::I32));
+                                    let fname = field_names.get(i).cloned().unwrap_or_else(|| format!("field{}", i));
+                                    (fname, arg)
+                                })
+                                .collect();
+                            return Ok(CHIRExpr {
+                                kind: CHIRExprKind::StructNew {
+                                    struct_name: name.clone(),
+                                    fields: args_chir,
+                                },
+                                ty,
+                                wasm_ty: ValType::I32,
+                                span: None,
+                            });
+                        }
                         return Ok(CHIRExpr::new(CHIRExprKind::Nop, ty, wasm_ty));
                     }
                 };
 
                 let param_tys: Vec<ValType> = self.type_ctx.functions
-                    .get(name.as_str())
+                    .get(init_name.as_str())
+                    .or_else(|| self.type_ctx.functions.get(name.as_str()))
                     .map(|sig| sig.params.iter().map(|p| match p {
                         crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
                         t => t.to_wasm(),
@@ -648,14 +1007,37 @@ impl<'a> LoweringContext<'a> {
             // Match 表达式
             Expr::Match { expr: subject, arms } => {
                 let subject_chir = self.lower_expr(subject)?;
-                let arms_chir: Result<Vec<_>, _> = arms.iter()
-                    .map(|arm| self.lower_match_arm(arm))
-                    .collect();
-
-                CHIRExprKind::Match {
-                    subject: Box::new(subject_chir),
-                    arms: arms_chir?,
+                let mut arms_chir = Vec::new();
+                for arm in arms {
+                    // 展开 Or 模式为多个独立 arms
+                    if let crate::ast::Pattern::Or(sub_patterns) = &arm.pattern {
+                        for sub_pat in sub_patterns {
+                            let pattern = self.lower_pattern(sub_pat)?;
+                            let body = self.lower_expr_to_block(&arm.body)?;
+                            arms_chir.push(CHIRMatchArm { pattern, guard: None, body });
+                        }
+                    } else {
+                        arms_chir.push(self.lower_match_arm(arm)?);
+                    }
                 }
+
+                // 推断 match 结果类型：优先从第一个 arm 的 body 推断
+                let (match_ty, match_wasm_ty) = arms_chir.first()
+                    .and_then(|arm| {
+                        arm.body.result.as_ref().map(|r| (r.ty.clone(), r.wasm_ty))
+                            .or_else(|| arm.body.stmts.last().and_then(|s| {
+                                if let crate::chir::CHIRStmt::Expr(e) = s { Some((e.ty.clone(), e.wasm_ty)) } else { None }
+                            }))
+                    })
+                    .unwrap_or((ty.clone(), wasm_ty));
+
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Match {
+                        subject: Box::new(subject_chir),
+                        arms: arms_chir,
+                    },
+                    match_ty, match_wasm_ty,
+                ));
             }
 
             // try-catch-finally：
@@ -663,17 +1045,27 @@ impl<'a> LoweringContext<'a> {
             //   仅执行 finally body（如有）
             // - 无 catch block（纯 try-finally）时，顺序执行 try body + finally body
             Expr::TryBlock { body, catch_body, catch_var, finally_body, resources, .. } => {
-                let has_catch = catch_var.is_some() || !catch_body.is_empty() || !resources.is_empty();
+                let has_catch = catch_var.is_some() || !catch_body.is_empty();
                 let mut stmts: Vec<crate::chir::CHIRStmt> = Vec::new();
 
+                // try-with-resources: lower resource declarations as let bindings
+                for (name, init_expr) in resources {
+                    let value_chir = self.lower_expr(init_expr)?;
+                    let local_wasm_ty = value_chir.wasm_ty;
+                    self.local_ast_types.insert(name.clone(), value_chir.ty.clone());
+                    let local_idx = self.alloc_local_typed(name.clone(), local_wasm_ty);
+                    stmts.push(crate::chir::CHIRStmt::Let { local_idx, value: value_chir });
+                }
+
                 if !has_catch {
-                    // 纯 try-finally：执行 try body
+                    // 无 catch 块：执行 try body（含 try-with-resources）
                     for stmt in body {
                         if let Ok(s) = self.lower_stmt(stmt) {
                             stmts.push(s);
                         }
                     }
                 }
+                // 有 catch 块时跳过 try body（throw/异常需要 WASM exception handling 支持）
                 // finally body（无论如何都执行）
                 if let Some(fin_stmts) = finally_body {
                     for stmt in fin_stmts {
@@ -683,13 +1075,94 @@ impl<'a> LoweringContext<'a> {
                     }
                 }
                 if stmts.is_empty() {
-                    // 没有任何语句需要执行：返回 Nop
                     CHIRExprKind::Nop
                 } else {
                     return Ok(CHIRExpr::new(
                         CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: None }),
                         ty.clone(),
                         wasm_ty,
+                    ));
+                }
+            }
+
+            // 类型转换 (as)
+            Expr::Cast { expr: inner, target_ty } => {
+                let inner_chir = self.lower_expr(inner)?;
+                let target_wasm = target_ty.to_wasm();
+                let cast_chir = self.insert_cast_if_needed(inner_chir, target_wasm);
+                return Ok(CHIRExpr::new(cast_chir.kind, target_ty.clone(), target_wasm));
+            }
+
+            // 枚举变体构造
+            Expr::VariantConst { enum_name, variant_name, arg } => {
+                let enum_def = self.enum_defs.iter().find(|e| e.name == *enum_name);
+                let disc = enum_def
+                    .and_then(|e| e.variant_index(variant_name))
+                    .unwrap_or(0) as i64;
+                let has_payload = enum_def.map_or(false, |e| e.has_payload());
+                if has_payload {
+                    let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
+                    let tmp = self.alloc_local_typed("__enum_tmp".into(), ValType::I32);
+                    let tmp_get = || CHIRExpr::new(
+                        CHIRExprKind::Local(tmp),
+                        crate::ast::Type::Int32, ValType::I32,
+                    );
+                    let disc_expr = CHIRExpr::new(
+                        CHIRExprKind::Integer(disc),
+                        crate::ast::Type::Int32, ValType::I32,
+                    );
+                    if let Some(arg_expr) = arg {
+                        let arg_chir = self.lower_expr(arg_expr)?;
+                        let alloc_size = CHIRExpr::new(
+                            CHIRExprKind::Integer(12),
+                            crate::ast::Type::Int32, ValType::I32,
+                        );
+                        let alloc_call = CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: alloc_idx, args: vec![alloc_size] },
+                            crate::ast::Type::Int32, ValType::I32,
+                        );
+                        let stmts = vec![
+                            crate::chir::CHIRStmt::Let { local_idx: tmp, value: alloc_call },
+                            crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(disc_expr), offset: 0, align: 2 },
+                                crate::ast::Type::Unit, ValType::I32,
+                            )),
+                            crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(arg_chir), offset: 4, align: 3 },
+                                crate::ast::Type::Unit, ValType::I32,
+                            )),
+                        ];
+                        let result = Some(Box::new(tmp_get()));
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result }),
+                            crate::ast::Type::Int32, ValType::I32,
+                        ));
+                    } else {
+                        let alloc_size = CHIRExpr::new(
+                            CHIRExprKind::Integer(4),
+                            crate::ast::Type::Int32, ValType::I32,
+                        );
+                        let alloc_call = CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: alloc_idx, args: vec![alloc_size] },
+                            crate::ast::Type::Int32, ValType::I32,
+                        );
+                        let stmts = vec![
+                            crate::chir::CHIRStmt::Let { local_idx: tmp, value: alloc_call },
+                            crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(disc_expr), offset: 0, align: 2 },
+                                crate::ast::Type::Unit, ValType::I32,
+                            )),
+                        ];
+                        let result = Some(Box::new(tmp_get()));
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result }),
+                            crate::ast::Type::Int32, ValType::I32,
+                        ));
+                    }
+                } else {
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Integer(disc),
+                        crate::ast::Type::Int32, ValType::I32,
                     ));
                 }
             }
@@ -742,18 +1215,224 @@ impl<'a> LoweringContext<'a> {
     /// 获取字段偏移（对未知结构体或未知字段均返回 0，避免 lowering 中断）
     pub fn get_field_offset(&self, obj_ty: &Type, field: &str) -> Result<u32, String> {
         match obj_ty {
-            Type::Struct(name, _) => {
-                let offset = self.struct_field_offsets
-                    .get(name.as_str())
-                    .and_then(|fields| fields.get(field).copied())
-                    .unwrap_or(0);
-                Ok(offset)
+            Type::Struct(name, type_args) => {
+                let names = Self::resolve_type_names(name, type_args);
+                for n in &names {
+                    if let Some(info) = self.class_field_info.get(n.as_str())
+                        .and_then(|fields| fields.get(field)) {
+                        return Ok(info.0);
+                    }
+                    if let Some(&offset) = self.class_field_offsets.get(n.as_str())
+                        .and_then(|fields| fields.get(field)) {
+                        return Ok(offset);
+                    }
+                    if let Some(&offset) = self.struct_field_offsets
+                        .get(n.as_str())
+                        .and_then(|fields| fields.get(field)) {
+                        return Ok(offset);
+                    }
+                }
+                Ok(0)
             }
-            _ => Ok(0),
+            _ => {
+                for (_class_name, fields) in self.class_field_info.iter() {
+                    if let Some(info) = fields.get(field) {
+                        return Ok(info.0);
+                    }
+                }
+                Ok(0)
+            },
         }
     }
 
+    fn resolve_type_names(name: &str, type_args: &[Type]) -> Vec<String> {
+        let mut names = Vec::new();
+        if !type_args.is_empty() {
+            names.push(crate::monomorph::mangle_name(name, type_args));
+        }
+        names.push(name.to_string());
+        names
+    }
+
     /// 将表达式转换为块
+    /// 内置类型（Int64, Float64, Bool, String）的方法调用
+    fn try_lower_builtin_method(
+        &mut self,
+        object: &Expr,
+        obj_ty: &crate::ast::Type,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<Option<CHIRExpr>, String> {
+        use crate::ast::Type;
+        match obj_ty {
+            Type::Int64 | Type::Int32 | Type::Int8 | Type::Int16 => {
+                match method {
+                    "toFloat64" => {
+                        let inner = self.lower_expr(object)?;
+                        let inner = self.insert_cast_if_needed(inner, ValType::I64);
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::Cast { expr: Box::new(inner), from_ty: ValType::I64, to_ty: ValType::F64 },
+                            Type::Float64, ValType::F64,
+                        )));
+                    }
+                    "abs" => {
+                        let inner = self.lower_expr(object)?;
+                        let inner = self.insert_cast_if_needed(inner, ValType::I64);
+                        let local = self.alloc_local_typed("__abs_tmp".into(), ValType::I64);
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::BuiltinAbs { val: Box::new(inner), tmp_local: local },
+                            Type::Int64, ValType::I64,
+                        )));
+                    }
+                    "compareTo" if args.len() == 1 => {
+                        let left = self.lower_expr(object)?;
+                        let left = self.insert_cast_if_needed(left, ValType::I64);
+                        let right = self.lower_expr(&args[0])?;
+                        let right = self.insert_cast_if_needed(right, ValType::I64);
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::BuiltinCompareTo { left: Box::new(left), right: Box::new(right) },
+                            Type::Int64, ValType::I64,
+                        )));
+                    }
+                    "toString" => {
+                        let inner = self.lower_expr(object)?;
+                        let inner = self.insert_cast_if_needed(inner, ValType::I64);
+                        if let Some(&func_idx) = self.func_indices.get("__i64_to_str") {
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![inner] },
+                                Type::String, ValType::I32,
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Type::Float64 | Type::Float32 => {
+                match method {
+                    "toInt64" => {
+                        let inner = self.lower_expr(object)?;
+                        let inner = self.insert_cast_if_needed(inner, ValType::F64);
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::Cast { expr: Box::new(inner), from_ty: ValType::F64, to_ty: ValType::I64 },
+                            Type::Int64, ValType::I64,
+                        )));
+                    }
+                    "toString" => {
+                        let inner = self.lower_expr(object)?;
+                        let inner = self.insert_cast_if_needed(inner, ValType::F64);
+                        if let Some(&func_idx) = self.func_indices.get("__f64_to_str") {
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![inner] },
+                                Type::String, ValType::I32,
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Type::Bool => {
+                if method == "toString" {
+                    let inner = self.lower_expr(object)?;
+                    if let Some(&func_idx) = self.func_indices.get("__bool_to_str") {
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx, args: vec![inner] },
+                            Type::String, ValType::I32,
+                        )));
+                    }
+                }
+            }
+            Type::String => {
+                match method {
+                    "toInt64" => {
+                        let inner = self.lower_expr(object)?;
+                        let inner = self.insert_cast_if_needed(inner, ValType::I32);
+                        if let Some(&func_idx) = self.func_indices.get("__str_to_i64") {
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![inner] },
+                                Type::Int64, ValType::I64,
+                            )));
+                        }
+                    }
+                    "isEmpty" => {
+                        let inner = self.lower_expr(object)?;
+                        let inner = self.insert_cast_if_needed(inner, ValType::I32);
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::BuiltinStringIsEmpty { val: Box::new(inner) },
+                            Type::Bool, ValType::I32,
+                        )));
+                    }
+                    "contains" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__str_contains") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let arg = self.lower_expr(&args[0])?;
+                            let arg = self.insert_cast_if_needed(arg, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, arg] },
+                                Type::Bool, ValType::I32,
+                            )));
+                        }
+                    }
+                    "startsWith" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__str_starts_with") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let arg = self.lower_expr(&args[0])?;
+                            let arg = self.insert_cast_if_needed(arg, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, arg] },
+                                Type::Bool, ValType::I32,
+                            )));
+                        }
+                    }
+                    "endsWith" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__str_ends_with") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let arg = self.lower_expr(&args[0])?;
+                            let arg = self.insert_cast_if_needed(arg, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, arg] },
+                                Type::Bool, ValType::I32,
+                            )));
+                        }
+                    }
+                    "trim" => {
+                        if let Some(&func_idx) = self.func_indices.get("__str_trim") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj] },
+                                Type::String, ValType::I32,
+                            )));
+                        }
+                    }
+                    "isBlank" => {
+                        // isBlank = trim().size == 0
+                        if let (Some(&trim_idx), Some(&_)) = (
+                            self.func_indices.get("__str_trim"),
+                            self.func_indices.get("__str_trim"),
+                        ) {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let trimmed = CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx: trim_idx, args: vec![obj] },
+                                Type::String, ValType::I32,
+                            );
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::BuiltinStringIsEmpty { val: Box::new(trimmed) },
+                                Type::Bool, ValType::I32,
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
     pub fn lower_expr_to_block(&mut self, expr: &Expr) -> Result<CHIRBlock, String> {
         // Block 表达式直接转换为 CHIRBlock（保留语句）
         if let Expr::Block(stmts, block_result) = expr {
@@ -773,13 +1452,147 @@ impl<'a> LoweringContext<'a> {
     }
 
     /// 降低 Match 分支
-    fn lower_match_arm(&mut self, _arm: &crate::ast::MatchArm) -> Result<CHIRMatchArm, String> {
-        // 简化：返回通配符模式
+    fn lower_match_arm(&mut self, arm: &crate::ast::MatchArm) -> Result<CHIRMatchArm, String> {
+        let pattern = self.lower_pattern(&arm.pattern)?;
+        let guard = if let Some(guard_expr) = &arm.guard {
+            Some(self.lower_expr(guard_expr)?)
+        } else {
+            None
+        };
+        let body = self.lower_expr_to_block(&arm.body)?;
         Ok(CHIRMatchArm {
-            pattern: CHIRPattern::Wildcard,
-            guard: None,
-            body: CHIRBlock::empty(),
+            pattern,
+            guard,
+            body,
         })
+    }
+
+    fn lower_pattern(&mut self, pat: &crate::ast::Pattern) -> Result<CHIRPattern, String> {
+        match pat {
+            crate::ast::Pattern::Wildcard => Ok(CHIRPattern::Wildcard),
+            crate::ast::Pattern::Binding(name) => {
+                let idx = self.alloc_local_typed(name.clone(), wasm_encoder::ValType::I64);
+                Ok(CHIRPattern::Binding(idx))
+            }
+            crate::ast::Pattern::Literal(lit) => {
+                let chir_lit = match lit {
+                    crate::ast::Literal::Integer(n) => crate::chir::CHIRLiteral::Integer(*n),
+                    crate::ast::Literal::Bool(b) => crate::chir::CHIRLiteral::Bool(*b),
+                    crate::ast::Literal::String(s) => crate::chir::CHIRLiteral::String(s.clone()),
+                    _ => crate::chir::CHIRLiteral::Integer(0),
+                };
+                Ok(CHIRPattern::Literal(chir_lit))
+            }
+            crate::ast::Pattern::Or(patterns) => {
+                // 多模式：展开为多个 Literal arms（简化处理：只取第一个非 Wildcard）
+                // 实际需要在 codegen 中处理 Or，这里暂时只取第一个
+                if let Some(first) = patterns.first() {
+                    self.lower_pattern(first)
+                } else {
+                    Ok(CHIRPattern::Wildcard)
+                }
+            }
+            crate::ast::Pattern::Range { start, end, inclusive } => {
+                let s = match start {
+                    crate::ast::Literal::Integer(n) => *n,
+                    _ => 0,
+                };
+                let e = match end {
+                    crate::ast::Literal::Integer(n) => *n,
+                    _ => 0,
+                };
+                Ok(CHIRPattern::Range { start: s, end: e, inclusive: *inclusive })
+            }
+            crate::ast::Pattern::Variant { enum_name, variant_name, payload } => {
+                let enum_def = self.enum_defs.iter().find(|e| e.name == *enum_name);
+                let discriminant = enum_def
+                    .and_then(|e| e.variant_index(variant_name))
+                    .unwrap_or(0) as i32;
+                let enum_has_payload = enum_def.map_or(false, |e| e.has_payload());
+                let payload_binding = if let Some(payload_pat) = payload {
+                    if let crate::ast::Pattern::Binding(name) = payload_pat.as_ref() {
+                        Some(self.alloc_local_typed(name.clone(), wasm_encoder::ValType::I64))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok(CHIRPattern::Variant { discriminant, payload_binding, enum_has_payload })
+            }
+            crate::ast::Pattern::Struct { name, fields } => {
+                let struct_ty = crate::ast::Type::Struct(name.clone(), vec![]);
+                let mut chir_fields = Vec::new();
+                for (field_name, sub_pat) in fields {
+                    let offset = self.get_field_offset(&struct_ty, field_name).unwrap_or(0);
+                    let field_ty = self.type_ctx.infer_field_type(&struct_ty, field_name)
+                        .unwrap_or(crate::ast::Type::Int64);
+                    let field_wasm = match &field_ty {
+                        crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                        t => t.to_wasm(),
+                    };
+                    match sub_pat {
+                        crate::ast::Pattern::Literal(lit) => {
+                            let val = match lit {
+                                crate::ast::Literal::Integer(n) => *n,
+                                crate::ast::Literal::Bool(b) => if *b { 1 } else { 0 },
+                                _ => 0,
+                            };
+                            chir_fields.push(crate::chir::StructPatternField::Literal {
+                                offset, value: val, wasm_ty: field_wasm,
+                            });
+                        }
+                        crate::ast::Pattern::Binding(bind_name) => {
+                            let local_idx = self.alloc_local_typed(bind_name.clone(), field_wasm);
+                            self.local_ast_types.insert(bind_name.clone(), field_ty.clone());
+                            chir_fields.push(crate::chir::StructPatternField::Binding {
+                                offset, local_idx, wasm_ty: field_wasm,
+                            });
+                        }
+                        crate::ast::Pattern::Wildcard => {
+                            // wildcard field: no check needed, no binding
+                        }
+                        crate::ast::Pattern::Struct { name: inner_name, fields: inner_fields } => {
+                            let inner_ty = crate::ast::Type::Struct(inner_name.clone(), vec![]);
+                            for (inner_field_name, inner_sub_pat) in inner_fields {
+                                let inner_offset = self.get_field_offset(&inner_ty, inner_field_name).unwrap_or(0);
+                                let inner_field_ty = self.type_ctx.infer_field_type(&inner_ty, inner_field_name)
+                                    .unwrap_or(crate::ast::Type::Int64);
+                                let inner_wasm = match &inner_field_ty {
+                                    crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                                    t => t.to_wasm(),
+                                };
+                                match inner_sub_pat {
+                                    crate::ast::Pattern::Literal(lit) => {
+                                        let val = match lit {
+                                            crate::ast::Literal::Integer(n) => *n,
+                                            crate::ast::Literal::Bool(b) => if *b { 1 } else { 0 },
+                                            _ => 0,
+                                        };
+                                        chir_fields.push(crate::chir::StructPatternField::NestedLiteral {
+                                            outer_offset: offset, inner_offset, value: val, wasm_ty: inner_wasm,
+                                        });
+                                    }
+                                    crate::ast::Pattern::Binding(bind_name) => {
+                                        let local_idx = self.alloc_local_typed(bind_name.clone(), inner_wasm);
+                                        self.local_ast_types.insert(bind_name.clone(), inner_field_ty.clone());
+                                        chir_fields.push(crate::chir::StructPatternField::NestedBinding {
+                                            outer_offset: offset, inner_offset, local_idx, wasm_ty: inner_wasm,
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {
+                            // Other nested patterns: treat as wildcard
+                        }
+                    }
+                }
+                Ok(CHIRPattern::Struct { fields: chir_fields })
+            }
+            _ => Ok(CHIRPattern::Wildcard),
+        }
     }
 }
 
@@ -1084,7 +1897,7 @@ mod tests {
 
         let expr = Expr::Array(vec![Expr::Integer(1), Expr::Integer(2)]);
         let chir = ctx.lower_expr(&expr).unwrap();
-        assert!(matches!(chir.kind, CHIRExprKind::ArrayNew { .. }));
+        assert!(matches!(chir.kind, CHIRExprKind::ArrayLiteral { .. }));
     }
 
     #[test]
@@ -1371,7 +2184,7 @@ mod tests {
             Expr::Float(3.0),
         ]);
         let chir = ctx.lower_expr(&expr).unwrap();
-        assert!(matches!(chir.kind, CHIRExprKind::ArrayNew { .. }));
+        assert!(matches!(chir.kind, CHIRExprKind::ArrayLiteral { .. }));
     }
 
     #[test]
@@ -1611,7 +2424,7 @@ mod tests {
             target_ty: Type::Int32,
         };
         let chir = ctx.lower_expr(&expr).unwrap();
-        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+        assert_eq!(chir.wasm_ty, ValType::I32);
     }
 
     #[test]

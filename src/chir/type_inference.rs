@@ -216,6 +216,12 @@ impl TypeInferenceContext {
                 if matches!(name.as_str(), "PI" | "E" | "TAU" | "INF" | "INFINITY" | "NEG_INF" | "NEG_INFINITY" | "NAN") {
                     return Ok(Type::Float64);
                 }
+                // 类/结构体名称 → 类型引用
+                if self.struct_fields.contains_key(name.as_str())
+                    || self.class_fields.contains_key(name.as_str())
+                {
+                    return Ok(Type::Struct(name.clone(), vec![]));
+                }
                 // 未知变量保守推断为对象引用 (I32)，避免 lowering 失败
                 Ok(Type::Int32)
             }
@@ -248,9 +254,10 @@ impl TypeInferenceContext {
                     "readln" => Ok(Type::String),
                     "exit" => Ok(Type::Nothing),
                     "abs" | "min" | "max" if !args.is_empty() => {
-                        // 优先查函数签名，无签名则从第一个参数推断
                         self.infer_expr(&args[0])
                     }
+                    "sqrt" | "floor" | "ceil" | "trunc" | "nearest"
+                    | "sin" | "cos" | "exp" | "log" | "pow" => Ok(Type::Float64),
                     // 整数类型转换构造函数 → 对应整数类型
                     "Int8" | "Int16" | "Int32" | "UInt8" | "UInt16" | "UInt32" => Ok(Type::Int32),
                     "Int64" | "UInt64" | "IntNative" | "UIntNative" => Ok(Type::Int64),
@@ -259,6 +266,9 @@ impl TypeInferenceContext {
                     "Float64" => Ok(Type::Float64),
                     // 字符串相关
                     "toString" | "format" => Ok(Type::String),
+                    // WASI 运行时函数
+                    "now" | "randomInt64" => Ok(Type::Int64),
+                    "randomFloat64" => Ok(Type::Float64),
                     _ => {
                         // 检查是否为结构体/类构造函数 → 对象引用 (I32)
                         if self.struct_fields.contains_key(name.as_str())
@@ -303,6 +313,17 @@ impl TypeInferenceContext {
                     Type::Tuple(types) => {
                         // 元组索引，返回第一个元素类型（简化）
                         Ok(types.first().cloned().unwrap_or(Type::Int64))
+                    }
+                    _ => Ok(Type::Int64),
+                }
+            }
+
+            // 元组索引 pair[0]
+            Expr::TupleIndex { object, index } => {
+                let obj_ty = self.infer_expr(object)?;
+                match obj_ty {
+                    Type::Tuple(types) => {
+                        Ok(types.get(*index as usize).cloned().unwrap_or(Type::Int64))
                     }
                     _ => Ok(Type::Int64),
                 }
@@ -449,19 +470,33 @@ impl TypeInferenceContext {
     /// 推断字段类型（查 struct_fields + class_fields，未知保守推断为 I32）
     pub fn infer_field_type(&self, obj_ty: &Type, field: &str) -> Result<Type, String> {
         match obj_ty {
-            Type::Struct(name, _) => {
-                // 先查 struct_fields
-                if let Some(fields) = self.struct_fields.get(name.as_str()) {
-                    return Ok(fields.get(field).cloned().unwrap_or(Type::Int32));
-                }
-                // 再查 class_fields
-                if let Some(fields) = self.class_fields.get(name.as_str()) {
-                    return Ok(fields.get(field).cloned().unwrap_or(Type::Int32));
+            Type::Struct(name, type_args) => {
+                let names = Self::resolve_type_names(name, type_args);
+                for n in &names {
+                    if let Some(fields) = self.struct_fields.get(n.as_str()) {
+                        if let Some(ty) = fields.get(field) {
+                            return Ok(ty.clone());
+                        }
+                    }
+                    if let Some(fields) = self.class_fields.get(n.as_str()) {
+                        if let Some(ty) = fields.get(field) {
+                            return Ok(ty.clone());
+                        }
+                    }
                 }
                 Ok(Type::Int32)
             }
             _ => Ok(Type::Int32),
         }
+    }
+
+    fn resolve_type_names(name: &str, type_args: &[Type]) -> Vec<String> {
+        let mut names = Vec::new();
+        if !type_args.is_empty() {
+            names.push(crate::monomorph::mangle_name(name, type_args));
+        }
+        names.push(name.to_string());
+        names
     }
 
     /// 收集函数中的局部变量类型

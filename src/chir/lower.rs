@@ -15,7 +15,9 @@ pub fn lower_function(
     struct_field_offsets: &HashMap<String, HashMap<String, u32>>,
     class_field_offsets: &HashMap<String, HashMap<String, u32>>,
     class_field_info: &HashMap<String, HashMap<String, (u32, Type)>>,
-    // 当函数是类实例方法时，传入类名；否则传 None
+    class_extends: &HashMap<String, String>,
+    func_return_types: &HashMap<String, Type>,
+    enum_defs: &[crate::ast::EnumDef],
     current_class_name: Option<&str>,
 ) -> Result<CHIRFunction, String> {
     // 为每个函数创建局部类型推断上下文（包含参数和局部变量）
@@ -26,9 +28,16 @@ pub fn lower_function(
     // 类方法：将类字段作为局部变量注册到类型推断上下文
     // 使 infer_expr(Expr::Var("fieldName")) 能正确推断字段类型
     if let Some(class_name) = current_class_name {
+        // 注册 this/self 的类型，使 this.field 能正确推断
+        let class_ty = Type::Struct(class_name.to_string(), vec![]);
+        if !type_ctx.locals.contains_key("this") {
+            type_ctx.add_local("this".to_string(), class_ty.clone());
+        }
+        if !type_ctx.locals.contains_key("self") {
+            type_ctx.add_local("self".to_string(), class_ty);
+        }
         if let Some(fields) = class_field_info.get(class_name) {
             for (field_name, (_, field_ty)) in fields {
-                // 不覆盖已有同名参数（如参数名与字段名冲突时以参数为准）
                 if !type_ctx.locals.contains_key(field_name) {
                     type_ctx.add_local(field_name.clone(), field_ty.clone());
                 }
@@ -53,6 +62,9 @@ pub fn lower_function(
         class_field_info,
     );
     ctx.return_wasm_ty = return_wasm;
+    ctx.class_extends = class_extends.clone();
+    ctx.func_return_types = func_return_types.clone();
+    ctx.enum_defs = enum_defs.to_vec();
 
     // 处理参数（分配局部变量索引，同时记录类型供赋值时强制类型转换）
     let mut params = Vec::new();
@@ -75,7 +87,12 @@ pub fn lower_function(
     // 如果是类实例方法，设置隐式 this 字段访问上下文
     // 实例方法 params[0] 名为 "this"，且调用者提供了类名
     if let Some(class_name) = current_class_name {
-        if let Some(this_param) = params.first() {
+        let is_init = func.name.starts_with("__") && func.name.ends_with("_init");
+        if is_init {
+            // init 函数：allocate this local after params（由 chir_codegen prologue 赋值）
+            let this_idx = ctx.alloc_local_typed("this".to_string(), wasm_encoder::ValType::I32);
+            ctx.current_class = Some((class_name.to_string(), this_idx));
+        } else if let Some(this_param) = params.first() {
             if this_param.name == "this" {
                 ctx.current_class = Some((class_name.to_string(), this_param.local_idx));
             }
@@ -108,18 +125,39 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     // 构建类型推断上下文
     let type_ctx = TypeInferenceContext::from_program(program);
 
-    // 构建函数索引表（偏移 2 跳过 WASI 导入：fd_write=0, proc_exit=1）
+    // 构建函数索引表（偏移 4 跳过 WASI 导入：fd_write=0, proc_exit=1, clock_time_get=2, random_get=3）
     // 同名不同参数的函数（重载）使用 "name$arity" 修饰名，优先精确匹配
-    let import_offset: u32 = 2;
+    let import_offset: u32 = 4;
     let mut func_indices = HashMap::new();
     let mut all_funcs: Vec<&Function> = program.functions.iter().collect();
 
-    // 将类方法（含 struct/class 方法）提取为顶级函数，和 program.functions 一起注册
-    // 方法名格式已是 "ClassName.methodName"，params[0] 为 "this"（非 static）
+    // 将类方法提取为顶级函数
     let class_methods_owned: Vec<Function> = program.classes.iter()
         .flat_map(|c| c.methods.iter().map(|m| m.func.clone()))
         .collect();
     all_funcs.extend(class_methods_owned.iter());
+
+    // 为有 init 的类生成 __ClassName_init 函数
+    let init_funcs_owned: Vec<Function> = program.classes.iter()
+        .filter(|c| c.type_params.is_empty())
+        .filter_map(|c| {
+            c.init.as_ref().map(|init_def| {
+                Function {
+                    visibility: crate::ast::Visibility::Public,
+                    name: format!("__{}_init", c.name),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: init_def.params.clone(),
+                    return_type: Some(Type::Struct(c.name.clone(), vec![])),
+                    throws: None,
+                    body: init_def.body.clone(),
+                    extern_import: None,
+                }
+            })
+        })
+        .collect();
+    all_funcs.extend(init_funcs_owned.iter());
+
 
     for (i, func) in all_funcs.iter().enumerate() {
         let idx = import_offset + i as u32;
@@ -128,6 +166,24 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         func_indices.insert(mangled, idx);
         // 原名：仅当尚未注册时插入（保留首个定义的覆盖规则；重载场景应走修饰名路径）
         func_indices.entry(func.name.clone()).or_insert(idx);
+    }
+
+    // 注册运行时助手函数索引（与 CHIRCodeGen 中的 RT_NAMES 顺序一致）
+    let rt_base = import_offset + all_funcs.len() as u32;
+    let rt_names = [
+        "__rt_println_i64", "__rt_print_i64",
+        "__rt_println_str", "__rt_print_str",
+        "__rt_println_bool", "__rt_print_bool",
+        "__rt_println_empty",
+        "__alloc",
+        "sin", "cos", "tan", "exp", "log", "pow",
+        "__i64_to_str", "__bool_to_str", "__str_to_i64",
+        "__str_concat", "__f64_to_str",
+        "now", "randomInt64", "randomFloat64",
+        "__str_contains", "__str_starts_with", "__str_ends_with", "__str_trim",
+    ];
+    for (i, name) in rt_names.iter().enumerate() {
+        func_indices.insert(name.to_string(), rt_base + i as u32);
     }
 
     // 构建结构体字段偏移表
@@ -145,51 +201,80 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     // 构建类字段偏移表 + 完整字段信息（含类型）
     let mut class_field_offsets = HashMap::new();
     let mut class_field_info: HashMap<String, HashMap<String, (u32, Type)>> = HashMap::new();
-    // 先记录每个类的直接字段
-    for class_def in &program.classes {
+    // struct 字段也加入 class_field_info，供 struct 方法中 this.field 访问
+    for struct_def in &program.structs {
         let mut offsets = HashMap::new();
         let mut info = HashMap::new();
-        let mut offset = 8u32; // vtable 指针占 8 字节
-        for field in &class_def.fields {
+        let mut offset = 0u32;
+        for field in &struct_def.fields {
             offsets.insert(field.name.clone(), offset);
             info.insert(field.name.clone(), (offset, field.ty.clone()));
             offset += field.ty.size() as u32;
         }
-        class_field_offsets.insert(class_def.name.clone(), offsets);
-        class_field_info.insert(class_def.name.clone(), info);
+        class_field_offsets.insert(struct_def.name.clone(), offsets);
+        class_field_info.insert(struct_def.name.clone(), info);
     }
-    // 继承：把父类字段合并到子类（不覆盖已有同名字段）
-    // 多轮迭代处理多层继承
-    let class_extends: HashMap<String, Option<String>> = program.classes.iter()
-        .map(|c| (c.name.clone(), c.extends.clone()))
+    // 预计算 has_vtable：有继承关系的类需要 vtable
+    let mut has_children: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for cd in &program.classes {
+        if let Some(ref parent) = cd.extends {
+            has_children.insert(parent.clone());
+        }
+    }
+    // 构建每个类的完整字段布局（父类字段在前，子类字段在后）
+    // 先构建类定义映射
+    let class_defs: HashMap<String, &crate::ast::ClassDef> = program.classes.iter()
+        .map(|c| (c.name.clone(), c))
         .collect();
-    for _ in 0..10 {
-        let mut changed = false;
-        for class_def in &program.classes {
-            let mut parent = class_def.extends.clone();
-            while let Some(ref parent_name) = parent {
-                // 先 clone 父类数据，然后合并到子类
-                let parent_info_snapshot = class_field_info.get(parent_name).cloned();
-                let parent_offsets_snapshot = class_field_offsets.get(parent_name).cloned();
-                if let Some(parent_info) = parent_info_snapshot {
-                    let child_info = class_field_info.get_mut(&class_def.name).unwrap();
-                    for (name, val) in parent_info {
-                        if !child_info.contains_key(&name) {
-                            child_info.insert(name, val);
-                            changed = true;
-                        }
-                    }
+    // 递归计算类的字段布局
+    fn build_class_fields(
+        class_name: &str,
+        class_defs: &HashMap<String, &crate::ast::ClassDef>,
+        has_children: &std::collections::HashSet<String>,
+        cache: &mut HashMap<String, (HashMap<String, u32>, HashMap<String, (u32, Type)>)>,
+    ) {
+        if cache.contains_key(class_name) { return; }
+        let cd = match class_defs.get(class_name) {
+            Some(cd) => cd,
+            None => return,
+        };
+        let needs_vtable = cd.extends.is_some() || has_children.contains(class_name);
+        let mut offsets = HashMap::new();
+        let mut info = HashMap::new();
+        let mut offset = if needs_vtable { 4u32 } else { 0u32 };
+        // 先添加父类字段
+        if let Some(ref parent) = cd.extends {
+            build_class_fields(parent, class_defs, has_children, cache);
+            if let Some((p_offsets, p_info)) = cache.get(parent) {
+                for (name, &off) in p_offsets {
+                    offsets.insert(name.clone(), off);
                 }
-                if let Some(parent_offsets) = parent_offsets_snapshot {
-                    let child_offsets = class_field_offsets.get_mut(&class_def.name).unwrap();
-                    for (name, val) in parent_offsets {
-                        child_offsets.entry(name).or_insert(val);
-                    }
+                for (name, val) in p_info {
+                    info.insert(name.clone(), val.clone());
                 }
-                parent = class_extends.get(parent_name).and_then(|p| p.clone());
+                offset = p_offsets.values().copied().max().unwrap_or(offset);
+                if let Some(max_entry) = p_info.values().max_by_key(|(o, _)| *o) {
+                    offset = max_entry.0 + max_entry.1.size();
+                }
             }
         }
-        if !changed { break; }
+        // 再添加自己的字段
+        for field in &cd.fields {
+            if !offsets.contains_key(&field.name) {
+                offsets.insert(field.name.clone(), offset);
+                info.insert(field.name.clone(), (offset, field.ty.clone()));
+                offset += field.ty.size() as u32;
+            }
+        }
+        cache.insert(class_name.to_string(), (offsets, info));
+    }
+    let mut field_cache: HashMap<String, (HashMap<String, u32>, HashMap<String, (u32, Type)>)> = HashMap::new();
+    for cd in &program.classes {
+        build_class_fields(&cd.name, &class_defs, &has_children, &mut field_cache);
+    }
+    for (name, (offsets, info)) in field_cache {
+        class_field_offsets.insert(name.clone(), offsets);
+        class_field_info.insert(name, info);
     }
 
     // 构建"方法名 → 类名"映射，用于 lower_function 时传入类上下文
@@ -197,6 +282,18 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     for class_def in &program.classes {
         for method in &class_def.methods {
             method_class_map.insert(method.func.name.clone(), class_def.name.clone());
+        }
+        let init_name = format!("__{}_init", class_def.name);
+        method_class_map.insert(init_name, class_def.name.clone());
+    }
+    // struct 方法（parser 已转为 "StructName.method" 顶级函数）也加入映射
+    let struct_names: std::collections::HashSet<String> = program.structs.iter().map(|s| s.name.clone()).collect();
+    for func in &all_funcs {
+        if let Some(dot) = func.name.find('.') {
+            let prefix = &func.name[..dot];
+            if struct_names.contains(prefix) && !method_class_map.contains_key(&func.name) {
+                method_class_map.insert(func.name.clone(), prefix.to_string());
+            }
         }
     }
 
@@ -209,10 +306,22 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         func_params.entry(func.name.clone()).or_insert(params);
     }
 
+    // 构建函数返回类型表
+    let mut func_return_types: HashMap<String, crate::ast::Type> = HashMap::new();
+    for func in &all_funcs {
+        if let Some(ref ret_ty) = func.return_type {
+            func_return_types.insert(func.name.clone(), ret_ty.clone());
+        }
+    }
+
+    // 构建类继承关系图
+    let class_extends_map: HashMap<String, String> = program.classes.iter()
+        .filter_map(|c| c.extends.as_ref().map(|p| (c.name.clone(), p.clone())))
+        .collect();
+
     // 转换所有函数（包含类方法）
     let mut chir_functions = Vec::new();
     for func in &all_funcs {
-        // 判断是否为类实例方法（params[0].name == "this"）
         let current_class_name = method_class_map.get(&func.name).map(|s| s.as_str());
         match lower_function(
             func,
@@ -222,6 +331,9 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
             &struct_field_offsets,
             &class_field_offsets,
             &class_field_info,
+            &class_extends_map,
+            &func_return_types,
+            &program.enums,
             current_class_name,
         ) {
             Ok(chir_func) => {
@@ -320,7 +432,9 @@ mod tests {
         let struct_offsets = HashMap::new();
         let class_offsets = HashMap::new();
         let class_field_info = HashMap::new();
+        let class_extends_map = HashMap::new();
 
+        let func_return_types = HashMap::new();
         let chir_func = lower_function(
             &func,
             &type_ctx,
@@ -329,6 +443,9 @@ mod tests {
             &struct_offsets,
             &class_offsets,
             &class_field_info,
+            &class_extends_map,
+            &func_return_types,
+            &[],
             None,
         ).unwrap();
 
@@ -354,7 +471,9 @@ mod tests {
         let struct_offsets = HashMap::new();
         let class_offsets = HashMap::new();
         let class_field_info = HashMap::new();
+        let class_extends_map = HashMap::new();
 
+        let func_return_types = HashMap::new();
         let chir_func = lower_function(
             &func,
             &type_ctx,
@@ -363,6 +482,9 @@ mod tests {
             &struct_offsets,
             &class_offsets,
             &class_field_info,
+            &class_extends_map,
+            &func_return_types,
+            &[],
             None,
         ).unwrap();
 
@@ -414,6 +536,8 @@ mod tests {
         info.insert("n".to_string(), (8, Type::Int64));
         class_field_info.insert("Counter".to_string(), info);
 
+        let class_extends_map = HashMap::new();
+        let func_return_types = HashMap::new();
         let chir_func = lower_function(
             &func,
             &type_ctx,
@@ -422,6 +546,9 @@ mod tests {
             &struct_offsets,
             &class_offsets,
             &class_field_info,
+            &class_extends_map,
+            &func_return_types,
+            &[],
             Some("Counter"),
         ).unwrap();
 

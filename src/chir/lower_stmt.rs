@@ -11,7 +11,6 @@ impl<'a> LoweringContext<'a> {
             // Let 语句
             Stmt::Let { pattern, ty, value } => {
                 let mut value_chir = self.lower_expr(value)?;
-                // 确定 local 的 WASM 类型：显式注解 > type_ctx 推断 > value 的 wasm_ty
                 let local_wasm_ty = if let Some(decl_ty) = ty {
                     let decl_wasm = match decl_ty {
                         crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
@@ -20,7 +19,6 @@ impl<'a> LoweringContext<'a> {
                     value_chir = self.insert_cast_if_needed(value_chir, decl_wasm);
                     decl_wasm
                 } else if let Pattern::Binding(name) = pattern {
-                    // 无注解时从 type_ctx 获取推断类型
                     self.type_ctx.locals.get(name.as_str())
                         .map(|t| match t {
                             crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
@@ -33,12 +31,25 @@ impl<'a> LoweringContext<'a> {
 
                 match pattern {
                     Pattern::Binding(name) => {
+                        let ast_ty = if let Some(decl_ty) = ty {
+                            decl_ty.clone()
+                        } else {
+                            value_chir.ty.clone()
+                        };
+                        self.local_ast_types.insert(name.clone(), ast_ty);
                         let local_idx = self.alloc_local_typed(name.clone(), local_wasm_ty);
                         value_chir = self.insert_cast_if_needed(value_chir, local_wasm_ty);
                         Ok(CHIRStmt::Let {
                             local_idx,
                             value: value_chir,
                         })
+                    }
+                    Pattern::Struct { name: struct_name, fields } => {
+                        let multi = self.lower_struct_deconstruction(struct_name, fields, value_chir)?;
+                        // Return the first statement; remaining will be handled by lower_stmts_to_block
+                        Ok(multi.into_iter().next().unwrap_or(CHIRStmt::Expr(
+                            crate::chir::CHIRExpr::new(crate::chir::CHIRExprKind::Nop, crate::ast::Type::Unit, wasm_encoder::ValType::I32),
+                        )))
                     }
                     _ => {
                         Ok(CHIRStmt::Expr(value_chir))
@@ -69,6 +80,12 @@ impl<'a> LoweringContext<'a> {
 
                 match pattern {
                     Pattern::Binding(name) => {
+                        let ast_ty = if let Some(decl_ty) = ty {
+                            decl_ty.clone()
+                        } else {
+                            value_chir.ty.clone()
+                        };
+                        self.local_ast_types.insert(name.clone(), ast_ty);
                         let local_idx = self.alloc_local_typed(name.clone(), local_wasm_ty);
                         value_chir = self.insert_cast_if_needed(value_chir, local_wasm_ty);
                         Ok(CHIRStmt::Let {
@@ -147,6 +164,343 @@ impl<'a> LoweringContext<'a> {
                 })
             }
 
+            // For 循环：降低为 While
+            Stmt::For { var, iterable, body } => {
+                fn replace_continue_in_block(block: &mut crate::chir::CHIRBlock, make_inc: &dyn Fn() -> CHIRStmt) {
+                    let mut new_stmts = Vec::new();
+                    for stmt in block.stmts.drain(..) {
+                        match stmt {
+                            CHIRStmt::Continue => {
+                                new_stmts.push(make_inc());
+                                new_stmts.push(CHIRStmt::Continue);
+                            }
+                            CHIRStmt::While { cond, body: inner } => {
+                                new_stmts.push(CHIRStmt::While { cond, body: inner });
+                            }
+                            CHIRStmt::Loop { body: inner } => {
+                                new_stmts.push(CHIRStmt::Loop { body: inner });
+                            }
+                            CHIRStmt::Expr(expr) => {
+                                let expr = replace_continue_in_expr(expr, make_inc);
+                                new_stmts.push(CHIRStmt::Expr(expr));
+                            }
+                            other => new_stmts.push(other),
+                        }
+                    }
+                    block.stmts = new_stmts;
+                }
+                fn replace_continue_in_expr(expr: crate::chir::CHIRExpr, make_inc: &dyn Fn() -> CHIRStmt) -> crate::chir::CHIRExpr {
+                    match expr.kind {
+                        crate::chir::CHIRExprKind::If { cond, mut then_block, else_block } => {
+                            replace_continue_in_block(&mut then_block, make_inc);
+                            let else_block = else_block.map(|mut b| {
+                                replace_continue_in_block(&mut b, make_inc);
+                                b
+                            });
+                            crate::chir::CHIRExpr { kind: crate::chir::CHIRExprKind::If { cond, then_block, else_block }, ..expr }
+                        }
+                        crate::chir::CHIRExprKind::Block(mut b) => {
+                            replace_continue_in_block(&mut b, make_inc);
+                            crate::chir::CHIRExpr { kind: crate::chir::CHIRExprKind::Block(b), ..expr }
+                        }
+                        _ => expr,
+                    }
+                }
+
+                if let crate::ast::Expr::Range { start, end, inclusive, step } = iterable {
+                    let start_chir = self.lower_expr(start)?;
+                    let end_chir = self.lower_expr(end)?;
+                    let step_val = if let Some(s) = step {
+                        self.lower_expr(s)?
+                    } else {
+                        crate::chir::CHIRExpr::new(
+                            crate::chir::CHIRExprKind::Integer(1),
+                            crate::ast::Type::Int64,
+                            wasm_encoder::ValType::I64,
+                        )
+                    };
+                    let loop_var_idx = self.alloc_local_typed(var.clone(), start_chir.wasm_ty);
+                    // 保存 end 值到临时 local
+                    let end_local_idx = self.alloc_local_typed(format!("__for_end_{}", var), end_chir.wasm_ty);
+                    // 构建条件：var < end (或 var <= end)
+                    let cmp_op = if *inclusive {
+                        crate::chir::CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::LtEq,
+                            left: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(loop_var_idx),
+                                start_chir.ty.clone(),
+                                start_chir.wasm_ty,
+                            )),
+                            right: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(end_local_idx),
+                                end_chir.ty.clone(),
+                                end_chir.wasm_ty,
+                            )),
+                        }
+                    } else {
+                        crate::chir::CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Lt,
+                            left: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(loop_var_idx),
+                                start_chir.ty.clone(),
+                                start_chir.wasm_ty,
+                            )),
+                            right: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(end_local_idx),
+                                end_chir.ty.clone(),
+                                end_chir.wasm_ty,
+                            )),
+                        }
+                    };
+                    let cond_expr = crate::chir::CHIRExpr::new(
+                        cmp_op,
+                        crate::ast::Type::Bool,
+                        wasm_encoder::ValType::I32,
+                    );
+                    // 降低循环体
+                    let mut body_block = self.lower_stmts_to_block(body)?;
+                    // 构建增量表达式（用于末尾和 continue 替换）
+                    let make_increment = || -> CHIRStmt {
+                        CHIRStmt::Assign {
+                            target: CHIRLValue::Local(loop_var_idx),
+                            value: crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Binary {
+                                    op: crate::ast::BinOp::Add,
+                                    left: Box::new(crate::chir::CHIRExpr::new(
+                                        crate::chir::CHIRExprKind::Local(loop_var_idx),
+                                        start_chir.ty.clone(),
+                                        start_chir.wasm_ty,
+                                    )),
+                                    right: Box::new(step_val.clone()),
+                                },
+                                start_chir.ty.clone(),
+                                start_chir.wasm_ty,
+                            ),
+                        }
+                    };
+                    replace_continue_in_block(&mut body_block, &make_increment);
+                    // 在循环体末尾追加 var = var + step
+                    body_block.stmts.push(make_increment());
+                    // 构造完整语句序列：let i = start; let __end = end; while (cond) { body }
+                    let init_stmt = CHIRStmt::Let {
+                        local_idx: loop_var_idx,
+                        value: start_chir,
+                    };
+                    let end_init_stmt = CHIRStmt::Let {
+                        local_idx: end_local_idx,
+                        value: end_chir,
+                    };
+                    let while_stmt = CHIRStmt::While {
+                        cond: cond_expr,
+                        body: body_block,
+                    };
+                    // 用一个包裹块把三条语句打包
+                    let wrapper_block = crate::chir::CHIRBlock {
+                        stmts: vec![init_stmt, end_init_stmt, while_stmt],
+                        result: None,
+                    };
+                    Ok(CHIRStmt::Expr(crate::chir::CHIRExpr::new(
+                        crate::chir::CHIRExprKind::Block(wrapper_block),
+                        crate::ast::Type::Unit,
+                        wasm_encoder::ValType::I32,
+                    )))
+                } else {
+                    // for (elem in arr) → 数组迭代
+                    // let __arr = arr; let __idx = 0; let __len = arr.length;
+                    // while (__idx < __len) { let elem = arr[__idx]; body; __idx++ }
+                    let arr_chir = self.lower_expr(iterable)?;
+                    let arr_local = self.alloc_local_typed(format!("__for_arr_{}", var), wasm_encoder::ValType::I32);
+                    let idx_local = self.alloc_local_typed(format!("__for_idx_{}", var), wasm_encoder::ValType::I64);
+                    let len_local = self.alloc_local_typed(format!("__for_len_{}", var), wasm_encoder::ValType::I64);
+                    let elem_local = self.alloc_local_typed(var.clone(), wasm_encoder::ValType::I64);
+                    
+                    let arr_init = CHIRStmt::Let {
+                        local_idx: arr_local,
+                        value: self.insert_cast_if_needed(arr_chir, wasm_encoder::ValType::I32),
+                    };
+                    let idx_init = CHIRStmt::Let {
+                        local_idx: idx_local,
+                        value: crate::chir::CHIRExpr::int_const(0, crate::ast::Type::Int64),
+                    };
+                    // len = i64.load(arr_ptr) → actually i32.load then extend
+                    let len_expr = crate::chir::CHIRExpr::new(
+                        crate::chir::CHIRExprKind::Cast {
+                            expr: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::FieldGet {
+                                    object: Box::new(crate::chir::CHIRExpr::new(
+                                        crate::chir::CHIRExprKind::Local(arr_local),
+                                        crate::ast::Type::Int32, wasm_encoder::ValType::I32,
+                                    )),
+                                    field_offset: 0,
+                                    field_ty: crate::ast::Type::Int32,
+                                },
+                                crate::ast::Type::Int32, wasm_encoder::ValType::I32,
+                            )),
+                            from_ty: wasm_encoder::ValType::I32,
+                            to_ty: wasm_encoder::ValType::I64,
+                        },
+                        crate::ast::Type::Int64, wasm_encoder::ValType::I64,
+                    );
+                    let len_init = CHIRStmt::Let { local_idx: len_local, value: len_expr };
+                    // cond: __idx < __len
+                    let cond_expr = crate::chir::CHIRExpr::new(
+                        crate::chir::CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Lt,
+                            left: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(idx_local),
+                                crate::ast::Type::Int64, wasm_encoder::ValType::I64,
+                            )),
+                            right: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(len_local),
+                                crate::ast::Type::Int64, wasm_encoder::ValType::I64,
+                            )),
+                        },
+                        crate::ast::Type::Bool, wasm_encoder::ValType::I32,
+                    );
+                    // elem = arr[__idx]
+                    let elem_expr = crate::chir::CHIRExpr::new(
+                        crate::chir::CHIRExprKind::ArrayGet {
+                            array: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(arr_local),
+                                crate::ast::Type::Int32, wasm_encoder::ValType::I32,
+                            )),
+                            index: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(idx_local),
+                                crate::ast::Type::Int64, wasm_encoder::ValType::I64,
+                            )),
+                        },
+                        crate::ast::Type::Int64, wasm_encoder::ValType::I64,
+                    );
+                    let elem_assign = CHIRStmt::Let { local_idx: elem_local, value: elem_expr };
+                    // lower body
+                    let mut body_block = self.lower_stmts_to_block(body)?;
+                    // prepend elem assignment
+                    body_block.stmts.insert(0, elem_assign);
+                    // increment: __idx = __idx + 1
+                    let make_increment = || -> CHIRStmt {
+                        CHIRStmt::Assign {
+                            target: CHIRLValue::Local(idx_local),
+                            value: crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Binary {
+                                    op: crate::ast::BinOp::Add,
+                                    left: Box::new(crate::chir::CHIRExpr::new(
+                                        crate::chir::CHIRExprKind::Local(idx_local),
+                                        crate::ast::Type::Int64, wasm_encoder::ValType::I64,
+                                    )),
+                                    right: Box::new(crate::chir::CHIRExpr::int_const(1, crate::ast::Type::Int64)),
+                                },
+                                crate::ast::Type::Int64, wasm_encoder::ValType::I64,
+                            ),
+                        }
+                    };
+                    replace_continue_in_block(&mut body_block, &make_increment);
+                    body_block.stmts.push(make_increment());
+                    let while_stmt = CHIRStmt::While { cond: cond_expr, body: body_block };
+                    let wrapper_block = crate::chir::CHIRBlock {
+                        stmts: vec![arr_init, idx_init, len_init, while_stmt],
+                        result: None,
+                    };
+                    Ok(CHIRStmt::Expr(crate::chir::CHIRExpr::new(
+                        crate::chir::CHIRExprKind::Block(wrapper_block),
+                        crate::ast::Type::Unit,
+                        wasm_encoder::ValType::I32,
+                    )))
+                }
+            }
+
+            // DoWhile 循环：降为 loop { body; if !cond break }
+            Stmt::DoWhile { body, cond } => {
+                let cond_chir = self.lower_expr(cond)?;
+                let mut body_block = self.lower_stmts_to_block(body)?;
+                // if (!cond) break
+                let not_cond = crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::Unary {
+                        op: crate::ast::UnaryOp::Not,
+                        expr: Box::new(cond_chir),
+                    },
+                    crate::ast::Type::Bool,
+                    wasm_encoder::ValType::I32,
+                );
+                let break_block = crate::chir::CHIRBlock {
+                    stmts: vec![CHIRStmt::Break],
+                    result: None,
+                };
+                let empty_block = crate::chir::CHIRBlock {
+                    stmts: vec![],
+                    result: None,
+                };
+                let if_break = crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::If {
+                        cond: Box::new(not_cond),
+                        then_block: break_block,
+                        else_block: Some(empty_block),
+                    },
+                    crate::ast::Type::Unit,
+                    wasm_encoder::ValType::I32,
+                );
+                body_block.stmts.push(CHIRStmt::Expr(if_break));
+                Ok(CHIRStmt::Loop { body: body_block })
+            }
+
+            // Assert 语句
+            Stmt::Assert { left, right, .. } => {
+                let left_chir = self.lower_expr(left)?;
+                let right_chir = self.lower_expr(right)?;
+                // 如果 left != right → unreachable (trap)
+                let ne_expr = crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::Binary {
+                        op: crate::ast::BinOp::NotEq,
+                        left: Box::new(left_chir),
+                        right: Box::new(right_chir),
+                    },
+                    crate::ast::Type::Bool,
+                    wasm_encoder::ValType::I32,
+                );
+                let trap_block = crate::chir::CHIRBlock {
+                    stmts: vec![CHIRStmt::Expr(crate::chir::CHIRExpr::new(
+                        crate::chir::CHIRExprKind::Unreachable,
+                        crate::ast::Type::Nothing,
+                        wasm_encoder::ValType::I32,
+                    ))],
+                    result: None,
+                };
+                let empty_block = crate::chir::CHIRBlock {
+                    stmts: vec![],
+                    result: None,
+                };
+                let if_trap = crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::If {
+                        cond: Box::new(ne_expr),
+                        then_block: trap_block,
+                        else_block: Some(empty_block),
+                    },
+                    crate::ast::Type::Unit,
+                    wasm_encoder::ValType::I32,
+                );
+                Ok(CHIRStmt::Expr(if_trap))
+            }
+
+            // Const 语句：等价于 Let
+            Stmt::Const { name, ty, value } => {
+                let mut value_chir = self.lower_expr(value)?;
+                let local_wasm_ty = if let Some(decl_ty) = ty {
+                    let decl_wasm = match decl_ty {
+                        crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                        t => t.to_wasm(),
+                    };
+                    value_chir = self.insert_cast_if_needed(value_chir, decl_wasm);
+                    decl_wasm
+                } else {
+                    value_chir.wasm_ty
+                };
+                let local_idx = self.alloc_local_typed(name.clone(), local_wasm_ty);
+                value_chir = self.insert_cast_if_needed(value_chir, local_wasm_ty);
+                Ok(CHIRStmt::Let {
+                    local_idx,
+                    value: value_chir,
+                })
+            }
+
             // 其他语句暂时转换为 Nop
             _ => Ok(CHIRStmt::Expr(crate::chir::CHIRExpr::new(
                 crate::chir::CHIRExprKind::Nop,
@@ -154,6 +508,50 @@ impl<'a> LoweringContext<'a> {
                 wasm_encoder::ValType::I32,
             ))),
         }
+    }
+
+    /// Struct deconstruction: let Point { x, y } = expr
+    /// Returns multiple statements that need to be emitted in sequence
+    fn lower_struct_deconstruction(
+        &mut self,
+        struct_name: &str,
+        fields: &[(String, crate::ast::Pattern)],
+        value_chir: crate::chir::CHIRExpr,
+    ) -> Result<Vec<CHIRStmt>, String> {
+        let struct_ty = crate::ast::Type::Struct(struct_name.to_string(), vec![]);
+        let ptr_local = self.alloc_local_typed(
+            format!("__destruct_{}", struct_name), wasm_encoder::ValType::I32,
+        );
+        let ptr_val = self.insert_cast_if_needed(value_chir, wasm_encoder::ValType::I32);
+        let mut stmts = vec![CHIRStmt::Let { local_idx: ptr_local, value: ptr_val }];
+        for (field_name, sub_pat) in fields {
+            if let crate::ast::Pattern::Binding(bind_name) = sub_pat {
+                let offset = self.get_field_offset(&struct_ty, field_name)?;
+                let field_ty = self.type_ctx.infer_field_type(&struct_ty, field_name)
+                    .unwrap_or(crate::ast::Type::Int64);
+                let field_wasm = match &field_ty {
+                    crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                    t => t.to_wasm(),
+                };
+                self.local_ast_types.insert(bind_name.clone(), field_ty.clone());
+                let bind_local = self.alloc_local_typed(bind_name.clone(), field_wasm);
+                let load_expr = crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::FieldGet {
+                        object: Box::new(crate::chir::CHIRExpr::new(
+                            crate::chir::CHIRExprKind::Local(ptr_local),
+                            struct_ty.clone(),
+                            wasm_encoder::ValType::I32,
+                        )),
+                        field_offset: offset,
+                        field_ty: field_ty,
+                    },
+                    crate::ast::Type::Int64,
+                    field_wasm,
+                );
+                stmts.push(CHIRStmt::Let { local_idx: bind_local, value: load_expr });
+            }
+        }
+        Ok(stmts)
     }
 
     /// 降低赋值目标
@@ -282,6 +680,19 @@ impl<'a> LoweringContext<'a> {
                 }
             }
 
+            // Struct deconstruction expands to multiple statements
+            if let Stmt::Let { pattern: Pattern::Struct { name, fields }, value, .. } = stmt {
+                let value_chir = self.lower_expr(value)?;
+                let multi = self.lower_struct_deconstruction(name, fields, value_chir)?;
+                chir_stmts.extend(multi);
+                continue;
+            }
+            if let Stmt::Var { pattern: Pattern::Struct { name, fields }, value, .. } = stmt {
+                let value_chir = self.lower_expr(value)?;
+                let multi = self.lower_struct_deconstruction(name, fields, value_chir)?;
+                chir_stmts.extend(multi);
+                continue;
+            }
             let chir_stmt = self.lower_stmt(stmt)?;
             chir_stmts.push(chir_stmt);
         }
@@ -737,7 +1148,7 @@ mod tests {
             cond: Expr::Bool(false),
         };
         let chir = ctx.lower_stmt(&stmt).unwrap();
-        assert!(matches!(chir, CHIRStmt::Expr(_)));
+        assert!(matches!(chir, CHIRStmt::Loop { .. }));
     }
 
     #[test]

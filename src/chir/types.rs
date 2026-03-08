@@ -94,6 +94,9 @@ pub enum CHIRExprKind {
         len: Box<CHIRExpr>,
         init: Box<CHIRExpr>,
     },
+    ArrayLiteral {
+        elements: Vec<CHIRExpr>,
+    },
     ArrayGet {
         array: Box<CHIRExpr>,
         index: Box<CHIRExpr>,
@@ -136,6 +139,31 @@ pub enum CHIRExprKind {
         newline: bool,
         /// 文件描述符（1=stdout, 2=stderr）
         fd: i32,
+    },
+
+    /// WASM 原生数学运算：sqrt, floor, ceil, trunc, nearest, abs
+    MathUnary {
+        op: String,
+        arg: Box<CHIRExpr>,
+    },
+    /// WASM 原生数学运算（二元）：pow 等通过运行时函数调用
+    MathBinary {
+        op: String,
+        left: Box<CHIRExpr>,
+        right: Box<CHIRExpr>,
+    },
+
+    // 内置类型方法
+    BuiltinAbs {
+        val: Box<CHIRExpr>,
+        tmp_local: u32,
+    },
+    BuiltinCompareTo {
+        left: Box<CHIRExpr>,
+        right: Box<CHIRExpr>,
+    },
+    BuiltinStringIsEmpty {
+        val: Box<CHIRExpr>,
     },
 
     // 特殊
@@ -205,12 +233,30 @@ pub enum CHIRPattern {
     Variant {
         discriminant: i32,   // 枚举判别值
         payload_binding: Option<u32>,
+        enum_has_payload: bool,
     },
     Range {
         start: i64,
         end: i64,
         inclusive: bool,
     },
+    Struct {
+        /// (field_offset, expected_value_or_binding)
+        fields: Vec<StructPatternField>,
+    },
+}
+
+/// 结构体模式匹配的字段
+#[derive(Debug, Clone)]
+pub enum StructPatternField {
+    /// 字段值必须等于常量
+    Literal { offset: u32, value: i64, wasm_ty: wasm_encoder::ValType },
+    /// 字段值绑定到局部变量
+    Binding { offset: u32, local_idx: u32, wasm_ty: wasm_encoder::ValType },
+    /// 嵌套结构体字段常量检查：先解引用 outer_offset 处的指针，再比较 inner_offset 处的值
+    NestedLiteral { outer_offset: u32, inner_offset: u32, value: i64, wasm_ty: wasm_encoder::ValType },
+    /// 嵌套结构体字段绑定
+    NestedBinding { outer_offset: u32, inner_offset: u32, local_idx: u32, wasm_ty: wasm_encoder::ValType },
 }
 
 /// CHIR 字面量
