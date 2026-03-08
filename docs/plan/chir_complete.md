@@ -134,7 +134,7 @@ emit_binary_op();  // → I64Add
 
 3. **测试简单函数**
    ```bash
-   USE_CHIR=1 cargo run -- examples/simple.cj
+   USE_CHIR=1 cargo run -- tests/examples/simple.cj
    wasm-validate output.wasm
    ```
 

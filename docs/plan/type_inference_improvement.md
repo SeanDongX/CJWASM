@@ -283,7 +283,7 @@ fn compile_method_call(...) {
 
 #### 第 5 步: 测试和验证（1 天）
 - 运行 `cargo test`
-- 运行 `./scripts/run_examples.sh`
+- 运行 `./scripts/system_test.sh`
 - 检查 WASM 验证错误数量变化
 - 预期: 4288 → ~1500 (-65%)
 

@@ -562,7 +562,7 @@ pub fn compile_to_wasm(program: &Program) -> Vec<u8> {
 
 **任务**:
 - 运行所有单元测试
-- 运行 `./scripts/run_examples.sh`
+- 运行 `./scripts/system_test.sh`
 - 对比 WASM 验证错误数量
 - 修复发现的问题
 

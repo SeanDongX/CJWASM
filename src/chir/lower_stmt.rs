@@ -501,6 +501,101 @@ impl<'a> LoweringContext<'a> {
                 })
             }
 
+            // while-let: while (let Some(n) <- current) { body }
+            // → loop { if current.tag != 1 { break }; let n = current.value; body }
+            Stmt::WhileLet { pattern, expr, body } => {
+                use crate::ast::Pattern;
+                let expr_chir = self.lower_expr(expr)?;
+                let ptr_local = self.alloc_local_typed("__wl_ptr".into(), wasm_encoder::ValType::I32);
+
+                let mut loop_stmts: Vec<crate::chir::CHIRStmt> = Vec::new();
+
+                // Evaluate expr and save to ptr_local each iteration
+                loop_stmts.push(crate::chir::CHIRStmt::Assign {
+                    target: crate::chir::CHIRLValue::Local(ptr_local),
+                    value: expr_chir.clone(),
+                });
+
+                // Load tag at offset 0
+                let tag_load = crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::Load {
+                        ptr: Box::new(crate::chir::CHIRExpr::new(
+                            crate::chir::CHIRExprKind::Local(ptr_local),
+                            crate::ast::Type::Int32, wasm_encoder::ValType::I32,
+                        )),
+                        offset: 0, align: 2,
+                    },
+                    crate::ast::Type::Int32, wasm_encoder::ValType::I32,
+                );
+                // if tag != 1 { break }
+                let cond_ne = crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::Binary {
+                        op: crate::ast::BinOp::NotEq,
+                        left: Box::new(tag_load),
+                        right: Box::new(crate::chir::CHIRExpr::new(
+                            crate::chir::CHIRExprKind::Integer(1),
+                            crate::ast::Type::Int32, wasm_encoder::ValType::I32,
+                        )),
+                    },
+                    crate::ast::Type::Bool, wasm_encoder::ValType::I32,
+                );
+                let break_block = crate::chir::CHIRBlock {
+                    stmts: vec![crate::chir::CHIRStmt::Break],
+                    result: None,
+                };
+                loop_stmts.push(crate::chir::CHIRStmt::Expr(crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::If {
+                        cond: Box::new(cond_ne),
+                        then_block: break_block,
+                        else_block: None,
+                    },
+                    crate::ast::Type::Unit, wasm_encoder::ValType::I32,
+                )));
+
+                // Bind payload variable from pattern
+                if let Pattern::Variant { payload: Some(ref payload_pat), .. } = pattern {
+                    if let Pattern::Binding(ref name) = **payload_pat {
+                        let bind_local = self.alloc_local_typed(name.clone(), wasm_encoder::ValType::I64);
+                        let val_load = crate::chir::CHIRExpr::new(
+                            crate::chir::CHIRExprKind::Load {
+                                ptr: Box::new(crate::chir::CHIRExpr::new(
+                                    crate::chir::CHIRExprKind::Local(ptr_local),
+                                    crate::ast::Type::Int32, wasm_encoder::ValType::I32,
+                                )),
+                                offset: 4, align: 3,
+                            },
+                            crate::ast::Type::Int64, wasm_encoder::ValType::I64,
+                        );
+                        loop_stmts.push(crate::chir::CHIRStmt::Let { local_idx: bind_local, value: val_load });
+                        self.local_ast_types.insert(name.clone(), crate::ast::Type::Int64);
+                    }
+                } else if let Pattern::Binding(ref name) = pattern {
+                    let bind_local = self.alloc_local_typed(name.clone(), wasm_encoder::ValType::I64);
+                    let val_load = crate::chir::CHIRExpr::new(
+                        crate::chir::CHIRExprKind::Load {
+                            ptr: Box::new(crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Local(ptr_local),
+                                crate::ast::Type::Int32, wasm_encoder::ValType::I32,
+                            )),
+                            offset: 4, align: 3,
+                        },
+                        crate::ast::Type::Int64, wasm_encoder::ValType::I64,
+                    );
+                    loop_stmts.push(crate::chir::CHIRStmt::Let { local_idx: bind_local, value: val_load });
+                    self.local_ast_types.insert(name.clone(), crate::ast::Type::Int64);
+                }
+
+                // Lower body statements
+                for s in body {
+                    if let Ok(chir_s) = self.lower_stmt(s) {
+                        loop_stmts.push(chir_s);
+                    }
+                }
+
+                let loop_body = crate::chir::CHIRBlock { stmts: loop_stmts, result: None };
+                Ok(CHIRStmt::Loop { body: loop_body })
+            }
+
             // 其他语句暂时转换为 Nop
             _ => Ok(CHIRStmt::Expr(crate::chir::CHIRExpr::new(
                 crate::chir::CHIRExprKind::Nop,

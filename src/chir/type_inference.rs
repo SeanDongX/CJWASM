@@ -118,6 +118,39 @@ impl TypeInferenceContext {
             ctx.struct_fields.insert(struct_def.name.clone(), fields);
         }
 
+        // Range 虚拟结构体字段
+        {
+            let mut range_fields = HashMap::new();
+            range_fields.insert("start".to_string(), Type::Int64);
+            range_fields.insert("end".to_string(), Type::Int64);
+            ctx.struct_fields.insert("Range".to_string(), range_fields);
+        }
+
+        // 注册 extend 方法签名
+        for ext in &program.extends {
+            for method in &ext.methods {
+                let sig = FunctionSignature {
+                    name: method.name.clone(),
+                    params: method.params.iter().map(|p| p.ty.clone()).collect(),
+                    return_ty: method.return_type.clone().unwrap_or(Type::Unit),
+                };
+                let mangled = format!("{}${}", method.name, method.params.len());
+                ctx.functions.insert(mangled, sig.clone());
+                ctx.functions.entry(method.name.clone()).or_insert(sig);
+
+                if let Some(dot_pos) = method.name.find('.') {
+                    let type_name = &method.name[..dot_pos];
+                    let method_name = &method.name[dot_pos + 1..];
+                    let ret_ty = method.return_type.clone().unwrap_or(Type::Unit);
+                    ctx.class_method_returns
+                        .entry(type_name.to_string())
+                        .or_default()
+                        .entry(method_name.to_string())
+                        .or_insert(ret_ty);
+                }
+            }
+        }
+
         // 收集类字段 + 类方法签名
         for class_def in &program.classes {
             let mut fields = HashMap::new();

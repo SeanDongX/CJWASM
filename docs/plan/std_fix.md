@@ -295,13 +295,13 @@ if let Some(&func_idx) = self.func_indices.get(stub_name) {
 cargo build 2>&1 | grep -E "^error"
 
 # 2. 编译 std 示例
-cargo run -- build -p examples/std 2>&1 | tail -5
+cargo run -- build -p tests/examples/std 2>&1 | tail -5
 
 # 3. WASM 验证（应无错误或大幅减少）
-wasm-validate examples/std/target/wasm/std_examples.wasm 2>&1 | wc -l
+wasm-validate tests/examples/std/target/wasm/std_examples.wasm 2>&1 | wc -l
 
 # 4. 运行全部示例
-./scripts/run_examples.sh
+./scripts/system_test.sh
 ```
 
 ---

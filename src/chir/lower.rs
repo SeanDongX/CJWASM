@@ -19,6 +19,7 @@ pub fn lower_function(
     func_return_types: &HashMap<String, Type>,
     enum_defs: &[crate::ast::EnumDef],
     current_class_name: Option<&str>,
+    lambda_base: u32,
 ) -> Result<CHIRFunction, String> {
     // 为每个函数创建局部类型推断上下文（包含参数和局部变量）
     let mut type_ctx = base_type_ctx.clone();
@@ -65,6 +66,7 @@ pub fn lower_function(
     ctx.class_extends = class_extends.clone();
     ctx.func_return_types = func_return_types.clone();
     ctx.enum_defs = enum_defs.to_vec();
+    ctx.lambda_counter = lambda_base;
 
     // 处理参数（分配局部变量索引，同时记录类型供赋值时强制类型转换）
     let mut params = Vec::new();
@@ -76,6 +78,7 @@ pub fn lower_function(
         // 使用 alloc_local_typed 记录参数 WASM 类型，
         // 使 Stmt::Assign 对参数赋值时能正确插入类型强制转换（如 TCO 生成的 param = tmp）
         let local_idx = ctx.alloc_local_typed(param.name.clone(), wasm_ty);
+        ctx.local_ast_types.insert(param.name.clone(), param.ty.clone());
         params.push(CHIRParam {
             name: param.name.clone(),
             ty: param.ty.clone(),
@@ -158,6 +161,25 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         .collect();
     all_funcs.extend(init_funcs_owned.iter());
 
+    // extend 方法提取为顶级函数（parser 已完成 TypeName.method 命名 + this 首参插入）
+    let extend_methods_owned: Vec<Function> = program.extends.iter()
+        .flat_map(|ext| ext.methods.iter().cloned())
+        .collect();
+    all_funcs.extend(extend_methods_owned.iter());
+
+    // Lambda 预扫描：收集所有 Lambda 表达式并生成 __lambda_N 函数
+    let mut lambda_counter = 0u32;
+    let mut lambda_funcs: Vec<Function> = Vec::new();
+    {
+        let funcs_snapshot: Vec<&Function> = all_funcs.clone();
+        for func in &funcs_snapshot {
+            for stmt in &func.body {
+                collect_lambdas_from_stmt(stmt, &mut lambda_counter, &mut lambda_funcs);
+            }
+        }
+    }
+    let lambda_funcs_owned = lambda_funcs;
+    all_funcs.extend(lambda_funcs_owned.iter());
 
     for (i, func) in all_funcs.iter().enumerate() {
         let idx = import_offset + i as u32;
@@ -181,6 +203,11 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         "__str_concat", "__f64_to_str",
         "now", "randomInt64", "randomFloat64",
         "__str_contains", "__str_starts_with", "__str_ends_with", "__str_trim",
+        "__str_to_array", "__str_index_of", "__str_replace",
+        // Collections (must match RT_NAMES in chir_codegen.rs)
+        "__arraylist_new", "__arraylist_append", "__arraylist_get", "__arraylist_set", "__arraylist_remove", "__arraylist_size",
+        "__hashmap_new", "__hashmap_put", "__hashmap_get", "__hashmap_contains", "__hashmap_remove", "__hashmap_size",
+        "__hashset_new", "__hashset_add", "__hashset_contains", "__hashset_size",
     ];
     for (i, name) in rt_names.iter().enumerate() {
         func_indices.insert(name.to_string(), rt_base + i as u32);
@@ -196,6 +223,13 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
             offset += field.ty.size() as u32;
         }
         struct_field_offsets.insert(struct_def.name.clone(), offsets);
+    }
+    // Range 虚拟结构体：[start:i64(8 bytes), end:i64(8 bytes)]
+    {
+        let mut range_offsets = HashMap::new();
+        range_offsets.insert("start".to_string(), 0u32);
+        range_offsets.insert("end".to_string(), 8u32);
+        struct_field_offsets.insert("Range".to_string(), range_offsets);
     }
 
     // 构建类字段偏移表 + 完整字段信息（含类型）
@@ -297,6 +331,35 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         }
     }
 
+    // 注册内建 Option / Result 枚举（若用户未自定义）
+    let has_user_option = program.enums.iter().any(|e| e.name == "Option");
+    let has_user_result = program.enums.iter().any(|e| e.name == "Result");
+    let mut all_enums = program.enums.clone();
+    if !has_user_option {
+        all_enums.push(crate::ast::EnumDef {
+            visibility: crate::ast::Visibility::Public,
+            name: "Option".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            variants: vec![
+                crate::ast::EnumVariant { name: "None".to_string(), payload: None },
+                crate::ast::EnumVariant { name: "Some".to_string(), payload: Some(Type::Int64) },
+            ],
+        });
+    }
+    if !has_user_result {
+        all_enums.push(crate::ast::EnumDef {
+            visibility: crate::ast::Visibility::Public,
+            name: "Result".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            variants: vec![
+                crate::ast::EnumVariant { name: "Ok".to_string(), payload: Some(Type::Int64) },
+                crate::ast::EnumVariant { name: "Err".to_string(), payload: Some(Type::String) },
+            ],
+        });
+    }
+
     // 构建函数参数表（含修饰名和原名），用于命名参数默认值补全
     let mut func_params: HashMap<String, Vec<Param>> = HashMap::new();
     for func in &all_funcs {
@@ -319,10 +382,24 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         .filter_map(|c| c.extends.as_ref().map(|p| (c.name.clone(), p.clone())))
         .collect();
 
+    // 预计算每个函数中的 lambda 数量，以便正确分配全局 lambda 索引
+    let mut lambda_counts: Vec<u32> = Vec::new();
+    for func in &all_funcs {
+        let mut cnt = 0u32;
+        let mut dummy = Vec::new();
+        for stmt in &func.body {
+            collect_lambdas_from_stmt(stmt, &mut cnt, &mut dummy);
+        }
+        lambda_counts.push(cnt);
+    }
+
     // 转换所有函数（包含类方法）
     let mut chir_functions = Vec::new();
-    for func in &all_funcs {
+    let mut global_lambda_offset = 0u32;
+    for (fi, func) in all_funcs.iter().enumerate() {
         let current_class_name = method_class_map.get(&func.name).map(|s| s.as_str());
+        let lambda_base = global_lambda_offset;
+        global_lambda_offset += lambda_counts[fi];
         match lower_function(
             func,
             &type_ctx,
@@ -333,8 +410,9 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
             &class_field_info,
             &class_extends_map,
             &func_return_types,
-            &program.enums,
+            &all_enums,
             current_class_name,
+            lambda_base,
         ) {
             Ok(chir_func) => {
                 chir_functions.push(chir_func);
@@ -375,6 +453,113 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         enums,
         globals,
     })
+}
+
+fn collect_lambdas_from_stmt(stmt: &crate::ast::Stmt, counter: &mut u32, out: &mut Vec<Function>) {
+    use crate::ast::{Stmt, Expr};
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+            collect_lambdas_from_expr(value, counter, out);
+        }
+        Stmt::Assign { value, .. } => {
+            collect_lambdas_from_expr(value, counter, out);
+        }
+        Stmt::Expr(e) => collect_lambdas_from_expr(e, counter, out),
+        Stmt::Return(Some(e)) => collect_lambdas_from_expr(e, counter, out),
+        Stmt::While { cond, body, .. } => {
+            collect_lambdas_from_expr(cond, counter, out);
+            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+        }
+        Stmt::DoWhile { body, cond } => {
+            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            collect_lambdas_from_expr(cond, counter, out);
+        }
+        Stmt::For { iterable, body, .. } => {
+            collect_lambdas_from_expr(iterable, counter, out);
+            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+        }
+        Stmt::Loop { body, .. } => {
+            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+        }
+        Stmt::UnsafeBlock { body } => {
+            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+        }
+        Stmt::Const { value, .. } => {
+            collect_lambdas_from_expr(value, counter, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &mut Vec<Function>) {
+    use crate::ast::{Expr, Param, Visibility};
+    match expr {
+        Expr::Lambda { params, return_type, body } => {
+            let idx = *counter;
+            *counter += 1;
+            let lambda_name = format!("__lambda_{}", idx);
+            let func_params: Vec<Param> = params.iter().map(|(name, ty)| Param {
+                name: name.clone(),
+                ty: ty.clone(),
+                default: None,
+                variadic: false,
+                is_named: false,
+                is_inout: false,
+            }).collect();
+            // Infer return type: explicit > parameter type > default Int64
+            let ret_type = return_type.clone().or_else(|| {
+                if let Some((_, ty)) = params.first() {
+                    Some(ty.clone())
+                } else {
+                    Some(Type::Int64)
+                }
+            });
+            let body_stmt = vec![crate::ast::Stmt::Return(Some(*body.clone()))];
+            out.push(Function {
+                visibility: Visibility::Public,
+                name: lambda_name,
+                type_params: vec![],
+                constraints: vec![],
+                params: func_params,
+                return_type: ret_type,
+                throws: None,
+                body: body_stmt,
+                extern_import: None,
+            });
+            collect_lambdas_from_expr(body, counter, out);
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_lambdas_from_expr(left, counter, out);
+            collect_lambdas_from_expr(right, counter, out);
+        }
+        Expr::Unary { expr, .. } => collect_lambdas_from_expr(expr, counter, out),
+        Expr::Call { args, .. } => {
+            for a in args { collect_lambdas_from_expr(a, counter, out); }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            collect_lambdas_from_expr(object, counter, out);
+            for a in args { collect_lambdas_from_expr(a, counter, out); }
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            collect_lambdas_from_expr(cond, counter, out);
+            collect_lambdas_from_expr(then_branch, counter, out);
+            if let Some(e) = else_branch { collect_lambdas_from_expr(e, counter, out); }
+        }
+        Expr::Block(stmts, expr) => {
+            for s in stmts { collect_lambdas_from_stmt(s, counter, out); }
+            if let Some(e) = expr { collect_lambdas_from_expr(e, counter, out); }
+        }
+        Expr::Array(elems) | Expr::Tuple(elems) => {
+            for e in elems { collect_lambdas_from_expr(e, counter, out); }
+        }
+        Expr::ConstructorCall { args, .. } => {
+            for a in args { collect_lambdas_from_expr(a, counter, out); }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields { collect_lambdas_from_expr(e, counter, out); }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

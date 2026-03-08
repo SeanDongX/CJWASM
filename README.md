@@ -89,10 +89,10 @@ myproject/
 
 ```bash
 # 编译单文件
-cjwasm examples/hello.cj
+cjwasm tests/examples/hello.cj
 
 # 指定输出
-cjwasm examples/hello.cj -o hello.wasm
+cjwasm tests/examples/hello.cj -o hello.wasm
 
 # 多文件编译
 cjwasm main.cj lib.cj -o app.wasm
@@ -120,7 +120,7 @@ wasmtime run --invoke main hello.wasm
 
 # 也可以单独运行
 cargo test                     # 1,317 个单元/集成测试（全部通过）
-./scripts/run_examples.sh      # 37 个示例测试（全部通过）
+./scripts/system_test.sh       # 38 个系统测试（全部通过）
 ./scripts/coverage.sh          # 测试覆盖率
 ./scripts/coverage.sh --html   # HTML 报告 → target/llvm-cov/html/
 ```
@@ -187,7 +187,7 @@ main(): Int64 {
 }
 ```
 
-更多示例见 [`examples/`](examples/) 目录（37 个示例文件，全部通过）。
+更多示例见 [`tests/examples/`](tests/examples/) 目录（38 个示例文件，全部通过）。
 
 ## 测试覆盖
 
@@ -294,7 +294,7 @@ cjwasm/
 │   │   └── macro.rs       # 宏代码生成（@Assert/@Expect）
 │   ├── memory.rs          # 内存管理（分配器 + RC + GC）
 │   └── pipeline.rs        # 编译管线 & 多文件解析
-├── examples/              # 仓颉示例程序（41 个）
+├── tests/examples/        # 仓颉示例程序（38 个）
 │   ├── hello.cj           # Hello World
 │   ├── functions.cj       # 函数定义与递归
 │   ├── class.cj           # 类与属性
@@ -333,7 +333,7 @@ cjwasm/
 │   ├── system_test.sh     # 系统测试（编译运行示例 & 验证结果）
 │   ├── benchmark.sh       # CJWasm vs CJC 综合性能对比
 │   ├── coverage.sh        # 测试覆盖率
-│   └── run_examples.sh    # 运行所有示例
+│   └── system_test.sh     # 系统测试（编译+WASM验证+运行+预期值校验）
 ├── docs/
 │   ├── spec.md            # 编译器规格说明书
 │   ├── next_steps.md      # 开发路线图与进度追踪
@@ -441,7 +441,7 @@ cargo bench
 | `system_test.sh` | 编译运行 28 个 .cj 示例并验证返回值 | `./scripts/system_test.sh [--verbose]` |
 | `benchmark.sh` | CJWasm vs CJC 性能对比（编译/运行/大小） | `./scripts/benchmark.sh [--quick]` |
 | `coverage.sh` | 生成测试覆盖率报告 | `./scripts/coverage.sh [--html]` |
-| `run_examples.sh` | 运行所有示例程序 | `./scripts/run_examples.sh` |
+| `system_test.sh` | 系统测试（编译+WASM验证+运行+预期值校验） | `./scripts/system_test.sh [--compile] [--verbose]` |
 
 ## 开发
 

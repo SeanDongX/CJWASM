@@ -156,13 +156,13 @@ let struct_ty = obj_type.and_then(|ty| match ty {
 cargo build 2>&1 | grep "^error"
 
 # 2. 编译 std 示例
-cargo run -- build -p examples/std 2>&1 | tail -5
+cargo run -- build -p tests/examples/std 2>&1 | tail -5
 
 # 3. 验证 WASM 错误数变化
-wasm-validate examples/std/target/wasm/std_examples.wasm 2>&1 | wc -l
+wasm-validate tests/examples/std/target/wasm/std_examples.wasm 2>&1 | wc -l
 
-# 4. 运行全部示例（37/37 必须全部通过）
-./scripts/run_examples.sh
+# 4. 运行全部系统测试（38/38 必须全部通过）
+./scripts/system_test.sh
 ```
 
 ---

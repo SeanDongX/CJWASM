@@ -54,7 +54,7 @@ grep -rn "关键字" third_party/cangjie_compiler/src/Parse/
 ## 测试命令
 ```bash
 cargo test                          # 单元测试
-./scripts/run_examples.sh           # 运行示例
+./scripts/system_test.sh            # 系统测试（编译+验证+运行）
 cargo run -- file.cj                # 编译单个文件
 cargo run -- build -p path/to/pkg   # 编译包
 ```

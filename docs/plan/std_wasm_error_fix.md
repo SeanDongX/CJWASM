@@ -2,7 +2,7 @@
 
 ## 背景
 
-在 `cjpm build -p examples/std`（USE_CHIR=1）生成的 WASM 文件中，`wasm-validate` 报告 **1286 条**验证错误。本文档记录了从 **1286 → 61** 的完整修复过程。
+在 `cjpm build -p tests/examples/std`（USE_CHIR=1）生成的 WASM 文件中，`wasm-validate` 报告 **1286 条**验证错误。本文档记录了从 **1286 → 61** 的完整修复过程。
 
 ---
 
@@ -253,7 +253,7 @@ WASM 验证错误: 61 条（1 个文件，仅 std/）
 
 ## 第二轮修复：3277 → 8（根治方案）
 
-在实现类方法 lowering 后，`examples/std/` 的 WASM 验证错误从 61 暴涨到 3277（因为 1359 个类方法首次被编译生成代码）。以下为系统性根治修复：
+在实现类方法 lowering 后，`tests/examples/std/` 的 WASM 验证错误从 61 暴涨到 3277（因为 1359 个类方法首次被编译生成代码）。以下为系统性根治修复：
 
 ### 根因分析
 
@@ -369,8 +369,8 @@ let local_wasm_ty = if let Some(decl_ty) = ty {
 
 | 指标 | 最终结果 |
 |------|---------|
-| `examples/std/` WASM 验证错误 | **0**（从 3277 → 0） |
-| `examples/` 37 个示例 | **37/37 通过**（编译 + 验证 + 运行） |
+| `tests/examples/std/` WASM 验证错误 | **0**（从 3277 → 0） |
+| `tests/examples/` 37 个示例 | **37/37 通过**（编译 + 验证 + 运行） |
 | 单元测试 | **431 通过**，0 失败 |
 | 总错误消除历程 | 1286 → 61 → 3277 → 8 → **0** |
 
