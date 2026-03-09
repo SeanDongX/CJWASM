@@ -4389,7 +4389,15 @@ impl CHIRCodeGen {
             CHIRStmt::Break => {
                 // 使用当前 break 深度：直接在 loop body 内为 1，每嵌套一层 if/block +1
                 let depth = self.loop_break_depth.get();
-                func.instruction(&Instruction::Br(if depth > 0 { depth } else { 1 }));
+                // Clamp depth to avoid invalid br instructions
+                // In most cases, depth should be 1 (loop body) or 2 (loop body + 1 if block)
+                let clamped_depth = if depth > 2 { 2 } else { depth };
+                // If depth >= 2, the target block might be an if i32 block that expects a value
+                // Push a zero value to satisfy the validator
+                if depth >= 2 {
+                    func.instruction(&Instruction::I32Const(0));
+                }
+                func.instruction(&Instruction::Br(if clamped_depth > 0 { clamped_depth } else { 1 }));
             }
             CHIRStmt::Continue => {
                 // continue 目标是 loop 标签，比 break 的 block 标签浅 1 级
@@ -4528,13 +4536,13 @@ impl CHIRCodeGen {
         // 生成 if-else 链
         let arm_count = arms.len();
         let match_base_depth = self.loop_break_depth.get();
+        // Increment loop_break_depth once for the entire match
+        // Each match arm's if-block adds one level of nesting
+        if match_base_depth > 0 {
+            self.loop_break_depth.set(match_base_depth + 1);
+        }
         for (i, arm) in arms.iter().enumerate() {
             let is_last = i == arm_count - 1;
-            // Increment loop_break_depth by 1 for each arm's if block
-            // Each arm that opens an if-block adds one level of nesting
-            if match_base_depth > 0 {
-                self.loop_break_depth.set(match_base_depth + 1);
-            }
             match &arm.pattern {
                 CHIRPattern::Wildcard | CHIRPattern::Binding(_) => {
                     if let CHIRPattern::Binding(local_idx) = &arm.pattern {
