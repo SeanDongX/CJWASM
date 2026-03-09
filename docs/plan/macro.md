@@ -283,7 +283,7 @@ public class Stmt <: ASTNode {
   ```
 - [ ] 保留编译器内建 `@Assert`/`@Expect` 作为回退（无宏系统时使用）
 - [ ] 实现 `@Test` 宏（标记测试函数，收集到测试入口）
-- [ ] 编写示例文件 `examples/macro_basic.cj`
+- [ ] 编写示例文件 `tests/examples/macro_basic.cj`
 
 **验收**：现有测试全部通过（宏版 @Assert 与内建版行为一致），`@Test` 可用
 

@@ -1,4 +1,4 @@
-# examples/std — L1 标准库测试目录
+# tests/examples/std — L1 标准库测试目录
 
 本目录用于验证 **L1 模块**（纯 Cangjie、Vendor 优先）的解析与构建，并包含各命名空间的 **全量 API 测试**。
 
@@ -31,13 +31,13 @@
 在 **仓库根目录** 执行（以便找到 `third_party/cangjie_runtime/std/libs/std`）：
 
 ```bash
-cjwasm build -p examples/std
+cjwasm build -p tests/examples/std
 ```
 
 或进入本目录并设置 vendor 路径后构建：
 
 ```bash
-cd examples/std
+cd tests/examples/std
 CJWASM_STD_PATH=../../third_party/cangjie_runtime/std/libs/std cjwasm build
 ```
 

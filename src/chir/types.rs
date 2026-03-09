@@ -166,6 +166,13 @@ pub enum CHIRExprKind {
         val: Box<CHIRExpr>,
     },
 
+    // 间接函数调用 (Lambda/函数类型变量)
+    CallIndirect {
+        type_idx: u32,          // WASM 类型索引
+        args: Vec<CHIRExpr>,
+        callee: Box<CHIRExpr>,  // table index expression
+    },
+
     // 特殊
     Nop,                     // 无操作
     Unreachable,             // 不可达代码

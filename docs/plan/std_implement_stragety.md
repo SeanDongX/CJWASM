@@ -21,7 +21,7 @@
 - 实现方式：`pipeline` 中 `resolve_import_to_files` + `get_vendor_std_dir`，L1 模块从 `third_party/cangjie_runtime/std/libs/std` 解析；支持 `cjwasm build` 与直接编译时向上查找或 `CJWASM_STD_PATH`。
 - 新增辅助：`l1_std_top_modules()`、`strip_block_comments()`（预处理 vendor `/* ... */` 注释）、`collect_import_files()`。
 - L1 模块单元测试（`tests/l1_std_test.rs`）：11 个模块全部解析通过。
-- L1 全量 API 测试（`examples/std/src/api_std_*.cj`）：11 个命名空间测试文件已建立。
+- L1 全量 API 测试（`tests/examples/std/src/api_std_*.cj`）：11 个命名空间测试文件已建立。
 
 #### L2: 轻量 Native 依赖 - Vendor + Overlay 回退
 - **std.collection** ✅  完全复用 vendor（ArrayList, HashMap, HashSet, LinkedList 等）
@@ -106,7 +106,7 @@
 
 #### 系统测试（`scripts/system_test.sh`）
 - **37/37 全部通过**（2026-02-25）
-- 含多文件（`examples/multifile/`）与 cjpm 项目（`examples/project/`）测试
+- 含多文件（`tests/examples/multifile/`）与 cjpm 项目（`tests/examples/project/`）测试
 - 之前因 match 表达式 Bug 失败的 7 个测试：`control_flow.cj`, `enum.cj`, `error_handling.cj`, `for_in_and_guards.cj`, `memory_management.cj`, `patterns.cj`, `phase6_error_module.cj` 全部修复通过
 
 #### L1 标准库单元测试（`tests/l1_std_test.rs`）
@@ -238,7 +238,7 @@ end
 1. **修复 `std.unicode` 解析错误**
    - 定位 `unicode_extension.cj` 中 Comma 解析错误（约行 2571）
    - 确认是 `Some`/`Ok`/`Err`/其它构造表达式仍按单参数解析
-   - 修复后 `examples/std` 项目应可完整构建
+   - 修复后 `tests/examples/std` 项目应可完整构建
 
 2. **修复预存在单元测试**
    - `test_parse_extern_func` 等：修复 `@import` 中 import token 识别
@@ -275,10 +275,10 @@ end
 - ✅ **2026-02-22**: 实现 @When 条件编译支持
 - ✅ **2026-02-22**: 综合测试通过（ArrayList + random）
 - ✅ **2026-02-25**: L1 模块单元测试基础设施（`tests/l1_std_test.rs`，11 个模块全通过）
-- ✅ **2026-02-25**: L1 全量 API 测试目录（`examples/std/`，11 个命名空间）
+- ✅ **2026-02-25**: L1 全量 API 测试目录（`tests/examples/std/`，11 个命名空间）
 - ✅ **2026-02-25**: Parser 增强（struct 主构造函数、`>>` pushback、`0X`、反引号字符串、enum operator func、枚举变体多类型、顶层 const/let/var、class where、extend where、UnsafeBlock、后缀++/--)
 - ✅ **2026-02-25**: 修复 match 表达式值传播 Bug（7 个系统测试由 FAIL → PASS，系统测试 37/37）
-- 📋 **待定**: `examples/std` 完整构建通过（需修复 std.unicode 解析错误）
+- 📋 **待定**: `tests/examples/std` 完整构建通过（需修复 std.unicode 解析错误）
 - 📋 **待定**: std.io 完整可用
 - 📋 **待定**: std.math 可用
 - 📋 **待定**: std.core 核心类型可用
@@ -319,6 +319,6 @@ end
 
 1. **match 表达式全面修复**：match arm body 值传播 Bug 修复，7 个系统测试恢复，系统测试达到 37/37 全通过。
 2. **Parser 大幅增强**：struct 主构造函数、`>>` 类型歧义消解、反引号字符串、`0X` 十六进制、enum operator func、枚举变体多类型、顶层 const/let/var、class/extend where 子句、UnsafeBlock 等均已支持，显著提升 L1 vendor 代码兼容性。
-3. **L1 测试基础设施完备**：`tests/l1_std_test.rs`（11 个模块单元测试）+ `examples/std/`（11 个命名空间全量 API 测试文件）。
+3. **L1 测试基础设施完备**：`tests/l1_std_test.rs`（11 个模块单元测试）+ `tests/examples/std/`（11 个命名空间全量 API 测试文件）。
 4. **P6 新语法特性**：do-while、`?.` 可选链、尾随闭包、`!in`、const、主构造函数、inout、try-with-resources 均已实现。
 5. 仓颉语言核心语法覆盖率约 **75-80%**，可编译运行主流三方库核心逻辑。

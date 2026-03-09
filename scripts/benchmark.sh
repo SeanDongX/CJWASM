@@ -422,9 +422,9 @@ run_compile_bench() {
         echo ""
     done
 
-    # 编译全部 examples
-    echo -e "${CYAN}── 批量编译 (全部 examples/*.cj) ──${NC}"
-    local all_files=$(ls "$PROJECT_DIR/examples/"*.cj 2>/dev/null | tr '\n' ' ')
+    # 编译全部 tests/examples
+    echo -e "${CYAN}── 批量编译 (全部 tests/examples/*.cj) ──${NC}"
+    local all_files=$(ls "$PROJECT_DIR/tests/examples/"*.cj 2>/dev/null | tr '\n' ' ')
     if [ -n "$all_files" ]; then
         local count=$(echo $all_files | wc -w | tr -d ' ')
         echo "  文件数: $count"
@@ -436,7 +436,7 @@ run_compile_bench() {
             --export-json "$REPORT_DIR/compile_all_examples_${TIMESTAMP}.json" \
             --command-name "cjwasm (${count}个文件)" \
             --shell=default \
-            "for f in $PROJECT_DIR/examples/*.cj; do $CJWASM \"\$f\" -o $TMPDIR/\$(basename \"\$f\" .cj).wasm 2>/dev/null; done" \
+            "for f in $PROJECT_DIR/tests/examples/*.cj; do $CJWASM \"\$f\" -o $TMPDIR/\$(basename \"\$f\" .cj).wasm 2>/dev/null; done" \
             2>&1
     fi
     echo ""
@@ -500,7 +500,7 @@ run_size_bench() {
     printf "  %-35s %10s\n" "─────────────────────────────────" "────────"
 
     local total_wasm=0
-    for f in "$PROJECT_DIR/examples/"*.cj; do
+    for f in "$PROJECT_DIR/tests/examples/"*.cj; do
         local basename=$(basename "$f")
         local out="$TMPDIR/size_${basename%.cj}.wasm"
         if $CJWASM "$f" -o "$out" >/dev/null 2>&1; then
@@ -651,10 +651,10 @@ run_throughput_bench() {
         printf "  %-12s %8s %12s %12s %12s\n" "$label" "$lines" "$avg_ms" "$lines_per_sec" "$kb_per_sec"
     done
 
-    # 全部 examples 合计
+    # 全部 tests/examples 合计
     local total_lines=0
     local total_bytes=0
-    for f in "$PROJECT_DIR/examples/"*.cj; do
+    for f in "$PROJECT_DIR/tests/examples/"*.cj; do
         total_lines=$((total_lines + $(wc -l < "$f" | tr -d ' ')))
         total_bytes=$((total_bytes + $(wc -c < "$f" | tr -d ' ')))
     done
@@ -663,7 +663,7 @@ run_throughput_bench() {
     local count=5
     for _ in $(seq 1 $count); do
         local start_ns=$(python3 -c 'import time; print(int(time.time_ns()))')
-        for f in "$PROJECT_DIR/examples/"*.cj; do
+        for f in "$PROJECT_DIR/tests/examples/"*.cj; do
             $CJWASM "$f" -o "$TMPDIR/tp_all_$(basename "$f" .cj).wasm" >/dev/null 2>&1
         done
         local end_ns=$(python3 -c 'import time; print(int(time.time_ns()))')

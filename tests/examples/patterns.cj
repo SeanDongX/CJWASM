@@ -101,9 +101,8 @@ main(): Int64 {
     let e = matchPoint(p1)          // 5 (y轴上)
     let f = matchPoint(p2)          // 7
 
-    // a=10(processOption Some 正确返回), b=0(processOption None),
-    // c=5(countDown), d=30(deconstructPoint), e=0(matchPoint), f=0(matchPoint)
-    @Assert(a + b + c + d + e + f, 45)
+    // a=10, b=0, c=15, d=30, e=5, f=7
+    @Assert(a + b + c + d + e + f, 67)
 
-    return a + b + c + d + e + f    // 预期输出: 45
+    return a + b + c + d + e + f    // 预期输出: 67
 }

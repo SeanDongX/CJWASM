@@ -64,6 +64,14 @@ pub struct LoweringContext<'a> {
 
     /// 局部变量的 AST 类型（用于内置方法推断）
     pub local_ast_types: HashMap<String, crate::ast::Type>,
+
+    /// try-catch 错误标志局部变量索引栈（嵌套 try 时多层）
+    pub err_flag_stack: Vec<u32>,
+    /// try-catch 错误值局部变量索引栈
+    pub err_val_stack: Vec<u32>,
+
+    /// Lambda 计数器（用于生成 __lambda_N 名称，与 lower.rs 中收集顺序一致）
+    pub lambda_counter: u32,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -92,6 +100,9 @@ impl<'a> LoweringContext<'a> {
             next_local: 0,
             return_wasm_ty: None,
             local_ast_types: HashMap::new(),
+            err_flag_stack: Vec::new(),
+            err_val_stack: Vec::new(),
+            lambda_counter: 0,
         }
     }
 
@@ -404,6 +415,166 @@ impl<'a> LoweringContext<'a> {
                             crate::ast::Type::Float64, ValType::F64,
                         ));
                     }
+                    // sort(arr): in-place bubble sort on i64 array [size:i32][data:i64*]
+                    "sort" if args.len() == 1 => {
+                        let arr = self.lower_expr(&args[0])?;
+                        let arr = self.insert_cast_if_needed(arr, ValType::I32);
+                        let arr_local = self.alloc_local_typed(format!("__sort_arr_{}", self.next_local), ValType::I32);
+                        let n_local = self.alloc_local_typed(format!("__sort_n_{}", self.next_local), ValType::I64);
+                        let i_local = self.alloc_local_typed(format!("__sort_i_{}", self.next_local), ValType::I64);
+                        let j_local = self.alloc_local_typed(format!("__sort_j_{}", self.next_local), ValType::I64);
+                        let tmp_local = self.alloc_local_typed(format!("__sort_tmp_{}", self.next_local), ValType::I64);
+
+                        let mut stmts = Vec::new();
+                        stmts.push(crate::chir::CHIRStmt::Let { local_idx: arr_local, value: arr });
+                        // n = load i32 at arr (size)
+                        stmts.push(crate::chir::CHIRStmt::Let {
+                            local_idx: n_local,
+                            value: CHIRExpr::new(CHIRExprKind::Cast {
+                                expr: Box::new(CHIRExpr::new(CHIRExprKind::FieldGet {
+                                    object: Box::new(CHIRExpr::new(CHIRExprKind::Local(arr_local), crate::ast::Type::Int32, ValType::I32)),
+                                    field_offset: 0, field_ty: crate::ast::Type::Int32,
+                                }, crate::ast::Type::Int32, ValType::I32)),
+                                from_ty: ValType::I32, to_ty: ValType::I64,
+                            }, crate::ast::Type::Int64, ValType::I64),
+                        });
+                        // i = 0
+                        stmts.push(crate::chir::CHIRStmt::Let {
+                            local_idx: i_local,
+                            value: CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int64, ValType::I64),
+                        });
+
+                        // helper: data_ptr + idx*8 + 4 → memory address of arr[idx]
+                        let elem_addr = |idx_local: u32| -> CHIRExpr {
+                            CHIRExpr::new(CHIRExprKind::Binary {
+                                op: crate::ast::BinOp::Add,
+                                left: Box::new(CHIRExpr::new(CHIRExprKind::Binary {
+                                    op: crate::ast::BinOp::Add,
+                                    left: Box::new(CHIRExpr::new(CHIRExprKind::Local(arr_local), crate::ast::Type::Int32, ValType::I32)),
+                                    right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(4), crate::ast::Type::Int32, ValType::I32)),
+                                }, crate::ast::Type::Int32, ValType::I32)),
+                                right: Box::new(CHIRExpr::new(CHIRExprKind::Binary {
+                                    op: crate::ast::BinOp::Mul,
+                                    left: Box::new(CHIRExpr::new(CHIRExprKind::Cast {
+                                        expr: Box::new(CHIRExpr::new(CHIRExprKind::Local(idx_local), crate::ast::Type::Int64, ValType::I64)),
+                                        from_ty: ValType::I64, to_ty: ValType::I32,
+                                    }, crate::ast::Type::Int32, ValType::I32)),
+                                    right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(8), crate::ast::Type::Int32, ValType::I32)),
+                                }, crate::ast::Type::Int32, ValType::I32)),
+                            }, crate::ast::Type::Int32, ValType::I32)
+                        };
+                        let load_elem = |idx_local: u32| -> CHIRExpr {
+                            CHIRExpr::new(CHIRExprKind::Load {
+                                ptr: Box::new(elem_addr(idx_local)),
+                                offset: 0, align: 3,
+                            }, crate::ast::Type::Int64, ValType::I64)
+                        };
+
+                        // inner loop: j = 0; while j < n - i - 1
+                        let j_init = crate::chir::CHIRStmt::Let {
+                            local_idx: j_local,
+                            value: CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int64, ValType::I64),
+                        };
+                        let j_limit = CHIRExpr::new(CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Sub,
+                            left: Box::new(CHIRExpr::new(CHIRExprKind::Binary {
+                                op: crate::ast::BinOp::Sub,
+                                left: Box::new(CHIRExpr::new(CHIRExprKind::Local(n_local), crate::ast::Type::Int64, ValType::I64)),
+                                right: Box::new(CHIRExpr::new(CHIRExprKind::Local(i_local), crate::ast::Type::Int64, ValType::I64)),
+                            }, crate::ast::Type::Int64, ValType::I64)),
+                            right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), crate::ast::Type::Int64, ValType::I64)),
+                        }, crate::ast::Type::Int64, ValType::I64);
+                        let j_cond = CHIRExpr::new(CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Lt,
+                            left: Box::new(CHIRExpr::new(CHIRExprKind::Local(j_local), crate::ast::Type::Int64, ValType::I64)),
+                            right: Box::new(j_limit),
+                        }, crate::ast::Type::Bool, ValType::I32);
+
+                        // j+1 local (we reuse j_local + 1 inline)
+                        let j_plus1_local = self.alloc_local_typed(format!("__sort_j1_{}", self.next_local), ValType::I64);
+
+                        // inner body: if arr[j] > arr[j+1] { swap }; j = j + 1
+                        let swap_cond = CHIRExpr::new(CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Gt,
+                            left: Box::new(load_elem(j_local)),
+                            right: Box::new(load_elem(j_plus1_local)),
+                        }, crate::ast::Type::Bool, ValType::I32);
+
+                        let swap_body = crate::chir::CHIRBlock {
+                            stmts: vec![
+                                // tmp = arr[j]
+                                crate::chir::CHIRStmt::Let { local_idx: tmp_local, value: load_elem(j_local) },
+                                // arr[j] = arr[j+1]
+                                crate::chir::CHIRStmt::Expr(CHIRExpr::new(CHIRExprKind::Store {
+                                    ptr: Box::new(elem_addr(j_local)),
+                                    value: Box::new(load_elem(j_plus1_local)),
+                                    offset: 0, align: 3,
+                                }, crate::ast::Type::Unit, ValType::I32)),
+                                // arr[j+1] = tmp
+                                crate::chir::CHIRStmt::Expr(CHIRExpr::new(CHIRExprKind::Store {
+                                    ptr: Box::new(elem_addr(j_plus1_local)),
+                                    value: Box::new(CHIRExpr::new(CHIRExprKind::Local(tmp_local), crate::ast::Type::Int64, ValType::I64)),
+                                    offset: 0, align: 3,
+                                }, crate::ast::Type::Unit, ValType::I32)),
+                            ],
+                            result: None,
+                        };
+
+                        let inner_body = crate::chir::CHIRBlock {
+                            stmts: vec![
+                                // j1 = j + 1
+                                crate::chir::CHIRStmt::Let {
+                                    local_idx: j_plus1_local,
+                                    value: CHIRExpr::new(CHIRExprKind::Binary {
+                                        op: crate::ast::BinOp::Add,
+                                        left: Box::new(CHIRExpr::new(CHIRExprKind::Local(j_local), crate::ast::Type::Int64, ValType::I64)),
+                                        right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), crate::ast::Type::Int64, ValType::I64)),
+                                    }, crate::ast::Type::Int64, ValType::I64),
+                                },
+                                // if arr[j] > arr[j+1] { swap }
+                                crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                    CHIRExprKind::If { cond: Box::new(swap_cond), then_block: swap_body, else_block: None },
+                                    crate::ast::Type::Unit, ValType::I32,
+                                )),
+                                // j = j + 1
+                                crate::chir::CHIRStmt::Assign {
+                                    target: crate::chir::CHIRLValue::Local(j_local),
+                                    value: CHIRExpr::new(CHIRExprKind::Local(j_plus1_local), crate::ast::Type::Int64, ValType::I64),
+                                },
+                            ],
+                            result: None,
+                        };
+
+                        // outer loop body: j_init, while j < ..., i = i + 1
+                        let outer_body = crate::chir::CHIRBlock {
+                            stmts: vec![
+                                j_init,
+                                crate::chir::CHIRStmt::While { cond: j_cond, body: inner_body },
+                                crate::chir::CHIRStmt::Assign {
+                                    target: crate::chir::CHIRLValue::Local(i_local),
+                                    value: CHIRExpr::new(CHIRExprKind::Binary {
+                                        op: crate::ast::BinOp::Add,
+                                        left: Box::new(CHIRExpr::new(CHIRExprKind::Local(i_local), crate::ast::Type::Int64, ValType::I64)),
+                                        right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), crate::ast::Type::Int64, ValType::I64)),
+                                    }, crate::ast::Type::Int64, ValType::I64),
+                                },
+                            ],
+                            result: None,
+                        };
+
+                        let outer_cond = CHIRExpr::new(CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Lt,
+                            left: Box::new(CHIRExpr::new(CHIRExprKind::Local(i_local), crate::ast::Type::Int64, ValType::I64)),
+                            right: Box::new(CHIRExpr::new(CHIRExprKind::Local(n_local), crate::ast::Type::Int64, ValType::I64)),
+                        }, crate::ast::Type::Bool, ValType::I32);
+
+                        stmts.push(crate::chir::CHIRStmt::While { cond: outer_cond, body: outer_body });
+
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: None }),
+                            crate::ast::Type::Unit, ValType::I32,
+                        ));
+                    }
                     _ => {}
                 }
 
@@ -427,6 +598,26 @@ impl<'a> LoweringContext<'a> {
                 let func_idx = match func_idx_opt {
                     Some(idx) => idx,
                     None => {
+                        // 检查是否为函数类型的局部变量调用（Lambda / call_indirect）
+                        if let Some(crate::ast::Type::Function { params: fn_params, ret }) = self.local_ast_types.get(name).cloned() {
+                            let mut lowered_args = Vec::new();
+                            for arg in args {
+                                lowered_args.push(self.lower_expr(arg)?);
+                            }
+                            let callee_local = self.local_map.get(name).copied().unwrap_or(0);
+                            let callee_expr = CHIRExpr::new(CHIRExprKind::Local(callee_local), crate::ast::Type::Int32, ValType::I32);
+                            let ret_wasm = ret.as_ref().as_ref().map(|t| t.to_wasm()).unwrap_or(ValType::I64);
+                            let ret_ty = ret.as_ref().as_ref().cloned().unwrap_or(crate::ast::Type::Int64);
+                            return Ok(CHIRExpr::new(
+                                CHIRExprKind::CallIndirect {
+                                    type_idx: 0, // placeholder, resolved by chir_codegen
+                                    args: lowered_args,
+                                    callee: Box::new(callee_expr),
+                                },
+                                ret_ty,
+                                ret_wasm,
+                            ));
+                        }
                         // 未知函数：生成与返回类型匹配的零值占位，避免误用 fd_write
                         return Ok(CHIRExpr::new(
                             CHIRExprKind::Nop,
@@ -666,10 +857,19 @@ impl<'a> LoweringContext<'a> {
                             call_args.push(val_chir);
                         }
 
+                        let (ret_ty, ret_wasm) = self.func_return_types.get(&mangled_method)
+                            .map(|rt| {
+                                let wt = match rt {
+                                    crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                                    t => t.to_wasm(),
+                                };
+                                (rt.clone(), wt)
+                            })
+                            .unwrap_or_else(|| (ty.clone(), wasm_ty));
                         return Ok(CHIRExpr::new(
                             CHIRExprKind::Call { func_idx, args: call_args },
-                            ty.clone(),
-                            wasm_ty,
+                            ret_ty,
+                            ret_wasm,
                         ));
                     }
                 }
@@ -765,11 +965,19 @@ impl<'a> LoweringContext<'a> {
                 let field_ty = self.type_ctx.infer_field_type(&obj_ty, field)?;
                 let obj_chir = self.insert_cast_if_needed(obj_chir, ValType::I32);
 
-                CHIRExprKind::FieldGet {
-                    object: Box::new(obj_chir),
-                    field_offset: offset,
+                let field_wasm = match &field_ty {
+                    crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                    t => t.to_wasm(),
+                };
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::FieldGet {
+                        object: Box::new(obj_chir),
+                        field_offset: offset,
+                        field_ty: field_ty.clone(),
+                    },
                     field_ty,
-                }
+                    field_wasm,
+                ));
             }
 
             // 数组
@@ -878,6 +1086,248 @@ impl<'a> LoweringContext<'a> {
 
             // 构造函数调用
             Expr::ConstructorCall { name, args, .. } => {
+                // ArrayList<T>() → __arraylist_new
+                if name == "ArrayList" && args.is_empty() {
+                    if let Some(&idx) = self.func_indices.get("__arraylist_new") {
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: idx, args: vec![] },
+                            crate::ast::Type::Array(Box::new(crate::ast::Type::Int64)),
+                            ValType::I32,
+                        ));
+                    }
+                }
+                // ArrayStack<T>() / LinkedList<T>() → backed by __arraylist_new
+                if (name == "ArrayStack" || name == "LinkedList") && args.is_empty() {
+                    if let Some(&idx) = self.func_indices.get("__arraylist_new") {
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: idx, args: vec![] },
+                            crate::ast::Type::Struct(name.to_string(), vec![]),
+                            ValType::I32,
+                        ));
+                    }
+                }
+                // HashMap<K,V>() → __hashmap_new
+                if name == "HashMap" && args.is_empty() {
+                    if let Some(&idx) = self.func_indices.get("__hashmap_new") {
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: idx, args: vec![] },
+                            crate::ast::Type::Map(Box::new(crate::ast::Type::Int64), Box::new(crate::ast::Type::Int64)),
+                            ValType::I32,
+                        ));
+                    }
+                }
+                // HashSet<T>() → __hashset_new
+                if name == "HashSet" && args.is_empty() {
+                    if let Some(&idx) = self.func_indices.get("__hashset_new") {
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: idx, args: vec![] },
+                            crate::ast::Type::Map(Box::new(crate::ast::Type::Int64), Box::new(crate::ast::Type::Int64)),
+                            ValType::I32,
+                        ));
+                    }
+                }
+                // AtomicInt64(val) → alloc 8 bytes, store val
+                if name == "AtomicInt64" {
+                    let alloc_idx = *self.func_indices.get("__alloc").unwrap_or(&7);
+                    let init_val = if args.is_empty() { 0i64 } else {
+                        match &args[0] { Expr::Integer(n) => *n, _ => 0 }
+                    };
+                    let ptr_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I32);
+                    let mut stmts = Vec::new();
+                    stmts.push(crate::chir::CHIRStmt::Let {
+                        local_idx: ptr_local,
+                        value: CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: alloc_idx, args: vec![CHIRExpr::new(CHIRExprKind::Integer(8), crate::ast::Type::Int32, ValType::I32)] },
+                            crate::ast::Type::Int32, ValType::I32,
+                        ),
+                    });
+                    stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store {
+                            ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), crate::ast::Type::Int32, ValType::I32)),
+                            value: Box::new(CHIRExpr::new(CHIRExprKind::Integer(init_val), crate::ast::Type::Int64, ValType::I64)),
+                            offset: 0, align: 3,
+                        },
+                        crate::ast::Type::Unit, ValType::I32,
+                    )));
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Block(crate::chir::CHIRBlock {
+                            stmts,
+                            result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), crate::ast::Type::Struct("AtomicInt64".to_string(), vec![]), ValType::I32))),
+                        }),
+                        crate::ast::Type::Struct("AtomicInt64".to_string(), vec![]), ValType::I32,
+                    ));
+                }
+                // AtomicBool() → alloc 8 bytes, store 0
+                if name == "AtomicBool" {
+                    let alloc_idx = *self.func_indices.get("__alloc").unwrap_or(&7);
+                    let ptr_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I32);
+                    let mut stmts = Vec::new();
+                    stmts.push(crate::chir::CHIRStmt::Let {
+                        local_idx: ptr_local,
+                        value: CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: alloc_idx, args: vec![CHIRExpr::new(CHIRExprKind::Integer(8), crate::ast::Type::Int32, ValType::I32)] },
+                            crate::ast::Type::Int32, ValType::I32,
+                        ),
+                    });
+                    stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store {
+                            ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), crate::ast::Type::Int32, ValType::I32)),
+                            value: Box::new(CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int64, ValType::I64)),
+                            offset: 0, align: 3,
+                        },
+                        crate::ast::Type::Unit, ValType::I32,
+                    )));
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Block(crate::chir::CHIRBlock {
+                            stmts,
+                            result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), crate::ast::Type::Struct("AtomicBool".to_string(), vec![]), ValType::I32))),
+                        }),
+                        crate::ast::Type::Struct("AtomicBool".to_string(), vec![]), ValType::I32,
+                    ));
+                }
+                // Mutex() / ReentrantMutex() → alloc 4 bytes (stub marker)
+                if name == "Mutex" || name == "ReentrantMutex" {
+                    let alloc_idx = *self.func_indices.get("__alloc").unwrap_or(&7);
+                    let ptr_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I32);
+                    let struct_name = name.to_string();
+                    let mut stmts = Vec::new();
+                    stmts.push(crate::chir::CHIRStmt::Let {
+                        local_idx: ptr_local,
+                        value: CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: alloc_idx, args: vec![CHIRExpr::new(CHIRExprKind::Integer(4), crate::ast::Type::Int32, ValType::I32)] },
+                            crate::ast::Type::Int32, ValType::I32,
+                        ),
+                    });
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Block(crate::chir::CHIRBlock {
+                            stmts,
+                            result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), crate::ast::Type::Struct(struct_name.clone(), vec![]), ValType::I32))),
+                        }),
+                        crate::ast::Type::Struct(struct_name, vec![]), ValType::I32,
+                    ));
+                }
+                // Array<T>(n, init) → alloc + loop fill
+                if name == "Array" && args.len() == 2 {
+                    let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
+                    let n_chir = self.lower_expr(&args[0])?;
+                    let n_chir = self.insert_cast_if_needed(n_chir, ValType::I32);
+                    let init_chir = self.lower_expr(&args[1])?;
+                    let elem_size: i64 = 8; // i64 elements
+                    let ptr_local = self.alloc_local_typed("__arr_ptr".into(), ValType::I32);
+                    let n_local = self.alloc_local_typed("__arr_n".into(), ValType::I32);
+                    let i_local = self.alloc_local_typed("__arr_i".into(), ValType::I32);
+                    let ptr_get = || CHIRExpr::new(CHIRExprKind::Local(ptr_local), crate::ast::Type::Int32, ValType::I32);
+                    let n_get = || CHIRExpr::new(CHIRExprKind::Local(n_local), crate::ast::Type::Int32, ValType::I32);
+                    let i_get = || CHIRExpr::new(CHIRExprKind::Local(i_local), crate::ast::Type::Int32, ValType::I32);
+
+                    // total_bytes = 4 (len) + n * elem_size
+                    let size_expr = CHIRExpr::new(
+                        CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Add,
+                            left: Box::new(CHIRExpr::new(CHIRExprKind::Integer(4), crate::ast::Type::Int32, ValType::I32)),
+                            right: Box::new(CHIRExpr::new(
+                                CHIRExprKind::Binary {
+                                    op: crate::ast::BinOp::Mul,
+                                    left: Box::new(n_get()),
+                                    right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(elem_size), crate::ast::Type::Int32, ValType::I32)),
+                                },
+                                crate::ast::Type::Int32, ValType::I32,
+                            )),
+                        },
+                        crate::ast::Type::Int32, ValType::I32,
+                    );
+                    let alloc_call = CHIRExpr::new(
+                        CHIRExprKind::Call { func_idx: alloc_idx, args: vec![size_expr] },
+                        crate::ast::Type::Int32, ValType::I32,
+                    );
+
+                    let mut stmts = vec![
+                        crate::chir::CHIRStmt::Let { local_idx: n_local, value: n_chir },
+                        crate::chir::CHIRStmt::Let { local_idx: ptr_local, value: alloc_call },
+                        // store len at offset 0
+                        crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                            CHIRExprKind::Store { ptr: Box::new(ptr_get()), value: Box::new(n_get()), offset: 0, align: 2 },
+                            crate::ast::Type::Unit, ValType::I32,
+                        )),
+                        crate::chir::CHIRStmt::Let { local_idx: i_local, value: CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int32, ValType::I32) },
+                    ];
+
+                    // loop: while i < n { arr[4 + i*8] = init; i++ }
+                    let is_lambda_init = matches!(&args[1], Expr::Lambda { .. });
+                    let init_local = self.alloc_local_typed("__arr_init".into(), if is_lambda_init { ValType::I32 } else { ValType::I64 });
+                    stmts.push(crate::chir::CHIRStmt::Let { local_idx: init_local, value: init_chir });
+
+                    let cond = CHIRExpr::new(
+                        CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Lt,
+                            left: Box::new(i_get()),
+                            right: Box::new(n_get()),
+                        },
+                        crate::ast::Type::Bool, ValType::I32,
+                    );
+                    let elem_addr = CHIRExpr::new(
+                        CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Add,
+                            left: Box::new(ptr_get()),
+                            right: Box::new(CHIRExpr::new(
+                                CHIRExprKind::Binary {
+                                    op: crate::ast::BinOp::Add,
+                                    left: Box::new(CHIRExpr::new(CHIRExprKind::Integer(4), crate::ast::Type::Int32, ValType::I32)),
+                                    right: Box::new(CHIRExpr::new(
+                                        CHIRExprKind::Binary {
+                                            op: crate::ast::BinOp::Mul,
+                                            left: Box::new(i_get()),
+                                            right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(elem_size), crate::ast::Type::Int32, ValType::I32)),
+                                        },
+                                        crate::ast::Type::Int32, ValType::I32,
+                                    )),
+                                },
+                                crate::ast::Type::Int32, ValType::I32,
+                            )),
+                        },
+                        crate::ast::Type::Int32, ValType::I32,
+                    );
+                    let store_value = if is_lambda_init {
+                        // call_indirect lambda(i) to get value
+                        let i_as_i64 = CHIRExpr::new(
+                            CHIRExprKind::Cast { expr: Box::new(i_get()), from_ty: ValType::I32, to_ty: ValType::I64 },
+                            crate::ast::Type::Int64, ValType::I64,
+                        );
+                        CHIRExpr::new(
+                            CHIRExprKind::CallIndirect {
+                                type_idx: 0,
+                                args: vec![i_as_i64],
+                                callee: Box::new(CHIRExpr::new(CHIRExprKind::Local(init_local), crate::ast::Type::Int32, ValType::I32)),
+                            },
+                            crate::ast::Type::Int64, ValType::I64,
+                        )
+                    } else {
+                        CHIRExpr::new(CHIRExprKind::Local(init_local), crate::ast::Type::Int64, ValType::I64)
+                    };
+                    let store_stmt = crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store { ptr: Box::new(elem_addr), value: Box::new(store_value), offset: 0, align: 3 },
+                        crate::ast::Type::Unit, ValType::I32,
+                    ));
+                    let inc_stmt = crate::chir::CHIRStmt::Assign {
+                        target: crate::chir::CHIRLValue::Local(i_local),
+                        value: CHIRExpr::new(
+                            CHIRExprKind::Binary {
+                                op: crate::ast::BinOp::Add,
+                                left: Box::new(i_get()),
+                                right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), crate::ast::Type::Int32, ValType::I32)),
+                            },
+                            crate::ast::Type::Int32, ValType::I32,
+                        ),
+                    };
+                    let loop_body = crate::chir::CHIRBlock { stmts: vec![store_stmt, inc_stmt], result: None };
+                    stmts.push(crate::chir::CHIRStmt::While { cond, body: loop_body });
+
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(ptr_get())) }),
+                        crate::ast::Type::Array(Box::new(crate::ast::Type::Int64)), ValType::I32,
+                    ));
+                }
+
                 // 类型转换构造函数
                 if let Some(to_wasm) = type_cast_wasm(name) {
                     if let Some(arg) = args.first() {
@@ -1040,10 +1490,7 @@ impl<'a> LoweringContext<'a> {
                 ));
             }
 
-            // try-catch-finally：
-            // - 有 catch block 时不执行 try body（避免 throw Nop 后继续执行引发 trap）
-            //   仅执行 finally body（如有）
-            // - 无 catch block（纯 try-finally）时，顺序执行 try body + finally body
+            // try-catch-finally using __err_flag pattern
             Expr::TryBlock { body, catch_body, catch_var, finally_body, resources, .. } => {
                 let has_catch = catch_var.is_some() || !catch_body.is_empty();
                 let mut stmts: Vec<crate::chir::CHIRStmt> = Vec::new();
@@ -1057,16 +1504,73 @@ impl<'a> LoweringContext<'a> {
                     stmts.push(crate::chir::CHIRStmt::Let { local_idx, value: value_chir });
                 }
 
-                if !has_catch {
-                    // 无 catch 块：执行 try body（含 try-with-resources）
+                if has_catch {
+                    let err_flag = self.alloc_local_typed("__err_flag".into(), ValType::I32);
+                    let err_val = self.alloc_local_typed("__err_val".into(), ValType::I64);
+                    // init err_flag = 0
+                    stmts.push(crate::chir::CHIRStmt::Let {
+                        local_idx: err_flag,
+                        value: CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int32, ValType::I32),
+                    });
+                    stmts.push(crate::chir::CHIRStmt::Let {
+                        local_idx: err_val,
+                        value: CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int64, ValType::I64),
+                    });
+
+                    self.err_flag_stack.push(err_flag);
+                    self.err_val_stack.push(err_val);
+
+                    // try body: wrap each stmt in if(!err_flag) { stmt }
+                    for stmt in body {
+                        if let Ok(s) = self.lower_stmt(stmt) {
+                            let flag_get = CHIRExpr::new(CHIRExprKind::Local(err_flag), crate::ast::Type::Int32, ValType::I32);
+                            let not_flag = CHIRExpr::new(
+                                CHIRExprKind::Unary { op: crate::ast::UnaryOp::Not, expr: Box::new(flag_get) },
+                                crate::ast::Type::Bool, ValType::I32,
+                            );
+                            let body_block = crate::chir::CHIRBlock { stmts: vec![s], result: None };
+                            stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                CHIRExprKind::If { cond: Box::new(not_flag), then_block: body_block, else_block: None },
+                                crate::ast::Type::Unit, ValType::I32,
+                            )));
+                        }
+                    }
+
+                    self.err_flag_stack.pop();
+                    self.err_val_stack.pop();
+
+                    // catch: if err_flag { let catch_var = err_val; catch_body }
+                    if !catch_body.is_empty() {
+                        let mut catch_stmts: Vec<crate::chir::CHIRStmt> = Vec::new();
+                        if let Some(cv) = catch_var {
+                            let cv_local = self.alloc_local_typed(cv.clone(), ValType::I64);
+                            catch_stmts.push(crate::chir::CHIRStmt::Let {
+                                local_idx: cv_local,
+                                value: CHIRExpr::new(CHIRExprKind::Local(err_val), crate::ast::Type::Int64, ValType::I64),
+                            });
+                        }
+                        for stmt in catch_body {
+                            if let Ok(s) = self.lower_stmt(stmt) {
+                                catch_stmts.push(s);
+                            }
+                        }
+                        let catch_block = crate::chir::CHIRBlock { stmts: catch_stmts, result: None };
+                        let flag_get = CHIRExpr::new(CHIRExprKind::Local(err_flag), crate::ast::Type::Int32, ValType::I32);
+                        stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                            CHIRExprKind::If { cond: Box::new(flag_get), then_block: catch_block, else_block: None },
+                            crate::ast::Type::Unit, ValType::I32,
+                        )));
+                    }
+                } else {
+                    // no catch: execute try body directly
                     for stmt in body {
                         if let Ok(s) = self.lower_stmt(stmt) {
                             stmts.push(s);
                         }
                     }
                 }
-                // 有 catch 块时跳过 try body（throw/异常需要 WASM exception handling 支持）
-                // finally body（无论如何都执行）
+
+                // finally: always execute
                 if let Some(fin_stmts) = finally_body {
                     for stmt in fin_stmts {
                         if let Ok(s) = self.lower_stmt(stmt) {
@@ -1079,8 +1583,8 @@ impl<'a> LoweringContext<'a> {
                 } else {
                     return Ok(CHIRExpr::new(
                         CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: None }),
-                        ty.clone(),
-                        wasm_ty,
+                        crate::ast::Type::Unit,
+                        ValType::I32,
                     ));
                 }
             }
@@ -1165,6 +1669,449 @@ impl<'a> LoweringContext<'a> {
                         crate::ast::Type::Int32, ValType::I32,
                     ));
                 }
+            }
+
+            // Option::Some(v) → alloc [tag=1][value]
+            Expr::Some(inner) => {
+                let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
+                let inner_chir = self.lower_expr(inner)?;
+                let value_wasm = inner_chir.wasm_ty;
+                let value_size: i64 = if value_wasm == ValType::I64 || value_wasm == ValType::F64 { 8 } else { 4 };
+                let total_size = 4 + value_size;
+                let store_align: u32 = if value_size == 8 { 3 } else { 2 };
+                let tmp = self.alloc_local_typed("__opt_tmp".into(), ValType::I32);
+                let tmp_get = || CHIRExpr::new(CHIRExprKind::Local(tmp), crate::ast::Type::Int32, ValType::I32);
+                let alloc_call = CHIRExpr::new(
+                    CHIRExprKind::Call { func_idx: alloc_idx, args: vec![
+                        CHIRExpr::new(CHIRExprKind::Integer(total_size), crate::ast::Type::Int32, ValType::I32)
+                    ] },
+                    crate::ast::Type::Int32, ValType::I32,
+                );
+                let tag_one = CHIRExpr::new(CHIRExprKind::Integer(1), crate::ast::Type::Int32, ValType::I32);
+                let stmts = vec![
+                    crate::chir::CHIRStmt::Let { local_idx: tmp, value: alloc_call },
+                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(tag_one), offset: 0, align: 2 },
+                        crate::ast::Type::Unit, ValType::I32,
+                    )),
+                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(inner_chir), offset: 4, align: store_align },
+                        crate::ast::Type::Unit, ValType::I32,
+                    )),
+                ];
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(tmp_get())) }),
+                    crate::ast::Type::Int32, ValType::I32,
+                ));
+            }
+
+            // Option::None → alloc [tag=0]
+            Expr::None => {
+                let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
+                let tmp = self.alloc_local_typed("__opt_tmp".into(), ValType::I32);
+                let tmp_get = || CHIRExpr::new(CHIRExprKind::Local(tmp), crate::ast::Type::Int32, ValType::I32);
+                let alloc_call = CHIRExpr::new(
+                    CHIRExprKind::Call { func_idx: alloc_idx, args: vec![
+                        CHIRExpr::new(CHIRExprKind::Integer(4), crate::ast::Type::Int32, ValType::I32)
+                    ] },
+                    crate::ast::Type::Int32, ValType::I32,
+                );
+                let tag_zero = CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int32, ValType::I32);
+                let stmts = vec![
+                    crate::chir::CHIRStmt::Let { local_idx: tmp, value: alloc_call },
+                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(tag_zero), offset: 0, align: 2 },
+                        crate::ast::Type::Unit, ValType::I32,
+                    )),
+                ];
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(tmp_get())) }),
+                    crate::ast::Type::Int32, ValType::I32,
+                ));
+            }
+
+            // a ?? b: if option.tag == 1 then option.value else default
+            Expr::NullCoalesce { option, default } => {
+                let opt_chir = self.lower_expr(option)?;
+                let default_chir = self.lower_expr(default)?;
+                let result_wasm = default_chir.wasm_ty;
+                let result_ty = default_chir.ty.clone();
+                let value_align: u32 = if result_wasm == ValType::I64 || result_wasm == ValType::F64 { 3 } else { 2 };
+                let tmp = self.alloc_local_typed("__nc_ptr".into(), ValType::I32);
+                let tmp_get = || CHIRExpr::new(CHIRExprKind::Local(tmp), crate::ast::Type::Int32, ValType::I32);
+                let tag_load = CHIRExpr::new(
+                    CHIRExprKind::Load { ptr: Box::new(tmp_get()), offset: 0, align: 2 },
+                    crate::ast::Type::Int32, ValType::I32,
+                );
+                let value_load = CHIRExpr::new(
+                    CHIRExprKind::Load { ptr: Box::new(tmp_get()), offset: 4, align: value_align },
+                    result_ty.clone(), result_wasm,
+                );
+                let cond = CHIRExpr::new(
+                    CHIRExprKind::Binary {
+                        op: crate::ast::BinOp::Eq,
+                        left: Box::new(tag_load),
+                        right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), crate::ast::Type::Int32, ValType::I32)),
+                    },
+                    crate::ast::Type::Bool, ValType::I32,
+                );
+                let then_block = crate::chir::CHIRBlock { stmts: vec![], result: Some(Box::new(value_load)) };
+                let else_block = crate::chir::CHIRBlock { stmts: vec![], result: Some(Box::new(default_chir)) };
+                let stmts = vec![
+                    crate::chir::CHIRStmt::Let { local_idx: tmp, value: opt_chir },
+                ];
+                let if_expr = CHIRExpr::new(
+                    CHIRExprKind::If { cond: Box::new(cond), then_block, else_block: Some(else_block) },
+                    result_ty.clone(), result_wasm,
+                );
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(if_expr)) }),
+                    result_ty, result_wasm,
+                ));
+            }
+
+            // if-let → desugar to Match
+            Expr::IfLet { pattern, expr, then_branch, else_branch } => {
+                let else_expr = else_branch
+                    .clone()
+                    .unwrap_or_else(|| Box::new(Expr::Integer(0)));
+                let match_expr = Expr::Match {
+                    expr: expr.clone(),
+                    arms: vec![
+                        crate::ast::MatchArm {
+                            pattern: pattern.clone(),
+                            guard: None,
+                            body: then_branch.clone(),
+                        },
+                        crate::ast::MatchArm {
+                            pattern: crate::ast::Pattern::Wildcard,
+                            guard: None,
+                            body: else_expr,
+                        },
+                    ],
+                };
+                return self.lower_expr(&match_expr);
+            }
+
+            // Result::Ok(v) → alloc [tag=0][value]
+            Expr::Ok(inner) => {
+                let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
+                let inner_chir = self.lower_expr(inner)?;
+                let value_wasm = inner_chir.wasm_ty;
+                let value_size: i64 = if value_wasm == ValType::I64 || value_wasm == ValType::F64 { 8 } else { 4 };
+                let total_size = 4 + value_size;
+                let store_align: u32 = if value_size == 8 { 3 } else { 2 };
+                let tmp = self.alloc_local_typed("__res_tmp".into(), ValType::I32);
+                let tmp_get = || CHIRExpr::new(CHIRExprKind::Local(tmp), crate::ast::Type::Int32, ValType::I32);
+                let alloc_call = CHIRExpr::new(
+                    CHIRExprKind::Call { func_idx: alloc_idx, args: vec![
+                        CHIRExpr::new(CHIRExprKind::Integer(total_size), crate::ast::Type::Int32, ValType::I32)
+                    ] },
+                    crate::ast::Type::Int32, ValType::I32,
+                );
+                let tag_zero = CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int32, ValType::I32);
+                let stmts = vec![
+                    crate::chir::CHIRStmt::Let { local_idx: tmp, value: alloc_call },
+                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(tag_zero), offset: 0, align: 2 },
+                        crate::ast::Type::Unit, ValType::I32,
+                    )),
+                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(inner_chir), offset: 4, align: store_align },
+                        crate::ast::Type::Unit, ValType::I32,
+                    )),
+                ];
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(tmp_get())) }),
+                    crate::ast::Type::Int32, ValType::I32,
+                ));
+            }
+
+            // Result::Err(e) → alloc [tag=1][error_ptr]
+            Expr::Err(inner) => {
+                let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
+                let inner_chir = self.lower_expr(inner)?;
+                let tmp = self.alloc_local_typed("__res_tmp".into(), ValType::I32);
+                let tmp_get = || CHIRExpr::new(CHIRExprKind::Local(tmp), crate::ast::Type::Int32, ValType::I32);
+                let alloc_call = CHIRExpr::new(
+                    CHIRExprKind::Call { func_idx: alloc_idx, args: vec![
+                        CHIRExpr::new(CHIRExprKind::Integer(8), crate::ast::Type::Int32, ValType::I32)
+                    ] },
+                    crate::ast::Type::Int32, ValType::I32,
+                );
+                let tag_one = CHIRExpr::new(CHIRExprKind::Integer(1), crate::ast::Type::Int32, ValType::I32);
+                let stmts = vec![
+                    crate::chir::CHIRStmt::Let { local_idx: tmp, value: alloc_call },
+                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(tag_one), offset: 0, align: 2 },
+                        crate::ast::Type::Unit, ValType::I32,
+                    )),
+                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store { ptr: Box::new(tmp_get()), value: Box::new(inner_chir), offset: 4, align: 2 },
+                        crate::ast::Type::Unit, ValType::I32,
+                    )),
+                ];
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(tmp_get())) }),
+                    crate::ast::Type::Int32, ValType::I32,
+                ));
+            }
+
+            // throw expr → set err_flag=1, err_val=expr (only inside try-catch)
+            Expr::Throw(inner) => {
+                if let (Some(&err_flag), Some(&err_val)) = (self.err_flag_stack.last(), self.err_val_stack.last()) {
+                    let inner_chir = self.lower_expr(inner)?;
+                    let inner_chir = self.insert_cast_if_needed(inner_chir, ValType::I64);
+                    let stmts = vec![
+                        crate::chir::CHIRStmt::Assign {
+                            target: crate::chir::CHIRLValue::Local(err_val),
+                            value: inner_chir,
+                        },
+                        crate::chir::CHIRStmt::Assign {
+                            target: crate::chir::CHIRLValue::Local(err_flag),
+                            value: CHIRExpr::new(CHIRExprKind::Integer(1), crate::ast::Type::Int32, ValType::I32),
+                        },
+                    ];
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: None }),
+                        crate::ast::Type::Unit, ValType::I32,
+                    ));
+                } else {
+                    CHIRExprKind::Unreachable
+                }
+            }
+
+            // Lambda → 返回 __lambda_N 的函数索引作为 i32 table index
+            Expr::Lambda { .. } => {
+                let idx = self.lambda_counter;
+                self.lambda_counter += 1;
+                let lambda_name = format!("__lambda_{}", idx);
+                if let Some(&func_idx) = self.func_indices.get(&lambda_name) {
+                    CHIRExprKind::Integer(func_idx as i64)
+                } else {
+                    CHIRExprKind::Integer(0)
+                }
+            }
+
+            // 尾随闭包：callee(args) { params => body } → callee(args, lambda)
+            Expr::TrailingClosure { callee, args, closure } => {
+                if let Expr::Call { name, type_args, named_args, .. } = callee.as_ref() {
+                    let mut all_args = args.clone();
+                    all_args.push(*closure.clone());
+                    let combined = Expr::Call {
+                        name: name.clone(),
+                        args: all_args,
+                        type_args: type_args.clone(),
+                        named_args: named_args.clone(),
+                    };
+                    return self.lower_expr(&combined);
+                }
+                CHIRExprKind::Nop
+            }
+
+            // Range 表达式：5..10 → 分配 [start:i64, end:i64]
+            Expr::Range { start, end, .. } => {
+                let start_chir = self.lower_expr(start)?;
+                let start_chir = self.insert_cast_if_needed(start_chir, ValType::I64);
+                let end_chir = self.lower_expr(end)?;
+                let end_chir = self.insert_cast_if_needed(end_chir, ValType::I64);
+
+                let alloc_idx = *self.func_indices.get("__alloc").unwrap_or(&7);
+                let ptr_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I32);
+                let start_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                let end_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+
+                let mut stmts = Vec::new();
+                // save start/end
+                stmts.push(crate::chir::CHIRStmt::Let {
+                    local_idx: start_local,
+                    value: start_chir,
+                });
+                stmts.push(crate::chir::CHIRStmt::Let {
+                    local_idx: end_local,
+                    value: end_chir,
+                });
+                // alloc 16 bytes
+                stmts.push(crate::chir::CHIRStmt::Let {
+                    local_idx: ptr_local,
+                    value: CHIRExpr::new(
+                        CHIRExprKind::Call {
+                            func_idx: alloc_idx,
+                            args: vec![CHIRExpr::new(CHIRExprKind::Integer(16), crate::ast::Type::Int32, ValType::I32)],
+                        },
+                        crate::ast::Type::Int32, ValType::I32,
+                    ),
+                });
+                // store start at offset 0
+                stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                    CHIRExprKind::Store {
+                        ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), crate::ast::Type::Int32, ValType::I32)),
+                        value: Box::new(CHIRExpr::new(CHIRExprKind::Local(start_local), crate::ast::Type::Int64, ValType::I64)),
+                        offset: 0, align: 3,
+                    },
+                    crate::ast::Type::Unit, ValType::I32,
+                )));
+                // store end at offset 8
+                stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                    CHIRExprKind::Store {
+                        ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), crate::ast::Type::Int32, ValType::I32)),
+                        value: Box::new(CHIRExpr::new(CHIRExprKind::Local(end_local), crate::ast::Type::Int64, ValType::I64)),
+                        offset: 8, align: 3,
+                    },
+                    crate::ast::Type::Unit, ValType::I32,
+                )));
+
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock {
+                        stmts,
+                        result: Some(Box::new(CHIRExpr::new(
+                            CHIRExprKind::Local(ptr_local), crate::ast::Type::Struct("Range".to_string(), vec![]), ValType::I32,
+                        ))),
+                    }),
+                    crate::ast::Type::Struct("Range".to_string(), vec![]), ValType::I32,
+                ));
+            }
+
+            // 可选链 b?.field → b.field (单线程非 null 简化)
+            Expr::OptionalChain { object, field } => {
+                let field_expr = Expr::Field {
+                    object: object.clone(),
+                    field: field.clone(),
+                };
+                return self.lower_expr(&field_expr);
+            }
+
+            // spawn { body } → 单线程桩：直接执行 body
+            Expr::Spawn { body } => {
+                let mut stmts = Vec::new();
+                for stmt in body {
+                    stmts.push(self.lower_stmt(stmt)?);
+                }
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: None }),
+                    crate::ast::Type::Unit, ValType::I32,
+                ));
+            }
+
+            // synchronized(lock) { body } → 单线程桩：直接执行 body
+            Expr::Synchronized { lock: _, body } => {
+                let mut stmts = Vec::new();
+                for stmt in body {
+                    stmts.push(self.lower_stmt(stmt)?);
+                }
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: None }),
+                    crate::ast::Type::Unit, ValType::I32,
+                ));
+            }
+
+            // @Assert(a, b) → if a != b { unreachable }; @Assert(cond) → if !cond { unreachable }
+            Expr::Macro { name, args } if name == "Assert" || name == "Expect" => {
+                if args.len() == 2 {
+                    let left = self.lower_expr(&args[0])?;
+                    let right = self.lower_expr(&args[1])?;
+                    let left = self.insert_cast_if_needed(left, ValType::I64);
+                    let right = self.insert_cast_if_needed(right, ValType::I64);
+                    let cond = CHIRExpr::new(
+                        CHIRExprKind::Binary { op: crate::ast::BinOp::NotEq, left: Box::new(left), right: Box::new(right) },
+                        crate::ast::Type::Bool, ValType::I32,
+                    );
+                    let then_block = crate::chir::CHIRBlock {
+                        stmts: vec![],
+                        result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Unreachable, crate::ast::Type::Unit, ValType::I32))),
+                    };
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::If { cond: Box::new(cond), then_block, else_block: None },
+                        crate::ast::Type::Unit, ValType::I32,
+                    ));
+                } else if args.len() == 1 {
+                    let cond_expr = self.lower_expr(&args[0])?;
+                    let cond = self.insert_cast_if_needed(cond_expr, ValType::I32);
+                    let negated = CHIRExpr::new(
+                        CHIRExprKind::Unary { op: crate::ast::UnaryOp::Not, expr: Box::new(cond) },
+                        crate::ast::Type::Bool, ValType::I32,
+                    );
+                    let then_block = crate::chir::CHIRBlock {
+                        stmts: vec![],
+                        result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Unreachable, crate::ast::Type::Unit, ValType::I32))),
+                    };
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::If { cond: Box::new(negated), then_block, else_block: None },
+                        crate::ast::Type::Unit, ValType::I32,
+                    ));
+                }
+                CHIRExprKind::Nop
+            }
+
+            Expr::Interpolate(parts) => {
+                let concat_idx = self.func_indices.get("__str_concat").copied();
+                let i64_to_str = self.func_indices.get("__i64_to_str").copied();
+                let f64_to_str = self.func_indices.get("__f64_to_str").copied();
+                let bool_to_str = self.func_indices.get("__bool_to_str").copied();
+
+                let mut result: Option<CHIRExpr> = None;
+                for part in parts {
+                    let part_expr = match part {
+                        crate::ast::InterpolatePart::Literal(s) => {
+                            CHIRExpr::new(CHIRExprKind::String(s.clone()), Type::String, ValType::I32)
+                        }
+                        crate::ast::InterpolatePart::Expr(e) => {
+                            let inner = self.lower_expr(e)?;
+                            match inner.wasm_ty {
+                                ValType::I64 => {
+                                    if let Some(idx) = i64_to_str {
+                                        CHIRExpr::new(
+                                            CHIRExprKind::Call { func_idx: idx, args: vec![inner] },
+                                            Type::String, ValType::I32,
+                                        )
+                                    } else { inner }
+                                }
+                                ValType::F64 => {
+                                    if let Some(idx) = f64_to_str {
+                                        CHIRExpr::new(
+                                            CHIRExprKind::Call { func_idx: idx, args: vec![inner] },
+                                            Type::String, ValType::I32,
+                                        )
+                                    } else { inner }
+                                }
+                                _ => {
+                                    if matches!(inner.ty, Type::Bool) {
+                                        if let Some(idx) = bool_to_str {
+                                            CHIRExpr::new(
+                                                CHIRExprKind::Call { func_idx: idx, args: vec![inner] },
+                                                Type::String, ValType::I32,
+                                            )
+                                        } else { inner }
+                                    } else if matches!(inner.ty, Type::String) {
+                                        inner
+                                    } else if let Some(idx) = i64_to_str {
+                                        let cast = self.insert_cast_if_needed(inner, ValType::I64);
+                                        CHIRExpr::new(
+                                            CHIRExprKind::Call { func_idx: idx, args: vec![cast] },
+                                            Type::String, ValType::I32,
+                                        )
+                                    } else {
+                                        inner
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    result = Some(match result {
+                        None => part_expr,
+                        Some(prev) => {
+                            if let Some(idx) = concat_idx {
+                                CHIRExpr::new(
+                                    CHIRExprKind::Call { func_idx: idx, args: vec![prev, part_expr] },
+                                    Type::String, ValType::I32,
+                                )
+                            } else {
+                                part_expr
+                            }
+                        }
+                    });
+                }
+                return Ok(result.unwrap_or_else(|| CHIRExpr::new(CHIRExprKind::String(String::new()), Type::String, ValType::I32)));
             }
 
             // 其他表达式暂时返回 Nop
@@ -1267,6 +2214,17 @@ impl<'a> LoweringContext<'a> {
         match obj_ty {
             Type::Int64 | Type::Int32 | Type::Int8 | Type::Int16 => {
                 match method {
+                    "format" if args.len() == 1 => {
+                        // fallback: format(spec) → toString() (ignores spec)
+                        if let Some(&func_idx) = self.func_indices.get("__i64_to_str") {
+                            let inner = self.lower_expr(object)?;
+                            let inner = self.insert_cast_if_needed(inner, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![inner] },
+                                Type::String, ValType::I32,
+                            )));
+                        }
+                    }
                     "toFloat64" => {
                         let inner = self.lower_expr(object)?;
                         let inner = self.insert_cast_if_needed(inner, ValType::I64);
@@ -1309,6 +2267,16 @@ impl<'a> LoweringContext<'a> {
             }
             Type::Float64 | Type::Float32 => {
                 match method {
+                    "format" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__f64_to_str") {
+                            let inner = self.lower_expr(object)?;
+                            let inner = self.insert_cast_if_needed(inner, ValType::F64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![inner] },
+                                Type::String, ValType::I32,
+                            )));
+                        }
+                    }
                     "toInt64" => {
                         let inner = self.lower_expr(object)?;
                         let inner = self.insert_cast_if_needed(inner, ValType::F64);
@@ -1407,6 +2375,42 @@ impl<'a> LoweringContext<'a> {
                             )));
                         }
                     }
+                    "toArray" if args.is_empty() => {
+                        if let Some(&func_idx) = self.func_indices.get("__str_to_array") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj] },
+                                Type::Array(Box::new(Type::Int64)), ValType::I32,
+                            )));
+                        }
+                    }
+                    "indexOf" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__str_index_of") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let arg = self.lower_expr(&args[0])?;
+                            let arg = self.insert_cast_if_needed(arg, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, arg] },
+                                Type::Int64, ValType::I64,
+                            )));
+                        }
+                    }
+                    "replace" if args.len() == 2 => {
+                        if let Some(&func_idx) = self.func_indices.get("__str_replace") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let old = self.lower_expr(&args[0])?;
+                            let old = self.insert_cast_if_needed(old, ValType::I32);
+                            let new = self.lower_expr(&args[1])?;
+                            let new = self.insert_cast_if_needed(new, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, old, new] },
+                                Type::String, ValType::I32,
+                            )));
+                        }
+                    }
                     "isBlank" => {
                         // isBlank = trim().size == 0
                         if let (Some(&trim_idx), Some(&_)) = (
@@ -1421,6 +2425,743 @@ impl<'a> LoweringContext<'a> {
                             );
                             return Ok(Some(CHIRExpr::new(
                                 CHIRExprKind::BuiltinStringIsEmpty { val: Box::new(trimmed) },
+                                Type::Bool, ValType::I32,
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // ArrayList methods (type Array for ArrayList): append, get, set, remove, size
+            // Array/Struct methods: isEmpty, clone, slice
+            Type::Array(_) | Type::Struct(_, _) => {
+                match method {
+                    "append" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__arraylist_append") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let arg = self.lower_expr(&args[0])?;
+                            let arg = self.insert_cast_if_needed(arg, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, arg] },
+                                Type::Unit, ValType::I32,
+                            )));
+                        }
+                    }
+                    "get" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__arraylist_get") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let idx = self.lower_expr(&args[0])?;
+                            let idx = self.insert_cast_if_needed(idx, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, idx] },
+                                Type::Int64, ValType::I64,
+                            )));
+                        }
+                    }
+                    "set" if args.len() == 2 => {
+                        if let Some(&func_idx) = self.func_indices.get("__arraylist_set") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let idx = self.lower_expr(&args[0])?;
+                            let idx = self.insert_cast_if_needed(idx, ValType::I64);
+                            let val = self.lower_expr(&args[1])?;
+                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, idx, val] },
+                                Type::Unit, ValType::I32,
+                            )));
+                        }
+                    }
+                    "remove" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__arraylist_remove") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let idx = self.lower_expr(&args[0])?;
+                            let idx = self.insert_cast_if_needed(idx, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, idx] },
+                                Type::Int64, ValType::I64,
+                            )));
+                        }
+                    }
+                    "size" if args.is_empty() => {
+                        if let Some(&func_idx) = self.func_indices.get("__arraylist_size") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj] },
+                                Type::Int64, ValType::I64,
+                            )));
+                        }
+                    }
+                    "isEmpty" if args.is_empty() => {
+                        let obj = self.lower_expr(object)?;
+                        let len_load = CHIRExpr::new(
+                            CHIRExprKind::Load { ptr: Box::new(obj), offset: 0, align: 2 },
+                            Type::Int32, ValType::I32,
+                        );
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::Binary {
+                                op: crate::ast::BinOp::Eq,
+                                left: Box::new(len_load),
+                                right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(0), Type::Int32, ValType::I32)),
+                            },
+                            Type::Bool, ValType::I32,
+                        )));
+                    }
+                    "clone" if args.is_empty() => {
+                        let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
+                        let obj = self.lower_expr(object)?;
+                        let src_local = self.alloc_local_typed("__clone_src".into(), ValType::I32);
+                        let dst_local = self.alloc_local_typed("__clone_dst".into(), ValType::I32);
+                        let len_local = self.alloc_local_typed("__clone_len".into(), ValType::I32);
+                        let src_get = || CHIRExpr::new(CHIRExprKind::Local(src_local), Type::Int32, ValType::I32);
+                        let dst_get = || CHIRExpr::new(CHIRExprKind::Local(dst_local), Type::Int32, ValType::I32);
+                        let len_get = || CHIRExpr::new(CHIRExprKind::Local(len_local), Type::Int32, ValType::I32);
+                        let len_load = CHIRExpr::new(
+                            CHIRExprKind::Load { ptr: Box::new(src_get()), offset: 0, align: 2 },
+                            Type::Int32, ValType::I32,
+                        );
+                        // total_bytes = 4 + len * 8
+                        let total = CHIRExpr::new(
+                            CHIRExprKind::Binary {
+                                op: crate::ast::BinOp::Add,
+                                left: Box::new(CHIRExpr::new(CHIRExprKind::Integer(4), Type::Int32, ValType::I32)),
+                                right: Box::new(CHIRExpr::new(
+                                    CHIRExprKind::Binary {
+                                        op: crate::ast::BinOp::Mul,
+                                        left: Box::new(len_get()),
+                                        right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(8), Type::Int32, ValType::I32)),
+                                    },
+                                    Type::Int32, ValType::I32,
+                                )),
+                            },
+                            Type::Int32, ValType::I32,
+                        );
+                        let alloc_call = CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: alloc_idx, args: vec![total] },
+                            Type::Int32, ValType::I32,
+                        );
+                        // memory.copy: copy total bytes from src to dst
+                        // Emit as a loop: for i in 0..total_bytes { dst[i] = src[i] }
+                        // Simplified: store len then copy elements in a loop
+                        let stmts = vec![
+                            crate::chir::CHIRStmt::Let { local_idx: src_local, value: obj },
+                            crate::chir::CHIRStmt::Let { local_idx: len_local, value: len_load },
+                            crate::chir::CHIRStmt::Let { local_idx: dst_local, value: alloc_call },
+                            // store len
+                            crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                CHIRExprKind::Store { ptr: Box::new(dst_get()), value: Box::new(len_get()), offset: 0, align: 2 },
+                                Type::Unit, ValType::I32,
+                            )),
+                        ];
+                        // copy elements loop
+                        let i_local = self.alloc_local_typed("__clone_i".into(), ValType::I32);
+                        let i_get = || CHIRExpr::new(CHIRExprKind::Local(i_local), Type::Int32, ValType::I32);
+                        let cond = CHIRExpr::new(
+                            CHIRExprKind::Binary { op: crate::ast::BinOp::Lt, left: Box::new(i_get()), right: Box::new(len_get()) },
+                            Type::Bool, ValType::I32,
+                        );
+                        let src_elem = CHIRExpr::new(
+                            CHIRExprKind::Load {
+                                ptr: Box::new(CHIRExpr::new(
+                                    CHIRExprKind::Binary { op: crate::ast::BinOp::Add, left: Box::new(src_get()),
+                                        right: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Add,
+                                            left: Box::new(CHIRExpr::new(CHIRExprKind::Integer(4), Type::Int32, ValType::I32)),
+                                            right: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Mul,
+                                                left: Box::new(i_get()), right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(8), Type::Int32, ValType::I32))
+                                            }, Type::Int32, ValType::I32))
+                                        }, Type::Int32, ValType::I32)) },
+                                    Type::Int32, ValType::I32,
+                                )),
+                                offset: 0, align: 3,
+                            },
+                            Type::Int64, ValType::I64,
+                        );
+                        let dst_elem_ptr = CHIRExpr::new(
+                            CHIRExprKind::Binary { op: crate::ast::BinOp::Add, left: Box::new(dst_get()),
+                                right: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Add,
+                                    left: Box::new(CHIRExpr::new(CHIRExprKind::Integer(4), Type::Int32, ValType::I32)),
+                                    right: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Mul,
+                                        left: Box::new(i_get()), right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(8), Type::Int32, ValType::I32))
+                                    }, Type::Int32, ValType::I32))
+                                }, Type::Int32, ValType::I32)) },
+                            Type::Int32, ValType::I32,
+                        );
+                        let loop_body = crate::chir::CHIRBlock {
+                            stmts: vec![
+                                crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                    CHIRExprKind::Store { ptr: Box::new(dst_elem_ptr), value: Box::new(src_elem), offset: 0, align: 3 },
+                                    Type::Unit, ValType::I32,
+                                )),
+                                crate::chir::CHIRStmt::Assign {
+                                    target: crate::chir::CHIRLValue::Local(i_local),
+                                    value: CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Add,
+                                        left: Box::new(i_get()), right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int32, ValType::I32))
+                                    }, Type::Int32, ValType::I32),
+                                },
+                            ],
+                            result: None,
+                        };
+                        let mut all_stmts = stmts;
+                        all_stmts.push(crate::chir::CHIRStmt::Let { local_idx: i_local, value: CHIRExpr::new(CHIRExprKind::Integer(0), Type::Int32, ValType::I32) });
+                        all_stmts.push(crate::chir::CHIRStmt::While { cond, body: loop_body });
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::Block(crate::chir::CHIRBlock { stmts: all_stmts, result: Some(Box::new(dst_get())) }),
+                            Type::Int32, ValType::I32,
+                        )));
+                    }
+                    "slice" if args.len() == 2 => {
+                        let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
+                        let obj = self.lower_expr(object)?;
+                        let start = self.lower_expr(&args[0])?;
+                        let start = self.insert_cast_if_needed(start, ValType::I32);
+                        let end = self.lower_expr(&args[1])?;
+                        let end = self.insert_cast_if_needed(end, ValType::I32);
+                        let src_local = self.alloc_local_typed("__slice_src".into(), ValType::I32);
+                        let start_local = self.alloc_local_typed("__slice_start".into(), ValType::I32);
+                        let end_local = self.alloc_local_typed("__slice_end".into(), ValType::I32);
+                        let new_len_local = self.alloc_local_typed("__slice_len".into(), ValType::I32);
+                        let dst_local = self.alloc_local_typed("__slice_dst".into(), ValType::I32);
+                        let src_get = || CHIRExpr::new(CHIRExprKind::Local(src_local), Type::Int32, ValType::I32);
+                        let start_get = || CHIRExpr::new(CHIRExprKind::Local(start_local), Type::Int32, ValType::I32);
+                        let end_get = || CHIRExpr::new(CHIRExprKind::Local(end_local), Type::Int32, ValType::I32);
+                        let new_len_get = || CHIRExpr::new(CHIRExprKind::Local(new_len_local), Type::Int32, ValType::I32);
+                        let dst_get = || CHIRExpr::new(CHIRExprKind::Local(dst_local), Type::Int32, ValType::I32);
+                        let new_len_val = CHIRExpr::new(
+                            CHIRExprKind::Binary { op: crate::ast::BinOp::Sub, left: Box::new(end_get()), right: Box::new(start_get()) },
+                            Type::Int32, ValType::I32,
+                        );
+                        let total = CHIRExpr::new(
+                            CHIRExprKind::Binary { op: crate::ast::BinOp::Add,
+                                left: Box::new(CHIRExpr::new(CHIRExprKind::Integer(4), Type::Int32, ValType::I32)),
+                                right: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Mul,
+                                    left: Box::new(new_len_get()), right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(8), Type::Int32, ValType::I32))
+                                }, Type::Int32, ValType::I32))
+                            },
+                            Type::Int32, ValType::I32,
+                        );
+                        let alloc_call = CHIRExpr::new(
+                            CHIRExprKind::Call { func_idx: alloc_idx, args: vec![total] },
+                            Type::Int32, ValType::I32,
+                        );
+                        let mut stmts = vec![
+                            crate::chir::CHIRStmt::Let { local_idx: src_local, value: obj },
+                            crate::chir::CHIRStmt::Let { local_idx: start_local, value: start },
+                            crate::chir::CHIRStmt::Let { local_idx: end_local, value: end },
+                            crate::chir::CHIRStmt::Let { local_idx: new_len_local, value: new_len_val },
+                            crate::chir::CHIRStmt::Let { local_idx: dst_local, value: alloc_call },
+                            crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                CHIRExprKind::Store { ptr: Box::new(dst_get()), value: Box::new(new_len_get()), offset: 0, align: 2 },
+                                Type::Unit, ValType::I32,
+                            )),
+                        ];
+                        // copy loop
+                        let i_local = self.alloc_local_typed("__slice_i".into(), ValType::I32);
+                        let i_get = || CHIRExpr::new(CHIRExprKind::Local(i_local), Type::Int32, ValType::I32);
+                        let cond = CHIRExpr::new(
+                            CHIRExprKind::Binary { op: crate::ast::BinOp::Lt, left: Box::new(i_get()), right: Box::new(new_len_get()) },
+                            Type::Bool, ValType::I32,
+                        );
+                        let src_offset = CHIRExpr::new(
+                            CHIRExprKind::Binary { op: crate::ast::BinOp::Add, left: Box::new(src_get()),
+                                right: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Add,
+                                    left: Box::new(CHIRExpr::new(CHIRExprKind::Integer(4), Type::Int32, ValType::I32)),
+                                    right: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Mul,
+                                        left: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Add, left: Box::new(start_get()), right: Box::new(i_get()) }, Type::Int32, ValType::I32)),
+                                        right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(8), Type::Int32, ValType::I32))
+                                    }, Type::Int32, ValType::I32))
+                                }, Type::Int32, ValType::I32))
+                            },
+                            Type::Int32, ValType::I32,
+                        );
+                        let src_val = CHIRExpr::new(
+                            CHIRExprKind::Load { ptr: Box::new(src_offset), offset: 0, align: 3 },
+                            Type::Int64, ValType::I64,
+                        );
+                        let dst_offset = CHIRExpr::new(
+                            CHIRExprKind::Binary { op: crate::ast::BinOp::Add, left: Box::new(dst_get()),
+                                right: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Add,
+                                    left: Box::new(CHIRExpr::new(CHIRExprKind::Integer(4), Type::Int32, ValType::I32)),
+                                    right: Box::new(CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Mul,
+                                        left: Box::new(i_get()), right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(8), Type::Int32, ValType::I32))
+                                    }, Type::Int32, ValType::I32))
+                                }, Type::Int32, ValType::I32))
+                            },
+                            Type::Int32, ValType::I32,
+                        );
+                        let loop_body = crate::chir::CHIRBlock {
+                            stmts: vec![
+                                crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                    CHIRExprKind::Store { ptr: Box::new(dst_offset), value: Box::new(src_val), offset: 0, align: 3 },
+                                    Type::Unit, ValType::I32,
+                                )),
+                                crate::chir::CHIRStmt::Assign {
+                                    target: crate::chir::CHIRLValue::Local(i_local),
+                                    value: CHIRExpr::new(CHIRExprKind::Binary { op: crate::ast::BinOp::Add,
+                                        left: Box::new(i_get()), right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int32, ValType::I32))
+                                    }, Type::Int32, ValType::I32),
+                                },
+                            ],
+                            result: None,
+                        };
+                        stmts.push(crate::chir::CHIRStmt::Let { local_idx: i_local, value: CHIRExpr::new(CHIRExprKind::Integer(0), Type::Int32, ValType::I32) });
+                        stmts.push(crate::chir::CHIRStmt::While { cond, body: loop_body });
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(dst_get())) }),
+                            Type::Int32, ValType::I32,
+                        )));
+                    }
+                    _ => {
+                        // ArrayStack/LinkedList methods (backed by ArrayList runtime)
+                        if let Type::Struct(sname, _) = obj_ty {
+                            if sname == "ArrayStack" {
+                                let obj = self.lower_expr(object)?;
+                                let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                                match method {
+                                    "push" if args.len() == 1 => {
+                                        if let Some(&func_idx) = self.func_indices.get("__arraylist_append") {
+                                            let val = self.lower_expr(&args[0])?;
+                                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                                            return Ok(Some(CHIRExpr::new(
+                                                CHIRExprKind::Call { func_idx, args: vec![obj, val] },
+                                                Type::Unit, ValType::I32,
+                                            )));
+                                        }
+                                    }
+                                    "peek" if args.is_empty() => {
+                                        if let (Some(&size_idx), Some(&get_idx)) = (
+                                            self.func_indices.get("__arraylist_size"),
+                                            self.func_indices.get("__arraylist_get"),
+                                        ) {
+                                            let ptr_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I32);
+                                            let stmts = vec![
+                                                crate::chir::CHIRStmt::Let { local_idx: ptr_local, value: obj },
+                                            ];
+                                            let size_expr = CHIRExpr::new(
+                                                CHIRExprKind::Call { func_idx: size_idx, args: vec![
+                                                    CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32),
+                                                ] },
+                                                Type::Int64, ValType::I64,
+                                            );
+                                            let idx_expr = CHIRExpr::new(
+                                                CHIRExprKind::Binary {
+                                                    op: crate::ast::BinOp::Sub,
+                                                    left: Box::new(size_expr),
+                                                    right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int64, ValType::I64)),
+                                                },
+                                                Type::Int64, ValType::I64,
+                                            );
+                                            let get_expr = CHIRExpr::new(
+                                                CHIRExprKind::Call { func_idx: get_idx, args: vec![
+                                                    CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32),
+                                                    idx_expr,
+                                                ] },
+                                                Type::Int64, ValType::I64,
+                                            );
+                                            return Ok(Some(CHIRExpr::new(
+                                                CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(get_expr)) }),
+                                                Type::Int64, ValType::I64,
+                                            )));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if sname == "LinkedList" {
+                                let obj = self.lower_expr(object)?;
+                                let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                                match method {
+                                    "append" if args.len() == 1 => {
+                                        if let Some(&func_idx) = self.func_indices.get("__arraylist_append") {
+                                            let val = self.lower_expr(&args[0])?;
+                                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                                            return Ok(Some(CHIRExpr::new(
+                                                CHIRExprKind::Call { func_idx, args: vec![obj, val] },
+                                                Type::Unit, ValType::I32,
+                                            )));
+                                        }
+                                    }
+                                    "prepend" if args.len() == 1 => {
+                                        // prepend(val): shift right by 1, set index 0
+                                        if let (Some(&append_idx), Some(&size_idx), Some(&get_idx), Some(&set_idx)) = (
+                                            self.func_indices.get("__arraylist_append"),
+                                            self.func_indices.get("__arraylist_size"),
+                                            self.func_indices.get("__arraylist_get"),
+                                            self.func_indices.get("__arraylist_set"),
+                                        ) {
+                                            let val = self.lower_expr(&args[0])?;
+                                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                                            let ptr_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I32);
+                                            let val_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                                            let i_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                                            let mut stmts = Vec::new();
+                                            stmts.push(crate::chir::CHIRStmt::Let { local_idx: ptr_local, value: obj });
+                                            stmts.push(crate::chir::CHIRStmt::Let { local_idx: val_local, value: val });
+                                            // append dummy to grow
+                                            stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                                CHIRExprKind::Call { func_idx: append_idx, args: vec![
+                                                    CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32),
+                                                    CHIRExpr::new(CHIRExprKind::Integer(0), Type::Int64, ValType::I64),
+                                                ] },
+                                                Type::Unit, ValType::I32,
+                                            )));
+                                            // i = size - 1
+                                            stmts.push(crate::chir::CHIRStmt::Let {
+                                                local_idx: i_local,
+                                                value: CHIRExpr::new(CHIRExprKind::Binary {
+                                                    op: crate::ast::BinOp::Sub,
+                                                    left: Box::new(CHIRExpr::new(
+                                                        CHIRExprKind::Call { func_idx: size_idx, args: vec![
+                                                            CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32),
+                                                        ] },
+                                                        Type::Int64, ValType::I64,
+                                                    )),
+                                                    right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int64, ValType::I64)),
+                                                }, Type::Int64, ValType::I64),
+                                            });
+                                            // while i > 0: set(i, get(i-1)); i = i - 1
+                                            let cond = CHIRExpr::new(CHIRExprKind::Binary {
+                                                op: crate::ast::BinOp::Gt,
+                                                left: Box::new(CHIRExpr::new(CHIRExprKind::Local(i_local), Type::Int64, ValType::I64)),
+                                                right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(0), Type::Int64, ValType::I64)),
+                                            }, Type::Bool, ValType::I32);
+                                            let prev_val = CHIRExpr::new(
+                                                CHIRExprKind::Call { func_idx: get_idx, args: vec![
+                                                    CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32),
+                                                    CHIRExpr::new(CHIRExprKind::Binary {
+                                                        op: crate::ast::BinOp::Sub,
+                                                        left: Box::new(CHIRExpr::new(CHIRExprKind::Local(i_local), Type::Int64, ValType::I64)),
+                                                        right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int64, ValType::I64)),
+                                                    }, Type::Int64, ValType::I64),
+                                                ] },
+                                                Type::Int64, ValType::I64,
+                                            );
+                                            let loop_body = crate::chir::CHIRBlock {
+                                                stmts: vec![
+                                                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                                        CHIRExprKind::Call { func_idx: set_idx, args: vec![
+                                                            CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32),
+                                                            CHIRExpr::new(CHIRExprKind::Local(i_local), Type::Int64, ValType::I64),
+                                                            prev_val,
+                                                        ] },
+                                                        Type::Unit, ValType::I32,
+                                                    )),
+                                                    crate::chir::CHIRStmt::Assign {
+                                                        target: crate::chir::CHIRLValue::Local(i_local),
+                                                        value: CHIRExpr::new(CHIRExprKind::Binary {
+                                                            op: crate::ast::BinOp::Sub,
+                                                            left: Box::new(CHIRExpr::new(CHIRExprKind::Local(i_local), Type::Int64, ValType::I64)),
+                                                            right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int64, ValType::I64)),
+                                                        }, Type::Int64, ValType::I64),
+                                                    },
+                                                ],
+                                                result: None,
+                                            };
+                                            stmts.push(crate::chir::CHIRStmt::While { cond, body: loop_body });
+                                            // set(0, val)
+                                            stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                                                CHIRExprKind::Call { func_idx: set_idx, args: vec![
+                                                    CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32),
+                                                    CHIRExpr::new(CHIRExprKind::Integer(0), Type::Int64, ValType::I64),
+                                                    CHIRExpr::new(CHIRExprKind::Local(val_local), Type::Int64, ValType::I64),
+                                                ] },
+                                                Type::Unit, ValType::I32,
+                                            )));
+                                            return Ok(Some(CHIRExpr::new(
+                                                CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: None }),
+                                                Type::Unit, ValType::I32,
+                                            )));
+                                        }
+                                    }
+                                    "get" if args.len() == 1 => {
+                                        if let Some(&func_idx) = self.func_indices.get("__arraylist_get") {
+                                            let idx = self.lower_expr(&args[0])?;
+                                            let idx = self.insert_cast_if_needed(idx, ValType::I64);
+                                            return Ok(Some(CHIRExpr::new(
+                                                CHIRExprKind::Call { func_idx, args: vec![obj, idx] },
+                                                Type::Int64, ValType::I64,
+                                            )));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // AtomicInt64/AtomicBool/Mutex/ReentrantMutex methods
+                        if let Type::Struct(sname, _) = obj_ty {
+                            if sname == "AtomicInt64" {
+                                let obj = self.lower_expr(object)?;
+                                let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                                match method {
+                                    "store" if args.len() == 1 => {
+                                        let val = self.lower_expr(&args[0])?;
+                                        let val = self.insert_cast_if_needed(val, ValType::I64);
+                                        return Ok(Some(CHIRExpr::new(
+                                            CHIRExprKind::Store { ptr: Box::new(obj), value: Box::new(val), offset: 0, align: 3 },
+                                            Type::Unit, ValType::I32,
+                                        )));
+                                    }
+                                    "load" if args.is_empty() => {
+                                        return Ok(Some(CHIRExpr::new(
+                                            CHIRExprKind::Load { ptr: Box::new(obj), offset: 0, align: 3 },
+                                            Type::Int64, ValType::I64,
+                                        )));
+                                    }
+                                    "fetchAdd" if args.len() == 1 => {
+                                        let delta = self.lower_expr(&args[0])?;
+                                        let delta = self.insert_cast_if_needed(delta, ValType::I64);
+                                        let old_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                                        let ptr_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I32);
+                                        let stmts = vec![
+                                            crate::chir::CHIRStmt::Let { local_idx: ptr_local, value: obj },
+                                            crate::chir::CHIRStmt::Let {
+                                                local_idx: old_local,
+                                                value: CHIRExpr::new(CHIRExprKind::Load {
+                                                    ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32)),
+                                                    offset: 0, align: 3,
+                                                }, Type::Int64, ValType::I64),
+                                            },
+                                            crate::chir::CHIRStmt::Expr(CHIRExpr::new(CHIRExprKind::Store {
+                                                ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32)),
+                                                value: Box::new(CHIRExpr::new(CHIRExprKind::Binary {
+                                                    op: crate::ast::BinOp::Add,
+                                                    left: Box::new(CHIRExpr::new(CHIRExprKind::Local(old_local), Type::Int64, ValType::I64)),
+                                                    right: Box::new(delta),
+                                                }, Type::Int64, ValType::I64)),
+                                                offset: 0, align: 3,
+                                            }, Type::Unit, ValType::I32)),
+                                        ];
+                                        return Ok(Some(CHIRExpr::new(
+                                            CHIRExprKind::Block(crate::chir::CHIRBlock {
+                                                stmts,
+                                                result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Local(old_local), Type::Int64, ValType::I64))),
+                                            }),
+                                            Type::Int64, ValType::I64,
+                                        )));
+                                    }
+                                    "compareAndSwap" if args.len() == 2 => {
+                                        let expected = self.lower_expr(&args[0])?;
+                                        let expected = self.insert_cast_if_needed(expected, ValType::I64);
+                                        let new_val = self.lower_expr(&args[1])?;
+                                        let new_val = self.insert_cast_if_needed(new_val, ValType::I64);
+                                        let cur_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                                        let ptr_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I32);
+                                        let exp_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                                        let new_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                                        let stmts = vec![
+                                            crate::chir::CHIRStmt::Let { local_idx: ptr_local, value: obj },
+                                            crate::chir::CHIRStmt::Let { local_idx: exp_local, value: expected },
+                                            crate::chir::CHIRStmt::Let { local_idx: new_local, value: new_val },
+                                            crate::chir::CHIRStmt::Let {
+                                                local_idx: cur_local,
+                                                value: CHIRExpr::new(CHIRExprKind::Load {
+                                                    ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32)),
+                                                    offset: 0, align: 3,
+                                                }, Type::Int64, ValType::I64),
+                                            },
+                                        ];
+                                        let if_body = crate::chir::CHIRBlock {
+                                            stmts: vec![crate::chir::CHIRStmt::Expr(CHIRExpr::new(CHIRExprKind::Store {
+                                                ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32)),
+                                                value: Box::new(CHIRExpr::new(CHIRExprKind::Local(new_local), Type::Int64, ValType::I64)),
+                                                offset: 0, align: 3,
+                                            }, Type::Unit, ValType::I32))],
+                                            result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int64, ValType::I64))),
+                                        };
+                                        let else_body = crate::chir::CHIRBlock {
+                                            stmts: vec![],
+                                            result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Integer(0), Type::Int64, ValType::I64))),
+                                        };
+                                        let cond = CHIRExpr::new(CHIRExprKind::Binary {
+                                            op: crate::ast::BinOp::Eq,
+                                            left: Box::new(CHIRExpr::new(CHIRExprKind::Local(cur_local), Type::Int64, ValType::I64)),
+                                            right: Box::new(CHIRExpr::new(CHIRExprKind::Local(exp_local), Type::Int64, ValType::I64)),
+                                        }, Type::Bool, ValType::I32);
+                                        return Ok(Some(CHIRExpr::new(
+                                            CHIRExprKind::Block(crate::chir::CHIRBlock {
+                                                stmts,
+                                                result: Some(Box::new(CHIRExpr::new(
+                                                    CHIRExprKind::If { cond: Box::new(cond), then_block: if_body, else_block: Some(else_body) },
+                                                    Type::Int64, ValType::I64,
+                                                ))),
+                                            }),
+                                            Type::Int64, ValType::I64,
+                                        )));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if sname == "AtomicBool" {
+                                let obj = self.lower_expr(object)?;
+                                let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                                match method {
+                                    "store" if args.len() == 1 => {
+                                        let val = self.lower_expr(&args[0])?;
+                                        let val = self.insert_cast_if_needed(val, ValType::I64);
+                                        return Ok(Some(CHIRExpr::new(
+                                            CHIRExprKind::Store { ptr: Box::new(obj), value: Box::new(val), offset: 0, align: 3 },
+                                            Type::Unit, ValType::I32,
+                                        )));
+                                    }
+                                    "load" if args.is_empty() => {
+                                        return Ok(Some(CHIRExpr::new(
+                                            CHIRExprKind::Load { ptr: Box::new(obj), offset: 0, align: 3 },
+                                            Type::Int64, ValType::I64,
+                                        )));
+                                    }
+                                    "compareAndSwap" if args.len() == 2 => {
+                                        let expected = self.lower_expr(&args[0])?;
+                                        let expected = self.insert_cast_if_needed(expected, ValType::I64);
+                                        let new_val = self.lower_expr(&args[1])?;
+                                        let new_val = self.insert_cast_if_needed(new_val, ValType::I64);
+                                        let cur_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                                        let ptr_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I32);
+                                        let exp_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                                        let new_local = self.alloc_local_typed(format!("__tmp_{}", self.next_local), ValType::I64);
+                                        let stmts = vec![
+                                            crate::chir::CHIRStmt::Let { local_idx: ptr_local, value: obj },
+                                            crate::chir::CHIRStmt::Let { local_idx: exp_local, value: expected },
+                                            crate::chir::CHIRStmt::Let { local_idx: new_local, value: new_val },
+                                            crate::chir::CHIRStmt::Let {
+                                                local_idx: cur_local,
+                                                value: CHIRExpr::new(CHIRExprKind::Load {
+                                                    ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32)),
+                                                    offset: 0, align: 3,
+                                                }, Type::Int64, ValType::I64),
+                                            },
+                                        ];
+                                        let if_body = crate::chir::CHIRBlock {
+                                            stmts: vec![crate::chir::CHIRStmt::Expr(CHIRExpr::new(CHIRExprKind::Store {
+                                                ptr: Box::new(CHIRExpr::new(CHIRExprKind::Local(ptr_local), Type::Int32, ValType::I32)),
+                                                value: Box::new(CHIRExpr::new(CHIRExprKind::Local(new_local), Type::Int64, ValType::I64)),
+                                                offset: 0, align: 3,
+                                            }, Type::Unit, ValType::I32))],
+                                            result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int64, ValType::I64))),
+                                        };
+                                        let else_body = crate::chir::CHIRBlock {
+                                            stmts: vec![],
+                                            result: Some(Box::new(CHIRExpr::new(CHIRExprKind::Integer(0), Type::Int64, ValType::I64))),
+                                        };
+                                        let cond = CHIRExpr::new(CHIRExprKind::Binary {
+                                            op: crate::ast::BinOp::Eq,
+                                            left: Box::new(CHIRExpr::new(CHIRExprKind::Local(cur_local), Type::Int64, ValType::I64)),
+                                            right: Box::new(CHIRExpr::new(CHIRExprKind::Local(exp_local), Type::Int64, ValType::I64)),
+                                        }, Type::Bool, ValType::I32);
+                                        return Ok(Some(CHIRExpr::new(
+                                            CHIRExprKind::Block(crate::chir::CHIRBlock {
+                                                stmts,
+                                                result: Some(Box::new(CHIRExpr::new(
+                                                    CHIRExprKind::If { cond: Box::new(cond), then_block: if_body, else_block: Some(else_body) },
+                                                    Type::Int64, ValType::I64,
+                                                ))),
+                                            }),
+                                            Type::Int64, ValType::I64,
+                                        )));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if sname == "Mutex" || sname == "ReentrantMutex" {
+                                match method {
+                                    "lock" | "unlock" => {
+                                        return Ok(Some(CHIRExpr::new(CHIRExprKind::Nop, Type::Unit, ValType::I32)));
+                                    }
+                                    "tryLock" => {
+                                        return Ok(Some(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int64, ValType::I64)));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // HashMap/HashSet methods (type Map for both)
+            Type::Map(_, _) => {
+                match method {
+                    "put" if args.len() == 2 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashmap_put") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let key = self.lower_expr(&args[0])?;
+                            let key = self.insert_cast_if_needed(key, ValType::I64);
+                            let val = self.lower_expr(&args[1])?;
+                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, key, val] },
+                                Type::Unit, ValType::I32,
+                            )));
+                        }
+                    }
+                    "get" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashmap_get") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let key = self.lower_expr(&args[0])?;
+                            let key = self.insert_cast_if_needed(key, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, key] },
+                                Type::Int64, ValType::I64,
+                            )));
+                        }
+                    }
+                    "containsKey" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashmap_contains") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let key = self.lower_expr(&args[0])?;
+                            let key = self.insert_cast_if_needed(key, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, key] },
+                                Type::Bool, ValType::I32,
+                            )));
+                        }
+                    }
+                    "remove" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashmap_remove") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let key = self.lower_expr(&args[0])?;
+                            let key = self.insert_cast_if_needed(key, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, key] },
+                                Type::Int64, ValType::I64,
+                            )));
+                        }
+                    }
+                    "size" if args.is_empty() => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashmap_size") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj] },
+                                Type::Int64, ValType::I64,
+                            )));
+                        }
+                    }
+                    "add" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashset_add") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let val = self.lower_expr(&args[0])?;
+                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, val] },
+                                Type::Unit, ValType::I32,
+                            )));
+                        }
+                    }
+                    "contains" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashset_contains") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let val = self.lower_expr(&args[0])?;
+                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, val] },
                                 Type::Bool, ValType::I32,
                             )));
                         }
