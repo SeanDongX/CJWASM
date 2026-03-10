@@ -677,117 +677,126 @@ impl CodeGen {
         self.func_indices
             .insert("__pow_i64".to_string(), runtime_func_base);
 
+        // __pow_f64(f64, f64) -> f64
+        types
+            .ty()
+            .function([ValType::F64, ValType::F64], [ValType::F64]);
+        self.func_types
+            .insert("__pow_f64".to_string(), runtime_type_base + 1);
+        self.func_indices
+            .insert("__pow_f64".to_string(), runtime_func_base + 1);
+
         // __str_concat(i32, i32) -> i32
         types
             .ty()
             .function([ValType::I32, ValType::I32], [ValType::I32]);
         self.func_types
-            .insert("__str_concat".to_string(), runtime_type_base + 1);
+            .insert("__str_concat".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__str_concat".to_string(), runtime_func_base + 1);
+            .insert("__str_concat".to_string(), runtime_func_base + 16);
 
         // __i64_to_str(i64) -> i32
         types.ty().function([ValType::I64], [ValType::I32]);
         self.func_types
-            .insert("__i64_to_str".to_string(), runtime_type_base + 2);
+            .insert("__i64_to_str".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__i64_to_str".to_string(), runtime_func_base + 2);
+            .insert("__i64_to_str".to_string(), runtime_func_base + 16);
 
         // __i32_to_str(i32) -> i32
         types.ty().function([ValType::I32], [ValType::I32]);
         self.func_types
-            .insert("__i32_to_str".to_string(), runtime_type_base + 3);
+            .insert("__i32_to_str".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__i32_to_str".to_string(), runtime_func_base + 3);
+            .insert("__i32_to_str".to_string(), runtime_func_base + 16);
 
         // __u32_to_str(i32) -> i32
         types.ty().function([ValType::I32], [ValType::I32]);
         self.func_types
-            .insert("__u32_to_str".to_string(), runtime_type_base + 4);
+            .insert("__u32_to_str".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__u32_to_str".to_string(), runtime_func_base + 4);
+            .insert("__u32_to_str".to_string(), runtime_func_base + 16);
 
         // __f64_to_str(f64) -> i32
         types.ty().function([ValType::F64], [ValType::I32]);
         self.func_types
-            .insert("__f64_to_str".to_string(), runtime_type_base + 5);
+            .insert("__f64_to_str".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__f64_to_str".to_string(), runtime_func_base + 5);
+            .insert("__f64_to_str".to_string(), runtime_func_base + 16);
 
         // __f32_to_str(f32) -> i32
         types.ty().function([ValType::F32], [ValType::I32]);
         self.func_types
-            .insert("__f32_to_str".to_string(), runtime_type_base + 6);
+            .insert("__f32_to_str".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__f32_to_str".to_string(), runtime_func_base + 6);
+            .insert("__f32_to_str".to_string(), runtime_func_base + 16);
 
         // __bool_to_str(i32) -> i32
         types.ty().function([ValType::I32], [ValType::I32]);
         self.func_types
-            .insert("__bool_to_str".to_string(), runtime_type_base + 7);
+            .insert("__bool_to_str".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__bool_to_str".to_string(), runtime_func_base + 7);
+            .insert("__bool_to_str".to_string(), runtime_func_base + 16);
 
         // 标准库雏形：min/max/abs (Int64)
         types
             .ty()
             .function([ValType::I64, ValType::I64], [ValType::I64]);
         self.func_types
-            .insert("__min_i64".to_string(), runtime_type_base + 8);
+            .insert("__min_i64".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__min_i64".to_string(), runtime_func_base + 8);
+            .insert("__min_i64".to_string(), runtime_func_base + 16);
         types
             .ty()
             .function([ValType::I64, ValType::I64], [ValType::I64]);
         self.func_types
-            .insert("__max_i64".to_string(), runtime_type_base + 9);
+            .insert("__max_i64".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__max_i64".to_string(), runtime_func_base + 9);
+            .insert("__max_i64".to_string(), runtime_func_base + 16);
         types.ty().function([ValType::I64], [ValType::I64]);
         self.func_types
-            .insert("__abs_i64".to_string(), runtime_type_base + 10);
+            .insert("__abs_i64".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__abs_i64".to_string(), runtime_func_base + 10);
+            .insert("__abs_i64".to_string(), runtime_func_base + 16);
 
         // Phase 8: 内存管理运行时函数
         // __alloc(size: i32) -> i32
         types.ty().function([ValType::I32], [ValType::I32]);
         self.func_types
-            .insert("__alloc".to_string(), runtime_type_base + 11);
+            .insert("__alloc".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__alloc".to_string(), runtime_func_base + 11);
+            .insert("__alloc".to_string(), runtime_func_base + 16);
 
         // __free(ptr: i32)
         types.ty().function([ValType::I32], []);
         self.func_types
-            .insert("__free".to_string(), runtime_type_base + 12);
+            .insert("__free".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__free".to_string(), runtime_func_base + 12);
+            .insert("__free".to_string(), runtime_func_base + 16);
 
         // __rc_inc(ptr: i32)
         types.ty().function([ValType::I32], []);
         self.func_types
-            .insert("__rc_inc".to_string(), runtime_type_base + 13);
+            .insert("__rc_inc".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__rc_inc".to_string(), runtime_func_base + 13);
+            .insert("__rc_inc".to_string(), runtime_func_base + 16);
 
         // __rc_dec(ptr: i32)
         types.ty().function([ValType::I32], []);
         self.func_types
-            .insert("__rc_dec".to_string(), runtime_type_base + 14);
+            .insert("__rc_dec".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__rc_dec".to_string(), runtime_func_base + 14);
+            .insert("__rc_dec".to_string(), runtime_func_base + 16);
 
         // __gc_collect() -> i32
         types.ty().function([], [ValType::I32]);
         self.func_types
-            .insert("__gc_collect".to_string(), runtime_type_base + 15);
+            .insert("__gc_collect".to_string(), runtime_type_base + 17);
         self.func_indices
-            .insert("__gc_collect".to_string(), runtime_func_base + 15);
+            .insert("__gc_collect".to_string(), runtime_func_base + 16);
 
         // Phase 7: WASI I/O 支持 — print/println/eprint/eprintln/readln + math 运行时
         // WASI fd_write 类型: (i32, i32, i32, i32) -> i32
-        let wasi_fd_write_type_idx = runtime_type_base + 16;
+        let wasi_fd_write_type_idx = runtime_type_base + 17;
         types.ty().function(
             [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
             [ValType::I32],
@@ -1498,6 +1507,7 @@ impl CodeGen {
         }
         // 运行时辅助函数
         codes.function(&self.emit_pow_i64());
+        codes.function(&self.emit_pow_f64());
         codes.function(&self.emit_str_concat());
         codes.function(&self.emit_i64_to_str());
         codes.function(&self.emit_i32_to_str());
@@ -2055,6 +2065,49 @@ impl CodeGen {
         f.instruction(&Instruction::LocalSet(1));
         f.instruction(&Instruction::Br(0));
         f.instruction(&Instruction::End);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 生成 __pow_f64(base: f64, exp: f64) -> f64 辅助函数
+    fn emit_pow_f64(&self) -> WasmFunc {
+        let mut f = WasmFunc::new(vec![(1, ValType::F64)]);
+        // 简单实现：result = 1.0; loop exp times: result *= base
+        // 局部变量: 0=base, 1=exp, 2=result, 3=counter
+
+        // result = 1.0
+        f.instruction(&Instruction::F64Const(1.0));
+        f.instruction(&Instruction::LocalSet(2));
+
+        // counter = 0.0
+        f.instruction(&Instruction::F64Const(0.0));
+        f.instruction(&Instruction::LocalSet(3));
+
+        // loop: while counter < exp
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::F64Lt);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+        // result *= base
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Mul);
+        f.instruction(&Instruction::LocalSet(2));
+
+        // counter += 1.0
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::F64Const(1.0));
+        f.instruction(&Instruction::F64Add);
+        f.instruction(&Instruction::LocalSet(3));
+
+        f.instruction(&Instruction::Br(1)); // continue loop
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
+
         f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);

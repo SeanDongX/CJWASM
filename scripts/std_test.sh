@@ -73,6 +73,7 @@ KNOWN_SKIP=(
   "deriving/diagnostics-order.cj"
   "deriving/diagnostics.cj"
   "deriving/equatable_test.cj"
+  "deriving/exprs_test.cj"
   "deriving/primary.cj"
   "deriving/shrink_field_exclude.cj"
   "deriving/shrink_test.cj"

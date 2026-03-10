@@ -241,6 +241,40 @@ impl<'a> LoweringContext<'a> {
                 ));
             }
 
+            // 幂运算：转换为函数调用
+            Expr::Binary { op: crate::ast::BinOp::Pow, left, right } => {
+                let left_chir = self.lower_expr(left)?;
+                let right_chir = self.lower_expr(right)?;
+
+                // 根据操作数类型选择 __pow_i64 或 __pow_f64
+                let func_name = if left_chir.wasm_ty == ValType::F64 || right_chir.wasm_ty == ValType::F64 {
+                    "__pow_f64"
+                } else {
+                    "__pow_i64"
+                };
+
+                // 解析函数索引
+                let mangled = format!("{}$2", func_name);
+                let func_idx = self.func_indices.get(&mangled)
+                    .or_else(|| self.func_indices.get(func_name))
+                    .copied()
+                    .unwrap_or(0);
+
+                // 确保两个操作数类型一致
+                let target_ty = if func_name == "__pow_f64" { ValType::F64 } else { ValType::I64 };
+                let left_casted = self.insert_cast_if_needed(left_chir, target_ty);
+                let right_casted = self.insert_cast_if_needed(right_chir, target_ty);
+
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Call {
+                        func_idx,
+                        args: vec![left_casted, right_casted],
+                    },
+                    if target_ty == ValType::F64 { crate::ast::Type::Float64 } else { crate::ast::Type::Int64 },
+                    target_ty,
+                ));
+            }
+
             // 二元运算
             Expr::Binary { op, left, right } => {
                 let left_chir = self.lower_expr(left)?;

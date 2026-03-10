@@ -77,6 +77,8 @@ const RT_STR_TRIM: &str = "__str_trim";
 const RT_STR_TO_ARRAY: &str = "__str_to_array";
 const RT_STR_INDEX_OF: &str = "__str_index_of";
 const RT_STR_REPLACE: &str = "__str_replace";
+const RT_POW_I64: &str = "__pow_i64";
+const RT_POW_F64: &str = "__pow_f64";
 // Collection runtime functions
 const RT_ARRAYLIST_NEW: &str = "__arraylist_new";
 const RT_ARRAYLIST_APPEND: &str = "__arraylist_append";
@@ -113,6 +115,7 @@ const RT_NAMES: &[&str] = &[
     RT_ARRAYLIST_NEW, RT_ARRAYLIST_APPEND, RT_ARRAYLIST_GET, RT_ARRAYLIST_SET, RT_ARRAYLIST_REMOVE, RT_ARRAYLIST_SIZE,
     RT_HASHMAP_NEW, RT_HASHMAP_PUT, RT_HASHMAP_GET, RT_HASHMAP_CONTAINS, RT_HASHMAP_REMOVE, RT_HASHMAP_SIZE,
     RT_HASHSET_NEW, RT_HASHSET_ADD, RT_HASHSET_CONTAINS, RT_HASHSET_SIZE,
+    RT_POW_I64, RT_POW_F64,
 ];
 
 // ─── CHIRCodeGen ──────────────────────────────────────────────────────────────
@@ -487,6 +490,8 @@ impl CHIRCodeGen {
             &[ValType::I32, ValType::I64],            // __hashset_add
             &[ValType::I32, ValType::I64],            // __hashset_contains
             &[ValType::I32],                          // __hashset_size
+            &[ValType::I64, ValType::I64],            // __pow_i64
+            &[ValType::F64, ValType::F64],            // __pow_f64
         ];
         for (i, name) in RT_NAMES.iter().enumerate() {
             let idx = IMPORT_COUNT + user_count + i as u32;
@@ -837,6 +842,16 @@ impl CHIRCodeGen {
         // (i32) → i64: __hashset_size
         functions.function(ty_i32_i64);
         rt_type_indices.push(ty_i32_i64);
+        // (i64, i64) → i64: __pow_i64
+        let ty_i64i64_i64 = types.len();
+        types.ty().function(vec![ValType::I64, ValType::I64], vec![ValType::I64]);
+        functions.function(ty_i64i64_i64);
+        rt_type_indices.push(ty_i64i64_i64);
+        // (f64, f64) → f64: __pow_f64
+        let ty_f64f64_f64 = types.len();
+        types.ty().function(vec![ValType::F64, ValType::F64], vec![ValType::F64]);
+        functions.function(ty_f64f64_f64);
+        rt_type_indices.push(ty_f64f64_f64);
         rt_type_indices
     }
 
@@ -924,6 +939,12 @@ impl CHIRCodeGen {
         codes.function(&self.emit_hashset_add());
         codes.function(&self.emit_hashset_contains());
         codes.function(&self.emit_hashset_size());
+        // __pow_i64
+        codes.function(&Self::build_rt_pow_i64());
+        // __pow_f64
+        let exp_idx2 = self.func_indices[RT_MATH_EXP];
+        let log_idx2 = self.func_indices[RT_MATH_LOG];
+        codes.function(&Self::build_rt_math_pow(exp_idx2, log_idx2));
     }
 
     /// 生成 I/O 辅助 MemArg
@@ -1360,6 +1381,47 @@ impl CHIRCodeGen {
         f.instruction(&Instruction::Call(log_idx)); // log(base)
         f.instruction(&Instruction::F64Mul); // exp * log(base)
         f.instruction(&Instruction::Call(exp_idx)); // exp(exp * log(base))
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// __pow_i64(base: i64, exp: i64) -> i64
+    /// Integer exponentiation: base ** exp (returns 0 for negative exp)
+    fn build_rt_pow_i64() -> wasm_encoder::Function {
+        // locals: 0=base, 1=exp, 2=result
+        let mut f = wasm_encoder::Function::new(vec![(1, ValType::I64)]);
+        // exp < 0 -> return 0
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::I64LtS);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // result = 1
+        f.instruction(&Instruction::I64Const(1));
+        f.instruction(&Instruction::LocalSet(2));
+        // loop: if exp <= 0 break; result *= base; exp--
+        f.instruction(&Instruction::Loop(BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::I64LeS);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64Mul);
+        f.instruction(&Instruction::LocalSet(2));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I64Const(1));
+        f.instruction(&Instruction::I64Sub);
+        f.instruction(&Instruction::LocalSet(1));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
         f
     }

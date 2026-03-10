@@ -978,7 +978,9 @@ impl CodeGen {
                 }
                 // P0: 查询标准库元数据
                 if let Some(Type::Struct(ref type_name, ref type_args)) = obj_ty {
-                    if let Some(ret) = crate::metadata::stdlib_method_return_type(type_name, type_args, method) {
+                    if let Some(ret) =
+                        crate::metadata::stdlib_method_return_type(type_name, type_args, method)
+                    {
                         return Some(ret);
                     }
                 }
@@ -1184,8 +1186,8 @@ impl CodeGen {
                 // ArrayList 方法（底层 WASM 函数均返回元素值 i64，非 Option）
                 "get" | "first" | "last" | "pop" | "remove" => Some(*elem_ty.clone()),
                 // Unit 返回值不暴露（避免 to_wasm() panic）
-                "add" | "push" | "append" | "prepend" | "insert" | "set"
-                | "clear" | "sort" | "sortBy" | "reverse" => None,
+                "add" | "push" | "append" | "prepend" | "insert" | "set" | "clear" | "sort"
+                | "sortBy" | "reverse" => None,
                 "contains" => Some(Type::Bool),
                 _ => None,
             },
@@ -1197,7 +1199,7 @@ impl CodeGen {
             },
             // Map<K,V> 方法返回类型
             Some(Type::Map(ref _key_ty, ref val_ty)) => match method {
-                "get" => Some(*val_ty.clone()), // 直接返回值类型，不是 Option
+                "get" => Some(*val_ty.clone()),    // 直接返回值类型，不是 Option
                 "remove" => Some(*val_ty.clone()), // remove 也返回值类型
                 "put" => Some(Type::Unit),
                 "containsKey" | "contains" => Some(Type::Bool), // HashMap.containsKey 和 HashSet.contains
@@ -1219,8 +1221,9 @@ impl CodeGen {
             }
             // AtomicInt64 方法返回类型
             Some(Type::Struct(ref name, _)) if name == "AtomicInt64" => match method {
-                "load" | "fetchAdd" | "fetchSub" | "fetchOr" | "fetchAnd" | "fetchXor"
-                | "swap" => Some(Type::Int64),
+                "load" | "fetchAdd" | "fetchSub" | "fetchOr" | "fetchAnd" | "fetchXor" | "swap" => {
+                    Some(Type::Int64)
+                }
                 "compareAndSwap" => Some(Type::Bool),
                 "store" => Some(Type::Unit),
                 _ => None,
@@ -1234,9 +1237,7 @@ impl CodeGen {
                 _ => None,
             },
             // Mutex/ReentrantMutex 方法返回类型
-            Some(Type::Struct(ref name, _))
-                if name == "Mutex" || name == "ReentrantMutex" =>
-            {
+            Some(Type::Struct(ref name, _)) if name == "Mutex" || name == "ReentrantMutex" => {
                 match method {
                     "tryLock" => Some(Type::Bool),
                     "lock" | "unlock" => Some(Type::Unit),
@@ -1653,7 +1654,9 @@ impl CodeGen {
                 }
                 // P0: 查询标准库元数据
                 if let Some(Type::Struct(ref type_name, ref type_args)) = obj_ty {
-                    if let Some(ret) = crate::metadata::stdlib_method_return_type(type_name, type_args, method) {
+                    if let Some(ret) =
+                        crate::metadata::stdlib_method_return_type(type_name, type_args, method)
+                    {
                         return Some(ret);
                     }
                 }
@@ -1725,7 +1728,10 @@ impl CodeGen {
                         }
                         // P1: 查找 class 字段（ClassInfo.all_fields 包含所有继承字段）
                         let class_field = self.classes.get(&lookup_name).and_then(|ci| {
-                            ci.all_fields.iter().find(|f| f.name == *field).map(|f| f.ty.clone())
+                            ci.all_fields
+                                .iter()
+                                .find(|f| f.name == *field)
+                                .map(|f| f.ty.clone())
                         });
                         if class_field.is_some() {
                             return class_field;
@@ -1753,9 +1759,7 @@ impl CodeGen {
                 use crate::ast::UnaryOp;
                 match op {
                     UnaryOp::Not => Some(Type::Bool), // ! 总是返回 Bool (i32)
-                    UnaryOp::BitNot | UnaryOp::Neg => {
-                        self.infer_ast_type_with_locals(expr, locals)
-                    }
+                    UnaryOp::BitNot | UnaryOp::Neg => self.infer_ast_type_with_locals(expr, locals),
                 }
             }
             Expr::Binary {
@@ -2158,10 +2162,21 @@ impl CodeGen {
                 // 内建类型构造函数（如 Rune(x), UInt32(x) 等）总是产生值
                 if matches!(
                     name.as_str(),
-                    "Rune" | "Int8" | "Int16" | "Int32" | "Int64"
-                        | "UInt8" | "UInt16" | "UInt32" | "UInt64"
-                        | "Float16" | "Float32" | "Float64"
-                        | "IntNative" | "UIntNative" | "Bool"
+                    "Rune"
+                        | "Int8"
+                        | "Int16"
+                        | "Int32"
+                        | "Int64"
+                        | "UInt8"
+                        | "UInt16"
+                        | "UInt32"
+                        | "UInt64"
+                        | "Float16"
+                        | "Float32"
+                        | "Float64"
+                        | "IntNative"
+                        | "UIntNative"
+                        | "Bool"
                 ) {
                     return !args.is_empty(); // 有参数时是类型转换（产生值），无参数时按函数查找
                 }
@@ -3953,14 +3968,11 @@ impl CodeGen {
                             .expect(&format!("类 {} 没有父类", current_class_name));
 
                         // 从父类获取字段偏移和类型
-                        let field_info_super = self
-                            .classes
-                            .get(parent_class_name)
-                            .and_then(|ci| {
-                                let off = ci.field_offset(field)?;
-                                let ft = ci.field_type(field)?.clone();
-                                Some((off, ft))
-                            });
+                        let field_info_super = self.classes.get(parent_class_name).and_then(|ci| {
+                            let off = ci.field_offset(field)?;
+                            let ft = ci.field_type(field)?.clone();
+                            Some((off, ft))
+                        });
 
                         if field_info_super.is_none() {
                             // 字段未找到（可能是属性/property的setter）- 尝试作为 this 字段赋值
@@ -5753,7 +5765,10 @@ impl CodeGen {
                             name.to_string()
                         };
                         // Check if this is a method call within the same class
-                        let (actual_key, is_implicit_method_call) = if self.func_params.contains_key(&key) {
+                        let (actual_key, is_implicit_method_call) = if self
+                            .func_params
+                            .contains_key(&key)
+                        {
                             (key.clone(), false)
                         } else if let Some(Type::Struct(class_name, _)) = locals.get_type("this") {
                             let method_key = format!("{}.{}", class_name, name);
@@ -5764,7 +5779,9 @@ impl CodeGen {
                                 let expected_param_count = args.len() + 1;
                                 let prefix_exact = format!("{}.{}", class_name, name);
                                 let prefix_mangled = format!("{}.{}$", class_name, name);
-                                let candidates: Vec<String> = self.func_params.keys()
+                                let candidates: Vec<String> = self
+                                    .func_params
+                                    .keys()
                                     .filter(|k| {
                                         (*k == &prefix_exact || k.starts_with(&prefix_mangled))
                                             && self.func_params[*k].len() == expected_param_count
@@ -5776,10 +5793,13 @@ impl CodeGen {
                                 } else {
                                     // 尝试接口默认方法：InterfaceName.__default_methodName
                                     let default_suffix = format!(".__default_{}", name);
-                                    let iface_candidates: Vec<String> = self.func_params.keys()
+                                    let iface_candidates: Vec<String> = self
+                                        .func_params
+                                        .keys()
                                         .filter(|k| {
                                             k.ends_with(&default_suffix)
-                                                && self.func_params[*k].len() == expected_param_count
+                                                && self.func_params[*k].len()
+                                                    == expected_param_count
                                         })
                                         .cloned()
                                         .collect();
@@ -5788,7 +5808,9 @@ impl CodeGen {
                                     } else {
                                         // 也尝试包级别的函数按参数数量匹配
                                         let pkg_prefix = format!("{}$", name);
-                                        let pkg_candidates: Vec<String> = self.func_params.keys()
+                                        let pkg_candidates: Vec<String> = self
+                                            .func_params
+                                            .keys()
                                             .filter(|k| {
                                                 (*k == name || k.starts_with(&pkg_prefix))
                                                     && self.func_params[*k].len() == args.len()
@@ -5806,7 +5828,9 @@ impl CodeGen {
                         } else {
                             // 尝试包级别的函数按参数数量匹配
                             let pkg_prefix = format!("{}$", name);
-                            let pkg_candidates: Vec<String> = self.func_params.keys()
+                            let pkg_candidates: Vec<String> = self
+                                .func_params
+                                .keys()
                                 .filter(|k| {
                                     (*k == name || k.starts_with(&pkg_prefix))
                                         && self.func_params[*k].len() == args.len()
@@ -5823,9 +5847,12 @@ impl CodeGen {
                         if self.func_params.get(&actual_key).is_none() {
                             // 函数未找到：生成警告并发出桩代码
                             eprintln!("[警告] 函数未找到: '{}' - 生成桩代码", actual_key);
-                            let matching: Vec<_> = self.func_params.keys()
+                            let matching: Vec<_> = self
+                                .func_params
+                                .keys()
                                 .filter(|k| k.contains(name.as_str()))
-                                .cloned().collect();
+                                .cloned()
+                                .collect();
                             if !matching.is_empty() {
                                 eprintln!("  包含 '{}' 的函数: {:?}", name, matching);
                             }
@@ -5877,7 +5904,11 @@ impl CodeGen {
                                 self.compile_expr(default, locals, func, loop_ctx);
                             } else {
                                 // 参数不足：发出警告并使用零值
-                                eprintln!("[警告] 函数 {} 第 {} 个参数缺少实参且无默认值，使用零值", name, i + 1);
+                                eprintln!(
+                                    "[警告] 函数 {} 第 {} 个参数缺少实参且无默认值，使用零值",
+                                    name,
+                                    i + 1
+                                );
                                 func.instruction(&Instruction::I64Const(0));
                             }
                         }
@@ -5973,14 +6004,11 @@ impl CodeGen {
                     .expect(&format!("类 {} 没有父类", current_class_name));
 
                 // 从父类获取字段偏移和类型
-                let field_info = self
-                    .classes
-                    .get(parent_class_name)
-                    .and_then(|ci| {
-                        let off = ci.field_offset(field)?;
-                        let ft = ci.field_type(field)?.clone();
-                        Some((off, ft))
-                    });
+                let field_info = self.classes.get(parent_class_name).and_then(|ci| {
+                    let off = ci.field_offset(field)?;
+                    let ft = ci.field_type(field)?.clone();
+                    Some((off, ft))
+                });
 
                 if let Some((offset, field_ty)) = field_info {
                     func.instruction(&Instruction::LocalGet(this_idx));
@@ -6097,7 +6125,9 @@ impl CodeGen {
                             if let Some(param) = params.get(param_idx) {
                                 if !param.variadic {
                                     // 只在实参 AST 类型确定时才做协调，避免 infer_type 回退 I64 误触发 I32WrapI64
-                                    if let Some(arg_ast_ty) = self.infer_ast_type_with_locals(arg, locals) {
+                                    if let Some(arg_ast_ty) =
+                                        self.infer_ast_type_with_locals(arg, locals)
+                                    {
                                         let arg_wasm_ty = arg_ast_ty.to_wasm();
                                         let param_wasm_ty = param.ty.to_wasm();
                                         self.emit_type_coercion(func, arg_wasm_ty, param_wasm_ty);
@@ -6138,10 +6168,18 @@ impl CodeGen {
                                     self.infer_type(expr) // 与 collect_locals 一致的回退
                                 };
                                 match ret_wasm_ty {
-                                    ValType::I32 => { func.instruction(&Instruction::I32Const(0)); }
-                                    ValType::F32 => { func.instruction(&Instruction::F32Const(0.0_f32)); }
-                                    ValType::F64 => { func.instruction(&Instruction::F64Const(0.0_f64)); }
-                                    _ => { func.instruction(&Instruction::I64Const(0)); }
+                                    ValType::I32 => {
+                                        func.instruction(&Instruction::I32Const(0));
+                                    }
+                                    ValType::F32 => {
+                                        func.instruction(&Instruction::F32Const(0.0_f32));
+                                    }
+                                    ValType::F64 => {
+                                        func.instruction(&Instruction::F64Const(0.0_f64));
+                                    }
+                                    _ => {
+                                        func.instruction(&Instruction::I64Const(0));
+                                    }
                                 }
                             }
                         }
@@ -6506,7 +6544,10 @@ impl CodeGen {
                         Some(Type::Array(ref elem_ty)) => Some(elem_ty.as_ref().clone()),
                         _ => None,
                     };
-                    let elem_wasm_ty = elem_ast_ty.as_ref().map(|t| t.to_wasm()).unwrap_or(ValType::I64);
+                    let elem_wasm_ty = elem_ast_ty
+                        .as_ref()
+                        .map(|t| t.to_wasm())
+                        .unwrap_or(ValType::I64);
                     let elem_size: i32 = match elem_wasm_ty {
                         ValType::I32 | ValType::F32 => 4,
                         _ => 8,
@@ -6626,12 +6667,14 @@ impl CodeGen {
 
                     // 获取字段的实际类型定义
                     let field_ty = if is_class {
-                        self.classes.get(name)
+                        self.classes
+                            .get(name)
                             .and_then(|ci| ci.field_type(field_name))
                             .cloned()
                             .unwrap_or(Type::Int64)
                     } else {
-                        self.structs.get(name)
+                        self.structs
+                            .get(name)
                             .and_then(|sd| sd.field_type(field_name))
                             .cloned()
                             .unwrap_or(Type::Int64)
@@ -7172,7 +7215,10 @@ impl CodeGen {
                     wasm_encoder::BlockType::Empty
                 } else {
                     // 优先使用 AST 类型推断：TypeParam 视为 I32（对象引用指针）
-                    let wasm_ty = match self.infer_ast_type_with_locals(&arms[0].body, locals).as_ref() {
+                    let wasm_ty = match self
+                        .infer_ast_type_with_locals(&arms[0].body, locals)
+                        .as_ref()
+                    {
                         Some(Type::TypeParam(_)) => ValType::I32,
                         Some(t) if !matches!(t, Type::Unit | Type::Nothing) => t.to_wasm(),
                         _ => self.infer_type_with_locals(&arms[0].body, locals),
@@ -8017,7 +8063,13 @@ impl CodeGen {
 
                 // 编译 catch 块（在 throw 发生时执行）
                 func.instruction(&Instruction::LocalGet(err_flag));
-                func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                // 修复：当 try-catch 产生值时，catch 块的 if 应该使用 Result 类型
+                let catch_block_type = if produces_value {
+                    wasm_encoder::BlockType::Result(ValType::I64)
+                } else {
+                    wasm_encoder::BlockType::Empty
+                };
+                func.instruction(&Instruction::If(catch_block_type));
                 if let Some(ref var) = catch_var {
                     if let Some(var_idx) = locals.get(var) {
                         func.instruction(&Instruction::LocalGet(err_val));

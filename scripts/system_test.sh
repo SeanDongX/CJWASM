@@ -35,6 +35,7 @@ NC='\033[0m'
 VERBOSE=false
 NO_BUILD=false
 COMPILE_ONLY=false
+NO_STD_TEST=false
 FILTER=""
 
 for arg in "$@"; do
@@ -42,6 +43,7 @@ for arg in "$@"; do
     --verbose|-v)  VERBOSE=true ;;
     --no-build)    NO_BUILD=true ;;
     --compile)     COMPILE_ONLY=true ;;
+    --no-std-test) NO_STD_TEST=true ;;
     -h|--help)
       echo "用法: $0 [选项] [文件名...]"
       echo ""
@@ -52,6 +54,7 @@ for arg in "$@"; do
       echo "  --verbose, -v  显示详细输出（编译器输出、WASM 验证错误等）"
       echo "  --compile      仅编译和 WASM 验证，不运行"
       echo "  --no-build     跳过编译器构建（假定已构建）"
+      echo "  --no-std-test  跳过 std_test.sh 兼容性测试"
       echo "  -h, --help     显示帮助"
       echo ""
       echo "示例:"
@@ -460,6 +463,31 @@ if [[ -d "$STD_DIR" && -f "$STD_DIR/cjpm.toml" && -z "$FILTER" ]]; then
     if $VERBOSE; then
       echo -e "  ${DIM}${RED}$compile_output${NC}"
     fi
+  fi
+fi
+
+# ── std 兼容性测试 (third_party/cangjie_test) ──
+
+STD_TEST_SCRIPT="$SCRIPT_DIR/std_test.sh"
+if [[ -x "$STD_TEST_SCRIPT" && -z "$FILTER" && $NO_STD_TEST == false ]]; then
+  echo ""
+  echo -e "${CYAN}[附加] std 兼容性测试: third_party/cangjie_test${NC}"
+
+  std_test_args=()
+  if $HAS_WASM_VALIDATE; then
+    std_test_args+=("--validate")
+  fi
+  if $VERBOSE; then
+    std_test_args+=("--verbose")
+  fi
+
+  if "$STD_TEST_SCRIPT" "${std_test_args[@]}"; then
+    printf "  %-28s ${GREEN}✓${NC}\n" "std_test.sh"
+    ((PASS++)) || true
+  else
+    printf "  %-28s ${RED}✗ 失败${NC}\n" "std_test.sh"
+    ((FAIL++)) || true
+    ERRORS+=("std_test.sh (失败)")
   fi
 fi
 
