@@ -633,6 +633,7 @@ mod tests {
             &func_return_types,
             &[],
             None,
+            0,
         ).unwrap();
 
         assert_eq!(chir_func.name, "test");
@@ -672,6 +673,7 @@ mod tests {
             &func_return_types,
             &[],
             None,
+            0,
         ).unwrap();
 
         assert_eq!(chir_func.params.len(), 2);
@@ -736,6 +738,7 @@ mod tests {
             &func_return_types,
             &[],
             Some("Counter"),
+            0,
         ).unwrap();
 
         assert_eq!(chir_func.name, "Counter.getN");

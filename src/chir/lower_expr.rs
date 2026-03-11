@@ -4106,7 +4106,8 @@ mod tests {
             step: None,
         };
         let chir = ctx.lower_expr(&expr).unwrap();
-        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+        // Range now lowers to a Block that allocates memory and stores start/end
+        assert!(matches!(chir.kind, CHIRExprKind::Block(_)));
     }
 
     #[test]
@@ -4121,7 +4122,8 @@ mod tests {
             crate::ast::InterpolatePart::Expr(Box::new(Expr::Integer(42))),
         ]);
         let chir = ctx.lower_expr(&expr).unwrap();
-        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+        // Without __str_concat in func_indices, result is the last part (Integer)
+        assert!(matches!(chir.kind, CHIRExprKind::Integer(42)));
     }
 
     #[test]
@@ -4138,7 +4140,8 @@ mod tests {
             default: Box::new(Expr::Integer(0)),
         };
         let chir = ctx.lower_expr(&expr).unwrap();
-        assert!(matches!(chir.kind, CHIRExprKind::Nop));
+        // NullCoalesce now lowers to a Block with If condition
+        assert!(matches!(chir.kind, CHIRExprKind::Block(_)));
     }
 
     #[test]
