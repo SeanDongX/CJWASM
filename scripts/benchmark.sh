@@ -19,6 +19,122 @@ BENCH_DIR="$PROJECT_DIR/benches/fixtures"
 REPORT_DIR="$PROJECT_DIR/target/bench_reports"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
+# ── 运行时峰值内存采集 (Peak RSS) ──
+# 返回值: 输出 "KB" (Linux: kbytes, macOS: bytes→KB)
+# 若不可用则输出 0
+peak_rss_kb() {
+    local cmd="$1"
+    local os
+    os="$(uname -s)"
+
+    if [[ "$os" == "Darwin" ]]; then
+        if command -v /usr/bin/time &>/dev/null; then
+            # /usr/bin/time -l: "maximum resident set size" 的数值单位是 bytes
+            local out rss_bytes
+            out=$({ /usr/bin/time -l bash -c "$cmd" >/dev/null; } 2>&1) || true
+            rss_bytes=$(echo "$out" | awk '/maximum resident set size/ {print $1; exit}')
+            if [[ -n "${rss_bytes:-}" ]]; then
+                echo $((rss_bytes / 1024))
+                return 0
+            fi
+        fi
+        echo 0
+        return 0
+    fi
+
+    # GNU time: "Maximum resident set size (kbytes):"
+    if command -v /usr/bin/time &>/dev/null; then
+        local out rss_kb
+        out=$({ /usr/bin/time -v bash -c "$cmd" >/dev/null; } 2>&1) || true
+        rss_kb=$(echo "$out" | awk -F': *' '/Maximum resident set size/ {print $2; exit}')
+        if [[ -n "${rss_kb:-}" ]]; then
+            echo "$rss_kb"
+            return 0
+        fi
+    fi
+
+    echo 0
+}
+
+positive_diff_kb() {
+    local total="${1:-0}"
+    local base="${2:-0}"
+    if [[ -z "$total" || "$total" == "0" ]]; then
+        echo 0
+        return 0
+    fi
+    if [[ -z "$base" || "$base" == "0" ]]; then
+        echo "$total"
+        return 0
+    fi
+    if (( total > base )); then
+        echo $((total - base))
+    else
+        echo 0
+    fi
+}
+
+format_kb_as_mb() {
+    local kb="${1:-0}"
+    if [[ -z "$kb" || "$kb" == "0" ]]; then
+        echo "N/A"
+        return 0
+    fi
+    python3 - <<PY 2>/dev/null || echo "N/A"
+kb = int("$kb")
+print(f"{kb/1024.0:.1f} MB")
+PY
+}
+
+WASMTIME_BASELINE_RSS_KB=0
+WASMTIME_BASELINE_READY=false
+
+# 采集 wasmtime 空载基线 RSS，用于从端到端 RSS 中扣除 VM/JIT 固定成本。
+measure_wasmtime_baseline_rss_kb() {
+    if $WASMTIME_BASELINE_READY; then
+        echo "$WASMTIME_BASELINE_RSS_KB"
+        return 0
+    fi
+
+    WASMTIME_BASELINE_READY=true
+
+    if ! $WASMTIME_AVAILABLE; then
+        echo 0
+        return 0
+    fi
+
+    local baseline_src="$TMPDIR/wasmtime_baseline_empty.cj"
+    local baseline_wasm="$TMPDIR/wasmtime_baseline_empty.wasm"
+
+    cat > "$baseline_src" << 'CJ'
+main(): Int64 {
+    return 0
+}
+CJ
+
+    if ! $CJWASM "$baseline_src" -o "$baseline_wasm" >/dev/null 2>&1; then
+        echo 0
+        return 0
+    fi
+
+    if ! wasmtime run --invoke main "$baseline_wasm" >/dev/null 2>&1; then
+        echo 0
+        return 0
+    fi
+
+    local baseline_kb=0
+    for _ in $(seq 1 3); do
+        local v
+        v=$(peak_rss_kb "wasmtime run --invoke main \"$baseline_wasm\"") || v=0
+        if [[ "$v" -gt "$baseline_kb" ]]; then
+            baseline_kb="$v"
+        fi
+    done
+
+    WASMTIME_BASELINE_RSS_KB="$baseline_kb"
+    echo "$WASMTIME_BASELINE_RSS_KB"
+}
+
 # 颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -899,7 +1015,11 @@ EOF
     # ── 运行时性能对比 ──
     local has_runtime=false
     local rt_rows=""
+    local wasmtime_baseline_rss_kb=0
+    local wasmtime_baseline_rss_fmt="N/A"
     if command -v wasmtime &>/dev/null; then
+        wasmtime_baseline_rss_kb=$(measure_wasmtime_baseline_rss_kb)
+        wasmtime_baseline_rss_fmt="$(format_kb_as_mb "$wasmtime_baseline_rss_kb")"
         for i in "${!sizes[@]}"; do
             local size="${sizes[$i]}"
             local label="${labels[$i]}"
@@ -925,8 +1045,26 @@ EOF
             done
             local wasm_rt_ms=$(echo "scale=2; $rt_total_ns / 10 / 1000000" | bc)
 
+            # 峰值内存: 取 3 次中的最大值（避免抖动）
+            local wasm_rss_kb=0
+            for _ in $(seq 1 3); do
+                local v
+                v=$(peak_rss_kb "wasmtime run --invoke main \"$rt_wasm\"") || v=0
+                if [[ "$v" -gt "$wasm_rss_kb" ]]; then
+                    wasm_rss_kb="$v"
+                fi
+            done
+            local wasm_rss_fmt
+            wasm_rss_fmt="$(format_kb_as_mb "$wasm_rss_kb")"
+            local wasm_guest_rss_kb
+            wasm_guest_rss_kb=$(positive_diff_kb "$wasm_rss_kb" "$wasmtime_baseline_rss_kb")
+            local wasm_guest_rss_fmt
+            wasm_guest_rss_fmt="$(format_kb_as_mb "$wasm_guest_rss_kb")"
+
             # cjc native 运行耗时
             local native_rt_ms="N/A"
+            local native_rss_kb=0
+            local native_rss_fmt="N/A"
             local rt_status=""
             if $CJC_AVAILABLE && [ -f "$rt_cjc_src" ]; then
                 if cjc "$rt_cjc_src" -o "$rt_cjc_bin" >/dev/null 2>&1 && "$rt_cjc_bin" >/dev/null 2>&1; then
@@ -938,6 +1076,17 @@ EOF
                         rt_total_ns=$((rt_total_ns + e - s))
                     done
                     native_rt_ms=$(echo "scale=2; $rt_total_ns / 10 / 1000000" | bc)
+
+                    # 峰值内存: 取 3 次最大值
+                    native_rss_kb=0
+                    for _ in $(seq 1 3); do
+                        local v
+                        v=$(peak_rss_kb "\"$rt_cjc_bin\"") || v=0
+                        if [[ "$v" -gt "$native_rss_kb" ]]; then
+                            native_rss_kb="$v"
+                        fi
+                    done
+                    native_rss_fmt="$(format_kb_as_mb "$native_rss_kb")"
                 else
                     rt_status="cjc 运行崩溃"
                 fi
@@ -946,8 +1095,11 @@ EOF
             rt_rows+="<tr class=\"highlight-row\">"
             rt_rows+="<td><strong>$label</strong></td>"
             rt_rows+="<td class=\"cjwasm\">${wasm_rt_ms} ms</td>"
+            rt_rows+="<td class=\"cjwasm\">${wasm_rss_fmt}</td>"
+            rt_rows+="<td class=\"cjwasm\">${wasm_guest_rss_fmt}</td>"
             if [ "$native_rt_ms" != "N/A" ]; then
                 rt_rows+="<td class=\"cjc\">${native_rt_ms} ms</td>"
+                rt_rows+="<td class=\"cjc\">${native_rss_fmt}</td>"
                 # 计算比率: 谁更快, 显示更友好
                 local wasm_faster=$(echo "$wasm_rt_ms < $native_rt_ms" | bc -l 2>/dev/null)
                 if [ "$wasm_faster" = "1" ]; then
@@ -959,8 +1111,10 @@ EOF
                 fi
             elif [ -n "$rt_status" ]; then
                 rt_rows+="<td style=\"color:#f97316\">${rt_status}</td>"
+                rt_rows+="<td style=\"color:#64748b\">-</td>"
                 rt_rows+="<td>-</td>"
             else
+                rt_rows+="<td style=\"color:#64748b\">N/A</td>"
                 rt_rows+="<td style=\"color:#64748b\">N/A</td>"
                 rt_rows+="<td>-</td>"
             fi
@@ -973,13 +1127,13 @@ EOF
 <div class="card full-width">
 <h2><span class="icon">🚀</span> 运行时性能 (wasmtime vs cjc native)</h2>
 <table>
-<tr><th>规模</th><th>wasmtime (cjwasm)</th><th>native (cjc)</th><th>比率</th></tr>
+<tr><th>规模</th><th>wasmtime 耗时</th><th>wasmtime 端到端 RSS</th><th>wasmtime 扣基线后 RSS</th><th>native 耗时</th><th>native Peak RSS</th><th>比率</th></tr>
 EOF
         echo "$rt_rows" >> "$HTML"
-        cat >> "$HTML" << 'EOF'
+        cat >> "$HTML" << EOF
 </table>
 <div class="note">
-  <strong>说明：</strong>wasmtime 运行时间包含 JIT 编译开销。对于短小程序，JIT 编译耗时占比较大，实际计算密集型程序的差距会更小。
+  <strong>说明：</strong>wasmtime 运行时间包含 JIT 编译开销。所有内存值均取自进程的 <strong>Peak RSS</strong>（macOS: <code>/usr/bin/time -l</code>；Linux: <code>/usr/bin/time -v</code>），取 3 次运行的最大值。<strong>wasmtime 端到端 RSS</strong> 包含 VM/JIT/宿主固定开销；<strong>wasmtime 扣基线后 RSS</strong> = 当前 Peak RSS - 空载 wasmtime Peak RSS（本次基线约 ${wasmtime_baseline_rss_fmt}），用于更接近 guest/程序本身内存占用，但它仍是估算值，不等于精确的 WASM 线性内存或 heap。
 </div>
 </div>
 EOF
