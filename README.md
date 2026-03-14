@@ -1,3 +1,5 @@
+English README: [README_EN.md](README_EN.md)
+
 # CJWasm
 
 仓颉语言（Cangjie）到 WebAssembly 的编译器前端，使用 Rust 编写。
