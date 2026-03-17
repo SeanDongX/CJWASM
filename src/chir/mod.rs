@@ -16,6 +16,7 @@ pub mod type_inference;
 pub mod lower_expr;
 pub mod lower_stmt;
 pub mod lower;
+pub mod optimize;
 
 pub use types::*;
 pub use builder::CHIRBuilder;
