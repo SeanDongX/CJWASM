@@ -45,7 +45,7 @@
 <body>
 <div class="container">
 <h1>CJWasm vs CJC 编译性能对比报告</h1>
-<div class="subtitle">生成时间: 2026-03-18 10:22:55 | 系统: arm64 | CPU: Apple M3</div>
+<div class="subtitle">生成时间: 2026-03-18 10:39:53 | 系统: arm64 | CPU: Apple M3</div>
 
 <div class="legend">
   <div class="legend-item"><div class="legend-dot dot-cjwasm"></div> <strong>cjwasm</strong> (Rust → WASM 前端编译器)</div>
@@ -58,13 +58,13 @@
 <tr><th>规模</th><th>cjwasm (ms)</th><th>cjc (ms)</th><th>加速比</th><th>可视化</th></tr>
 <tr class="highlight-row">
   <td><strong>小规模(27行)</strong></td>
-  <td class="cjwasm">20.80</td>
-  <td class="cjc">215.38</td>
+  <td class="cjwasm">21.02</td>
+  <td class="cjc">224.86</td>
   <td class="speedup">10x</td>
   <td>
     <div class="bar-container">
       <span class="bar-label cjwasm">cjwasm</span>
-      <div class="bar bar-cjwasm" style="width: 9.6%"></div>
+      <div class="bar bar-cjwasm" style="width: 9.3%"></div>
     </div>
     <div class="bar-container" style="margin-top:3px">
       <span class="bar-label cjc">cjc</span>
@@ -74,13 +74,13 @@
 </tr>
 <tr class="highlight-row">
   <td><strong>中规模(100行)</strong></td>
-  <td class="cjwasm">21.16</td>
-  <td class="cjc">220.46</td>
+  <td class="cjwasm">21.79</td>
+  <td class="cjc">224.02</td>
   <td class="speedup">10x</td>
   <td>
     <div class="bar-container">
       <span class="bar-label cjwasm">cjwasm</span>
-      <div class="bar bar-cjwasm" style="width: 9.5%"></div>
+      <div class="bar bar-cjwasm" style="width: 9.7%"></div>
     </div>
     <div class="bar-container" style="margin-top:3px">
       <span class="bar-label cjc">cjc</span>
@@ -90,13 +90,13 @@
 </tr>
 <tr class="highlight-row">
   <td><strong>大规模(311行)</strong></td>
-  <td class="cjwasm">22.39</td>
-  <td class="cjc">233.66</td>
+  <td class="cjwasm">22.97</td>
+  <td class="cjc">235.55</td>
   <td class="speedup">10x</td>
   <td>
     <div class="bar-container">
       <span class="bar-label cjwasm">cjwasm</span>
-      <div class="bar bar-cjwasm" style="width: 9.5%"></div>
+      <div class="bar bar-cjwasm" style="width: 9.7%"></div>
     </div>
     <div class="bar-container" style="margin-top:3px">
       <span class="bar-label cjc">cjc</span>
@@ -105,14 +105,14 @@
   </td>
 </tr>
 <tr class="highlight-row">
-  <td><strong>高负载(97行)</strong></td>
-  <td class="cjwasm">21.50</td>
-  <td class="cjc">0</td>
-  <td class="speedup">N/Ax</td>
+  <td><strong>高负载(89行)</strong></td>
+  <td class="cjwasm">21.68</td>
+  <td class="cjc">226.84</td>
+  <td class="speedup">10x</td>
   <td>
     <div class="bar-container">
       <span class="bar-label cjwasm">cjwasm</span>
-      <div class="bar bar-cjwasm" style="width: 100%"></div>
+      <div class="bar bar-cjwasm" style="width: 9.5%"></div>
     </div>
     <div class="bar-container" style="margin-top:3px">
       <span class="bar-label cjc">cjc</span>
@@ -151,11 +151,11 @@
   <td class="speedup">91x</td>
 </tr>
 <tr class="highlight-row">
-  <td>高负载(97行)</td>
+  <td>高负载(89行)</td>
   <td>2490 B</td>
   <td class="cjwasm">9012 B</td>
-  <td class="cjc">N/A</td>
-  <td class="speedup">N/A</td>
+  <td class="cjc">1023.3 KB</td>
+  <td class="speedup">116x</td>
 </tr>
 </table>
 </div>
@@ -163,7 +163,7 @@
 <h2><span class="icon">🚀</span> 运行时性能 (wasmtime vs cjc native)</h2>
 <table>
 <tr><th>规模</th><th>wasmtime 耗时</th><th>wasmtime 端到端 RSS</th><th>wasmtime 扣基线后 RSS</th><th>native 耗时</th><th>native Peak RSS</th><th>比率</th></tr>
-<tr class="highlight-row"><td><strong>小规模(27行)</strong></td><td class="cjwasm">22.95 ms</td><td class="cjwasm">9.4 MB</td><td class="cjwasm">N/A</td><td class="cjc">39.16 ms</td><td class="cjc">0.5 MB</td><td class="speedup">wasm 1.7x 快</td></tr><tr class="highlight-row"><td><strong>中规模(100行)</strong></td><td class="cjwasm">22.94 ms</td><td class="cjwasm">9.4 MB</td><td class="cjwasm">0.0 MB</td><td class="cjc">38.32 ms</td><td class="cjc">0.5 MB</td><td class="speedup">wasm 1.7x 快</td></tr><tr class="highlight-row"><td><strong>大规模(311行)</strong></td><td class="cjwasm">22.91 ms</td><td class="cjwasm">9.5 MB</td><td class="cjwasm">0.1 MB</td><td class="cjc">38.50 ms</td><td class="cjc">0.5 MB</td><td class="speedup">wasm 1.7x 快</td></tr><tr class="highlight-row"><td><strong>高负载(97行)</strong></td><td class="cjwasm">27.56 ms</td><td class="cjwasm">9.6 MB</td><td class="cjwasm">0.2 MB</td><td style="color:#64748b">N/A</td><td style="color:#64748b">N/A</td><td>-</td></tr>
+<tr class="highlight-row"><td><strong>小规模(27行)</strong></td><td class="cjwasm">24.19 ms</td><td class="cjwasm">9.4 MB</td><td class="cjwasm">N/A</td><td class="cjc">37.02 ms</td><td class="cjc">0.5 MB</td><td class="speedup">wasm 1.5x 快</td></tr><tr class="highlight-row"><td><strong>中规模(100行)</strong></td><td class="cjwasm">23.61 ms</td><td class="cjwasm">9.4 MB</td><td class="cjwasm">0.1 MB</td><td class="cjc">37.30 ms</td><td class="cjc">0.5 MB</td><td class="speedup">wasm 1.6x 快</td></tr><tr class="highlight-row"><td><strong>大规模(311行)</strong></td><td class="cjwasm">24.20 ms</td><td class="cjwasm">9.5 MB</td><td class="cjwasm">0.1 MB</td><td class="cjc">37.00 ms</td><td class="cjc">0.5 MB</td><td class="speedup">wasm 1.5x 快</td></tr><tr class="highlight-row"><td><strong>高负载(89行)</strong></td><td class="cjwasm">28.13 ms</td><td class="cjwasm">9.4 MB</td><td class="cjwasm">N/A</td><td class="cjc">83.35 ms</td><td class="cjc">0.5 MB</td><td class="speedup">wasm 3.0x 快</td></tr>
 </table>
 <div class="note">
   <strong>说明：</strong>wasmtime 运行时间包含 JIT 编译开销。所有内存值均取自进程的 <strong>Peak RSS</strong>（macOS: <code>/usr/bin/time -l</code>；Linux: <code>/usr/bin/time -v</code>），取 3 次运行的最大值。<strong>wasmtime 端到端 RSS</strong> 包含 VM/JIT/宿主固定开销；<strong>wasmtime 扣基线后 RSS</strong> = 当前 Peak RSS - 空载 wasmtime Peak RSS（本次基线约 9.4 MB），用于更接近 guest/程序本身内存占用，但它仍是估算值，不等于精确的 WASM 线性内存或 heap。
@@ -175,19 +175,19 @@
 <tr><th>版本</th><th>wasmtime 耗时</th><th>WASM 大小</th><th>说明</th></tr>
 <tr class="highlight-row">
   <td><strong class="cjwasm">CHIR + 优化（默认）</strong></td>
-  <td class="cjwasm">27.50 ms</td>
+  <td class="cjwasm">28.17 ms</td>
   <td class="cjwasm">9012 B</td>
   <td>小函数内联 + 冗余 local 消除</td>
 </tr>
 <tr class="highlight-row">
   <td><strong class="cjc">CHIR 无优化（NO_CHIR_OPT）</strong></td>
-  <td class="cjc">33.89 ms</td>
+  <td class="cjc">34.49 ms</td>
   <td class="cjc">9028 B</td>
   <td>无内联优化</td>
 </tr>
 </table>
 <div class="note">
-  <strong>优化加速比：</strong><span class="speedup">1.23x</span> — bench_heavy.cj 包含 100,000 次密集小函数调用（identity / double / square / addOne / Counter.get 等），CHIR 内联 pass 将这些调用直接替换为表达式，消除 call 指令开销。wasmtime JIT 会对两者都做本地优化，差异会被部分抹平；在无 JIT 的解释器（wasm-interp）下可观察到约 1.7x 加速。
+  <strong>优化加速比：</strong><span class="speedup">1.22x</span> — bench_heavy.cj 包含 100,000 次密集小函数调用（identity / double / square / addOne / Counter.get 等），CHIR 内联 pass 将这些调用直接替换为表达式，消除 call 指令开销。wasmtime JIT 会对两者都做本地优化，差异会被部分抹平；在无 JIT 的解释器（wasm-interp）下可观察到约 1.7x 加速。
 </div>
 </div>
 <div class="card" style="text-align:center">

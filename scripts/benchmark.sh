@@ -489,6 +489,84 @@ main() {
     println(v.length() + c.increment() + c.decrement() + p.first + p.second + fib + g + pw + sq + primes + col + id)
 }
 CJ
+
+    # cjc 高负载版本（纯函数，与 bench_heavy.cj 对应）
+    cat > "$TMPDIR/cjc_bench_heavy.cj" << 'CJ'
+func identity(x: Int64): Int64 { return x }
+func double(x: Int64): Int64 { return x * 2 }
+func square(x: Int64): Int64 { return x * x }
+func addOne(x: Int64): Int64 { return x + 1 }
+func subOne(x: Int64): Int64 { return x - 1 }
+func negate(x: Int64): Int64 { return -x }
+func abs2(x: Int64): Int64 { if (x < 0) { return -x } else { return x } }
+func clamp(x: Int64, lo: Int64, hi: Int64): Int64 {
+    if (x < lo) { return lo }
+    if (x > hi) { return hi }
+    return x
+}
+func counterGet(count: Int64): Int64 { return count }
+func counterInc(count: Int64): Int64 { return count + 1 }
+func counterDec(count: Int64): Int64 { return count - 1 }
+func vectorDot(x: Int64, y: Int64, ox: Int64, oy: Int64): Int64 { return x * ox + y * oy }
+func vectorLengthSq(x: Int64, y: Int64): Int64 { return x * x + y * y }
+
+func testInlineCalls(n: Int64): Int64 {
+    var sum: Int64 = 0
+    var i: Int64 = 0
+    while (i < n) {
+        let a = identity(i)
+        let b = double(a)
+        let c = square(addOne(a))
+        let d = subOne(b)
+        sum = sum + a + b + c + d
+        i = i + 1
+    }
+    return sum
+}
+func testCounterCalls(n: Int64): Int64 {
+    var sum: Int64 = 0
+    var i: Int64 = 0
+    while (i < n) {
+        let g = counterGet(i)
+        let inc = counterInc(i)
+        let dec = counterDec(i)
+        sum = sum + g + inc + dec
+        i = i + 1
+    }
+    return sum
+}
+func testVectorCalls(n: Int64): Int64 {
+    var sum: Int64 = 0
+    var i: Int64 = 0
+    while (i < n) {
+        let d = vectorDot(i, i + 1, 2, 3)
+        let l = vectorLengthSq(i, i + 1)
+        sum = sum + d + l
+        i = i + 1
+    }
+    return sum
+}
+func testUtilCalls(n: Int64): Int64 {
+    var sum: Int64 = 0
+    var i: Int64 = 0
+    while (i < n) {
+        let a = abs2(i - n / 2)
+        let b = clamp(i, 10, n - 10)
+        let c = negate(subOne(i))
+        sum = sum + a + b + c
+        i = i + 1
+    }
+    return sum
+}
+main() {
+    let N: Int64 = 1000000
+    let a = testInlineCalls(N)
+    let b = testCounterCalls(N)
+    let c = testVectorCalls(N)
+    let d = testUtilCalls(N)
+    println((a + b + c + d) % 1000000007)
+}
+CJ
 }
 
 # ============================================================
@@ -811,7 +889,7 @@ generate_html_report() {
 
     # 收集编译速度数据
     local sizes=("small" "medium" "large" "heavy")
-    local labels=("小规模(27行)" "中规模(100行)" "大规模(311行)" "高负载(97行)")
+    local labels=("小规模(27行)" "中规模(100行)" "大规模(311行)" "高负载(89行)")
     local cjwasm_times=()
     local cjc_times=()
     local src_sizes=()
