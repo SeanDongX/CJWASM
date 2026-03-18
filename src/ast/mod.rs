@@ -532,6 +532,10 @@ pub struct EnumVariant {
 #[derive(Debug, Clone)]
 pub struct InterfaceMethod {
     pub name: String,
+    /// 泛型类型参数（如 func f<T, U>()）
+    pub type_params: Vec<String>,
+    /// 类型约束（来自 `<T: Bound>` 或 `where T: Bound`）
+    pub constraints: Vec<TypeConstraint>,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     /// 默认实现体（若有则为 Some）

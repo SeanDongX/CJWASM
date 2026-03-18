@@ -1,7 +1,7 @@
 //! 类型推断器 - 遍历 AST 推断表达式类型
 
 use crate::ast::{Expr, Stmt, Type, Function, Program, BinOp, UnaryOp, Pattern};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 从函数体推断返回类型：找第一个 Stmt::Return(Some(expr)) 并推断 expr 类型
 /// 用于处理没有显式返回类型注解的函数（如 Cangjie 隐式类型推断函数）
@@ -44,6 +44,12 @@ pub struct FunctionSignature {
 pub struct TypeInferenceContext {
     /// 局部变量类型表
     pub locals: HashMap<String, Type>,
+    /// 局部变量可变性（true=可变 var/inout，false=不可变 let/普通参数）
+    pub local_mutability: HashMap<String, bool>,
+
+    /// 名义类型继承关系：type_name -> direct supertypes
+    /// 包含 class extends / class implements / interface parents
+    pub nominal_supertypes: HashMap<String, Vec<String>>,
 
     /// 函数签名表（单态化后）
     pub functions: HashMap<String, FunctionSignature>,
@@ -69,6 +75,8 @@ impl TypeInferenceContext {
     pub fn new() -> Self {
         TypeInferenceContext {
             locals: HashMap::new(),
+            local_mutability: HashMap::new(),
+            nominal_supertypes: HashMap::new(),
             functions: HashMap::new(),
             struct_fields: HashMap::new(),
             class_fields: HashMap::new(),
@@ -180,6 +188,21 @@ impl TypeInferenceContext {
             ctx.class_method_returns.insert(class_def.name.clone(), method_returns);
         }
 
+        // 收集名义子类型关系（class/interface）
+        for iface in &program.interfaces {
+            for parent in &iface.parents {
+                ctx.add_nominal_supertype(iface.name.clone(), parent.clone());
+            }
+        }
+        for class_def in &program.classes {
+            if let Some(parent) = &class_def.extends {
+                ctx.add_nominal_supertype(class_def.name.clone(), parent.clone());
+            }
+            for iface in &class_def.implements {
+                ctx.add_nominal_supertype(class_def.name.clone(), iface.clone());
+            }
+        }
+
         // 继承合并：将父类字段 + 方法签名传播到子类（多轮直到稳定）
         let class_extends: HashMap<String, Option<String>> = program.classes.iter()
             .map(|c| (c.name.clone(), c.extends.clone()))
@@ -215,7 +238,122 @@ impl TypeInferenceContext {
 
     /// 添加局部变量
     pub fn add_local(&mut self, name: String, ty: Type) {
-        self.locals.insert(name, ty);
+        self.add_local_with_mutability(name, ty, true);
+    }
+
+    /// 添加局部变量并显式设置可变性
+    pub fn add_local_with_mutability(&mut self, name: String, ty: Type, mutable: bool) {
+        self.locals.insert(name.clone(), ty);
+        self.local_mutability.insert(name, mutable);
+    }
+
+    /// 赋值兼容性：`value` 是否可赋给 `target`
+    pub fn is_assignable_type(&self, target: &Type, value: &Type) -> bool {
+        self.is_subtype(value, target)
+    }
+
+    fn is_subtype(&self, sub: &Type, sup: &Type) -> bool {
+        if sub == sup {
+            return true;
+        }
+        if matches!(sup, Type::TypeParam(_) | Type::This | Type::Qualified(_)) {
+            // lowering 阶段对未单态化类型保持保守放行
+            return true;
+        }
+        if matches!(sub, Type::Nothing) {
+            // Nothing 是底类型
+            return true;
+        }
+        if let Type::Struct(sup_name, _) = sup {
+            if sup_name == "Object" && Self::is_reference_like(sub) {
+                return true;
+            }
+        }
+
+        match (sub, sup) {
+            (Type::Struct(sub_name, _), Type::Struct(sup_name, _)) => {
+                self.nominal_is_subtype(sub_name, sup_name)
+            }
+            (Type::Tuple(sub_items), Type::Tuple(sup_items)) => {
+                sub_items.len() == sup_items.len()
+                    && sub_items
+                        .iter()
+                        .zip(sup_items.iter())
+                        .all(|(s, t)| self.is_subtype(s, t))
+            }
+            (
+                Type::Function { params: sub_params, ret: sub_ret },
+                Type::Function { params: sup_params, ret: sup_ret },
+            ) => {
+                sub_params.len() == sup_params.len()
+                    // 函数参数逆变：sup_param <: sub_param
+                    && sub_params
+                        .iter()
+                        .zip(sup_params.iter())
+                        .all(|(s, t)| self.is_subtype(t, s))
+                    // 返回值协变：sub_ret <: sup_ret
+                    && self.is_function_ret_subtype(sub_ret.as_ref(), sup_ret.as_ref())
+            }
+            (Type::Option(sub_t), Type::Option(sup_t)) => self.is_subtype(sub_t, sup_t),
+            (Type::Result(sub_ok, sub_err), Type::Result(sup_ok, sup_err)) => {
+                self.is_subtype(sub_ok, sup_ok) && self.is_subtype(sub_err, sup_err)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_function_ret_subtype(&self, sub: &Option<Type>, sup: &Option<Type>) -> bool {
+        match (sub, sup) {
+            (None, None) => true,
+            (Some(s), Some(t)) => self.is_subtype(s, t),
+            _ => false,
+        }
+    }
+
+    fn is_reference_like(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Struct(..)
+                | Type::String
+                | Type::Array(_)
+                | Type::Tuple(_)
+                | Type::Function { .. }
+                | Type::Option(_)
+                | Type::Result(_, _)
+                | Type::Slice(_)
+                | Type::Map(_, _)
+                | Type::This
+                | Type::Qualified(_)
+        )
+    }
+
+    fn add_nominal_supertype(&mut self, ty: String, parent: String) {
+        let entry = self.nominal_supertypes.entry(ty).or_default();
+        if !entry.iter().any(|p| p == &parent) {
+            entry.push(parent);
+        }
+    }
+
+    fn nominal_is_subtype(&self, sub_name: &str, sup_name: &str) -> bool {
+        if sub_name == sup_name {
+            return true;
+        }
+        let mut stack = vec![sub_name.to_string()];
+        let mut visited = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(parents) = self.nominal_supertypes.get(&cur) {
+                for parent in parents {
+                    if parent == sup_name {
+                        return true;
+                    }
+                    stack.push(parent.clone());
+                }
+            }
+        }
+        false
     }
 
     /// 获取局部变量类型
@@ -424,24 +562,69 @@ impl TypeInferenceContext {
     }
 
     /// 推断二元运算结果类型
-    fn infer_binary_result(&self, op: &BinOp, left: &Type, _right: &Type) -> Result<Type, String> {
+    fn infer_binary_result(&self, op: &BinOp, left: &Type, right: &Type) -> Result<Type, String> {
+        let invalid = || {
+            Err(format!(
+                "semantic error: invalid binary operator '{}' on type '{}' and '{}'",
+                Self::binop_symbol(op),
+                Self::type_name(left),
+                Self::type_name(right)
+            ))
+        };
         match op {
             // 比较运算符返回 Bool
-            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
-                Ok(Type::Bool)
+            BinOp::Eq | BinOp::NotEq => {
+                if left == right {
+                    Ok(Type::Bool)
+                } else {
+                    invalid()
+                }
+            }
+            BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+                if left == right && (Self::is_numeric(left) || matches!(left, Type::Rune | Type::String)) {
+                    Ok(Type::Bool)
+                } else {
+                    invalid()
+                }
             }
             // 逻辑运算符返回 Bool
-            BinOp::LogicalAnd | BinOp::LogicalOr => Ok(Type::Bool),
+            BinOp::LogicalAnd | BinOp::LogicalOr => {
+                if matches!((left, right), (Type::Bool, Type::Bool)) {
+                    Ok(Type::Bool)
+                } else {
+                    invalid()
+                }
+            }
             // 算术运算符返回操作数类型
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-                // 简化：返回左操作数类型
-                Ok(left.clone())
+            BinOp::Mod => {
+                if left == right && Self::is_integral(left) {
+                    Ok(left.clone())
+                } else {
+                    invalid()
+                }
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow => {
+                if matches!((left, right), (Type::String, Type::String)) && matches!(op, BinOp::Add) {
+                    return Ok(Type::String);
+                }
+                if left == right && Self::is_numeric(left) {
+                    Ok(left.clone())
+                } else {
+                    invalid()
+                }
             }
             // 位运算返回整数类型
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-                Ok(left.clone())
+                if left == right && Self::is_integral(left) {
+                    Ok(left.clone())
+                } else {
+                    invalid()
+                }
             }
-            _ => Ok(left.clone()),
+            // 集合不包含：当前先保守返回 Bool（后续在 P1-2 细化）
+            BinOp::NotIn => Ok(Type::Bool),
+            // 管道表达式由 lowering 特化处理，这里返回右值类型
+            BinOp::Pipeline => Ok(right.clone()),
         }
     }
 
@@ -450,6 +633,114 @@ impl TypeInferenceContext {
         match op {
             UnaryOp::Not => Ok(Type::Bool),
             UnaryOp::Neg | UnaryOp::BitNot => Ok(expr_ty.clone()),
+        }
+    }
+
+    fn is_numeric(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Int8
+                | Type::Int16
+                | Type::Int32
+                | Type::Int64
+                | Type::IntNative
+                | Type::UInt8
+                | Type::UInt16
+                | Type::UInt32
+                | Type::UInt64
+                | Type::UIntNative
+                | Type::Float16
+                | Type::Float32
+                | Type::Float64
+                | Type::Rune
+        )
+    }
+
+    fn is_integral(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Int8
+                | Type::Int16
+                | Type::Int32
+                | Type::Int64
+                | Type::IntNative
+                | Type::UInt8
+                | Type::UInt16
+                | Type::UInt32
+                | Type::UInt64
+                | Type::UIntNative
+                | Type::Rune
+        )
+    }
+
+    fn binop_symbol(op: &BinOp) -> &'static str {
+        match op {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::Eq => "==",
+            BinOp::NotEq => "!=",
+            BinOp::Lt => "<",
+            BinOp::Gt => ">",
+            BinOp::LtEq => "<=",
+            BinOp::GtEq => ">=",
+            BinOp::LogicalAnd => "&&",
+            BinOp::LogicalOr => "||",
+            BinOp::Pow => "**",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::NotIn => "!in",
+            BinOp::Pipeline => "|>",
+        }
+    }
+
+    fn type_name(ty: &Type) -> String {
+        match ty {
+            Type::Int8 => "Int8".to_string(),
+            Type::Int16 => "Int16".to_string(),
+            Type::Int32 => "Int32".to_string(),
+            Type::Int64 => "Int64".to_string(),
+            Type::IntNative => "IntNative".to_string(),
+            Type::UInt8 => "UInt8".to_string(),
+            Type::UInt16 => "UInt16".to_string(),
+            Type::UInt32 => "UInt32".to_string(),
+            Type::UInt64 => "UInt64".to_string(),
+            Type::UIntNative => "UIntNative".to_string(),
+            Type::Float16 => "Float16".to_string(),
+            Type::Float32 => "Float32".to_string(),
+            Type::Float64 => "Float64".to_string(),
+            Type::Rune => "Rune".to_string(),
+            Type::Bool => "Bool".to_string(),
+            Type::Nothing => "Nothing".to_string(),
+            Type::Unit => "Unit".to_string(),
+            Type::String => "String".to_string(),
+            Type::Array(elem) => format!("Array<{}>", Self::type_name(elem)),
+            Type::Struct(name, args) => {
+                if args.is_empty() {
+                    name.clone()
+                } else {
+                    let params = args.iter().map(Self::type_name).collect::<Vec<_>>().join(",");
+                    format!("{}<{}>", name, params)
+                }
+            }
+            Type::Tuple(types) => {
+                let items = types.iter().map(Self::type_name).collect::<Vec<_>>().join(",");
+                format!("({})", items)
+            }
+            Type::Range => "Range".to_string(),
+            Type::Function { .. } => "Function".to_string(),
+            Type::Option(t) => format!("Option<{}>", Self::type_name(t)),
+            Type::Result(ok, err) => format!("Result<{},{}>", Self::type_name(ok), Self::type_name(err)),
+            Type::Slice(t) => format!("Slice<{}>", Self::type_name(t)),
+            Type::Map(k, v) => format!("Map<{},{}>", Self::type_name(k), Self::type_name(v)),
+            Type::TypeParam(name) => name.clone(),
+            Type::This => "This".to_string(),
+            Type::Qualified(parts) => parts.join("."),
         }
     }
 
@@ -536,7 +827,7 @@ impl TypeInferenceContext {
     pub fn collect_locals_from_function(&mut self, func: &Function) {
         // 添加参数
         for param in &func.params {
-            self.add_local(param.name.clone(), param.ty.clone());
+            self.add_local_with_mutability(param.name.clone(), param.ty.clone(), param.is_inout);
         }
 
         // 遍历函数体收集 let/var 声明
@@ -556,7 +847,8 @@ impl TypeInferenceContext {
                 } else {
                     Type::Int32 // 保守推断为对象引用
                 };
-                self.collect_pattern_bindings(pattern, &var_ty);
+                let mutable = matches!(stmt, Stmt::Var { .. });
+                self.collect_pattern_bindings(pattern, &var_ty, mutable);
             }
             // 递归处理嵌套语句
             Stmt::While { cond: _, body } | Stmt::Loop { body } => {
@@ -566,13 +858,13 @@ impl TypeInferenceContext {
             }
             Stmt::For { var, body, .. } => {
                 // For 循环变量：类型保守推断为 I32（迭代器元素常为对象或整数）
-                self.add_local(var.clone(), Type::Int32);
+                self.add_local_with_mutability(var.clone(), Type::Int32, true);
                 for s in body {
                     self.collect_locals_from_stmt(s);
                 }
             }
             Stmt::WhileLet { pattern, body, .. } => {
-                self.collect_pattern_bindings(pattern, &Type::Int32);
+                self.collect_pattern_bindings(pattern, &Type::Int32, false);
                 for s in body {
                     self.collect_locals_from_stmt(s);
                 }
@@ -593,14 +885,14 @@ impl TypeInferenceContext {
     }
 
     /// 从模式中收集绑定变量
-    fn collect_pattern_bindings(&mut self, pattern: &Pattern, ty: &Type) {
+    fn collect_pattern_bindings(&mut self, pattern: &Pattern, ty: &Type, mutable: bool) {
         match pattern {
             Pattern::Binding(name) => {
-                self.add_local(name.clone(), ty.clone());
+                self.add_local_with_mutability(name.clone(), ty.clone(), mutable);
             }
             Pattern::Tuple(pats) => {
                 for p in pats {
-                    self.collect_pattern_bindings(p, ty);
+                    self.collect_pattern_bindings(p, ty, mutable);
                 }
             }
             _ => {}
@@ -761,6 +1053,86 @@ mod tests {
             };
             assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Bool);
         }
+    }
+
+    #[test]
+    fn test_infer_binary_mixed_numeric_is_error() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local_with_mutability("a".into(), Type::Int8, true);
+        ctx.add_local_with_mutability("b".into(), Type::Int16, true);
+        let expr = Expr::Binary {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Var("a".into())),
+            right: Box::new(Expr::Var("b".into())),
+        };
+        let err = ctx.infer_expr(&expr).unwrap_err();
+        assert!(err.contains("invalid binary operator"));
+    }
+
+    #[test]
+    fn test_infer_binary_mod_float_is_error() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Binary {
+            op: BinOp::Mod,
+            left: Box::new(Expr::Float32(1.0)),
+            right: Box::new(Expr::Float32(1.0)),
+        };
+        let err = ctx.infer_expr(&expr).unwrap_err();
+        assert!(err.contains("invalid binary operator"));
+    }
+
+    #[test]
+    fn test_is_assignable_type_with_nominal_subtype() {
+        let mut ctx = TypeInferenceContext::new();
+        // C <: B <: A <: J <: I
+        ctx.nominal_supertypes.insert("C".into(), vec!["B".into()]);
+        ctx.nominal_supertypes.insert("B".into(), vec!["A".into()]);
+        ctx.nominal_supertypes.insert("A".into(), vec!["J".into()]);
+        ctx.nominal_supertypes.insert("J".into(), vec!["I".into()]);
+
+        assert!(ctx.is_assignable_type(
+            &Type::Struct("A".into(), vec![]),
+            &Type::Struct("C".into(), vec![])
+        ));
+        assert!(ctx.is_assignable_type(
+            &Type::Struct("I".into(), vec![]),
+            &Type::Struct("C".into(), vec![])
+        ));
+        assert!(ctx.is_assignable_type(
+            &Type::Struct("Object".into(), vec![]),
+            &Type::Struct("C".into(), vec![])
+        ));
+    }
+
+    #[test]
+    fn test_is_assignable_type_function_return_covariant() {
+        let mut ctx = TypeInferenceContext::new();
+        // C <: A
+        ctx.nominal_supertypes.insert("C".into(), vec!["A".into()]);
+
+        let source = Type::Function {
+            params: vec![
+                Type::Struct("A".into(), vec![]),
+                Type::Struct("B".into(), vec![]),
+            ],
+            ret: Box::new(Some(Type::Tuple(vec![
+                Type::Struct("A".into(), vec![]),
+                Type::Struct("C".into(), vec![]),
+            ]))),
+        };
+        let target = Type::Function {
+            params: vec![
+                Type::Struct("A".into(), vec![]),
+                Type::Struct("B".into(), vec![]),
+            ],
+            ret: Box::new(Some(Type::Tuple(vec![
+                Type::Struct("A".into(), vec![]),
+                Type::Struct("A".into(), vec![]),
+            ]))),
+        };
+
+        // (A, B) -> (A, C) 是 (A, B) -> (A, A) 的子类型（返回值协变）
+        assert!(ctx.is_assignable_type(&target, &source));
     }
 
     #[test]

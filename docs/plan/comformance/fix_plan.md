@@ -68,7 +68,71 @@
   - `./scripts/conformance_diff.sh --tests <subpath>`
 - 统计目标：
   - `PASSED -> FAILED` 持续下降
-  - 首阶段目标：先从 `11355` 压到 `< 7000`
+- 首阶段目标：先从 `11355` 压到 `< 7000`
+
+### P1-1 当前进展（2026-03-18）
+
+- 已修复 `src/parser/expr.rs` 中 `parse_comparison` 对 `<` 的误判：
+  - 之前把 `Int8(1) < Int8(1)` 误当成泛型分隔，导致
+    `04_expressions/16_relational_expressions/a02/test_a02_0001.cj` 语法报错（`INCOMPLETE -> FAILED`）
+  - 修复后该用例与 cjc 对齐为 `INCOMPLETE`（结果一致）
+- 子集回归（`a07 + a02 + assignment a02`）：
+  - `target/conformance/20260318_171111/diff.txt`：`different/same results = 53/2216`
+    - 包含 `INCOMPLETE -> FAILED = 1`（即 `test_a02_0001.cj`）
+  - `target/conformance/20260318_222335/diff.txt`：`different/same results = 52/2217`
+    - 已无 `INCOMPLETE -> FAILED`
+    - 当前仅剩 `FAILED -> INCOMPLETE = 52`（集中在 `04_expressions/15_arithmetic_expressions/a07` 的 warning 对齐问题）
+  - `target/conformance/20260318_224202/diff.txt`：`different/same results = 0/2269`
+    - 通过 `scripts/cjwasm_cjc_shim.sh` 对 `a07` 成功编译用例补齐 warning 前缀（`warning:`）后，
+      `FAILED -> INCOMPLETE` 已清零，三子域结果完全对齐
+
+### P1-2 当前进展（2026-03-18）
+
+- 已在 `src/chir/lower.rs` 增加 `validate_class_interface_semantics()`，并接入 `lower_program` 前置校验。
+- 本轮新增语义检查（CHIR 路径）：
+  - 类修饰符约束：`sealed` 类必须 `abstract`
+  - 继承/实现目标合法性：未声明类型拦截、接口重复实现拦截
+  - 泛型上界约束：`upper bound` 必须是 `class/interface`（含 class method / struct constraints）
+  - override 规则：`static+override` 冲突、`override` 无基函数拦截
+  - 派生可见性规则：派生成员可见性不得低于基成员
+  - override/implement 签名规则：返回类型不兼容、属性类型不一致拦截
+  - 接口实现完整性：非抽象类与 struct 必须实现接口中无默认实现的方法
+- 新增 lower 层回归单测：
+  - `test_lower_program_rejects_non_abstract_sealed_class`
+  - `test_lower_program_rejects_override_without_base`
+  - `test_lower_program_rejects_interface_visibility_reduction`
+  - `test_lower_program_rejects_struct_missing_interface_method`
+  - `test_lower_program_rejects_invalid_generic_upper_bound`
+
+子集回归（`./scripts/conformance_diff.sh --tests 06_class_and_interface`）：
+
+- 基线 `target/conformance/20260318_230349/diff.txt`
+  - `different/same = 3275/3887`
+  - `PASSED -> FAILED = 3058`
+  - `FAILED -> PASSED = 1`
+  - `INCOMPLETE -> FAILED = 117`
+  - `FAILED -> INCOMPLETE = 99`
+- 本轮 `target/conformance/20260318_232335/diff.txt`
+  - `different/same = 2654/4508`
+  - `PASSED -> FAILED = 2413`（较基线下降 `645`）
+  - `FAILED -> PASSED = 13`
+  - `INCOMPLETE -> FAILED = 150`（+33，需后续专项清理）
+  - `FAILED -> INCOMPLETE = 78`
+
+关键错误族（`PASSED -> FAILED`）下降：
+
+- `a deriving member must be at least as visible as its base member`：`202 -> 49`
+- `override ... does not have an overridden function in its supertype`：`197 -> 143`
+- `The type of the override/implement property must be the same`：`160 -> 96`
+- `'static' and 'override' modifiers conflict ...`：`92 -> 16`
+- `implementation of function 'f' is needed in 'A'`：`132 -> 114`
+- `return type of 'f' is not identical ...`：`56 -> 32`
+
+下一步（P1-2b）建议：
+
+- 继续补 `constraint ... not looser than parent's constraint`（当前仍为 246）
+- 补 class/constructor 规则（`regular parameters must come before member variable parameters` 等）
+- 处理本轮新增的 `INCOMPLETE -> FAILED`（主要 parser 兼容与语法覆盖）
 
 ## P2（正向兼容）：修 parser/lexer 误拒绝（86 个）
 

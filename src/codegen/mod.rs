@@ -8129,6 +8129,8 @@ mod tests {
                 parents: vec![],
                 methods: vec![InterfaceMethod {
                     name: "draw".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
                     params: vec![],
                     return_type: Some(Type::Int64),
                     default_body: Some(vec![Stmt::Return(Some(Expr::Integer(0)))]),
@@ -8186,6 +8188,8 @@ mod tests {
                 parents: vec![],
                 methods: vec![InterfaceMethod {
                     name: "print".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
                     params: vec![],
                     return_type: Some(Type::Unit),
                     default_body: None,

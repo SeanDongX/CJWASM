@@ -3067,6 +3067,45 @@ mod tests {
     }
 
     #[test]
+    fn test_pg_interface_generic_method_with_constraints() {
+        let source = r#"
+            interface I {
+                static func f<T1, T2>(x: T1): T1 where T1 <: T2 & Any;
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        let method = &program.interfaces[0].methods[0];
+        assert_eq!(method.name, "f");
+        assert_eq!(method.type_params, vec!["T1".to_string(), "T2".to_string()]);
+        assert_eq!(method.constraints.len(), 1);
+        assert_eq!(method.constraints[0].param, "T1");
+        assert_eq!(method.constraints[0].bounds, vec!["T2".to_string(), "Any".to_string()]);
+    }
+
+    #[test]
+    fn test_pg_class_method_redef_static_order() {
+        let source = r#"
+            interface I {
+                static func f<T>(): Unit;
+            }
+            class A <: I {
+                public redef static func f<T>() {}
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 1);
+        assert_eq!(program.classes[0].methods.len(), 1);
+        assert!(program.classes[0].methods[0].override_);
+        assert_eq!(program.classes[0].methods[0].func.type_params, vec!["T".to_string()]);
+    }
+
+    #[test]
     fn test_pg_enum_prop_with_body() {
         let source = r#"
             enum Foo {

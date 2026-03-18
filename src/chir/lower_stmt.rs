@@ -101,6 +101,26 @@ impl<'a> LoweringContext<'a> {
 
             // 赋值语句
             Stmt::Assign { target, value } => {
+                // P1-1: 赋值语义检查（不可变变量 + 类型不匹配）
+                if let AssignTarget::Var(name) = target {
+                    if self.get_local(name).is_some() {
+                        if !self.type_ctx.local_mutability.get(name).copied().unwrap_or(true) {
+                            return Err("semantic error: cannot assign to immutable value".to_string());
+                        }
+                        if let Some(target_ty) = self
+                            .local_ast_types
+                            .get(name)
+                            .cloned()
+                            .or_else(|| self.type_ctx.locals.get(name).cloned())
+                        {
+                            let value_ty = self.type_ctx.infer_expr(value)?;
+                            if !self.type_ctx.is_assignable_type(&target_ty, &value_ty) {
+                                return Err("semantic error: mismatched types".to_string());
+                            }
+                        }
+                    }
+                }
+
                 let mut value_chir = self.lower_expr(value)?;
                 let target_chir = self.lower_assign_target(target)?;
 

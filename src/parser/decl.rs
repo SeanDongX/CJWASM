@@ -731,7 +731,11 @@ impl Parser {
                 }
             }
             // public override operator func ... → 跳过修饰符，下一轮匹配 Func；若消费了 operator 则设标志供 parse_function 解析运算符名
-            while self.check(&Token::Override) || self.check(&Token::Operator) || self.check(&Token::Mut) {
+            while self.check(&Token::Override)
+                || self.check(&Token::Redef)
+                || self.check(&Token::Operator)
+                || self.check(&Token::Mut)
+            {
                 if self.check(&Token::Operator) {
                     self.parsing_operator_func = true;
                 }
@@ -1231,6 +1235,8 @@ impl Parser {
                 if !self.check(&Token::LBrace) {
                     methods.push(crate::ast::InterfaceMethod {
                         name: format!("__get_{}", prop_name),
+                        type_params: vec![],
+                        constraints: vec![],
                         params: vec![],
                         return_type: Some(prop_ty),
                         default_body: None,
@@ -1260,6 +1266,8 @@ impl Parser {
                             };
                             methods.push(crate::ast::InterfaceMethod {
                                 name: format!("__get_{}", prop_name),
+                                type_params: vec![],
+                                constraints: vec![],
                                 params: vec![],
                                 return_type: Some(prop_ty.clone()),
                                 default_body,
@@ -1294,6 +1302,8 @@ impl Parser {
                             };
                             methods.push(crate::ast::InterfaceMethod {
                                 name: format!("__set_{}", prop_name),
+                                type_params: vec![],
+                                constraints: vec![],
                                 params: vec![Param {
                                     name: val_name,
                                     ty: prop_ty.clone(),
@@ -1320,6 +1330,7 @@ impl Parser {
                 || self.check(&Token::Public)
                 || self.check(&Token::Protected)
                 || self.check(&Token::Override)
+                || self.check(&Token::Redef)
                 || self.check(&Token::Open)
                 || self.check(&Token::Mut)
             {
@@ -1331,13 +1342,18 @@ impl Parser {
                 continue;
             }
             self.expect(Token::Func)?;
-            let m_name = match self.advance() {
-                Some(Token::Ident(n)) => n,
+            let (m_name, type_params, mut constraints) = match self.advance() {
+                Some(Token::Ident(n)) => {
+                    let (tp, tc) = self.parse_type_params_with_constraints()?;
+                    (n, tp, tc)
+                }
                 Some(tok) => {
                     return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string()))
                 }
                 None => return self.bail(ParseError::UnexpectedEof),
             };
+            let prev_type_params =
+                std::mem::replace(&mut self.current_type_params, type_params.clone());
             self.expect(Token::LParen)?;
             let params = self.parse_params()?;
             self.expect(Token::RParen)?;
@@ -1348,7 +1364,8 @@ impl Parser {
                 None
             };
             // 可选 where 子句（如 func write<T>(v: T): Unit where T <: ToString { ... }）
-            let _ = self.parse_where_clause()?;
+            let where_constraints = self.parse_where_clause()?;
+            constraints.extend(where_constraints);
             if self.check(&Token::Lt) {
                 self.advance();
                 loop {
@@ -1384,10 +1401,13 @@ impl Parser {
             };
             methods.push(crate::ast::InterfaceMethod {
                 name: m_name,
+                type_params,
+                constraints,
                 params,
                 return_type,
                 default_body,
             });
+            self.current_type_params = prev_type_params;
         }
         self.expect(Token::RBrace)?;
         Ok(crate::ast::InterfaceDef {
@@ -1680,7 +1700,11 @@ impl Parser {
                 continue;
             }
             // cjc 兼容: extend 内方法前可带 static / override / operator，跳过后由 parse_function 解析
-            while self.check(&Token::Static) || self.check(&Token::Override) || self.check(&Token::Operator) {
+            while self.check(&Token::Static)
+                || self.check(&Token::Override)
+                || self.check(&Token::Redef)
+                || self.check(&Token::Operator)
+            {
                 self.advance();
             }
             let prev_receiver = self.receiver_name.clone();
@@ -2176,6 +2200,7 @@ impl Parser {
             } else if self.check(&Token::Open)
                 || self.check(&Token::Static)
                 || self.check(&Token::Override)
+                || self.check(&Token::Redef)
                 || self.check(&Token::Unsafe)
                 || self.check(&Token::Func)
                 || self.check(&Token::Operator)
@@ -2185,7 +2210,7 @@ impl Parser {
                     self.advance(); // 消费 open，cjwasm 不区分 open/非 open
                 }
                 // P2.4: 记录 static 修饰符
-                let is_static = self.check(&Token::Static);
+                let mut is_static = self.check(&Token::Static);
                 if is_static {
                     self.advance(); // 消费 static
                                     // P3.11: static init() { ... } 静态初始化块
@@ -2258,13 +2283,18 @@ impl Parser {
                         continue;
                     }
                 }
-                let override_ = self.check(&Token::Override);
+                let override_ = self.check(&Token::Override) || self.check(&Token::Redef);
                 if override_ {
                     self.advance();
                 }
                 // override 后可能还有 open 修饰符 (protected override open func)
                 if self.check(&Token::Open) {
                     self.advance();
+                }
+                // 兼容 `redef static func` 等修饰符顺序
+                if !is_static && self.check(&Token::Static) {
+                    self.advance();
+                    is_static = true;
                 }
                 // override prop — 带 override 的属性声明脱糖为 getter/setter 方法
                 if self.check(&Token::Prop) {
@@ -2500,6 +2530,7 @@ impl Parser {
                             | Some(Token::Protected)
                             | Some(Token::Internal)
                             | Some(Token::Override)
+                            | Some(Token::Redef)
                             | Some(Token::Open)
                             | Some(Token::Static)
                             | Some(Token::Func)

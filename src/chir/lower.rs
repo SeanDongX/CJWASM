@@ -1,6 +1,6 @@
 //! AST → CHIR 完整降低（Lowering）
 
-use crate::ast::{Function, Param, Program, Type};
+use crate::ast::{Function, Param, Program, Type, TypeConstraint, Visibility};
 use crate::chir::{CHIRFunction, CHIRProgram, CHIRParam};
 use crate::chir::type_inference::TypeInferenceContext;
 use crate::chir::lower_expr::LoweringContext;
@@ -46,6 +46,712 @@ fn validate_class_inheritance(program: &Program) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct MethodSig {
+    name: String,
+    params: Vec<Type>,
+    return_type: Option<Type>,
+    visibility: Visibility,
+    is_static: bool,
+    type_params: Vec<String>,
+    constraints: Vec<TypeConstraint>,
+}
+
+#[derive(Debug, Clone)]
+struct ClassMethodSig {
+    sig: MethodSig,
+    is_override: bool,
+}
+
+#[derive(Debug, Clone)]
+struct InterfaceMethodReq {
+    sig: MethodSig,
+    required: bool,
+}
+
+fn method_short_name(owner: &str, full_name: &str) -> String {
+    if let Some(short) = full_name.strip_prefix(&format!("{owner}.")) {
+        return short.to_string();
+    }
+    full_name
+        .rsplit_once('.')
+        .map(|(_, short)| short.to_string())
+        .unwrap_or_else(|| full_name.to_string())
+}
+
+fn split_receiver(params: &[Param]) -> (bool, Vec<Type>) {
+    let has_receiver = params
+        .first()
+        .map(|p| p.name == "this" || p.name == "self")
+        .unwrap_or(false);
+    let start = if has_receiver { 1 } else { 0 };
+    (
+        !has_receiver,
+        params[start..].iter().map(|p| p.ty.clone()).collect(),
+    )
+}
+
+fn class_method_sig(owner: &str, method: &crate::ast::ClassMethod) -> ClassMethodSig {
+    let short_name = method_short_name(owner, &method.func.name);
+    let (is_static, params) = split_receiver(&method.func.params);
+    ClassMethodSig {
+        sig: MethodSig {
+            name: short_name,
+            params,
+            return_type: method.func.return_type.clone(),
+            visibility: method.func.visibility.clone(),
+            is_static,
+            type_params: method.func.type_params.clone(),
+            constraints: method.func.constraints.clone(),
+        },
+        is_override: method.override_,
+    }
+}
+
+fn top_level_method_sig(owner: &str, func: &Function) -> MethodSig {
+    let short_name = method_short_name(owner, &func.name);
+    let (is_static, params) = split_receiver(&func.params);
+    MethodSig {
+        name: short_name,
+        params,
+        return_type: func.return_type.clone(),
+        visibility: func.visibility.clone(),
+        is_static,
+        type_params: func.type_params.clone(),
+        constraints: func.constraints.clone(),
+    }
+}
+
+fn interface_method_sig(method: &crate::ast::InterfaceMethod) -> MethodSig {
+    MethodSig {
+        name: method.name.clone(),
+        params: method.params.iter().map(|p| p.ty.clone()).collect(),
+        return_type: method.return_type.clone(),
+        visibility: Visibility::Public,
+        is_static: false,
+        type_params: method.type_params.clone(),
+        constraints: method.constraints.clone(),
+    }
+}
+
+fn sig_key(sig: &MethodSig) -> String {
+    format!(
+        "{}|{}|{:?}|{:?}",
+        sig.name,
+        sig.type_params.len(),
+        sig.params,
+        sig.return_type
+    )
+}
+
+fn same_name_params(lhs: &MethodSig, rhs: &MethodSig) -> bool {
+    lhs.name == rhs.name
+        && lhs.params == rhs.params
+        && lhs.type_params.len() == rhs.type_params.len()
+}
+
+fn visibility_rank(v: &Visibility) -> u8 {
+    match v {
+        Visibility::Private => 0,
+        Visibility::Internal => 1,
+        Visibility::Protected => 2,
+        Visibility::Public => 3,
+    }
+}
+
+fn visibility_at_least(child: &Visibility, base: &Visibility) -> bool {
+    visibility_rank(child) >= visibility_rank(base)
+}
+
+fn validate_upper_bounds(
+    constraints: &[crate::ast::TypeConstraint],
+    class_names: &HashSet<String>,
+    interface_names: &HashSet<String>,
+    type_params: &HashSet<String>,
+) -> Result<(), String> {
+    for constraint in constraints {
+        for bound in &constraint.bounds {
+            if class_names.contains(bound)
+                || interface_names.contains(bound)
+                || bound == "Object"
+                || bound == "Any"
+                || type_params.contains(bound)
+            {
+                continue;
+            }
+            return Err(format!(
+                "the upper bound '{}' of generic parameter 'Generics-{}' must be class or interface",
+                bound, constraint.param
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn constraints_by_param_index(sig: &MethodSig) -> HashMap<usize, Vec<String>> {
+    let index_map: HashMap<String, usize> = sig
+        .type_params
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| (name.clone(), idx))
+        .collect();
+    let mut out: HashMap<usize, Vec<String>> = HashMap::new();
+    for c in &sig.constraints {
+        if let Some(&idx) = index_map.get(&c.param) {
+            let entry = out.entry(idx).or_default();
+            for b in &c.bounds {
+                if !entry.contains(b) {
+                    entry.push(b.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn is_super_class_of(
+    candidate_super: &str,
+    maybe_sub: &str,
+    class_parent: &HashMap<String, Option<String>>,
+) -> bool {
+    let mut cur = Some(maybe_sub.to_string());
+    while let Some(name) = cur {
+        if name == candidate_super {
+            return true;
+        }
+        cur = class_parent.get(&name).cloned().flatten();
+    }
+    false
+}
+
+fn is_super_interface_of(
+    candidate_super: &str,
+    maybe_sub: &str,
+    interface_map: &HashMap<String, &crate::ast::InterfaceDef>,
+    visiting: &mut HashSet<String>,
+) -> bool {
+    if candidate_super == maybe_sub {
+        return true;
+    }
+    if !visiting.insert(maybe_sub.to_string()) {
+        return false;
+    }
+    let Some(iface) = interface_map.get(maybe_sub) else {
+        visiting.remove(maybe_sub);
+        return false;
+    };
+    for parent in &iface.parents {
+        if is_super_interface_of(candidate_super, parent, interface_map, visiting) {
+            visiting.remove(maybe_sub);
+            return true;
+        }
+    }
+    visiting.remove(maybe_sub);
+    false
+}
+
+fn is_bound_looser_or_equal(
+    child_bound: &str,
+    parent_bound: &str,
+    class_parent: &HashMap<String, Option<String>>,
+    interface_map: &HashMap<String, &crate::ast::InterfaceDef>,
+) -> bool {
+    if child_bound == parent_bound || child_bound == "Any" {
+        return true;
+    }
+    if parent_bound == "Any" {
+        return child_bound == "Any";
+    }
+    if child_bound == "Object" {
+        return parent_bound == "Object"
+            || class_parent.contains_key(parent_bound)
+            || interface_map.contains_key(parent_bound);
+    }
+    if parent_bound == "Object" {
+        return false;
+    }
+    if class_parent.contains_key(parent_bound) {
+        return class_parent.contains_key(child_bound)
+            && is_super_class_of(child_bound, parent_bound, class_parent);
+    }
+    if interface_map.contains_key(parent_bound) {
+        if !interface_map.contains_key(child_bound) {
+            return false;
+        }
+        let mut visiting = HashSet::new();
+        return is_super_interface_of(child_bound, parent_bound, interface_map, &mut visiting);
+    }
+    // 泛型上界（如 T1 <: T2）当前仅支持同名等价比较。
+    child_bound == parent_bound
+}
+
+fn constraints_not_tighter_than_parent(
+    child: &MethodSig,
+    parent: &MethodSig,
+    class_parent: &HashMap<String, Option<String>>,
+    interface_map: &HashMap<String, &crate::ast::InterfaceDef>,
+) -> bool {
+    if child.type_params.is_empty() && parent.type_params.is_empty() {
+        return true;
+    }
+    if child.type_params.len() != parent.type_params.len() {
+        return false;
+    }
+
+    let child_constraints = constraints_by_param_index(child);
+    let parent_constraints = constraints_by_param_index(parent);
+
+    for idx in 0..child.type_params.len() {
+        let child_bounds = child_constraints.get(&idx).cloned().unwrap_or_default();
+        if child_bounds.is_empty() {
+            continue;
+        }
+        let parent_bounds = parent_constraints.get(&idx).cloned().unwrap_or_default();
+        if parent_bounds.is_empty() {
+            if child_bounds.iter().all(|b| b == "Any") {
+                continue;
+            }
+            return false;
+        }
+        for child_bound in child_bounds {
+            if !parent_bounds.iter().any(|parent_bound| {
+                is_bound_looser_or_equal(&child_bound, parent_bound, class_parent, interface_map)
+            }) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn collect_interface_methods(
+    iface_name: &str,
+    interface_map: &HashMap<String, &crate::ast::InterfaceDef>,
+    cache: &mut HashMap<String, HashMap<String, InterfaceMethodReq>>,
+    visiting: &mut HashSet<String>,
+) -> Result<HashMap<String, InterfaceMethodReq>, String> {
+    if let Some(cached) = cache.get(iface_name) {
+        return Ok(cached.clone());
+    }
+    if !visiting.insert(iface_name.to_string()) {
+        return Err(format!(
+            "cyclic interface inheritance detected at '{}'",
+            iface_name
+        ));
+    }
+
+    let iface = interface_map
+        .get(iface_name)
+        .ok_or_else(|| format!("undeclared type name '{}'", iface_name))?;
+
+    let mut methods: HashMap<String, InterfaceMethodReq> = HashMap::new();
+    for parent in &iface.parents {
+        let parent_methods = collect_interface_methods(parent, interface_map, cache, visiting)?;
+        for (key, req) in parent_methods {
+            methods.entry(key).or_insert(req);
+        }
+    }
+
+    for method in &iface.methods {
+        let sig = interface_method_sig(method);
+        methods.insert(
+            sig_key(&sig),
+            InterfaceMethodReq {
+                sig,
+                required: method.default_body.is_none(),
+            },
+        );
+    }
+
+    visiting.remove(iface_name);
+    cache.insert(iface_name.to_string(), methods.clone());
+    Ok(methods)
+}
+
+fn has_chain_method_with_same_name_params(
+    class_name: &str,
+    expected: &MethodSig,
+    class_methods: &HashMap<String, HashMap<String, Vec<ClassMethodSig>>>,
+    class_parent: &HashMap<String, Option<String>>,
+) -> bool {
+    let mut cur = Some(class_name.to_string());
+    while let Some(name) = cur {
+        if let Some(methods_by_name) = class_methods.get(&name) {
+            if let Some(methods) = methods_by_name.get(&expected.name) {
+                if methods.iter().any(|m| same_name_params(&m.sig, expected)) {
+                    return true;
+                }
+            }
+        }
+        cur = class_parent.get(&name).cloned().flatten();
+    }
+    false
+}
+
+/// P1-2：类/接口语义校验（CHIR 路径）。
+fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
+    let class_map: HashMap<String, &crate::ast::ClassDef> = program
+        .classes
+        .iter()
+        .map(|c| (c.name.clone(), c))
+        .collect();
+    let interface_map: HashMap<String, &crate::ast::InterfaceDef> = program
+        .interfaces
+        .iter()
+        .map(|i| (i.name.clone(), i))
+        .collect();
+    let class_names: HashSet<String> = class_map.keys().cloned().collect();
+    let interface_names: HashSet<String> = interface_map.keys().cloned().collect();
+
+    // 接口父接口合法性与重复检查
+    for iface in &program.interfaces {
+        let mut seen = HashSet::new();
+        for parent in &iface.parents {
+            if !interface_map.contains_key(parent.as_str()) {
+                return Err(format!("undeclared type name '{}'", parent));
+            }
+            if !seen.insert(parent.clone()) {
+                return Err(format!(
+                    "interface '{}' inherits or implements duplicate interface '{}'",
+                    iface.name, parent
+                ));
+            }
+        }
+    }
+
+    // 泛型上界必须是 class 或 interface（CJC 对齐）
+    for class_def in &program.classes {
+        let class_type_params: HashSet<String> = class_def.type_params.iter().cloned().collect();
+        validate_upper_bounds(
+            &class_def.constraints,
+            &class_names,
+            &interface_names,
+            &class_type_params,
+        )?;
+        for method in &class_def.methods {
+            let method_type_params: HashSet<String> = class_def
+                .type_params
+                .iter()
+                .cloned()
+                .chain(method.func.type_params.iter().cloned())
+                .collect();
+            validate_upper_bounds(
+                &method.func.constraints,
+                &class_names,
+                &interface_names,
+                &method_type_params,
+            )?;
+        }
+    }
+    for iface in &program.interfaces {
+        for method in &iface.methods {
+            let method_type_params: HashSet<String> = method.type_params.iter().cloned().collect();
+            validate_upper_bounds(
+                &method.constraints,
+                &class_names,
+                &interface_names,
+                &method_type_params,
+            )?;
+        }
+    }
+    for struct_def in &program.structs {
+        let struct_type_params: HashSet<String> = struct_def.type_params.iter().cloned().collect();
+        validate_upper_bounds(
+            &struct_def.constraints,
+            &class_names,
+            &interface_names,
+            &struct_type_params,
+        )?;
+    }
+
+    let mut class_parent: HashMap<String, Option<String>> = HashMap::new();
+    let mut class_direct_ifaces: HashMap<String, Vec<String>> = HashMap::new();
+    let mut class_methods: HashMap<String, HashMap<String, Vec<ClassMethodSig>>> = HashMap::new();
+
+    // 预处理 class：规范化 extends/implements，并收集方法签名
+    for class_def in &program.classes {
+        if class_def.is_sealed && !class_def.is_abstract {
+            return Err("non-abstract class cannot be modified by 'sealed'".to_string());
+        }
+
+        let mut parent = None;
+        let mut interfaces = class_def.implements.clone();
+        if let Some(ext) = &class_def.extends {
+            if class_map.contains_key(ext.as_str()) {
+                parent = Some(ext.clone());
+            } else if interface_map.contains_key(ext.as_str()) {
+                interfaces.push(ext.clone());
+            } else {
+                return Err(format!("undeclared type name '{}'", ext));
+            }
+        }
+
+        let mut seen = HashSet::new();
+        for iface in &interfaces {
+            if !interface_map.contains_key(iface.as_str()) {
+                return Err(format!("undeclared type name '{}'", iface));
+            }
+            if !seen.insert(iface.clone()) {
+                return Err(format!(
+                    "class '{}' inherits or implements duplicate interface '{}'",
+                    class_def.name, iface
+                ));
+            }
+        }
+
+        class_parent.insert(class_def.name.clone(), parent);
+        class_direct_ifaces.insert(class_def.name.clone(), interfaces);
+
+        let mut by_name: HashMap<String, Vec<ClassMethodSig>> = HashMap::new();
+        for method in &class_def.methods {
+            let sig = class_method_sig(&class_def.name, method);
+            by_name.entry(sig.sig.name.clone()).or_default().push(sig);
+        }
+        class_methods.insert(class_def.name.clone(), by_name);
+    }
+
+    // struct 方法签名（顶层函数形式: StructName.method）
+    let struct_names: HashSet<String> = program.structs.iter().map(|s| s.name.clone()).collect();
+    let mut struct_methods: HashMap<String, HashMap<String, Vec<MethodSig>>> = HashMap::new();
+    for func in &program.functions {
+        if let Some((owner, _)) = func.name.split_once('.') {
+            if struct_names.contains(owner) {
+                let sig = top_level_method_sig(owner, func);
+                struct_methods
+                    .entry(owner.to_string())
+                    .or_default()
+                    .entry(sig.name.clone())
+                    .or_default()
+                    .push(sig);
+            }
+        }
+    }
+
+    let mut iface_cache: HashMap<String, HashMap<String, InterfaceMethodReq>> = HashMap::new();
+
+    // class 语义校验
+    for class_def in &program.classes {
+        if let Some(parent_name) = class_parent
+            .get(&class_def.name)
+            .cloned()
+            .flatten()
+        {
+            if let Some(parent) = class_map.get(parent_name.as_str()) {
+                if !parent.is_open && !parent.is_abstract && !parent.is_sealed {
+                    return Err(format!(
+                        "super class '{}' is not inheritable",
+                        parent_name
+                    ));
+                }
+            }
+        }
+
+        // 收集父类方法（用于 override/实现签名校验）
+        let mut parent_methods_by_name: HashMap<String, Vec<MethodSig>> = HashMap::new();
+        let mut cur_parent = class_parent
+            .get(&class_def.name)
+            .cloned()
+            .flatten();
+        while let Some(parent_name) = cur_parent {
+            if let Some(methods_by_name) = class_methods.get(&parent_name) {
+                for (name, methods) in methods_by_name {
+                    for method in methods {
+                        parent_methods_by_name
+                            .entry(name.clone())
+                            .or_default()
+                            .push(method.sig.clone());
+                    }
+                }
+            }
+            cur_parent = class_parent.get(&parent_name).cloned().flatten();
+        }
+
+        // 收集当前类及祖先类声明的 interfaces
+        let mut inherited_ifaces = Vec::new();
+        let mut seen_ifaces = HashSet::new();
+        let mut cur = Some(class_def.name.clone());
+        while let Some(class_name) = cur {
+            if let Some(ifaces) = class_direct_ifaces.get(&class_name) {
+                for iface in ifaces {
+                    if seen_ifaces.insert(iface.clone()) {
+                        inherited_ifaces.push(iface.clone());
+                    }
+                }
+            }
+            cur = class_parent.get(&class_name).cloned().flatten();
+        }
+
+        let mut iface_methods_by_name: HashMap<String, Vec<MethodSig>> = HashMap::new();
+        let mut required_iface_methods: Vec<MethodSig> = Vec::new();
+        for iface_name in inherited_ifaces {
+            let mut visiting = HashSet::new();
+            let methods = collect_interface_methods(
+                &iface_name,
+                &interface_map,
+                &mut iface_cache,
+                &mut visiting,
+            )?;
+            for req in methods.values() {
+                iface_methods_by_name
+                    .entry(req.sig.name.clone())
+                    .or_default()
+                    .push(req.sig.clone());
+                if req.required {
+                    required_iface_methods.push(req.sig.clone());
+                }
+            }
+        }
+
+        if let Some(current_methods) = class_methods.get(&class_def.name) {
+            for methods in current_methods.values() {
+                for method in methods {
+                    if method.is_override && method.sig.is_static {
+                        return Err(
+                            "'static' and 'override' modifiers conflict on function declaration"
+                                .to_string(),
+                        );
+                    }
+
+                    let mut base_match: Option<MethodSig> = None;
+                    if let Some(parent_candidates) = parent_methods_by_name.get(&method.sig.name) {
+                        if let Some(found) = parent_candidates
+                            .iter()
+                            .find(|base| same_name_params(base, &method.sig)
+                                && base.is_static == method.sig.is_static)
+                        {
+                            base_match = Some(found.clone());
+                        }
+                    }
+                    if base_match.is_none() {
+                        if let Some(iface_candidates) = iface_methods_by_name.get(&method.sig.name)
+                        {
+                            if let Some(found) = iface_candidates
+                                .iter()
+                                .find(|base| same_name_params(base, &method.sig))
+                            {
+                                base_match = Some(found.clone());
+                            }
+                        }
+                    }
+
+                    if method.is_override && base_match.is_none() {
+                        return Err(format!(
+                            "'override' function '{}' does not have an overridden function in its supertype",
+                            method.sig.name
+                        ));
+                    }
+
+                    if let Some(base) = base_match {
+                        if !visibility_at_least(&method.sig.visibility, &base.visibility) {
+                            return Err(
+                                "a deriving member must be at least as visible as its base member"
+                                    .to_string(),
+                            );
+                        }
+                        if !constraints_not_tighter_than_parent(
+                            &method.sig,
+                            &base,
+                            &class_parent,
+                            &interface_map,
+                        ) {
+                            return Err(
+                                "the constraint of type parameter is not looser than parent's constraint"
+                                    .to_string(),
+                            );
+                        }
+                        if method.sig.return_type != base.return_type {
+                            if method.sig.name.starts_with("__get_")
+                                || method.sig.name.starts_with("__set_")
+                            {
+                                return Err(
+                                    "The type of the override/implement property must be the same"
+                                        .to_string(),
+                                );
+                            }
+                            return Err(format!(
+                                "return type of '{}' is not identical or not a subtype of the overridden/redefined/implement function",
+                                method.sig.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 非 abstract class 必须实现接口中未提供默认实现的方法
+        if !class_def.is_abstract {
+            for required in &required_iface_methods {
+                if !has_chain_method_with_same_name_params(
+                    &class_def.name,
+                    required,
+                    &class_methods,
+                    &class_parent,
+                ) {
+                    return Err(format!(
+                        "implementation of function '{}' is needed in '{}'",
+                        required.name, class_def.name
+                    ));
+                }
+            }
+        }
+    }
+
+    // struct 实现 interface 的完整性校验
+    for struct_def in &program.structs {
+        let mut implemented_ifaces = Vec::new();
+        for constraint in &struct_def.constraints {
+            if constraint.param == struct_def.name {
+                implemented_ifaces.extend(constraint.bounds.iter().cloned());
+            }
+        }
+        if implemented_ifaces.is_empty() {
+            continue;
+        }
+
+        let mut seen = HashSet::new();
+        for iface in &implemented_ifaces {
+            if !interface_map.contains_key(iface.as_str()) {
+                return Err(format!("undeclared type name '{}'", iface));
+            }
+            if !seen.insert(iface.clone()) {
+                return Err(format!(
+                    "class '{}' inherits or implements duplicate interface '{}'",
+                    struct_def.name, iface
+                ));
+            }
+        }
+
+        let methods_by_name = struct_methods
+            .get(&struct_def.name)
+            .cloned()
+            .unwrap_or_default();
+
+        for iface_name in implemented_ifaces {
+            let mut visiting = HashSet::new();
+            let methods = collect_interface_methods(
+                &iface_name,
+                &interface_map,
+                &mut iface_cache,
+                &mut visiting,
+            )?;
+            for req in methods.values().filter(|m| m.required) {
+                let implemented = methods_by_name
+                    .get(&req.sig.name)
+                    .map(|cands| cands.iter().any(|m| same_name_params(m, &req.sig)))
+                    .unwrap_or(false);
+                if !implemented {
+                    return Err(format!(
+                        "implementation of function '{}' is needed in '{}'",
+                        req.sig.name, struct_def.name
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// 降低函数
 pub fn lower_function(
     func: &Function,
@@ -64,7 +770,7 @@ pub fn lower_function(
     // 为每个函数创建局部类型推断上下文（包含参数和局部变量）
     let mut type_ctx = base_type_ctx.clone();
     for param in &func.params {
-        type_ctx.add_local(param.name.clone(), param.ty.clone());
+        type_ctx.add_local_with_mutability(param.name.clone(), param.ty.clone(), param.is_inout);
     }
     // 类方法：将类字段作为局部变量注册到类型推断上下文
     // 使 infer_expr(Expr::Var("fieldName")) 能正确推断字段类型
@@ -166,6 +872,7 @@ pub fn lower_function(
 /// 降低程序
 pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     validate_class_inheritance(program)?;
+    validate_class_interface_semantics(program)?;
 
     // 构建类型推断上下文
     let type_ctx = TypeInferenceContext::from_program(program);
@@ -461,6 +1168,13 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
                 chir_functions.push(chir_func);
             }
             Err(_e) => {
+                if _e.starts_with("semantic error:") {
+                    return Err(
+                        _e.strip_prefix("semantic error:")
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or(_e),
+                    );
+                }
                 // 生成空函数占位，避免索引错位
                 let empty_body = crate::chir::CHIRBlock { stmts: vec![], result: None };
                 let return_ty = func.return_type.clone().unwrap_or(Type::Unit);
@@ -608,7 +1322,10 @@ fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{ClassDef, ClassMethod, Expr, FieldDef, Param, Stmt, Visibility};
+    use crate::ast::{
+        ClassDef, ClassMethod, Expr, FieldDef, InterfaceDef, InterfaceMethod, Param, Pattern,
+        Stmt, StructDef, TypeConstraint, Visibility,
+    };
 
     fn make_func(name: &str, params: Vec<Param>, body: Vec<Stmt>) -> Function {
         Function {
@@ -900,5 +1617,469 @@ mod tests {
 
         let err = lower_program(&program).unwrap_err();
         assert!(err.contains("cannot inherit itself"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_non_abstract_sealed_class() {
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "A".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: true,
+            is_open: false,
+            extends: None,
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("non-abstract class cannot be modified by 'sealed'"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_override_without_base() {
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "A".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: None,
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: true,
+                func: make_func(
+                    "A.f",
+                    vec![Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct("A".to_string(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    vec![Stmt::Return(Some(Expr::Integer(1)))],
+                ),
+            }],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("does not have an overridden function in its supertype"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_interface_visibility_reduction() {
+        let iface = InterfaceDef {
+            visibility: Visibility::Public,
+            name: "I".to_string(),
+            parents: vec![],
+            methods: vec![InterfaceMethod {
+                name: "f".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Unit),
+                default_body: None,
+            }],
+            assoc_types: vec![],
+        };
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "A".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            // parser 对 `class A <: I` 会把 I 放到 extends
+            extends: Some("I".to_string()),
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: false,
+                func: Function {
+                    visibility: Visibility::Protected,
+                    name: "A.f".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct("A".to_string(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::Unit),
+                    throws: None,
+                    body: vec![],
+                    extern_import: None,
+                },
+            }],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![iface],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("at least as visible as its base member"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_struct_missing_interface_method() {
+        let iface = InterfaceDef {
+            visibility: Visibility::Public,
+            name: "I".to_string(),
+            parents: vec![],
+            methods: vec![InterfaceMethod {
+                name: "f".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                default_body: None,
+            }],
+            assoc_types: vec![],
+        };
+        let st = StructDef {
+            visibility: Visibility::Public,
+            name: "S".to_string(),
+            type_params: vec![],
+            constraints: vec![TypeConstraint {
+                param: "S".to_string(),
+                bounds: vec!["I".to_string()],
+            }],
+            fields: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![st],
+            classes: vec![],
+            enums: vec![],
+            interfaces: vec![iface],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("implementation of function 'f' is needed in 'S'"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_invalid_generic_upper_bound() {
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "A".to_string(),
+            type_params: vec!["T".to_string()],
+            constraints: vec![TypeConstraint {
+                param: "T".to_string(),
+                bounds: vec!["Int64".to_string()],
+            }],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: None,
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("must be class or interface"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_tighter_generic_constraint_than_interface() {
+        let iface = InterfaceDef {
+            visibility: Visibility::Public,
+            name: "I".to_string(),
+            parents: vec![],
+            methods: vec![InterfaceMethod {
+                name: "f".to_string(),
+                type_params: vec!["T".to_string()],
+                constraints: vec![TypeConstraint {
+                    param: "T".to_string(),
+                    bounds: vec!["BoundBase".to_string()],
+                }],
+                params: vec![],
+                return_type: Some(Type::Unit),
+                default_body: None,
+            }],
+            assoc_types: vec![],
+        };
+        let bound_base = ClassDef {
+            visibility: Visibility::default(),
+            name: "BoundBase".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: true,
+            extends: None,
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![],
+            primary_ctor_params: vec![],
+        };
+        let bound_child = ClassDef {
+            visibility: Visibility::default(),
+            name: "BoundChild".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: Some("BoundBase".to_string()),
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![],
+            primary_ctor_params: vec![],
+        };
+        let impl_class = ClassDef {
+            visibility: Visibility::default(),
+            name: "Impl".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: Some("I".to_string()),
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: false,
+                func: Function {
+                    visibility: Visibility::Public,
+                    name: "Impl.f".to_string(),
+                    type_params: vec!["T".to_string()],
+                    constraints: vec![TypeConstraint {
+                        param: "T".to_string(),
+                        bounds: vec!["BoundChild".to_string()],
+                    }],
+                    params: vec![Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct("Impl".to_string(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::Unit),
+                    throws: None,
+                    body: vec![],
+                    extern_import: None,
+                },
+            }],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![bound_base, bound_child, impl_class],
+            enums: vec![],
+            interfaces: vec![iface],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("the constraint of type parameter is not looser than parent's constraint"));
+    }
+
+    #[test]
+    fn test_lower_program_accepts_looser_generic_constraint_than_interface() {
+        let iface = InterfaceDef {
+            visibility: Visibility::Public,
+            name: "I".to_string(),
+            parents: vec![],
+            methods: vec![InterfaceMethod {
+                name: "f".to_string(),
+                type_params: vec!["T".to_string()],
+                constraints: vec![TypeConstraint {
+                    param: "T".to_string(),
+                    bounds: vec!["BoundBase".to_string()],
+                }],
+                params: vec![],
+                return_type: Some(Type::Unit),
+                default_body: None,
+            }],
+            assoc_types: vec![],
+        };
+        let bound_base = ClassDef {
+            visibility: Visibility::default(),
+            name: "BoundBase".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: None,
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![],
+            primary_ctor_params: vec![],
+        };
+        let impl_class = ClassDef {
+            visibility: Visibility::default(),
+            name: "Impl".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: Some("I".to_string()),
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: false,
+                func: Function {
+                    visibility: Visibility::Public,
+                    name: "Impl.f".to_string(),
+                    type_params: vec!["T".to_string()],
+                    constraints: vec![TypeConstraint {
+                        param: "T".to_string(),
+                        bounds: vec!["Object".to_string()],
+                    }],
+                    params: vec![Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct("Impl".to_string(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::Unit),
+                    throws: None,
+                    body: vec![],
+                    extern_import: None,
+                },
+            }],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![bound_base, impl_class],
+            enums: vec![],
+            interfaces: vec![iface],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let chir_program = lower_program(&program).unwrap();
+        assert!(!chir_program.functions.is_empty());
+    }
+
+    #[test]
+    fn test_lower_program_rejects_assign_to_immutable() {
+        let program = make_program(vec![make_func(
+            "main",
+            vec![],
+            vec![
+                Stmt::Let {
+                    pattern: Pattern::Binding("x".to_string()),
+                    ty: Some(Type::Int64),
+                    value: Expr::Integer(1),
+                },
+                Stmt::Assign {
+                    target: crate::ast::AssignTarget::Var("x".to_string()),
+                    value: Expr::Integer(2),
+                },
+            ],
+        )]);
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("cannot assign to immutable value"));
     }
 }

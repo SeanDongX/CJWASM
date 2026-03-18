@@ -100,37 +100,9 @@ impl Parser {
         while let Some(op) = match self.peek() {
             Some(Token::Eq) => Some(BinOp::Eq),
             Some(Token::NotEq) => Some(BinOp::NotEq),
-            Some(Token::Lt) => {
-                // 启发式区分泛型 Array<T> 与比较 a < b：
-                // 如果 < 后是类型关键字，视为泛型（返回 None，不当作比较）
-                // 如果 < 后是 Ident，再看其后第三个 token 是否 > 或 , （泛型上下文）
-                let next = self.peek_next();
-                let is_type_keyword = matches!(
-                    next,
-                    Some(
-                        Token::TypeInt64
-                            | Token::TypeInt32
-                            | Token::TypeFloat64
-                            | Token::TypeFloat32
-                            | Token::TypeBool
-                            | Token::TypeString
-                            | Token::TypeInt8
-                            | Token::TypeInt16
-                            | Token::TypeUInt8
-                            | Token::TypeUInt16
-                            | Token::TypeUInt32
-                            | Token::TypeUInt64
-                            | Token::TypeRune
-                    )
-                );
-                let is_generic_ident = matches!(next, Some(Token::Ident(_)))
-                    && matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
-                if is_type_keyword || is_generic_ident {
-                    None
-                } else {
-                    Some(BinOp::Lt)
-                }
-            }
+            // 泛型实参由 parse_primary/parse_postfix 的 parse_opt_type_args 系列逻辑处理；
+            // 比较表达式层面的 `<` 必须按关系运算符解析，避免把 `Int8(1) < Int8(1)` 误判为泛型。
+            Some(Token::Lt) => Some(BinOp::Lt),
             Some(Token::Gt) => Some(BinOp::Gt),
             Some(Token::LtEq) => Some(BinOp::LtEq),
             Some(Token::GtEq) => Some(BinOp::GtEq),
