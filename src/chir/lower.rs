@@ -4,7 +4,47 @@ use crate::ast::{Function, Param, Program, Type};
 use crate::chir::{CHIRFunction, CHIRProgram, CHIRParam};
 use crate::chir::type_inference::TypeInferenceContext;
 use crate::chir::lower_expr::LoweringContext;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// 继承合法性检查：避免自继承/循环继承导致 lowering 或 codegen 死循环。
+fn validate_class_inheritance(program: &Program) -> Result<(), String> {
+    let extends: HashMap<String, String> = program
+        .classes
+        .iter()
+        .filter_map(|c| c.extends.as_ref().map(|p| (c.name.clone(), p.clone())))
+        .collect();
+
+    // cjc 对齐：直接自继承给出专用错误。
+    for class_def in &program.classes {
+        if class_def.extends.as_ref() == Some(&class_def.name) {
+            return Err(format!(
+                "declaration '{}' cannot inherit itself",
+                class_def.name
+            ));
+        }
+    }
+
+    // 通用循环继承检测：A <: B <: ... <: A
+    for class_def in &program.classes {
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(class_def.name.clone());
+        let mut chain = vec![class_def.name.clone()];
+        let mut parent = class_def.extends.clone();
+
+        while let Some(parent_name) = parent {
+            chain.push(parent_name.clone());
+            if !seen.insert(parent_name.clone()) {
+                return Err(format!(
+                    "cyclic class inheritance detected: {}",
+                    chain.join(" <: ")
+                ));
+            }
+            parent = extends.get(&parent_name).cloned();
+        }
+    }
+
+    Ok(())
+}
 
 /// 降低函数
 pub fn lower_function(
@@ -125,6 +165,8 @@ pub fn lower_function(
 
 /// 降低程序
 pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
+    validate_class_inheritance(program)?;
+
     // 构建类型推断上下文
     let type_ctx = TypeInferenceContext::from_program(program);
 
@@ -822,5 +864,41 @@ mod tests {
         assert_eq!(chir_program.functions.len(), 1);
         assert_eq!(chir_program.functions[0].name, "bad");
         assert!(chir_program.functions[0].body.stmts.is_empty());
+    }
+
+    #[test]
+    fn test_lower_program_rejects_self_inheritance() {
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "A".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: true,
+            extends: Some("A".to_string()),
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("cannot inherit itself"));
     }
 }

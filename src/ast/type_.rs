@@ -75,8 +75,11 @@ impl Type {
             Type::Float64 => ValType::F64,
             Type::Rune => ValType::I32,
             Type::Bool => ValType::I32,
-            Type::Nothing => panic!("Nothing 类型不能转换为 WASM 值类型"),
-            Type::Unit => panic!("Unit 类型不能转换为 WASM 值类型"),
+            // P0: 为避免编译阶段 panic（Conformance 负例会构造到这些类型路径），
+            // Nothing/Unit 在需要 ValType 时统一保守回退为 i32。
+            // 语义正确性由上层类型检查与返回值规则约束，不在这里 panic 中断流程。
+            Type::Nothing => ValType::I32,
+            Type::Unit => ValType::I32,
             Type::String => ValType::I32,
             Type::Array(_) => ValType::I32,
             Type::Tuple(_) => ValType::I32,
@@ -146,15 +149,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Nothing 类型不能转换为 WASM")]
-    fn test_to_wasm_nothing_panic() {
-        Type::Nothing.to_wasm();
+    fn test_to_wasm_nothing_fallback_i32() {
+        assert_eq!(Type::Nothing.to_wasm(), ValType::I32);
     }
 
     #[test]
-    #[should_panic(expected = "Unit 类型不能转换为 WASM")]
-    fn test_to_wasm_unit_panic() {
-        Type::Unit.to_wasm();
+    fn test_to_wasm_unit_fallback_i32() {
+        assert_eq!(Type::Unit.to_wasm(), ValType::I32);
     }
 
     #[test]

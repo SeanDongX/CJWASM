@@ -364,6 +364,7 @@ Outputs:
 |------|------|------|
 | `run_test.sh` | test runner with interactive levels | `./scripts/run_test.sh [1-5]` |
 | `system_test.sh` | compile and run example `.cj` files | `./scripts/system_test.sh [--verbose]` |
+| `conformance_diff.sh` | compare Conformance compile results between `cjc` and `cjwasm` (with harness report diff) | `./scripts/conformance_diff.sh [--tests <path>] [--level <n>]` |
 | `benchmark.sh` | CJWasm vs CJC benchmarking | `./scripts/benchmark.sh [--quick]` |
 | `coverage.sh` | coverage report generation | `./scripts/coverage.sh [--html]` |
 

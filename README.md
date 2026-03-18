@@ -441,6 +441,7 @@ cargo bench
 |------|------|------|
 | `run_test.sh` | 测试运行器，交互式选择测试级别 | `./scripts/run_test.sh [1-5]` |
 | `system_test.sh` | 编译运行 28 个 .cj 示例并验证返回值 | `./scripts/system_test.sh [--verbose]` |
+| `conformance_diff.sh` | 对比 Conformance 测试中 `cjc` 与 `cjwasm` 编译结果（含 report diff） | `./scripts/conformance_diff.sh [--tests <path>] [--level <n>]` |
 | `benchmark.sh` | CJWasm vs CJC 性能对比（编译/运行/大小） | `./scripts/benchmark.sh [--quick]` |
 | `coverage.sh` | 生成测试覆盖率报告 | `./scripts/coverage.sh [--html]` |
 | `system_test.sh` | 系统测试（编译+WASM验证+运行+预期值校验） | `./scripts/system_test.sh [--compile] [--verbose]` |
