@@ -351,7 +351,9 @@ pub fn compile_source_to_wasm(source: &str) -> Result<Vec<u8>, String> {
     if std::env::var("NO_CHIR").is_err() {
         // 新路径: AST → CHIR → WASM
         let mut chir_program = crate::chir::lower_program(&program)?;
-        crate::chir::optimize::optimize_chir(&mut chir_program);
+        if std::env::var("NO_CHIR_OPT").is_err() {
+            crate::chir::optimize::optimize_chir(&mut chir_program);
+        }
         let mut codegen = crate::codegen::chir_codegen::CHIRCodeGen::new();
         Ok(codegen.generate(&chir_program))
     } else {
@@ -382,7 +384,9 @@ pub fn compile_files_to_wasm(files: &[&str]) -> Result<Vec<u8>, String> {
     if std::env::var("NO_CHIR").is_err() {
         // 新路径: AST → CHIR → WASM
         let mut chir_program = crate::chir::lower_program(&program)?;
-        crate::chir::optimize::optimize_chir(&mut chir_program);
+        if std::env::var("NO_CHIR_OPT").is_err() {
+            crate::chir::optimize::optimize_chir(&mut chir_program);
+        }
         let mut codegen = crate::codegen::chir_codegen::CHIRCodeGen::new();
         Ok(codegen.generate(&chir_program))
     } else {

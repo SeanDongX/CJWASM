@@ -1,20 +1,5 @@
 // 高负载基准：密集调用小函数，放大内联优化效果
-
-class Counter {
-    var count: Int64;
-    init(count: Int64) { this.count = count }
-    func get(self: Counter): Int64 { return self.count }
-    func increment(self: Counter): Int64 { return self.count + 1 }
-    func decrement(self: Counter): Int64 { return self.count - 1 }
-}
-
-class Vector2D {
-    var x: Int64;
-    var y: Int64;
-    init(x: Int64, y: Int64) { this.x = x; this.y = y }
-    func dot(self: Vector2D, ox: Int64, oy: Int64): Int64 { return self.x * ox + self.y * oy }
-    func lengthSq(self: Vector2D): Int64 { return self.x * self.x + self.y * self.y }
-}
+// 全部使用纯函数（无堆分配），支持大 N
 
 func identity(x: Int64): Int64 { return x }
 func double(x: Int64): Int64 { return x * 2 }
@@ -28,6 +13,15 @@ func clamp(x: Int64, lo: Int64, hi: Int64): Int64 {
     if (x > hi) { return hi }
     return x
 }
+
+// Counter 操作改为纯函数（原来是 class 方法）
+func counterGet(count: Int64): Int64 { return count }
+func counterInc(count: Int64): Int64 { return count + 1 }
+func counterDec(count: Int64): Int64 { return count - 1 }
+
+// Vector2D 操作改为纯函数
+func vectorDot(x: Int64, y: Int64, ox: Int64, oy: Int64): Int64 { return x * ox + y * oy }
+func vectorLengthSq(x: Int64, y: Int64): Int64 { return x * x + y * y }
 
 // 密集调用 identity/double/square/addOne 各 N 次
 func testInlineCalls(n: Int64): Int64 {
@@ -44,29 +38,27 @@ func testInlineCalls(n: Int64): Int64 {
     return sum
 }
 
-// 密集调用 Counter 方法
+// 密集调用 counter 纯函数
 func testCounterCalls(n: Int64): Int64 {
     var sum: Int64 = 0
     var i: Int64 = 0
     while (i < n) {
-        let c = Counter(i)
-        let g = c.get()
-        let inc = c.increment()
-        let dec = c.decrement()
+        let g = counterGet(i)
+        let inc = counterInc(i)
+        let dec = counterDec(i)
         sum = sum + g + inc + dec
         i = i + 1
     }
     return sum
 }
 
-// 密集调用 Vector2D 方法
+// 密集调用 vector 纯函数
 func testVectorCalls(n: Int64): Int64 {
     var sum: Int64 = 0
     var i: Int64 = 0
     while (i < n) {
-        let v = Vector2D(i, i + 1)
-        let d = v.dot(2, 3)
-        let l = v.lengthSq()
+        let d = vectorDot(i, i + 1, 2, 3)
+        let l = vectorLengthSq(i, i + 1)
         sum = sum + d + l
         i = i + 1
     }
@@ -88,7 +80,7 @@ func testUtilCalls(n: Int64): Int64 {
 }
 
 main(): Int64 {
-    let N: Int64 = 100000
+    let N: Int64 = 1000000
     let a = testInlineCalls(N)
     let b = testCounterCalls(N)
     let c = testVectorCalls(N)
