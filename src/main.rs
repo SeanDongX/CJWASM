@@ -292,7 +292,8 @@ fn cmd_compile(args: &[String]) {
 
     let wasm = if use_chir {
         match cjwasm::chir::lower_program(&program) {
-            Ok(chir_program) => {
+            Ok(mut chir_program) => {
+                cjwasm::chir::optimize::optimize_chir(&mut chir_program);
                 let mut codegen = cjwasm::codegen::chir_codegen::CHIRCodeGen::new();
                 codegen.generate(&chir_program)
             }

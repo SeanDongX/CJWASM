@@ -11,8 +11,68 @@ const IMPORT_COUNT: u32 = 4;
 
 /// 入口：对 CHIRProgram 执行所有优化 pass
 pub fn optimize_chir(program: &mut CHIRProgram) {
+    let before_inline = count_calls(program);
     inline_small_functions(program);
+    let after_inline = count_calls(program);
+
+    let before_locals = count_locals(program);
     eliminate_redundant_locals(program);
+    let after_locals = count_locals(program);
+
+    eprintln!("[optimize] inline: calls {} -> {} (eliminated {})",
+        before_inline, after_inline, before_inline - after_inline);
+    eprintln!("[optimize] locals: lets {} -> {} (eliminated {})",
+        before_locals, after_locals, before_locals - after_locals);
+}
+
+fn count_calls(program: &CHIRProgram) -> usize {
+    program.functions.iter().map(|f| count_calls_in_block(&f.body)).sum()
+}
+
+fn count_calls_in_block(block: &CHIRBlock) -> usize {
+    block.stmts.iter().map(count_calls_in_stmt).sum::<usize>()
+        + block.result.as_ref().map_or(0, |e| count_calls_in_expr(e))
+}
+
+fn count_calls_in_stmt(stmt: &CHIRStmt) -> usize {
+    match stmt {
+        CHIRStmt::Let { value, .. } => count_calls_in_expr(value),
+        CHIRStmt::Assign { value, .. } => count_calls_in_expr(value),
+        CHIRStmt::Expr(e) => count_calls_in_expr(e),
+        CHIRStmt::Return(Some(e)) => count_calls_in_expr(e),
+        CHIRStmt::While { cond, body } => count_calls_in_expr(cond) + count_calls_in_block(body),
+        CHIRStmt::Loop { body } => count_calls_in_block(body),
+        _ => 0,
+    }
+}
+
+fn count_calls_in_expr(expr: &CHIRExpr) -> usize {
+    match &expr.kind {
+        CHIRExprKind::Call { args, .. } => 1 + args.iter().map(count_calls_in_expr).sum::<usize>(),
+        CHIRExprKind::Binary { left, right, .. } => count_calls_in_expr(left) + count_calls_in_expr(right),
+        CHIRExprKind::Unary { expr, .. } => count_calls_in_expr(expr),
+        CHIRExprKind::Cast { expr, .. } => count_calls_in_expr(expr),
+        CHIRExprKind::If { cond, then_block, else_block } => {
+            count_calls_in_expr(cond)
+                + count_calls_in_block(then_block)
+                + else_block.as_ref().map_or(0, |b| count_calls_in_block(b))
+        }
+        CHIRExprKind::Block(b) => count_calls_in_block(b),
+        _ => 0,
+    }
+}
+
+fn count_locals(program: &CHIRProgram) -> usize {
+    program.functions.iter().map(|f| count_lets_in_block(&f.body)).sum()
+}
+
+fn count_lets_in_block(block: &CHIRBlock) -> usize {
+    block.stmts.iter().map(|s| match s {
+        CHIRStmt::Let { .. } => 1,
+        CHIRStmt::While { body, .. } => count_lets_in_block(body),
+        CHIRStmt::Loop { body } => count_lets_in_block(body),
+        _ => 0,
+    }).sum()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -20,12 +80,21 @@ pub fn optimize_chir(program: &mut CHIRProgram) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn is_inlinable(func: &CHIRFunction) -> bool {
-    if !func.body.stmts.is_empty() {
+    // 提取可内联的 result 表达式：
+    // 形式1: stmts=[], result=Some(expr)
+    // 形式2: stmts=[Return(expr)], result=None
+    let result: &CHIRExpr = if func.body.stmts.is_empty() {
+        match &func.body.result {
+            Some(r) => r,
+            None => return false,
+        }
+    } else if func.body.stmts.len() == 1 {
+        match &func.body.stmts[0] {
+            CHIRStmt::Return(Some(e)) => e,
+            _ => return false,
+        }
+    } else {
         return false;
-    }
-    let result = match &func.body.result {
-        Some(r) => r,
-        None => return false,
     };
     if count_expr_nodes(result) > 8 {
         return false;
@@ -33,7 +102,25 @@ fn is_inlinable(func: &CHIRFunction) -> bool {
     if has_side_effects(result) {
         return false;
     }
+    // result 的 wasm_ty 必须与函数返回类型一致，否则内联后类型不匹配
+    if result.wasm_ty != func.return_wasm_ty {
+        return false;
+    }
     true
+}
+
+/// 提取可内联函数的 result 表达式（与 is_inlinable 逻辑对应）
+fn get_inlinable_result(func: &CHIRFunction) -> Option<&CHIRExpr> {
+    if func.body.stmts.is_empty() {
+        func.body.result.as_deref()
+    } else if func.body.stmts.len() == 1 {
+        match &func.body.stmts[0] {
+            CHIRStmt::Return(Some(e)) => Some(e),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 fn count_expr_nodes(expr: &CHIRExpr) -> usize {
@@ -67,8 +154,31 @@ fn has_side_effects(expr: &CHIRExpr) -> bool {
         CHIRExprKind::FieldGet { object, .. } => has_side_effects(object),
         CHIRExprKind::TupleGet { tuple, .. } => has_side_effects(tuple),
         CHIRExprKind::Load { ptr, .. } => has_side_effects(ptr),
+        CHIRExprKind::If { cond, then_block, else_block } => {
+            has_side_effects(cond)
+                || has_side_effects_block(then_block)
+                || else_block.as_ref().map_or(false, |b| has_side_effects_block(b))
+        }
+        CHIRExprKind::Block(b) => has_side_effects_block(b),
+        CHIRExprKind::Match { subject, arms } => {
+            has_side_effects(subject)
+                || arms.iter().any(|a| has_side_effects_block(&a.body))
+        }
         _ => false,
     }
+}
+
+fn has_side_effects_block(block: &CHIRBlock) -> bool {
+    block.stmts.iter().any(|s| match s {
+        CHIRStmt::Let { value, .. } => has_side_effects(value),
+        CHIRStmt::Assign { value, .. } => has_side_effects(value),
+        CHIRStmt::Expr(e) => has_side_effects(e),
+        // Return 是控制流副作用，内联含 Return 的 block 会导致 caller 提前返回
+        CHIRStmt::Return(_) => true,
+        CHIRStmt::While { cond, body } => has_side_effects(cond) || has_side_effects_block(body),
+        CHIRStmt::Loop { body } => has_side_effects_block(body),
+        _ => false,
+    }) || block.result.as_ref().map_or(false, |r| has_side_effects(r))
 }
 
 fn has_call_to(expr: &CHIRExpr, target_idx: u32) -> bool {
@@ -87,8 +197,30 @@ fn has_call_to(expr: &CHIRExpr, target_idx: u32) -> bool {
         CHIRExprKind::FieldGet { object, .. } => has_call_to(object, target_idx),
         CHIRExprKind::TupleGet { tuple, .. } => has_call_to(tuple, target_idx),
         CHIRExprKind::Load { ptr, .. } => has_call_to(ptr, target_idx),
+        CHIRExprKind::If { cond, then_block, else_block } => {
+            has_call_to(cond, target_idx)
+                || has_call_to_block(then_block, target_idx)
+                || else_block.as_ref().map_or(false, |b| has_call_to_block(b, target_idx))
+        }
+        CHIRExprKind::Block(b) => has_call_to_block(b, target_idx),
+        CHIRExprKind::Match { subject, arms } => {
+            has_call_to(subject, target_idx)
+                || arms.iter().any(|a| has_call_to_block(&a.body, target_idx))
+        }
         _ => false,
     }
+}
+
+fn has_call_to_block(block: &CHIRBlock, target_idx: u32) -> bool {
+    block.stmts.iter().any(|s| match s {
+        CHIRStmt::Let { value, .. } => has_call_to(value, target_idx),
+        CHIRStmt::Assign { value, .. } => has_call_to(value, target_idx),
+        CHIRStmt::Expr(e) => has_call_to(e, target_idx),
+        CHIRStmt::Return(Some(e)) => has_call_to(e, target_idx),
+        CHIRStmt::While { cond, body } => has_call_to(cond, target_idx) || has_call_to_block(body, target_idx),
+        CHIRStmt::Loop { body } => has_call_to_block(body, target_idx),
+        _ => false,
+    }) || block.result.as_ref().map_or(false, |r| has_call_to(r, target_idx))
 }
 
 /// 将 expr 中所有 Local(param_local) 替换为对应 arg，并将被内联函数的非参数 locals 偏移
@@ -152,9 +284,228 @@ fn subst_expr(
             offset,
             align,
         },
+        // 控制流：必须递归进入 block，以便重映射其中的 Let local_idx
+        CHIRExprKind::If { cond, then_block, else_block } => CHIRExprKind::If {
+            cond: Box::new(subst_expr(*cond, params, args, caller_next_local, param_count)),
+            then_block: subst_block(then_block, params, args, caller_next_local, param_count),
+            else_block: else_block.map(|b| subst_block(b, params, args, caller_next_local, param_count)),
+        },
+        CHIRExprKind::Block(b) => CHIRExprKind::Block(
+            subst_block(b, params, args, caller_next_local, param_count)
+        ),
+        CHIRExprKind::Match { subject, arms } => CHIRExprKind::Match {
+            subject: Box::new(subst_expr(*subject, params, args, caller_next_local, param_count)),
+            arms: arms.into_iter().map(|arm| CHIRMatchArm {
+                pattern: subst_pattern(arm.pattern, param_count, caller_next_local),
+                guard: arm.guard.map(|g| subst_expr(g, params, args, caller_next_local, param_count)),
+                body: subst_block(arm.body, params, args, caller_next_local, param_count),
+            }).collect(),
+        },
+        CHIRExprKind::Call { func_idx, args: call_args } => CHIRExprKind::Call {
+            func_idx,
+            args: call_args.into_iter()
+                .map(|a| subst_expr(a, params, args, caller_next_local, param_count))
+                .collect(),
+        },
+        CHIRExprKind::MethodCall { vtable_offset, func_idx, receiver, args: call_args } => CHIRExprKind::MethodCall {
+            vtable_offset,
+            func_idx,
+            receiver: Box::new(subst_expr(*receiver, params, args, caller_next_local, param_count)),
+            args: call_args.into_iter()
+                .map(|a| subst_expr(a, params, args, caller_next_local, param_count))
+                .collect(),
+        },
+        CHIRExprKind::CallIndirect { type_idx, args: call_args, callee } => CHIRExprKind::CallIndirect {
+            type_idx,
+            args: call_args.into_iter()
+                .map(|a| subst_expr(a, params, args, caller_next_local, param_count))
+                .collect(),
+            callee: Box::new(subst_expr(*callee, params, args, caller_next_local, param_count)),
+        },
+        CHIRExprKind::ArrayGet { array, index } => CHIRExprKind::ArrayGet {
+            array: Box::new(subst_expr(*array, params, args, caller_next_local, param_count)),
+            index: Box::new(subst_expr(*index, params, args, caller_next_local, param_count)),
+        },
+        CHIRExprKind::ArraySet { array, index, value } => CHIRExprKind::ArraySet {
+            array: Box::new(subst_expr(*array, params, args, caller_next_local, param_count)),
+            index: Box::new(subst_expr(*index, params, args, caller_next_local, param_count)),
+            value: Box::new(subst_expr(*value, params, args, caller_next_local, param_count)),
+        },
+        CHIRExprKind::ArrayNew { len, init } => CHIRExprKind::ArrayNew {
+            len: Box::new(subst_expr(*len, params, args, caller_next_local, param_count)),
+            init: Box::new(subst_expr(*init, params, args, caller_next_local, param_count)),
+        },
+        CHIRExprKind::ArrayLiteral { elements } => CHIRExprKind::ArrayLiteral {
+            elements: elements.into_iter()
+                .map(|e| subst_expr(e, params, args, caller_next_local, param_count))
+                .collect(),
+        },
+        CHIRExprKind::TupleNew { elements } => CHIRExprKind::TupleNew {
+            elements: elements.into_iter()
+                .map(|e| subst_expr(e, params, args, caller_next_local, param_count))
+                .collect(),
+        },
+        CHIRExprKind::StructNew { struct_name, fields } => CHIRExprKind::StructNew {
+            struct_name,
+            fields: fields.into_iter()
+                .map(|(n, e)| (n, subst_expr(e, params, args, caller_next_local, param_count)))
+                .collect(),
+        },
+        CHIRExprKind::Store { ptr, value, offset, align } => CHIRExprKind::Store {
+            ptr: Box::new(subst_expr(*ptr, params, args, caller_next_local, param_count)),
+            value: Box::new(subst_expr(*value, params, args, caller_next_local, param_count)),
+            offset,
+            align,
+        },
+        CHIRExprKind::FieldSet { object, field_offset, value } => CHIRExprKind::FieldSet {
+            object: Box::new(subst_expr(*object, params, args, caller_next_local, param_count)),
+            field_offset,
+            value: Box::new(subst_expr(*value, params, args, caller_next_local, param_count)),
+        },
+        CHIRExprKind::Print { arg, newline, fd } => CHIRExprKind::Print {
+            arg: arg.map(|a| Box::new(subst_expr(*a, params, args, caller_next_local, param_count))),
+            newline,
+            fd,
+        },
+        CHIRExprKind::MathUnary { op, arg } => CHIRExprKind::MathUnary {
+            op,
+            arg: Box::new(subst_expr(*arg, params, args, caller_next_local, param_count)),
+        },
+        CHIRExprKind::MathBinary { op, left, right } => CHIRExprKind::MathBinary {
+            op,
+            left: Box::new(subst_expr(*left, params, args, caller_next_local, param_count)),
+            right: Box::new(subst_expr(*right, params, args, caller_next_local, param_count)),
+        },
+        CHIRExprKind::BuiltinAbs { val, tmp_local } => {
+            let new_tmp = if tmp_local >= param_count {
+                caller_next_local + (tmp_local - param_count)
+            } else {
+                tmp_local
+            };
+            CHIRExprKind::BuiltinAbs {
+                val: Box::new(subst_expr(*val, params, args, caller_next_local, param_count)),
+                tmp_local: new_tmp,
+            }
+        }
+        CHIRExprKind::BuiltinCompareTo { left, right } => CHIRExprKind::BuiltinCompareTo {
+            left: Box::new(subst_expr(*left, params, args, caller_next_local, param_count)),
+            right: Box::new(subst_expr(*right, params, args, caller_next_local, param_count)),
+        },
+        CHIRExprKind::BuiltinStringIsEmpty { val } => CHIRExprKind::BuiltinStringIsEmpty {
+            val: Box::new(subst_expr(*val, params, args, caller_next_local, param_count)),
+        },
         other => other,
     };
     CHIRExpr { kind: new_kind, ..expr }
+}
+
+fn subst_block(
+    block: CHIRBlock,
+    params: &[CHIRParam],
+    args: &[CHIRExpr],
+    caller_next_local: u32,
+    param_count: u32,
+) -> CHIRBlock {
+    CHIRBlock {
+        stmts: block.stmts.into_iter()
+            .map(|s| subst_stmt(s, params, args, caller_next_local, param_count))
+            .collect(),
+        result: block.result.map(|r| Box::new(subst_expr(*r, params, args, caller_next_local, param_count))),
+    }
+}
+
+fn subst_stmt(
+    stmt: CHIRStmt,
+    params: &[CHIRParam],
+    args: &[CHIRExpr],
+    caller_next_local: u32,
+    param_count: u32,
+) -> CHIRStmt {
+    match stmt {
+        CHIRStmt::Let { local_idx, value } => {
+            // 重映射 Let 的写目标 local_idx
+            let new_idx = if local_idx >= param_count {
+                caller_next_local + (local_idx - param_count)
+            } else {
+                local_idx
+            };
+            CHIRStmt::Let {
+                local_idx: new_idx,
+                value: subst_expr(value, params, args, caller_next_local, param_count),
+            }
+        }
+        CHIRStmt::Assign { target, value } => CHIRStmt::Assign {
+            target: subst_lvalue(target, params, args, caller_next_local, param_count),
+            value: subst_expr(value, params, args, caller_next_local, param_count),
+        },
+        CHIRStmt::Expr(e) => CHIRStmt::Expr(
+            subst_expr(e, params, args, caller_next_local, param_count)
+        ),
+        CHIRStmt::Return(Some(e)) => CHIRStmt::Return(Some(
+            subst_expr(e, params, args, caller_next_local, param_count)
+        )),
+        CHIRStmt::While { cond, body } => CHIRStmt::While {
+            cond: subst_expr(cond, params, args, caller_next_local, param_count),
+            body: subst_block(body, params, args, caller_next_local, param_count),
+        },
+        CHIRStmt::Loop { body } => CHIRStmt::Loop {
+            body: subst_block(body, params, args, caller_next_local, param_count),
+        },
+        other => other,
+    }
+}
+
+fn subst_lvalue(
+    lvalue: CHIRLValue,
+    params: &[CHIRParam],
+    args: &[CHIRExpr],
+    caller_next_local: u32,
+    param_count: u32,
+) -> CHIRLValue {
+    match lvalue {
+        CHIRLValue::Local(idx) => {
+            let new_idx = if idx >= param_count {
+                caller_next_local + (idx - param_count)
+            } else {
+                idx
+            };
+            CHIRLValue::Local(new_idx)
+        }
+        CHIRLValue::Field { object, offset } => CHIRLValue::Field {
+            object: Box::new(subst_expr(*object, params, args, caller_next_local, param_count)),
+            offset,
+        },
+        CHIRLValue::Index { array, index } => CHIRLValue::Index {
+            array: Box::new(subst_expr(*array, params, args, caller_next_local, param_count)),
+            index: Box::new(subst_expr(*index, params, args, caller_next_local, param_count)),
+        },
+    }
+}
+
+fn subst_pattern(pattern: CHIRPattern, param_count: u32, caller_next_local: u32) -> CHIRPattern {
+    let remap = |idx: u32| -> u32 {
+        if idx >= param_count { caller_next_local + (idx - param_count) } else { idx }
+    };
+    match pattern {
+        CHIRPattern::Binding(idx) => CHIRPattern::Binding(remap(idx)),
+        CHIRPattern::Variant { discriminant, payload_binding, enum_has_payload } => {
+            CHIRPattern::Variant {
+                discriminant,
+                payload_binding: payload_binding.map(remap),
+                enum_has_payload,
+            }
+        }
+        CHIRPattern::Struct { fields } => CHIRPattern::Struct {
+            fields: fields.into_iter().map(|field| match field {
+                StructPatternField::Binding { offset, local_idx, wasm_ty } =>
+                    StructPatternField::Binding { offset, local_idx: remap(local_idx), wasm_ty },
+                StructPatternField::NestedBinding { outer_offset, inner_offset, local_idx, wasm_ty } =>
+                    StructPatternField::NestedBinding { outer_offset, inner_offset, local_idx: remap(local_idx), wasm_ty },
+                other => other,
+            }).collect(),
+        },
+        other => other,
+    }
 }
 
 fn inline_in_expr(
@@ -172,26 +523,47 @@ fn inline_in_expr(
             }
             if let Some(callee) = inlinable.get(&fi) {
                 let param_count = callee.params.len() as u32;
-                let callee_extra_locals = callee.locals.len() as u32;
+                // callee.locals 始终为空（lower.rs 中 locals: Vec::new()）
+                // 必须从 local_wasm_types 中读取非参数 locals
+                let mut callee_extra: Vec<(u32, ValType)> = callee
+                    .local_wasm_types
+                    .iter()
+                    .filter(|(&idx, _)| idx >= param_count)
+                    .map(|(&idx, &ty)| (idx, ty))
+                    .collect();
+                callee_extra.sort_by_key(|&(idx, _)| idx);
                 // 为被内联函数的非参数 locals 分配新索引
                 let base = *next_local;
-                for i in 0..callee_extra_locals {
-                    let orig_idx = param_count + i;
-                    let wasm_ty = callee
-                        .local_wasm_types
-                        .get(&orig_idx)
-                        .copied()
-                        .unwrap_or(ValType::I64);
-                    extra_locals.push((base + i, wasm_ty));
+                for &(orig_idx, wasm_ty) in &callee_extra {
+                    let new_idx = base + (orig_idx - param_count);
+                    extra_locals.push((new_idx, wasm_ty));
                 }
-                *next_local += callee_extra_locals;
+                *next_local += callee_extra.len() as u32;
 
-                let result = callee.body.result.as_ref().unwrap().as_ref().clone();
+                let result = match get_inlinable_result(callee) {
+                    Some(r) => r.clone(),
+                    None => return,
+                };
+                let original_wasm_ty = expr.wasm_ty;
+                let original_ty = expr.ty.clone();
                 let args_cloned: Vec<CHIRExpr> = match &expr.kind {
                     CHIRExprKind::Call { args, .. } => args.clone(),
                     _ => unreachable!(),
                 };
-                let inlined = substitute_and_remap(result, &callee.params, &args_cloned, base);
+                let mut inlined = substitute_and_remap(result, &callee.params, &args_cloned, base);
+                // 如果内联结果的 wasm_ty 与原 Call 不一致，插入 Cast 保证类型正确
+                if inlined.wasm_ty != original_wasm_ty {
+                    inlined = CHIRExpr {
+                        kind: CHIRExprKind::Cast {
+                            expr: Box::new(inlined),
+                            from_ty: callee.return_wasm_ty,
+                            to_ty: original_wasm_ty,
+                        },
+                        ty: original_ty,
+                        wasm_ty: original_wasm_ty,
+                        span: None,
+                    };
+                }
                 *expr = inlined;
                 return;
             }
@@ -536,43 +908,152 @@ fn collect_reads_stmt(stmt: &CHIRStmt, map: &mut HashMap<u32, u32>) {
 }
 
 fn substitute_local(expr: CHIRExpr, idx: u32, replacement: &CHIRExpr) -> CHIRExpr {
+    let sl = |e: CHIRExpr| substitute_local(e, idx, replacement);
+    let sl_block = |b: CHIRBlock| substitute_local_block(b, idx, replacement);
     let new_kind = match expr.kind {
         CHIRExprKind::Local(i) if i == idx => return replacement.clone(),
         CHIRExprKind::Binary { op, left, right } => CHIRExprKind::Binary {
             op,
-            left: Box::new(substitute_local(*left, idx, replacement)),
-            right: Box::new(substitute_local(*right, idx, replacement)),
+            left: Box::new(sl(*left)),
+            right: Box::new(sl(*right)),
         },
         CHIRExprKind::Unary { op, expr: inner } => CHIRExprKind::Unary {
             op,
-            expr: Box::new(substitute_local(*inner, idx, replacement)),
+            expr: Box::new(sl(*inner)),
         },
         CHIRExprKind::Cast { expr: inner, from_ty, to_ty } => CHIRExprKind::Cast {
-            expr: Box::new(substitute_local(*inner, idx, replacement)),
+            expr: Box::new(sl(*inner)),
             from_ty,
             to_ty,
         },
         CHIRExprKind::FieldGet { object, field_offset, field_ty } => CHIRExprKind::FieldGet {
-            object: Box::new(substitute_local(*object, idx, replacement)),
+            object: Box::new(sl(*object)),
             field_offset,
             field_ty,
         },
         CHIRExprKind::TupleGet { tuple, index } => CHIRExprKind::TupleGet {
-            tuple: Box::new(substitute_local(*tuple, idx, replacement)),
+            tuple: Box::new(sl(*tuple)),
             index,
         },
         CHIRExprKind::Load { ptr, offset, align } => CHIRExprKind::Load {
-            ptr: Box::new(substitute_local(*ptr, idx, replacement)),
+            ptr: Box::new(sl(*ptr)),
             offset,
             align,
         },
         CHIRExprKind::Call { func_idx, args } => CHIRExprKind::Call {
             func_idx,
-            args: args.into_iter().map(|a| substitute_local(a, idx, replacement)).collect(),
+            args: args.into_iter().map(sl).collect(),
+        },
+        CHIRExprKind::MethodCall { vtable_offset, func_idx, receiver, args } => CHIRExprKind::MethodCall {
+            vtable_offset,
+            func_idx,
+            receiver: Box::new(sl(*receiver)),
+            args: args.into_iter().map(sl).collect(),
+        },
+        CHIRExprKind::CallIndirect { type_idx, args, callee } => CHIRExprKind::CallIndirect {
+            type_idx,
+            args: args.into_iter().map(sl).collect(),
+            callee: Box::new(sl(*callee)),
+        },
+        CHIRExprKind::If { cond, then_block, else_block } => CHIRExprKind::If {
+            cond: Box::new(sl(*cond)),
+            then_block: sl_block(then_block),
+            else_block: else_block.map(sl_block),
+        },
+        CHIRExprKind::Block(b) => CHIRExprKind::Block(sl_block(b)),
+        CHIRExprKind::Match { subject, arms } => CHIRExprKind::Match {
+            subject: Box::new(sl(*subject)),
+            arms: arms.into_iter().map(|arm| CHIRMatchArm {
+                pattern: arm.pattern,
+                guard: arm.guard.map(sl),
+                body: sl_block(arm.body),
+            }).collect(),
+        },
+        CHIRExprKind::ArrayGet { array, index } => CHIRExprKind::ArrayGet {
+            array: Box::new(sl(*array)),
+            index: Box::new(sl(*index)),
+        },
+        CHIRExprKind::ArraySet { array, index, value } => CHIRExprKind::ArraySet {
+            array: Box::new(sl(*array)),
+            index: Box::new(sl(*index)),
+            value: Box::new(sl(*value)),
+        },
+        CHIRExprKind::ArrayNew { len, init } => CHIRExprKind::ArrayNew {
+            len: Box::new(sl(*len)),
+            init: Box::new(sl(*init)),
+        },
+        CHIRExprKind::ArrayLiteral { elements } => CHIRExprKind::ArrayLiteral {
+            elements: elements.into_iter().map(sl).collect(),
+        },
+        CHIRExprKind::TupleNew { elements } => CHIRExprKind::TupleNew {
+            elements: elements.into_iter().map(sl).collect(),
+        },
+        CHIRExprKind::StructNew { struct_name, fields } => CHIRExprKind::StructNew {
+            struct_name,
+            fields: fields.into_iter().map(|(n, e)| (n, sl(e))).collect(),
+        },
+        CHIRExprKind::Store { ptr, value, offset, align } => CHIRExprKind::Store {
+            ptr: Box::new(sl(*ptr)),
+            value: Box::new(sl(*value)),
+            offset,
+            align,
+        },
+        CHIRExprKind::FieldSet { object, field_offset, value } => CHIRExprKind::FieldSet {
+            object: Box::new(sl(*object)),
+            field_offset,
+            value: Box::new(sl(*value)),
+        },
+        CHIRExprKind::Print { arg, newline, fd } => CHIRExprKind::Print {
+            arg: arg.map(|a| Box::new(sl(*a))),
+            newline,
+            fd,
+        },
+        CHIRExprKind::MathUnary { op, arg } => CHIRExprKind::MathUnary {
+            op,
+            arg: Box::new(sl(*arg)),
+        },
+        CHIRExprKind::MathBinary { op, left, right } => CHIRExprKind::MathBinary {
+            op,
+            left: Box::new(sl(*left)),
+            right: Box::new(sl(*right)),
+        },
+        CHIRExprKind::BuiltinAbs { val, tmp_local } => CHIRExprKind::BuiltinAbs {
+            val: Box::new(sl(*val)),
+            tmp_local,
+        },
+        CHIRExprKind::BuiltinCompareTo { left, right } => CHIRExprKind::BuiltinCompareTo {
+            left: Box::new(sl(*left)),
+            right: Box::new(sl(*right)),
+        },
+        CHIRExprKind::BuiltinStringIsEmpty { val } => CHIRExprKind::BuiltinStringIsEmpty {
+            val: Box::new(sl(*val)),
         },
         other => other,
     };
     CHIRExpr { kind: new_kind, ..expr }
+}
+
+fn substitute_local_block(block: CHIRBlock, idx: u32, replacement: &CHIRExpr) -> CHIRBlock {
+    CHIRBlock {
+        stmts: block.stmts.into_iter()
+            .map(|s| substitute_local_stmt(s, idx, replacement))
+            .collect(),
+        result: block.result.map(|r| Box::new(substitute_local(*r, idx, replacement))),
+    }
+}
+
+fn substitute_local_stmt(stmt: CHIRStmt, idx: u32, replacement: &CHIRExpr) -> CHIRStmt {
+    let sl = |e: CHIRExpr| substitute_local(e, idx, replacement);
+    let sl_block = |b: CHIRBlock| substitute_local_block(b, idx, replacement);
+    match stmt {
+        CHIRStmt::Let { local_idx, value } => CHIRStmt::Let { local_idx, value: sl(value) },
+        CHIRStmt::Assign { target, value } => CHIRStmt::Assign { target, value: sl(value) },
+        CHIRStmt::Expr(e) => CHIRStmt::Expr(sl(e)),
+        CHIRStmt::Return(Some(e)) => CHIRStmt::Return(Some(sl(e))),
+        CHIRStmt::While { cond, body } => CHIRStmt::While { cond: sl(cond), body: sl_block(body) },
+        CHIRStmt::Loop { body } => CHIRStmt::Loop { body: sl_block(body) },
+        other => other,
+    }
 }
 
 /// 在单个 block 内做线性扫描，消除满足条件的 Let
@@ -653,23 +1134,7 @@ fn eliminate_in_block(
 }
 
 fn subst_in_stmt(stmt: CHIRStmt, idx: u32, replacement: &CHIRExpr) -> CHIRStmt {
-    match stmt {
-        CHIRStmt::Let { local_idx, value } => CHIRStmt::Let {
-            local_idx,
-            value: substitute_local(value, idx, replacement),
-        },
-        CHIRStmt::Assign { target, value } => CHIRStmt::Assign {
-            target,
-            value: substitute_local(value, idx, replacement),
-        },
-        CHIRStmt::Expr(e) => CHIRStmt::Expr(substitute_local(e, idx, replacement)),
-        CHIRStmt::Return(Some(e)) => CHIRStmt::Return(Some(substitute_local(e, idx, replacement))),
-        CHIRStmt::While { cond, body } => CHIRStmt::While {
-            cond: substitute_local(cond, idx, replacement),
-            body,
-        },
-        other => other,
-    }
+    substitute_local_stmt(stmt, idx, replacement)
 }
 
 fn eliminate_redundant_locals(program: &mut CHIRProgram) {
@@ -685,6 +1150,35 @@ fn eliminate_redundant_locals(program: &mut CHIRProgram) {
     }
 }
 
+/// 扫描函数体中所有 Let/Assign 写入的最大 local_idx（不含参数）
+fn max_written_local_in_block(block: &CHIRBlock) -> Option<u32> {
+    let mut max: Option<u32> = None;
+    for stmt in &block.stmts {
+        let m = max_written_local_in_stmt(stmt);
+        max = opt_max(max, m);
+    }
+    max
+}
+
+fn max_written_local_in_stmt(stmt: &CHIRStmt) -> Option<u32> {
+    match stmt {
+        CHIRStmt::Let { local_idx, .. } => Some(*local_idx),
+        CHIRStmt::Assign { target: CHIRLValue::Local(idx), .. } => Some(*idx),
+        CHIRStmt::While { body, .. } | CHIRStmt::Loop { body } => {
+            max_written_local_in_block(body)
+        }
+        _ => None,
+    }
+}
+
+fn opt_max(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
 fn inline_small_functions(program: &mut CHIRProgram) {
     // 构建可内联函数表（深拷贝，避免借用冲突）
     let mut inlinable: HashMap<u32, CHIRFunction> = HashMap::new();
@@ -694,7 +1188,10 @@ fn inline_small_functions(program: &mut CHIRProgram) {
             continue;
         }
         // 检查不递归调用自身
-        let result = func.body.result.as_ref().unwrap();
+        let result = match get_inlinable_result(func) {
+            Some(r) => r,
+            None => continue,
+        };
         if has_call_to(result, func_idx) {
             continue;
         }
@@ -708,8 +1205,13 @@ fn inline_small_functions(program: &mut CHIRProgram) {
     // 对每个函数执行内联
     for func in &mut program.functions {
         let param_count = func.params.len() as u32;
-        let local_count = func.locals.len() as u32;
-        let mut next_local = param_count + local_count;
+        // 从 local_wasm_types 计算已分配的最大 local_idx（这是权威来源）
+        let wasm_types_max = func.local_wasm_types.keys().copied().max();
+        let body_max = max_written_local_in_block(&func.body);
+        let mut next_local = wasm_types_max
+            .map_or(param_count, |m| m + 1)
+            .max(body_max.map_or(0, |m| m + 1))
+            .max(param_count);
         let mut extra_locals: Vec<(u32, ValType)> = Vec::new();
 
         inline_in_block(&mut func.body, &inlinable, &mut next_local, &mut extra_locals);
