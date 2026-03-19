@@ -381,6 +381,7 @@ impl Parser {
                     }
                     let name = match self.advance() {
                         Some(Token::Ident(name)) => name,
+                        Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => name,
                         Some(Token::None) => "None".to_string(),
                         Some(Token::Some) => "Some".to_string(),
                         Some(Token::Ok) => "Ok".to_string(),
@@ -478,7 +479,7 @@ impl Parser {
                 {
                     // Peek ahead to check if this looks like a lambda: { ident => ... } or { => ... }
                     let looks_like_lambda = matches!(self.peek_next(), Some(Token::FatArrow))
-                        || (matches!(self.peek_next(), Some(Token::Ident(_)))
+                        || (self.peek_next_ident_like()
                             && matches!(
                                 self.peek_at(2),
                                 Some(Token::FatArrow) | Some(Token::Colon) | Some(Token::Comma)
@@ -499,16 +500,20 @@ impl Parser {
                             // { a, b, c => body } — 多参无类型 lambda（trailing closure）
                             let mut params = Vec::new();
                             loop {
-                                let name = match self.advance() {
-                                    Some(Token::Ident(n)) => n,
-                                    Some(Token::Underscore) => "_".to_string(),
-                                    Some(tok) => {
-                                        return self.bail(ParseError::UnexpectedToken(
-                                            tok,
-                                            "参数名".to_string(),
-                                        ));
+                                let name = if self.check(&Token::Underscore) {
+                                    self.advance();
+                                    "_".to_string()
+                                } else {
+                                    match self.advance_ident() {
+                                        Some(n) => n,
+                                        None => {
+                                            let tok = self.advance().unwrap_or(Token::Semicolon);
+                                            return self.bail(ParseError::UnexpectedToken(
+                                                tok,
+                                                "参数名".to_string(),
+                                            ));
+                                        }
                                     }
-                                    None => return self.bail(ParseError::UnexpectedEof),
                                 };
                                 params.push((name, Type::Int64)); // 默认使用 Int64，避免 TypeParam
                                 if self.check(&Token::FatArrow) {
@@ -734,15 +739,15 @@ impl Parser {
                     })
                 } else if self.check(&Token::Dot) {
                     self.advance();
-                    let field_or_method = match self.advance() {
-                        Some(Token::Ident(m)) => m,
-                        Some(tok) => {
+                    let field_or_method = match self.advance_ident() {
+                        Some(m) => m,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
                             return self.bail(ParseError::UnexpectedToken(
                                 tok,
                                 "字段名或方法名".to_string(),
-                            ))
+                            ));
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     // 检查是否为方法调用 super.method(...) 或字段访问 super.field
                     if self.check(&Token::LParen) {
@@ -772,12 +777,18 @@ impl Parser {
             Some(Token::RuneLit(c)) => Ok(Expr::Rune(c)),
             Some(Token::True) => Ok(Expr::Bool(true)),
             Some(Token::False) => Ok(Expr::Bool(false)),
-            Some(Token::StringLit(s)) | Some(Token::BacktickStringLit(s)) => {
-                self.parse_string_or_interpolated(s)
+            Some(Token::StringLit(s)) => self.parse_string_or_interpolated(s),
+            Some(Token::BacktickStringLit(StringOrInterpolated::Interpolated(parts))) => {
+                self.parse_string_or_interpolated(StringOrInterpolated::Interpolated(parts))
             }
-            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => {
-                Ok(Expr::String(s))
+            Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => {
+                self.pushback = Some(Token::Ident(name));
+                self.parse_primary()
             }
+            Some(Token::RawStringLit(s))
+            | Some(Token::MultiLineStringLit(s))
+            | Some(Token::HashRawStringLit(s))
+            | Some(Token::SingleQuoteStringLit(s)) => Ok(Expr::String(s)),
             // Option/Result 构造器（允许 Some(e1,e2,...) 解析为 Some(Tuple(...))）
             Some(Token::Some) => {
                 // 支持 Some<T>(value) 泛型语法
@@ -980,8 +991,8 @@ impl Parser {
                     // 检查是否是 try (let/var name = expr) 或 try (name = expr) 形式
                     let has_let_var = matches!(self.peek(), Some(Token::Let) | Some(Token::Var));
                     // 或者 name = expr（不带 let/var 的资源绑定）
-                    let has_bare_assign = matches!(self.peek(), Some(Token::Ident(_)))
-                        && matches!(self.peek_at(1), Some(Token::Assign));
+                    let has_bare_assign =
+                        self.peek_ident_like() && matches!(self.peek_at(1), Some(Token::Assign));
                     if has_let_var || has_bare_assign {
                         let mut res = Vec::new();
                         loop {
@@ -1045,10 +1056,15 @@ impl Parser {
                 self.expect(Token::Catch)?;
                 let (catch_var, catch_type) = if self.check(&Token::LParen) {
                     self.advance();
-                    let var = match self.advance() {
-                        Some(Token::Ident(v)) => Some(v),
-                        Some(Token::Underscore) => None, // catch (_: Type)
-                        _ => return self.bail(ParseError::UnexpectedEof),
+                    let var = if self.check(&Token::Underscore) {
+                        self.advance();
+                        None // catch (_: Type)
+                    } else {
+                        Some(self.advance_ident().ok_or_else(|| ParseErrorAt {
+                            error: ParseError::UnexpectedEof,
+                            byte_start: self.at().0,
+                            byte_end: self.at().1,
+                        })?)
                     };
                     // P2: catch (e: Exception) 或 catch (e: E1 | E2) 异常类型模式
                     let catch_type = if self.check(&Token::Colon) {
@@ -1121,14 +1137,24 @@ impl Parser {
                     .map(|c| c.is_uppercase())
                     .unwrap_or(false);
                 if looks_like_type && self.check(&Token::Dot) {
-                    if let Some(Token::Ident(ref v)) = self.peek_next() {
+                    if let Some(v) = match self.peek_next() {
+                        Some(Token::Ident(v)) => Some(v),
+                        Some(Token::BacktickStringLit(StringOrInterpolated::Plain(v))) => Some(v),
+                        _ => None,
+                    } {
                         let variant_looks_like_type =
                             v.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
                         if variant_looks_like_type {
                             self.advance();
-                            let variant = match self.advance() {
-                                Some(Token::Ident(v)) => v,
-                                _ => unreachable!(),
+                            let variant = match self.advance_ident() {
+                                Some(v) => v,
+                                None => {
+                                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                                    return self.bail(ParseError::UnexpectedToken(
+                                        tok,
+                                        "变体名".to_string(),
+                                    ));
+                                }
                             };
                             let arg = if self.check(&Token::LParen) {
                                 self.advance();
@@ -1215,7 +1241,7 @@ impl Parser {
                 }
                 // 检查是否是 (ident : 开头的 Lambda；当前已消费 (，用 peek/peek_at(1) 看括号内
                 // 支持两种形式: ( params ): R { body } 与 ( params ) => body（params 后直接 => 无 )）
-                if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
+                if (self.peek_ident_like() || matches!(self.peek(), Some(Token::Underscore)))
                     && matches!(self.peek_at(1), Some(Token::Colon))
                 {
                     let params = self.parse_lambda_params()?;
@@ -1271,12 +1297,12 @@ impl Parser {
                 // 也支持 { _: T, x: T => body }（第一个参数为通配符）
                 // 注意：当前 { 已被 advance() 消费，用 peek() 看第一个 token，peek_at(1) 看第二个；仅当第二个 token 为 : , 或 => 时才按 lambda 解析，否则按块解析
                 let second = self.peek_at(1);
-                let is_lambda =
-                    matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
-                        && matches!(
-                            second,
-                            Some(Token::Colon) | Some(Token::Comma) | Some(Token::FatArrow)
-                        );
+                let is_lambda = (self.peek_ident_like()
+                    || matches!(self.peek(), Some(Token::Underscore)))
+                    && matches!(
+                        second,
+                        Some(Token::Colon) | Some(Token::Comma) | Some(Token::FatArrow)
+                    );
                 if is_lambda {
                     if matches!(second, Some(Token::Colon)) {
                         // Lambda { x: T, y: T => body }；{ 已消费，解析参数
@@ -1292,16 +1318,20 @@ impl Parser {
                         // 多参无类型 Lambda { a, b, c => body }
                         let mut params = Vec::new();
                         loop {
-                            let name = match self.advance() {
-                                Some(Token::Ident(n)) => n,
-                                Some(Token::Underscore) => "_".to_string(),
-                                Some(tok) => {
-                                    return self.bail(ParseError::UnexpectedToken(
-                                        tok,
-                                        "参数名".to_string(),
-                                    ));
+                            let name = if self.check(&Token::Underscore) {
+                                self.advance();
+                                "_".to_string()
+                            } else {
+                                match self.advance_ident() {
+                                    Some(n) => n,
+                                    None => {
+                                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                                        return self.bail(ParseError::UnexpectedToken(
+                                            tok,
+                                            "参数名".to_string(),
+                                        ));
+                                    }
                                 }
-                                None => return self.bail(ParseError::UnexpectedEof),
                             };
                             params.push((name, Type::Int64)); // 默认使用 Int64
                             if self.check(&Token::FatArrow) {
@@ -1637,16 +1667,16 @@ impl Parser {
             self.peek()
         );
         loop {
-            let name = match self.advance() {
-                Some(Token::Ident(name)) => name,
-                Some(tok) => {
+            let name = match self.advance_ident() {
+                Some(name) => name,
+                None => {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
                     eprintln!(
                         "DEBUG parse_struct_fields: unexpected token {:?} at position",
                         tok
                     );
                     return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()));
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             if self.check(&Token::Colon) {
                 self.advance();
@@ -1675,13 +1705,17 @@ impl Parser {
         let mut params = Vec::new();
 
         loop {
-            let name = match self.advance() {
-                Some(Token::Ident(name)) => name,
-                Some(Token::Underscore) => "_".to_string(),
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string()))
+            let name = if self.check(&Token::Underscore) {
+                self.advance();
+                "_".to_string()
+            } else {
+                match self.advance_ident() {
+                    Some(name) => name,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
+                    }
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             let ty = if self.check(&Token::Colon) {
                 self.advance();
@@ -1774,15 +1808,19 @@ impl Parser {
 
         loop {
             // P2.9: 命名参数 name!: value 或 name: value (cjc 兼容)
-            if let Some(Token::Ident(_)) = self.peek() {
+            if self.peek_ident_like() {
                 let next = self.peek_at(1).cloned();
                 let is_named_bang = matches!(next, Some(Token::Bang))
                     && matches!(self.peek_at(2), Some(Token::Colon));
                 let is_named_colon = matches!(next, Some(Token::Colon));
                 if is_named_bang {
-                    let name = match self.advance() {
-                        Some(Token::Ident(n)) => n,
-                        _ => unreachable!(),
+                    let name = match self.advance_ident() {
+                        Some(n) => n,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
+                            return self
+                                .bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
+                        }
                     };
                     self.advance(); // skip !
                     self.advance(); // skip :
@@ -1795,9 +1833,13 @@ impl Parser {
                     continue;
                 }
                 if is_named_colon {
-                    let name = match self.advance() {
-                        Some(Token::Ident(n)) => n,
-                        _ => unreachable!(),
+                    let name = match self.advance_ident() {
+                        Some(n) => n,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
+                            return self
+                                .bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
+                        }
                     };
                     self.advance(); // skip :
                     let value = self.parse_expr()?;
@@ -1835,10 +1877,29 @@ impl Parser {
             Some(Token::Super) => Expr::Var("super".to_string()),
             Some(Token::True) => Expr::Bool(true),
             Some(Token::False) => Expr::Bool(false),
-            Some(Token::StringLit(s)) | Some(Token::BacktickStringLit(s)) => {
-                self.parse_string_or_interpolated(s)?
+            Some(Token::StringLit(s)) => self.parse_string_or_interpolated(s)?,
+            Some(Token::BacktickStringLit(StringOrInterpolated::Interpolated(parts))) => {
+                self.parse_string_or_interpolated(StringOrInterpolated::Interpolated(parts))?
             }
-            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => Expr::String(s),
+            Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => {
+                if self.check(&Token::LParen) {
+                    self.advance();
+                    let (args, named_args) = self.parse_args()?;
+                    self.expect(Token::RParen)?;
+                    Expr::Call {
+                        name,
+                        type_args: None,
+                        args,
+                        named_args,
+                    }
+                } else {
+                    Expr::Var(name)
+                }
+            }
+            Some(Token::RawStringLit(s))
+            | Some(Token::MultiLineStringLit(s))
+            | Some(Token::HashRawStringLit(s))
+            | Some(Token::SingleQuoteStringLit(s)) => Expr::String(s),
             Some(Token::Ident(name)) => {
                 if self.check(&Token::LParen) {
                     // 函数调用
@@ -1883,6 +1944,7 @@ impl Parser {
                     self.advance();
                     let field = match self.advance() {
                         Some(Token::Ident(name)) => name,
+                        Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => name,
                         Some(Token::None) => "None".to_string(),
                         Some(Token::Some) => "Some".to_string(),
                         Some(Token::Ok) => "Ok".to_string(),
@@ -2159,7 +2221,10 @@ impl Parser {
         }
         // 对于标识符，只有当 <Ident> 后面紧跟 > 或 , 时才认为是泛型类型实参
         // 否则（如 < range.start）视为比较运算符
-        if matches!(next, Token::Ident(_)) {
+        if matches!(
+            next,
+            Token::Ident(_) | Token::BacktickStringLit(StringOrInterpolated::Plain(_))
+        ) {
             return matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
         }
         false

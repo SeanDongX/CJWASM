@@ -1,7 +1,7 @@
 //! CHIR 构建器 - 辅助构建 CHIR 结构
 
 use super::types::*;
-use crate::ast::{BinOp, UnaryOp, Type};
+use crate::ast::{BinOp, Type, UnaryOp};
 use wasm_encoder::ValType;
 
 /// CHIR 构建器
@@ -41,11 +41,7 @@ impl CHIRBuilder {
 
     /// 字符串常量
     pub fn string_const(&self, value: String) -> CHIRExpr {
-        CHIRExpr::new(
-            CHIRExprKind::String(value),
-            Type::String,
-            ValType::I32,
-        )
+        CHIRExpr::new(CHIRExprKind::String(value), Type::String, ValType::I32)
     }
 
     /// 局部变量引用
@@ -84,11 +80,7 @@ impl CHIRBuilder {
     /// 函数调用
     pub fn call(&self, func_idx: u32, args: Vec<CHIRExpr>, return_ty: Type) -> CHIRExpr {
         let wasm_ty = return_ty.to_wasm();
-        CHIRExpr::new(
-            CHIRExprKind::Call { func_idx, args },
-            return_ty,
-            wasm_ty,
-        )
+        CHIRExpr::new(CHIRExprKind::Call { func_idx, args }, return_ty, wasm_ty)
     }
 
     /// 类型转换
@@ -178,11 +170,7 @@ impl CHIRBuilder {
     }
 
     /// 从语句列表和结果表达式创建块
-    pub fn block_from_stmts_and_result(
-        &self,
-        stmts: Vec<CHIRStmt>,
-        result: CHIRExpr,
-    ) -> CHIRBlock {
+    pub fn block_from_stmts_and_result(&self, stmts: Vec<CHIRStmt>, result: CHIRExpr) -> CHIRBlock {
         CHIRBlock {
             stmts,
             result: Some(Box::new(result)),
@@ -265,12 +253,7 @@ mod tests {
         let stmt = builder.return_stmt(Some(expr));
         let block = builder.block_from_stmts(vec![stmt]);
 
-        let func = builder.function(
-            "test".to_string(),
-            vec![],
-            Type::Int64,
-            block,
-        );
+        let func = builder.function("test".to_string(), vec![], Type::Int64, block);
 
         assert_eq!(func.name, "test");
         assert_eq!(func.return_wasm_ty, ValType::I64);

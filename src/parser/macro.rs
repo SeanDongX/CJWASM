@@ -22,10 +22,7 @@ impl Parser {
         let name = match self.advance() {
             Some(Token::Ident(s)) => s,
             Some(tok) => {
-                return self.bail(ParseError::UnexpectedToken(
-                    tok,
-                    "macro name".to_string(),
-                ));
+                return self.bail(ParseError::UnexpectedToken(tok, "macro name".to_string()));
             }
             None => return self.bail(ParseError::UnexpectedEof),
         };
@@ -127,13 +124,13 @@ mod tests {
 
                 // 第一个参数是二元表达式
                 match &args[0] {
-                    Expr::Binary { .. } => {},
+                    Expr::Binary { .. } => {}
                     _ => panic!("Expected binary expression"),
                 }
 
                 // 第二个参数是整数字面量
                 match &args[1] {
-                    Expr::Integer(42) => {},
+                    Expr::Integer(42) => {}
                     _ => panic!("Expected integer 42"),
                 }
             }

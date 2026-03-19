@@ -62,7 +62,7 @@ pub fn emit_alloc_func(heap_start: i32) -> WasmFunc {
     // 对齐到 8 字节: (n + 7) & ~7
     f.instruction(&Instruction::I32Const(7));
     f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::I32Const(-8i32));  // 0xFFFFFFF8
+    f.instruction(&Instruction::I32Const(-8i32)); // 0xFFFFFFF8
     f.instruction(&Instruction::I32And);
     f.instruction(&Instruction::LocalSet(1)); // actual_size
 
@@ -76,7 +76,7 @@ pub fn emit_alloc_func(heap_start: i32) -> WasmFunc {
 
     // block $done { loop $search { ... } }
     f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $done
-    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));  // $search
+    f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // $search
 
     // if curr_ptr == 0 → break (无可用块)
     f.instruction(&Instruction::LocalGet(3));
@@ -421,11 +421,7 @@ use crate::ast::Type;
 pub fn is_heap_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Struct(_, _)
-            | Type::Array(_)
-            | Type::Tuple(_)
-            | Type::Option(_)
-            | Type::Result(_, _)
+        Type::Struct(_, _) | Type::Array(_) | Type::Tuple(_) | Type::Option(_) | Type::Result(_, _)
     )
 }
 
@@ -475,7 +471,10 @@ mod tests {
         assert!(is_heap_type(&Type::Array(Box::new(Type::Int64))));
         assert!(is_heap_type(&Type::Tuple(vec![Type::Int64])));
         assert!(is_heap_type(&Type::Option(Box::new(Type::Int64))));
-        assert!(is_heap_type(&Type::Result(Box::new(Type::Int64), Box::new(Type::String))));
+        assert!(is_heap_type(&Type::Result(
+            Box::new(Type::Int64),
+            Box::new(Type::String)
+        )));
         assert!(!is_heap_type(&Type::Int64));
         assert!(!is_heap_type(&Type::Bool));
         assert!(!is_heap_type(&Type::String)); // 字符串常量在数据段

@@ -216,15 +216,15 @@ impl Parser {
                     // P2.2: type Name = Type
                     Some(Token::TypeAlias) => {
                         self.advance();
-                        let alias_name = match self.advance() {
-                            Some(Token::Ident(n)) => n,
-                            Some(tok) => {
+                        let alias_name = match self.advance_ident() {
+                            Some(n) => n,
+                            None => {
+                                let tok = self.advance().unwrap_or(Token::Semicolon);
                                 return self.bail(ParseError::UnexpectedToken(
                                     tok,
                                     "类型别名名称".to_string(),
-                                ))
+                                ));
                             }
-                            None => return self.bail(ParseError::UnexpectedEof),
                         };
                         self.expect(Token::Assign)?;
                         let target_ty = self.parse_type()?;
@@ -251,7 +251,7 @@ impl Parser {
                     // cjc: macro FuncName(...) — 宏函数声明，跳过整个宏函数体
                     Some(Token::Macro) => {
                         self.advance(); // consume macro
-                        // 可能接 func 关键字（如 macro func Name）或直接是函数名
+                                        // 可能接 func 关键字（如 macro func Name）或直接是函数名
                         if self.check(&Token::Func) {
                             functions.push(self.parse_function_with_visibility(visibility)?)
                         } else {
@@ -265,14 +265,20 @@ impl Parser {
                                     Some(Token::LBrace) => {
                                         depth += 1;
                                         self.advance();
-                                        if depth == 1 { break; }
+                                        if depth == 1 {
+                                            break;
+                                        }
                                     }
                                     Some(Token::RBrace) => {
-                                        if depth > 0 { depth -= 1; }
+                                        if depth > 0 {
+                                            depth -= 1;
+                                        }
                                         self.advance();
                                     }
                                     None => break,
-                                    _ => { self.advance(); }
+                                    _ => {
+                                        self.advance();
+                                    }
                                 }
                             }
                             // 消费整个 body { ... }
@@ -331,12 +337,12 @@ impl Parser {
 
         // cjc 风格: import path.to.Item 或 import path.to.* 或 import path.to.Item as alias
         // 或 import path.to.{Item1, Item2, ...}
-        let first = match self.advance() {
-            Some(Token::Ident(n)) => n,
-            Some(tok) => {
-                return self.bail(ParseError::UnexpectedToken(tok, "导入路径".to_string()))
+        let first = match self.advance_ident() {
+            Some(n) => n,
+            None => {
+                let tok = self.advance().unwrap_or(Token::Semicolon);
+                return self.bail(ParseError::UnexpectedToken(tok, "导入路径".to_string()));
             }
-            None => return self.bail(ParseError::UnexpectedEof),
         };
 
         let mut module_path = vec![first];
@@ -357,13 +363,20 @@ impl Parser {
                 self.advance();
                 let mut items = Vec::new();
                 loop {
-                    let item = match self.advance() {
-                        Some(Token::Ident(n)) => n,
-                        Some(Token::Star) => "*".to_string(),
-                        Some(tok) => {
-                            return self.bail(ParseError::UnexpectedToken(tok, "导入项名称".to_string()))
+                    let item = if self.check(&Token::Star) {
+                        self.advance();
+                        "*".to_string()
+                    } else {
+                        match self.advance_ident() {
+                            Some(n) => n,
+                            None => {
+                                let tok = self.advance().unwrap_or(Token::Semicolon);
+                                return self.bail(ParseError::UnexpectedToken(
+                                    tok,
+                                    "导入项名称".to_string(),
+                                ));
+                            }
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     items.push(item);
 
@@ -384,20 +397,23 @@ impl Parser {
                     alias: None,
                 });
             }
-            let part = match self.advance() {
-                Some(Token::Ident(n)) => n,
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "导入路径".to_string()))
+            let part = match self.advance_ident() {
+                Some(n) => n,
+                None => {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "导入路径".to_string()));
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             module_path.push(part);
         }
         let alias = if self.check(&Token::As) {
             self.advance();
-            match self.advance() {
-                Some(Token::Ident(n)) => Some(n),
-                _ => return self.bail(ParseError::UnexpectedEof),
+            match self.advance_ident() {
+                Some(n) => Some(n),
+                None => {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "导入别名".to_string()));
+                }
             }
         } else {
             None
@@ -520,12 +536,12 @@ impl Parser {
     ) -> Result<StructDef, ParseErrorAt> {
         self.expect(Token::Struct)?;
 
-        let name = match self.advance() {
-            Some(Token::Ident(name)) => name,
-            Some(tok) => {
-                return self.bail(ParseError::UnexpectedToken(tok, "结构体名".to_string()))
+        let name = match self.advance_ident() {
+            Some(name) => name,
+            None => {
+                let tok = self.advance().unwrap_or(Token::Semicolon);
+                return self.bail(ParseError::UnexpectedToken(tok, "结构体名".to_string()));
             }
-            None => return self.bail(ParseError::UnexpectedEof),
         };
 
         let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
@@ -557,15 +573,13 @@ impl Parser {
             self.advance();
             let mut bounds = Vec::new();
             loop {
-                let bound = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(
-                            tok,
-                            "约束接口名".to_string(),
-                        ));
+                let bound = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self
+                            .bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 bounds.push(bound);
                 if self.check(&Token::Lt) {
@@ -588,21 +602,23 @@ impl Parser {
 
         while !self.check(&Token::RBrace) {
             // cjc 兼容: 主构造函数前可有可见性，如 public StructName(...)
-            if self.check(&Token::Public) || self.check(&Token::Private)
-                || self.check(&Token::Protected) || self.check(&Token::Internal)
+            if self.check(&Token::Public)
+                || self.check(&Token::Private)
+                || self.check(&Token::Protected)
+                || self.check(&Token::Internal)
             {
                 self.advance();
             }
             // cjc 兼容: struct 主构造函数 StructName(var a: T, var b: U) { } — 参数即字段
-            if matches!(self.peek(), Some(Token::Ident(ref n)) if n == &name)
-                && matches!(self.peek_next(), Some(Token::LParen))
-            {
+            if self.peek_ident_eq(&name) && matches!(self.peek_next(), Some(Token::LParen)) {
                 self.advance(); // consume struct name
                 self.expect(Token::LParen)?;
                 // 解析 (public|private|...)? (var|let)? name: Type, ... 作为主构造参数，并转为 fields
                 while !self.check(&Token::RParen) {
-                    if self.check(&Token::Public) || self.check(&Token::Private)
-                        || self.check(&Token::Protected) || self.check(&Token::Internal)
+                    if self.check(&Token::Public)
+                        || self.check(&Token::Private)
+                        || self.check(&Token::Protected)
+                        || self.check(&Token::Internal)
                     {
                         self.advance();
                     }
@@ -617,6 +633,10 @@ impl Parser {
                                 .bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
                         }
                     };
+                    // cjc 兼容: struct 主构造参数支持必需命名参数标记 name!: Type
+                    if self.check(&Token::Bang) {
+                        self.advance();
+                    }
                     self.expect(Token::Colon)?;
                     let ty = self.parse_type()?;
                     fields.push(FieldDef {
@@ -649,7 +669,8 @@ impl Parser {
             }
 
             // cjc 兼容: [const] init 构造函数 — 解析并忽略 body（cjwasm 通过字段顺序构造）
-            let is_const_init = self.check(&Token::Const) && matches!(self.peek_next(), Some(Token::Init));
+            let is_const_init =
+                self.check(&Token::Const) && matches!(self.peek_next(), Some(Token::Init));
             if self.check(&Token::Init) || is_const_init {
                 if is_const_init {
                     self.advance(); // consume 'const'
@@ -713,8 +734,10 @@ impl Parser {
 
             // 普通字段
             // cjc 兼容: 跳过可选的可见性、static、及 var/let 前缀 (public/private [static] var/let name: Type)
-            if self.check(&Token::Public) || self.check(&Token::Private)
-                || self.check(&Token::Protected) || self.check(&Token::Internal)
+            if self.check(&Token::Public)
+                || self.check(&Token::Private)
+                || self.check(&Token::Protected)
+                || self.check(&Token::Internal)
             {
                 self.advance();
             }
@@ -747,12 +770,12 @@ impl Parser {
             // prop name: Type { get() { ... } set(value) { ... } } — 与带主构造分支相同逻辑
             if self.check(&Token::Prop) {
                 self.advance();
-                let prop_name = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string()))
+                let prop_name = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 self.expect(Token::Colon)?;
                 let prop_ty = self.parse_type()?;
@@ -790,16 +813,20 @@ impl Parser {
                         } else if kw == "set" {
                             self.advance();
                             self.expect(Token::LParen)?;
-                            let val_name = match self.advance() {
-                                Some(Token::Ident(n)) => n,
-                                Some(Token::Underscore) => "_".to_string(),
-                                Some(tok) => {
-                                    return self.bail(ParseError::UnexpectedToken(
-                                        tok,
-                                        "setter 参数名".to_string(),
-                                    ))
+                            let val_name = if self.check(&Token::Underscore) {
+                                self.advance();
+                                "_".to_string()
+                            } else {
+                                match self.advance_ident() {
+                                    Some(n) => n,
+                                    None => {
+                                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                                        return self.bail(ParseError::UnexpectedToken(
+                                            tok,
+                                            "setter 参数名".to_string(),
+                                        ));
+                                    }
                                 }
-                                None => return self.bail(ParseError::UnexpectedEof),
                             };
                             self.expect(Token::RParen)?;
                             self.receiver_name = Some("this".to_string());
@@ -851,12 +878,12 @@ impl Parser {
             if self.check(&Token::Var) || self.check(&Token::Let) || self.check(&Token::Const) {
                 self.advance();
             }
-            let field_name = match self.advance() {
-                Some(Token::Ident(name)) => name,
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()))
+            let field_name = match self.advance_ident() {
+                Some(name) => name,
+                None => {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()));
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             // 支持 name = expr（无类型）或 name: Type [= expr]
             let (ty, default) = if self.check(&Token::Assign) {
@@ -918,6 +945,7 @@ impl Parser {
     ) -> Result<EnumDef, ParseErrorAt> {
         self.expect(Token::Enum)?;
         let name = match self.advance() {
+            Some(Token::BacktickStringLit(StringOrInterpolated::Plain(n))) => n,
             Some(Token::Ident(n)) => n,
             // cjc: 允许关键字作为枚举名 (如 Result, Option 等)
             Some(Token::TypeResult) => "Result".to_string(),
@@ -953,10 +981,10 @@ impl Parser {
         if self.check(&Token::SubType)
             || self.check(&Token::Colon)
             || (self.check(&Token::Lt)
-                && matches!(self.peek_next(), Some(Token::Colon) | Some(Token::Ident(_))))
+                && (matches!(self.peek_next(), Some(Token::Colon)) || self.peek_next_ident_like()))
         {
             if self.check(&Token::Lt)
-                && matches!(self.peek_next(), Some(Token::Colon) | Some(Token::Ident(_)))
+                && (matches!(self.peek_next(), Some(Token::Colon)) || self.peek_next_ident_like())
             {
                 self.advance(); // Lt
                 if self.check(&Token::Colon) {
@@ -965,12 +993,9 @@ impl Parser {
             } else {
                 self.advance();
             }
-            let _ = match self.advance() {
-                Some(Token::Ident(_)) => (),
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "协议/约束名".to_string()))
-                }
-                None => return self.bail(ParseError::UnexpectedEof),
+            if self.advance_ident().is_none() {
+                let tok = self.advance().unwrap_or(Token::Semicolon);
+                return self.bail(ParseError::UnexpectedToken(tok, "协议/约束名".to_string()));
             };
             if self.check(&Token::Lt) {
                 self.advance();
@@ -993,19 +1018,25 @@ impl Parser {
             // cjc: enum Name <: A & B & C { ... } — 多继承约束用 & 连接
             while self.check(&Token::And) {
                 self.advance(); // consume &
-                // 消费下一个约束名
-                match self.advance() {
-                    Some(Token::Ident(_)) => (),
-                    Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "协议/约束名".to_string())),
-                    None => return self.bail(ParseError::UnexpectedEof),
+                                // 消费下一个约束名
+                if self.advance_ident().is_none() {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "协议/约束名".to_string()));
                 }
                 // 可选的泛型参数
                 if self.check(&Token::Lt) {
                     self.advance();
                     loop {
                         let _ = self.parse_type()?;
-                        if self.check(&Token::Gt) { self.advance(); break; }
-                        if self.check(&Token::Comma) { self.advance(); } else { break; }
+                        if self.check(&Token::Gt) {
+                            self.advance();
+                            break;
+                        }
+                        if self.check(&Token::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
@@ -1020,6 +1051,31 @@ impl Parser {
                 || self.check(&Token::Internal)
             {
                 self.advance();
+            }
+            // cjc: enum 方法支持多种修饰符顺序，如
+            // public redef static func f() {}
+            // static public func f() {}
+            let mut is_static_method = false;
+            loop {
+                if self.check(&Token::Public)
+                    || self.check(&Token::Private)
+                    || self.check(&Token::Protected)
+                    || self.check(&Token::Internal)
+                    || self.check(&Token::Open)
+                    || self.check(&Token::Override)
+                    || self.check(&Token::Redef)
+                    || self.check(&Token::Mut)
+                    || self.check(&Token::Unsafe)
+                {
+                    self.advance();
+                    continue;
+                }
+                if self.check(&Token::Static) {
+                    is_static_method = true;
+                    self.advance();
+                    continue;
+                }
+                break;
             }
             // cjc 兼容: enum 内部 prop 声明，解析后丢弃
             if self.check(&Token::Prop) {
@@ -1060,7 +1116,7 @@ impl Parser {
                     .params
                     .iter()
                     .any(|p| p.name == "self" || p.name == "this");
-                if !has_self {
+                if !has_self && !is_static_method {
                     func.params.insert(
                         0,
                         crate::ast::Param {
@@ -1093,6 +1149,7 @@ impl Parser {
                 continue;
             }
             let v_name = match self.advance() {
+                Some(Token::BacktickStringLit(StringOrInterpolated::Plain(n))) => n,
                 Some(Token::Ident(n)) => n,
                 // cjc: 关键字可作为变体名 (Ok, Err, Some, None, Option, etc.)
                 Some(Token::Ok) => "Ok".to_string(),
@@ -1149,22 +1206,24 @@ impl Parser {
         visibility: Visibility,
     ) -> Result<crate::ast::InterfaceDef, ParseErrorAt> {
         self.expect(Token::Interface)?;
-        let name = match self.advance() {
-            Some(Token::Ident(n)) => n,
-            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string())),
-            None => return self.bail(ParseError::UnexpectedEof),
+        let name = match self.advance_ident() {
+            Some(n) => n,
+            None => {
+                let tok = self.advance().unwrap_or(Token::Semicolon);
+                return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string()));
+            }
         };
         // 解析接口继承 : Parent1, Parent2 或 <: Parent (cjc)
         let parents = if self.check(&Token::Colon) || self.check(&Token::SubType) {
             self.advance();
             let mut ps = Vec::new();
             loop {
-                ps.push(match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(tok, "父接口名".to_string()))
+                ps.push(match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "父接口名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 });
                 // cjc: 多继承用 & 分隔 (interface Foo <: A & B)；也兼容逗号
                 if self.check(&Token::And) || self.check(&Token::Comma) {
@@ -1203,13 +1262,13 @@ impl Parser {
             // 关联类型: type Element; (cjc: type 是保留字)
             if matches!(self.peek(), Some(Token::TypeAlias)) {
                 self.advance(); // consume "type"
-                let type_name = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
+                let type_name = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
                         return self
-                            .bail(ParseError::UnexpectedToken(tok, "关联类型名".to_string()))
+                            .bail(ParseError::UnexpectedToken(tok, "关联类型名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 self.expect(Token::Semicolon)?;
                 assoc_types.push(crate::ast::AssocTypeDef { name: type_name });
@@ -1219,12 +1278,12 @@ impl Parser {
             // cjc: 接口中的 prop 声明，脱糖为抽象 getter/setter 方法
             if self.check(&Token::Prop) {
                 self.advance(); // consume prop
-                let prop_name = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string()))
+                let prop_name = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 self.expect(Token::Colon)?;
                 let prop_ty = self.parse_type()?;
@@ -1275,16 +1334,20 @@ impl Parser {
                         } else if kw == "set" {
                             self.advance();
                             self.expect(Token::LParen)?;
-                            let val_name = match self.advance() {
-                                Some(Token::Ident(n)) => n,
-                                Some(Token::Underscore) => "_".to_string(),
-                                Some(tok) => {
-                                    return self.bail(ParseError::UnexpectedToken(
-                                        tok,
-                                        "setter 参数名".to_string(),
-                                    ))
+                            let val_name = if self.check(&Token::Underscore) {
+                                self.advance();
+                                "_".to_string()
+                            } else {
+                                match self.advance_ident() {
+                                    Some(n) => n,
+                                    None => {
+                                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                                        return self.bail(ParseError::UnexpectedToken(
+                                            tok,
+                                            "setter 参数名".to_string(),
+                                        ));
+                                    }
                                 }
-                                None => return self.bail(ParseError::UnexpectedEof),
                             };
                             self.expect(Token::RParen)?;
                             let default_body = if self.check(&Token::LBrace) {
@@ -1342,15 +1405,15 @@ impl Parser {
                 continue;
             }
             self.expect(Token::Func)?;
-            let (m_name, type_params, mut constraints) = match self.advance() {
-                Some(Token::Ident(n)) => {
+            let (m_name, type_params, mut constraints) = match self.advance_ident() {
+                Some(n) => {
                     let (tp, tc) = self.parse_type_params_with_constraints()?;
                     (n, tp, tc)
                 }
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string()))
+                None => {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string()));
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             let prev_type_params =
                 std::mem::replace(&mut self.current_type_params, type_params.clone());
@@ -1428,6 +1491,7 @@ impl Parser {
             let _ = self.parse_type_params()?;
         }
         let target_type = match self.advance() {
+            Some(Token::BacktickStringLit(StringOrInterpolated::Plain(n))) => n,
             Some(Token::Ident(n)) => n,
             Some(Token::TypeRune) => "Rune".to_string(),
             Some(Token::TypeInt64) => "Int64".to_string(),
@@ -1456,22 +1520,22 @@ impl Parser {
         let interface = if self.check(&Token::Colon)
             || self.check(&Token::SubType)
             || (self.check(&Token::Lt) && matches!(self.peek_next(), Some(Token::Colon)))
-            || (self.check(&Token::Lt) && matches!(self.peek_next(), Some(Token::Ident(_))))
+            || (self.check(&Token::Lt) && self.peek_next_ident_like())
         {
             if self.check(&Token::Lt) && matches!(self.peek_next(), Some(Token::Colon)) {
                 self.advance(); // Lt
                 self.advance(); // Colon
-            } else if self.check(&Token::Lt) && matches!(self.peek_next(), Some(Token::Ident(_))) {
+            } else if self.check(&Token::Lt) && self.peek_next_ident_like() {
                 self.advance(); // Lt，接口名在下一 token
             } else {
                 self.advance();
             }
-            let name = match self.advance() {
-                Some(Token::Ident(n)) => n,
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string()))
+            let name = match self.advance_ident() {
+                Some(n) => n,
+                None => {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string()));
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             // 消费接口的类型实参，如 SortByExtension<T> 中的 <T>（此处确定是泛型，直接解析）
             if self.check(&Token::Lt) {
@@ -1495,13 +1559,9 @@ impl Parser {
             // cjc: extend Type <: A & B { ... } — 跳过后续 & Bound / & Bound<T>
             while self.check(&Token::And) {
                 self.advance();
-                let _ = match self.advance() {
-                    Some(Token::Ident(_)) => (),
-                    Some(tok) => {
-                        return self
-                            .bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string()))
-                    }
-                    None => return self.bail(ParseError::UnexpectedEof),
+                if self.advance_ident().is_none() {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string()));
                 };
                 if self.check(&Token::Lt) {
                     self.advance();
@@ -1564,13 +1624,13 @@ impl Parser {
             // 关联类型绑定: type Element = ConcreteType; (cjc: type 是保留字)
             if matches!(self.peek(), Some(Token::TypeAlias)) {
                 self.advance(); // consume "type"
-                let type_name = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
+                let type_name = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
                         return self
-                            .bail(ParseError::UnexpectedToken(tok, "关联类型名".to_string()))
+                            .bail(ParseError::UnexpectedToken(tok, "关联类型名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 self.expect(Token::Assign)?;
                 let ty = self.parse_type()?;
@@ -1601,12 +1661,12 @@ impl Parser {
             // prop in extend block: prop name: Type { get() { ... } set(v) { ... } }
             if self.check(&Token::Prop) {
                 self.advance();
-                let prop_name = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string()))
+                let prop_name = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 self.expect(Token::Colon)?;
                 let prop_ty = self.parse_type()?;
@@ -1644,16 +1704,20 @@ impl Parser {
                         } else if kw == "set" {
                             self.advance();
                             self.expect(Token::LParen)?;
-                            let val_name = match self.advance() {
-                                Some(Token::Ident(n)) => n,
-                                Some(Token::Underscore) => "_".to_string(),
-                                Some(tok) => {
-                                    return self.bail(ParseError::UnexpectedToken(
-                                        tok,
-                                        "setter 参数名".to_string(),
-                                    ))
+                            let val_name = if self.check(&Token::Underscore) {
+                                self.advance();
+                                "_".to_string()
+                            } else {
+                                match self.advance_ident() {
+                                    Some(n) => n,
+                                    None => {
+                                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                                        return self.bail(ParseError::UnexpectedToken(
+                                            tok,
+                                            "setter 参数名".to_string(),
+                                        ));
+                                    }
                                 }
-                                None => return self.bail(ParseError::UnexpectedEof),
                             };
                             self.expect(Token::RParen)?;
                             self.receiver_name = Some("this".to_string());
@@ -1773,10 +1837,12 @@ impl Parser {
             }
         }
         self.expect(Token::Class)?;
-        let name = match self.advance() {
-            Some(Token::Ident(n)) => n,
-            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类名".to_string())),
-            None => return self.bail(ParseError::UnexpectedEof),
+        let name = match self.advance_ident() {
+            Some(n) => n,
+            None => {
+                let tok = self.advance().unwrap_or(Token::Semicolon);
+                return self.bail(ParseError::UnexpectedToken(tok, "类名".to_string()));
+            }
         };
         // 解析可选的泛型类型参数 <T, U: Bound, ...>
         let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
@@ -1916,12 +1982,12 @@ impl Parser {
             }
             if self.check(&Token::Var) || self.check(&Token::Let) {
                 self.advance();
-                let f_name = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()))
+                let f_name = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 // 支持 let name = expr（无类型）或 let name: Type [= expr]
                 let (ty, default) = if self.check(&Token::Assign) {
@@ -2003,12 +2069,12 @@ impl Parser {
             } else if self.check(&Token::Prop) {
                 // prop name: Type { get() { ... } set(value) { ... } }
                 self.advance();
-                let prop_name = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string()))
+                let prop_name = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 self.expect(Token::Colon)?;
                 let prop_ty = self.parse_type()?;
@@ -2051,16 +2117,20 @@ impl Parser {
                         } else if kw == "set" {
                             self.advance();
                             self.expect(Token::LParen)?;
-                            let val_name = match self.advance() {
-                                Some(Token::Ident(n)) => n,
-                                Some(Token::Underscore) => "_".to_string(),
-                                Some(tok) => {
-                                    return self.bail(ParseError::UnexpectedToken(
-                                        tok,
-                                        "setter 参数名".to_string(),
-                                    ))
+                            let val_name = if self.check(&Token::Underscore) {
+                                self.advance();
+                                "_".to_string()
+                            } else {
+                                match self.advance_ident() {
+                                    Some(n) => n,
+                                    None => {
+                                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                                        return self.bail(ParseError::UnexpectedToken(
+                                            tok,
+                                            "setter 参数名".to_string(),
+                                        ));
+                                    }
                                 }
-                                None => return self.bail(ParseError::UnexpectedEof),
                             };
                             self.expect(Token::RParen)?;
                             self.receiver_name = Some("this".to_string());
@@ -2113,11 +2183,7 @@ impl Parser {
                 self.expect(Token::RBrace)?;
             } else if {
                 // 仓颉允许用类名代替 init 作为构造函数: ClassName(let param: Type) {}
-                let is_named_ctor = if let Some(Token::Ident(ref n)) = self.peek() {
-                    n == &name
-                } else {
-                    false
-                };
+                let is_named_ctor = self.peek_ident_eq(&name);
                 is_named_ctor && matches!(self.peek_next(), Some(Token::LParen))
             } {
                 self.advance(); // 消费类名
@@ -2244,13 +2310,13 @@ impl Parser {
                         || self.check(&Token::Var)
                     {
                         self.advance(); // 消费 const/let/var
-                        let f_name = match self.advance() {
-                            Some(Token::Ident(n)) => n,
-                            Some(tok) => {
+                        let f_name = match self.advance_ident() {
+                            Some(n) => n,
+                            None => {
+                                let tok = self.advance().unwrap_or(Token::Semicolon);
                                 return self
-                                    .bail(ParseError::UnexpectedToken(tok, "常量名".to_string()))
+                                    .bail(ParseError::UnexpectedToken(tok, "常量名".to_string()));
                             }
-                            None => return self.bail(ParseError::UnexpectedEof),
                         };
                         let (ty, default) = if self.check(&Token::Assign) {
                             self.advance();
@@ -2299,13 +2365,13 @@ impl Parser {
                 // override prop — 带 override 的属性声明脱糖为 getter/setter 方法
                 if self.check(&Token::Prop) {
                     self.advance(); // consume prop
-                    let prop_name = match self.advance() {
-                        Some(Token::Ident(n)) => n,
-                        Some(tok) => {
+                    let prop_name = match self.advance_ident() {
+                        Some(n) => n,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
                             return self
-                                .bail(ParseError::UnexpectedToken(tok, "属性名".to_string()))
+                                .bail(ParseError::UnexpectedToken(tok, "属性名".to_string()));
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     self.expect(Token::Colon)?;
                     let prop_ty = self.parse_type()?;
@@ -2346,16 +2412,20 @@ impl Parser {
                             } else if kw == "set" {
                                 self.advance();
                                 self.expect(Token::LParen)?;
-                                let val_name = match self.advance() {
-                                    Some(Token::Ident(n)) => n,
-                                    Some(Token::Underscore) => "_".to_string(),
-                                    Some(tok) => {
-                                        return self.bail(ParseError::UnexpectedToken(
-                                            tok,
-                                            "setter 参数名".to_string(),
-                                        ))
+                                let val_name = if self.check(&Token::Underscore) {
+                                    self.advance();
+                                    "_".to_string()
+                                } else {
+                                    match self.advance_ident() {
+                                        Some(n) => n,
+                                        None => {
+                                            let tok = self.advance().unwrap_or(Token::Semicolon);
+                                            return self.bail(ParseError::UnexpectedToken(
+                                                tok,
+                                                "setter 参数名".to_string(),
+                                            ));
+                                        }
                                     }
-                                    None => return self.bail(ParseError::UnexpectedEof),
                                 };
                                 self.expect(Token::RParen)?;
                                 self.receiver_name = Some("this".to_string());
@@ -2443,16 +2513,16 @@ impl Parser {
                     };
                     (format!("{}.{}", name, op_name), vec![])
                 } else {
-                    match self.advance() {
-                        Some(Token::Ident(n)) => {
+                    match self.advance_ident() {
+                        Some(n) => {
                             let tp = self.parse_type_params()?;
                             (format!("{}.{}", name, n), tp)
                         }
-                        Some(tok) => {
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
                             return self
-                                .bail(ParseError::UnexpectedToken(tok, "方法名".to_string()))
+                                .bail(ParseError::UnexpectedToken(tok, "方法名".to_string()));
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     }
                 };
                 // 合并类的泛型参数与方法自身的泛型参数，使类的 T 在方法体和返回类型中可识别为 TypeParam
@@ -2539,8 +2609,7 @@ impl Parser {
                             | Some(Token::Prop)
                             | Some(Token::Mut)
                             | Some(Token::At)
-                    )
-                {
+                    ) {
                     // 抽象方法或声明：无函数体
                     if self.check(&Token::Semicolon) {
                         self.advance();
@@ -2585,13 +2654,15 @@ impl Parser {
                     init = Some(crate::ast::InitDef { params, body });
                 } else {
                     // const FIELD_NAME: Type = value — 类级别常量，当作字段处理
-                    let f_name = match self.advance() {
-                        Some(Token::Ident(n)) => n,
-                        Some(tok) => {
-                            return self
-                                .bail(ParseError::UnexpectedToken(tok, "常量名或 init".to_string()))
+                    let f_name = match self.advance_ident() {
+                        Some(n) => n,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
+                            return self.bail(ParseError::UnexpectedToken(
+                                tok,
+                                "常量名或 init".to_string(),
+                            ));
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     let (ty, default) = if self.check(&Token::Assign) {
                         self.advance();
@@ -2863,7 +2934,10 @@ impl Parser {
     }
 
     /// cjc 兼容: 解析 main() { ... } 形式的入口函数（无需 func 关键字）
-    pub(crate) fn parse_main_function(&mut self, visibility: Visibility) -> Result<Function, ParseErrorAt> {
+    pub(crate) fn parse_main_function(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<Function, ParseErrorAt> {
         // consume "main"
         self.advance();
         self.expect(Token::LParen)?;
@@ -2909,14 +2983,20 @@ impl Parser {
             } else {
                 false
             };
-            let name = match self.advance() {
-                Some(Token::Ident(name)) => name,
-                Some(Token::This) => "this".to_string(),
-                Some(Token::Underscore) => "_".to_string(),
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string()))
+            let name = if self.check(&Token::This) {
+                self.advance();
+                "this".to_string()
+            } else if self.check(&Token::Underscore) {
+                self.advance();
+                "_".to_string()
+            } else {
+                match self.advance_ident() {
+                    Some(name) => name,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
+                    }
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             // P2.9: 命名参数 name!: Type = default，或 name = default（类型推断）
             let is_named = if self.check(&Token::Bang) {

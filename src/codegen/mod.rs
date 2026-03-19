@@ -13,11 +13,11 @@ use wasm_encoder::{
     ValType,
 };
 
+pub mod chir_codegen;
 mod decl;
 mod expr;
 mod r#macro;
 mod type_;
-pub mod chir_codegen;
 
 pub(crate) use decl::ClassInfo;
 
@@ -292,7 +292,9 @@ impl CodeGen {
         }
 
         // 保存全局变量的初始化表达式，用于类型推断
-        self.global_var_inits = program.constants.iter()
+        self.global_var_inits = program
+            .constants
+            .iter()
             .map(|c| (c.name.clone(), c.init.clone()))
             .collect();
 
@@ -6952,10 +6954,7 @@ impl LocalsBuilder {
     /// Pass 5: 将 FunctionTypeContext 中的精确类型应用到已注册的局部变量。
     /// 仅做 I64 → I32 的降级修正（当 type_ctx 确认该变量应为 I32 时）。
     /// 不做 I32 → I64 的升级（避免引入新的类型错误）。
-    pub(crate) fn apply_type_corrections(
-        &mut self,
-        type_ctx: &crate::typeck::FunctionTypeContext,
-    ) {
+    pub(crate) fn apply_type_corrections(&mut self, type_ctx: &crate::typeck::FunctionTypeContext) {
         for (name, &idx) in &self.names {
             if let Some(&ctx_ty) = type_ctx.local_types.get(name.as_str()) {
                 let existing = self.types[idx as usize];
@@ -7548,10 +7547,8 @@ mod tests {
 
     #[test]
     fn test_type_mangle_suffix_map() {
-        let result = CodeGen::type_mangle_suffix(&Type::Map(
-            Box::new(Type::String),
-            Box::new(Type::Int64),
-        ));
+        let result =
+            CodeGen::type_mangle_suffix(&Type::Map(Box::new(Type::String), Box::new(Type::Int64)));
         assert_eq!(result, "Map_String_Int64");
     }
 
@@ -7603,7 +7600,9 @@ mod tests {
     #[test]
     fn test_resolve_type_alias() {
         let mut codegen = CodeGen::new();
-        codegen.type_aliases.insert("MyInt".to_string(), Type::Int64);
+        codegen
+            .type_aliases
+            .insert("MyInt".to_string(), Type::Int64);
         let resolved = codegen.resolve_type(&Type::Struct("MyInt".to_string(), vec![]));
         assert_eq!(resolved, Type::Int64);
     }

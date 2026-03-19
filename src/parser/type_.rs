@@ -2,7 +2,7 @@
 
 use super::{ParseError, ParseErrorAt, Parser};
 use crate::ast::{Type, TypeConstraint};
-use crate::lexer::Token;
+use crate::lexer::{StringOrInterpolated, Token};
 
 impl Parser {
     /// 判断 token 是否为类型的有效起始（避免将 n < 10 的 < 误解析为类型实参）
@@ -39,6 +39,7 @@ impl Parser {
                 | Token::LParen
                 | Token::Question
                 | Token::Ident(_)
+                | Token::BacktickStringLit(StringOrInterpolated::Plain(_))
         )
     }
 
@@ -50,7 +51,7 @@ impl Parser {
         if !self.peek_next().map(Self::is_type_start).unwrap_or(false) {
             return Ok(None);
         }
-        if let Some(Token::Ident(_)) = self.peek_next() {
+        if self.peek_next_ident_like() {
             if !matches!(self.peek_at(2), Some(Token::Gt | Token::Comma | Token::Lt)) {
                 return Ok(None);
             }
@@ -89,24 +90,24 @@ impl Parser {
         let mut params = Vec::new();
         let mut constraints = Vec::new();
         loop {
-            let p = match self.advance() {
-                Some(Token::Ident(n)) => n,
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "类型参数名".to_string()))
+            let p = match self.advance_ident() {
+                Some(n) => n,
+                None => {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "类型参数名".to_string()));
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             if self.check(&Token::Colon) || self.check(&Token::SubType) {
                 self.advance();
                 let mut bounds = Vec::new();
                 loop {
-                    let bound = match self.advance() {
-                        Some(Token::Ident(n)) => n,
-                        Some(tok) => {
+                    let bound = match self.advance_ident() {
+                        Some(n) => n,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
                             return self
-                                .bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string()))
+                                .bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string()));
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     bounds.push(bound);
                     if self.check(&Token::And) {
@@ -150,12 +151,12 @@ impl Parser {
         self.advance();
         let mut constraints = Vec::new();
         loop {
-            let param = match self.advance() {
-                Some(Token::Ident(n)) => n,
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "类型参数名".to_string()))
+            let param = match self.advance_ident() {
+                Some(n) => n,
+                None => {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "类型参数名".to_string()));
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             if !self.check(&Token::Colon) && !self.check(&Token::SubType) {
                 return self.bail(ParseError::UnexpectedToken(
@@ -166,13 +167,13 @@ impl Parser {
             self.advance();
             let mut bounds = Vec::new();
             loop {
-                let bound = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
+                let bound = match self.advance_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
                         return self
-                            .bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string()))
+                            .bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 bounds.push(bound);
                 if self.check(&Token::Lt) {
@@ -233,17 +234,14 @@ impl Parser {
             Some(Token::LParen) => {
                 let mut types = Vec::new();
                 if !self.check(&Token::RParen) {
-                    if matches!(self.peek(), Some(Token::Ident(_)))
-                        && matches!(self.peek_next(), Some(Token::Colon))
-                    {
+                    if self.peek_ident_like() && matches!(self.peek_next(), Some(Token::Colon)) {
                         self.advance();
                         self.advance();
                     }
                     types.push(self.parse_type()?);
                     while self.check(&Token::Comma) {
                         self.advance();
-                        if matches!(self.peek(), Some(Token::Ident(_)))
-                            && matches!(self.peek_next(), Some(Token::Colon))
+                        if self.peek_ident_like() && matches!(self.peek_next(), Some(Token::Colon))
                         {
                             self.advance();
                             self.advance();
@@ -343,12 +341,13 @@ impl Parser {
                 self.expect(Token::Gt)?;
                 Ok(Type::Map(Box::new(key_type), Box::new(val_type)))
             }
-            Some(Token::Ident(name)) => {
+            Some(Token::Ident(name))
+            | Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => {
                 // P1: 检查是否为限定类型 (pkg.Module.Type)
                 let mut path = vec![name.clone()];
                 while self.check(&Token::Dot) {
                     self.advance();
-                    if let Some(Token::Ident(segment)) = self.advance() {
+                    if let Some(segment) = self.advance_ident() {
                         path.push(segment);
                     } else {
                         return self.bail(ParseError::UnexpectedToken(

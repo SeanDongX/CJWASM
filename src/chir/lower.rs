@@ -1,9 +1,9 @@
 //! AST → CHIR 完整降低（Lowering）
 
 use crate::ast::{Function, Param, Program, Type, TypeConstraint, Visibility};
-use crate::chir::{CHIRFunction, CHIRProgram, CHIRParam};
-use crate::chir::type_inference::TypeInferenceContext;
 use crate::chir::lower_expr::LoweringContext;
+use crate::chir::type_inference::TypeInferenceContext;
+use crate::chir::{CHIRFunction, CHIRParam, CHIRProgram};
 use std::collections::{HashMap, HashSet};
 
 /// 继承合法性检查：避免自继承/循环继承导致 lowering 或 codegen 死循环。
@@ -531,27 +531,17 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
 
     // class 语义校验
     for class_def in &program.classes {
-        if let Some(parent_name) = class_parent
-            .get(&class_def.name)
-            .cloned()
-            .flatten()
-        {
+        if let Some(parent_name) = class_parent.get(&class_def.name).cloned().flatten() {
             if let Some(parent) = class_map.get(parent_name.as_str()) {
                 if !parent.is_open && !parent.is_abstract && !parent.is_sealed {
-                    return Err(format!(
-                        "super class '{}' is not inheritable",
-                        parent_name
-                    ));
+                    return Err(format!("super class '{}' is not inheritable", parent_name));
                 }
             }
         }
 
         // 收集父类方法（用于 override/实现签名校验）
         let mut parent_methods_by_name: HashMap<String, Vec<MethodSig>> = HashMap::new();
-        let mut cur_parent = class_parent
-            .get(&class_def.name)
-            .cloned()
-            .flatten();
+        let mut cur_parent = class_parent.get(&class_def.name).cloned().flatten();
         while let Some(parent_name) = cur_parent {
             if let Some(methods_by_name) = class_methods.get(&parent_name) {
                 for (name, methods) in methods_by_name {
@@ -614,11 +604,10 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
 
                     let mut base_match: Option<MethodSig> = None;
                     if let Some(parent_candidates) = parent_methods_by_name.get(&method.sig.name) {
-                        if let Some(found) = parent_candidates
-                            .iter()
-                            .find(|base| same_name_params(base, &method.sig)
-                                && base.is_static == method.sig.is_static)
-                        {
+                        if let Some(found) = parent_candidates.iter().find(|base| {
+                            same_name_params(base, &method.sig)
+                                && base.is_static == method.sig.is_static
+                        }) {
                             base_match = Some(found.clone());
                         }
                     }
@@ -824,7 +813,8 @@ pub fn lower_function(
         // 使用 alloc_local_typed 记录参数 WASM 类型，
         // 使 Stmt::Assign 对参数赋值时能正确插入类型强制转换（如 TCO 生成的 param = tmp）
         let local_idx = ctx.alloc_local_typed(param.name.clone(), wasm_ty);
-        ctx.local_ast_types.insert(param.name.clone(), param.ty.clone());
+        ctx.local_ast_types
+            .insert(param.name.clone(), param.ty.clone());
         params.push(CHIRParam {
             name: param.name.clone(),
             ty: param.ty.clone(),
@@ -884,34 +874,38 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     let mut all_funcs: Vec<&Function> = program.functions.iter().collect();
 
     // 将类方法提取为顶级函数
-    let class_methods_owned: Vec<Function> = program.classes.iter()
+    let class_methods_owned: Vec<Function> = program
+        .classes
+        .iter()
         .flat_map(|c| c.methods.iter().map(|m| m.func.clone()))
         .collect();
     all_funcs.extend(class_methods_owned.iter());
 
     // 为有 init 的类生成 __ClassName_init 函数
-    let init_funcs_owned: Vec<Function> = program.classes.iter()
+    let init_funcs_owned: Vec<Function> = program
+        .classes
+        .iter()
         .filter(|c| c.type_params.is_empty())
         .filter_map(|c| {
-            c.init.as_ref().map(|init_def| {
-                Function {
-                    visibility: crate::ast::Visibility::Public,
-                    name: format!("__{}_init", c.name),
-                    type_params: vec![],
-                    constraints: vec![],
-                    params: init_def.params.clone(),
-                    return_type: Some(Type::Struct(c.name.clone(), vec![])),
-                    throws: None,
-                    body: init_def.body.clone(),
-                    extern_import: None,
-                }
+            c.init.as_ref().map(|init_def| Function {
+                visibility: crate::ast::Visibility::Public,
+                name: format!("__{}_init", c.name),
+                type_params: vec![],
+                constraints: vec![],
+                params: init_def.params.clone(),
+                return_type: Some(Type::Struct(c.name.clone(), vec![])),
+                throws: None,
+                body: init_def.body.clone(),
+                extern_import: None,
             })
         })
         .collect();
     all_funcs.extend(init_funcs_owned.iter());
 
     // extend 方法提取为顶级函数（parser 已完成 TypeName.method 命名 + this 首参插入）
-    let extend_methods_owned: Vec<Function> = program.extends.iter()
+    let extend_methods_owned: Vec<Function> = program
+        .extends
+        .iter()
         .flat_map(|ext| ext.methods.iter().cloned())
         .collect();
     all_funcs.extend(extend_methods_owned.iter());
@@ -942,22 +936,54 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     // 注册运行时助手函数索引（与 CHIRCodeGen 中的 RT_NAMES 顺序一致）
     let rt_base = import_offset + all_funcs.len() as u32;
     let rt_names = [
-        "__rt_println_i64", "__rt_print_i64",
-        "__rt_println_str", "__rt_print_str",
-        "__rt_println_bool", "__rt_print_bool",
+        "__rt_println_i64",
+        "__rt_print_i64",
+        "__rt_println_str",
+        "__rt_print_str",
+        "__rt_println_bool",
+        "__rt_print_bool",
         "__rt_println_empty",
         "__alloc",
-        "sin", "cos", "tan", "exp", "log", "pow",
-        "__i64_to_str", "__bool_to_str", "__str_to_i64",
-        "__str_concat", "__f64_to_str",
-        "now", "randomInt64", "randomFloat64",
-        "__str_contains", "__str_starts_with", "__str_ends_with", "__str_trim",
-        "__str_to_array", "__str_index_of", "__str_replace",
+        "sin",
+        "cos",
+        "tan",
+        "exp",
+        "log",
+        "pow",
+        "__i64_to_str",
+        "__bool_to_str",
+        "__str_to_i64",
+        "__str_concat",
+        "__f64_to_str",
+        "now",
+        "randomInt64",
+        "randomFloat64",
+        "__str_contains",
+        "__str_starts_with",
+        "__str_ends_with",
+        "__str_trim",
+        "__str_to_array",
+        "__str_index_of",
+        "__str_replace",
         // Collections (must match RT_NAMES in chir_codegen.rs)
-        "__arraylist_new", "__arraylist_append", "__arraylist_get", "__arraylist_set", "__arraylist_remove", "__arraylist_size",
-        "__hashmap_new", "__hashmap_put", "__hashmap_get", "__hashmap_contains", "__hashmap_remove", "__hashmap_size",
-        "__hashset_new", "__hashset_add", "__hashset_contains", "__hashset_size",
-        "__pow_i64", "__pow_f64",
+        "__arraylist_new",
+        "__arraylist_append",
+        "__arraylist_get",
+        "__arraylist_set",
+        "__arraylist_remove",
+        "__arraylist_size",
+        "__hashmap_new",
+        "__hashmap_put",
+        "__hashmap_get",
+        "__hashmap_contains",
+        "__hashmap_remove",
+        "__hashmap_size",
+        "__hashset_new",
+        "__hashset_add",
+        "__hashset_contains",
+        "__hashset_size",
+        "__pow_i64",
+        "__pow_f64",
     ];
     for (i, name) in rt_names.iter().enumerate() {
         func_indices.insert(name.to_string(), rt_base + i as u32);
@@ -1007,7 +1033,9 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     }
     // 构建每个类的完整字段布局（父类字段在前，子类字段在后）
     // 先构建类定义映射
-    let class_defs: HashMap<String, &crate::ast::ClassDef> = program.classes.iter()
+    let class_defs: HashMap<String, &crate::ast::ClassDef> = program
+        .classes
+        .iter()
         .map(|c| (c.name.clone(), c))
         .collect();
     // 递归计算类的字段布局
@@ -1017,7 +1045,9 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         has_children: &std::collections::HashSet<String>,
         cache: &mut HashMap<String, (HashMap<String, u32>, HashMap<String, (u32, Type)>)>,
     ) {
-        if cache.contains_key(class_name) { return; }
+        if cache.contains_key(class_name) {
+            return;
+        }
         let cd = match class_defs.get(class_name) {
             Some(cd) => cd,
             None => return,
@@ -1052,7 +1082,8 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         }
         cache.insert(class_name.to_string(), (offsets, info));
     }
-    let mut field_cache: HashMap<String, (HashMap<String, u32>, HashMap<String, (u32, Type)>)> = HashMap::new();
+    let mut field_cache: HashMap<String, (HashMap<String, u32>, HashMap<String, (u32, Type)>)> =
+        HashMap::new();
     for cd in &program.classes {
         build_class_fields(&cd.name, &class_defs, &has_children, &mut field_cache);
     }
@@ -1071,7 +1102,8 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         method_class_map.insert(init_name, class_def.name.clone());
     }
     // struct 方法（parser 已转为 "StructName.method" 顶级函数）也加入映射
-    let struct_names: std::collections::HashSet<String> = program.structs.iter().map(|s| s.name.clone()).collect();
+    let struct_names: std::collections::HashSet<String> =
+        program.structs.iter().map(|s| s.name.clone()).collect();
     for func in &all_funcs {
         if let Some(dot) = func.name.find('.') {
             let prefix = &func.name[..dot];
@@ -1092,8 +1124,14 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
             type_params: vec![],
             constraints: vec![],
             variants: vec![
-                crate::ast::EnumVariant { name: "None".to_string(), payload: None },
-                crate::ast::EnumVariant { name: "Some".to_string(), payload: Some(Type::Int64) },
+                crate::ast::EnumVariant {
+                    name: "None".to_string(),
+                    payload: None,
+                },
+                crate::ast::EnumVariant {
+                    name: "Some".to_string(),
+                    payload: Some(Type::Int64),
+                },
             ],
         });
     }
@@ -1104,8 +1142,14 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
             type_params: vec![],
             constraints: vec![],
             variants: vec![
-                crate::ast::EnumVariant { name: "Ok".to_string(), payload: Some(Type::Int64) },
-                crate::ast::EnumVariant { name: "Err".to_string(), payload: Some(Type::String) },
+                crate::ast::EnumVariant {
+                    name: "Ok".to_string(),
+                    payload: Some(Type::Int64),
+                },
+                crate::ast::EnumVariant {
+                    name: "Err".to_string(),
+                    payload: Some(Type::String),
+                },
             ],
         });
     }
@@ -1128,7 +1172,9 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     }
 
     // 构建类继承关系图
-    let class_extends_map: HashMap<String, String> = program.classes.iter()
+    let class_extends_map: HashMap<String, String> = program
+        .classes
+        .iter()
         .filter_map(|c| c.extends.as_ref().map(|p| (c.name.clone(), p.clone())))
         .collect();
 
@@ -1169,26 +1215,45 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
             }
             Err(_e) => {
                 if _e.starts_with("semantic error:") {
-                    return Err(
-                        _e.strip_prefix("semantic error:")
-                            .map(|s| s.trim().to_string())
-                            .unwrap_or(_e),
-                    );
+                    return Err(_e
+                        .strip_prefix("semantic error:")
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or(_e));
                 }
                 // 生成空函数占位，避免索引错位
-                let empty_body = crate::chir::CHIRBlock { stmts: vec![], result: None };
+                let empty_body = crate::chir::CHIRBlock {
+                    stmts: vec![],
+                    result: None,
+                };
                 let return_ty = func.return_type.clone().unwrap_or(Type::Unit);
                 let return_wasm_ty = match &return_ty {
                     Type::Unit | Type::Nothing => wasm_encoder::ValType::I32,
                     t => t.to_wasm(),
                 };
-                let params: Vec<CHIRParam> = func.params.iter().enumerate().map(|(i, p)| {
-                    let wt = match &p.ty { Type::Unit | Type::Nothing => wasm_encoder::ValType::I32, t => t.to_wasm() };
-                    CHIRParam { name: p.name.clone(), ty: p.ty.clone(), wasm_ty: wt, local_idx: i as u32 }
-                }).collect();
+                let params: Vec<CHIRParam> = func
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let wt = match &p.ty {
+                            Type::Unit | Type::Nothing => wasm_encoder::ValType::I32,
+                            t => t.to_wasm(),
+                        };
+                        CHIRParam {
+                            name: p.name.clone(),
+                            ty: p.ty.clone(),
+                            wasm_ty: wt,
+                            local_idx: i as u32,
+                        }
+                    })
+                    .collect();
                 chir_functions.push(CHIRFunction {
-                    name: func.name.clone(), params, return_ty, return_wasm_ty,
-                    locals: vec![], body: empty_body,
+                    name: func.name.clone(),
+                    params,
+                    return_ty,
+                    return_wasm_ty,
+                    locals: vec![],
+                    body: empty_body,
                     local_wasm_types: std::collections::HashMap::new(),
                 });
             }
@@ -1213,7 +1278,7 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
 }
 
 fn collect_lambdas_from_stmt(stmt: &crate::ast::Stmt, counter: &mut u32, out: &mut Vec<Function>) {
-    use crate::ast::{Stmt, Expr};
+    use crate::ast::{Expr, Stmt};
     match stmt {
         Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
             collect_lambdas_from_expr(value, counter, out);
@@ -1225,21 +1290,31 @@ fn collect_lambdas_from_stmt(stmt: &crate::ast::Stmt, counter: &mut u32, out: &m
         Stmt::Return(Some(e)) => collect_lambdas_from_expr(e, counter, out),
         Stmt::While { cond, body, .. } => {
             collect_lambdas_from_expr(cond, counter, out);
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            for s in body {
+                collect_lambdas_from_stmt(s, counter, out);
+            }
         }
         Stmt::DoWhile { body, cond } => {
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            for s in body {
+                collect_lambdas_from_stmt(s, counter, out);
+            }
             collect_lambdas_from_expr(cond, counter, out);
         }
         Stmt::For { iterable, body, .. } => {
             collect_lambdas_from_expr(iterable, counter, out);
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            for s in body {
+                collect_lambdas_from_stmt(s, counter, out);
+            }
         }
         Stmt::Loop { body, .. } => {
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            for s in body {
+                collect_lambdas_from_stmt(s, counter, out);
+            }
         }
         Stmt::UnsafeBlock { body } => {
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            for s in body {
+                collect_lambdas_from_stmt(s, counter, out);
+            }
         }
         Stmt::Const { value, .. } => {
             collect_lambdas_from_expr(value, counter, out);
@@ -1251,18 +1326,25 @@ fn collect_lambdas_from_stmt(stmt: &crate::ast::Stmt, counter: &mut u32, out: &m
 fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &mut Vec<Function>) {
     use crate::ast::{Expr, Param, Visibility};
     match expr {
-        Expr::Lambda { params, return_type, body } => {
+        Expr::Lambda {
+            params,
+            return_type,
+            body,
+        } => {
             let idx = *counter;
             *counter += 1;
             let lambda_name = format!("__lambda_{}", idx);
-            let func_params: Vec<Param> = params.iter().map(|(name, ty)| Param {
-                name: name.clone(),
-                ty: ty.clone(),
-                default: None,
-                variadic: false,
-                is_named: false,
-                is_inout: false,
-            }).collect();
+            let func_params: Vec<Param> = params
+                .iter()
+                .map(|(name, ty)| Param {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                    default: None,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
+                })
+                .collect();
             // Infer return type: explicit > parameter type > default Int64
             let ret_type = return_type.clone().or_else(|| {
                 if let Some((_, ty)) = params.first() {
@@ -1291,29 +1373,50 @@ fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &m
         }
         Expr::Unary { expr, .. } => collect_lambdas_from_expr(expr, counter, out),
         Expr::Call { args, .. } => {
-            for a in args { collect_lambdas_from_expr(a, counter, out); }
+            for a in args {
+                collect_lambdas_from_expr(a, counter, out);
+            }
         }
         Expr::MethodCall { object, args, .. } => {
             collect_lambdas_from_expr(object, counter, out);
-            for a in args { collect_lambdas_from_expr(a, counter, out); }
+            for a in args {
+                collect_lambdas_from_expr(a, counter, out);
+            }
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             collect_lambdas_from_expr(cond, counter, out);
             collect_lambdas_from_expr(then_branch, counter, out);
-            if let Some(e) = else_branch { collect_lambdas_from_expr(e, counter, out); }
+            if let Some(e) = else_branch {
+                collect_lambdas_from_expr(e, counter, out);
+            }
         }
         Expr::Block(stmts, expr) => {
-            for s in stmts { collect_lambdas_from_stmt(s, counter, out); }
-            if let Some(e) = expr { collect_lambdas_from_expr(e, counter, out); }
+            for s in stmts {
+                collect_lambdas_from_stmt(s, counter, out);
+            }
+            if let Some(e) = expr {
+                collect_lambdas_from_expr(e, counter, out);
+            }
         }
         Expr::Array(elems) | Expr::Tuple(elems) => {
-            for e in elems { collect_lambdas_from_expr(e, counter, out); }
+            for e in elems {
+                collect_lambdas_from_expr(e, counter, out);
+            }
         }
         Expr::ConstructorCall { args, .. } => {
-            for a in args { collect_lambdas_from_expr(a, counter, out); }
+            for a in args {
+                collect_lambdas_from_expr(a, counter, out);
+            }
         }
         Expr::StructInit { fields, .. } => {
-            for (_, e) in fields { collect_lambdas_from_expr(e, counter, out); }
+            for (_, e) in fields {
+                collect_lambdas_from_expr(e, counter, out);
+            }
         }
         _ => {}
     }
@@ -1323,8 +1426,8 @@ fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &m
 mod tests {
     use super::*;
     use crate::ast::{
-        ClassDef, ClassMethod, Expr, FieldDef, InterfaceDef, InterfaceMethod, Param, Pattern,
-        Stmt, StructDef, TypeConstraint, Visibility,
+        ClassDef, ClassMethod, Expr, FieldDef, InterfaceDef, InterfaceMethod, Param, Pattern, Stmt,
+        StructDef, TypeConstraint, Visibility,
     };
 
     fn make_func(name: &str, params: Vec<Param>, body: Vec<Stmt>) -> Function {
@@ -1393,7 +1496,8 @@ mod tests {
             &[],
             None,
             0,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(chir_func.name, "test");
         assert_eq!(chir_func.return_wasm_ty, wasm_encoder::ValType::I64);
@@ -1433,7 +1537,8 @@ mod tests {
             &[],
             None,
             0,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(chir_func.params.len(), 2);
         assert_eq!(chir_func.params[0].name, "a");
@@ -1442,9 +1547,11 @@ mod tests {
 
     #[test]
     fn test_lower_program() {
-        let program = make_program(vec![
-            make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])
-        ]);
+        let program = make_program(vec![make_func(
+            "main",
+            vec![],
+            vec![Stmt::Return(Some(Expr::Integer(0)))],
+        )]);
 
         let chir_program = lower_program(&program).unwrap();
 
@@ -1477,7 +1584,10 @@ mod tests {
         let func_params = HashMap::new();
         let struct_offsets = HashMap::new();
         let mut class_offsets = HashMap::new();
-        class_offsets.insert("Counter".to_string(), [("n".to_string(), 8u32)].into_iter().collect());
+        class_offsets.insert(
+            "Counter".to_string(),
+            [("n".to_string(), 8u32)].into_iter().collect(),
+        );
         let mut class_field_info: HashMap<String, HashMap<String, (u32, Type)>> = HashMap::new();
         let mut info = HashMap::new();
         info.insert("n".to_string(), (8, Type::Int64));
@@ -1498,7 +1608,8 @@ mod tests {
             &[],
             Some("Counter"),
             0,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(chir_func.name, "Counter.getN");
         assert_eq!(chir_func.params[0].name, "this");
@@ -1546,7 +1657,11 @@ mod tests {
         let program = crate::ast::Program {
             package_name: None,
             imports: vec![],
-            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            functions: vec![make_func(
+                "main",
+                vec![],
+                vec![Stmt::Return(Some(Expr::Integer(0)))],
+            )],
             structs: vec![],
             classes: vec![class_def],
             enums: vec![],
@@ -1965,7 +2080,9 @@ mod tests {
         };
 
         let err = lower_program(&program).unwrap_err();
-        assert!(err.contains("the constraint of type parameter is not looser than parent's constraint"));
+        assert!(
+            err.contains("the constraint of type parameter is not looser than parent's constraint")
+        );
     }
 
     #[test]

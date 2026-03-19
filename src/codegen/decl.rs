@@ -100,7 +100,10 @@ impl CodeGen {
                 return idx;
             }
         }
-        eprintln!("[警告] 方法未找到（可能是泛型方法，未单态化）: key='{}', method='{}'", key, method);
+        eprintln!(
+            "[警告] 方法未找到（可能是泛型方法，未单态化）: key='{}', method='{}'",
+            key, method
+        );
         // 返回 None 表示未找到（调用方负责生成桩代码）
         return u32::MAX;
     }

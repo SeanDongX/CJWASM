@@ -29,13 +29,17 @@ fn bench_compile_e2e(c: &mut Criterion) {
 
     for (name, source) in &cases {
         group.throughput(Throughput::Bytes(source.len() as u64));
-        group.bench_with_input(BenchmarkId::new("source_to_wasm", name), source, |b, src| {
-            b.iter(|| {
-                let wasm = cjwasm::pipeline::compile_source_to_wasm(black_box(src))
-                    .expect("编译不应失败");
-                black_box(wasm);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("source_to_wasm", name),
+            source,
+            |b, src| {
+                b.iter(|| {
+                    let wasm = cjwasm::pipeline::compile_source_to_wasm(black_box(src))
+                        .expect("编译不应失败");
+                    black_box(wasm);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -59,7 +63,9 @@ fn bench_lexer(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("tokenize", name), source, |b, src| {
             b.iter(|| {
                 let lexer = cjwasm::lexer::Lexer::new(black_box(src));
-                let tokens: Vec<_> = lexer.collect::<Result<Vec<_>, _>>().expect("词法分析不应失败");
+                let tokens: Vec<_> = lexer
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("词法分析不应失败");
                 black_box(tokens);
             });
         });
@@ -83,7 +89,9 @@ fn bench_parser(c: &mut Criterion) {
 
     for (name, source) in &cases {
         let lexer = cjwasm::lexer::Lexer::new(source);
-        let tokens: Vec<_> = lexer.collect::<Result<Vec<_>, _>>().expect("词法分析不应失败");
+        let tokens: Vec<_> = lexer
+            .collect::<Result<Vec<_>, _>>()
+            .expect("词法分析不应失败");
 
         group.throughput(Throughput::Elements(tokens.len() as u64));
         group.bench_with_input(
@@ -149,17 +157,13 @@ fn bench_codegen(c: &mut Criterion) {
         cjwasm::optimizer::optimize_program(&mut program);
         cjwasm::monomorph::monomorphize_program(&mut program);
 
-        group.bench_with_input(
-            BenchmarkId::new("emit_wasm", name),
-            &program,
-            |b, prog| {
-                b.iter(|| {
-                    let mut codegen = cjwasm::codegen::CodeGen::new();
-                    let wasm = codegen.compile(black_box(prog));
-                    black_box(wasm);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("emit_wasm", name), &program, |b, prog| {
+            b.iter(|| {
+                let mut codegen = cjwasm::codegen::CodeGen::new();
+                let wasm = codegen.compile(black_box(prog));
+                black_box(wasm);
+            });
+        });
     }
 
     group.finish();
@@ -179,17 +183,13 @@ fn bench_output_size(c: &mut Criterion) {
     ];
 
     for (name, source) in &cases {
-        group.bench_with_input(
-            BenchmarkId::new("wasm_bytes", name),
-            source,
-            |b, src| {
-                b.iter(|| {
-                    let wasm = cjwasm::pipeline::compile_source_to_wasm(black_box(src))
-                        .expect("编译不应失败");
-                    black_box(wasm.len())
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("wasm_bytes", name), source, |b, src| {
+            b.iter(|| {
+                let wasm =
+                    cjwasm::pipeline::compile_source_to_wasm(black_box(src)).expect("编译不应失败");
+                black_box(wasm.len())
+            });
+        });
     }
 
     group.finish();

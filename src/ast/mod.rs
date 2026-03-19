@@ -5,35 +5,35 @@ pub use type_::Type;
 /// 一元运算符
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnaryOp {
-    Not,     // !
-    Neg,     // - 负号
-    BitNot,  // ~ 按位取反
+    Not,    // !
+    Neg,    // - 负号
+    BitNot, // ~ 按位取反
 }
 
 /// 二元运算符 (与 cjc release/1.0 对齐, 移除 >>>)
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinOp {
-    Add,    // +
-    Sub,    // -
-    Mul,    // *
-    Div,    // /
-    Mod,    // %
-    Eq,     // ==
-    NotEq,  // !=
-    Lt,     // <
-    Gt,     // >
-    LtEq,   // <=
-    GtEq,   // >=
-    LogicalAnd,  // &&
-    LogicalOr,   // ||
-    Pow,         // ** 幂运算
-    BitAnd,      // &
-    BitOr,       // |
-    BitXor,      // ^
-    Shl,         // <<
-    Shr,         // >>
-    NotIn,       // !in (集合不包含)
-    Pipeline,    // |> 管道：left |> right 表示 right(left)
+    Add,        // +
+    Sub,        // -
+    Mul,        // *
+    Div,        // /
+    Mod,        // %
+    Eq,         // ==
+    NotEq,      // !=
+    Lt,         // <
+    Gt,         // >
+    LtEq,       // <=
+    GtEq,       // >=
+    LogicalAnd, // &&
+    LogicalOr,  // ||
+    Pow,        // ** 幂运算
+    BitAnd,     // &
+    BitOr,      // |
+    BitXor,     // ^
+    Shl,        // <<
+    Shr,        // >>
+    NotIn,      // !in (集合不包含)
+    Pipeline,   // |> 管道：left |> right 表示 right(left)
 }
 
 /// 字符串插值的部分
@@ -66,10 +66,7 @@ pub enum Expr {
     /// 变量引用
     Var(String),
     /// 一元运算 (! 等)
-    Unary {
-        op: UnaryOp,
-        expr: Box<Expr>,
-    },
+    Unary { op: UnaryOp, expr: Box<Expr> },
     /// 二元运算
     Binary {
         op: BinOp,
@@ -102,9 +99,7 @@ pub enum Expr {
         named_args: Vec<(String, Expr)>,
     },
     /// super 字段访问：super.field
-    SuperFieldAccess {
-        field: String,
-    },
+    SuperFieldAccess { field: String },
     /// if 表达式
     If {
         cond: Box<Expr>,
@@ -123,17 +118,11 @@ pub enum Expr {
     /// 元组字面量 (a, b, c)
     Tuple(Vec<Expr>),
     /// 元组索引访问 tuple.0, tuple.1
-    TupleIndex {
-        object: Box<Expr>,
-        index: u32,
-    },
+    TupleIndex { object: Box<Expr>, index: u32 },
     /// 数组字面量 [1, 2, 3]
     Array(Vec<Expr>),
     /// 数组访问 arr[index]
-    Index {
-        array: Box<Expr>,
-        index: Box<Expr>,
-    },
+    Index { array: Box<Expr>, index: Box<Expr> },
     /// 结构体实例化 Point { x: 1, y: 2 } 或 Pair<Int64,String> { first: 1, second: "hi" }
     StructInit {
         name: String,
@@ -149,16 +138,13 @@ pub enum Expr {
         named_args: Vec<(String, Expr)>,
     },
     /// 字段访问 point.x
-    Field {
-        object: Box<Expr>,
-        field: String,
-    },
+    Field { object: Box<Expr>, field: String },
     /// 范围表达式 0..10 或 0..=10，可选步长 : step
     Range {
         start: Box<Expr>,
         end: Box<Expr>,
-        inclusive: bool,  // true 表示 ..=
-        step: Option<Box<Expr>>,  // P2.6: for-in 带步长 `0..=10 : 2`
+        inclusive: bool,         // true 表示 ..=
+        step: Option<Box<Expr>>, // P2.6: for-in 带步长 `0..=10 : 2`
     },
     /// 枚举变体构造 Color.Red 或 Result.Ok(42)（无关联值时值为 i32 判别式，有关联值为堆指针）
     VariantConst {
@@ -173,10 +159,7 @@ pub enum Expr {
         arms: Vec<MatchArm>,
     },
     /// 类型转换 expr as Type
-    Cast {
-        expr: Box<Expr>,
-        target_ty: Type,
-    },
+    Cast { expr: Box<Expr>, target_ty: Type },
     /// Lambda 表达式 (x: Int64) -> Int64 { x * 2 } 或 { x: Int64 => x * 2 }
     Lambda {
         params: Vec<(String, Type)>,
@@ -233,28 +216,15 @@ pub enum Expr {
     /// continue 在表达式上下文
     Continue,
     /// Map 字面量 Map<K, V> { key1 => val1, key2 => val2 }
-    MapLiteral {
-        entries: Vec<(Expr, Expr)>,
-    },
+    MapLiteral { entries: Vec<(Expr, Expr)> },
     /// P3.4: 类型检查 expr is Type — 返回 Bool
-    IsType {
-        expr: Box<Expr>,
-        target_ty: Type,
-    },
+    IsType { expr: Box<Expr>, target_ty: Type },
     /// P5.1: spawn { block } — 单线程桩实现（直接执行）
-    Spawn {
-        body: Vec<Stmt>,
-    },
+    Spawn { body: Vec<Stmt> },
     /// P5.2: synchronized(lock) { block } — 单线程桩实现（直接执行）
-    Synchronized {
-        lock: Box<Expr>,
-        body: Vec<Stmt>,
-    },
+    Synchronized { lock: Box<Expr>, body: Vec<Stmt> },
     /// P6.1: 可选链 obj?.field — 若 obj 为 None 返回 None，否则访问字段
-    OptionalChain {
-        object: Box<Expr>,
-        field: String,
-    },
+    OptionalChain { object: Box<Expr>, field: String },
     /// P6.2: 尾随闭包调用 f(args) { params => body }
     TrailingClosure {
         callee: Box<Expr>,
@@ -262,17 +232,14 @@ pub enum Expr {
         closure: Box<Expr>,
     },
     /// 宏调用 @MacroName(args)
-    Macro {
-        name: String,
-        args: Vec<Expr>,
-    },
+    Macro { name: String, args: Vec<Expr> },
 }
 
 /// match 分支
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
-    pub guard: Option<Box<Expr>>,  // if 守卫条件
+    pub guard: Option<Box<Expr>>, // if 守卫条件
     pub body: Box<Expr>,
 }
 
@@ -308,10 +275,7 @@ pub enum Pattern {
         payload: Option<Box<Pattern>>,
     },
     /// P3.5: 类型测试模式 x: Type — 匹配时检查对象类型，成功则绑定到 x
-    TypeTest {
-        binding: String,
-        ty: Type,
-    },
+    TypeTest { binding: String, ty: Type },
     /// 字段模式 obj.field（cjc 兼容，match 时匹配/绑定字段访问）
     Field { object: String, field: String },
     /// 表达式守卫模式（用于无主体 match { case expr => ... }）
@@ -344,19 +308,13 @@ pub enum Stmt {
         value: Expr,
     },
     /// 赋值
-    Assign {
-        target: AssignTarget,
-        value: Expr,
-    },
+    Assign { target: AssignTarget, value: Expr },
     /// 表达式语句
     Expr(Expr),
     /// return 语句
     Return(Option<Expr>),
     /// while 循环
-    While {
-        cond: Expr,
-        body: Vec<Stmt>,
-    },
+    While { cond: Expr, body: Vec<Stmt> },
     /// while-let 循环：当 expr 匹配 pattern 时执行 body，否则退出
     WhileLet {
         pattern: Pattern,
@@ -364,10 +322,7 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
     /// do-while 循环：先执行 body，再检查 cond
-    DoWhile {
-        body: Vec<Stmt>,
-        cond: Expr,
-    },
+    DoWhile { body: Vec<Stmt>, cond: Expr },
     /// for 循环 (for i in 0..10 { ... })
     For {
         var: String,
@@ -416,7 +371,11 @@ pub enum AssignTarget {
     /// 链式字段 obj.field1.field2（如 this.outputBOS.curPos）
     FieldPath { base: String, fields: Vec<String> },
     /// 链式字段后索引 obj.field1.field2[i]（如 this.outputBOS.outBuf[i]）
-    IndexPath { base: String, fields: Vec<String>, index: Box<Expr> },
+    IndexPath {
+        base: String,
+        fields: Vec<String>,
+        index: Box<Expr>,
+    },
     /// 复杂表达式索引 expr[i]（如 obj.method()[i]）
     ExprIndex { expr: Box<Expr>, index: Box<Expr> },
     /// 元组解构 (a, b) = expr
@@ -474,7 +433,10 @@ impl StructDef {
 
     /// 获取字段类型
     pub fn field_type(&self, field_name: &str) -> Option<&Type> {
-        self.fields.iter().find(|f| f.name == field_name).map(|f| &f.ty)
+        self.fields
+            .iter()
+            .find(|f| f.name == field_name)
+            .map(|f| &f.ty)
     }
 }
 
@@ -653,11 +615,17 @@ pub struct EnumDef {
 
 impl EnumDef {
     pub fn variant_index(&self, name: &str) -> Option<u32> {
-        self.variants.iter().position(|v| v.name == name).map(|i| i as u32)
+        self.variants
+            .iter()
+            .position(|v| v.name == name)
+            .map(|i| i as u32)
     }
 
     pub fn variant_payload(&self, name: &str) -> Option<&Type> {
-        self.variants.iter().find(|v| v.name == name).and_then(|v| v.payload.as_ref())
+        self.variants
+            .iter()
+            .find(|v| v.name == name)
+            .and_then(|v| v.payload.as_ref())
     }
 
     /// 是否有任意变体带关联值

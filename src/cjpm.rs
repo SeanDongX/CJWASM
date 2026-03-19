@@ -171,10 +171,7 @@ pub fn build(opts: &BuildOptions) -> Result<BuildResult, String> {
     // 收集源文件
     let cj_files = collect_cj_files(&src_dir);
     if cj_files.is_empty() {
-        return Err(format!(
-            "在 {} 中未找到 .cj 源文件",
-            src_dir.display()
-        ));
+        return Err(format!("在 {} 中未找到 .cj 源文件", src_dir.display()));
     }
 
     if opts.verbose {
@@ -504,11 +501,7 @@ version = "0.1.0"
 output-type = "executable"
 "#;
         fs::write(tmp.join("cjpm.toml"), toml).unwrap();
-        fs::write(
-            tmp.join("src/main.cj"),
-            "func main(): Int64 { return 42 }",
-        )
-        .unwrap();
+        fs::write(tmp.join("src/main.cj"), "func main(): Int64 { return 42 }").unwrap();
 
         let opts = BuildOptions {
             project_dir: tmp.clone(),
@@ -564,11 +557,7 @@ name = "multitest"
         let tmp = create_test_project("build_output");
         let toml = "[package]\nname = \"app\"\n";
         fs::write(tmp.join("cjpm.toml"), toml).unwrap();
-        fs::write(
-            tmp.join("src/main.cj"),
-            "func main(): Int64 { return 0 }",
-        )
-        .unwrap();
+        fs::write(tmp.join("src/main.cj"), "func main(): Int64 { return 0 }").unwrap();
 
         let opts = BuildOptions {
             project_dir: tmp.clone(),
@@ -576,10 +565,7 @@ name = "multitest"
             verbose: false,
         };
         let result = build(&opts).unwrap();
-        assert!(result
-            .output_path
-            .to_string_lossy()
-            .contains("custom.wasm"));
+        assert!(result.output_path.to_string_lossy().contains("custom.wasm"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

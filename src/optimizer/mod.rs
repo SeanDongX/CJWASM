@@ -243,11 +243,19 @@ fn fold_expr(expr: Expr) -> Expr {
             let tail = tail.map(|e| Box::new(fold_expr(*e)));
             Block(stmts, tail)
         }
-        Call { name, type_args, args, named_args } => Call {
+        Call {
+            name,
+            type_args,
+            args,
+            named_args,
+        } => Call {
             name,
             type_args,
             args: args.into_iter().map(fold_expr).collect(),
-            named_args: named_args.into_iter().map(|(n, e)| (n, fold_expr(e))).collect(),
+            named_args: named_args
+                .into_iter()
+                .map(|(n, e)| (n, fold_expr(e)))
+                .collect(),
         },
         MethodCall {
             object,
@@ -259,7 +267,10 @@ fn fold_expr(expr: Expr) -> Expr {
             object: Box::new(fold_expr(*object)),
             method,
             args: args.into_iter().map(fold_expr).collect(),
-            named_args: named_args.into_iter().map(|(n, e)| (n, fold_expr(e))).collect(),
+            named_args: named_args
+                .into_iter()
+                .map(|(n, e)| (n, fold_expr(e)))
+                .collect(),
             type_args,
         },
         Array(elems) => Array(elems.into_iter().map(fold_expr).collect()),
@@ -280,13 +291,14 @@ fn fold_expr(expr: Expr) -> Expr {
             object: Box::new(fold_expr(*object)),
             field,
         },
-        StructInit { name, type_args, fields } => StructInit {
+        StructInit {
             name,
             type_args,
-            fields: fields
-                .into_iter()
-                .map(|(n, e)| (n, fold_expr(e)))
-                .collect(),
+            fields,
+        } => StructInit {
+            name,
+            type_args,
+            fields: fields.into_iter().map(|(n, e)| (n, fold_expr(e))).collect(),
         },
         Match { expr, arms } => Match {
             expr: Box::new(fold_expr(*expr)),
@@ -299,13 +311,22 @@ fn fold_expr(expr: Expr) -> Expr {
                 })
                 .collect(),
         },
-        Range { start, end, inclusive, step } => Range {
+        Range {
+            start,
+            end,
+            inclusive,
+            step,
+        } => Range {
             start: Box::new(fold_expr(*start)),
             end: Box::new(fold_expr(*end)),
             inclusive,
             step: step.map(|s| Box::new(fold_expr(*s))),
         },
-        VariantConst { enum_name, variant_name, arg } => VariantConst {
+        VariantConst {
+            enum_name,
+            variant_name,
+            arg,
+        } => VariantConst {
             enum_name,
             variant_name,
             arg: arg.map(|e| Box::new(fold_expr(*e))),
@@ -363,7 +384,9 @@ fn fold_expr(expr: Expr) -> Expr {
             parts
                 .into_iter()
                 .map(|p| match p {
-                    crate::ast::InterpolatePart::Literal(s) => crate::ast::InterpolatePart::Literal(s),
+                    crate::ast::InterpolatePart::Literal(s) => {
+                        crate::ast::InterpolatePart::Literal(s)
+                    }
                     crate::ast::InterpolatePart::Expr(e) => {
                         crate::ast::InterpolatePart::Expr(Box::new(fold_expr(*e)))
                     }
@@ -435,7 +458,8 @@ fn fold_binary_float(x: f64, y: f64, op: &BinOp) -> Option<Expr> {
         Gt => Bool(x > y),
         LtEq => Bool(x <= y),
         GtEq => Bool(x >= y),
-        Mod | BitAnd | BitOr | BitXor | Shl | Shr | LogicalAnd | LogicalOr | Pow | NotIn | Pipeline => return None,
+        Mod | BitAnd | BitOr | BitXor | Shl | Shr | LogicalAnd | LogicalOr | Pow | NotIn
+        | Pipeline => return None,
     };
     Some(out)
 }
@@ -475,52 +499,149 @@ mod tests {
 
     #[test]
     fn fold_int_sub() {
-        let e = Expr::Binary { op: BinOp::Sub, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(3)) };
+        let e = Expr::Binary {
+            op: BinOp::Sub,
+            left: Box::new(Expr::Integer(10)),
+            right: Box::new(Expr::Integer(3)),
+        };
         assert!(matches!(fold_expr(e), Expr::Integer(7)));
     }
 
     #[test]
     fn fold_int_div() {
-        let e = Expr::Binary { op: BinOp::Div, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(3)) };
+        let e = Expr::Binary {
+            op: BinOp::Div,
+            left: Box::new(Expr::Integer(10)),
+            right: Box::new(Expr::Integer(3)),
+        };
         assert!(matches!(fold_expr(e), Expr::Integer(3)));
     }
 
     #[test]
     fn fold_int_div_zero() {
-        let e = Expr::Binary { op: BinOp::Div, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(0)) };
+        let e = Expr::Binary {
+            op: BinOp::Div,
+            left: Box::new(Expr::Integer(10)),
+            right: Box::new(Expr::Integer(0)),
+        };
         // 除零不折叠，应保持为 Binary
         assert!(matches!(fold_expr(e), Expr::Binary { .. }));
     }
 
     #[test]
     fn fold_int_mod() {
-        let e = Expr::Binary { op: BinOp::Mod, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(3)) };
+        let e = Expr::Binary {
+            op: BinOp::Mod,
+            left: Box::new(Expr::Integer(10)),
+            right: Box::new(Expr::Integer(3)),
+        };
         assert!(matches!(fold_expr(e), Expr::Integer(1)));
     }
 
     #[test]
     fn fold_int_mod_zero() {
-        let e = Expr::Binary { op: BinOp::Mod, left: Box::new(Expr::Integer(10)), right: Box::new(Expr::Integer(0)) };
+        let e = Expr::Binary {
+            op: BinOp::Mod,
+            left: Box::new(Expr::Integer(10)),
+            right: Box::new(Expr::Integer(0)),
+        };
         assert!(matches!(fold_expr(e), Expr::Binary { .. }));
     }
 
     #[test]
     fn fold_int_comparisons() {
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Eq, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(1)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::NotEq, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(2)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Lt, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(2)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Gt, left: Box::new(Expr::Integer(2)), right: Box::new(Expr::Integer(1)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::LtEq, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(1)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::GtEq, left: Box::new(Expr::Integer(2)), right: Box::new(Expr::Integer(2)) }), Expr::Bool(true)));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::Eq,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(1))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::NotEq,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(2))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::Lt,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(2))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::Gt,
+                left: Box::new(Expr::Integer(2)),
+                right: Box::new(Expr::Integer(1))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::LtEq,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(1))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::GtEq,
+                left: Box::new(Expr::Integer(2)),
+                right: Box::new(Expr::Integer(2))
+            }),
+            Expr::Bool(true)
+        ));
     }
 
     #[test]
     fn fold_int_bitwise() {
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::BitAnd, left: Box::new(Expr::Integer(0xFF)), right: Box::new(Expr::Integer(0x0F)) }), Expr::Integer(0x0F)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::BitOr, left: Box::new(Expr::Integer(0xF0)), right: Box::new(Expr::Integer(0x0F)) }), Expr::Integer(0xFF)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::BitXor, left: Box::new(Expr::Integer(0xFF)), right: Box::new(Expr::Integer(0x0F)) }), Expr::Integer(0xF0)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Shl, left: Box::new(Expr::Integer(1)), right: Box::new(Expr::Integer(4)) }), Expr::Integer(16)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Shr, left: Box::new(Expr::Integer(16)), right: Box::new(Expr::Integer(2)) }), Expr::Integer(4)));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::BitAnd,
+                left: Box::new(Expr::Integer(0xFF)),
+                right: Box::new(Expr::Integer(0x0F))
+            }),
+            Expr::Integer(0x0F)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::BitOr,
+                left: Box::new(Expr::Integer(0xF0)),
+                right: Box::new(Expr::Integer(0x0F))
+            }),
+            Expr::Integer(0xFF)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::BitXor,
+                left: Box::new(Expr::Integer(0xFF)),
+                right: Box::new(Expr::Integer(0x0F))
+            }),
+            Expr::Integer(0xF0)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::Shl,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(4))
+            }),
+            Expr::Integer(16)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::Shr,
+                left: Box::new(Expr::Integer(16)),
+                right: Box::new(Expr::Integer(2))
+            }),
+            Expr::Integer(4)
+        ));
     }
 
     // UShr (>>>) removed in cjc alignment
@@ -528,54 +649,142 @@ mod tests {
     #[test]
     fn fold_int_logical_returns_none() {
         // LogicalAnd, LogicalOr, Pow 不折叠整数
-        let e = Expr::Binary { op: BinOp::Pow, left: Box::new(Expr::Integer(2)), right: Box::new(Expr::Integer(3)) };
+        let e = Expr::Binary {
+            op: BinOp::Pow,
+            left: Box::new(Expr::Integer(2)),
+            right: Box::new(Expr::Integer(3)),
+        };
         assert!(matches!(fold_expr(e), Expr::Binary { .. }));
     }
 
     #[test]
     fn fold_float_add() {
-        let e = Expr::Binary { op: BinOp::Add, left: Box::new(Expr::Float(1.5)), right: Box::new(Expr::Float(2.5)) };
-        if let Expr::Float(v) = fold_expr(e) { assert!((v - 4.0).abs() < 0.001); } else { panic!("expected float"); }
+        let e = Expr::Binary {
+            op: BinOp::Add,
+            left: Box::new(Expr::Float(1.5)),
+            right: Box::new(Expr::Float(2.5)),
+        };
+        if let Expr::Float(v) = fold_expr(e) {
+            assert!((v - 4.0).abs() < 0.001);
+        } else {
+            panic!("expected float");
+        }
     }
 
     #[test]
     fn fold_float_sub() {
-        let e = Expr::Binary { op: BinOp::Sub, left: Box::new(Expr::Float(5.0)), right: Box::new(Expr::Float(2.0)) };
-        if let Expr::Float(v) = fold_expr(e) { assert!((v - 3.0).abs() < 0.001); } else { panic!("expected float"); }
+        let e = Expr::Binary {
+            op: BinOp::Sub,
+            left: Box::new(Expr::Float(5.0)),
+            right: Box::new(Expr::Float(2.0)),
+        };
+        if let Expr::Float(v) = fold_expr(e) {
+            assert!((v - 3.0).abs() < 0.001);
+        } else {
+            panic!("expected float");
+        }
     }
 
     #[test]
     fn fold_float_mul() {
-        let e = Expr::Binary { op: BinOp::Mul, left: Box::new(Expr::Float(3.0)), right: Box::new(Expr::Float(4.0)) };
-        if let Expr::Float(v) = fold_expr(e) { assert!((v - 12.0).abs() < 0.001); } else { panic!("expected float"); }
+        let e = Expr::Binary {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Float(3.0)),
+            right: Box::new(Expr::Float(4.0)),
+        };
+        if let Expr::Float(v) = fold_expr(e) {
+            assert!((v - 12.0).abs() < 0.001);
+        } else {
+            panic!("expected float");
+        }
     }
 
     #[test]
     fn fold_float_div() {
-        let e = Expr::Binary { op: BinOp::Div, left: Box::new(Expr::Float(10.0)), right: Box::new(Expr::Float(4.0)) };
-        if let Expr::Float(v) = fold_expr(e) { assert!((v - 2.5).abs() < 0.001); } else { panic!("expected float"); }
+        let e = Expr::Binary {
+            op: BinOp::Div,
+            left: Box::new(Expr::Float(10.0)),
+            right: Box::new(Expr::Float(4.0)),
+        };
+        if let Expr::Float(v) = fold_expr(e) {
+            assert!((v - 2.5).abs() < 0.001);
+        } else {
+            panic!("expected float");
+        }
     }
 
     #[test]
     fn fold_float_comparisons() {
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Eq, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(1.0)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::NotEq, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(2.0)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Lt, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(2.0)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Gt, left: Box::new(Expr::Float(2.0)), right: Box::new(Expr::Float(1.0)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::LtEq, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(1.0)) }), Expr::Bool(true)));
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::GtEq, left: Box::new(Expr::Float(2.0)), right: Box::new(Expr::Float(2.0)) }), Expr::Bool(true)));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::Eq,
+                left: Box::new(Expr::Float(1.0)),
+                right: Box::new(Expr::Float(1.0))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::NotEq,
+                left: Box::new(Expr::Float(1.0)),
+                right: Box::new(Expr::Float(2.0))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::Lt,
+                left: Box::new(Expr::Float(1.0)),
+                right: Box::new(Expr::Float(2.0))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::Gt,
+                left: Box::new(Expr::Float(2.0)),
+                right: Box::new(Expr::Float(1.0))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::LtEq,
+                left: Box::new(Expr::Float(1.0)),
+                right: Box::new(Expr::Float(1.0))
+            }),
+            Expr::Bool(true)
+        ));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::GtEq,
+                left: Box::new(Expr::Float(2.0)),
+                right: Box::new(Expr::Float(2.0))
+            }),
+            Expr::Bool(true)
+        ));
     }
 
     #[test]
     fn fold_float_unsupported_ops() {
         // Mod, BitAnd 等不支持浮点
-        assert!(matches!(fold_expr(Expr::Binary { op: BinOp::Mod, left: Box::new(Expr::Float(1.0)), right: Box::new(Expr::Float(2.0)) }), Expr::Binary { .. }));
+        assert!(matches!(
+            fold_expr(Expr::Binary {
+                op: BinOp::Mod,
+                left: Box::new(Expr::Float(1.0)),
+                right: Box::new(Expr::Float(2.0))
+            }),
+            Expr::Binary { .. }
+        ));
     }
 
     #[test]
     fn fold_unary_neg_int() {
         use crate::ast::UnaryOp;
-        let e = Expr::Unary { op: UnaryOp::Neg, expr: Box::new(Expr::Integer(42)) };
+        let e = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(Expr::Integer(42)),
+        };
         assert!(matches!(fold_expr(e), Expr::Integer(-42)));
     }
 
@@ -583,16 +792,25 @@ mod tests {
     fn fold_unary_neg_float_not_folded() {
         use crate::ast::UnaryOp;
         // Neg on Float is not folded by the optimizer (only Integer)
-        let e = Expr::Unary { op: UnaryOp::Neg, expr: Box::new(Expr::Float(3.14)) };
+        let e = Expr::Unary {
+            op: UnaryOp::Neg,
+            expr: Box::new(Expr::Float(3.14)),
+        };
         assert!(matches!(fold_expr(e), Expr::Unary { .. }));
     }
 
     #[test]
     fn fold_unary_not() {
         use crate::ast::UnaryOp;
-        let e = Expr::Unary { op: UnaryOp::Not, expr: Box::new(Expr::Bool(true)) };
+        let e = Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(Expr::Bool(true)),
+        };
         assert!(matches!(fold_expr(e), Expr::Bool(false)));
-        let e2 = Expr::Unary { op: UnaryOp::Not, expr: Box::new(Expr::Bool(false)) };
+        let e2 = Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(Expr::Bool(false)),
+        };
         assert!(matches!(fold_expr(e2), Expr::Bool(true)));
     }
 
@@ -600,7 +818,10 @@ mod tests {
     fn fold_unary_bitnot_not_folded() {
         use crate::ast::UnaryOp;
         // BitNot is not folded by the optimizer
-        let e = Expr::Unary { op: UnaryOp::BitNot, expr: Box::new(Expr::Integer(0)) };
+        let e = Expr::Unary {
+            op: UnaryOp::BitNot,
+            expr: Box::new(Expr::Integer(0)),
+        };
         assert!(matches!(fold_expr(e), Expr::Unary { .. }));
     }
 
@@ -622,7 +843,10 @@ mod tests {
         };
         let folded = fold_expr(e);
         // cond should become Bool(true), then_branch should become Integer(5)
-        if let Expr::If { cond, then_branch, .. } = folded {
+        if let Expr::If {
+            cond, then_branch, ..
+        } = folded
+        {
             assert!(matches!(*cond, Expr::Bool(true)));
             assert!(matches!(*then_branch, Expr::Integer(5)));
         } else {
@@ -689,7 +913,10 @@ mod tests {
             })]),
         };
         let folded = fold_expr(e);
-        if let Expr::TryBlock { body, finally_body, .. } = folded {
+        if let Expr::TryBlock {
+            body, finally_body, ..
+        } = folded
+        {
             if let Stmt::Expr(Expr::Integer(3)) = &body[0] {
                 // body folded correctly
             } else {

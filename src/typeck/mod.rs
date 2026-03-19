@@ -119,7 +119,11 @@ fn scan_stmt(stmt: &Stmt, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
                 scan_stmt(s, ctx, global);
             }
         }
-        Stmt::For { var, iterable, body } => {
+        Stmt::For {
+            var,
+            iterable,
+            body,
+        } => {
             // for 循环变量类型：Range → I64（整数索引），数组 → 元素类型
             let loop_var_ty = resolve_for_loop_var_type(iterable, ctx, global);
             ctx.local_types.entry(var.clone()).or_insert(loop_var_ty);
@@ -140,7 +144,11 @@ fn scan_stmt(stmt: &Stmt, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
                 scan_stmt(s, ctx, global);
             }
         }
-        Stmt::WhileLet { pattern, expr, body } => {
+        Stmt::WhileLet {
+            pattern,
+            expr,
+            body,
+        } => {
             scan_expr(expr, ctx, global);
             // while let 绑定变量：保守用 I32（枚举载荷通常是引用）
             if let Pattern::Binding(name) = pattern {
@@ -160,7 +168,12 @@ fn scan_stmt(stmt: &Stmt, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
 
 fn scan_expr(expr: &Expr, ctx: &mut FunctionTypeContext, global: &FunctionTypeGlobal<'_>) {
     match expr {
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             scan_expr(cond, ctx, global);
             scan_expr(then_branch, ctx, global);
             if let Some(eb) = else_branch {
@@ -185,7 +198,12 @@ fn scan_expr(expr: &Expr, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
                 }
             }
         }
-        Expr::IfLet { pattern, expr, then_branch, else_branch } => {
+        Expr::IfLet {
+            pattern,
+            expr,
+            then_branch,
+            else_branch,
+        } => {
             scan_expr(expr, ctx, global);
             collect_pattern_vars(pattern, ctx);
             scan_expr(then_branch, ctx, global);
@@ -196,7 +214,14 @@ fn scan_expr(expr: &Expr, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
         Expr::Lambda { body, .. } => {
             scan_expr(body, ctx, global);
         }
-        Expr::TryBlock { resources, body, catch_body, catch_var, finally_body, .. } => {
+        Expr::TryBlock {
+            resources,
+            body,
+            catch_body,
+            catch_var,
+            finally_body,
+            ..
+        } => {
             for (res_name, res_expr) in resources {
                 let wt = resolve_expr_type(res_expr, ctx, global);
                 ctx.local_types.entry(res_name.clone()).or_insert(wt);
@@ -228,9 +253,15 @@ fn scan_expr(expr: &Expr, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
                 scan_stmt(s, ctx, global);
             }
         }
-        Expr::Call { args, named_args, .. }
-        | Expr::MethodCall { args, named_args, .. }
-        | Expr::ConstructorCall { args, named_args, .. } => {
+        Expr::Call {
+            args, named_args, ..
+        }
+        | Expr::MethodCall {
+            args, named_args, ..
+        }
+        | Expr::ConstructorCall {
+            args, named_args, ..
+        } => {
             for a in args {
                 scan_expr(a, ctx, global);
             }
@@ -238,7 +269,9 @@ fn scan_expr(expr: &Expr, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
                 scan_expr(a, ctx, global);
             }
         }
-        Expr::SuperCall { args, named_args, .. } => {
+        Expr::SuperCall {
+            args, named_args, ..
+        } => {
             for a in args {
                 scan_expr(a, ctx, global);
             }
@@ -264,7 +297,10 @@ fn scan_expr(expr: &Expr, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
         | Expr::PrefixDecr(inner) => {
             scan_expr(inner, ctx, global);
         }
-        Expr::Index { array: object, index } => {
+        Expr::Index {
+            array: object,
+            index,
+        } => {
             scan_expr(object, ctx, global);
             scan_expr(index, ctx, global);
         }
@@ -288,7 +324,9 @@ fn scan_expr(expr: &Expr, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
             scan_expr(option, ctx, global);
             scan_expr(default, ctx, global);
         }
-        Expr::Range { start, end, step, .. } => {
+        Expr::Range {
+            start, end, step, ..
+        } => {
             scan_expr(start, ctx, global);
             scan_expr(end, ctx, global);
             if let Some(s) = step {
@@ -305,7 +343,11 @@ fn scan_expr(expr: &Expr, ctx: &mut FunctionTypeContext, global: &FunctionTypeGl
                 }
             }
         }
-        Expr::TrailingClosure { callee, args, closure } => {
+        Expr::TrailingClosure {
+            callee,
+            args,
+            closure,
+        } => {
             scan_expr(callee, ctx, global);
             for a in args {
                 scan_expr(a, ctx, global);
@@ -332,7 +374,9 @@ fn collect_pattern_vars(pattern: &Pattern, ctx: &mut FunctionTypeContext) {
                 collect_pattern_vars(p, ctx);
             }
         }
-        Pattern::Variant { payload: Some(p), .. } => {
+        Pattern::Variant {
+            payload: Some(p), ..
+        } => {
             collect_pattern_vars(p, ctx);
         }
         Pattern::Struct { fields, .. } => {
@@ -401,19 +445,14 @@ pub(crate) fn resolve_expr_type(
         Expr::Call { name, args, .. } => {
             // 原始类型转换构造函数（Int64(x), Int32(x) 等），与 Type::T.to_wasm() 一致
             match name.as_str() {
-                "Int8" | "Int16" | "Int32" | "UInt8" | "UInt16" | "UInt32" => {
-                    return ValType::I32
-                }
+                "Int8" | "Int16" | "Int32" | "UInt8" | "UInt16" | "UInt32" => return ValType::I32,
                 "Int64" | "UInt64" | "IntNative" | "UIntNative" => return ValType::I64,
                 "Float16" | "Float32" => return ValType::F32,
                 "Float64" => return ValType::F64,
                 _ => {}
             }
             // I/O 内置函数：void 返回
-            if matches!(
-                name.as_str(),
-                "println" | "print" | "eprintln" | "eprint"
-            ) {
+            if matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint") {
                 return ValType::I32;
             }
             // 字符串读取

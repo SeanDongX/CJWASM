@@ -269,12 +269,8 @@ fn cmd_compile(args: &[String]) {
                 std::process::exit(1);
             }
         };
-        let new_imports = pipeline::collect_import_files(
-            &prog,
-            &base_dirs,
-            &mut visited,
-            vendor_std.as_deref(),
-        );
+        let new_imports =
+            pipeline::collect_import_files(&prog, &base_dirs, &mut visited, vendor_std.as_deref());
         import_queue.extend(new_imports);
         programs.push(prog);
     }

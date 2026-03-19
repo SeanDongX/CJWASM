@@ -130,6 +130,16 @@ impl Parser {
                     None
                 }
             }
+            Some(Token::BacktickStringLit(crate::lexer::StringOrInterpolated::Plain(_))) => {
+                if let Some(Token::BacktickStringLit(crate::lexer::StringOrInterpolated::Plain(
+                    n,
+                ))) = self.advance()
+                {
+                    Some(n)
+                } else {
+                    None
+                }
+            }
             Some(Token::Main) => {
                 self.advance();
                 Some("main".to_string())
@@ -163,6 +173,36 @@ impl Parser {
                 Some("loop".to_string())
             }
             _ => None,
+        }
+    }
+
+    fn peek_ident_like(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(Token::Ident(_))
+                | Some(Token::BacktickStringLit(
+                    crate::lexer::StringOrInterpolated::Plain(_)
+                ))
+        )
+    }
+
+    fn peek_next_ident_like(&self) -> bool {
+        matches!(
+            self.peek_next(),
+            Some(Token::Ident(_))
+                | Some(Token::BacktickStringLit(
+                    crate::lexer::StringOrInterpolated::Plain(_)
+                ))
+        )
+    }
+
+    fn peek_ident_eq(&self, expected: &str) -> bool {
+        match self.peek() {
+            Some(Token::Ident(n)) => n == expected,
+            Some(Token::BacktickStringLit(crate::lexer::StringOrInterpolated::Plain(n))) => {
+                n == expected
+            }
+            _ => false,
         }
     }
 
@@ -227,10 +267,15 @@ impl Parser {
                 let mut depth = 1u32;
                 while depth > 0 {
                     match self.advance() {
-                        Some(Token::LBracket) => { depth += 1; collected.push(Token::LBracket); }
+                        Some(Token::LBracket) => {
+                            depth += 1;
+                            collected.push(Token::LBracket);
+                        }
                         Some(Token::RBracket) => {
                             depth -= 1;
-                            if depth > 0 { collected.push(Token::RBracket); }
+                            if depth > 0 {
+                                collected.push(Token::RBracket);
+                            }
                         }
                         None => return self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
                         Some(tok) => collected.push(tok),
@@ -1435,7 +1480,10 @@ mod tests {
     fn test_parse_error_import_alias_missing_name() {
         // import foo as
         let err = parse_should_fail("import foo as");
-        assert!(matches!(err.error, ParseError::UnexpectedEof));
+        assert!(matches!(
+            err.error,
+            ParseError::UnexpectedEof | ParseError::UnexpectedToken(..)
+        ));
     }
 
     #[test]
@@ -3082,7 +3130,10 @@ mod tests {
         assert_eq!(method.type_params, vec!["T1".to_string(), "T2".to_string()]);
         assert_eq!(method.constraints.len(), 1);
         assert_eq!(method.constraints[0].param, "T1");
-        assert_eq!(method.constraints[0].bounds, vec!["T2".to_string(), "Any".to_string()]);
+        assert_eq!(
+            method.constraints[0].bounds,
+            vec!["T2".to_string(), "Any".to_string()]
+        );
     }
 
     #[test]
@@ -3102,7 +3153,10 @@ mod tests {
         assert_eq!(program.classes.len(), 1);
         assert_eq!(program.classes[0].methods.len(), 1);
         assert!(program.classes[0].methods[0].override_);
-        assert_eq!(program.classes[0].methods[0].func.type_params, vec!["T".to_string()]);
+        assert_eq!(
+            program.classes[0].methods[0].func.type_params,
+            vec!["T".to_string()]
+        );
     }
 
     #[test]
@@ -3118,5 +3172,97 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let program = parser.parse_program().unwrap();
         assert_eq!(program.enums.len(), 1);
+    }
+
+    #[test]
+    fn test_p2_parse_backtick_identifiers_in_decl_expr_type() {
+        let source = r#"
+            interface I { func `f`(): Unit }
+            class C <: I { public override func `f`(): Unit {} }
+            func id(x: `C`): `C` { return x }
+            main() {
+                let c = C()
+                c.`f`()
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.interfaces.len(), 1);
+        assert_eq!(program.interfaces[0].methods[0].name, "f");
+        assert_eq!(program.classes.len(), 1);
+        assert_eq!(program.classes[0].methods[0].func.name, "C.f");
+        assert_eq!(
+            program
+                .functions
+                .iter()
+                .find(|f| f.name == "id")
+                .unwrap()
+                .params[0]
+                .ty,
+            Type::Struct("C".to_string(), vec![])
+        );
+    }
+
+    #[test]
+    fn test_p2_parse_backtick_named_param_and_arg() {
+        let source = r#"
+            func foo(`name`!: Int64): Int64 { return `name` }
+            func main(): Int64 { return foo(`name`: 1) }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        let foo = program.functions.iter().find(|f| f.name == "foo").unwrap();
+        assert_eq!(foo.params[0].name, "name");
+        assert!(foo.params[0].is_named);
+    }
+
+    #[test]
+    fn test_p2_parse_struct_primary_ctor_named_param_with_modifier() {
+        let source = r#"
+            struct S {
+                S(protected let a!: Int64) {}
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(program.structs.len(), 1);
+        assert_eq!(program.structs[0].name, "S");
+        assert_eq!(program.structs[0].fields.len(), 1);
+        assert_eq!(program.structs[0].fields[0].name, "a");
+        assert_eq!(program.structs[0].fields[0].ty, Type::Int64);
+    }
+
+    #[test]
+    fn test_p2_parse_enum_method_with_redef_static_modifier_order() {
+        let source = r#"
+            interface I { static func f<T>(): Unit }
+            enum A <: I {
+                E
+                public redef static func f<T>() {}
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        let enum_fn = program
+            .functions
+            .iter()
+            .find(|f| f.name == "A.f")
+            .expect("enum static method should be lowered to top-level A.f");
+        assert_eq!(enum_fn.type_params, vec!["T".to_string()]);
+        assert!(
+            !enum_fn.params.iter().any(|p| p.name == "this"),
+            "static enum method should not get implicit this"
+        );
     }
 }

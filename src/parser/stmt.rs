@@ -275,7 +275,10 @@ impl Parser {
                             Some(Token::Ident(n)) => n,
                             Some(Token::Underscore) => "_".to_string(),
                             Some(tok) => {
-                                return self.bail(ParseError::UnexpectedToken(tok, "元组元素名".to_string()))
+                                return self.bail(ParseError::UnexpectedToken(
+                                    tok,
+                                    "元组元素名".to_string(),
+                                ))
                             }
                             None => return self.bail(ParseError::UnexpectedEof),
                         };
@@ -624,10 +627,7 @@ impl Parser {
             Expr::Index { array, index } => {
                 // 支持数组索引赋值: arr[i] = value 或 obj.field[i] = value
                 match *array {
-                    Expr::Var(name) => Ok(AssignTarget::Index {
-                        array: name,
-                        index,
-                    }),
+                    Expr::Var(name) => Ok(AssignTarget::Index { array: name, index }),
                     Expr::Field { object, field } => {
                         // obj.field[i] = value
                         let mut path = vec![field];

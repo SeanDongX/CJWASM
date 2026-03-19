@@ -41,19 +41,9 @@ fn assert_valid_wasm(wasm: &[u8], name: &str) {
         name,
         wasm.len()
     );
-    assert_eq!(
-        &wasm[0..4],
-        b"\0asm",
-        "{}: 魔数应为 \\0asm",
-        name
-    );
+    assert_eq!(&wasm[0..4], b"\0asm", "{}: 魔数应为 \\0asm", name);
     // WASM 版本 (4-8): 0x01 0x00 0x00 0x00 表示 1
-    assert_eq!(
-        &wasm[4..8],
-        [1, 0, 0, 0],
-        "{}: 版本应为 1",
-        name
-    );
+    assert_eq!(&wasm[4..8], [1, 0, 0, 0], "{}: 版本应为 1", name);
 }
 
 #[test]
@@ -553,8 +543,8 @@ fn test_compile_example_files() {
         let path = entry.path();
         let name = path.file_name().unwrap().to_string_lossy();
         let source = std::fs::read_to_string(&path).expect("读取示例源文件");
-        let wasm = compile_source_result(&source)
-            .unwrap_or_else(|e| panic!("编译失败 ({}): {}", name, e));
+        let wasm =
+            compile_source_result(&source).unwrap_or_else(|e| panic!("编译失败 ({}): {}", name, e));
         assert_valid_wasm(&wasm, &name);
     }
 }
@@ -852,18 +842,17 @@ fn test_l1_std_vendor_resolution() {
     if let Some(ref v) = vendor {
         let module_path = ["std".to_string(), "overflow".to_string()];
         let bases: &[&Path] = &[];
-        let files = cjwasm::pipeline::resolve_import_to_files(
-            &module_path,
-            bases,
-            Some(v.as_path()),
-        );
+        let files =
+            cjwasm::pipeline::resolve_import_to_files(&module_path, bases, Some(v.as_path()));
         assert!(
             !files.is_empty(),
             "L1 std.overflow 应从 vendor 解析到至少一个 .cj 文件 (vendor={})",
             v.display()
         );
         assert!(
-            files.iter().all(|p| p.extension().map_or(false, |e| e == "cj")),
+            files
+                .iter()
+                .all(|p| p.extension().map_or(false, |e| e == "cj")),
             "解析结果应均为 .cj 文件"
         );
     }
@@ -3311,7 +3300,10 @@ fn assert_has_memory_exports(wasm: &[u8]) {
     assert!(wasm_str.contains("__free"), "应导出 __free 函数");
     assert!(wasm_str.contains("__rc_inc"), "应导出 __rc_inc 函数");
     assert!(wasm_str.contains("__rc_dec"), "应导出 __rc_dec 函数");
-    assert!(wasm_str.contains("__gc_collect"), "应导出 __gc_collect 函数");
+    assert!(
+        wasm_str.contains("__gc_collect"),
+        "应导出 __gc_collect 函数"
+    );
 }
 
 // --- 内存管理函数导出验证 ---
@@ -5039,7 +5031,10 @@ fn test_class_with_deinit() {
         func main() : Int64 { let r = Resource(42); return r.getHandle() }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "class with deinit: parse or codegen");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "class with deinit: parse or codegen"
+    );
 }
 
 #[test]
@@ -5178,7 +5173,10 @@ fn test_class_abstract_method() {
         func main() : Int64 { return 0 }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "abstract method: parse or codegen");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "abstract method: parse or codegen"
+    );
 }
 
 #[test]
@@ -5268,7 +5266,10 @@ fn test_enum_subtype() {
         func main() : Int64 { return 0 }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "enum subtype: parse or codegen");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "enum subtype: parse or codegen"
+    );
 }
 
 #[test]
@@ -6613,7 +6614,10 @@ fn test_cg2_complex_type_array_array() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg2_complex_type_array_array");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg2_complex_type_array_array"
+    );
 }
 
 #[test]
@@ -6627,7 +6631,10 @@ fn test_cg2_complex_type_func_sig() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg2_complex_type_func_sig");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg2_complex_type_func_sig"
+    );
 }
 
 #[test]
@@ -7702,7 +7709,10 @@ fn test_cg3_class_generic_simple() {
         func main() : Int64 { let b = Box<Int64>(42); return b.get() }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg3_class_generic_simple");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg3_class_generic_simple"
+    );
 }
 
 #[test]
@@ -7715,7 +7725,10 @@ fn test_cg3_interface_with_methods() {
         func main() : Int64 { return 0 }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg3_interface_with_methods");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg3_interface_with_methods"
+    );
 }
 
 #[test]
@@ -8521,7 +8534,11 @@ fn test_cg4_class_generic_instantiate() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg4_class_generic_instantiate: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg4_class_generic_instantiate: {:?}",
+        result.err()
+    );
     assert_valid_wasm(&result.unwrap(), "cg4_class_generic_instantiate");
 }
 
@@ -8540,7 +8557,11 @@ fn test_cg4_class_with_interface_method() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg4_class_with_interface_method: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg4_class_with_interface_method: {:?}",
+        result.err()
+    );
     if let Ok(wasm) = result {
         assert_valid_wasm(&wasm, "cg4_class_with_interface_method");
     }
@@ -8925,7 +8946,11 @@ fn test_cg4_complex_class_hierarchy() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg4_complex_class_hierarchy: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg4_complex_class_hierarchy: {:?}",
+        result.err()
+    );
     if let Ok(wasm) = result {
         assert_valid_wasm(&wasm, "cg4_complex_class_hierarchy");
     }
@@ -9162,7 +9187,11 @@ fn test_cg5_trait_method_dispatch() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg5_trait_method_dispatch: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg5_trait_method_dispatch: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9178,7 +9207,11 @@ fn test_cg5_extend_with_computed_prop() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg5_extend_with_computed_prop: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg5_extend_with_computed_prop: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9222,7 +9255,11 @@ fn test_cg5_enum_match_all_variants() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg5_enum_match_all_variants: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg5_enum_match_all_variants: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9239,7 +9276,11 @@ fn test_cg5_class_deinit_with_body() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg5_class_deinit_with_body: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg5_class_deinit_with_body: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9357,7 +9398,10 @@ fn test_cg5_multiline_string_literal() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg5_multiline_string_literal");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg5_multiline_string_literal"
+    );
 }
 
 #[test]
@@ -9381,7 +9425,11 @@ fn test_cg5_complex_class_system() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg5_complex_class_system: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg5_complex_class_system: {:?}",
+        result.err()
+    );
 }
 
 // ====================================================================
@@ -9398,7 +9446,11 @@ fn test_cg6_method_tostring_chain() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_method_tostring_chain: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_method_tostring_chain: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9422,7 +9474,11 @@ fn test_cg6_method_hashcode_int() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_method_hashcode_int: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_method_hashcode_int: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9434,7 +9490,11 @@ fn test_cg6_string_add_operator() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_string_add_operator: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_string_add_operator: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9468,7 +9528,11 @@ fn test_cg6_class_vtable_dispatch() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_class_vtable_dispatch: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_class_vtable_dispatch: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9486,7 +9550,11 @@ fn test_cg6_interface_impl_dispatch() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_interface_impl_dispatch: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_interface_impl_dispatch: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9503,7 +9571,11 @@ fn test_cg6_complex_pattern_match_enum() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_complex_pattern_match_enum: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_complex_pattern_match_enum: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9537,7 +9609,11 @@ fn test_cg6_class_field_default_init() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_class_field_default_init: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_class_field_default_init: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9550,7 +9626,11 @@ fn test_cg6_closure_capture_var() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_closure_capture_var: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_closure_capture_var: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9586,7 +9666,11 @@ fn test_cg6_enum_match_payload_extract() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_enum_match_payload_extract: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_enum_match_payload_extract: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -9939,7 +10023,11 @@ fn test_cg6_optional_binding_match() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg6_optional_binding_match: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg6_optional_binding_match: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -10014,7 +10102,10 @@ fn test_cg7_float64_abs() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg7_float64_abs should not panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg7_float64_abs should not panic"
+    );
 }
 
 #[test]
@@ -10026,7 +10117,10 @@ fn test_cg7_string_charAt() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg7_string_charAt should not panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg7_string_charAt should not panic"
+    );
 }
 
 #[test]
@@ -10038,7 +10132,10 @@ fn test_cg7_string_toUpper() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg7_string_toUpper should not panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg7_string_toUpper should not panic"
+    );
 }
 
 #[test]
@@ -10050,7 +10147,10 @@ fn test_cg7_string_toLower() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg7_string_toLower should not panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg7_string_toLower should not panic"
+    );
 }
 
 #[test]
@@ -10104,7 +10204,11 @@ fn test_cg7_class_chain_methods() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg7_class_chain_methods: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg7_class_chain_methods: {:?}",
+        result.err()
+    );
     if let Ok(wasm) = result {
         assert_valid_wasm(&wasm, "cg7_class_chain_methods");
     }
@@ -10124,7 +10228,11 @@ fn test_cg7_class_field_update_return() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg7_class_field_update_return: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg7_class_field_update_return: {:?}",
+        result.err()
+    );
     if let Ok(wasm) = result {
         assert_valid_wasm(&wasm, "cg7_class_field_update_return");
     }
@@ -10162,7 +10270,11 @@ fn test_cg7_class_with_array_member() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg7_class_with_array_member: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg7_class_with_array_member: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -10178,7 +10290,11 @@ fn test_cg7_match_with_binding_and_guard() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg7_match_with_binding_and_guard: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg7_match_with_binding_and_guard: {:?}",
+        result.err()
+    );
     if let Ok(wasm) = result {
         assert_valid_wasm(&wasm, "cg7_match_with_binding_and_guard");
     }
@@ -10276,7 +10392,10 @@ fn test_cg7_rune_to_int() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok() || result.is_err(), "cg7_rune_to_int should not panic");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "cg7_rune_to_int should not panic"
+    );
 }
 
 #[test]
@@ -10384,7 +10503,11 @@ fn test_cg8_class_static_method() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg8_class_static_method: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg8_class_static_method: {:?}",
+        result.err()
+    );
     if let Ok(wasm) = result {
         assert_valid_wasm(&wasm, "cg8_class_static_method");
     }
@@ -10437,7 +10560,11 @@ fn test_cg8_class_deep_inheritance_3() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg8_class_deep_inheritance_3: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg8_class_deep_inheritance_3: {:?}",
+        result.err()
+    );
     if let Ok(wasm) = result {
         assert_valid_wasm(&wasm, "cg8_class_deep_inheritance_3");
     }
@@ -10506,7 +10633,11 @@ fn test_cg8_class_with_all_features() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg8_class_with_all_features: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg8_class_with_all_features: {:?}",
+        result.err()
+    );
     if let Ok(wasm) = result {
         assert_valid_wasm(&wasm, "cg8_class_with_all_features");
     }
@@ -10528,7 +10659,11 @@ fn test_cg8_complex_extend_prop() {
         }
     "#;
     let result = compile_source_result(source);
-    assert!(result.is_ok(), "cg8_complex_extend_prop: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "cg8_complex_extend_prop: {:?}",
+        result.err()
+    );
     if let Ok(wasm) = result {
         assert_valid_wasm(&wasm, "cg8_complex_extend_prop");
     }

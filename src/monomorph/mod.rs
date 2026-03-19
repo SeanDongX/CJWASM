@@ -908,8 +908,14 @@ fn collect_instantiations(
                 }
             }
             (
-                Type::Function { params: pp, ret: pr },
-                Type::Function { params: cp, ret: cr },
+                Type::Function {
+                    params: pp,
+                    ret: pr,
+                },
+                Type::Function {
+                    params: cp,
+                    ret: cr,
+                },
             ) => {
                 for (p, c) in pp.iter().zip(cp.iter()) {
                     unify_type(p, c, bindings);
@@ -934,11 +940,15 @@ fn collect_instantiations(
             Expr::Rune(_) => Some(Type::Rune),
             Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
             Expr::Var(name) => locals.get(name).cloned(),
-            Expr::ConstructorCall { name, type_args, .. } => Some(Type::Struct(
+            Expr::ConstructorCall {
+                name, type_args, ..
+            } => Some(Type::Struct(
                 name.clone(),
                 type_args.clone().unwrap_or_default(),
             )),
-            Expr::StructInit { name, type_args, .. } => Some(Type::Struct(
+            Expr::StructInit {
+                name, type_args, ..
+            } => Some(Type::Struct(
                 name.clone(),
                 type_args.clone().unwrap_or_default(),
             )),
@@ -946,10 +956,12 @@ fn collect_instantiations(
                 .first()
                 .and_then(|e| infer_expr_type(e, locals))
                 .map(|t| Type::Array(Box::new(t))),
-            Expr::Some(e) => {
-                infer_expr_type(e.as_ref(), locals).map(|t| Type::Option(Box::new(t)))
-            }
-            Expr::Lambda { params, return_type, .. } => {
+            Expr::Some(e) => infer_expr_type(e.as_ref(), locals).map(|t| Type::Option(Box::new(t))),
+            Expr::Lambda {
+                params,
+                return_type,
+                ..
+            } => {
                 let param_types: Vec<Type> = params.iter().map(|(_, ty)| ty.clone()).collect();
                 Some(Type::Function {
                     params: param_types,
@@ -965,15 +977,25 @@ fn collect_instantiations(
     fn collect_p3_locals(stmts: &[Stmt], locals: &mut HashMap<String, Type>) {
         for stmt in stmts {
             match stmt {
-                Stmt::Let { pattern, ty: Some(ty), .. }
-                | Stmt::Var { pattern, ty: Some(ty), .. } => {
+                Stmt::Let {
+                    pattern,
+                    ty: Some(ty),
+                    ..
+                }
+                | Stmt::Var {
+                    pattern,
+                    ty: Some(ty),
+                    ..
+                } => {
                     if !matches!(ty, Type::TypeParam(_)) {
                         if let Pattern::Binding(name) = pattern {
                             locals.insert(name.clone(), ty.clone());
                         }
                     }
                 }
-                Stmt::Const { name, ty: Some(ty), .. } => {
+                Stmt::Const {
+                    name, ty: Some(ty), ..
+                } => {
                     if !matches!(ty, Type::TypeParam(_)) {
                         locals.insert(name.clone(), ty.clone());
                     }
@@ -1027,11 +1049,13 @@ fn collect_instantiations(
                     Some(n) => *n,
                     None => return,
                 };
-                let (_, type_params, params) =
-                    match gf_defs.iter().find(|(n, tp, _)| n == name && tp.len() == n_tp) {
-                        Some(d) => d,
-                        None => return,
-                    };
+                let (_, type_params, params) = match gf_defs
+                    .iter()
+                    .find(|(n, tp, _)| n == name && tp.len() == n_tp)
+                {
+                    Some(d) => d,
+                    None => return,
+                };
 
                 let mut bindings: HashMap<String, Type> = HashMap::new();
                 for (param, arg) in params.iter().zip(args.iter()) {
@@ -1045,9 +1069,7 @@ fn collect_instantiations(
                             params: fp_types, ..
                         } = &param.ty
                         {
-                            for ((_, lp_ty), fpt) in
-                                lambda_params.iter().zip(fp_types.iter())
-                            {
+                            for ((_, lp_ty), fpt) in lambda_params.iter().zip(fp_types.iter()) {
                                 if !matches!(lp_ty, Type::TypeParam(_)) {
                                     unify_type(fpt, lp_ty, &mut bindings);
                                 }
@@ -2294,65 +2316,66 @@ mod tests {
             imports: vec![],
             structs: vec![],
             interfaces: vec![],
-            classes: vec![
-                ClassDef {
-                    visibility: Visibility::default(),
-                    name: "Wrapper".to_string(),
-                    type_params: vec!["T".to_string()],
-                    constraints: vec![],
-                    is_abstract: false,
-                    is_sealed: false,
-                    is_open: false,
-                    extends: None,
-                    implements: vec![],
-                    fields: vec![crate::ast::FieldDef {
-                        name: "data".to_string(),
+            classes: vec![ClassDef {
+                visibility: Visibility::default(),
+                name: "Wrapper".to_string(),
+                type_params: vec!["T".to_string()],
+                constraints: vec![],
+                is_abstract: false,
+                is_sealed: false,
+                is_open: false,
+                extends: None,
+                implements: vec![],
+                fields: vec![crate::ast::FieldDef {
+                    name: "data".to_string(),
+                    ty: Type::TypeParam("T".to_string()),
+                    default: None,
+                }],
+                init: Some(InitDef {
+                    params: vec![crate::ast::Param {
+                        name: "d".to_string(),
                         ty: Type::TypeParam("T".to_string()),
                         default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
                     }],
-                    init: Some(InitDef {
+                    body: vec![Stmt::Assign {
+                        target: crate::ast::AssignTarget::Field {
+                            object: "this".to_string(),
+                            field: "data".to_string(),
+                        },
+                        value: Expr::Var("d".to_string()),
+                    }],
+                }),
+                deinit: None,
+                static_init: None,
+                methods: vec![crate::ast::ClassMethod {
+                    override_: false,
+                    func: Function {
+                        visibility: Visibility::default(),
+                        name: "Wrapper.get".to_string(),
+                        type_params: vec![],
+                        constraints: vec![],
                         params: vec![crate::ast::Param {
-                            name: "d".to_string(),
-                            ty: Type::TypeParam("T".to_string()),
+                            name: "self".to_string(),
+                            ty: Type::Struct(
+                                "Wrapper".to_string(),
+                                vec![Type::TypeParam("T".to_string())],
+                            ),
                             default: None,
                             variadic: false,
                             is_named: false,
                             is_inout: false,
                         }],
-                        body: vec![Stmt::Assign {
-                            target: crate::ast::AssignTarget::Field {
-                                object: "this".to_string(),
-                                field: "data".to_string(),
-                            },
-                            value: Expr::Var("d".to_string()),
-                        }],
-                    }),
-                    deinit: None,
-                    static_init: None,
-                    methods: vec![crate::ast::ClassMethod {
-                        override_: false,
-                        func: Function {
-                            visibility: Visibility::default(),
-                            name: "Wrapper.get".to_string(),
-                            type_params: vec![],
-                            constraints: vec![],
-                            params: vec![crate::ast::Param {
-                                name: "self".to_string(),
-                                ty: Type::Struct("Wrapper".to_string(), vec![Type::TypeParam("T".to_string())]),
-                                default: None,
-                                variadic: false,
-                                is_named: false,
-                                is_inout: false,
-                            }],
-                            return_type: Some(Type::TypeParam("T".to_string())),
-                            throws: None,
-                            body: vec![Stmt::Return(Some(Expr::Var("data".to_string())))],
-                            extern_import: None,
-                        },
-                    }],
-                    primary_ctor_params: vec![],
-                },
-            ],
+                        return_type: Some(Type::TypeParam("T".to_string())),
+                        throws: None,
+                        body: vec![Stmt::Return(Some(Expr::Var("data".to_string())))],
+                        extern_import: None,
+                    },
+                }],
+                primary_ctor_params: vec![],
+            }],
             enums: vec![],
             functions: vec![Function {
                 visibility: Visibility::default(),
@@ -2473,7 +2496,9 @@ mod tests {
                     }],
                     return_type: Some(Type::Option(Box::new(Type::TypeParam("T".to_string())))),
                     throws: None,
-                    body: vec![Stmt::Return(Some(Expr::Some(Box::new(Expr::Var("x".to_string())))))],
+                    body: vec![Stmt::Return(Some(Expr::Some(Box::new(Expr::Var(
+                        "x".to_string(),
+                    )))))],
                     extern_import: None,
                 },
                 Function {
@@ -2517,24 +2542,22 @@ mod tests {
             structs: vec![],
             interfaces: vec![],
             classes: vec![],
-            enums: vec![
-                EnumDef {
-                    visibility: Visibility::default(),
-                    name: "Maybe".to_string(),
-                    type_params: vec!["T".to_string()],
-                    constraints: vec![],
-                    variants: vec![
-                        EnumVariant {
-                            name: "Just".to_string(),
-                            payload: Some(Type::TypeParam("T".to_string())),
-                        },
-                        EnumVariant {
-                            name: "Nothing".to_string(),
-                            payload: None,
-                        },
-                    ],
-                },
-            ],
+            enums: vec![EnumDef {
+                visibility: Visibility::default(),
+                name: "Maybe".to_string(),
+                type_params: vec!["T".to_string()],
+                constraints: vec![],
+                variants: vec![
+                    EnumVariant {
+                        name: "Just".to_string(),
+                        payload: Some(Type::TypeParam("T".to_string())),
+                    },
+                    EnumVariant {
+                        name: "Nothing".to_string(),
+                        payload: None,
+                    },
+                ],
+            }],
             functions: vec![Function {
                 visibility: Visibility::default(),
                 name: "unwrap".to_string(),

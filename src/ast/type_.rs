@@ -194,8 +194,14 @@ mod tests {
         assert_eq!(Type::Float16.to_wasm(), ValType::F32);
         assert_eq!(Type::Rune.to_wasm(), ValType::I32);
         assert_eq!(Type::Bool.to_wasm(), ValType::I32);
-        assert_eq!(Type::Tuple(vec![Type::Int64, Type::Float64]).to_wasm(), ValType::I32);
-        assert_eq!(Type::Struct("Point".to_string(), vec![]).to_wasm(), ValType::I32);
+        assert_eq!(
+            Type::Tuple(vec![Type::Int64, Type::Float64]).to_wasm(),
+            ValType::I32
+        );
+        assert_eq!(
+            Type::Struct("Point".to_string(), vec![]).to_wasm(),
+            ValType::I32
+        );
         assert_eq!(Type::Range.to_wasm(), ValType::I32);
         assert_eq!(
             Type::Function {

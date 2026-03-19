@@ -153,6 +153,91 @@
 
 - `positive_expected_compile_but_failed` 从 `86` 降到 `< 20`
 
+### P2-1 当前进展（2026-03-19）
+
+- 已完成反引号标识符的 parser 主干兼容（`src/parser/mod.rs`, `decl.rs`, `type_.rs`, `expr.rs`）：
+  - `advance_ident` 新增 `BacktickStringLit(Plain(...))` 支持
+  - 新增并接入 `peek_ident_like/peek_next_ident_like/peek_ident_eq`
+  - 参数、命名参数、类型名、字段/方法名、`catch` 变量、`super.xxx`、点访问等路径统一改为“标识符位可接收反引号标识符”
+  - 表达式中 `BacktickStringLit(Plain(...))` 改为按标识符处理；仅 `Interpolated` 继续按字符串处理
+- 新增 parser 回归单测：
+  - `test_p2_parse_backtick_identifiers_in_decl_expr_type`
+  - `test_p2_parse_backtick_named_param_and_arg`
+  - `cargo test parser:: --lib`：`214 passed`
+- 定向 conformance 回归（3 个子目录）：
+  - 命令：`./scripts/conformance_diff.sh --tests ...a04 --tests ...a05 --tests ...a06`
+  - 结果：`target/conformance/20260319_093234/diff.txt`
+  - `different/same = 15/161`，其中 `PASSED -> FAILED = 12`，`INCOMPLETE -> FAILED = 3`
+- 关键变化（P2 命中）：
+  - `06_03_01_01_a05_17`、`06_03_04_01_a06_26`、`06_03_04_01_a06_33`
+  - 由原来的 parser 报错
+    `BacktickStringLit(Plain("f")) -> 期望: 方法名`
+    转为 CHIR 语义错误（例如 `return type ...`、`'static' and 'override' modifiers conflict`）
+  - 说明该批 “反引号方法名/标识符” 语法误拒绝已从 parser 阶段清除，剩余差异主要转入语义层（P1）
+
+### P2-2 当前进展（2026-03-19）
+
+- 已修复 `src/parser/decl.rs` 两类 parser 误拒绝：
+  - `struct` 主构造参数支持必需命名参数标记：`name!: Type`
+    - 场景：`struct S { S(protected let a!: Int64) {} }`
+    - 之前报错：`Bang -> expect:Colon`
+  - `enum` 成员函数修饰符顺序兼容：
+    - 支持 `public redef static func ...`、`static public func ...` 等组合
+    - 之前报错：`Static -> expect:变体名`（被误当作 enum variant 解析）
+    - 同步修正：enum `static` 方法不再注入隐式 `this` 参数
+
+- 新增 parser 回归单测（`src/parser/mod.rs`）：
+  - `test_p2_parse_struct_primary_ctor_named_param_with_modifier`
+  - `test_p2_parse_enum_method_with_redef_static_modifier_order`
+
+- 验证结果：
+  - `cargo test parser:: --lib`：`216 passed`
+  - 定向 conformance：
+    - `./scripts/conformance_diff.sh --tests ../testsuite/src/tests/05_function/01_function_definition/05_function_declaration/a01/test_a01_14.cj --tests ../testsuite/src/tests/06_class_and_interface/02_interfaces/04_implementation_of_interfaces/01_overriding_and_overloading_when_a_class_implements_interfaces/a05/test_a05_089.cj --tests ../testsuite/src/tests/02_types/01_value_types/10_struct_type/02_constructors/a02/test_a02_190.cj`
+    - 基线 `target/conformance/20260319_101809/diff.txt`：`PASSED -> FAILED = 2`
+    - 本轮 `target/conformance/20260319_102052/diff.txt`：`different/same = 0/3`，`PASSED -> FAILED = 0`
+  - 同语法族扩展回归（390 用例）：
+    - `./scripts/conformance_diff.sh --tests ../testsuite/src/tests/02_types/01_value_types/10_struct_type/02_constructors/a02 --tests ../testsuite/src/tests/06_class_and_interface/02_interfaces/04_implementation_of_interfaces/01_overriding_and_overloading_when_a_class_implements_interfaces/a05`
+    - `target/conformance/20260319_102615/diff.txt` 中不再出现 `Bang -> expect:Colon`、`Static -> expect:变体名` 两类 parser 报错
+    - 当前剩余差异主要转入语义层（大量 `PASSED -> FAILED` 为“负向用例未被拒绝”）
+
+## 下一步执行计划（2026-03-19）
+
+### Step 1（P1-2c，优先）
+
+目标：修复 `static + override/redef` 在“实现接口静态方法”场景下的误报，降低 `06_02_04_01_a05` 子域误拒绝。
+
+- 改造点：
+  - `src/chir/lower.rs` 中 override/redef 校验规则
+  - 区分“非法冲突”与“实现接口静态成员的合法路径”
+- 回归命令：
+  - `./scripts/conformance_diff.sh --no-build --tests ../testsuite/src/tests/06_class_and_interface/02_interfaces/04_implementation_of_interfaces/01_overriding_and_overloading_when_a_class_implements_interfaces/a05`
+- 验收：
+  - `PASSED -> FAILED` 持续下降
+  - 不引入新的 `INCOMPLETE -> FAILED`
+
+### Step 2（P1-2d）
+
+目标：补齐 `struct` 构造参数修饰符语义矩阵（`private/protected/internal/public` + named/unnamed + default），与 cjc 负向语义对齐。
+
+- 改造点：
+  - `src/chir/lower.rs` / `src/typeck/mod.rs` 的构造参数合法性校验
+  - 与 parser 已支持的语法做“语义层一致性收敛”
+- 回归命令：
+  - `./scripts/conformance_diff.sh --no-build --tests ../testsuite/src/tests/02_types/01_value_types/10_struct_type/02_constructors/a02`
+- 验收：
+  - 该子域内 `PASSED -> FAILED` 持续下降
+  - 不回退 P2-2 已修复的 `Bang -> expect:Colon` 语法问题
+
+### Step 3（过程约束）
+
+目标：保证每轮优化可追踪、可回滚、可比较。
+
+- 每完成一个子域后，必须更新本文件：
+  - 记录本轮 `diff.txt` 路径
+  - 记录 `different/same`、`PASSED -> FAILED`、`INCOMPLETE -> FAILED` 变化
+  - 标注“语法问题已转入语义层”或“新语法缺口”归因
+
 ## P3（收尾）
 
 - `compile_warning=yes` 相关 17 个差异：补 warning 语义或在对齐阶段单独统计

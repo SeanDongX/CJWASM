@@ -222,7 +222,11 @@ mod tests {
         let mut wasm_func = WasmFunc::new(vec![]);
         let before = wasm_func.byte_len();
         codegen.compile_macro_call("Deprecated", &[], &locals, &mut wasm_func, None);
-        assert_eq!(wasm_func.byte_len(), before, "Deprecated should not emit code");
+        assert_eq!(
+            wasm_func.byte_len(),
+            before,
+            "Deprecated should not emit code"
+        );
     }
 
     #[test]
@@ -259,6 +263,10 @@ mod tests {
         let mut wasm_func = WasmFunc::new(vec![]);
         let before = wasm_func.byte_len();
         codegen.compile_macro_call("UnknownMacro", &[], &locals, &mut wasm_func, None);
-        assert_eq!(wasm_func.byte_len(), before, "Unknown macro should not emit code");
+        assert_eq!(
+            wasm_func.byte_len(),
+            before,
+            "Unknown macro should not emit code"
+        );
     }
 }

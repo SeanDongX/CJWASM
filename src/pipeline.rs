@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 /// L1 顶层 std 模块名（纯 Cangjie 实现，Vendor 优先）
 const L1_STD_TOP: &[&str] = &[
-    "io", "binary", "console", "overflow", "crypto", "deriving",
-    "ast", "argopt", "sort", "ref", "unicode",
+    "io", "binary", "console", "overflow", "crypto", "deriving", "ast", "argopt", "sort", "ref",
+    "unicode",
 ];
 
 /// 返回 L1 顶层模块名列表，供测试或工具使用
@@ -34,7 +34,7 @@ fn strip_quote_contents(source: &str) -> String {
         if i + 6 <= len && &bytes[i..i + 6] == b"quote(" {
             out.push_str("quote()");
             i += 6; // skip "quote("
-            // 消费直到匹配的 ')'，跟踪嵌套深度
+                    // 消费直到匹配的 ')'，跟踪嵌套深度
             let mut depth = 1usize;
             while i < len && depth > 0 {
                 let ch = bytes[i];
@@ -183,8 +183,8 @@ pub fn parse_source(source: &str) -> Result<Program, String> {
 
 /// 解析文件为 Program AST，返回 (program, source)
 pub fn parse_file(path: &str) -> Result<(Program, String), String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| format!("无法读取文件 '{}': {}", path, e))?;
+    let source =
+        std::fs::read_to_string(path).map_err(|e| format!("无法读取文件 '{}': {}", path, e))?;
     let program = parse_source(&source).map_err(|e| format!("{}: {}", path, e))?;
     Ok((program, source))
 }
@@ -292,7 +292,12 @@ pub fn resolve_import_to_files(
     // L1 Vendor 优先：std.io / std.crypto.digest 等
     if let Some(vendor) = vendor_std_dir {
         if is_l1_std_module(module_path) && module_path.len() >= 2 {
-            let rel: PathBuf = module_path[1..].iter().cloned().collect::<Vec<_>>().join("/").into();
+            let rel: PathBuf = module_path[1..]
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("/")
+                .into();
             let dir = vendor.join(rel);
             if dir.exists() && dir.is_dir() {
                 let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
@@ -435,7 +440,10 @@ extend<T> Array<T> <: SortByExtension<T> {
         let program = result.unwrap();
         assert_eq!(program.extends.len(), 1);
         assert_eq!(program.extends[0].target_type, "Array");
-        assert_eq!(program.extends[0].interface.as_deref(), Some("SortByExtension"));
+        assert_eq!(
+            program.extends[0].interface.as_deref(),
+            Some("SortByExtension")
+        );
     }
 
     #[test]
@@ -528,8 +536,13 @@ extend<T> Array<T> <: SortByExtension<T> {
             bases,
             Some(vendor_ref),
         );
-        assert!(!files.is_empty(), "L1 std.overflow 应解析到 vendor 下多个 .cj");
-        assert!(files.iter().all(|p| p.extension().map_or(false, |e| e == "cj")));
+        assert!(
+            !files.is_empty(),
+            "L1 std.overflow 应解析到 vendor 下多个 .cj"
+        );
+        assert!(files
+            .iter()
+            .all(|p| p.extension().map_or(false, |e| e == "cj")));
 
         let _ = fs::remove_dir_all(&tmp).ok();
     }
@@ -549,10 +562,7 @@ extend<T> Array<T> <: SortByExtension<T> {
         let test_file = tmp.join("math/utils.cj");
         let _ = fs::write(&test_file, "func foo(): Int64 { return 0 }");
 
-        let result = resolve_import_path(
-            &["math".to_string(), "utils".to_string()],
-            &tmp,
-        );
+        let result = resolve_import_path(&["math".to_string(), "utils".to_string()], &tmp);
         assert!(result.is_some());
 
         // 清理
@@ -566,10 +576,7 @@ extend<T> Array<T> <: SortByExtension<T> {
         let test_file = tmp.join("math_utils.cj");
         let _ = fs::write(&test_file, "func foo(): Int64 { return 0 }");
 
-        let result = resolve_import_path(
-            &["math".to_string(), "utils".to_string()],
-            &tmp,
-        );
+        let result = resolve_import_path(&["math".to_string(), "utils".to_string()], &tmp);
         assert!(result.is_some());
 
         let _ = fs::remove_dir_all(&tmp);
@@ -582,10 +589,7 @@ extend<T> Array<T> <: SortByExtension<T> {
         let test_file = tmp.join("src/math/utils.cj");
         let _ = fs::write(&test_file, "func foo(): Int64 { return 0 }");
 
-        let result = resolve_import_path(
-            &["math".to_string(), "utils".to_string()],
-            &tmp,
-        );
+        let result = resolve_import_path(&["math".to_string(), "utils".to_string()], &tmp);
         assert!(result.is_some());
 
         let _ = fs::remove_dir_all(&tmp);
@@ -651,11 +655,8 @@ extend<T> Array<T> <: SortByExtension<T> {
         let file2 = tmp.join("helper.cj");
         let _ = fs::write(&file2, "func helper(): Int64 { return 42 }");
 
-        let wasm = compile_files_to_wasm(&[
-            file1.to_str().unwrap(),
-            file2.to_str().unwrap(),
-        ])
-        .unwrap();
+        let wasm =
+            compile_files_to_wasm(&[file1.to_str().unwrap(), file2.to_str().unwrap()]).unwrap();
         assert!(wasm.len() >= 8);
         assert_eq!(&wasm[0..4], b"\0asm");
 

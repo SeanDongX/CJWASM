@@ -57,7 +57,8 @@ pub fn analyze(program: &Program) -> SemanticContext {
             }
             if let Some(inferred) = infer_return_from_body(&func.body, &known) {
                 known.insert(func.name.clone(), inferred.clone());
-                ctx.inferred_return_types.insert(func.name.clone(), inferred);
+                ctx.inferred_return_types
+                    .insert(func.name.clone(), inferred);
                 changed = true;
             }
         }
@@ -87,7 +88,8 @@ pub fn analyze(program: &Program) -> SemanticContext {
                 }
                 if let Some(inferred) = infer_return_from_body(&m.func.body, &known) {
                     known.insert(m.func.name.clone(), inferred.clone());
-                    ctx.inferred_return_types.insert(m.func.name.clone(), inferred);
+                    ctx.inferred_return_types
+                        .insert(m.func.name.clone(), inferred);
                     changed = true;
                 }
             }
@@ -169,29 +171,41 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
 
         // ── Option/Result 构造 ────────────────────────────────────────────────
         Expr::Some(inner) => infer_expr(inner, known).map(|t| Type::Option(Box::new(t))),
-        Expr::Ok(inner) => infer_expr(inner, known)
-            .map(|t| Type::Result(Box::new(t), Box::new(Type::String))),
+        Expr::Ok(inner) => {
+            infer_expr(inner, known).map(|t| Type::Result(Box::new(t), Box::new(Type::String)))
+        }
         Expr::Err(_) => Some(Type::Result(Box::new(Type::Int64), Box::new(Type::String))),
         Expr::None => None,
 
         // ── 构造函数 / 结构体 ─────────────────────────────────────────────────
-        Expr::StructInit { name, type_args, .. } => {
+        Expr::StructInit {
+            name, type_args, ..
+        } => {
             let ta = type_args.clone().unwrap_or_default();
             Some(Type::Struct(name.clone(), ta))
         }
-        Expr::ConstructorCall { name, type_args, .. } => {
+        Expr::ConstructorCall {
+            name, type_args, ..
+        } => {
             let ta = type_args.clone().unwrap_or_default();
             Some(Type::Struct(name.clone(), ta))
         }
 
         // ── 函数调用 ──────────────────────────────────────────────────────────
-        Expr::Call { name, type_args, .. } => {
+        Expr::Call {
+            name, type_args, ..
+        } => {
             // 优先查已知符号表
             if let Some(ty) = known.get(name.as_str()) {
                 return Some(ty.clone());
             }
             // 大写开头名字 → 构造函数，返回 Struct 类型
-            if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            if name
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+            {
                 let ta = type_args.clone().unwrap_or_default();
                 return Some(Type::Struct(name.clone(), ta));
             }
@@ -329,19 +343,13 @@ mod tests {
     #[test]
     fn test_infer_expr_integer() {
         let known = HashMap::new();
-        assert_eq!(
-            infer_expr(&Expr::Integer(42), &known),
-            Some(Type::Int64)
-        );
+        assert_eq!(infer_expr(&Expr::Integer(42), &known), Some(Type::Int64));
     }
 
     #[test]
     fn test_infer_expr_float() {
         let known = HashMap::new();
-        assert_eq!(
-            infer_expr(&Expr::Float(3.14), &known),
-            Some(Type::Float64)
-        );
+        assert_eq!(infer_expr(&Expr::Float(3.14), &known), Some(Type::Float64));
     }
 
     #[test]
@@ -421,10 +429,7 @@ mod tests {
         let expr = Expr::Ok(Box::new(Expr::String("ok".to_string())));
         assert_eq!(
             infer_expr(&expr, &known),
-            Some(Type::Result(
-                Box::new(Type::String),
-                Box::new(Type::String),
-            ))
+            Some(Type::Result(Box::new(Type::String), Box::new(Type::String),))
         );
     }
 
@@ -434,10 +439,7 @@ mod tests {
         let expr = Expr::Err(Box::new(Expr::String("err".to_string())));
         assert_eq!(
             infer_expr(&expr, &known),
-            Some(Type::Result(
-                Box::new(Type::Int64),
-                Box::new(Type::String),
-            ))
+            Some(Type::Result(Box::new(Type::Int64), Box::new(Type::String),))
         );
     }
 
@@ -646,10 +648,7 @@ mod tests {
     #[test]
     fn test_infer_expr_tuple() {
         let known = HashMap::new();
-        let expr = Expr::Tuple(vec![
-            Expr::Integer(1),
-            Expr::String("two".to_string()),
-        ]);
+        let expr = Expr::Tuple(vec![Expr::Integer(1), Expr::String("two".to_string())]);
         assert_eq!(
             infer_expr(&expr, &known),
             Some(Type::Tuple(vec![Type::Int64, Type::String]))
@@ -659,10 +658,7 @@ mod tests {
     #[test]
     fn test_infer_expr_array() {
         let known = HashMap::new();
-        let expr = Expr::Array(vec![
-            Expr::Integer(1),
-            Expr::Integer(2),
-        ]);
+        let expr = Expr::Array(vec![Expr::Integer(1), Expr::Integer(2)]);
         assert_eq!(
             infer_expr(&expr, &known),
             Some(Type::Array(Box::new(Type::Int64)))

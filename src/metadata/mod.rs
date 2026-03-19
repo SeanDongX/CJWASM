@@ -10,7 +10,11 @@ use crate::ast::Type;
 /// `type_name`  - 对象的结构体名（如 "ArrayList", "HashMap"）
 /// `type_args`  - 泛型参数（如 ArrayList<Int64> → [Int64]）
 /// `method`     - 方法名
-pub fn stdlib_method_return_type(type_name: &str, type_args: &[Type], method: &str) -> Option<Type> {
+pub fn stdlib_method_return_type(
+    type_name: &str,
+    type_args: &[Type],
+    method: &str,
+) -> Option<Type> {
     let elem = || type_args.first().cloned().unwrap_or(Type::Int64);
     let ktype = || type_args.first().cloned().unwrap_or(Type::Int64);
     let vtype = || type_args.get(1).cloned().unwrap_or(Type::Int64);
@@ -18,9 +22,10 @@ pub fn stdlib_method_return_type(type_name: &str, type_args: &[Type], method: &s
     match (type_name, method) {
         // ── ArrayList / LinkedList / ArrayStack ──────────────────────────────
         // 底层 WASM 实现均直接返回元素值（i64），不包装为 Option
-        ("ArrayList" | "LinkedList" | "ArrayStack", "get" | "first" | "last" | "pop" | "remove") => {
-            Some(elem())
-        }
+        (
+            "ArrayList" | "LinkedList" | "ArrayStack",
+            "get" | "first" | "last" | "pop" | "remove",
+        ) => Some(elem()),
         // Unit 返回值不暴露，避免 .to_wasm() panic
         (
             "ArrayList" | "LinkedList" | "ArrayStack",
@@ -30,9 +35,7 @@ pub fn stdlib_method_return_type(type_name: &str, type_args: &[Type], method: &s
         ("ArrayList" | "LinkedList" | "ArrayStack", "size") => Some(Type::Int64),
         ("ArrayList" | "LinkedList" | "ArrayStack", "isEmpty") => Some(Type::Bool),
         ("ArrayList" | "LinkedList" | "ArrayStack", "contains") => Some(Type::Bool),
-        ("ArrayList" | "LinkedList" | "ArrayStack", "indexOf" | "lastIndexOf") => {
-            Some(Type::Int64)
-        }
+        ("ArrayList" | "LinkedList" | "ArrayStack", "indexOf" | "lastIndexOf") => Some(Type::Int64),
         ("ArrayList" | "LinkedList" | "ArrayStack", "toArray" | "clone" | "slice") => {
             Some(Type::Array(Box::new(elem())))
         }
@@ -50,9 +53,7 @@ pub fn stdlib_method_return_type(type_name: &str, type_args: &[Type], method: &s
         ("HashMap", "size") => Some(Type::Int64),
         ("HashMap", "keys") => Some(Type::Array(Box::new(ktype()))),
         ("HashMap", "values") => Some(Type::Array(Box::new(vtype()))),
-        ("HashMap", "entries") => {
-            Some(Type::Array(Box::new(Type::Tuple(vec![ktype(), vtype()]))))
-        }
+        ("HashMap", "entries") => Some(Type::Array(Box::new(Type::Tuple(vec![ktype(), vtype()])))),
         ("HashMap", "toString") => Some(Type::String),
 
         // ── HashSet ──────────────────────────────────────────────────────────
@@ -61,9 +62,7 @@ pub fn stdlib_method_return_type(type_name: &str, type_args: &[Type], method: &s
         ("HashSet", "size") => Some(Type::Int64),
         ("HashSet", "isEmpty") => Some(Type::Bool),
         ("HashSet", "toArray") => Some(Type::Array(Box::new(elem()))),
-        ("HashSet", "iterator") => {
-            Some(Type::Struct("Iterator".to_string(), type_args.to_vec()))
-        }
+        ("HashSet", "iterator") => Some(Type::Struct("Iterator".to_string(), type_args.to_vec())),
 
         // ── StringBuilder ────────────────────────────────────────────────────
         ("StringBuilder", "append" | "prepend" | "insert" | "deleteCharAt" | "clear") => {
@@ -97,18 +96,15 @@ pub fn stdlib_method_return_type(type_name: &str, type_args: &[Type], method: &s
         ("Duration", "add" | "sub" | "mul") => Some(Type::Struct("Duration".to_string(), vec![])),
 
         // ── DateTime / Instant ───────────────────────────────────────────────
-        ("DateTime" | "Instant", "timestamp" | "toEpochMilli" | "toEpochNano") => {
-            Some(Type::Int64)
-        }
+        ("DateTime" | "Instant", "timestamp" | "toEpochMilli" | "toEpochNano") => Some(Type::Int64),
         ("DateTime" | "Instant", "format" | "toString") => Some(Type::String),
         ("DateTime" | "Instant", "add" | "sub") => {
             Some(Type::Struct(type_name.to_string(), vec![]))
         }
         ("DateTime" | "Instant", "isBefore" | "isAfter" | "equals") => Some(Type::Bool),
-        (
-            "DateTime",
-            "year" | "month" | "day" | "hour" | "minute" | "second" | "nanosecond",
-        ) => Some(Type::Int64),
+        ("DateTime", "year" | "month" | "day" | "hour" | "minute" | "second" | "nanosecond") => {
+            Some(Type::Int64)
+        }
 
         // ── Thread ───────────────────────────────────────────────────────────
         ("Thread", "join" | "start" | "sleep") => None,
@@ -129,10 +125,9 @@ pub fn stdlib_method_return_type(type_name: &str, type_args: &[Type], method: &s
             | "OutputStream" | "InputStream",
             "readToString",
         ) => Some(Type::String),
-        (
-            "File" | "FileReader" | "BufferedReader" | "InputStream",
-            "readLine" | "readLines",
-        ) => Some(Type::Option(Box::new(Type::String))),
+        ("File" | "FileReader" | "BufferedReader" | "InputStream", "readLine" | "readLines") => {
+            Some(Type::Option(Box::new(Type::String)))
+        }
         (
             "File" | "FileWriter" | "FileReader" | "BufferedReader" | "BufferedWriter"
             | "OutputStream" | "InputStream",
@@ -142,16 +137,18 @@ pub fn stdlib_method_return_type(type_name: &str, type_args: &[Type], method: &s
             "File" | "FileWriter" | "FileReader" | "BufferedReader" | "BufferedWriter",
             "size" | "length",
         ) => Some(Type::Int64),
-        (
-            "File",
-            "exists" | "isFile" | "isDirectory" | "createNewFile" | "mkdirs" | "delete",
-        ) => Some(Type::Bool),
-        ("File", "listFiles") => {
-            Some(Type::Array(Box::new(Type::Struct("File".to_string(), vec![]))))
+        ("File", "exists" | "isFile" | "isDirectory" | "createNewFile" | "mkdirs" | "delete") => {
+            Some(Type::Bool)
         }
+        ("File", "listFiles") => Some(Type::Array(Box::new(Type::Struct(
+            "File".to_string(),
+            vec![],
+        )))),
         ("File", "name" | "absolutePath" | "canonicalPath" | "parent") => Some(Type::String),
         ("File", "openRead") => Some(Type::Struct("FileReader".to_string(), vec![])),
-        ("File", "openWrite" | "openAppend") => Some(Type::Struct("FileWriter".to_string(), vec![])),
+        ("File", "openWrite" | "openAppend") => {
+            Some(Type::Struct("FileWriter".to_string(), vec![]))
+        }
 
         // ── Random ───────────────────────────────────────────────────────────
         ("Random", "nextInt64" | "nextInt32" | "nextInt" | "nextLong") => Some(Type::Int64),
@@ -271,7 +268,9 @@ pub fn stdlib_constructor_type(name: &str, type_args: &[Type]) -> Option<Type> {
         "FileReader" => Some(Type::Struct("FileReader".to_string(), vec![])),
         "BufferedReader" => Some(Type::Struct("BufferedReader".to_string(), vec![])),
         "BufferedWriter" => Some(Type::Struct("BufferedWriter".to_string(), vec![])),
-        "Queue" | "Deque" | "PriorityQueue" => Some(Type::Struct(name.to_string(), type_args.to_vec())),
+        "Queue" | "Deque" | "PriorityQueue" => {
+            Some(Type::Struct(name.to_string(), type_args.to_vec()))
+        }
         "Stack" => Some(Type::Struct("Stack".to_string(), type_args.to_vec())),
         "TreeMap" => Some(Type::Map(Box::new(ktype()), Box::new(vtype()))),
         "TreeSet" => Some(Type::Map(Box::new(elem()), Box::new(Type::Int64))),
@@ -491,7 +490,10 @@ mod tests {
         );
         assert_eq!(
             stdlib_method_return_type("File", &[], "listFiles"),
-            Some(Type::Array(Box::new(Type::Struct("File".to_string(), vec![]))))
+            Some(Type::Array(Box::new(Type::Struct(
+                "File".to_string(),
+                vec![]
+            ))))
         );
         assert_eq!(
             stdlib_method_return_type("File", &[], "openRead"),
@@ -584,10 +586,7 @@ mod tests {
 
     #[test]
     fn test_unknown_type_method_returns_none() {
-        assert_eq!(
-            stdlib_method_return_type("UnknownType", &[], "foo"),
-            None
-        );
+        assert_eq!(stdlib_method_return_type("UnknownType", &[], "foo"), None);
     }
 
     // ─── stdlib_field_type ───────────────────────────────────────────────────
@@ -610,22 +609,13 @@ mod tests {
 
     #[test]
     fn test_thread_fields() {
-        assert_eq!(
-            stdlib_field_type("Thread", &[], "id"),
-            Some(Type::Int64)
-        );
-        assert_eq!(
-            stdlib_field_type("Thread", &[], "name"),
-            Some(Type::String)
-        );
+        assert_eq!(stdlib_field_type("Thread", &[], "id"), Some(Type::Int64));
+        assert_eq!(stdlib_field_type("Thread", &[], "name"), Some(Type::String));
     }
 
     #[test]
     fn test_file_fields() {
-        assert_eq!(
-            stdlib_field_type("File", &[], "name"),
-            Some(Type::String)
-        );
+        assert_eq!(stdlib_field_type("File", &[], "name"), Some(Type::String));
     }
 
     #[test]
@@ -717,17 +707,11 @@ mod tests {
         let map_args = vec![Type::String, Type::Int64];
         assert_eq!(
             stdlib_constructor_type("TreeMap", &map_args),
-            Some(Type::Map(
-                Box::new(Type::String),
-                Box::new(Type::Int64),
-            ))
+            Some(Type::Map(Box::new(Type::String), Box::new(Type::Int64),))
         );
         assert_eq!(
             stdlib_constructor_type("Channel", &[Type::String]),
-            Some(Type::Struct(
-                "Channel".to_string(),
-                vec![Type::String],
-            ))
+            Some(Type::Struct("Channel".to_string(), vec![Type::String],))
         );
     }
 

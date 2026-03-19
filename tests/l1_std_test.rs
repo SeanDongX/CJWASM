@@ -30,11 +30,8 @@ fn test_l1_all_top_modules_resolve_from_vendor() {
 
     for &name in modules {
         let module_path = ["std".to_string(), name.to_string()];
-        let files = cjwasm::pipeline::resolve_import_to_files(
-            &module_path,
-            bases,
-            Some(vendor.as_path()),
-        );
+        let files =
+            cjwasm::pipeline::resolve_import_to_files(&module_path, bases, Some(vendor.as_path()));
         assert!(
             !files.is_empty(),
             "L1 模块 std.{} 应从 vendor 解析到至少一个 .cj 文件 (vendor={})",
@@ -42,7 +39,9 @@ fn test_l1_all_top_modules_resolve_from_vendor() {
             vendor.display()
         );
         assert!(
-            files.iter().all(|p| p.extension().map_or(false, |e| e == "cj")),
+            files
+                .iter()
+                .all(|p| p.extension().map_or(false, |e| e == "cj")),
             "L1 std.{} 解析结果应均为 .cj 文件: {:?}",
             name,
             files
@@ -116,11 +115,8 @@ fn assert_l1_module_resolves(name: &str) {
     };
     let module_path = ["std".to_string(), name.to_string()];
     let bases: &[&Path] = &[];
-    let files = cjwasm::pipeline::resolve_import_to_files(
-        &module_path,
-        bases,
-        Some(vendor.as_path()),
-    );
+    let files =
+        cjwasm::pipeline::resolve_import_to_files(&module_path, bases, Some(vendor.as_path()));
     assert!(
         !files.is_empty(),
         "std.{} 应从 vendor 解析到至少一个 .cj (vendor={})",
@@ -128,7 +124,9 @@ fn assert_l1_module_resolves(name: &str) {
         vendor.display()
     );
     assert!(
-        files.iter().all(|p| p.extension().map_or(false, |e| e == "cj")),
+        files
+            .iter()
+            .all(|p| p.extension().map_or(false, |e| e == "cj")),
         "std.{} 解析结果应均为 .cj: {:?}",
         name,
         files
@@ -144,15 +142,20 @@ fn test_l1_std_subpackage_resolve() {
     };
     let bases: &[&Path] = &[];
     let subpackages = [
-        ["std".to_string(), "crypto".to_string(), "digest".to_string()],
-        ["std".to_string(), "crypto".to_string(), "cipher".to_string()],
+        [
+            "std".to_string(),
+            "crypto".to_string(),
+            "digest".to_string(),
+        ],
+        [
+            "std".to_string(),
+            "crypto".to_string(),
+            "cipher".to_string(),
+        ],
     ];
     for module_path in &subpackages {
-        let files = cjwasm::pipeline::resolve_import_to_files(
-            module_path,
-            bases,
-            Some(vendor.as_path()),
-        );
+        let files =
+            cjwasm::pipeline::resolve_import_to_files(module_path, bases, Some(vendor.as_path()));
         let name = module_path.join(".");
         assert!(
             !files.is_empty(),
@@ -192,7 +195,9 @@ fn test_l1_collect_import_files_multi_module() {
         files.len()
     );
     assert!(
-        files.iter().all(|p| p.extension().map_or(false, |e| e == "cj")),
+        files
+            .iter()
+            .all(|p| p.extension().map_or(false, |e| e == "cj")),
         "collect 结果应均为 .cj"
     );
 }

@@ -1190,7 +1190,10 @@ mod tests {
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(tokens[0], Token::HashRawStringLit("hello".to_string()));
         assert_eq!(tokens[1], Token::HashRawStringLit("world".to_string()));
-        assert_eq!(tokens[2], Token::HashRawStringLit("raw###string".to_string()));
+        assert_eq!(
+            tokens[2],
+            Token::HashRawStringLit("raw###string".to_string())
+        );
     }
 
     #[test]

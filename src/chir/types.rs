@@ -1,6 +1,6 @@
 //! CHIR 类型定义
 
-use crate::ast::{BinOp, UnaryOp, Type, StructDef, ClassDef, EnumDef};
+use crate::ast::{BinOp, ClassDef, EnumDef, StructDef, Type, UnaryOp};
 use wasm_encoder::ValType;
 
 /// 源码位置（用于错误报告）
@@ -31,8 +31,8 @@ pub enum CHIRExprKind {
     Rune(char),
 
     // 变量和引用
-    Local(u32),              // 局部变量索引
-    Global(String),          // 全局变量名
+    Local(u32),     // 局部变量索引
+    Global(String), // 全局变量名
 
     // 运算
     Binary {
@@ -47,12 +47,12 @@ pub enum CHIRExprKind {
 
     // 函数调用
     Call {
-        func_idx: u32,       // 函数索引（已解析）
+        func_idx: u32, // 函数索引（已解析）
         args: Vec<CHIRExpr>,
     },
     MethodCall {
         vtable_offset: Option<u32>, // vtable 偏移（虚方法）
-        func_idx: Option<u32>,       // 函数索引（静态方法）
+        func_idx: Option<u32>,      // 函数索引（静态方法）
         receiver: Box<CHIRExpr>,
         args: Vec<CHIRExpr>,
     },
@@ -168,38 +168,27 @@ pub enum CHIRExprKind {
 
     // 间接函数调用 (Lambda/函数类型变量)
     CallIndirect {
-        type_idx: u32,          // WASM 类型索引
+        type_idx: u32, // WASM 类型索引
         args: Vec<CHIRExpr>,
-        callee: Box<CHIRExpr>,  // table index expression
+        callee: Box<CHIRExpr>, // table index expression
     },
 
     // 特殊
-    Nop,                     // 无操作
-    Unreachable,             // 不可达代码
+    Nop,         // 无操作
+    Unreachable, // 不可达代码
 }
 
 /// CHIR 语句
 #[derive(Debug, Clone)]
 pub enum CHIRStmt {
-    Let {
-        local_idx: u32,
-        value: CHIRExpr,
-    },
-    Assign {
-        target: CHIRLValue,
-        value: CHIRExpr,
-    },
+    Let { local_idx: u32, value: CHIRExpr },
+    Assign { target: CHIRLValue, value: CHIRExpr },
     Expr(CHIRExpr),
     Return(Option<CHIRExpr>),
     Break,
     Continue,
-    While {
-        cond: CHIRExpr,
-        body: CHIRBlock,
-    },
-    Loop {
-        body: CHIRBlock,
-    },
+    While { cond: CHIRExpr, body: CHIRBlock },
+    Loop { body: CHIRBlock },
 }
 
 /// CHIR 左值
@@ -235,10 +224,10 @@ pub struct CHIRMatchArm {
 #[derive(Debug, Clone)]
 pub enum CHIRPattern {
     Wildcard,
-    Binding(u32),            // 局部变量索引
+    Binding(u32), // 局部变量索引
     Literal(CHIRLiteral),
     Variant {
-        discriminant: i32,   // 枚举判别值
+        discriminant: i32, // 枚举判别值
         payload_binding: Option<u32>,
         enum_has_payload: bool,
     },
@@ -257,13 +246,31 @@ pub enum CHIRPattern {
 #[derive(Debug, Clone)]
 pub enum StructPatternField {
     /// 字段值必须等于常量
-    Literal { offset: u32, value: i64, wasm_ty: wasm_encoder::ValType },
+    Literal {
+        offset: u32,
+        value: i64,
+        wasm_ty: wasm_encoder::ValType,
+    },
     /// 字段值绑定到局部变量
-    Binding { offset: u32, local_idx: u32, wasm_ty: wasm_encoder::ValType },
+    Binding {
+        offset: u32,
+        local_idx: u32,
+        wasm_ty: wasm_encoder::ValType,
+    },
     /// 嵌套结构体字段常量检查：先解引用 outer_offset 处的指针，再比较 inner_offset 处的值
-    NestedLiteral { outer_offset: u32, inner_offset: u32, value: i64, wasm_ty: wasm_encoder::ValType },
+    NestedLiteral {
+        outer_offset: u32,
+        inner_offset: u32,
+        value: i64,
+        wasm_ty: wasm_encoder::ValType,
+    },
     /// 嵌套结构体字段绑定
-    NestedBinding { outer_offset: u32, inner_offset: u32, local_idx: u32, wasm_ty: wasm_encoder::ValType },
+    NestedBinding {
+        outer_offset: u32,
+        inner_offset: u32,
+        local_idx: u32,
+        wasm_ty: wasm_encoder::ValType,
+    },
 }
 
 /// CHIR 字面量
@@ -343,11 +350,7 @@ impl CHIRExpr {
 
     /// 创建布尔常量
     pub fn bool_const(value: bool) -> Self {
-        CHIRExpr::new(
-            CHIRExprKind::Bool(value),
-            Type::Bool,
-            ValType::I32,
-        )
+        CHIRExpr::new(CHIRExprKind::Bool(value), Type::Bool, ValType::I32)
     }
 }
 
@@ -492,9 +495,23 @@ mod tests {
         assert!(matches!(binding, CHIRPattern::Binding(5)));
 
         let literal = CHIRPattern::Literal(CHIRLiteral::Integer(42));
-        assert!(matches!(literal, CHIRPattern::Literal(CHIRLiteral::Integer(42))));
+        assert!(matches!(
+            literal,
+            CHIRPattern::Literal(CHIRLiteral::Integer(42))
+        ));
 
-        let range = CHIRPattern::Range { start: 1, end: 10, inclusive: true };
-        assert!(matches!(range, CHIRPattern::Range { start: 1, end: 10, inclusive: true }));
+        let range = CHIRPattern::Range {
+            start: 1,
+            end: 10,
+            inclusive: true,
+        };
+        assert!(matches!(
+            range,
+            CHIRPattern::Range {
+                start: 1,
+                end: 10,
+                inclusive: true
+            }
+        ));
     }
 }

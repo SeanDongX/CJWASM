@@ -10,15 +10,15 @@
 //! - 类型转换显式表示，便于生成正确的 WASM 指令
 //! - 便于添加优化 Pass
 
-pub mod types;
 pub mod builder;
-pub mod type_inference;
+pub mod lower;
 pub mod lower_expr;
 pub mod lower_stmt;
-pub mod lower;
 pub mod optimize;
+pub mod type_inference;
+pub mod types;
 
-pub use types::*;
 pub use builder::CHIRBuilder;
+pub use lower::{lower_function, lower_program};
 pub use type_inference::TypeInferenceContext;
-pub use lower::{lower_program, lower_function};
+pub use types::*;
