@@ -69,6 +69,12 @@ struct InterfaceMethodReq {
     required: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseMethodSource {
+    Parent,
+    Interface,
+}
+
 fn method_short_name(owner: &str, full_name: &str) -> String {
     if let Some(short) = full_name.strip_prefix(&format!("{owner}.")) {
         return short.to_string();
@@ -128,7 +134,7 @@ fn interface_method_sig(method: &crate::ast::InterfaceMethod) -> MethodSig {
         params: method.params.iter().map(|p| p.ty.clone()).collect(),
         return_type: method.return_type.clone(),
         visibility: Visibility::Public,
-        is_static: false,
+        is_static: method.is_static,
         type_params: method.type_params.clone(),
         constraints: method.constraints.clone(),
     }
@@ -595,20 +601,13 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
         if let Some(current_methods) = class_methods.get(&class_def.name) {
             for methods in current_methods.values() {
                 for method in methods {
-                    if method.is_override && method.sig.is_static {
-                        return Err(
-                            "'static' and 'override' modifiers conflict on function declaration"
-                                .to_string(),
-                        );
-                    }
-
-                    let mut base_match: Option<MethodSig> = None;
+                    let mut base_match: Option<(MethodSig, BaseMethodSource)> = None;
                     if let Some(parent_candidates) = parent_methods_by_name.get(&method.sig.name) {
                         if let Some(found) = parent_candidates.iter().find(|base| {
                             same_name_params(base, &method.sig)
                                 && base.is_static == method.sig.is_static
                         }) {
-                            base_match = Some(found.clone());
+                            base_match = Some((found.clone(), BaseMethodSource::Parent));
                         }
                     }
                     if base_match.is_none() {
@@ -616,11 +615,27 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
                         {
                             if let Some(found) = iface_candidates
                                 .iter()
-                                .find(|base| same_name_params(base, &method.sig))
+                                .find(|base| {
+                                    same_name_params(base, &method.sig)
+                                        && base.is_static == method.sig.is_static
+                                })
                             {
-                                base_match = Some(found.clone());
+                                base_match = Some((found.clone(), BaseMethodSource::Interface));
                             }
                         }
+                    }
+
+                    if method.is_override
+                        && method.sig.is_static
+                        && !matches!(
+                            base_match.as_ref().map(|(_, src)| *src),
+                            Some(BaseMethodSource::Interface)
+                        )
+                    {
+                        return Err(
+                            "'static' and 'override' modifiers conflict on function declaration"
+                                .to_string(),
+                        );
                     }
 
                     if method.is_override && base_match.is_none() {
@@ -630,7 +645,7 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
                         ));
                     }
 
-                    if let Some(base) = base_match {
+                    if let Some((base, base_source)) = base_match {
                         if !visibility_at_least(&method.sig.visibility, &base.visibility) {
                             return Err(
                                 "a deriving member must be at least as visible as its base member"
@@ -648,7 +663,16 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
                                     .to_string(),
                             );
                         }
-                        if method.sig.return_type != base.return_type {
+                        // 对接口 static 成员实现，若子方法省略返回类型，允许后续类型推断决定，
+                        // 避免在 lowering 前置阶段产生误报。
+                        let skip_inferred_static_interface_return_check =
+                            method.sig.return_type.is_none()
+                                && method.sig.is_static
+                                && base.is_static
+                                && matches!(base_source, BaseMethodSource::Interface);
+                        if !skip_inferred_static_interface_return_check
+                            && method.sig.return_type != base.return_type
+                        {
                             if method.sig.name.starts_with("__get_")
                                 || method.sig.name.starts_with("__set_")
                             {
@@ -1821,6 +1845,255 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_program_rejects_static_override_without_interface_base() {
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "A".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: None,
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: true,
+                func: Function {
+                    visibility: Visibility::Public,
+                    name: "A.f".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: Some(Type::Unit),
+                    throws: None,
+                    body: vec![],
+                    extern_import: None,
+                },
+            }],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains(
+            "'static' and 'override' modifiers conflict on function declaration"
+        ));
+    }
+
+    #[test]
+    fn test_lower_program_accepts_static_redef_for_interface_static_method() {
+        let iface = InterfaceDef {
+            visibility: Visibility::Public,
+            name: "I".to_string(),
+            parents: vec![],
+            methods: vec![InterfaceMethod {
+                name: "f".to_string(),
+                is_static: true,
+                type_params: vec!["T".to_string()],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Unit),
+                default_body: None,
+            }],
+            assoc_types: vec![],
+        };
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "A".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            // parser 对 `class A <: I` 会把 I 放到 extends
+            extends: Some("I".to_string()),
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: true,
+                func: Function {
+                    visibility: Visibility::Public,
+                    name: "A.f".to_string(),
+                    type_params: vec!["T".to_string()],
+                    constraints: vec![TypeConstraint {
+                        param: "T".to_string(),
+                        bounds: vec!["Any".to_string()],
+                    }],
+                    params: vec![],
+                    return_type: Some(Type::Unit),
+                    throws: None,
+                    body: vec![],
+                    extern_import: None,
+                },
+            }],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![iface],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let chir_program = lower_program(&program).unwrap();
+        assert!(!chir_program.functions.is_empty());
+    }
+
+    #[test]
+    fn test_lower_program_rejects_static_redef_for_interface_instance_method() {
+        let iface = InterfaceDef {
+            visibility: Visibility::Public,
+            name: "I".to_string(),
+            parents: vec![],
+            methods: vec![InterfaceMethod {
+                name: "f".to_string(),
+                is_static: false,
+                type_params: vec![],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Unit),
+                default_body: None,
+            }],
+            assoc_types: vec![],
+        };
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "A".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: Some("I".to_string()),
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: true,
+                func: Function {
+                    visibility: Visibility::Public,
+                    name: "A.f".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: Some(Type::Unit),
+                    throws: None,
+                    body: vec![],
+                    extern_import: None,
+                },
+            }],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![iface],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains(
+            "'static' and 'override' modifiers conflict on function declaration"
+        ));
+    }
+
+    #[test]
+    fn test_lower_program_accepts_static_redef_with_inferred_return_type() {
+        let iface = InterfaceDef {
+            visibility: Visibility::Public,
+            name: "I".to_string(),
+            parents: vec![],
+            methods: vec![InterfaceMethod {
+                name: "f".to_string(),
+                is_static: true,
+                type_params: vec!["T".to_string()],
+                constraints: vec![],
+                params: vec![],
+                return_type: Some(Type::Int64),
+                default_body: None,
+            }],
+            assoc_types: vec![],
+        };
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "A".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: Some("I".to_string()),
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: true,
+                func: Function {
+                    visibility: Visibility::Public,
+                    name: "A.f".to_string(),
+                    type_params: vec!["T".to_string()],
+                    constraints: vec![],
+                    params: vec![],
+                    return_type: None,
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Integer(1)))],
+                    extern_import: None,
+                },
+            }],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![iface],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let chir_program = lower_program(&program).unwrap();
+        assert!(!chir_program.functions.is_empty());
+    }
+
+    #[test]
     fn test_lower_program_rejects_interface_visibility_reduction() {
         let iface = InterfaceDef {
             visibility: Visibility::Public,
@@ -1828,6 +2101,7 @@ mod tests {
             parents: vec![],
             methods: vec![InterfaceMethod {
                 name: "f".to_string(),
+                is_static: false,
                 type_params: vec![],
                 constraints: vec![],
                 params: vec![],
@@ -1899,6 +2173,7 @@ mod tests {
             parents: vec![],
             methods: vec![InterfaceMethod {
                 name: "f".to_string(),
+                is_static: false,
                 type_params: vec![],
                 constraints: vec![],
                 params: vec![],
@@ -1981,6 +2256,7 @@ mod tests {
             parents: vec![],
             methods: vec![InterfaceMethod {
                 name: "f".to_string(),
+                is_static: false,
                 type_params: vec!["T".to_string()],
                 constraints: vec![TypeConstraint {
                     param: "T".to_string(),
@@ -2093,6 +2369,7 @@ mod tests {
             parents: vec![],
             methods: vec![InterfaceMethod {
                 name: "f".to_string(),
+                is_static: false,
                 type_params: vec!["T".to_string()],
                 constraints: vec![TypeConstraint {
                     param: "T".to_string(),

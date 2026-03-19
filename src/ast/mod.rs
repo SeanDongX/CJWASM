@@ -494,6 +494,8 @@ pub struct EnumVariant {
 #[derive(Debug, Clone)]
 pub struct InterfaceMethod {
     pub name: String,
+    /// 是否为 static 接口方法
+    pub is_static: bool,
     /// 泛型类型参数（如 func f<T, U>()）
     pub type_params: Vec<String>,
     /// 类型约束（来自 `<T: Bound>` 或 `where T: Bound`）

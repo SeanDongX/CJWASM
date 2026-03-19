@@ -8128,6 +8128,7 @@ mod tests {
                 parents: vec![],
                 methods: vec![InterfaceMethod {
                     name: "draw".to_string(),
+                    is_static: false,
                     type_params: vec![],
                     constraints: vec![],
                     params: vec![],
@@ -8187,6 +8188,7 @@ mod tests {
                 parents: vec![],
                 methods: vec![InterfaceMethod {
                     name: "print".to_string(),
+                    is_static: false,
                     type_params: vec![],
                     constraints: vec![],
                     params: vec![],

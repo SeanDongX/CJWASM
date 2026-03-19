@@ -1294,6 +1294,7 @@ impl Parser {
                 if !self.check(&Token::LBrace) {
                     methods.push(crate::ast::InterfaceMethod {
                         name: format!("__get_{}", prop_name),
+                        is_static: false,
                         type_params: vec![],
                         constraints: vec![],
                         params: vec![],
@@ -1325,6 +1326,7 @@ impl Parser {
                             };
                             methods.push(crate::ast::InterfaceMethod {
                                 name: format!("__get_{}", prop_name),
+                                is_static: false,
                                 type_params: vec![],
                                 constraints: vec![],
                                 params: vec![],
@@ -1365,6 +1367,7 @@ impl Parser {
                             };
                             methods.push(crate::ast::InterfaceMethod {
                                 name: format!("__set_{}", prop_name),
+                                is_static: false,
                                 type_params: vec![],
                                 constraints: vec![],
                                 params: vec![Param {
@@ -1388,7 +1391,8 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 continue;
             }
-            // cjc: 接口方法可有 static / public / protected / override / mut 修饰符（忽略）
+            // cjc: 接口方法可有 static / public / protected / override / mut 修饰符
+            let mut is_static_method = false;
             while self.check(&Token::Static)
                 || self.check(&Token::Public)
                 || self.check(&Token::Protected)
@@ -1397,6 +1401,9 @@ impl Parser {
                 || self.check(&Token::Open)
                 || self.check(&Token::Mut)
             {
+                if self.check(&Token::Static) {
+                    is_static_method = true;
+                }
                 self.advance();
             }
             // After consuming modifiers, could still be prop or func
@@ -1464,6 +1471,7 @@ impl Parser {
             };
             methods.push(crate::ast::InterfaceMethod {
                 name: m_name,
+                is_static: is_static_method,
                 type_params,
                 constraints,
                 params,

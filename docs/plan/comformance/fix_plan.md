@@ -216,6 +216,38 @@
   - `PASSED -> FAILED` 持续下降
   - 不引入新的 `INCOMPLETE -> FAILED`
 
+### Step 1 当前进展（2026-03-19）
+
+- 已完成 `static + override/redef` 语义路径细化（`src/chir/lower.rs`）：
+  - `InterfaceMethod` 新增 `is_static` 元信息（`src/ast/mod.rs`），并在 parser 接口方法解析中落盘（`src/parser/decl.rs`）
+  - interface 基函数匹配从“仅同名同参”改为“同名同参 + static 属性一致”
+  - `static + override/redef` 仅在“实现接口 static 成员”路径放行，接口实例方法不再误放行
+  - 对“接口 static 实现且实现侧省略返回类型”的场景，避免 lowering 前置阶段误报返回类型不兼容
+- 新增回归单测：
+  - `test_lower_program_rejects_static_redef_for_interface_instance_method`
+  - `test_lower_program_accepts_static_redef_with_inferred_return_type`
+  - 并更新 `test_p_interface_static_modifier` / `test_pg_interface_generic_method_with_constraints` 对 `is_static` 的断言
+
+验证结果：
+
+- `cargo test parser:: --lib`：`216 passed`
+- `cargo test chir::lower::tests:: --lib`：`19 passed`
+- 定向 conformance（先 `cargo build --release`，再执行 Step1 命令）：
+  - 基线 `target/conformance/20260319_172957/diff.txt`
+    - `different/same = 41/88`
+    - `PASSED -> FAILED = 39`
+    - `INCOMPLETE -> FAILED = 2`
+  - 本轮 `target/conformance/20260319_174116/diff.txt`
+    - `different/same = 38/91`
+    - `PASSED -> FAILED = 37`（下降 `2`）
+    - `INCOMPLETE -> FAILED = 1`（下降 `1`）
+
+本轮命中变化：
+
+- `test_a05_001`：`INCOMPLETE -> FAILED` 回落为结果一致（`INCOMPLETE`）
+- `test_a05_005`、`test_a05_026`：`PASSED -> FAILED` 回落为结果一致（`PASSED`）
+- 说明 `static + override/redef` 在“实现接口 static 方法 + 省略返回类型”场景的误报已收敛；当前剩余差异主因转为约束矩阵与部分 parser 兼容缺口。
+
 ### Step 2（P1-2d）
 
 目标：补齐 `struct` 构造参数修饰符语义矩阵（`private/protected/internal/public` + named/unnamed + default），与 cjc 负向语义对齐。

@@ -1990,6 +1990,7 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let program = parser.parse_program().unwrap();
         assert_eq!(program.interfaces.len(), 1);
+        assert!(program.interfaces[0].methods[0].is_static);
     }
 
     #[test]
@@ -3127,6 +3128,7 @@ mod tests {
         let program = parser.parse_program().unwrap();
         let method = &program.interfaces[0].methods[0];
         assert_eq!(method.name, "f");
+        assert!(method.is_static);
         assert_eq!(method.type_params, vec!["T1".to_string(), "T2".to_string()]);
         assert_eq!(method.constraints.len(), 1);
         assert_eq!(method.constraints[0].param, "T1");
