@@ -609,21 +609,51 @@ impl Parser {
             {
                 self.advance();
             }
+            // struct 主构造函数不允许 static 修饰符
+            if self.check(&Token::Static) {
+                let saved_pos = self.pos;
+                let saved_pushback = self.pushback.clone();
+                self.advance();
+                let static_ctor = self.peek_ident_eq(&name) && matches!(self.peek_next(), Some(Token::LParen));
+                self.pos = saved_pos;
+                self.pushback = saved_pushback;
+                if static_ctor {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Static,
+                        "struct 主构造函数不允许 static 修饰符".to_string(),
+                    ));
+                }
+            }
             // cjc 兼容: struct 主构造函数 StructName(var a: T, var b: U) { } — 参数即字段
             if self.peek_ident_eq(&name) && matches!(self.peek_next(), Some(Token::LParen)) {
                 self.advance(); // consume struct name
                 self.expect(Token::LParen)?;
-                // 解析 (public|private|...)? (var|let)? name: Type, ... 作为主构造参数，并转为 fields
+                // 解析 (public|private|...)? (var|let)? name!: Type = default? 并按规则校验参数矩阵
+                let mut seen_named_param = false;
+                let mut seen_member_param = false;
                 while !self.check(&Token::RParen) {
-                    if self.check(&Token::Public)
+                    let visibility_tok = if self.check(&Token::Public)
                         || self.check(&Token::Private)
                         || self.check(&Token::Protected)
                         || self.check(&Token::Internal)
                     {
+                        self.advance()
+                    } else {
+                        None
+                    };
+                    let is_member_param = if self.check(&Token::Var) || self.check(&Token::Let) {
                         self.advance();
-                    }
-                    if self.check(&Token::Var) || self.check(&Token::Let) {
-                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    if !is_member_param {
+                        if let Some(vtok) = visibility_tok {
+                            return self.bail(ParseError::UnexpectedToken(
+                                vtok,
+                                "non-member 参数前不允许可见性修饰符".to_string(),
+                            ));
+                        }
                     }
                     let param_name = match self.advance_ident() {
                         Some(n) => n,
@@ -634,37 +664,76 @@ impl Parser {
                         }
                     };
                     // cjc 兼容: struct 主构造参数支持必需命名参数标记 name!: Type
-                    if self.check(&Token::Bang) {
+                    let is_named = if self.check(&Token::Bang) {
                         self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    if seen_named_param && !is_named {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Ident(param_name.clone()),
+                            "unnamed parameters must come before named parameters".to_string(),
+                        ));
+                    }
+                    if seen_member_param && !is_member_param {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Ident(param_name.clone()),
+                            "regular parameters must come before member variable parameters"
+                                .to_string(),
+                        ));
                     }
                     self.expect(Token::Colon)?;
                     let ty = self.parse_type()?;
+                    if matches!(&ty, Type::Tuple(items) if items.is_empty()) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::RParen,
+                            "struct 构造参数类型不支持 `()`".to_string(),
+                        ));
+                    }
+                    let default = if self.check(&Token::Assign) {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    if default.is_some() && !is_named {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Assign,
+                            "only named parameters can have default values".to_string(),
+                        ));
+                    }
+                    if is_named {
+                        seen_named_param = true;
+                    }
+                    if is_member_param {
+                        seen_member_param = true;
+                    }
                     fields.push(FieldDef {
                         name: param_name,
                         ty,
-                        default: None,
+                        default,
                     });
                     if !self.check(&Token::Comma) {
                         break;
                     }
                     self.advance();
+                    // cjc 对齐：struct 主构造参数列表不接受尾随逗号。
+                    if self.check(&Token::RParen) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::RParen,
+                            "参数名".to_string(),
+                        ));
+                    }
                 }
                 self.expect(Token::RParen)?;
-                // 跳过可选的 { body } 或 ;
-                if self.check(&Token::LBrace) {
-                    self.advance();
-                    let mut depth = 1;
-                    while depth > 0 {
-                        match self.advance() {
-                            Some(Token::LBrace) => depth += 1,
-                            Some(Token::RBrace) => depth -= 1,
-                            None => return self.bail(ParseError::UnexpectedEof),
-                            _ => {}
-                        }
-                    }
-                } else if self.check(&Token::Semicolon) {
-                    self.advance();
-                }
+                // 主构造函数 body 必须存在且使用大括号包裹
+                self.expect(Token::LBrace)?;
+                let prev_receiver = self.receiver_name.clone();
+                self.receiver_name = Some("this".to_string());
+                let _body = self.parse_stmts()?;
+                self.receiver_name = prev_receiver;
+                self.expect(Token::RBrace)?;
                 continue;
             }
 

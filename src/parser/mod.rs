@@ -3224,6 +3224,52 @@ mod tests {
     }
 
     #[test]
+    fn test_p2_parse_backtick_local_var_names() {
+        let source = r#"
+            func main(): Int64 {
+                var `x` = 1
+                let `y` = `x`
+                return `y`
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        let main = program.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(matches!(
+            main.body.first(),
+            Some(Stmt::Var {
+                pattern: Pattern::Binding(name),
+                ..
+            }) if name == "x"
+        ));
+        assert!(matches!(
+            main.body.get(1),
+            Some(Stmt::Let {
+                pattern: Pattern::Binding(name),
+                ..
+            }) if name == "y"
+        ));
+    }
+
+    #[test]
+    fn test_p2_parse_integer_suffix_range_with_negative_end() {
+        let source = r#"
+            func main(): Int64 {
+                let r = -1224i32..-15931i32:36
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
     fn test_p2_parse_struct_primary_ctor_named_param_with_modifier() {
         let source = r#"
             struct S {
@@ -3240,6 +3286,114 @@ mod tests {
         assert_eq!(program.structs[0].fields.len(), 1);
         assert_eq!(program.structs[0].fields[0].name, "a");
         assert_eq!(program.structs[0].fields[0].ty, Type::Int64);
+    }
+
+    #[test]
+    fn test_p1_parse_struct_primary_ctor_named_default() {
+        let source = r#"
+            struct S {
+                S(a!: Int64 = 1, private let b!: String = "x") {
+                    var c = a
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(program.structs.len(), 1);
+        assert_eq!(program.structs[0].fields.len(), 2);
+        assert!(program.structs[0].fields[0].default.is_some());
+        assert!(program.structs[0].fields[1].default.is_some());
+    }
+
+    #[test]
+    fn test_p2_parse_struct_primary_ctor_body_allows_this() {
+        let source = r#"
+            struct S {
+                S(var a: Int64) {
+                    this.a = 1
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.structs.len(), 1);
+    }
+
+    #[test]
+    fn test_p1_reject_struct_primary_ctor_named_before_unnamed() {
+        let err = parse_should_fail(
+            r#"
+            struct S {
+                S(a!: Int64, b: Int64) {}
+            }
+        "#,
+        );
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_p1_reject_struct_primary_ctor_regular_after_member() {
+        let err = parse_should_fail(
+            r#"
+            struct S {
+                S(let a: Int64, b: Int64) {}
+            }
+        "#,
+        );
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_p1_reject_struct_primary_ctor_modifier_without_member() {
+        let err = parse_should_fail(
+            r#"
+            struct S {
+                S(public a: Int64) {}
+            }
+        "#,
+        );
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_p1_reject_struct_primary_ctor_trailing_comma() {
+        let err = parse_should_fail(
+            r#"
+            struct S {
+                S(a: Int64, b!: Bool,) {}
+            }
+        "#,
+        );
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_p1_reject_struct_primary_ctor_static_modifier() {
+        let err = parse_should_fail(
+            r#"
+            struct S {
+                static S() {}
+            }
+        "#,
+        );
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
+    }
+
+    #[test]
+    fn test_p1_reject_struct_primary_ctor_missing_body() {
+        let err = parse_should_fail(
+            r#"
+            struct S {
+                S()
+            }
+        "#,
+        );
+        assert!(matches!(err.error, ParseError::UnexpectedToken(..)));
     }
 
     #[test]

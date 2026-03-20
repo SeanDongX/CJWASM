@@ -261,6 +261,29 @@
   - 该子域内 `PASSED -> FAILED` 持续下降
   - 不回退 P2-2 已修复的 `Bang -> expect:Colon` 语法问题
 
+### Step 2 当前进展（2026-03-20）
+
+- 已在 `src/parser/decl.rs` 收敛 `struct` 主构造参数列表边界：
+  - 新增“尾随逗号非法”校验（`S(a: Int64, b!: Bool,)` 现在报错）
+  - 用例对齐：`test_a02_105.cj` 从 `FAILED -> INCOMPLETE` 回落为结果一致（`FAILED`）
+- 新增 parser 回归单测（`src/parser/mod.rs`）：
+  - `test_p1_reject_struct_primary_ctor_trailing_comma`
+
+验证结果：
+
+- `cargo test parser:: --lib`：`226 passed`
+- 定向 conformance（先 `cargo build --release`，再执行 Step2 命令）：
+  - 基线 `target/conformance/20260320_112457/diff.txt`
+    - `different/same = 1/260`
+    - `FAILED -> INCOMPLETE = 1`
+  - 本轮 `target/conformance/20260320_112824/diff.txt`
+    - `different/same = 0/261`
+    - `PASSED -> FAILED = 0`
+    - `INCOMPLETE -> FAILED = 0`
+    - `FAILED -> INCOMPLETE = 0`（下降 `1`）
+- 回归检查：`target/conformance/20260320_112824/{diff.txt,cjwasm.log,cjc.log}` 中未出现
+  `Bang -> expect:Colon` / `Static -> expect:变体名`。
+
 ### Step 3（过程约束）
 
 目标：保证每轮优化可追踪、可回滚、可比较。
