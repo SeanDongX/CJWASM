@@ -46,6 +46,82 @@ fn validate_class_inheritance(program: &Program) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate extension declarations to prevent duplicate interface implementations
+fn validate_extensions(program: &Program) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    // Known standard library interface implementations
+    let mut known_implementations: HashMap<String, HashSet<String>> = HashMap::new();
+
+    // Numeric types implement ToString, Equatable, Hashable
+    for ty in &["Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
+                "Float32", "Float64", "IntNative", "UIntNative"] {
+        let mut interfaces = HashSet::new();
+        interfaces.insert("ToString".to_string());
+        interfaces.insert("Equatable".to_string());
+        interfaces.insert("Hashable".to_string());
+        known_implementations.insert(ty.to_string(), interfaces);
+    }
+
+    // String implements ToString, Equatable, Hashable
+    {
+        let mut interfaces = HashSet::new();
+        interfaces.insert("ToString".to_string());
+        interfaces.insert("Equatable".to_string());
+        interfaces.insert("Hashable".to_string());
+        known_implementations.insert("String".to_string(), interfaces);
+    }
+
+    // Bool implements ToString, Equatable, Hashable
+    {
+        let mut interfaces = HashSet::new();
+        interfaces.insert("ToString".to_string());
+        interfaces.insert("Equatable".to_string());
+        interfaces.insert("Hashable".to_string());
+        known_implementations.insert("Bool".to_string(), interfaces);
+    }
+
+    // Rune implements ToString, Equatable, Hashable
+    {
+        let mut interfaces = HashSet::new();
+        interfaces.insert("ToString".to_string());
+        interfaces.insert("Equatable".to_string());
+        interfaces.insert("Hashable".to_string());
+        known_implementations.insert("Rune".to_string(), interfaces);
+    }
+
+    let mut type_interfaces: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for ext in &program.extends {
+        if let Some(ref interface) = ext.interface {
+            let type_name = &ext.target_type;
+
+            // Check if this type already implements this interface in standard library
+            if let Some(known_ifaces) = known_implementations.get(type_name) {
+                if known_ifaces.contains(interface) {
+                    return Err(format!(
+                        "type '{}' already implements interface '{}' (from standard library)",
+                        type_name, interface
+                    ));
+                }
+            }
+
+            // Check for duplicate extends in the same program
+            let interfaces = type_interfaces.entry(type_name.clone()).or_insert_with(HashSet::new);
+
+            if interfaces.contains(interface) {
+                return Err(format!(
+                    "type '{}' implements interface '{}' multiple times",
+                    type_name, interface
+                ));
+            }
+            interfaces.insert(interface.clone());
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct MethodSig {
     name: String,
@@ -887,6 +963,7 @@ pub fn lower_function(
 pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     validate_class_inheritance(program)?;
     validate_class_interface_semantics(program)?;
+    validate_extensions(program)?;
 
     // 构建类型推断上下文
     let type_ctx = TypeInferenceContext::from_program(program);
