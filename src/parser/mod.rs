@@ -83,6 +83,41 @@ impl Parser {
         }
     }
 
+    /// Validate raw identifier (backtick identifier) content
+    /// Returns error if identifier is invalid
+    fn validate_raw_identifier(&self, ident: &str) -> Result<(), String> {
+        // Empty or whitespace-only identifier
+        if ident.trim().is_empty() {
+            return Err("原始标识符不能为空或只包含空白字符".to_string());
+        }
+
+        // Single underscore is reserved as wildcard pattern
+        if ident == "_" {
+            return Err("原始标识符不能是单个下划线 '_'".to_string());
+        }
+
+        // Must start with letter or underscore
+        let first_char = ident.chars().next().unwrap();
+        if !first_char.is_alphabetic() && first_char != '_' {
+            return Err(format!(
+                "原始标识符必须以字母或下划线开头，但以 '{}' 开头",
+                first_char
+            ));
+        }
+
+        // Remaining characters must be alphanumeric or underscore
+        for ch in ident.chars().skip(1) {
+            if !ch.is_alphanumeric() && ch != '_' {
+                return Err(format!(
+                    "原始标识符只能包含字母、数字和下划线，但包含 '{}'",
+                    ch
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     fn bail<T>(&self, e: ParseError) -> Result<T, ParseErrorAt> {
         let (s, e_end) = self.at();
         Err(ParseErrorAt {
@@ -135,6 +170,10 @@ impl Parser {
                     n,
                 ))) = self.advance()
                 {
+                    // Validate raw identifier
+                    if let Err(_) = self.validate_raw_identifier(&n) {
+                        return None;
+                    }
                     Some(n)
                 } else {
                     None

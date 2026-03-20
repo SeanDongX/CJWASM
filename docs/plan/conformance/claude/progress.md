@@ -12,9 +12,12 @@
 ## Phase 1: Quick Wins (Week 1-2)
 
 **Target:** 133 tests
-**Completed:** 0/133 (0.0%)
+**Completed:** 12/133 (9.0%)
 
-- [ ] 1.1 Integer Literal Range Validation (0/26)
+- [x] 1.1 Integer Literal Range Validation (12/26) - **PARTIAL**
+  - ✓ Added TypedInteger token with range validation
+  - ✓ All bug_0005869 tests (12 tests) now correctly rejected
+  - ⚠ Need to find remaining 14 tests
 - [ ] 1.2 Extension Re-implementation Validation (0/57)
 - [ ] 1.3 Raw Identifier Validation (0/50)
 
