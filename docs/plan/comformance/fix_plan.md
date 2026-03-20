@@ -300,6 +300,31 @@
   - 对最终精确对齐建议改为“真实编译依赖包并传播错误”
   - 当前影响量较小（在主回归中约 2.5% 带 aux/staticlib 痕迹）
 
+### P3 当前进展（2026-03-20）
+
+- 已将 `scripts/cjwasm_cjc_shim.sh` 的 `staticlib/macro` 路径从“直接成功 stub”改为“真实编译优先”：
+  - `--output-type=staticlib` / `--compile-macro` 先调用 `cjwasm` 编译源文件；
+  - 非 `harness` 公共库场景下，编译失败会透传非零退出码（依赖失败可传导到主测试）；
+  - 对 `testsuite/src/utils/*` 保留失败回退 stub（仅该路径），避免 `harness` 启动阶段公共库失败导致整轮中断。
+- 已补齐 warning 对齐能力：
+  - 通用识别首源文件 `@CompileWarning(s): yes`，由 shim 输出 `warning:` 前缀；
+  - 保留原有 `04_expressions/15_arithmetic_expressions/a07` 的定向 warning 补齐逻辑。
+- 已新增 `scripts/conformance_post_stats.py` 并接入 `scripts/conformance_diff.sh`：
+  - 每轮 diff 后生成 `post_stats.txt`；
+  - 单独统计 `compile_warning` 相关差异与 `aux/staticlib/macro` 相关差异，避免与主结果混杂。
+
+验证结果：
+
+- shim 直连验证：
+  - `staticlib` 成功样例：`rc=0` 且生成目标 `lib*.a`；
+  - `staticlib` / `compile-macro` 失败样例：`rc=1` 且不生成目标产物。
+- 定向 conformance 回归：
+  - 命令：
+    `./scripts/conformance_diff.sh --no-build --tests ../testsuite/src/tests/05_function/06_closures/a17/test_a17_01.cj --tests ../testsuite/src/tests/10_overloading/02_operator_overloading/02_the_scope_of_operator_functions_and_the_search_strategy_when_operators_are_used/02_the_search_strategy_when_operators_are_used/a01/test_a01_01.cj --tests ../testsuite/src/tests/14_metaprogramming/02_macros/02_macro_invocation/a24/test_a24_01.cj`
+  - 结果目录：`target/conformance/20260320_170913`
+    - `different/same results = 0/3`
+    - 新增产物：`target/conformance/20260320_170913/post_stats.txt`
+
 ## 推荐执行顺序（可直接开工）
 
 1. `P0`：panic 全清

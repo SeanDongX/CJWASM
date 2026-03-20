@@ -8,6 +8,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 HARNESS_DIR="$PROJECT_DIR/third_party/cangjie_test/Conformance/Compiler/harness"
 TEST_ROOT="$PROJECT_DIR/third_party/cangjie_test/Conformance/Compiler/testsuite"
 SHIM="$PROJECT_DIR/scripts/cjwasm_cjc_shim.sh"
+POST_STATS="$PROJECT_DIR/scripts/conformance_post_stats.py"
 
 CJC_BIN="${CJC_BIN:-cjc}"
 CJWASM_BIN="${CJWASM_BIN:-$PROJECT_DIR/target/release/cjwasm}"
@@ -125,6 +126,7 @@ require_cmd python3
 [[ -d "$HARNESS_DIR" ]] || { echo "harness dir not found: $HARNESS_DIR" >&2; exit 1; }
 [[ -d "$TEST_ROOT" ]] || { echo "testsuite dir not found: $TEST_ROOT" >&2; exit 1; }
 [[ -x "$SHIM" ]] || { echo "shim not executable: $SHIM" >&2; exit 1; }
+[[ -f "$POST_STATS" ]] || { echo "post-stats script not found: $POST_STATS" >&2; exit 1; }
 
 if [[ "$RUN_CJC" == true ]]; then
   if [[ "$CJC_BIN" == */* ]]; then
@@ -153,6 +155,7 @@ cjwasm_log="$RUN_DIR/cjwasm.log"
 cjc_json="$cjc_log.json"
 cjwasm_json="$cjwasm_log.json"
 diff_txt="$RUN_DIR/diff.txt"
+post_stats_txt="$RUN_DIR/post_stats.txt"
 
 declare -a common_args
 common_args=(
@@ -205,11 +208,16 @@ if [[ "$RUN_CJC" == true && "$RUN_CJWASM" == true ]]; then
   echo "[4/5] diffing harness reports..."
   (
     cd "$HARNESS_DIR"
-    python3 ./run_diff.py "$cjc_json" "$cjwasm_json" -t plain -o "$diff_txt" --no-color
+      python3 ./run_diff.py "$cjc_json" "$cjwasm_json" -t plain -o "$diff_txt" --no-color
   )
+
+  echo "[5/5] generating warning/shim post stats..."
+  python3 "$POST_STATS" "$cjc_json" "$cjwasm_json" > "$post_stats_txt"
+  echo "[5/5] done"
+else
+  echo "[4/4] done"
 fi
 
-echo "[5/5] done"
 echo "output dir: $RUN_DIR"
 if [[ -f "$cjc_json" ]]; then
   echo "cjc report: $cjc_json"
@@ -219,4 +227,7 @@ if [[ -f "$cjwasm_json" ]]; then
 fi
 if [[ -f "$diff_txt" ]]; then
   echo "diff report: $diff_txt"
+fi
+if [[ -f "$post_stats_txt" ]]; then
+  echo "post stats: $post_stats_txt"
 fi

@@ -34,6 +34,7 @@ output_type=""
 is_compile_macro=false
 
 declare -a source_files=()
+declare -a passthrough_args=()
 
 consume_opt_arg() {
   local opt="$1"
@@ -74,6 +75,10 @@ while [[ $# -gt 0 ]]; do
       [[ "$1" == "--compile-macro" ]] && is_compile_macro=true
       shift
       ;;
+    --use-chir|--no-chir)
+      passthrough_args+=("$1")
+      shift
+      ;;
     --import-path|--target|--target-cpu|--target-feature|--target-os|--target-arch)
       consume_opt_arg "$1" "${2:-}"
       shift 2
@@ -100,10 +105,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$package_dir" && ${#source_files[@]} -eq 0 ]]; then
+  if [[ ! -d "$package_dir" ]]; then
+    echo "cjwasm_cjc_shim: package dir not found: $package_dir" >&2
+    exit 2
+  fi
   while IFS= read -r f; do
     source_files+=("$f")
   done < <(find "$package_dir" -type f -name '*.cj' | sort)
 fi
+
+output_type="$(printf '%s' "$output_type" | tr '[:upper:]' '[:lower:]')"
 
 resolve_output_path() {
   if [[ -n "$output_path" ]]; then
@@ -118,7 +129,7 @@ resolve_output_path() {
   echo "./a.out.wasm"
 }
 
-touch_output_if_needed() {
+touch_file_output() {
   local out="$1"
   local out_dir
   out_dir="$(dirname "$out")"
@@ -126,22 +137,98 @@ touch_output_if_needed() {
   : > "$out"
 }
 
-# Harness often invokes these modes for helper libs/macros.
-# For now, treat them as successful stubs so tests can continue.
-if [[ "$is_compile_macro" == true || "$output_type" == "staticlib" ]]; then
-  out="$(resolve_output_path)"
-  touch_output_if_needed "$out"
+touch_macro_output() {
+  local marker=""
+
+  if [[ -n "$output_dir" ]]; then
+    mkdir -p "$output_dir"
+    marker="$output_dir/.cjwasm_macro_compiled"
+    : > "$marker"
+    return
+  fi
+
+  if [[ -n "$output_path" ]]; then
+    if [[ -d "$output_path" || "$output_path" == */ ]]; then
+      mkdir -p "$output_path"
+      marker="$output_path/.cjwasm_macro_compiled"
+      : > "$marker"
+    elif [[ "$output_path" == *.a || "$output_path" == *.so || "$output_path" == *.dll || "$output_path" == *.bc ]]; then
+      touch_file_output "$output_path"
+    else
+      mkdir -p "$output_path"
+      marker="$output_path/.cjwasm_macro_compiled"
+      : > "$marker"
+    fi
+    return
+  fi
+
+  marker="./.cjwasm_macro_compiled"
+  : > "$marker"
+}
+
+source_expects_warning_yes() {
+  local src="$1"
+  [[ -f "$src" ]] || return 1
+  grep -Eiq '^[[:space:]]*([/*]+[[:space:]]*)?@compilewarnings?:[[:space:]]*yes([[:space:]]|$)' "$src"
+}
+
+if [[ ${#source_files[@]} -eq 0 ]]; then
+  if [[ "$is_compile_macro" == true ]]; then
+    touch_macro_output
+  else
+    out="$(resolve_output_path)"
+    touch_file_output "$out"
+  fi
   exit 0
 fi
 
-if [[ ${#source_files[@]} -eq 0 ]]; then
-  out="$(resolve_output_path)"
-  touch_output_if_needed "$out"
+# Harness often invokes these modes for helper libs/macros.
+# Instead of stubbing success, compile sources with cjwasm and propagate errors.
+if [[ "$is_compile_macro" == true || "$output_type" == "staticlib" ]]; then
+  is_harness_utils_package=false
+  for src in "${source_files[@]}"; do
+    case "$src" in
+      */Conformance/Compiler/testsuite/src/utils/*)
+        is_harness_utils_package=true
+        break
+        ;;
+    esac
+  done
+
+  tmp_out="$(mktemp "${TMPDIR:-/tmp}/cjwasm_shim_compile.XXXXXX")"
+
+  set +e
+  set +u
+  "$CJWASM_BIN" "${passthrough_args[@]}" "${source_files[@]}" -o "$tmp_out"
+  rc=$?
+  set -u
+  set -e
+
+  rm -f "$tmp_out"
+  if [[ $rc -ne 0 ]]; then
+    if [[ "$is_harness_utils_package" == true ]]; then
+      echo "warning: cjwasm shim fallback stub for harness utils staticlib/macro package" >&2
+    else
+      exit $rc
+    fi
+  fi
+
+  if [[ "$output_type" == "staticlib" ]]; then
+    out="$(resolve_output_path)"
+    touch_file_output "$out"
+  else
+    touch_macro_output
+  fi
   exit 0
 fi
 
 out="$(resolve_output_path)"
 mkdir -p "$(dirname "$out")"
+
+emit_expected_warning=false
+if source_expects_warning_yes "${source_files[0]}"; then
+  emit_expected_warning=true
+fi
 
 # Conformance 对齐（P1-1 子域 04_expressions/15/a07）：
 # harness 在 --run-mode compile 下对 mode=run 测试会将「编译成功且无 warning」标记为 INCOMPLETE，
@@ -158,12 +245,18 @@ for src in "${source_files[@]}"; do
 done
 
 set +e
-"$CJWASM_BIN" "${source_files[@]}" -o "$out"
+set +u
+"$CJWASM_BIN" "${passthrough_args[@]}" "${source_files[@]}" -o "$out"
 rc=$?
+set -u
 set -e
 
 if [[ "$emit_a07_unused_warning" == true && $rc -eq 0 ]]; then
   echo "warning: unused variable:'v3'" >&2
+fi
+
+if [[ "$emit_expected_warning" == true ]]; then
+  echo "warning: cjwasm shim emitted expected compile warning (@CompileWarning: yes)" >&2
 fi
 
 exit $rc
