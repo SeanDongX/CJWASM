@@ -1,5 +1,12 @@
 use logos::Logos;
 
+/// Typed integer literal information
+#[derive(Debug, PartialEq, Clone)]
+pub struct TypedInt {
+    pub value: i64,
+    pub type_suffix: String,
+}
+
 /// 字符串插值的部分
 #[derive(Debug, PartialEq, Clone)]
 pub enum StringPart {
@@ -31,6 +38,53 @@ pub fn unescape_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// Parse typed integer literal (e.g., 0b1010_1010_i8) and validate range
+fn parse_typed_integer(lex: &mut logos::Lexer<Token>) -> Option<TypedInt> {
+    let slice = lex.slice();
+
+    // Find the type suffix position
+    let suffix_pos = slice.rfind('_')?;
+    let number_part = &slice[..suffix_pos];
+    let type_suffix = &slice[suffix_pos + 1..];
+
+    // Remove underscores from number part
+    let s: String = number_part.chars().filter(|c| *c != '_').collect();
+
+    // Parse the number based on prefix
+    let value = if number_part.len() >= 2 && (number_part.starts_with("0x") || number_part.starts_with("0X")) {
+        u64::from_str_radix(&s[2..], 16).ok()?
+    } else if number_part.starts_with("0o") || number_part.starts_with("0O") {
+        u64::from_str_radix(&s[2..], 8).ok()?
+    } else if number_part.starts_with("0b") || number_part.starts_with("0B") {
+        u64::from_str_radix(&s[2..], 2).ok()?
+    } else {
+        s.parse::<u64>().ok()?
+    };
+
+    // Validate range based on type suffix
+    let valid = match type_suffix {
+        "i8" => value <= i8::MAX as u64,
+        "i16" => value <= i16::MAX as u64,
+        "i32" => value <= i32::MAX as u64,
+        "i64" => value <= i64::MAX as u64,
+        "u8" => value <= u8::MAX as u64,
+        "u16" => value <= u16::MAX as u64,
+        "u32" => value <= u32::MAX as u64,
+        "u64" => true, // u64 can hold any u64 value
+        _ => return None,
+    };
+
+    if !valid {
+        // Return None to cause lexer error - the value exceeds the type's range
+        return None;
+    }
+
+    Some(TypedInt {
+        value: value as i64,
+        type_suffix: type_suffix.to_string(),
+    })
 }
 
 /// 处理多行字符串：移除首行空行，并 strip 公共缩进
@@ -552,14 +606,22 @@ pub enum Token {
     })]
     Float32(f32),
 
-    #[regex(r"0[xX][0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*", |lex| {
+    // Integer literals with type suffix (_i8, _i16, _i32, _i64, _u8, _u16, _u32, _u64)
+    #[regex(r"(?:0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[oO][0-7][0-7_]*|0[bB][01][01_]*|[0-9][0-9_]*)_(?:i8|i16|i32|i64|u8|u16|u32|u64)", priority = 5, callback = parse_typed_integer)]
+    TypedInteger(TypedInt),
+
+    #[regex(r"0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[oO][0-7][0-7_]*|0[bB][01][01_]*|[0-9][0-9_]*", |lex| {
         let slice = lex.slice();
         let s: String = slice.chars().filter(|c| *c != '_').collect();
         if slice.len() >= 2 && (slice.starts_with("0x") || slice.starts_with("0X")) {
             i64::from_str_radix(&s[2..], 16).ok().or_else(|| u64::from_str_radix(&s[2..], 16).ok().map(|v| v as i64))
-        } else if slice.starts_with("0o") { i64::from_str_radix(&s[2..], 8).ok().or_else(|| u64::from_str_radix(&s[2..], 8).ok().map(|v| v as i64)) }
-        else if slice.starts_with("0b") { i64::from_str_radix(&s[2..], 2).ok().or_else(|| u64::from_str_radix(&s[2..], 2).ok().map(|v| v as i64)) }
-        else { s.parse::<i64>().ok().or_else(|| s.parse::<u64>().ok().map(|v| v as i64)) }
+        } else if slice.starts_with("0o") || slice.starts_with("0O") {
+            i64::from_str_radix(&s[2..], 8).ok().or_else(|| u64::from_str_radix(&s[2..], 8).ok().map(|v| v as i64))
+        } else if slice.starts_with("0b") || slice.starts_with("0B") {
+            i64::from_str_radix(&s[2..], 2).ok().or_else(|| u64::from_str_radix(&s[2..], 2).ok().map(|v| v as i64))
+        } else {
+            s.parse::<i64>().ok().or_else(|| s.parse::<u64>().ok().map(|v| v as i64))
+        }
     })]
     Integer(i64),
 

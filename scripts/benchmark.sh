@@ -148,6 +148,7 @@ NC='\033[0m' # No Color
 WARMUP=3
 RUNS=10
 MODE="all"
+CJC_OPT_LEVEL="${CJC_OPT_LEVEL:--O2}"
 
 # ── 解析命令行参数 ──
 while [[ $# -gt 0 ]]; do
@@ -168,6 +169,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --criterion    仅 Rust 内部微基准"
             echo "  --runs N       设置迭代次数 (默认 10)"
             echo "  --warmup N     设置预热次数 (默认 3)"
+            echo "  环境变量: CJC_OPT_LEVEL (默认 -O2)"
             exit 0
             ;;
         *) echo "未知选项: $1"; exit 1 ;;
@@ -211,6 +213,7 @@ if command -v cjc &>/dev/null; then
     CJC_AVAILABLE=true
     CJC_VERSION=$(cjc --version 2>&1 | head -1)
     echo -e "  ${GREEN}✓ cjc 就绪: $CJC_VERSION${NC}"
+    echo -e "  ${GREEN}✓ cjc 优化级别: $CJC_OPT_LEVEL${NC}"
 
     # macOS SIP 会在 bash 子进程中清除 DYLD_LIBRARY_PATH，
     # 导致 cjc 编译的 native 二进制找不到 libcangjie-runtime.dylib。
@@ -599,8 +602,8 @@ run_compile_bench() {
                 --export-json "$REPORT_DIR/compile_${size}_${TIMESTAMP}.json" \
                 --command-name "cjwasm" \
                 "$CJWASM $cjwasm_src -o $cjwasm_out" \
-                --command-name "cjc" \
-                "cjc $cjc_src -o $cjc_out" \
+                --command-name "cjc ($CJC_OPT_LEVEL)" \
+                "cjc $CJC_OPT_LEVEL \"$cjc_src\" -o \"$cjc_out\"" \
                 2>&1
         else
             hyperfine \
@@ -672,7 +675,7 @@ run_size_bench() {
         # cjc 编译
         local cjc_size="N/A"
         if $CJC_AVAILABLE && [ -f "$cjc_src" ]; then
-            if cjc "$cjc_src" -o "$cjc_out" 2>/dev/null; then
+            if cjc "$CJC_OPT_LEVEL" "$cjc_src" -o "$cjc_out" 2>/dev/null; then
                 cjc_size=$(wc -c < "$cjc_out" | tr -d ' ')
             fi
         fi
@@ -751,7 +754,7 @@ run_runtime_bench() {
         echo -e "${CYAN}── $label: WASM 运行时 ──${NC}"
 
         if $CJC_AVAILABLE && [ -f "$cjc_src" ]; then
-            if cjc "$cjc_src" -o "$cjc_out" 2>/dev/null && "$cjc_out" >/dev/null 2>&1; then
+            if cjc "$CJC_OPT_LEVEL" "$cjc_src" -o "$cjc_out" 2>/dev/null && "$cjc_out" >/dev/null 2>&1; then
                 hyperfine \
                     -N \
                     --warmup "$WARMUP" \
@@ -759,7 +762,7 @@ run_runtime_bench() {
                     --export-json "$REPORT_DIR/runtime_${size}_${TIMESTAMP}.json" \
                     --command-name "wasmtime (cjwasm)" \
                     "wasmtime run --invoke main $wasm_out" \
-                    --command-name "native (cjc)" \
+                    --command-name "native (cjc $CJC_OPT_LEVEL)" \
                     "$cjc_out" \
                     2>&1
             else
@@ -920,7 +923,7 @@ generate_html_report() {
             total_ns=0
             for _ in $(seq 1 5); do
                 local s=$(python3 -c 'import time; print(int(time.time_ns()))')
-                cjc "$cjc_src" -o "$cjc_out" >/dev/null 2>&1
+                cjc "$CJC_OPT_LEVEL" "$cjc_src" -o "$cjc_out" >/dev/null 2>&1
                 local e=$(python3 -c 'import time; print(int(time.time_ns()))')
                 total_ns=$((total_ns + e - s))
             done
@@ -994,7 +997,7 @@ HTMLHEAD
 
 <div class="legend">
   <div class="legend-item"><div class="legend-dot dot-cjwasm"></div> <strong>cjwasm</strong> (Rust → WASM 前端编译器)</div>
-  <div class="legend-item"><div class="legend-dot dot-cjc"></div> <strong>cjc</strong> ($( cjc --version 2>&1 | head -1 || echo 'N/A' )) 原生编译器</div>
+  <div class="legend-item"><div class="legend-dot dot-cjc"></div> <strong>cjc</strong> ($( cjc --version 2>&1 | head -1 || echo 'N/A' ), ${CJC_OPT_LEVEL}) 原生编译器</div>
 </div>
 EOF
 
@@ -1145,7 +1148,7 @@ EOF
             local native_rss_fmt="N/A"
             local rt_status=""
             if $CJC_AVAILABLE && [ -f "$rt_cjc_src" ]; then
-                if cjc "$rt_cjc_src" -o "$rt_cjc_bin" >/dev/null 2>&1 && "$rt_cjc_bin" >/dev/null 2>&1; then
+                if cjc "$CJC_OPT_LEVEL" "$rt_cjc_src" -o "$rt_cjc_bin" >/dev/null 2>&1 && "$rt_cjc_bin" >/dev/null 2>&1; then
                     rt_total_ns=0
                     for _ in $(seq 1 10); do
                         local s=$(python3 -c 'import time; print(int(time.time_ns()))')

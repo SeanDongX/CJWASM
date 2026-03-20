@@ -1,0 +1,91 @@
+================================================================================
+CJWasm2 Conformance Quick Reference - CJC-Only Passing Tests
+================================================================================
+
+OVERVIEW:
+  Total: 7,071 tests passing only in CJC
+  - Negative tests (CJWasm accepts invalid code): 6,993 (98.9%)
+  - Positive tests (CJWasm rejects valid code): 78 (1.1%)
+
+TOP 5 CATEGORIES TO FIX:
+  1. Class/Interface:     2,699 tests (2,683 neg, 16 pos)
+  2. Types:               1,192 tests (1,184 neg, 8 pos)
+  3. Expressions:         1,099 tests (1,096 neg, 3 pos)
+  4. Packages/Modules:      448 tests (441 neg, 7 pos)
+  5. Names/Scopes:          443 tests (432 neg, 11 pos)
+
+QUICK WINS (Easy to Fix):
+  
+  1. Integer Literal Range Validation (~14 tests)
+     Problem: 0b1010_1010_i8 accepted (should reject - exceeds Int8 max)
+     Fix: Add range checking in lexer for typed integer literals
+     File: src/lexer/mod.rs
+     
+  2. Abstract Function Validation (~100+ tests)
+     Problem: Non-abstract class with abstract function accepted
+     Fix: Check class has 'abstract' modifier if any function lacks body
+     File: src/chir/lower.rs or semantic validation
+     
+  3. Extension Re-implementation (~101 tests)
+     Problem: extend Int64 <: ToString {} accepted (already implements)
+     Fix: Check if type already implements interface before extending
+     File: src/chir/lower.rs
+     
+  4. Raw Identifier Validation (~50+ tests)
+     Problem: ` ` (space in backticks) accepted as identifier
+     Fix: Validate raw identifier content in lexer
+     File: src/lexer/mod.rs
+
+COMMON PATTERNS:
+
+  Negative Tests (Should Fail):
+  - Integer literals out of range for their type suffix
+  - Abstract functions in non-abstract classes
+  - Re-extending types with interfaces they already have
+  - Invalid raw identifiers (spaces, special chars)
+  - Float variables assigned integer literals without conversion
+  - main() with throw but no return type annotation
+  
+  Positive Tests (Should Pass):
+  - Valid semicolon/newline usage in complex expressions
+  - Valid property declarations
+  - Valid exception handling patterns
+
+SAMPLE FAILING TESTS:
+
+  test_bug_0005814.cj:
+    extend Int64 <: ToString {}  // Already implements ToString
+    
+  test_bug_0005869_bil_i8.cj:
+    0b1010_1010_i8  // 170 exceeds Int8 max (127)
+    
+  test_a07_03.cj:
+    class SomeClass {
+      public func inc(x: Int32): Int32  // No body, not abstract class
+    }
+    
+  test_a01_18.cj:
+    var f: Float64 = 1  // Integer literal for Float64 variable
+    
+  test_a05_05.cj:
+    var ` `: Int32 = 1  // Space in raw identifier
+
+TESTING COMMANDS:
+
+  # Run specific category
+  ./scripts/system_test.sh tests/01_lexical_structure
+  
+  # Run single test
+  cargo run -- path/to/test.cj
+  
+  # Full conformance
+  ./scripts/system_test.sh
+
+NEXT STEPS:
+
+  1. Start with integer literal range checking (highest ROI)
+  2. Add abstract class validation
+  3. Strengthen type system validation
+  4. Add comprehensive semantic checks
+
+See ANALYSIS.md for detailed breakdown and fix strategy.

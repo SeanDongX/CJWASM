@@ -1,0 +1,95 @@
+================================================================================
+CJWasm2 Conformance Analysis Summary
+================================================================================
+
+Analysis Date: 2026-03-20
+Test Run: target/conformance/20260320_205738/
+
+KEY FINDINGS:
+-------------
+✗ 7,071 tests pass in CJC but fail in CJWasm2
+  - 6,993 (98.9%) are NEGATIVE tests → CJWasm2 is TOO PERMISSIVE
+  - 78 (1.1%) are POSITIVE tests → CJWasm2 is TOO STRICT
+
+MAIN ISSUE: CJWasm2 accepts invalid code that should be rejected.
+
+TOP 5 PROBLEM AREAS:
+-------------------
+1. Class/Interface validation:     2,699 tests
+2. Type system validation:         1,192 tests  
+3. Expression validation:          1,099 tests
+4. Package/Module validation:        448 tests
+5. Scope/Variable validation:        443 tests
+
+QUICK WINS (Start Here):
+------------------------
+
+1. INTEGER LITERAL RANGE VALIDATION (26 tests)
+   Issue: 0b1010_1010_i8 accepted (170 > Int8::MAX)
+   Fix: Add range checking in src/lexer/mod.rs
+   Test: cargo run -- third_party/cangjie_test/.../test_bug_0005869_bil_i8.cj
+   
+2. ABSTRACT CLASS VALIDATION (706 tests)
+   Issue: Non-abstract class with abstract function accepted
+   Fix: Validate in src/chir/lower.rs or add semantic pass
+   Test: cargo run -- third_party/cangjie_test/.../test_a07_03.cj
+   
+3. EXTENSION RE-IMPLEMENTATION (57 tests)
+   Issue: extend Int64 <: ToString {} accepted (already implements)
+   Fix: Check existing implementations in src/chir/lower.rs
+   Test: cargo run -- third_party/cangjie_test/.../test_bug_0005814.cj
+   
+4. TYPE MISMATCH VALIDATION (407 tests)
+   Issue: var f: Float64 = 1 accepted (no implicit conversion)
+   Fix: Strengthen type checking in src/chir/lower_expr.rs
+   Test: cargo run -- third_party/cangjie_test/.../test_a01_18.cj
+
+DOCUMENTS CREATED:
+-----------------
+✓ ANALYSIS.md - Detailed breakdown with fix strategy
+✓ QUICK_REFERENCE.txt - Quick lookup guide
+✓ passed_only_in_cjc.txt - Full list of failing tests (7,071 tests)
+✓ post_stats.txt - Statistical summary
+
+RECOMMENDED WORKFLOW:
+--------------------
+1. Pick a category (start with "Quick Wins")
+2. Read 2-3 sample test files to understand the issue
+3. Identify where validation should occur
+4. Implement the validation check
+5. Test with: cargo run -- <test_file.cj>
+6. Verify it now rejects the invalid code
+7. Run category tests: ./scripts/system_test.sh
+8. Move to next issue
+
+EXAMPLE FIX WORKFLOW:
+--------------------
+# Fix integer literal range validation
+1. Read: third_party/cangjie_test/.../test_bug_0005869_bil_i8.cj
+2. Understand: 0b1010_1010_i8 = 170, but Int8 max = 127
+3. Locate: src/lexer/mod.rs - integer literal parsing
+4. Add: Range check for typed literals
+5. Test: cargo run -- <test_file.cj>
+6. Expect: Compilation error about value exceeding range
+7. Verify: All 26 integer range tests now fail compilation
+
+TESTING COMMANDS:
+----------------
+# Single test
+cargo run --release -- path/to/test.cj
+
+# Category test
+./scripts/system_test.sh tests/01_lexical_structure
+
+# Full conformance (takes time)
+./scripts/system_test.sh
+
+NEXT STEPS:
+----------
+1. Start with integer literal range validation (highest ROI, ~26 tests)
+2. Add abstract class validation (~706 tests)
+3. Implement extension validation (~57 tests)
+4. Strengthen type system (~1,600 tests)
+5. Add comprehensive semantic validation (~4,000+ tests)
+
+For detailed analysis, see: target/conformance/20260320_205738/ANALYSIS.md

@@ -675,6 +675,11 @@ impl Parser {
                 self.pos -= 1; // 回退，让 parse_macro_call 重新消费 @
                 self.parse_macro_call()
             }
+            Some(Token::TypedInteger(typed_int)) => {
+                // Typed integer literal with suffix (e.g., 0b1010_1010_i8)
+                // Range validation already done in lexer
+                Ok(Expr::Integer(typed_int.value))
+            }
             Some(Token::Integer(n)) => {
                 // 可选整数字面量后缀（如 0x0Au8 / 1i32），消费掉避免后缀被当作独立标识符。
                 if matches!(
