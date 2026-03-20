@@ -676,14 +676,29 @@ impl Parser {
                 self.parse_macro_call()
             }
             Some(Token::Integer(n)) => {
-                // 可选后缀 u8/u16/...（如 0x0Au8），消费掉以便后续不把 u8 当独立 token
-                if matches!(self.peek(), Some(Token::Ident(ref s)) if s == "u8" || s == "u16" || s == "u32" || s == "u64")
+                // 可选整数字面量后缀（如 0x0Au8 / 1i32），消费掉避免后缀被当作独立标识符。
+                if matches!(
+                    self.peek(),
+                    Some(Token::Ident(ref s))
+                        if s == "u8"
+                            || s == "u16"
+                            || s == "u32"
+                            || s == "u64"
+                            || s == "i8"
+                            || s == "i16"
+                            || s == "i32"
+                            || s == "i64"
+                )
                     || matches!(
                         self.peek(),
                         Some(Token::TypeUInt8)
                             | Some(Token::TypeUInt16)
                             | Some(Token::TypeUInt32)
                             | Some(Token::TypeUInt64)
+                            | Some(Token::TypeInt8)
+                            | Some(Token::TypeInt16)
+                            | Some(Token::TypeInt32)
+                            | Some(Token::TypeInt64)
                     )
                 {
                     self.advance();
@@ -700,7 +715,8 @@ impl Parser {
                         // 2.. 后面是 ] 或 ) 或 , 说明是开放式范围
                         Box::new(Expr::Integer(i64::MAX))
                     } else {
-                        Box::new(self.parse_primary()?)
+                        // 允许负数结尾，如 1..-2 或 1..=-3:4
+                        Box::new(self.parse_unary()?)
                     };
                     // P2.6: 可选步长 `: step`（支持负步长 -1）
                     let step = if self.check(&Token::Colon) {
@@ -719,6 +735,7 @@ impl Parser {
                 Ok(Expr::Integer(n))
             }
             Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Ok(Expr::Float(f)),
+            Some(Token::Float16(f)) => Ok(Expr::Float32(f)),
             Some(Token::Float32(f)) => Ok(Expr::Float32(f)),
             Some(Token::This) => match self.receiver_name.clone() {
                 Some(n) => Ok(Expr::Var(n)),
@@ -1866,8 +1883,38 @@ impl Parser {
         // 只解析简单表达式: 变量、字面量、函数调用、字段访问等
         // 不解析结构体初始化 (因为 { 会被误认为 match body)
         let mut expr = match self.advance() {
-            Some(Token::Integer(n)) => Expr::Integer(n),
+            Some(Token::Integer(n)) => {
+                // 与 parse_primary 一致：允许并吞掉整数字面量后缀。
+                if matches!(
+                    self.peek(),
+                    Some(Token::Ident(ref s))
+                        if s == "u8"
+                            || s == "u16"
+                            || s == "u32"
+                            || s == "u64"
+                            || s == "i8"
+                            || s == "i16"
+                            || s == "i32"
+                            || s == "i64"
+                )
+                    || matches!(
+                        self.peek(),
+                        Some(Token::TypeUInt8)
+                            | Some(Token::TypeUInt16)
+                            | Some(Token::TypeUInt32)
+                            | Some(Token::TypeUInt64)
+                            | Some(Token::TypeInt8)
+                            | Some(Token::TypeInt16)
+                            | Some(Token::TypeInt32)
+                            | Some(Token::TypeInt64)
+                    )
+                {
+                    self.advance();
+                }
+                Expr::Integer(n)
+            }
             Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Expr::Float(f),
+            Some(Token::Float16(f)) => Expr::Float32(f),
             Some(Token::Float32(f)) => Expr::Float32(f),
             Some(Token::This) => match self.receiver_name.clone() {
                 Some(n) => Expr::Var(n),

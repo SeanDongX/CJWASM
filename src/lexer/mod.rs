@@ -536,6 +536,14 @@ pub enum Token {
     })]
     Float64Suffix(f64),
 
+    // Float16：f16 后缀（当前前端统一按 f32 承载，避免被拆成 `...f` + `16`）
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f16|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f16|[0-9][0-9_]*f16", priority = 4, callback = |lex| {
+        let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
+        let s = s.trim_end_matches("f16");
+        s.parse::<f32>().ok()
+    })]
+    Float16(f32),
+
     // Float32：f 或 f32 后缀
     #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f32|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f32|[0-9][0-9_]*f32|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
@@ -1152,6 +1160,15 @@ mod tests {
             Token::Float32(v) => assert!((*v - 3.14_f32).abs() < 0.001),
             _ => panic!("Expected Float32, got {:?}", tokens[0]),
         }
+    }
+
+    #[test]
+    fn test_lexer_float16_literal() {
+        let source = "1.5f16 2f16";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert!(matches!(tokens[0], Token::Float16(_)));
+        assert!(matches!(tokens[1], Token::Float16(_)));
     }
 
     #[test]

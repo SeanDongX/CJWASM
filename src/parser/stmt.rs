@@ -87,41 +87,41 @@ impl Parser {
                 let pattern = if self.check(&Token::LParen) {
                     self.parse_pattern()?
                 } else {
-                    let first = match self.advance() {
-                        Some(Token::Ident(name)) => name,
-                        Some(tok) => {
+                    let first = match self.advance_ident() {
+                        Some(name) => name,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
                             return self.bail(ParseError::UnexpectedToken(
                                 tok,
                                 "变量名或类型名".to_string(),
-                            ))
+                            ));
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     if self.check(&Token::LBrace) {
                         self.advance();
                         let mut fields = Vec::new();
                         while !self.check(&Token::RBrace) {
-                            let fname = match self.advance() {
-                                Some(Token::Ident(n)) => n,
-                                Some(tok) => {
+                            let fname = match self.advance_ident() {
+                                Some(n) => n,
+                                None => {
+                                    let tok = self.advance().unwrap_or(Token::Semicolon);
                                     return self.bail(ParseError::UnexpectedToken(
                                         tok,
                                         "字段名".to_string(),
-                                    ))
+                                    ));
                                 }
-                                None => return self.bail(ParseError::UnexpectedEof),
                             };
                             let binding = if self.check(&Token::Colon) {
                                 self.advance();
-                                match self.advance() {
-                                    Some(Token::Ident(n)) => n,
-                                    Some(tok) => {
+                                match self.advance_ident() {
+                                    Some(n) => n,
+                                    None => {
+                                        let tok = self.advance().unwrap_or(Token::Semicolon);
                                         return self.bail(ParseError::UnexpectedToken(
                                             tok,
                                             "绑定名".to_string(),
-                                        ))
+                                        ));
                                     }
-                                    None => return self.bail(ParseError::UnexpectedEof),
                                 }
                             } else {
                                 fname.clone()
@@ -167,13 +167,12 @@ impl Parser {
                 let pattern = if self.check(&Token::LParen) {
                     self.parse_pattern()?
                 } else {
-                    let name = match self.advance() {
-                        Some(Token::Ident(name)) => name,
-                        Some(tok) => {
-                            return self
-                                .bail(ParseError::UnexpectedToken(tok, "变量名".to_string()))
+                    let name = match self.advance_ident() {
+                        Some(name) => name,
+                        None => {
+                            let tok = self.advance().unwrap_or(Token::Semicolon);
+                            return self.bail(ParseError::UnexpectedToken(tok, "变量名".to_string()));
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     Pattern::Binding(name)
                 };
