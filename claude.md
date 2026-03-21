@@ -60,4 +60,6 @@ grep -rn "关键字" third_party/cangjie_compiler/src/Parse/
 
 ## 参考
 - 官方编译器: `third_party/cangjie_compiler/`
+- 官方运行时: `third_party/cangjie_runtime/`
+- 官方测试集：`third_party/cangjie_test/`
 
