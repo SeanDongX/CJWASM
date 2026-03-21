@@ -1841,11 +1841,15 @@ impl Parser {
                 continue;
             }
             // cjc 兼容: extend 内方法前可带 static / override / operator，跳过后由 parse_function 解析
+            let mut is_static_method = false;
             while self.check(&Token::Static)
                 || self.check(&Token::Override)
                 || self.check(&Token::Redef)
                 || self.check(&Token::Operator)
             {
+                if self.check(&Token::Static) {
+                    is_static_method = true;
+                }
                 self.advance();
             }
             let prev_receiver = self.receiver_name.clone();
@@ -1857,7 +1861,7 @@ impl Parser {
                 .params
                 .iter()
                 .any(|p| p.name == "self" || p.name == "this");
-            if !has_self && !func.name.starts_with("static ") {
+            if !has_self && !is_static_method {
                 func.params.insert(
                     0,
                     crate::ast::Param {
@@ -1870,9 +1874,11 @@ impl Parser {
                     },
                 );
             }
-            // 重命名为 TypeName.methodName 格式
+            // 重命名为 TypeName.methodName 格式（static 方法加 "static " 前缀）
             let method_name = if func.name.contains('.') {
                 func.name.clone()
+            } else if is_static_method {
+                format!("static {}.{}", target_type, func.name)
             } else {
                 format!("{}.{}", target_type, func.name)
             };

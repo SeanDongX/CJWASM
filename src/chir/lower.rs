@@ -119,6 +119,118 @@ fn validate_extensions(program: &Program) -> Result<(), String> {
         }
     }
 
+    // Validate: method name cannot conflict with type parameter of extended class
+    let class_type_params: HashMap<String, Vec<String>> = program
+        .classes
+        .iter()
+        .map(|c| (c.name.clone(), c.type_params.clone()))
+        .collect();
+
+    for ext in &program.extends {
+        let type_name = &ext.target_type;
+        if let Some(type_params) = class_type_params.get(type_name) {
+            for method in &ext.methods {
+                let bare = method.name.split('.').last().unwrap_or(&method.name);
+                if type_params.contains(&bare.to_string()) {
+                    return Err(format!(
+                        "member name '{}' conflicts with type parameter of '{}'",
+                        bare, type_name
+                    ));
+                }
+            }
+        }
+    }
+
+    // Validate: static and instance methods with same name cannot be overloaded
+    // across all extensions of the same type
+    let mut type_method_staticness: HashMap<String, HashMap<String, bool>> = HashMap::new();
+
+    for ext in &program.extends {
+        let type_name = &ext.target_type;
+
+        // Check within this extension first
+        // A method is static if its name starts with "static "
+        let mut this_ext: HashMap<String, bool> = HashMap::new();
+        for method in &ext.methods {
+            let is_static = method.name.starts_with("static ");
+            // Strip "static " prefix and "TypeName." prefix to get bare method name
+            let stripped = if is_static {
+                method.name.trim_start_matches("static ")
+            } else {
+                &method.name
+            };
+            let bare_name = stripped.split('.').last().unwrap_or(stripped);
+            if let Some(&prev_static) = this_ext.get(bare_name) {
+                if prev_static != is_static {
+                    return Err(format!(
+                        "static and instance member function '{}' in extension of '{}' cannot be overloaded",
+                        bare_name, type_name
+                    ));
+                }
+            }
+            this_ext.insert(bare_name.to_string(), is_static);
+        }
+
+        // Check against previously seen extensions of the same type
+        let global = type_method_staticness
+            .entry(type_name.clone())
+            .or_insert_with(HashMap::new);
+        for (name, is_static) in &this_ext {
+            if let Some(&prev_static) = global.get(name) {
+                if prev_static != *is_static {
+                    return Err(format!(
+                        "static and instance member function '{}' in extension of '{}' cannot be overloaded",
+                        name, type_name
+                    ));
+                }
+            }
+            global.insert(name.clone(), *is_static);
+        }
+    }
+
+    // Validate: duplicate method signatures (same name + param types) across class + extensions
+    // Key: type_name -> set of (bare_name, param_types_fingerprint)
+    let mut type_method_sigs: HashMap<String, HashSet<String>> = HashMap::new();
+
+    // Collect class methods first
+    for class in &program.classes {
+        let sigs = type_method_sigs.entry(class.name.clone()).or_insert_with(HashSet::new);
+        for cm in &class.methods {
+            let is_static = cm.func.params.first().map(|p| p.name != "this").unwrap_or(true);
+            let bare = cm.func.name.split('.').last().unwrap_or(&cm.func.name);
+            // Build param fingerprint (skip implicit this)
+            let param_tys: Vec<String> = cm.func.params.iter()
+                .filter(|p| p.name != "this")
+                .map(|p| format!("{:?}", p.ty))
+                .collect();
+            let sig = format!("{}|{}|{}", bare, is_static, param_tys.join(","));
+            sigs.insert(sig);
+        }
+    }
+
+    // Check extension methods against collected sigs
+    for ext in &program.extends {
+        let type_name = &ext.target_type;
+        let sigs = type_method_sigs.entry(type_name.clone()).or_insert_with(HashSet::new);
+        for method in &ext.methods {
+            let is_static = method.name.starts_with("static ");
+            let stripped = if is_static { method.name.trim_start_matches("static ") } else { &method.name };
+            let bare = stripped.split('.').last().unwrap_or(stripped);
+            let param_tys: Vec<String> = method.params.iter()
+                .filter(|p| p.name != "this")
+                .map(|p| format!("{:?}", p.ty))
+                .collect();
+            let sig = format!("{}|{}|{}", bare, is_static, param_tys.join(","));
+            if sigs.contains(&sig) {
+                return Err(format!(
+                    "duplicate definition of '{}' in extension of '{}'",
+                    bare, type_name
+                ));
+            }
+            sigs.insert(sig);
+        }
+    }
+
     Ok(())
 }
 
