@@ -795,7 +795,7 @@ extend<T> Array<T> <: SortByExtension<T> {
     #[test]
     fn test_compile_class_inheritance() {
         let source = r#"
-            class Base { var id: Int64; init(i: Int64) { this.id = i } }
+            open class Base { var id: Int64; init(i: Int64) { this.id = i } }
             class Derived <: Base { init(i: Int64) { super(i) } }
             func main(): Int64 {
                 let d = Derived(1)

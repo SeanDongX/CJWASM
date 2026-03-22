@@ -1,6 +1,8 @@
 mod type_;
 
 pub use type_::Type;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// 一元运算符
 #[derive(Debug, Clone, PartialEq)]
@@ -393,6 +395,13 @@ pub struct FieldDef {
     pub default: Option<Expr>,
 }
 
+impl FieldDef {
+    /// 获取字段在所属类型中的可见性（若未显式登记则回退为默认可见性）。
+    pub fn visibility_in_owner(&self, owner: &str) -> Visibility {
+        get_field_visibility(owner, &self.name).unwrap_or_default()
+    }
+}
+
 /// 顶层常量定义 (let/var name: Type = expr)
 #[derive(Debug, Clone)]
 pub struct ConstDef {
@@ -655,6 +664,35 @@ pub enum Visibility {
     Private,
     /// 子类可见
     Protected,
+}
+
+thread_local! {
+    static FIELD_VISIBILITY_REGISTRY: RefCell<HashMap<String, HashMap<String, Visibility>>> =
+        RefCell::new(HashMap::new());
+}
+
+pub fn clear_field_visibility_registry() {
+    FIELD_VISIBILITY_REGISTRY.with(|registry| registry.borrow_mut().clear());
+}
+
+pub fn record_field_visibility(owner: &str, field: &str, visibility: Visibility) {
+    FIELD_VISIBILITY_REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry
+            .entry(owner.to_string())
+            .or_default()
+            .insert(field.to_string(), visibility);
+    });
+}
+
+pub fn get_field_visibility(owner: &str, field: &str) -> Option<Visibility> {
+    FIELD_VISIBILITY_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .get(owner)
+            .and_then(|fields| fields.get(field))
+            .cloned()
+    })
 }
 
 /// 导入项

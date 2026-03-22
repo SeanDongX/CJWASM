@@ -6,6 +6,7 @@ use crate::lexer::{StringOrInterpolated, Token};
 
 impl Parser {
     pub fn parse_program(&mut self) -> Result<Program, ParseErrorAt> {
+        clear_field_visibility_registry();
         let mut package_name = None;
         let mut imports = Vec::new();
         let mut structs = Vec::new();
@@ -602,11 +603,23 @@ impl Parser {
 
         while !self.check(&Token::RBrace) {
             // cjc 兼容: 主构造函数前可有可见性，如 public StructName(...)
-            if self.check(&Token::Public)
+            let ctor_visibility_prefix = if self.check(&Token::Public)
                 || self.check(&Token::Private)
                 || self.check(&Token::Protected)
                 || self.check(&Token::Internal)
             {
+                let saved_pos = self.pos;
+                let saved_pushback = self.pushback.clone();
+                self.advance();
+                let is_ctor =
+                    self.peek_ident_eq(&name) && matches!(self.peek_next(), Some(Token::LParen));
+                self.pos = saved_pos;
+                self.pushback = saved_pushback;
+                is_ctor
+            } else {
+                false
+            };
+            if ctor_visibility_prefix {
                 self.advance();
             }
             // struct 主构造函数不允许 static 修饰符
@@ -709,6 +722,14 @@ impl Parser {
                     if is_member_param {
                         seen_member_param = true;
                     }
+                    let field_visibility = match visibility_tok.as_ref() {
+                        Some(Token::Public) => Visibility::Public,
+                        Some(Token::Private) => Visibility::Private,
+                        Some(Token::Protected) => Visibility::Protected,
+                        Some(Token::Internal) => Visibility::Internal,
+                        _ => Visibility::default(),
+                    };
+                    record_field_visibility(&name, &param_name, field_visibility);
                     fields.push(FieldDef {
                         name: param_name,
                         ty,
@@ -803,13 +824,21 @@ impl Parser {
 
             // 普通字段
             // cjc 兼容: 跳过可选的可见性、static、及 var/let 前缀 (public/private [static] var/let name: Type)
-            if self.check(&Token::Public)
-                || self.check(&Token::Private)
-                || self.check(&Token::Protected)
-                || self.check(&Token::Internal)
-            {
+            let member_vis = if self.check(&Token::Public) {
                 self.advance();
-            }
+                Visibility::Public
+            } else if self.check(&Token::Private) {
+                self.advance();
+                Visibility::Private
+            } else if self.check(&Token::Protected) {
+                self.advance();
+                Visibility::Protected
+            } else if self.check(&Token::Internal) {
+                self.advance();
+                Visibility::Internal
+            } else {
+                Visibility::default()
+            };
             // static 后跟 let/var/const → 静态字段，消费 static；static 后跟 func/init 等 → 下一轮匹配 Func 等，消费 static 并 continue
             if self.check(&Token::Static) {
                 match self.peek_next() {
@@ -976,6 +1005,7 @@ impl Parser {
                 ));
             };
 
+            record_field_visibility(&name, &field_name, member_vis);
             fields.push(FieldDef {
                 name: field_name,
                 ty,
@@ -2104,6 +2134,7 @@ impl Parser {
                 if self.check(&Token::Semicolon) {
                     self.advance();
                 }
+                record_field_visibility(&name, &f_name, member_vis.clone());
                 fields.push(crate::ast::FieldDef {
                     name: f_name,
                     ty,
@@ -2424,6 +2455,7 @@ impl Parser {
                         if self.check(&Token::Semicolon) {
                             self.advance();
                         }
+                        record_field_visibility(&name, &f_name, member_vis.clone());
                         fields.push(crate::ast::FieldDef {
                             name: f_name,
                             ty,
@@ -2770,6 +2802,7 @@ impl Parser {
                     if self.check(&Token::Semicolon) {
                         self.advance();
                     }
+                    record_field_visibility(&name, &f_name, member_vis.clone());
                     fields.push(crate::ast::FieldDef {
                         name: f_name,
                         ty,
@@ -2805,6 +2838,7 @@ impl Parser {
         // P6: 展开主构造函数参数为字段 + init
         if !primary_ctor_params.is_empty() {
             for p in &primary_ctor_params {
+                record_field_visibility(&class_def.name, &p.name, Visibility::default());
                 class_def.fields.push(FieldDef {
                     name: p.name.clone(),
                     ty: p.ty.clone(),

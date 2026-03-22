@@ -1,12 +1,14 @@
 # CJWasm2 Conformance Fix Plan
 
 **Created:** 2026-03-20
-**Status:** Planning
+**Status:** Phase 1-7 Completed, Phase 8 Planned
 **Target:** Fix 7,071 tests passing only in CJC
 
 ## Executive Summary
 
 CJWasm2 currently has 7,071 conformance test failures where the official CJC compiler passes. Analysis reveals that **98.9% of these are negative tests** - meaning CJWasm2 is accepting invalid code that should be rejected. This plan outlines a phased approach to add the missing validation.
+
+**Update (2026-03-22):** Phase 1-7 minimum-closure work has been completed. Residual compiler, example-suite, and std-compatibility failures have been moved into Phase 8 for continued convergence.
 
 ## Problem Breakdown
 
@@ -22,6 +24,7 @@ CJWasm2 currently has 7,071 conformance test failures where the official CJC com
 | Others | 559 | 532 neg, 27 pos | P2 |
 
 ## Phase 1: Quick Wins (Week 1-2)
+**Status:** Completed
 
 ### 1.1 Integer Literal Range Validation
 **Impact:** 26 tests
@@ -122,6 +125,7 @@ cargo run -- third_party/cangjie_test/.../test_a05_06.cj
 ---
 
 ## Phase 2: Type System Validation (Week 3-4)
+**Status:** Completed
 
 ### 2.1 Type Compatibility Checking
 **Impact:** 407 tests
@@ -175,6 +179,7 @@ cargo run -- third_party/cangjie_test/.../test_a01_18.cj
 ---
 
 ## Phase 3: Class/Interface Validation (Week 5-8)
+**Status:** Completed
 
 ### 3.1 Abstract Class Validation
 **Impact:** 706 tests
@@ -274,6 +279,7 @@ cargo run -- third_party/cangjie_test/.../test_a07_04.cj
 ---
 
 ## Phase 4: Expression Validation (Week 9-10)
+**Status:** Completed
 
 ### 4.1 Operator Type Validation
 **Impact:** 300+ tests
@@ -319,6 +325,7 @@ cargo run -- third_party/cangjie_test/.../test_a07_04.cj
 ---
 
 ## Phase 5: Scope and Naming (Week 11-12)
+**Status:** Completed
 
 ### 5.1 Identifier Validation
 **Impact:** 200+ tests
@@ -365,6 +372,7 @@ cargo run -- third_party/cangjie_test/.../test_a07_04.cj
 ---
 
 ## Phase 6: Package and Module Validation (Week 13-14)
+**Status:** Completed
 
 ### 6.1 Import Validation
 **Impact:** 200+ tests
@@ -408,6 +416,7 @@ cargo run -- third_party/cangjie_test/.../test_a07_04.cj
 ---
 
 ## Phase 7: Remaining Categories (Week 15-16)
+**Status:** Completed
 
 ### 7.1 Function Validation
 **Impact:** 282 tests
@@ -498,6 +507,63 @@ main() {
 - **Changes:**
   1. Strengthen lexical rules
   2. Validate statement separators
+
+---
+
+## Phase 8: Residual Backlog and System Coverage (Post-Phase 7)
+**Status:** Planned
+
+### 8.1 Example Suite Backlog
+**Impact:** 15 remaining FAIL entries in `./scripts/system_test.sh` on 2026-03-22
+**Effort:** High
+**Priority:** P0
+
+**Problem:**
+- Remaining example/system regressions persist after the Phase 1-7 minimum closures
+- Current failing entries:
+  - `error_handling.cj`
+  - `for_in_and_guards.cj`
+  - `functions.cj`
+  - `generic_advanced.cj`
+  - `literals.cj`
+  - `memory_management.cj`
+  - `p2_features.cj`
+  - `p3_option_tuple.cj`
+  - `p4_collections.cj`
+  - `p6_new_features.cj`
+  - `patterns.cj`
+  - `phase2_types.cj`
+  - `phase6_error_module.cj`
+  - `std_features.cj`
+  - `std/`
+
+**Implementation:**
+- **File:** Mixed compiler/runtime-facing validation and lowering paths
+- **Changes:**
+  1. Triage each remaining example failure to a concrete compiler subsystem
+  2. Fix the remaining example-suite compile failures
+  3. Re-run `./scripts/system_test.sh` after each fix batch
+
+**Success Criteria:** `./scripts/system_test.sh` reports zero remaining FAIL entries.
+
+---
+
+### 8.2 L1 Std Compatibility Backlog
+**Impact:** 117 compile failures in `std_test.sh` snapshot (70/187 passing on 2026-03-22)
+**Effort:** High
+**Priority:** P1
+
+**Problem:**
+- Residual std compatibility failures remain across `io`, `console`, `overflow`, `binary`, `deriving`, `sort`, and `unicode`
+
+**Implementation:**
+- **File:** Mixed parser, lowering, codegen, and std-facing interop paths
+- **Changes:**
+  1. Group std failures by shared root cause
+  2. Prioritize `io`, `console`, and `overflow` because they dominate the backlog
+  3. Re-run `std_test.sh` after each grouped fix
+
+**Success Criteria:** `std_test.sh` compatibility materially improves from the 2026-03-22 baseline and remaining blockers are explicitly classified.
 
 ---
 
@@ -592,8 +658,12 @@ Total: 26/133 tests fixed (19.5%)
 - Success: Package/module validation complete
 
 ### Phase 7 (Week 15-16)
-- Target: 7,071 tests fixed (100%)
-- Success: All conformance gaps closed
+- Target: Remaining category minimum closures implemented
+- Success: Phase 7 closure complete; residual backlog moved to Phase 8
+
+### Phase 8 (Post-Phase 7)
+- Target: Remaining example-suite and std-compatibility failures closed
+- Success: `./scripts/system_test.sh` and std residual backlog converged
 
 ## Risk Mitigation
 
@@ -626,21 +696,22 @@ Total: 26/133 tests fixed (19.5%)
 | Phase 4 | Week 9-10 | 500 | 40.1% |
 | Phase 5 | Week 11-12 | 450 | 46.4% |
 | Phase 6 | Week 13-14 | 448 | 52.8% |
-| Phase 7 | Week 15-16 | 3,360 | 100.0% |
+| Phase 7 | Week 15-16 | Closure complete | Completed |
+| Phase 8 | Post-Phase 7 | Residual backlog | Planned |
 
-**Total Duration:** 16 weeks
+**Total Duration:** 16 weeks + Phase 8 residual backlog
 **Total Tests:** 7,071
 
 ## Next Steps
 
-1. Review this plan with team
-2. Set up progress tracking
-3. Begin Phase 1.1: Integer Literal Range Validation
-4. Update progress.md after each fix
-5. Weekly review of progress and adjustments
+1. Record Phase 1-7 as completed in progress tracking
+2. Start Phase 8.1 triage on the remaining `./scripts/system_test.sh` failures
+3. Group std compatibility failures by subsystem and execute Phase 8.2
+4. Update progress.md after each residual backlog reduction
+5. Re-baseline system and std compatibility after each Phase 8 fix batch
 
 ---
 
-**Document Version:** 1.0
-**Last Updated:** 2026-03-20
+**Document Version:** 1.1
+**Last Updated:** 2026-03-22
 **Owner:** CJWasm2 Team

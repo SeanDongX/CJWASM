@@ -118,6 +118,82 @@ impl Parser {
         Ok(())
     }
 
+    fn validate_raw_identifier_span(
+        &self,
+        ident: &str,
+        span: (usize, usize),
+    ) -> Result<(), ParseErrorAt> {
+        if self.validate_raw_identifier(ident).is_err() {
+            return self.bail_at(
+                ParseError::UnexpectedToken(
+                    Token::Ident(ident.to_string()),
+                    "合法原始标识符".to_string(),
+                ),
+                span,
+            );
+        }
+        Ok(())
+    }
+
+    fn integer_suffix_from_token(token: Option<&Token>) -> Option<&'static str> {
+        match token {
+            Some(Token::Ident(s)) => match s.as_str() {
+                "i8" => Some("i8"),
+                "i16" => Some("i16"),
+                "i32" => Some("i32"),
+                "i64" => Some("i64"),
+                "u8" => Some("u8"),
+                "u16" => Some("u16"),
+                "u32" => Some("u32"),
+                "u64" => Some("u64"),
+                _ => None,
+            },
+            Some(Token::TypeInt8) => Some("i8"),
+            Some(Token::TypeInt16) => Some("i16"),
+            Some(Token::TypeInt32) => Some("i32"),
+            Some(Token::TypeInt64) => Some("i64"),
+            Some(Token::TypeUInt8) => Some("u8"),
+            Some(Token::TypeUInt16) => Some("u16"),
+            Some(Token::TypeUInt32) => Some("u32"),
+            Some(Token::TypeUInt64) => Some("u64"),
+            _ => None,
+        }
+    }
+
+    fn validate_integer_suffix_literal(
+        &self,
+        raw_value: i64,
+        suffix: &str,
+        negative: bool,
+        span: (usize, usize),
+    ) -> Result<i64, ParseErrorAt> {
+        let magnitude = i128::from(raw_value);
+        let (min, max) = match suffix {
+            "i8" => (i8::MIN as i128, i8::MAX as i128),
+            "i16" => (i16::MIN as i128, i16::MAX as i128),
+            "i32" => (i32::MIN as i128, i32::MAX as i128),
+            "i64" => (i64::MIN as i128, i64::MAX as i128),
+            "u8" => (u8::MIN as i128, u8::MAX as i128),
+            "u16" => (u16::MIN as i128, u16::MAX as i128),
+            "u32" => (u32::MIN as i128, u32::MAX as i128),
+            "u64" => (u64::MIN as i128, u64::MAX as i128),
+            _ => return Ok(raw_value),
+        };
+
+        let final_value = if negative { -magnitude } else { magnitude };
+        if final_value < min || final_value > max {
+            return self.bail_at(
+                ParseError::UnexpectedToken(
+                    Token::Integer(raw_value),
+                    format!("{} 范围内的整数字面量", suffix),
+                ),
+                span,
+            );
+        }
+
+        Ok(final_value as i64)
+    }
+
     fn bail<T>(&self, e: ParseError) -> Result<T, ParseErrorAt> {
         let (s, e_end) = self.at();
         Err(ParseErrorAt {
@@ -3306,6 +3382,68 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let program = parser.parse_program().unwrap();
         assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_p2_parse_error_out_of_range_integer_suffix_without_underscore() {
+        let err = parse_should_fail("func main() { let x = 170i8 }");
+        assert!(err.to_string().contains("i8"));
+    }
+
+    #[test]
+    fn test_p2_parse_negative_min_integer_suffix_without_underscore() {
+        let source = r#"
+            func main(): Int64 {
+                let x = -128i8
+                let y = -32768i16
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_p2_parse_error_invalid_raw_identifier_in_expr() {
+        let err = parse_should_fail("func main() { let a = ` ` }");
+        assert!(err.to_string().contains("合法原始标识符"));
+    }
+
+    #[test]
+    fn test_p3_struct_field_visibility_registry_and_extension_field_access_shape() {
+        let source = r#"
+            struct MyStruct {
+                private var myBasePrivateVar = "asdgsd"
+            }
+
+            extend MyStruct {
+                func myGetFunc() {
+                    this.myBasePrivateVar
+                }
+            }
+
+            main(): Unit { }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+
+        assert_eq!(
+            crate::ast::get_field_visibility("MyStruct", "myBasePrivateVar"),
+            Some(crate::ast::Visibility::Private)
+        );
+        assert_eq!(program.extends.len(), 1);
+        assert_eq!(program.extends[0].methods.len(), 1);
+        assert!(matches!(
+            program.extends[0].methods[0].body.first(),
+            Some(Stmt::Expr(Expr::Field { object, field }))
+                if matches!(object.as_ref(), Expr::Var(name) if name == "this")
+                    && field == "myBasePrivateVar"
+        ));
     }
 
     #[test]

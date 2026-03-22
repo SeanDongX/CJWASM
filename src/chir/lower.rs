@@ -46,9 +46,516 @@ fn validate_class_inheritance(program: &Program) -> Result<(), String> {
     Ok(())
 }
 
+/// 顶层作用域命名唯一性校验。
+/// 规则（最小闭环）：
+/// - 顶层常量（let/var/const）之间不可重名
+/// - 顶层常量/函数/类型（class/struct/interface/enum/type alias）不可同名
+/// - 函数重载（同名不同参数）保持允许
+fn validate_top_level_name_uniqueness(program: &Program) -> Result<(), String> {
+    fn duplicate_err(name: &str, new_kind: &str, existing_kind: &str) -> String {
+        format!(
+            "duplicate top-level name '{}': {} conflicts with {}",
+            name, new_kind, existing_kind
+        )
+    }
+
+    let mut const_names: HashSet<String> = HashSet::new();
+    for constant in &program.constants {
+        if !const_names.insert(constant.name.clone()) {
+            return Err(duplicate_err(&constant.name, "constant", "constant"));
+        }
+    }
+
+    let mut type_names: HashMap<String, &'static str> = HashMap::new();
+    let mut insert_type_name = |name: &str, kind: &'static str| -> Result<(), String> {
+        if let Some(existing_kind) = type_names.get(name) {
+            return Err(duplicate_err(name, kind, existing_kind));
+        }
+        type_names.insert(name.to_string(), kind);
+        Ok(())
+    };
+
+    for class_def in &program.classes {
+        insert_type_name(&class_def.name, "class")?;
+    }
+    for struct_def in &program.structs {
+        insert_type_name(&struct_def.name, "struct")?;
+    }
+    for interface_def in &program.interfaces {
+        insert_type_name(&interface_def.name, "interface")?;
+    }
+    for enum_def in &program.enums {
+        insert_type_name(&enum_def.name, "enum")?;
+    }
+    for (alias_name, _) in &program.type_aliases {
+        insert_type_name(alias_name, "type alias")?;
+    }
+
+    for constant in &program.constants {
+        if let Some(existing_kind) = type_names.get(&constant.name) {
+            return Err(duplicate_err(&constant.name, "constant", existing_kind));
+        }
+    }
+
+    for func in &program.functions {
+        if const_names.contains(&func.name) {
+            return Err(duplicate_err(&func.name, "function", "constant"));
+        }
+        if let Some(existing_kind) = type_names.get(&func.name) {
+            return Err(duplicate_err(&func.name, "function", existing_kind));
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate extension declarations to prevent duplicate interface implementations
 fn validate_extensions(program: &Program) -> Result<(), String> {
     use std::collections::HashSet;
+
+    fn validate_extension_expr_access(
+        target_type: &str,
+        expr: &crate::ast::Expr,
+    ) -> Result<(), String> {
+        use crate::ast::Expr;
+        match expr {
+            Expr::Field { object, field } => {
+                if matches!(object.as_ref(), Expr::Var(name) if name == "this" || name == "self")
+                    && matches!(
+                        crate::ast::get_field_visibility(target_type, field),
+                        Some(Visibility::Private)
+                    )
+                {
+                    return Err(format!(
+                        "extension of '{}' cannot access private member '{}'",
+                        target_type, field
+                    ));
+                }
+                validate_extension_expr_access(target_type, object)
+            }
+            Expr::Unary { expr, .. }
+            | Expr::Try(expr)
+            | Expr::Throw(expr)
+            | Expr::Some(expr)
+            | Expr::Ok(expr)
+            | Expr::Err(expr)
+            | Expr::PostfixIncr(expr)
+            | Expr::PostfixDecr(expr)
+            | Expr::PrefixIncr(expr)
+            | Expr::PrefixDecr(expr) => validate_extension_expr_access(target_type, expr),
+            Expr::Binary { left, right, .. } => {
+                validate_extension_expr_access(target_type, left)?;
+                validate_extension_expr_access(target_type, right)
+            }
+            Expr::Call {
+                args, named_args, ..
+            } => {
+                for arg in args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                for (_, arg) in named_args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                Ok(())
+            }
+            Expr::MethodCall {
+                object,
+                args,
+                named_args,
+                ..
+            } => {
+                validate_extension_expr_access(target_type, object)?;
+                for arg in args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                for (_, arg) in named_args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                Ok(())
+            }
+            Expr::SuperCall {
+                args, named_args, ..
+            } => {
+                for arg in args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                for (_, arg) in named_args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                Ok(())
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                validate_extension_expr_access(target_type, cond)?;
+                validate_extension_expr_access(target_type, then_branch)?;
+                if let Some(expr) = else_branch {
+                    validate_extension_expr_access(target_type, expr)?;
+                }
+                Ok(())
+            }
+            Expr::IfLet {
+                expr,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                validate_extension_expr_access(target_type, expr)?;
+                validate_extension_expr_access(target_type, then_branch)?;
+                if let Some(expr) = else_branch {
+                    validate_extension_expr_access(target_type, expr)?;
+                }
+                Ok(())
+            }
+            Expr::Block(stmts, trailing) => {
+                for stmt in stmts {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                if let Some(expr) = trailing {
+                    validate_extension_expr_access(target_type, expr)?;
+                }
+                Ok(())
+            }
+            Expr::Tuple(items) | Expr::Array(items) => {
+                for item in items {
+                    validate_extension_expr_access(target_type, item)?;
+                }
+                Ok(())
+            }
+            Expr::Index { array, index }
+            | Expr::SliceExpr {
+                array,
+                start: index,
+                ..
+            } => {
+                validate_extension_expr_access(target_type, array)?;
+                validate_extension_expr_access(target_type, index)
+            }
+            Expr::StructInit { fields, .. } => {
+                for (_, value) in fields {
+                    validate_extension_expr_access(target_type, value)?;
+                }
+                Ok(())
+            }
+            Expr::ConstructorCall {
+                args, named_args, ..
+            } => {
+                for arg in args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                for (_, arg) in named_args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                Ok(())
+            }
+            Expr::Range { start, end, step, .. } => {
+                validate_extension_expr_access(target_type, start)?;
+                validate_extension_expr_access(target_type, end)?;
+                if let Some(step) = step {
+                    validate_extension_expr_access(target_type, step)?;
+                }
+                Ok(())
+            }
+            Expr::VariantConst { arg, .. } => {
+                if let Some(arg) = arg {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                Ok(())
+            }
+            Expr::Match { expr, arms } => {
+                validate_extension_expr_access(target_type, expr)?;
+                for arm in arms {
+                    validate_extension_expr_access(target_type, &arm.body)?;
+                }
+                Ok(())
+            }
+            Expr::Cast { expr, .. }
+            | Expr::IsType { expr, .. } => validate_extension_expr_access(target_type, expr),
+            Expr::Lambda { body, .. } => validate_extension_expr_access(target_type, body),
+            Expr::NullCoalesce { option, default } => {
+                validate_extension_expr_access(target_type, option)?;
+                validate_extension_expr_access(target_type, default)
+            }
+            Expr::TryBlock {
+                resources,
+                body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                for (_, expr) in resources {
+                    validate_extension_expr_access(target_type, expr)?;
+                }
+                for stmt in body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                for stmt in catch_body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                if let Some(finally_body) = finally_body {
+                    for stmt in finally_body {
+                        validate_extension_stmt_access(target_type, stmt)?;
+                    }
+                }
+                Ok(())
+            }
+            Expr::MapLiteral { entries } => {
+                for (key, value) in entries {
+                    validate_extension_expr_access(target_type, key)?;
+                    validate_extension_expr_access(target_type, value)?;
+                }
+                Ok(())
+            }
+            Expr::Spawn { body } => {
+                for stmt in body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                Ok(())
+            }
+            Expr::Synchronized { lock, body } => {
+                validate_extension_expr_access(target_type, lock)?;
+                for stmt in body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                Ok(())
+            }
+            Expr::OptionalChain { object, field } => {
+                if matches!(object.as_ref(), Expr::Var(name) if name == "this" || name == "self")
+                    && matches!(
+                        crate::ast::get_field_visibility(target_type, field),
+                        Some(Visibility::Private)
+                    )
+                {
+                    return Err(format!(
+                        "extension of '{}' cannot access private member '{}'",
+                        target_type, field
+                    ));
+                }
+                validate_extension_expr_access(target_type, object)
+            }
+            Expr::TrailingClosure {
+                callee,
+                args,
+                closure,
+            } => {
+                validate_extension_expr_access(target_type, callee)?;
+                for arg in args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                validate_extension_expr_access(target_type, closure)
+            }
+            Expr::Macro { args, .. } => {
+                for arg in args {
+                    validate_extension_expr_access(target_type, arg)?;
+                }
+                Ok(())
+            }
+            Expr::TupleIndex { object, .. } => validate_extension_expr_access(target_type, object),
+            Expr::Return(Some(expr)) => validate_extension_expr_access(target_type, expr),
+            Expr::Return(None)
+            | Expr::Integer(_)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Bool(_)
+            | Expr::String(_)
+            | Expr::Rune(_)
+            | Expr::Var(_)
+            | Expr::SuperFieldAccess { .. }
+            | Expr::Break
+            | Expr::Continue
+            | Expr::None => Ok(()),
+            Expr::Interpolate(parts) => {
+                for part in parts {
+                    if let crate::ast::InterpolatePart::Expr(expr) = part {
+                        validate_extension_expr_access(target_type, expr)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_extension_assign_target_access(
+        target_type: &str,
+        target: &crate::ast::AssignTarget,
+    ) -> Result<(), String> {
+        use crate::ast::AssignTarget;
+        match target {
+            AssignTarget::Field { object, field }
+                if (object == "this" || object == "self")
+                    && matches!(
+                        crate::ast::get_field_visibility(target_type, field),
+                        Some(Visibility::Private)
+                    ) =>
+            {
+                Err(format!(
+                    "extension of '{}' cannot access private member '{}'",
+                    target_type, field
+                ))
+            }
+            AssignTarget::FieldPath { base, fields }
+                if base == "this" || base == "self" =>
+            {
+                if let Some(field) = fields.first() {
+                    if matches!(
+                        crate::ast::get_field_visibility(target_type, field),
+                        Some(Visibility::Private)
+                    ) {
+                        return Err(format!(
+                            "extension of '{}' cannot access private member '{}'",
+                            target_type, field
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            AssignTarget::IndexPath { base, fields, index }
+                if base == "this" || base == "self" =>
+            {
+                if let Some(field) = fields.first() {
+                    if matches!(
+                        crate::ast::get_field_visibility(target_type, field),
+                        Some(Visibility::Private)
+                    ) {
+                        return Err(format!(
+                            "extension of '{}' cannot access private member '{}'",
+                            target_type, field
+                        ));
+                    }
+                }
+                validate_extension_expr_access(target_type, index)
+            }
+            AssignTarget::Index { index, .. } => validate_extension_expr_access(target_type, index),
+            AssignTarget::ExprIndex { expr, index } => {
+                validate_extension_expr_access(target_type, expr)?;
+                validate_extension_expr_access(target_type, index)
+            }
+            AssignTarget::Tuple(items) => {
+                for item in items {
+                    validate_extension_assign_target_access(target_type, item)?;
+                }
+                Ok(())
+            }
+            AssignTarget::Var(_)
+            | AssignTarget::Field { .. }
+            | AssignTarget::FieldPath { .. }
+            | AssignTarget::IndexPath { .. }
+            | AssignTarget::SuperField { .. } => Ok(()),
+        }
+    }
+
+    fn validate_extension_stmt_access(
+        target_type: &str,
+        stmt: &crate::ast::Stmt,
+    ) -> Result<(), String> {
+        use crate::ast::Stmt;
+        match stmt {
+            Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Expr(value) => {
+                validate_extension_expr_access(target_type, value)
+            }
+            Stmt::Assign { target, value } => {
+                validate_extension_assign_target_access(target_type, target)?;
+                validate_extension_expr_access(target_type, value)
+            }
+            Stmt::Return(Some(expr)) => validate_extension_expr_access(target_type, expr),
+            Stmt::While { cond, body } => {
+                validate_extension_expr_access(target_type, cond)?;
+                for stmt in body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                Ok(())
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                validate_extension_expr_access(target_type, expr)?;
+                for stmt in body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                Ok(())
+            }
+            Stmt::DoWhile { body, cond } => {
+                for stmt in body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                validate_extension_expr_access(target_type, cond)
+            }
+            Stmt::For { iterable, body, .. } => {
+                validate_extension_expr_access(target_type, iterable)?;
+                for stmt in body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                Ok(())
+            }
+            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+                for stmt in body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                Ok(())
+            }
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                validate_extension_expr_access(target_type, left)?;
+                validate_extension_expr_access(target_type, right)
+            }
+            Stmt::Const { value, .. } => validate_extension_expr_access(target_type, value),
+            Stmt::LocalFunc(func) => {
+                for stmt in &func.body {
+                    validate_extension_stmt_access(target_type, stmt)?;
+                }
+                Ok(())
+            }
+            Stmt::Return(None) | Stmt::Break | Stmt::Continue => Ok(()),
+        }
+    }
+
+    fn collect_interface_hierarchy(
+        name: &str,
+        interface_map: &HashMap<String, &crate::ast::InterfaceDef>,
+        out: &mut HashSet<String>,
+    ) {
+        if !out.insert(name.to_string()) {
+            return;
+        }
+        if let Some(iface) = interface_map.get(name) {
+            for parent in &iface.parents {
+                collect_interface_hierarchy(parent, interface_map, out);
+            }
+        }
+    }
+
+    fn collect_class_interfaces(
+        name: &str,
+        class_map: &HashMap<String, &crate::ast::ClassDef>,
+        interface_map: &HashMap<String, &crate::ast::InterfaceDef>,
+        memo: &mut HashMap<String, HashSet<String>>,
+    ) -> HashSet<String> {
+        if let Some(cached) = memo.get(name) {
+            return cached.clone();
+        }
+
+        let mut interfaces = HashSet::new();
+        if let Some(class_def) = class_map.get(name) {
+            if let Some(parent) = &class_def.extends {
+                if class_map.contains_key(parent) {
+                    interfaces.extend(collect_class_interfaces(
+                        parent,
+                        class_map,
+                        interface_map,
+                        memo,
+                    ));
+                } else if interface_map.contains_key(parent) {
+                    collect_interface_hierarchy(parent, interface_map, &mut interfaces);
+                }
+            }
+
+            for iface in &class_def.implements {
+                collect_interface_hierarchy(iface, interface_map, &mut interfaces);
+            }
+        }
+
+        memo.insert(name.to_string(), interfaces.clone());
+        interfaces
+    }
 
     // Known standard library interface implementations
     let mut known_implementations: HashMap<String, HashSet<String>> = HashMap::new();
@@ -90,6 +597,18 @@ fn validate_extensions(program: &Program) -> Result<(), String> {
         known_implementations.insert("Rune".to_string(), interfaces);
     }
 
+    let interface_map: HashMap<String, &crate::ast::InterfaceDef> = program
+        .interfaces
+        .iter()
+        .map(|iface| (iface.name.clone(), iface))
+        .collect();
+    let class_map: HashMap<String, &crate::ast::ClassDef> = program
+        .classes
+        .iter()
+        .map(|class_def| (class_def.name.clone(), class_def))
+        .collect();
+    let mut class_interfaces_memo: HashMap<String, HashSet<String>> = HashMap::new();
+
     let mut type_interfaces: HashMap<String, HashSet<String>> = HashMap::new();
 
     for ext in &program.extends {
@@ -101,6 +620,21 @@ fn validate_extensions(program: &Program) -> Result<(), String> {
                 if known_ifaces.contains(interface) {
                     return Err(format!(
                         "type '{}' already implements interface '{}' (from standard library)",
+                        type_name, interface
+                    ));
+                }
+            }
+
+            if class_map.contains_key(type_name) {
+                let implemented = collect_class_interfaces(
+                    type_name,
+                    &class_map,
+                    &interface_map,
+                    &mut class_interfaces_memo,
+                );
+                if implemented.contains(interface) {
+                    return Err(format!(
+                        "type '{}' already implements interface '{}'",
                         type_name, interface
                     ));
                 }
@@ -231,6 +765,14 @@ fn validate_extensions(program: &Program) -> Result<(), String> {
         }
     }
 
+    for ext in &program.extends {
+        for method in &ext.methods {
+            for stmt in &method.body {
+                validate_extension_stmt_access(&ext.target_type, stmt)?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -355,6 +897,361 @@ fn visibility_rank(v: &Visibility) -> u8 {
 
 fn visibility_at_least(child: &Visibility, base: &Visibility) -> bool {
     visibility_rank(child) >= visibility_rank(base)
+}
+
+fn min_visibility(lhs: &Visibility, rhs: &Visibility) -> Visibility {
+    if visibility_rank(lhs) <= visibility_rank(rhs) {
+        lhs.clone()
+    } else {
+        rhs.clone()
+    }
+}
+
+fn visibility_name(v: &Visibility) -> &'static str {
+    match v {
+        Visibility::Private => "private",
+        Visibility::Internal => "internal",
+        Visibility::Protected => "protected",
+        Visibility::Public => "public",
+    }
+}
+
+fn first_non_public_type_ref(
+    ty: &Type,
+    nominal_visibility: &HashMap<String, Visibility>,
+) -> Option<(String, Visibility)> {
+    match ty {
+        Type::Struct(name, type_args) => {
+            if let Some(vis) = nominal_visibility.get(name) {
+                if *vis != Visibility::Public {
+                    return Some((name.clone(), vis.clone()));
+                }
+            }
+            for arg in type_args {
+                if let Some(found) = first_non_public_type_ref(arg, nominal_visibility) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Type::Array(inner) | Type::Option(inner) | Type::Slice(inner) => {
+            first_non_public_type_ref(inner, nominal_visibility)
+        }
+        Type::Tuple(items) => {
+            for item in items {
+                if let Some(found) = first_non_public_type_ref(item, nominal_visibility) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Type::Function { params, ret } => {
+            for param in params {
+                if let Some(found) = first_non_public_type_ref(param, nominal_visibility) {
+                    return Some(found);
+                }
+            }
+            if let Some(ret_ty) = ret.as_ref() {
+                return first_non_public_type_ref(ret_ty, nominal_visibility);
+            }
+            None
+        }
+        Type::Result(ok, err) | Type::Map(ok, err) => {
+            if let Some(found) = first_non_public_type_ref(ok, nominal_visibility) {
+                return Some(found);
+            }
+            first_non_public_type_ref(err, nominal_visibility)
+        }
+        Type::Qualified(path) => {
+            let name = path.last()?;
+            if let Some(vis) = nominal_visibility.get(name) {
+                if *vis != Visibility::Public {
+                    return Some((name.clone(), vis.clone()));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn validate_public_decl_signature_types(
+    decl_name: &str,
+    params: &[Param],
+    return_type: Option<&Type>,
+    nominal_visibility: &HashMap<String, Visibility>,
+) -> Result<(), String> {
+    for param in params {
+        if let Some((ty_name, vis)) = first_non_public_type_ref(&param.ty, nominal_visibility) {
+            return Err(format!(
+                "public declaration '{}' uses {} type '{}' in parameter '{}'",
+                decl_name,
+                visibility_name(&vis),
+                ty_name,
+                param.name
+            ));
+        }
+    }
+
+    if let Some(ret_ty) = return_type {
+        if let Some((ty_name, vis)) = first_non_public_type_ref(ret_ty, nominal_visibility) {
+            return Err(format!(
+                "public declaration '{}' uses {} type '{}' in return type",
+                decl_name,
+                visibility_name(&vis),
+                ty_name
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_public_signature_type_visibility(program: &Program) -> Result<(), String> {
+    let mut nominal_visibility: HashMap<String, Visibility> = HashMap::new();
+    for class_def in &program.classes {
+        nominal_visibility.insert(class_def.name.clone(), class_def.visibility.clone());
+    }
+    for struct_def in &program.structs {
+        nominal_visibility.insert(struct_def.name.clone(), struct_def.visibility.clone());
+    }
+    for interface_def in &program.interfaces {
+        nominal_visibility.insert(interface_def.name.clone(), interface_def.visibility.clone());
+    }
+    for enum_def in &program.enums {
+        nominal_visibility.insert(enum_def.name.clone(), enum_def.visibility.clone());
+    }
+    // 当前 AST 的 type alias 不带显式 visibility，按默认 internal 处理。
+    for (alias_name, _) in &program.type_aliases {
+        nominal_visibility.insert(alias_name.clone(), Visibility::Internal);
+    }
+
+    for func in &program.functions {
+        let mut effective_visibility = func.visibility.clone();
+        if let Some((owner, _)) = func.name.split_once('.') {
+            if let Some(owner_vis) = nominal_visibility.get(owner) {
+                effective_visibility = min_visibility(&effective_visibility, owner_vis);
+            }
+        }
+        if effective_visibility == Visibility::Public {
+            validate_public_decl_signature_types(
+                &func.name,
+                &func.params,
+                func.return_type.as_ref(),
+                &nominal_visibility,
+            )?;
+        }
+    }
+
+    for class_def in &program.classes {
+        for method in &class_def.methods {
+            let effective_visibility =
+                min_visibility(&method.func.visibility, &class_def.visibility);
+            if effective_visibility == Visibility::Public {
+                validate_public_decl_signature_types(
+                    &method.func.name,
+                    &method.func.params,
+                    method.func.return_type.as_ref(),
+                    &nominal_visibility,
+                )?;
+            }
+        }
+    }
+
+    for ext in &program.extends {
+        let owner_visibility = nominal_visibility
+            .get(&ext.target_type)
+            .cloned()
+            .unwrap_or(Visibility::Public);
+        for method in &ext.methods {
+            let effective_visibility = min_visibility(&method.visibility, &owner_visibility);
+            if effective_visibility == Visibility::Public {
+                validate_public_decl_signature_types(
+                    &method.name,
+                    &method.params,
+                    method.return_type.as_ref(),
+                    &nominal_visibility,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn expr_contains_throw(expr: &crate::ast::Expr) -> bool {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Throw(_) => true,
+        Expr::Unary { expr, .. }
+        | Expr::Try(expr)
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::TupleIndex { object: expr, .. }
+        | Expr::OptionalChain { object: expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsType { expr, .. } => expr_contains_throw(expr),
+        Expr::Binary { left, right, .. } => expr_contains_throw(left) || expr_contains_throw(right),
+        Expr::Call {
+            args, named_args, ..
+        }
+        | Expr::ConstructorCall {
+            args, named_args, ..
+        } => {
+            args.iter().any(expr_contains_throw)
+                || named_args.iter().any(|(_, expr)| expr_contains_throw(expr))
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            expr_contains_throw(object)
+                || args.iter().any(expr_contains_throw)
+                || named_args.iter().any(|(_, expr)| expr_contains_throw(expr))
+        }
+        Expr::SuperCall {
+            args, named_args, ..
+        } => {
+            args.iter().any(expr_contains_throw)
+                || named_args.iter().any(|(_, expr)| expr_contains_throw(expr))
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_contains_throw(cond)
+                || expr_contains_throw(then_branch)
+                || else_branch.as_ref().is_some_and(|expr| expr_contains_throw(expr))
+        }
+        Expr::IfLet {
+            expr,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_contains_throw(expr)
+                || expr_contains_throw(then_branch)
+                || else_branch.as_ref().is_some_and(|expr| expr_contains_throw(expr))
+        }
+        Expr::Block(stmts, trailing) => {
+            stmts.iter().any(stmt_contains_throw)
+                || trailing.as_ref().is_some_and(|expr| expr_contains_throw(expr))
+        }
+        Expr::Tuple(items) | Expr::Array(items) => items.iter().any(expr_contains_throw),
+        Expr::Index { array, index } => expr_contains_throw(array) || expr_contains_throw(index),
+        Expr::StructInit { fields, .. } => fields.iter().any(|(_, expr)| expr_contains_throw(expr)),
+        Expr::Field { object, .. } => expr_contains_throw(object),
+        Expr::Range { start, end, step, .. } => {
+            expr_contains_throw(start)
+                || expr_contains_throw(end)
+                || step.as_ref().is_some_and(|expr| expr_contains_throw(expr))
+        }
+        Expr::VariantConst { arg, .. } => arg.as_ref().is_some_and(|expr| expr_contains_throw(expr)),
+        Expr::Match { expr, arms } => {
+            expr_contains_throw(expr) || arms.iter().any(|arm| expr_contains_throw(&arm.body))
+        }
+        Expr::Lambda { body, .. } => expr_contains_throw(body),
+        Expr::NullCoalesce { option, default } => {
+            expr_contains_throw(option) || expr_contains_throw(default)
+        }
+        Expr::TryBlock {
+            resources,
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            resources.iter().any(|(_, expr)| expr_contains_throw(expr))
+                || body.iter().any(stmt_contains_throw)
+                || catch_body.iter().any(stmt_contains_throw)
+                || finally_body
+                    .as_ref()
+                    .is_some_and(|stmts| stmts.iter().any(stmt_contains_throw))
+        }
+        Expr::SliceExpr { array, start, end } => {
+            expr_contains_throw(array) || expr_contains_throw(start) || expr_contains_throw(end)
+        }
+        Expr::MapLiteral { entries } => entries
+            .iter()
+            .any(|(key, value)| expr_contains_throw(key) || expr_contains_throw(value)),
+        Expr::Spawn { body } => body.iter().any(stmt_contains_throw),
+        Expr::Synchronized { lock, body } => {
+            expr_contains_throw(lock) || body.iter().any(stmt_contains_throw)
+        }
+        Expr::TrailingClosure { callee, args, closure } => {
+            expr_contains_throw(callee)
+                || args.iter().any(expr_contains_throw)
+                || expr_contains_throw(closure)
+        }
+        Expr::Macro { args, .. } => args.iter().any(expr_contains_throw),
+        Expr::Interpolate(parts) => parts.iter().any(|part| match part {
+            crate::ast::InterpolatePart::Literal(_) => false,
+            crate::ast::InterpolatePart::Expr(expr) => expr_contains_throw(expr),
+        }),
+        Expr::Return(Some(expr)) => expr_contains_throw(expr),
+        Expr::Return(None)
+        | Expr::Integer(_)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::Bool(_)
+        | Expr::Rune(_)
+        | Expr::String(_)
+        | Expr::Var(_)
+        | Expr::SuperFieldAccess { .. }
+        | Expr::Break
+        | Expr::Continue
+        | Expr::None => false,
+    }
+}
+
+fn stmt_contains_throw(stmt: &crate::ast::Stmt) -> bool {
+    use crate::ast::Stmt;
+    match stmt {
+        Stmt::Let { value, .. }
+        | Stmt::Var { value, .. }
+        | Stmt::Assign { value, .. }
+        | Stmt::Expr(value)
+        | Stmt::Const { value, .. } => expr_contains_throw(value),
+        Stmt::Return(Some(expr)) => expr_contains_throw(expr),
+        Stmt::While { cond, body } => {
+            expr_contains_throw(cond) || body.iter().any(stmt_contains_throw)
+        }
+        Stmt::WhileLet { expr, body, .. } => {
+            expr_contains_throw(expr) || body.iter().any(stmt_contains_throw)
+        }
+        Stmt::DoWhile { body, cond } => {
+            body.iter().any(stmt_contains_throw) || expr_contains_throw(cond)
+        }
+        Stmt::For { iterable, body, .. } => {
+            expr_contains_throw(iterable) || body.iter().any(stmt_contains_throw)
+        }
+        Stmt::Loop { body } | Stmt::UnsafeBlock { body } => body.iter().any(stmt_contains_throw),
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            expr_contains_throw(left) || expr_contains_throw(right)
+        }
+        Stmt::LocalFunc(func) => func.body.iter().any(stmt_contains_throw),
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue => false,
+    }
+}
+
+fn validate_main_throw_rules(program: &Program) -> Result<(), String> {
+    for func in &program.functions {
+        if func.name == "main" && func.return_type.is_none() && func.body.iter().any(stmt_contains_throw)
+        {
+            return Err(
+                "main containing throw must declare an explicit return type".to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_upper_bounds(
@@ -1073,12 +1970,22 @@ pub fn lower_function(
 
 /// 降低程序
 pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
+    validate_top_level_name_uniqueness(program)?;
+    validate_public_signature_type_visibility(program)?;
     validate_class_inheritance(program)?;
     validate_class_interface_semantics(program)?;
     validate_extensions(program)?;
+    validate_main_throw_rules(program)?;
 
     // 构建类型推断上下文
     let type_ctx = TypeInferenceContext::from_program(program);
+
+    for constant in &program.constants {
+        let init_ty = type_ctx.infer_expr(&constant.init)?;
+        if !type_ctx.is_assignable_type(&constant.ty, &init_ty) {
+            return Err("mismatched types".to_string());
+        }
+    }
 
     // 构建函数索引表（偏移 4 跳过 WASI 导入：fd_write=0, proc_exit=1, clock_time_get=2, random_get=3）
     // 同名不同参数的函数（重载）使用 "name$arity" 修饰名，优先精确匹配
@@ -1639,8 +2546,8 @@ fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &m
 mod tests {
     use super::*;
     use crate::ast::{
-        ClassDef, ClassMethod, Expr, FieldDef, InterfaceDef, InterfaceMethod, Param, Pattern, Stmt,
-        StructDef, TypeConstraint, Visibility,
+        ClassDef, ClassMethod, Expr, ExtendDef, FieldDef, InterfaceDef, InterfaceMethod, Param,
+        Pattern, Stmt, StructDef, TypeConstraint, Visibility,
     };
 
     fn make_func(name: &str, params: Vec<Param>, body: Vec<Stmt>) -> Function {
@@ -2664,5 +3571,646 @@ mod tests {
 
         let err = lower_program(&program).unwrap_err();
         assert!(err.contains("cannot assign to immutable value"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_extension_accessing_private_struct_field() {
+        crate::ast::clear_field_visibility_registry();
+        crate::ast::record_field_visibility("S", "secret", Visibility::Private);
+
+        let extension_method = Function {
+            visibility: Visibility::Public,
+            name: "S.peek".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            params: vec![Param {
+                name: "this".to_string(),
+                ty: Type::Struct("S".to_string(), vec![]),
+                default: None,
+                variadic: false,
+                is_named: false,
+                is_inout: false,
+            }],
+            return_type: None,
+            throws: None,
+            body: vec![Stmt::Expr(Expr::Field {
+                object: Box::new(Expr::Var("this".to_string())),
+                field: "secret".to_string(),
+            })],
+            extern_import: None,
+        };
+
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![StructDef {
+                visibility: Visibility::Public,
+                name: "S".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                fields: vec![FieldDef {
+                    name: "secret".to_string(),
+                    ty: Type::Int64,
+                    default: None,
+                }],
+            }],
+            classes: vec![],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![ExtendDef {
+                target_type: "S".to_string(),
+                interface: None,
+                assoc_type_bindings: vec![],
+                methods: vec![extension_method],
+            }],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("cannot access private member 'secret'"));
+        crate::ast::clear_field_visibility_registry();
+    }
+
+    #[test]
+    fn test_lower_program_allows_extension_accessing_non_private_struct_field() {
+        crate::ast::clear_field_visibility_registry();
+        crate::ast::record_field_visibility("S", "value", Visibility::Public);
+
+        let extension_method = Function {
+            visibility: Visibility::Public,
+            name: "S.peek".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            params: vec![Param {
+                name: "this".to_string(),
+                ty: Type::Struct("S".to_string(), vec![]),
+                default: None,
+                variadic: false,
+                is_named: false,
+                is_inout: false,
+            }],
+            return_type: None,
+            throws: None,
+            body: vec![Stmt::Expr(Expr::Field {
+                object: Box::new(Expr::Var("this".to_string())),
+                field: "value".to_string(),
+            })],
+            extern_import: None,
+        };
+
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![StructDef {
+                visibility: Visibility::Public,
+                name: "S".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                fields: vec![FieldDef {
+                    name: "value".to_string(),
+                    ty: Type::Int64,
+                    default: None,
+                }],
+            }],
+            classes: vec![],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![ExtendDef {
+                target_type: "S".to_string(),
+                interface: None,
+                assoc_type_bindings: vec![],
+                methods: vec![extension_method],
+            }],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let result = lower_program(&program);
+        assert!(result.is_ok(), "{result:?}");
+        crate::ast::clear_field_visibility_registry();
+    }
+
+    #[test]
+    fn test_lower_program_rejects_extension_reimplementing_user_interface() {
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![],
+            classes: vec![ClassDef {
+                visibility: Visibility::default(),
+                name: "A".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                is_abstract: false,
+                is_sealed: false,
+                is_open: false,
+                extends: None,
+                implements: vec!["I".to_string()],
+                fields: vec![],
+                init: None,
+                deinit: None,
+                static_init: None,
+                methods: vec![],
+                primary_ctor_params: vec![],
+            }],
+            enums: vec![],
+            interfaces: vec![InterfaceDef {
+                visibility: Visibility::Public,
+                name: "I".to_string(),
+                parents: vec![],
+                methods: vec![],
+                assoc_types: vec![],
+            }],
+            extends: vec![ExtendDef {
+                target_type: "A".to_string(),
+                interface: Some("I".to_string()),
+                assoc_type_bindings: vec![],
+                methods: vec![],
+            }],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("already implements interface 'I'"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_extension_reimplementing_inherited_interface() {
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![],
+            classes: vec![
+                ClassDef {
+                    visibility: Visibility::default(),
+                    name: "A".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    is_abstract: false,
+                    is_sealed: false,
+                    is_open: true,
+                    extends: None,
+                    implements: vec!["I".to_string()],
+                    fields: vec![],
+                    init: None,
+                    deinit: None,
+                    static_init: None,
+                    methods: vec![],
+                    primary_ctor_params: vec![],
+                },
+                ClassDef {
+                    visibility: Visibility::default(),
+                    name: "B".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    is_abstract: false,
+                    is_sealed: false,
+                    is_open: false,
+                    extends: Some("A".to_string()),
+                    implements: vec![],
+                    fields: vec![],
+                    init: None,
+                    deinit: None,
+                    static_init: None,
+                    methods: vec![],
+                    primary_ctor_params: vec![],
+                },
+            ],
+            enums: vec![],
+            interfaces: vec![InterfaceDef {
+                visibility: Visibility::Public,
+                name: "I".to_string(),
+                parents: vec![],
+                methods: vec![],
+                assoc_types: vec![],
+            }],
+            extends: vec![ExtendDef {
+                target_type: "B".to_string(),
+                interface: Some("I".to_string()),
+                assoc_type_bindings: vec![],
+                methods: vec![],
+            }],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("already implements interface 'I'"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_top_level_constant_type_mismatch() {
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![],
+            classes: vec![],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![crate::ast::ConstDef {
+                name: "f".to_string(),
+                ty: Type::Float64,
+                init: Expr::Integer(1),
+            }],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("mismatched types"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_duplicate_top_level_constants() {
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![],
+            classes: vec![],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![
+                crate::ast::ConstDef {
+                    name: "name".to_string(),
+                    ty: Type::Int64,
+                    init: Expr::Integer(0),
+                },
+                crate::ast::ConstDef {
+                    name: "name".to_string(),
+                    ty: Type::Int64,
+                    init: Expr::Integer(1),
+                },
+            ],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("duplicate top-level name 'name'"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_top_level_constant_and_function_same_name() {
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func(
+                "name",
+                vec![],
+                vec![Stmt::Return(Some(Expr::Integer(0)))],
+            )],
+            structs: vec![],
+            classes: vec![],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![crate::ast::ConstDef {
+                name: "name".to_string(),
+                ty: Type::Int64,
+                init: Expr::Integer(1),
+            }],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("duplicate top-level name 'name'"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_top_level_constant_and_type_same_name() {
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "name".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: None,
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![crate::ast::ConstDef {
+                name: "name".to_string(),
+                ty: Type::Int64,
+                init: Expr::Integer(1),
+            }],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("duplicate top-level name 'name'"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_public_function_param_using_internal_type() {
+        let class_def = ClassDef {
+            visibility: Visibility::Internal,
+            name: "C1".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: None,
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![],
+            primary_ctor_params: vec![],
+        };
+
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![
+                Function {
+                    visibility: Visibility::Public,
+                    name: "foo".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "p1".to_string(),
+                        ty: Type::Struct("C1".to_string(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+                    extern_import: None,
+                },
+                make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))]),
+            ],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("public declaration 'foo' uses internal type 'C1' in parameter 'p1'"));
+    }
+
+    #[test]
+    fn test_lower_program_accepts_public_function_param_using_public_type() {
+        let class_def = ClassDef {
+            visibility: Visibility::Public,
+            name: "C1".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: None,
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![],
+            primary_ctor_params: vec![],
+        };
+
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![
+                Function {
+                    visibility: Visibility::Public,
+                    name: "foo".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "p1".to_string(),
+                        ty: Type::Struct("C1".to_string(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::Int64),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::Integer(0)))],
+                    extern_import: None,
+                },
+                make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))]),
+            ],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        assert!(lower_program(&program).is_ok());
+    }
+
+    #[test]
+    fn test_lower_program_rejects_extension_private_field_access() {
+        crate::ast::clear_field_visibility_registry();
+        crate::ast::record_field_visibility("MyStruct", "secret", Visibility::Private);
+
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![StructDef {
+                visibility: Visibility::default(),
+                name: "MyStruct".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                fields: vec![FieldDef {
+                    name: "secret".to_string(),
+                    ty: Type::String,
+                    default: None,
+                }],
+            }],
+            classes: vec![],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![ExtendDef {
+                target_type: "MyStruct".to_string(),
+                interface: None,
+                assoc_type_bindings: vec![],
+                methods: vec![Function {
+                    visibility: Visibility::default(),
+                    name: "MyStruct.leak".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct("MyStruct".to_string(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: None,
+                    body: vec![Stmt::Expr(Expr::Field {
+                        object: Box::new(Expr::Var("this".to_string())),
+                        field: "secret".to_string(),
+                    })],
+                    throws: None,
+                    extern_import: None,
+                }],
+            }],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("cannot access private member 'secret'"));
+    }
+
+    #[test]
+    fn test_lower_program_allows_extension_non_private_field_access() {
+        crate::ast::clear_field_visibility_registry();
+        crate::ast::record_field_visibility("MyStruct", "value", Visibility::Public);
+
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],
+            structs: vec![StructDef {
+                visibility: Visibility::default(),
+                name: "MyStruct".to_string(),
+                type_params: vec![],
+                constraints: vec![],
+                fields: vec![FieldDef {
+                    name: "value".to_string(),
+                    ty: Type::Int64,
+                    default: None,
+                }],
+            }],
+            classes: vec![],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![ExtendDef {
+                target_type: "MyStruct".to_string(),
+                interface: None,
+                assoc_type_bindings: vec![],
+                methods: vec![Function {
+                    visibility: Visibility::default(),
+                    name: "MyStruct.read".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct("MyStruct".to_string(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::Int64),
+                    body: vec![Stmt::Return(Some(Expr::Field {
+                        object: Box::new(Expr::Var("this".to_string())),
+                        field: "value".to_string(),
+                    }))],
+                    throws: None,
+                    extern_import: None,
+                }],
+            }],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        assert!(lower_program(&program).is_ok());
+    }
+
+    #[test]
+    fn test_lower_program_rejects_extension_private_field_access_from_parsed_source() {
+        let source = r#"
+            struct MyStruct {
+                private var myBasePrivateVar = "asdgsd"
+            }
+
+            extend MyStruct {
+                func myGetFunc() {
+                    this.myBasePrivateVar
+                }
+            }
+
+            main(): Unit { }
+        "#;
+
+        let mut program = crate::pipeline::parse_source(source).unwrap();
+        crate::optimizer::optimize_program(&mut program);
+        crate::monomorph::monomorphize_program(&mut program);
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("cannot access private member 'myBasePrivateVar'"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_extension_private_field_access_from_real_file() {
+        let path = "third_party/cangjie_test/Conformance/Compiler/testsuite/src/tests/08_extension/04_the_accessing_and_shadowing_of_extensions/a05/test_a05_05.cj";
+        let (mut program, _) = crate::pipeline::parse_file(path).unwrap();
+        crate::optimizer::optimize_program(&mut program);
+        crate::monomorph::monomorphize_program(&mut program);
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("cannot access private member 'myBasePrivateVar'"));
+    }
+
+    #[test]
+    fn test_lower_program_rejects_main_throw_without_explicit_return_type() {
+        let source = r#"
+            main() {
+                throw Exception()
+            }
+        "#;
+
+        let mut program = crate::pipeline::parse_source(source).unwrap();
+        crate::optimizer::optimize_program(&mut program);
+        crate::monomorph::monomorphize_program(&mut program);
+
+        let err = lower_program(&program).unwrap_err();
+        assert!(err.contains("main containing throw must declare an explicit return type"));
+    }
+
+    #[test]
+    fn test_lower_program_accepts_explicit_unit_main_without_throw() {
+        let source = r#"
+            main(): Unit { }
+        "#;
+
+        let mut program = crate::pipeline::parse_source(source).unwrap();
+        crate::optimizer::optimize_program(&mut program);
+        crate::monomorph::monomorphize_program(&mut program);
+
+        assert!(lower_program(&program).is_ok());
     }
 }

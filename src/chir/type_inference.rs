@@ -61,6 +61,10 @@ pub struct TypeInferenceContext {
     /// 类字段类型
     pub class_fields: HashMap<String, HashMap<String, Type>>,
 
+    /// 类静态字段名：class_name -> {field_name}
+    /// 用于表达式校验（static 成员只能用类型名访问）
+    pub class_static_fields: HashMap<String, HashSet<String>>,
+
     /// 类方法返回类型：class_name → method_name → return_type
     pub class_method_returns: HashMap<String, HashMap<String, Type>>,
 
@@ -81,6 +85,7 @@ impl TypeInferenceContext {
             functions: HashMap::new(),
             struct_fields: HashMap::new(),
             class_fields: HashMap::new(),
+            class_static_fields: HashMap::new(),
             class_method_returns: HashMap::new(),
             current_return_ty: None,
             globals: HashMap::new(),
@@ -243,6 +248,19 @@ impl TypeInferenceContext {
                 fields.insert(field.name.clone(), field.ty.clone());
             }
             ctx.class_fields.insert(class_def.name.clone(), fields);
+            // 由于 AST 里 FieldDef 尚未携带 is_static 元信息，这里只做“保守”静态字段识别：
+            // 仅当类没有 init / 主构造参数 / 方法 / 继承关系时，才将类内字段视为静态字段。
+            let can_infer_static_fields = class_def.init.is_none()
+                && class_def.primary_ctor_params.is_empty()
+                && class_def.methods.is_empty()
+                && class_def.extends.is_none();
+            let static_fields: HashSet<String> = if can_infer_static_fields {
+                class_def.fields.iter().map(|f| f.name.clone()).collect()
+            } else {
+                HashSet::new()
+            };
+            ctx.class_static_fields
+                .insert(class_def.name.clone(), static_fields);
 
             let mut method_returns = HashMap::new();
             for method in &class_def.methods {
@@ -562,7 +580,25 @@ impl TypeInferenceContext {
             // 字段访问
             Expr::Field { object, field } => {
                 let obj_ty = self.infer_expr(object)?;
+                if let Type::Struct(class_name, _) = &obj_ty {
+                    if self.is_static_class_field(class_name, field) && !self.is_type_name_expr(object)
+                    {
+                        return Err(format!(
+                            "semantic error: static member '{}' cannot be accessed via instance",
+                            field
+                        ));
+                    }
+                }
                 self.infer_field_type(&obj_ty, field)
+            }
+
+            // 前后缀自增/自减：仅允许可赋值表达式
+            Expr::PostfixIncr(expr)
+            | Expr::PostfixDecr(expr)
+            | Expr::PrefixIncr(expr)
+            | Expr::PrefixDecr(expr) => {
+                self.ensure_update_target_assignable(expr)?;
+                self.infer_expr(expr)
             }
 
             // 数组
@@ -666,6 +702,57 @@ impl TypeInferenceContext {
 
             // 其他表达式：保守推断为对象引用 (I32)
             _ => Ok(Type::Int32),
+        }
+    }
+
+    fn is_type_name_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Var(name) => {
+                !self.locals.contains_key(name)
+                    && !self.globals.contains_key(name)
+                    && (self.struct_fields.contains_key(name) || self.class_fields.contains_key(name))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_static_class_field(&self, class_name: &str, field: &str) -> bool {
+        self.class_static_fields
+            .get(class_name)
+            .map(|fields| fields.contains(field))
+            .unwrap_or(false)
+    }
+
+    fn ensure_update_target_assignable(&self, expr: &Expr) -> Result<(), String> {
+        match expr {
+            Expr::Var(name) => {
+                if !self.local_mutability.get(name).copied().unwrap_or(true) {
+                    return Err("semantic error: cannot assign to immutable value".to_string());
+                }
+                Ok(())
+            }
+            Expr::Field { object, field } => {
+                let obj_ty = self.infer_expr(object)?;
+                if let Type::Struct(class_name, _) = &obj_ty {
+                    if self.is_static_class_field(class_name, field) && !self.is_type_name_expr(object)
+                    {
+                        return Err(format!(
+                            "semantic error: static member '{}' cannot be accessed via instance",
+                            field
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Expr::Index { array, .. } => {
+                if matches!(self.infer_expr(array)?, Type::Tuple(_)) {
+                    Err("semantic error: expression is not assignable".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Expr::TupleIndex { .. } => Err("semantic error: expression is not assignable".to_string()),
+            _ => Err("semantic error: expression is not assignable".to_string()),
         }
     }
 
@@ -982,9 +1069,16 @@ impl TypeInferenceContext {
                     self.collect_locals_from_stmt(s);
                 }
             }
-            Stmt::For { var, body, .. } => {
-                // For 循环变量：类型保守推断为 I32（迭代器元素常为对象或整数）
-                self.add_local_with_mutability(var.clone(), Type::Int32, true);
+            Stmt::For { var, iterable, body } => {
+                let iter_ty = match iterable {
+                    Expr::Range { .. } => Type::Int64,
+                    Expr::Array(elems) => elems
+                        .first()
+                        .and_then(|expr| self.infer_expr(expr).ok())
+                        .unwrap_or(Type::Int64),
+                    _ => Type::Int32,
+                };
+                self.add_local_with_mutability(var.clone(), iter_ty, true);
                 for s in body {
                     self.collect_locals_from_stmt(s);
                 }
@@ -1561,6 +1655,62 @@ mod tests {
             field: "x".into(),
         };
         assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Float64);
+    }
+
+    #[test]
+    fn test_infer_field_reject_instance_access_static_member() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local("c".into(), Type::Struct("C".into(), vec![]));
+        ctx.class_fields
+            .insert("C".into(), HashMap::from([("x".into(), Type::Int64)]));
+        ctx.class_static_fields
+            .insert("C".into(), HashSet::from(["x".into()]));
+
+        let expr = Expr::Field {
+            object: Box::new(Expr::Var("c".into())),
+            field: "x".into(),
+        };
+        let err = ctx.infer_expr(&expr).unwrap_err();
+        assert!(err.contains("static member"));
+    }
+
+    #[test]
+    fn test_infer_field_allow_type_access_static_member() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.class_fields
+            .insert("C".into(), HashMap::from([("x".into(), Type::Int64)]));
+        ctx.class_static_fields
+            .insert("C".into(), HashSet::from(["x".into()]));
+
+        let expr = Expr::Field {
+            object: Box::new(Expr::Var("C".into())),
+            field: "x".into(),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    #[test]
+    fn test_infer_postfix_incr_reject_non_assignable_tuple_index() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local(
+            "t".into(),
+            Type::Tuple(vec![Type::Int64, Type::Int64, Type::Int64]),
+        );
+        let expr = Expr::PostfixIncr(Box::new(Expr::Index {
+            array: Box::new(Expr::Var("t".into())),
+            index: Box::new(Expr::Integer(1)),
+        }));
+
+        let err = ctx.infer_expr(&expr).unwrap_err();
+        assert!(err.contains("not assignable"));
+    }
+
+    #[test]
+    fn test_infer_postfix_incr_allow_assignable_var() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local_with_mutability("x".into(), Type::Int64, true);
+        let expr = Expr::PostfixIncr(Box::new(Expr::Var("x".into())));
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
     }
 
     // ─── 数组/元组推断 ───

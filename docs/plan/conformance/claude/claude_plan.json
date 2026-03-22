@@ -2,10 +2,19 @@
   "title": "CJWasm2 Conformance Fix Plan",
   "metadata": {
     "created": "2026-03-20",
-    "status": "Planning",
+    "status": "Phase 1-7 Completed, Phase 8 Planned",
     "target": "Fix 7,071 tests passing only in CJC",
-    "total_duration": "16 weeks",
-    "total_tests": "7,071"
+    "total_duration": "16 weeks + Phase 8 residual backlog",
+    "total_tests": "7,071",
+    "completed_phases": [
+      "Phase 1",
+      "Phase 2",
+      "Phase 3",
+      "Phase 4",
+      "Phase 5",
+      "Phase 6",
+      "Phase 7"
+    ]
   },
   "executive_summary": "CJWasm2 currently has 7,071 conformance test failures where the official CJC compiler passes. Analysis reveals that **98.9% of these are negative tests** - meaning CJWasm2 is accepting invalid code that should be rejected. This plan outlines a phased approach to add the missing validation.",
   "problem_breakdown": [
@@ -60,6 +69,7 @@
   ],
   "phases": [
     {
+      "status": "Completed",
       "phase": "Phase 1: Quick Wins (Week 1-2)",
       "tasks": [
         {
@@ -164,6 +174,7 @@
       ]
     },
     {
+      "status": "Completed",
       "phase": "Phase 2: Type System Validation (Week 3-4)",
       "tasks": [
         {
@@ -218,6 +229,7 @@
       ]
     },
     {
+      "status": "Completed",
       "phase": "Phase 3: Class/Interface Validation (Week 5-8)",
       "tasks": [
         {
@@ -310,6 +322,7 @@
       ]
     },
     {
+      "status": "Completed",
       "phase": "Phase 4: Expression Validation (Week 9-10)",
       "tasks": [
         {
@@ -353,6 +366,7 @@
       ]
     },
     {
+      "status": "Completed",
       "phase": "Phase 5: Scope and Naming (Week 11-12)",
       "tasks": [
         {
@@ -396,6 +410,7 @@
       ]
     },
     {
+      "status": "Completed",
       "phase": "Phase 6: Package and Module Validation (Week 13-14)",
       "tasks": [
         {
@@ -439,6 +454,7 @@
       ]
     },
     {
+      "status": "Completed",
       "phase": "Phase 7: Remaining Categories (Week 15-16)",
       "tasks": [
         {
@@ -584,6 +600,73 @@
           "success_criteria": null
         }
       ]
+    },
+    {
+      "status": "Planned",
+      "phase": "Phase 8: Residual Backlog and System Coverage (Post-Phase 7)",
+      "tasks": [
+        {
+          "id": "8.1",
+          "title": "Example Suite Backlog Closure",
+          "impact": "15 remaining FAIL entries in ./scripts/system_test.sh (2026-03-22 snapshot)",
+          "effort": "High",
+          "priority": "P0",
+          "problem": "- Remaining example/system regressions persist after Phase 1-7 minimum closures",
+          "implementation": {
+            "file": "Mixed compiler/runtime-facing validation and lowering paths",
+            "location": "Residual example failures from ./scripts/system_test.sh",
+            "changes": [
+              "Triage each remaining failing example to a concrete compiler subsystem",
+              "Fix the remaining example-suite compile failures",
+              "Re-run ./scripts/system_test.sh after each fix batch"
+            ]
+          },
+          "test_cases": [
+            "error_handling.cj",
+            "for_in_and_guards.cj",
+            "functions.cj",
+            "generic_advanced.cj",
+            "literals.cj",
+            "memory_management.cj",
+            "p2_features.cj",
+            "p3_option_tuple.cj",
+            "p4_collections.cj",
+            "p6_new_features.cj",
+            "patterns.cj",
+            "phase2_types.cj",
+            "phase6_error_module.cj",
+            "std_features.cj",
+            "std/"
+          ],
+          "success_criteria": "./scripts/system_test.sh reports zero remaining FAIL entries."
+        },
+        {
+          "id": "8.2",
+          "title": "L1 Std Compatibility Backlog",
+          "impact": "117 compile failures in std_test.sh snapshot (70/187 passing on 2026-03-22)",
+          "effort": "High",
+          "priority": "P1",
+          "problem": "- Residual std compatibility failures remain across io/console/overflow/binary/deriving/sort/unicode",
+          "implementation": {
+            "file": "Mixed parser, lowering, codegen, and std-facing interop paths",
+            "location": "Residual failures reported by std_test.sh",
+            "changes": [
+              "Group std failures by shared root cause",
+              "Prioritize io, console, and overflow because they dominate the backlog",
+              "Re-run std_test.sh after each grouped fix"
+            ]
+          },
+          "test_cases": [
+            "std_test.sh io module",
+            "std_test.sh console module",
+            "std_test.sh overflow module",
+            "std_test.sh binary module",
+            "std_test.sh sort module",
+            "std_test.sh unicode module"
+          ],
+          "success_criteria": "std_test.sh compatibility materially improves from the 2026-03-22 baseline and remaining blockers are explicitly classified."
+        }
+      ]
     }
   ],
   "implementation_strategy": {
@@ -679,8 +762,13 @@
     },
     {
       "phase_window": "Phase 7 (Week 15-16)",
-      "target": "7,071 tests fixed (100%)",
-      "success": "All conformance gaps closed"
+      "target": "Remaining category minimum closures implemented",
+      "success": "Phase 7 closure complete; residual backlog moved to Phase 8"
+    },
+    {
+      "phase_window": "Phase 8 (Post-Phase 7)",
+      "target": "Remaining example-suite and std-compatibility failures closed",
+      "success": "System and std residual backlog converged"
     }
   ],
   "risk_mitigation": [
@@ -741,20 +829,26 @@
     {
       "phase": "Phase 7",
       "duration": "Week 15-16",
-      "tests_fixed": "3,360",
-      "completion": "100.0%"
+      "tests_fixed": "Closure complete",
+      "completion": "Completed"
+    },
+    {
+      "phase": "Phase 8",
+      "duration": "Post-Phase 7",
+      "tests_fixed": "Residual backlog",
+      "completion": "Planned"
     }
   ],
   "next_steps": [
-    "Review this plan with team",
-    "Set up progress tracking",
-    "Begin Phase 1.1: Integer Literal Range Validation",
-    "Update progress.md after each fix",
-    "Weekly review of progress and adjustments"
+    "Record Phase 1-7 as completed in progress tracking",
+    "Start Phase 8.1 triage on the remaining ./scripts/system_test.sh failures",
+    "Group std compatibility failures by subsystem and execute Phase 8.2",
+    "Update progress.md after each residual backlog reduction",
+    "Re-baseline system and std compatibility after each Phase 8 fix batch"
   ],
   "document_info": {
-    "document_version": "1.0",
-    "last_updated": "2026-03-20",
+    "document_version": "1.1",
+    "last_updated": "2026-03-22",
     "owner": "CJWasm2 Team"
   }
 }

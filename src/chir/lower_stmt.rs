@@ -11,6 +11,11 @@ impl<'a> LoweringContext<'a> {
             // Let 语句
             Stmt::Let { pattern, ty, value } => {
                 let mut value_chir = self.lower_expr(value)?;
+                if let Some(decl_ty) = ty {
+                    if !self.type_ctx.is_assignable_type(decl_ty, &value_chir.ty) {
+                        return Err("semantic error: mismatched types".to_string());
+                    }
+                }
                 let local_wasm_ty = if let Some(decl_ty) = ty {
                     let decl_wasm = match decl_ty {
                         crate::ast::Type::Unit | crate::ast::Type::Nothing => {
@@ -72,6 +77,11 @@ impl<'a> LoweringContext<'a> {
             // Var 语句
             Stmt::Var { pattern, ty, value } => {
                 let mut value_chir = self.lower_expr(value)?;
+                if let Some(decl_ty) = ty {
+                    if !self.type_ctx.is_assignable_type(decl_ty, &value_chir.ty) {
+                        return Err("semantic error: mismatched types".to_string());
+                    }
+                }
                 let local_wasm_ty = if let Some(decl_ty) = ty {
                     let decl_wasm = match decl_ty {
                         crate::ast::Type::Unit | crate::ast::Type::Nothing => {
@@ -1004,6 +1014,62 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_let_rejects_mismatched_init_type() {
+        let type_ctx = TypeInferenceContext::new();
+        let func_indices = HashMap::new();
+        let func_params = HashMap::new();
+        let struct_offsets = HashMap::new();
+        let class_offsets = HashMap::new();
+        let class_field_info = HashMap::new();
+
+        let mut ctx = LoweringContext::new(
+            &type_ctx,
+            &func_indices,
+            &func_params,
+            &struct_offsets,
+            &class_offsets,
+            &class_field_info,
+        );
+
+        let stmt = Stmt::Let {
+            pattern: Pattern::Binding("x".to_string()),
+            ty: Some(Type::Float64),
+            value: Expr::Integer(42),
+        };
+
+        let err = ctx.lower_stmt(&stmt).unwrap_err();
+        assert!(err.contains("mismatched types"));
+    }
+
+    #[test]
+    fn test_lower_var_rejects_mismatched_init_type() {
+        let type_ctx = TypeInferenceContext::new();
+        let func_indices = HashMap::new();
+        let func_params = HashMap::new();
+        let struct_offsets = HashMap::new();
+        let class_offsets = HashMap::new();
+        let class_field_info = HashMap::new();
+
+        let mut ctx = LoweringContext::new(
+            &type_ctx,
+            &func_indices,
+            &func_params,
+            &struct_offsets,
+            &class_offsets,
+            &class_field_info,
+        );
+
+        let stmt = Stmt::Var {
+            pattern: Pattern::Binding("x".to_string()),
+            ty: Some(Type::Int32),
+            value: Expr::Float(1.0),
+        };
+
+        let err = ctx.lower_stmt(&stmt).unwrap_err();
+        assert!(err.contains("mismatched types"));
+    }
+
+    #[test]
     fn test_lower_return() {
         let type_ctx = TypeInferenceContext::new();
         let func_indices = HashMap::new();
@@ -1113,6 +1179,63 @@ mod tests {
             pattern: Pattern::Binding("y".into()),
             ty: None,
             value: Expr::Float(3.14),
+        };
+        let chir = ctx.lower_stmt(&stmt).unwrap();
+        assert!(matches!(chir, CHIRStmt::Let { .. }));
+    }
+
+    #[test]
+    fn test_lower_var_init_rejects_int_to_float64() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new();
+        let fp = HashMap::new();
+        let so = HashMap::new();
+        let co = HashMap::new();
+        let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let stmt = Stmt::Var {
+            pattern: Pattern::Binding("f".into()),
+            ty: Some(Type::Float64),
+            value: Expr::Integer(1),
+        };
+        let err = ctx.lower_stmt(&stmt).unwrap_err();
+        assert!(err.contains("mismatched types"));
+    }
+
+    #[test]
+    fn test_lower_var_init_rejects_float_to_int32() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new();
+        let fp = HashMap::new();
+        let so = HashMap::new();
+        let co = HashMap::new();
+        let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let stmt = Stmt::Var {
+            pattern: Pattern::Binding("x".into()),
+            ty: Some(Type::Int32),
+            value: Expr::Float(1.0),
+        };
+        let err = ctx.lower_stmt(&stmt).unwrap_err();
+        assert!(err.contains("mismatched types"));
+    }
+
+    #[test]
+    fn test_lower_var_init_accepts_exact_type_match() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new();
+        let fp = HashMap::new();
+        let so = HashMap::new();
+        let co = HashMap::new();
+        let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let stmt = Stmt::Var {
+            pattern: Pattern::Binding("f".into()),
+            ty: Some(Type::Float64),
+            value: Expr::Float(1.0),
         };
         let chir = ctx.lower_stmt(&stmt).unwrap();
         assert!(matches!(chir, CHIRStmt::Let { .. }));
@@ -1509,7 +1632,8 @@ mod tests {
 
     #[test]
     fn test_lower_block_trailing_expr() {
-        let type_ctx = TypeInferenceContext::new();
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("a".into(), Type::Int64);
         let fi = HashMap::new();
         let fp = HashMap::new();
         let so = HashMap::new();

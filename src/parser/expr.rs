@@ -254,6 +254,27 @@ impl Parser {
         }
         if matches!(self.peek(), Some(Token::Minus)) {
             self.advance();
+            if let Some(Token::Integer(n)) = self.peek().cloned() {
+                if let Some(suffix) = Self::integer_suffix_from_token(self.peek_at(1)) {
+                    let followed_by_range = matches!(
+                        self.peek_at(2),
+                        Some(Token::DotDot) | Some(Token::DotDotEq)
+                    );
+                    if followed_by_range {
+                        let expr = self.parse_unary()?;
+                        return Ok(Expr::Unary {
+                            op: UnaryOp::Neg,
+                            expr: Box::new(expr),
+                        });
+                    }
+                    let int_span = self.at();
+                    self.advance();
+                    self.advance();
+                    let value =
+                        self.validate_integer_suffix_literal(n, suffix, true, int_span)?;
+                    return Ok(Expr::Integer(value));
+                }
+            }
             let expr = self.parse_unary()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
@@ -381,7 +402,10 @@ impl Parser {
                     }
                     let name = match self.advance() {
                         Some(Token::Ident(name)) => name,
-                        Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => name,
+                        Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => {
+                            self.validate_raw_identifier_span(&name, self.at_prev())?;
+                            name
+                        }
                         Some(Token::None) => "None".to_string(),
                         Some(Token::Some) => "Some".to_string(),
                         Some(Token::Ok) => "Ok".to_string(),
@@ -681,33 +705,13 @@ impl Parser {
                 Ok(Expr::Integer(typed_int.value))
             }
             Some(Token::Integer(n)) => {
-                // 可选整数字面量后缀（如 0x0Au8 / 1i32），消费掉避免后缀被当作独立标识符。
-                if matches!(
-                    self.peek(),
-                    Some(Token::Ident(ref s))
-                        if s == "u8"
-                            || s == "u16"
-                            || s == "u32"
-                            || s == "u64"
-                            || s == "i8"
-                            || s == "i16"
-                            || s == "i32"
-                            || s == "i64"
-                )
-                    || matches!(
-                        self.peek(),
-                        Some(Token::TypeUInt8)
-                            | Some(Token::TypeUInt16)
-                            | Some(Token::TypeUInt32)
-                            | Some(Token::TypeUInt64)
-                            | Some(Token::TypeInt8)
-                            | Some(Token::TypeInt16)
-                            | Some(Token::TypeInt32)
-                            | Some(Token::TypeInt64)
-                    )
-                {
+                let value = if let Some(suffix) = Self::integer_suffix_from_token(self.peek()) {
+                    let suffix_span = self.at();
                     self.advance();
-                }
+                    self.validate_integer_suffix_literal(n, suffix, false, suffix_span)?
+                } else {
+                    n
+                };
                 // 检查是否是范围表达式
                 if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                     let inclusive = self.check(&Token::DotDotEq);
@@ -731,13 +735,13 @@ impl Parser {
                         None
                     };
                     return Ok(Expr::Range {
-                        start: Box::new(Expr::Integer(n)),
+                        start: Box::new(Expr::Integer(value)),
                         end,
                         inclusive,
                         step,
                     });
                 }
-                Ok(Expr::Integer(n))
+                Ok(Expr::Integer(value))
             }
             Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Ok(Expr::Float(f)),
             Some(Token::Float16(f)) => Ok(Expr::Float32(f)),
@@ -804,6 +808,7 @@ impl Parser {
                 self.parse_string_or_interpolated(StringOrInterpolated::Interpolated(parts))
             }
             Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => {
+                self.validate_raw_identifier_span(&name, self.at_prev())?;
                 self.pushback = Some(Token::Ident(name));
                 self.parse_primary()
             }
@@ -1934,6 +1939,7 @@ impl Parser {
                 self.parse_string_or_interpolated(StringOrInterpolated::Interpolated(parts))?
             }
             Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => {
+                self.validate_raw_identifier_span(&name, self.at_prev())?;
                 if self.check(&Token::LParen) {
                     self.advance();
                     let (args, named_args) = self.parse_args()?;
@@ -1996,7 +2002,10 @@ impl Parser {
                     self.advance();
                     let field = match self.advance() {
                         Some(Token::Ident(name)) => name,
-                        Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => name,
+                        Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name))) => {
+                            self.validate_raw_identifier_span(&name, self.at_prev())?;
+                            name
+                        }
                         Some(Token::None) => "None".to_string(),
                         Some(Token::Some) => "Some".to_string(),
                         Some(Token::Ok) => "Ok".to_string(),
