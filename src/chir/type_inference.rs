@@ -68,6 +68,9 @@ pub struct TypeInferenceContext {
     /// 类方法返回类型：class_name → method_name → return_type
     pub class_method_returns: HashMap<String, HashMap<String, Type>>,
 
+    /// 裸枚举变体名到枚举类型的映射（如 `TR` -> `CasingOption`）
+    pub enum_variant_types: HashMap<String, Type>,
+
     /// 当前函数返回类型
     pub current_return_ty: Option<Type>,
 
@@ -87,6 +90,7 @@ impl TypeInferenceContext {
             class_fields: HashMap::new(),
             class_static_fields: HashMap::new(),
             class_method_returns: HashMap::new(),
+            enum_variant_types: HashMap::new(),
             current_return_ty: None,
             globals: HashMap::new(),
         }
@@ -219,25 +223,26 @@ impl TypeInferenceContext {
         // 注册 extend 方法签名
         for ext in &program.extends {
             for method in &ext.methods {
+                let short_name = method
+                    .name
+                    .rsplit_once('.')
+                    .map(|(_, short)| short.to_string())
+                    .unwrap_or_else(|| method.name.clone());
                 let sig = FunctionSignature {
-                    name: method.name.clone(),
+                    name: short_name.clone(),
                     params: method.params.iter().map(|p| p.ty.clone()).collect(),
                     return_ty: method.return_type.clone().unwrap_or(Type::Unit),
                 };
-                let mangled = format!("{}${}", method.name, method.params.len());
+                let mangled = format!("{}${}", short_name, method.params.len());
                 ctx.functions.insert(mangled, sig.clone());
-                ctx.functions.entry(method.name.clone()).or_insert(sig);
+                ctx.functions.entry(short_name.clone()).or_insert(sig);
 
-                if let Some(dot_pos) = method.name.find('.') {
-                    let type_name = &method.name[..dot_pos];
-                    let method_name = &method.name[dot_pos + 1..];
-                    let ret_ty = method.return_type.clone().unwrap_or(Type::Unit);
-                    ctx.class_method_returns
-                        .entry(type_name.to_string())
-                        .or_default()
-                        .entry(method_name.to_string())
-                        .or_insert(ret_ty);
-                }
+                let ret_ty = method.return_type.clone().unwrap_or(Type::Unit);
+                ctx.class_method_returns
+                    .entry(ext.target_type.clone())
+                    .or_default()
+                    .entry(short_name)
+                    .or_insert(ret_ty);
             }
         }
 
@@ -285,6 +290,15 @@ impl TypeInferenceContext {
                 .insert(class_def.name.clone(), method_returns);
         }
 
+        for enum_def in &program.enums {
+            let enum_ty = Type::Struct(enum_def.name.clone(), vec![]);
+            for variant in &enum_def.variants {
+                ctx.enum_variant_types
+                    .entry(variant.name.clone())
+                    .or_insert_with(|| enum_ty.clone());
+            }
+        }
+
         // 收集名义子类型关系（class/interface）
         for iface in &program.interfaces {
             for parent in &iface.parents {
@@ -298,6 +312,16 @@ impl TypeInferenceContext {
             for iface in &class_def.implements {
                 ctx.add_nominal_supertype(class_def.name.clone(), iface.clone());
             }
+        }
+
+        // 注册顶层常量/变量类型。显式类型保持声明类型；隐式类型按初始化表达式顺序推断。
+        for constant in &program.constants {
+            let ty = if constant.explicit_ty {
+                constant.ty.clone()
+            } else {
+                ctx.infer_expr(&constant.init).unwrap_or_else(|_| constant.ty.clone())
+            };
+            ctx.globals.insert(constant.name.clone(), ty);
         }
 
         // 继承合并：将父类字段 + 方法签名传播到子类（多轮直到稳定）
@@ -359,6 +383,10 @@ impl TypeInferenceContext {
         if sub == sup {
             return true;
         }
+        if Self::is_integral(sub) && Self::is_integral(sup) {
+            // 数值上下文下允许整型宽度互通（如 Int64 字面量赋给 Int32）
+            return true;
+        }
         if matches!(sup, Type::TypeParam(_) | Type::This | Type::Qualified(_)) {
             // lowering 阶段对未单态化类型保持保守放行
             return true;
@@ -374,6 +402,42 @@ impl TypeInferenceContext {
         }
 
         match (sub, sup) {
+            (Type::Array(sub_t), Type::Array(sup_t)) => self.is_subtype(sub_t, sup_t),
+            (Type::Slice(sub_t), Type::Slice(sup_t)) => self.is_subtype(sub_t, sup_t),
+            (Type::Map(sub_k, sub_v), Type::Map(sup_k, sup_v)) => {
+                self.is_subtype(sub_k, sup_k) && self.is_subtype(sub_v, sup_v)
+            }
+            (value, Type::Option(inner))
+                if !matches!(value, Type::Option(_))
+                    && !matches!(value, Type::Struct(name, _) if name == "Option") =>
+            {
+                self.is_subtype(value, inner)
+            }
+            (value, Type::Struct(name, args))
+                if name == "Option" && args.len() == 1 && !matches!(value, Type::Option(_)) =>
+            {
+                self.is_subtype(value, &args[0])
+            }
+            (Type::Option(sub_t), Type::Struct(name, args))
+                if name == "Option" && args.len() == 1 =>
+            {
+                self.is_subtype(sub_t, &args[0])
+            }
+            (Type::Struct(name, args), Type::Option(sup_t))
+                if name == "Option" && args.len() == 1 =>
+            {
+                self.is_subtype(&args[0], sup_t)
+            }
+            (Type::Result(sub_ok, sub_err), Type::Struct(name, args))
+                if name == "Result" && args.len() == 2 =>
+            {
+                self.is_subtype(sub_ok, &args[0]) && self.is_subtype(sub_err, &args[1])
+            }
+            (Type::Struct(name, args), Type::Result(sup_ok, sup_err))
+                if name == "Result" && args.len() == 2 =>
+            {
+                self.is_subtype(&args[0], sup_ok) && self.is_subtype(&args[1], sup_err)
+            }
             (Type::Struct(sub_name, _), Type::Struct(sup_name, _)) => {
                 self.nominal_is_subtype(sub_name, sup_name)
             }
@@ -481,6 +545,41 @@ impl TypeInferenceContext {
             Expr::Rune(_) => Ok(Type::Rune),
             Expr::String(_) => Ok(Type::String),
             Expr::Interpolate(_) => Ok(Type::String),
+            Expr::VariantConst { enum_name, .. } => {
+                Ok(Type::Struct(enum_name.clone(), vec![]))
+            }
+            Expr::Some(inner) => Ok(Type::Option(Box::new(self.infer_expr(inner)?))),
+            Expr::None => Ok(Type::Option(Box::new(Type::Nothing))),
+            Expr::Ok(inner) => Ok(Type::Result(
+                Box::new(self.infer_expr(inner)?),
+                Box::new(Type::Nothing),
+            )),
+            Expr::Err(inner) => Ok(Type::Result(
+                Box::new(Type::Nothing),
+                Box::new(self.infer_expr(inner)?),
+            )),
+            Expr::NullCoalesce { option, default } => {
+                let opt_ty = self.infer_expr(option)?;
+                let default_ty = self.infer_expr(default)?;
+                match opt_ty {
+                    Type::Option(inner) => {
+                        if self.is_assignable_type(inner.as_ref(), &default_ty) {
+                            Ok(*inner)
+                        } else {
+                            Ok(default_ty)
+                        }
+                    }
+                    Type::Struct(name, args) if name == "Option" => {
+                        let inner = args.first().cloned().unwrap_or(Type::Int64);
+                        if self.is_assignable_type(&inner, &default_ty) {
+                            Ok(inner)
+                        } else {
+                            Ok(default_ty)
+                        }
+                    }
+                    _ => Ok(default_ty),
+                }
+            }
 
             // 变量
             Expr::Var(name) => {
@@ -498,6 +597,9 @@ impl TypeInferenceContext {
                     "PI" | "E" | "TAU" | "INF" | "INFINITY" | "NEG_INF" | "NEG_INFINITY" | "NAN"
                 ) {
                     return Ok(Type::Float64);
+                }
+                if let Some(enum_ty) = self.enum_variant_types.get(name) {
+                    return Ok(enum_ty.clone());
                 }
                 // 类/结构体名称 → 类型引用
                 if self.struct_fields.contains_key(name.as_str())
@@ -580,6 +682,13 @@ impl TypeInferenceContext {
             // 字段访问
             Expr::Field { object, field } => {
                 let obj_ty = self.infer_expr(object)?;
+                if matches!(obj_ty, Type::Array(_)) && matches!(field.as_str(), "size" | "length") {
+                    return Ok(Type::Int64);
+                }
+                if matches!(obj_ty, Type::Range) && matches!(field.as_str(), "start" | "end" | "step")
+                {
+                    return Ok(Type::Int64);
+                }
                 if let Type::Struct(class_name, _) = &obj_ty {
                     if self.is_static_class_field(class_name, field) && !self.is_type_name_expr(object)
                     {
@@ -589,7 +698,16 @@ impl TypeInferenceContext {
                         ));
                     }
                 }
-                self.infer_field_type(&obj_ty, field)
+                if let Some(field_ty) = self.lookup_field_type(&obj_ty, field) {
+                    return Ok(field_ty);
+                }
+                if let Some(method_ret) = self.lookup_method_return(&obj_ty, field) {
+                    return Ok(Type::Function {
+                        params: vec![],
+                        ret: Box::new(Some(method_ret)),
+                    });
+                }
+                Ok(Type::Int32)
             }
 
             // 前后缀自增/自减：仅允许可赋值表达式
@@ -612,10 +730,16 @@ impl TypeInferenceContext {
             }
 
             // 数组索引
-            Expr::Index { array, .. } => {
+            Expr::Index { array, index } => {
                 let arr_ty = self.infer_expr(array)?;
                 match arr_ty {
-                    Type::Array(elem_ty) => Ok(*elem_ty),
+                    Type::Array(elem_ty) => {
+                        if matches!(index.as_ref(), Expr::Range { .. }) {
+                            Ok(Type::Array(elem_ty))
+                        } else {
+                            Ok(*elem_ty)
+                        }
+                    }
                     Type::Tuple(types) => {
                         // 元组索引，返回第一个元素类型（简化）
                         Ok(types.first().cloned().unwrap_or(Type::Int64))
@@ -623,6 +747,8 @@ impl TypeInferenceContext {
                     _ => Ok(Type::Int64),
                 }
             }
+
+            Expr::Range { .. } => Ok(Type::Range),
 
             // 元组索引 pair[0]
             Expr::TupleIndex { object, index } => {
@@ -691,12 +817,33 @@ impl TypeInferenceContext {
                 }
             }
 
+            Expr::IfLet {
+                pattern,
+                expr,
+                then_branch,
+                else_branch,
+            } => {
+                let subject_ty = self.infer_expr(expr)?;
+                let mut then_ctx = self.clone();
+                then_ctx.bind_pattern_types(pattern, &subject_ty, false);
+                let then_ty = then_ctx.infer_expr(then_branch)?;
+                if let Some(else_expr) = else_branch {
+                    let _else_ty = self.infer_expr(else_expr)?;
+                    Ok(then_ty)
+                } else {
+                    Ok(Type::Unit)
+                }
+            }
+
             // Match 表达式
-            Expr::Match { arms, .. } => {
+            Expr::Match { expr, arms } => {
                 if arms.is_empty() {
                     Ok(Type::Unit)
                 } else {
-                    self.infer_expr(&arms[0].body)
+                    let subject_ty = self.infer_expr(expr)?;
+                    let mut arm_ctx = self.clone();
+                    arm_ctx.bind_pattern_types(&arms[0].pattern, &subject_ty, false);
+                    arm_ctx.infer_expr(&arms[0].body)
                 }
             }
 
@@ -769,15 +916,22 @@ impl TypeInferenceContext {
         match op {
             // 比较运算符返回 Bool
             BinOp::Eq | BinOp::NotEq => {
-                if left == right {
+                if left == right
+                    || (Self::is_integral(left) && Self::is_integral(right))
+                    || (matches!(left, Type::Bool) && Self::is_integral(right))
+                    || (matches!(right, Type::Bool) && Self::is_integral(left))
+                    || self.is_assignable_type(left, right)
+                    || self.is_assignable_type(right, left)
+                {
                     Ok(Type::Bool)
                 } else {
                     invalid()
                 }
             }
             BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
-                if left == right
-                    && (Self::is_numeric(left) || matches!(left, Type::Rune | Type::String))
+                if (left == right
+                    && (Self::is_numeric(left) || matches!(left, Type::Rune | Type::String)))
+                    || (Self::is_integral(left) && Self::is_integral(right))
                 {
                     Ok(Type::Bool)
                 } else {
@@ -794,8 +948,8 @@ impl TypeInferenceContext {
             }
             // 算术运算符返回操作数类型
             BinOp::Mod => {
-                if left == right && Self::is_integral(left) {
-                    Ok(left.clone())
+                if Self::is_integral(left) && Self::is_integral(right) {
+                    Ok(Self::promote_integral_binary_type(left, right))
                 } else {
                     invalid()
                 }
@@ -807,13 +961,23 @@ impl TypeInferenceContext {
                 }
                 if left == right && Self::is_numeric(left) {
                     Ok(left.clone())
+                } else if Self::is_integral(left) && Self::is_integral(right) {
+                    Ok(Self::promote_integral_binary_type(left, right))
                 } else {
                     invalid()
                 }
             }
             // 位运算返回整数类型
-            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-                if left == right && Self::is_integral(left) {
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                if Self::is_integral(left) && Self::is_integral(right) {
+                    Ok(Self::promote_integral_binary_type(left, right))
+                } else {
+                    invalid()
+                }
+            }
+            // 移位结果保持左操作数类型；右操作数只需是整数
+            BinOp::Shl | BinOp::Shr => {
+                if Self::is_integral(left) && Self::is_integral(right) {
                     Ok(left.clone())
                 } else {
                     invalid()
@@ -829,7 +993,15 @@ impl TypeInferenceContext {
     /// 推断一元运算结果类型
     fn infer_unary_result(&self, op: &UnaryOp, expr_ty: &Type) -> Result<Type, String> {
         match op {
-            UnaryOp::Not => Ok(Type::Bool),
+            UnaryOp::Not => {
+                if matches!(expr_ty, Type::Bool) {
+                    Ok(Type::Bool)
+                } else if Self::is_integral(expr_ty) {
+                    Ok(expr_ty.clone())
+                } else {
+                    Ok(Type::Bool)
+                }
+            }
             UnaryOp::Neg | UnaryOp::BitNot => Ok(expr_ty.clone()),
         }
     }
@@ -897,6 +1069,23 @@ impl TypeInferenceContext {
         }
     }
 
+    fn promote_integral_binary_type(left: &Type, right: &Type) -> Type {
+        if left == right {
+            return left.clone();
+        }
+        if matches!(
+            left,
+            Type::Int64 | Type::UInt64 | Type::IntNative | Type::UIntNative
+        ) || matches!(
+            right,
+            Type::Int64 | Type::UInt64 | Type::IntNative | Type::UIntNative
+        ) {
+            Type::Int64
+        } else {
+            Type::Int32
+        }
+    }
+
     fn type_name(ty: &Type) -> String {
         match ty {
             Type::Int8 => "Int8".to_string(),
@@ -961,38 +1150,60 @@ impl TypeInferenceContext {
     ) -> Result<Type, String> {
         // 优先按对象类型分派
         let obj_type_name = match obj_ty {
-            Type::Struct(n, _) => n.as_str(),
-            Type::Array(_) => "Array",
-            _ => "",
+            Type::Struct(n, _) => Some(n.as_str()),
+            Type::Array(_) => Some("Array"),
+            Type::String => Some("String"),
+            Type::Rune => Some("Rune"),
+            Type::Bool => Some("Bool"),
+            Type::Int8 => Some("Int8"),
+            Type::Int16 => Some("Int16"),
+            Type::Int32 => Some("Int32"),
+            Type::Int64 => Some("Int64"),
+            Type::IntNative => Some("IntNative"),
+            Type::UInt8 => Some("UInt8"),
+            Type::UInt16 => Some("UInt16"),
+            Type::UInt32 => Some("UInt32"),
+            Type::UInt64 => Some("UInt64"),
+            Type::UIntNative => Some("UIntNative"),
+            Type::Float16 => Some("Float16"),
+            Type::Float32 => Some("Float32"),
+            Type::Float64 => Some("Float64"),
+            Type::Option(_) => Some("Option"),
+            Type::Result(_, _) => Some("Result"),
+            Type::Slice(_) => Some("Slice"),
+            Type::Map(_, _) => Some("Map"),
+            _ => None,
         };
 
         // 优先查找用户定义的类方法真实返回类型
-        if !obj_type_name.is_empty() {
+        if let Some(obj_type_name) = obj_type_name {
             if let Some(methods) = self.class_method_returns.get(obj_type_name) {
                 if let Some(ret_ty) = methods.get(method) {
                     return Ok(ret_ty.clone());
                 }
             }
-        }
-
-        match (obj_type_name, method) {
-            // ArrayList
-            ("ArrayList", "append" | "set" | "clear") => return Ok(Type::Unit),
-            ("ArrayList", "get" | "remove" | "size") => return Ok(Type::Int64),
-            ("ArrayList", "isEmpty") => return Ok(Type::Bool),
-            // HashMap
-            ("HashMap", "put" | "clear") => return Ok(Type::Unit),
-            ("HashMap", "get" | "remove" | "size") => return Ok(Type::Int64),
-            ("HashMap", "containsKey") => return Ok(Type::Int64),
-            // HashSet
-            ("HashSet", "add" | "clear") => return Ok(Type::Unit),
-            ("HashSet", "size") => return Ok(Type::Int64),
-            ("HashSet", "contains") => return Ok(Type::Int64),
-            // Array
-            ("Array", "push" | "append" | "set" | "clear") => return Ok(Type::Unit),
-            ("Array", "get" | "size" | "length") => return Ok(Type::Int64),
-            ("Array", "isEmpty") => return Ok(Type::Bool),
-            _ => {}
+            match (obj_type_name, method) {
+                // ArrayList
+                ("ArrayList", "append" | "set" | "clear") => return Ok(Type::Unit),
+                ("ArrayList", "get" | "remove" | "size") => return Ok(Type::Int64),
+                ("ArrayList", "isEmpty") => return Ok(Type::Bool),
+                // HashMap
+                ("HashMap", "put" | "clear") => return Ok(Type::Unit),
+                ("HashMap", "get" | "remove" | "size") => return Ok(Type::Int64),
+                ("HashMap", "containsKey") => return Ok(Type::Int64),
+                // HashSet
+                ("HashSet", "add" | "clear") => return Ok(Type::Unit),
+                ("HashSet", "size") => return Ok(Type::Int64),
+                ("HashSet", "contains") => return Ok(Type::Int64),
+                // Array
+                ("Array", "push" | "append" | "set" | "clear") => return Ok(Type::Unit),
+                ("Array", "get" | "size" | "length") => return Ok(Type::Int64),
+                ("Array", "isEmpty") => return Ok(Type::Bool),
+                _ => {}
+            }
+            if let Some(ret_ty) = self.lookup_method_return(obj_ty, method) {
+                return Ok(ret_ty);
+            }
         }
         // 通用方法名推断（fallback）
         // 原则：宁可返回 Int64（emit 一个零值），也不能错误地返回 Unit（导致 empty-stack）
@@ -1004,26 +1215,88 @@ impl TypeInferenceContext {
         }
     }
 
+    fn lookup_method_return(&self, obj_ty: &Type, method: &str) -> Option<Type> {
+        match obj_ty {
+            Type::Struct(name, type_args) => crate::metadata::stdlib_method_return_type(
+                name,
+                type_args,
+                method,
+            ),
+            Type::Int8 => crate::metadata::stdlib_method_return_type("Int8", &[], method),
+            Type::Int16 => crate::metadata::stdlib_method_return_type("Int16", &[], method),
+            Type::Int32 => crate::metadata::stdlib_method_return_type("Int32", &[], method),
+            Type::Int64 => crate::metadata::stdlib_method_return_type("Int64", &[], method),
+            Type::IntNative => crate::metadata::stdlib_method_return_type("IntNative", &[], method),
+            Type::UInt8 => crate::metadata::stdlib_method_return_type("UInt8", &[], method),
+            Type::UInt16 => crate::metadata::stdlib_method_return_type("UInt16", &[], method),
+            Type::UInt32 => crate::metadata::stdlib_method_return_type("UInt32", &[], method),
+            Type::UInt64 => crate::metadata::stdlib_method_return_type("UInt64", &[], method),
+            Type::UIntNative => crate::metadata::stdlib_method_return_type("UIntNative", &[], method),
+            Type::Float16 => crate::metadata::stdlib_method_return_type("Float16", &[], method),
+            Type::Float32 => crate::metadata::stdlib_method_return_type("Float32", &[], method),
+            Type::Float64 => crate::metadata::stdlib_method_return_type("Float64", &[], method),
+            Type::Array(elem_ty) => crate::metadata::stdlib_method_return_type(
+                "Array",
+                &[(*elem_ty.clone())],
+                method,
+            ),
+            Type::String => crate::metadata::stdlib_method_return_type("String", &[], method),
+            Type::Rune => crate::metadata::stdlib_method_return_type("Rune", &[], method),
+            Type::Option(inner) => crate::metadata::stdlib_method_return_type(
+                "Option",
+                &[(*inner.clone())],
+                method,
+            ),
+            Type::Result(ok, err) => crate::metadata::stdlib_method_return_type(
+                "Result",
+                &[(*ok.clone()), (*err.clone())],
+                method,
+            ),
+            Type::Slice(elem_ty) => crate::metadata::stdlib_method_return_type(
+                "Slice",
+                &[(*elem_ty.clone())],
+                method,
+            ),
+            Type::Map(key_ty, value_ty) => crate::metadata::stdlib_method_return_type(
+                "Map",
+                &[(*key_ty.clone()), (*value_ty.clone())],
+                method,
+            ),
+            _ => None,
+        }
+    }
+
     /// 推断字段类型（查 struct_fields + class_fields，未知保守推断为 I32）
     pub fn infer_field_type(&self, obj_ty: &Type, field: &str) -> Result<Type, String> {
+        Ok(self.lookup_field_type(obj_ty, field).unwrap_or(Type::Int32))
+    }
+
+    fn lookup_field_type(&self, obj_ty: &Type, field: &str) -> Option<Type> {
         match obj_ty {
             Type::Struct(name, type_args) => {
                 let names = Self::resolve_type_names(name, type_args);
                 for n in &names {
                     if let Some(fields) = self.struct_fields.get(n.as_str()) {
                         if let Some(ty) = fields.get(field) {
-                            return Ok(ty.clone());
+                            return Some(ty.clone());
                         }
                     }
                     if let Some(fields) = self.class_fields.get(n.as_str()) {
                         if let Some(ty) = fields.get(field) {
-                            return Ok(ty.clone());
+                            return Some(ty.clone());
                         }
                     }
                 }
-                Ok(Type::Int32)
+                crate::metadata::stdlib_field_type(name, type_args, field)
             }
-            _ => Ok(Type::Int32),
+            Type::Array(elem_ty) => crate::metadata::stdlib_field_type(
+                "Array",
+                &[(*elem_ty.clone())],
+                field,
+            ),
+            Type::String => crate::metadata::stdlib_field_type("String", &[], field),
+            Type::Range => crate::metadata::stdlib_field_type("Range", &[], field),
+            _ => None,
         }
     }
 
@@ -1083,8 +1356,9 @@ impl TypeInferenceContext {
                     self.collect_locals_from_stmt(s);
                 }
             }
-            Stmt::WhileLet { pattern, body, .. } => {
-                self.collect_pattern_bindings(pattern, &Type::Int32, false);
+            Stmt::WhileLet { pattern, expr, body } => {
+                let expr_ty = self.infer_expr(expr).unwrap_or(Type::Int32);
+                self.collect_pattern_bindings(pattern, &expr_ty, false);
                 for s in body {
                     self.collect_locals_from_stmt(s);
                 }
@@ -1106,16 +1380,87 @@ impl TypeInferenceContext {
 
     /// 从模式中收集绑定变量
     fn collect_pattern_bindings(&mut self, pattern: &Pattern, ty: &Type, mutable: bool) {
+        self.bind_pattern_types(pattern, ty, mutable);
+    }
+
+    fn bind_pattern_types(&mut self, pattern: &Pattern, ty: &Type, mutable: bool) {
         match pattern {
             Pattern::Binding(name) => {
                 self.add_local_with_mutability(name.clone(), ty.clone(), mutable);
             }
             Pattern::Tuple(pats) => {
-                for p in pats {
-                    self.collect_pattern_bindings(p, ty, mutable);
+                if let Type::Tuple(items) = ty {
+                    for (idx, p) in pats.iter().enumerate() {
+                        let elem_ty = items.get(idx).unwrap_or(ty);
+                        self.bind_pattern_types(p, elem_ty, mutable);
+                    }
+                } else {
+                    for p in pats {
+                        self.bind_pattern_types(p, ty, mutable);
+                    }
                 }
             }
+            Pattern::Variant {
+                enum_name,
+                variant_name,
+                payload: Some(payload),
+            } => {
+                if let Some(payload_ty) =
+                    self.variant_payload_type(ty, enum_name.as_str(), variant_name.as_str())
+                {
+                    self.bind_pattern_types(payload, &payload_ty, mutable);
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                if let Type::Struct(name, type_args) = ty {
+                    let names = Self::resolve_type_names(name, type_args);
+                    for (field_name, field_pat) in fields {
+                        let field_ty = names
+                            .iter()
+                            .find_map(|resolved| {
+                                self.struct_fields
+                                    .get(resolved.as_str())
+                                    .and_then(|fields| fields.get(field_name))
+                                    .cloned()
+                                    .or_else(|| {
+                                        self.class_fields
+                                            .get(resolved.as_str())
+                                            .and_then(|fields| fields.get(field_name))
+                                            .cloned()
+                                    })
+                            })
+                            .unwrap_or(Type::Int32);
+                        self.bind_pattern_types(field_pat, &field_ty, mutable);
+                    }
+                }
+            }
+            Pattern::Or(pats) => {
+                for p in pats {
+                    self.bind_pattern_types(p, ty, mutable);
+                }
+            }
+            Pattern::TypeTest { binding, ty } => {
+                self.add_local_with_mutability(binding.clone(), ty.clone(), mutable);
+            }
             _ => {}
+        }
+    }
+
+    fn variant_payload_type(&self, subject_ty: &Type, enum_name: &str, variant_name: &str) -> Option<Type> {
+        match (enum_name, variant_name, subject_ty) {
+            ("Option", "Some", Type::Option(inner)) => Some((**inner).clone()),
+            ("Option", "Some", Type::Struct(name, args)) if name == "Option" => {
+                Some(args.first().cloned().unwrap_or(Type::Int64))
+            }
+            ("Result", "Ok", Type::Result(ok, _)) => Some((**ok).clone()),
+            ("Result", "Err", Type::Result(_, err)) => Some((**err).clone()),
+            ("Result", "Ok", Type::Struct(name, args)) if name == "Result" => {
+                Some(args.first().cloned().unwrap_or(Type::Int64))
+            }
+            ("Result", "Err", Type::Struct(name, args)) if name == "Result" => {
+                Some(args.get(1).cloned().unwrap_or(Type::String))
+            }
+            _ => None,
         }
     }
 
@@ -1140,7 +1485,32 @@ impl TypeInferenceContext {
                     self.collect_locals_from_expr(else_expr);
                 }
             }
+            Expr::IfLet {
+                pattern,
+                expr,
+                then_branch,
+                else_branch,
+            } => {
+                let subject_ty = self.infer_expr(expr).unwrap_or(Type::Int32);
+                self.bind_pattern_types(pattern, &subject_ty, false);
+                self.collect_locals_from_expr(then_branch);
+                if let Some(else_expr) = else_branch {
+                    self.collect_locals_from_expr(else_expr);
+                }
+            }
             Expr::Match { arms, .. } => {
+                if let Expr::Match { expr: subject, .. } = expr {
+                    if let Ok(subject_ty) = self.infer_expr(subject) {
+                        for arm in arms {
+                            self.bind_pattern_types(&arm.pattern, &subject_ty, false);
+                            if let Some(guard) = &arm.guard {
+                                self.collect_locals_from_expr(guard);
+                            }
+                            self.collect_locals_from_expr(&arm.body);
+                        }
+                        return;
+                    }
+                }
                 for arm in arms {
                     self.collect_locals_from_expr(&arm.body);
                 }
@@ -1320,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_binary_mixed_numeric_is_error() {
+    fn test_infer_binary_mixed_numeric_promotes_integral() {
         let mut ctx = TypeInferenceContext::new();
         ctx.add_local_with_mutability("a".into(), Type::Int8, true);
         ctx.add_local_with_mutability("b".into(), Type::Int16, true);
@@ -1329,8 +1699,33 @@ mod tests {
             left: Box::new(Expr::Var("a".into())),
             right: Box::new(Expr::Var("b".into())),
         };
-        let err = ctx.infer_expr(&expr).unwrap_err();
-        assert!(err.contains("invalid binary operator"));
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int32);
+    }
+
+    #[test]
+    fn test_infer_binary_mixed_int32_int64_promotes_to_int64() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local_with_mutability("a".into(), Type::Int32, true);
+        ctx.add_local_with_mutability("b".into(), Type::Int64, true);
+        let expr = Expr::Binary {
+            op: BinOp::Add,
+            left: Box::new(Expr::Var("a".into())),
+            right: Box::new(Expr::Var("b".into())),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    #[test]
+    fn test_infer_shift_keeps_left_operand_type() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local_with_mutability("a".into(), Type::Int8, true);
+        ctx.add_local_with_mutability("b".into(), Type::UInt64, true);
+        let expr = Expr::Binary {
+            op: BinOp::Shl,
+            left: Box::new(Expr::Var("a".into())),
+            right: Box::new(Expr::Var("b".into())),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int8);
     }
 
     #[test]
@@ -1366,6 +1761,66 @@ mod tests {
             &Type::Struct("Object".into(), vec![]),
             &Type::Struct("C".into(), vec![])
         ));
+    }
+
+    #[test]
+    fn test_is_assignable_type_integral_widths() {
+        let ctx = TypeInferenceContext::new();
+        assert!(ctx.is_assignable_type(&Type::Int32, &Type::Int64));
+        assert!(ctx.is_assignable_type(&Type::Int64, &Type::Int32));
+    }
+
+    #[test]
+    fn test_is_assignable_type_option_result_bridge_with_struct_form() {
+        let ctx = TypeInferenceContext::new();
+        assert!(ctx.is_assignable_type(
+            &Type::Struct("Option".into(), vec![Type::Int64]),
+            &Type::Option(Box::new(Type::Nothing))
+        ));
+        assert!(ctx.is_assignable_type(
+            &Type::Option(Box::new(Type::Int64)),
+            &Type::Struct("Option".into(), vec![Type::Int64])
+        ));
+        assert!(ctx.is_assignable_type(
+            &Type::Struct("Result".into(), vec![Type::Int64, Type::String]),
+            &Type::Result(Box::new(Type::Int64), Box::new(Type::Nothing))
+        ));
+        assert!(ctx.is_assignable_type(
+            &Type::Result(Box::new(Type::Int64), Box::new(Type::String)),
+            &Type::Struct("Result".into(), vec![Type::Int64, Type::String])
+        ));
+    }
+
+    #[test]
+    fn test_is_assignable_type_allows_value_to_option_autowrap() {
+        let ctx = TypeInferenceContext::new();
+        assert!(ctx.is_assignable_type(
+            &Type::Option(Box::new(Type::Int8)),
+            &Type::Int64
+        ));
+    }
+
+    #[test]
+    fn test_infer_binary_result_allows_bool_integral_equality() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Binary {
+            op: BinOp::NotEq,
+            left: Box::new(Expr::Bool(true)),
+            right: Box::new(Expr::Integer(0)),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Bool);
+    }
+
+    #[test]
+    fn test_infer_eq_allows_option_none_compatibility() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local("opt".into(), Type::Option(Box::new(Type::Int64)));
+        let expr = Expr::Binary {
+            op: BinOp::NotEq,
+            left: Box::new(Expr::Var("opt".into())),
+            right: Box::new(Expr::None),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Bool);
     }
 
     #[test]
@@ -1604,6 +2059,73 @@ mod tests {
         assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
     }
 
+    #[test]
+    fn test_infer_field_type_for_range_properties() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Field {
+            object: Box::new(Expr::Range {
+                start: Box::new(Expr::Integer(1)),
+                end: Box::new(Expr::Integer(3)),
+                inclusive: false,
+                step: None,
+            }),
+            field: "start".into(),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    #[test]
+    fn test_infer_method_return_extension_on_primitive_type() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local("n".into(), Type::Int64);
+        ctx.class_method_returns.insert(
+            "Int64".into(),
+            HashMap::from([(
+                "checkedPow".into(),
+                Type::Option(Box::new(Type::Int64)),
+            )]),
+        );
+
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("n".into())),
+            method: "checkedPow".into(),
+            args: vec![Expr::Integer(2)],
+            type_args: None,
+            named_args: vec![],
+        };
+        assert_eq!(
+            ctx.infer_expr(&expr).unwrap(),
+            Type::Option(Box::new(Type::Int64))
+        );
+    }
+
+    #[test]
+    fn test_infer_method_return_hashmap_runtime_overrides_metadata() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local(
+            "map".into(),
+            Type::Struct("HashMap".into(), vec![Type::Int64, Type::Int64]),
+        );
+
+        let get_expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("map".into())),
+            method: "get".into(),
+            args: vec![Expr::Integer(1)],
+            type_args: None,
+            named_args: vec![],
+        };
+        let contains_expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("map".into())),
+            method: "containsKey".into(),
+            args: vec![Expr::Integer(1)],
+            type_args: None,
+            named_args: vec![],
+        };
+
+        assert_eq!(ctx.infer_expr(&get_expr).unwrap(), Type::Int64);
+        assert_eq!(ctx.infer_expr(&contains_expr).unwrap(), Type::Int64);
+    }
+
     // ─── 字段推断 ───
 
     #[test]
@@ -1672,6 +2194,48 @@ mod tests {
         };
         let err = ctx.infer_expr(&expr).unwrap_err();
         assert!(err.contains("static member"));
+    }
+
+    #[test]
+    fn test_infer_option_result_constructors() {
+        let ctx = TypeInferenceContext::new();
+        assert_eq!(
+            ctx.infer_expr(&Expr::VariantConst {
+                enum_name: "CasingOption".into(),
+                variant_name: "TR".into(),
+                arg: None,
+            })
+            .unwrap(),
+            Type::Struct("CasingOption".into(), vec![])
+        );
+        assert_eq!(
+            ctx.infer_expr(&Expr::Some(Box::new(Expr::Integer(1)))).unwrap(),
+            Type::Option(Box::new(Type::Int64))
+        );
+        assert_eq!(
+            ctx.infer_expr(&Expr::None).unwrap(),
+            Type::Option(Box::new(Type::Nothing))
+        );
+        assert_eq!(
+            ctx.infer_expr(&Expr::Ok(Box::new(Expr::Integer(1)))).unwrap(),
+            Type::Result(Box::new(Type::Int64), Box::new(Type::Nothing))
+        );
+        assert_eq!(
+            ctx.infer_expr(&Expr::Err(Box::new(Expr::String("e".into()))))
+                .unwrap(),
+            Type::Result(Box::new(Type::Nothing), Box::new(Type::String))
+        );
+    }
+
+    #[test]
+    fn test_infer_null_coalesce_uses_option_payload_type() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local("opt".into(), Type::Option(Box::new(Type::Int64)));
+        let expr = Expr::NullCoalesce {
+            option: Box::new(Expr::Var("opt".into())),
+            default: Box::new(Expr::Integer(0)),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
     }
 
     #[test]
@@ -2021,6 +2585,121 @@ mod tests {
         ctx.collect_locals_from_function(&func);
         assert_eq!(ctx.get_local("inner").unwrap(), &Type::Bool);
         assert!(ctx.get_local("i").is_some());
+    }
+
+    #[test]
+    fn test_collect_locals_while_let_payload_and_if_let_payload() {
+        let mut ctx = TypeInferenceContext::new();
+        let some_x = Pattern::Variant {
+            enum_name: "Option".into(),
+            variant_name: "Some".into(),
+            payload: Some(Box::new(Pattern::Binding("x".into()))),
+        };
+        let some_n = Pattern::Variant {
+            enum_name: "Option".into(),
+            variant_name: "Some".into(),
+            payload: Some(Box::new(Pattern::Binding("n".into()))),
+        };
+        let func = make_function(
+            "test",
+            vec![make_param("opt", Type::Option(Box::new(Type::Int64)))],
+            Some(Type::Int64),
+            vec![
+                Stmt::Expr(Expr::IfLet {
+                    pattern: some_x,
+                    expr: Box::new(Expr::Var("opt".into())),
+                    then_branch: Box::new(Expr::Var("x".into())),
+                    else_branch: Some(Box::new(Expr::Integer(0))),
+                }),
+                Stmt::WhileLet {
+                    pattern: some_n,
+                    expr: Box::new(Expr::Var("opt".into())),
+                    body: vec![Stmt::Expr(Expr::Var("n".into()))],
+                },
+            ],
+        );
+        ctx.collect_locals_from_function(&func);
+        assert_eq!(ctx.get_local("x"), Some(&Type::Int64));
+        assert_eq!(ctx.get_local("n"), Some(&Type::Int64));
+    }
+
+    #[test]
+    fn test_collect_locals_if_let_payload_with_struct_option_type() {
+        let mut ctx = TypeInferenceContext::new();
+        let some_x = Pattern::Variant {
+            enum_name: "Option".into(),
+            variant_name: "Some".into(),
+            payload: Some(Box::new(Pattern::Binding("x".into()))),
+        };
+        let func = make_function(
+            "test",
+            vec![make_param(
+                "opt",
+                Type::Struct("Option".into(), vec![Type::Int64]),
+            )],
+            Some(Type::Int64),
+            vec![Stmt::Expr(Expr::IfLet {
+                pattern: some_x,
+                expr: Box::new(Expr::Var("opt".into())),
+                then_branch: Box::new(Expr::Var("x".into())),
+                else_branch: Some(Box::new(Expr::Integer(0))),
+            })],
+        );
+        ctx.collect_locals_from_function(&func);
+        assert_eq!(ctx.get_local("x"), Some(&Type::Int64));
+    }
+
+    #[test]
+    fn test_collect_locals_struct_destructure_and_match_fields() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.struct_fields.insert(
+            "Point".into(),
+            HashMap::from([
+                ("x".into(), Type::Int64),
+                ("y".into(), Type::Int64),
+            ]),
+        );
+        let func = make_function(
+            "test",
+            vec![make_param("p", Type::Struct("Point".into(), vec![]))],
+            Some(Type::Int64),
+            vec![
+                Stmt::Let {
+                    pattern: Pattern::Struct {
+                        name: "Point".into(),
+                        fields: vec![
+                            ("x".into(), Pattern::Binding("x".into())),
+                            ("y".into(), Pattern::Binding("y".into())),
+                        ],
+                    },
+                    ty: None,
+                    value: Expr::Var("p".into()),
+                },
+                Stmt::Expr(Expr::Match {
+                    expr: Box::new(Expr::Var("p".into())),
+                    arms: vec![AstMatchArm {
+                        pattern: Pattern::Struct {
+                            name: "Point".into(),
+                            fields: vec![
+                                ("x".into(), Pattern::Binding("mx".into())),
+                                ("y".into(), Pattern::Binding("my".into())),
+                            ],
+                        },
+                        guard: None,
+                        body: Box::new(Expr::Binary {
+                            op: BinOp::Add,
+                            left: Box::new(Expr::Var("mx".into())),
+                            right: Box::new(Expr::Var("my".into())),
+                        }),
+                    }],
+                }),
+            ],
+        );
+        ctx.collect_locals_from_function(&func);
+        assert_eq!(ctx.get_local("x"), Some(&Type::Int64));
+        assert_eq!(ctx.get_local("y"), Some(&Type::Int64));
+        assert_eq!(ctx.get_local("mx"), Some(&Type::Int64));
+        assert_eq!(ctx.get_local("my"), Some(&Type::Int64));
     }
 
     // ─── infer_return_type_from_body ───

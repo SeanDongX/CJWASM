@@ -214,7 +214,7 @@ main() {
     @Assert(arr[7], 8)
     @Assert(arr[8], 9)
 
-    let idx: Int64 = 0
+    var idx: Int64 = 0
     while (idx < 9) {
         print(arr[idx])
         if (idx < 8) { print(" ") }

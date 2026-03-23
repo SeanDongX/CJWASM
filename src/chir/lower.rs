@@ -870,6 +870,67 @@ fn interface_method_sig(method: &crate::ast::InterfaceMethod) -> MethodSig {
     }
 }
 
+fn builtin_class_method(
+    name: &str,
+    visibility: Visibility,
+    return_type: Option<Type>,
+) -> ClassMethodSig {
+    ClassMethodSig {
+        sig: MethodSig {
+            name: name.to_string(),
+            params: vec![],
+            return_type,
+            visibility,
+            is_static: false,
+            type_params: vec![],
+            constraints: vec![],
+        },
+        is_override: false,
+    }
+}
+
+fn builtin_class_methods_by_name(class_name: &str) -> HashMap<String, Vec<ClassMethodSig>> {
+    let methods = match class_name {
+        "Object" => vec![
+            builtin_class_method("toString", Visibility::Public, Some(Type::String)),
+            builtin_class_method("hashCode", Visibility::Public, Some(Type::Int64)),
+        ],
+        // std.core.Error / Exception 提供基础异常字符串化与类型名接口
+        "Error" | "Exception" => vec![
+            builtin_class_method("getClassName", Visibility::Protected, Some(Type::String)),
+            builtin_class_method("toString", Visibility::Public, Some(Type::String)),
+        ],
+        _ => vec![],
+    };
+
+    let mut by_name: HashMap<String, Vec<ClassMethodSig>> = HashMap::new();
+    for method in methods {
+        by_name
+            .entry(method.sig.name.clone())
+            .or_default()
+            .push(method);
+    }
+    by_name
+}
+
+fn is_builtin_interface(name: &str) -> bool {
+    matches!(
+        name,
+        "Comparable"
+            | "Hashable"
+            | "Equatable"
+            | "ToString"
+            | "List"
+            | "Collection"
+            | "Iterable"
+            | "Iterator"
+            | "InputStream"
+            | "OutputStream"
+            | "Seekable"
+            | "Resource"
+    )
+}
+
 fn sig_key(sig: &MethodSig) -> String {
     format!(
         "{}|{}|{:?}|{:?}",
@@ -1264,8 +1325,11 @@ fn validate_upper_bounds(
         for bound in &constraint.bounds {
             if class_names.contains(bound)
                 || interface_names.contains(bound)
+                || is_builtin_interface(bound)
                 || bound == "Object"
                 || bound == "Any"
+                || bound == "Error"
+                || bound == "Exception"
                 || type_params.contains(bound)
             {
                 continue;
@@ -1421,6 +1485,9 @@ fn collect_interface_methods(
     cache: &mut HashMap<String, HashMap<String, InterfaceMethodReq>>,
     visiting: &mut HashSet<String>,
 ) -> Result<HashMap<String, InterfaceMethodReq>, String> {
+    if is_builtin_interface(iface_name) {
+        return Ok(HashMap::new());
+    }
     if let Some(cached) = cache.get(iface_name) {
         return Ok(cached.clone());
     }
@@ -1491,8 +1558,28 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
         .iter()
         .map(|i| (i.name.clone(), i))
         .collect();
-    let class_names: HashSet<String> = class_map.keys().cloned().collect();
-    let interface_names: HashSet<String> = interface_map.keys().cloned().collect();
+    let mut class_names: HashSet<String> = class_map.keys().cloned().collect();
+    class_names.insert("Error".to_string());
+    class_names.insert("Exception".to_string());
+    class_names.insert("Object".to_string());
+    class_names.insert("Any".to_string());
+    let mut interface_names: HashSet<String> = interface_map.keys().cloned().collect();
+    for builtin in [
+        "Comparable",
+        "Hashable",
+        "Equatable",
+        "ToString",
+        "List",
+        "Collection",
+        "Iterable",
+        "Iterator",
+        "InputStream",
+        "OutputStream",
+        "Seekable",
+        "Resource",
+    ] {
+        interface_names.insert(builtin.to_string());
+    }
 
     // 接口父接口合法性与重复检查
     for iface in &program.interfaces {
@@ -1570,6 +1657,8 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
         if let Some(ext) = &class_def.extends {
             if class_map.contains_key(ext.as_str()) {
                 parent = Some(ext.clone());
+            } else if matches!(ext.as_str(), "Error" | "Exception" | "Object" | "Any") {
+                parent = Some(ext.clone());
             } else if interface_map.contains_key(ext.as_str()) {
                 interfaces.push(ext.clone());
             } else {
@@ -1579,7 +1668,7 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
 
         let mut seen = HashSet::new();
         for iface in &interfaces {
-            if !interface_map.contains_key(iface.as_str()) {
+            if !interface_map.contains_key(iface.as_str()) && !is_builtin_interface(iface) {
                 return Err(format!("undeclared type name '{}'", iface));
             }
             if !seen.insert(iface.clone()) {
@@ -1599,6 +1688,14 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
             by_name.entry(sig.sig.name.clone()).or_default().push(sig);
         }
         class_methods.insert(class_def.name.clone(), by_name);
+    }
+
+    for builtin in ["Error", "Exception", "Object", "Any"] {
+        class_parent.entry(builtin.to_string()).or_insert(None);
+        class_direct_ifaces.entry(builtin.to_string()).or_default();
+        class_methods
+            .entry(builtin.to_string())
+            .or_insert_with(|| builtin_class_methods_by_name(builtin));
     }
 
     // struct 方法签名（顶层函数形式: StructName.method）
@@ -1981,6 +2078,9 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     let type_ctx = TypeInferenceContext::from_program(program);
 
     for constant in &program.constants {
+        if !constant.explicit_ty {
+            continue;
+        }
         let init_ty = type_ctx.infer_expr(&constant.init)?;
         if !type_ctx.is_assignable_type(&constant.ty, &init_ty) {
             return Err("mismatched types".to_string());
@@ -2941,6 +3041,63 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_program_allows_override_against_builtin_exception_method() {
+        let class_def = ClassDef {
+            visibility: Visibility::default(),
+            name: "MyException".to_string(),
+            type_params: vec![],
+            constraints: vec![],
+            is_abstract: false,
+            is_sealed: false,
+            is_open: false,
+            extends: Some("Exception".to_string()),
+            implements: vec![],
+            fields: vec![],
+            init: None,
+            deinit: None,
+            static_init: None,
+            methods: vec![ClassMethod {
+                override_: true,
+                func: Function {
+                    visibility: Visibility::Protected,
+                    name: "MyException.getClassName".to_string(),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: vec![Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct("MyException".to_string(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    }],
+                    return_type: Some(Type::String),
+                    throws: None,
+                    body: vec![Stmt::Return(Some(Expr::String(
+                        "MyException".to_string(),
+                    )))],
+                    extern_import: None,
+                },
+            }],
+            primary_ctor_params: vec![],
+        };
+        let program = crate::ast::Program {
+            package_name: None,
+            imports: vec![],
+            functions: vec![make_func("main", vec![], vec![])],
+            structs: vec![],
+            classes: vec![class_def],
+            enums: vec![],
+            interfaces: vec![],
+            extends: vec![],
+            type_aliases: vec![],
+            constants: vec![],
+        };
+
+        assert!(lower_program(&program).is_ok());
+    }
+
+    #[test]
     fn test_lower_program_rejects_static_override_without_interface_base() {
         let class_def = ClassDef {
             visibility: Visibility::default(),
@@ -3818,6 +3975,7 @@ mod tests {
             type_aliases: vec![],
             constants: vec![crate::ast::ConstDef {
                 name: "f".to_string(),
+                explicit_ty: true,
                 ty: Type::Float64,
                 init: Expr::Integer(1),
             }],
@@ -3842,11 +4000,13 @@ mod tests {
             constants: vec![
                 crate::ast::ConstDef {
                     name: "name".to_string(),
+                    explicit_ty: true,
                     ty: Type::Int64,
                     init: Expr::Integer(0),
                 },
                 crate::ast::ConstDef {
                     name: "name".to_string(),
+                    explicit_ty: true,
                     ty: Type::Int64,
                     init: Expr::Integer(1),
                 },
@@ -3875,6 +4035,7 @@ mod tests {
             type_aliases: vec![],
             constants: vec![crate::ast::ConstDef {
                 name: "name".to_string(),
+                explicit_ty: true,
                 ty: Type::Int64,
                 init: Expr::Integer(1),
             }],
@@ -3915,6 +4076,7 @@ mod tests {
             type_aliases: vec![],
             constants: vec![crate::ast::ConstDef {
                 name: "name".to_string(),
+                explicit_ty: true,
                 ty: Type::Int64,
                 init: Expr::Integer(1),
             }],

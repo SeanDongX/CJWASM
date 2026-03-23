@@ -782,6 +782,39 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_extend_builtin_receiver_type_is_primitive() {
+        let source = r#"
+            extend Int8 {
+                func shl(y: UInt64): Int8 { this << y }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        let method = &program.extends[0].methods[0];
+        assert_eq!(method.params[0].ty, crate::ast::Type::Int8);
+    }
+
+    #[test]
+    fn test_parse_extend_generic_receiver_type_preserves_args() {
+        let source = r#"
+            extend Array<Int8> {
+                func firstOrZero(): Int8 { this[0] }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        let method = &program.extends[0].methods[0];
+        assert_eq!(
+            method.params[0].ty,
+            crate::ast::Type::Array(Box::new(crate::ast::Type::Int8))
+        );
+    }
+
+    #[test]
     fn test_parse_class_with_init_deinit_prop() {
         let source = r#"
             class MyClass {

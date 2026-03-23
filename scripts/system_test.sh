@@ -121,7 +121,7 @@ fi
 mkdir -p "$OUT_DIR"
 
 # WASM 验证错误汇总日志
-VALIDATE_LOG=$(mktemp /tmp/cjwasm_validate_XXXXXX.log)
+VALIDATE_LOG=$(mktemp "${TMPDIR:-/tmp}/cjwasm_validate.XXXXXX")
 trap 'rm -f "$VALIDATE_LOG"' EXIT
 VALIDATE_ERRORS_TOTAL=0
 VALIDATE_FILES_INVALID=0

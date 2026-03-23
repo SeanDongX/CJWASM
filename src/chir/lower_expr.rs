@@ -2510,7 +2510,7 @@ impl<'a> LoweringContext<'a> {
                         stmts,
                         result: Some(Box::new(tmp_get())),
                     }),
-                    crate::ast::Type::Int32,
+                    ty.clone(),
                     ValType::I32,
                 ));
             }
@@ -2564,7 +2564,7 @@ impl<'a> LoweringContext<'a> {
                         stmts,
                         result: Some(Box::new(tmp_get())),
                     }),
-                    crate::ast::Type::Int32,
+                    ty.clone(),
                     ValType::I32,
                 ));
             }
@@ -2747,7 +2747,7 @@ impl<'a> LoweringContext<'a> {
                         stmts,
                         result: Some(Box::new(tmp_get())),
                     }),
-                    crate::ast::Type::Int32,
+                    ty.clone(),
                     ValType::I32,
                 ));
             }
@@ -2812,7 +2812,7 @@ impl<'a> LoweringContext<'a> {
                         stmts,
                         result: Some(Box::new(tmp_get())),
                     }),
-                    crate::ast::Type::Int32,
+                    ty.clone(),
                     ValType::I32,
                 ));
             }
@@ -6198,6 +6198,43 @@ mod tests {
         let chir = ctx.lower_expr(&expr).unwrap();
         // NullCoalesce now lowers to a Block with If condition
         assert!(matches!(chir.kind, CHIRExprKind::Block(_)));
+    }
+
+    #[test]
+    fn test_lower_option_and_result_constructors_preserve_ast_type() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new();
+        let fp = HashMap::new();
+        let so = HashMap::new();
+        let co = HashMap::new();
+        let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let some_expr = Expr::Some(Box::new(Expr::Integer(1)));
+        let some_chir = ctx.lower_expr(&some_expr).unwrap();
+        assert_eq!(some_chir.ty, Type::Option(Box::new(Type::Int64)));
+        assert_eq!(some_chir.wasm_ty, ValType::I32);
+
+        let none_expr = Expr::None;
+        let none_chir = ctx.lower_expr(&none_expr).unwrap();
+        assert_eq!(none_chir.ty, Type::Option(Box::new(Type::Nothing)));
+        assert_eq!(none_chir.wasm_ty, ValType::I32);
+
+        let ok_expr = Expr::Ok(Box::new(Expr::Integer(1)));
+        let ok_chir = ctx.lower_expr(&ok_expr).unwrap();
+        assert_eq!(
+            ok_chir.ty,
+            Type::Result(Box::new(Type::Int64), Box::new(Type::Nothing))
+        );
+        assert_eq!(ok_chir.wasm_ty, ValType::I32);
+
+        let err_expr = Expr::Err(Box::new(Expr::String("e".into())));
+        let err_chir = ctx.lower_expr(&err_expr).unwrap();
+        assert_eq!(
+            err_chir.ty,
+            Type::Result(Box::new(Type::Nothing), Box::new(Type::String))
+        );
+        assert_eq!(err_chir.wasm_ty, ValType::I32);
     }
 
     #[test]

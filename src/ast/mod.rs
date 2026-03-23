@@ -406,6 +406,7 @@ impl FieldDef {
 #[derive(Debug, Clone)]
 pub struct ConstDef {
     pub name: String,
+    pub explicit_ty: bool,
     pub ty: Type,
     pub init: Expr,
 }

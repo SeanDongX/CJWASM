@@ -182,6 +182,10 @@ pub struct CHIRCodeGen {
 }
 
 impl CHIRCodeGen {
+    fn cond_needs_i32_wrap(cond: &CHIRExpr) -> bool {
+        cond.wasm_ty == ValType::I64 && !matches!(cond.ty, Type::Bool)
+    }
+
     pub fn new() -> Self {
         CHIRCodeGen {
             func_indices: HashMap::new(),
@@ -4307,7 +4311,7 @@ impl CHIRCodeGen {
                 self.emit_expr(cond, func);
                 if !self.expr_produces_wasm_value_ctx(cond) {
                     func.instruction(&Instruction::I32Const(0));
-                } else if cond.wasm_ty == ValType::I64 {
+                } else if Self::cond_needs_i32_wrap(cond) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 // 使用 expr_produces_wasm_value_ctx 统一判断，与 stmt 层一致
@@ -4953,7 +4957,7 @@ impl CHIRCodeGen {
                 self.emit_expr(cond, func);
                 if !self.expr_produces_wasm_value_ctx(cond) {
                     func.instruction(&Instruction::I32Const(0));
-                } else if cond.wasm_ty == ValType::I64 {
+                } else if Self::cond_needs_i32_wrap(cond) {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 // void 上下文：始终用 Empty，分支不得产出值
@@ -5086,7 +5090,7 @@ impl CHIRCodeGen {
                 // 条件可能是 void（Unit Call），需补零值（false）避免 i32.eqz 空栈错误
                 if !self.expr_produces_wasm_value_ctx(cond) {
                     func.instruction(&Instruction::I32Const(0));
-                } else if cond.wasm_ty == ValType::I64 {
+                } else if Self::cond_needs_i32_wrap(cond) {
                     // 条件可能是 I64，需先截断到 I32，再用 I32Eqz 实现 `!cond`
                     func.instruction(&Instruction::I32WrapI64);
                 }

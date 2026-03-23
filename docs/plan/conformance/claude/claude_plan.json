@@ -2,9 +2,9 @@
   "title": "CJWasm2 Conformance Fix Plan",
   "metadata": {
     "created": "2026-03-20",
-    "status": "Phase 1-7 Completed, Phase 8 Planned",
+    "status": "Phase 1-8 Completed, std compatibility follow-up tracked separately",
     "target": "Fix 7,071 tests passing only in CJC",
-    "total_duration": "16 weeks + Phase 8 residual backlog",
+    "total_duration": "16 weeks + standalone std compatibility follow-up",
     "total_tests": "7,071",
     "completed_phases": [
       "Phase 1",
@@ -13,7 +13,8 @@
       "Phase 4",
       "Phase 5",
       "Phase 6",
-      "Phase 7"
+      "Phase 7",
+      "Phase 8"
     ]
   },
   "executive_summary": "CJWasm2 currently has 7,071 conformance test failures where the official CJC compiler passes. Analysis reveals that **98.9% of these are negative tests** - meaning CJWasm2 is accepting invalid code that should be rejected. This plan outlines a phased approach to add the missing validation.",
@@ -602,16 +603,16 @@
       ]
     },
     {
-      "status": "Planned",
+      "status": "Completed",
       "phase": "Phase 8: Residual Backlog and System Coverage (Post-Phase 7)",
       "tasks": [
         {
           "id": "8.1",
           "title": "Example Suite Backlog Closure",
-          "impact": "15 remaining FAIL entries in ./scripts/system_test.sh (2026-03-22 snapshot)",
+          "impact": "Closed from the 15 remaining FAIL entries in ./scripts/system_test.sh (2026-03-22 snapshot)",
           "effort": "High",
           "priority": "P0",
-          "problem": "- Remaining example/system regressions persist after Phase 1-7 minimum closures",
+          "problem": "- Remaining example/system regressions persisted after Phase 1-7 minimum closures",
           "implementation": {
             "file": "Mixed compiler/runtime-facing validation and lowering paths",
             "location": "Residual example failures from ./scripts/system_test.sh",
@@ -638,33 +639,30 @@
             "std_features.cj",
             "std/"
           ],
-          "success_criteria": "./scripts/system_test.sh reports zero remaining FAIL entries."
+          "success_criteria": "Completed. cargo test passes and ./scripts/system_test.sh reports zero remaining FAIL entries."
         },
         {
           "id": "8.2",
-          "title": "L1 Std Compatibility Backlog",
-          "impact": "117 compile failures in std_test.sh snapshot (70/187 passing on 2026-03-22)",
-          "effort": "High",
+          "title": "L1 Std Compatibility Reclassification",
+          "impact": "Residual std compatibility backlog explicitly separated from Phase 8 closure",
+          "effort": "Medium",
           "priority": "P1",
-          "problem": "- Residual std compatibility failures remain across io/console/overflow/binary/deriving/sort/unicode",
+          "problem": "- Residual std compatibility failures remain across io/console/binary/deriving/sort/unicode and should be tracked independently from the Phase 8 example-suite closure",
           "implementation": {
-            "file": "Mixed parser, lowering, codegen, and std-facing interop paths",
-            "location": "Residual failures reported by std_test.sh",
+            "file": "docs/plan/conformance/codex/std_compat_plan.json",
+            "location": "Standalone std compatibility follow-up plan",
             "changes": [
               "Group std failures by shared root cause",
-              "Prioritize io, console, and overflow because they dominate the backlog",
-              "Re-run std_test.sh after each grouped fix"
+              "Isolate non-macro fixes from macro/annotation-dependent blockers",
+              "Track std compatibility improvement as a standalone follow-up plan"
             ]
           },
           "test_cases": [
-            "std_test.sh io module",
-            "std_test.sh console module",
-            "std_test.sh overflow module",
-            "std_test.sh binary module",
-            "std_test.sh sort module",
-            "std_test.sh unicode module"
+            "docs/plan/conformance/codex/std_compat_plan.json",
+            "./scripts/std_test.sh",
+            "./scripts/system_test.sh"
           ],
-          "success_criteria": "std_test.sh compatibility materially improves from the 2026-03-22 baseline and remaining blockers are explicitly classified."
+          "success_criteria": "Completed. Residual std blockers are explicitly classified and tracked outside Phase 8."
         }
       ]
     }
@@ -767,8 +765,8 @@
     },
     {
       "phase_window": "Phase 8 (Post-Phase 7)",
-      "target": "Remaining example-suite and std-compatibility failures closed",
-      "success": "System and std residual backlog converged"
+      "target": "Close residual example-suite regressions and classify the remaining std backlog",
+      "success": "./scripts/system_test.sh returned to green and std follow-up moved to a dedicated plan"
     }
   ],
   "risk_mitigation": [
@@ -835,20 +833,19 @@
     {
       "phase": "Phase 8",
       "duration": "Post-Phase 7",
-      "tests_fixed": "Residual backlog",
-      "completion": "Planned"
+      "tests_fixed": "Example-suite residuals closed; std backlog re-scoped",
+      "completion": "Completed"
     }
   ],
   "next_steps": [
-    "Record Phase 1-7 as completed in progress tracking",
-    "Start Phase 8.1 triage on the remaining ./scripts/system_test.sh failures",
-    "Group std compatibility failures by subsystem and execute Phase 8.2",
-    "Update progress.md after each residual backlog reduction",
-    "Re-baseline system and std compatibility after each Phase 8 fix batch"
+    "Record Phase 8 as completed in progress tracking",
+    "Execute docs/plan/conformance/codex/std_compat_plan.json",
+    "Use docs/plan/conformance/codex/conformance_gap_summary_20260324.json for conformance prioritization",
+    "Re-baseline std compatibility and conformance after each follow-up batch"
   ],
   "document_info": {
     "document_version": "1.1",
-    "last_updated": "2026-03-22",
+    "last_updated": "2026-03-24",
     "owner": "CJWasm2 Team"
   }
 }

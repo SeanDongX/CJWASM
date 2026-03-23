@@ -436,11 +436,12 @@ impl Parser {
                 return self.bail(ParseError::UnexpectedToken(tok, "常量名".to_string()));
             }
         };
-        let ty = if self.check(&Token::Colon) {
+        let explicit_ty = self.check(&Token::Colon);
+        let ty = if explicit_ty {
             self.advance();
             self.parse_type()?
         } else {
-            // 无类型注解时用 Int64 占位，codegen 可依 init 推断
+            // 无类型注解时由后续类型推断决定，暂存占位类型
             Type::Int64
         };
         self.expect(Token::Assign)?;
@@ -448,7 +449,12 @@ impl Parser {
         if self.check(&Token::Semicolon) {
             self.advance();
         }
-        Ok(ConstDef { name, ty, init })
+        Ok(ConstDef {
+            name,
+            explicit_ty,
+            ty,
+            init,
+        })
     }
 
     /// 解析 @import("module", "name") 属性（用于 extern func 前）
@@ -864,6 +870,28 @@ impl Parser {
             }
             if self.check(&Token::Func) {
                 continue; // 下一轮循环会匹配上面的「if self.check(&Token::Func)」并解析方法
+            }
+            let is_const_init =
+                self.check(&Token::Const) && matches!(self.peek_next(), Some(Token::Init));
+            if self.check(&Token::Init) || is_const_init {
+                if is_const_init {
+                    self.advance(); // consume const
+                }
+                self.advance(); // consume init
+                self.expect(Token::LParen)?;
+                let _params = self.parse_params()?;
+                self.expect(Token::RParen)?;
+                self.expect(Token::LBrace)?;
+                let mut depth = 1;
+                while depth > 0 {
+                    match self.advance() {
+                        Some(Token::LBrace) => depth += 1,
+                        Some(Token::RBrace) => depth -= 1,
+                        None => return self.bail(ParseError::UnexpectedEof),
+                        _ => {}
+                    }
+                }
+                continue;
             }
             // prop name: Type { get() { ... } set(value) { ... } } — 与带主构造分支相同逻辑
             if self.check(&Token::Prop) {
@@ -1593,6 +1621,37 @@ impl Parser {
     /// extend TypeName: InterfaceName { type Element = ConcreteType; func method(...): ... { ... } }
     pub(crate) fn parse_extend(&mut self) -> Result<crate::ast::ExtendDef, ParseErrorAt> {
         self.expect(Token::Extend)?;
+        fn extend_receiver_type(target_type: &str, type_args: &[Type]) -> Type {
+            match (target_type, type_args) {
+                ("Int8", _) => Type::Int8,
+                ("Int16", _) => Type::Int16,
+                ("Int32", _) => Type::Int32,
+                ("Int64", _) => Type::Int64,
+                ("IntNative", _) => Type::IntNative,
+                ("UInt8", _) => Type::UInt8,
+                ("UInt16", _) => Type::UInt16,
+                ("UInt32", _) => Type::UInt32,
+                ("UInt64", _) => Type::UInt64,
+                ("UIntNative", _) => Type::UIntNative,
+                ("Float16", _) => Type::Float16,
+                ("Float32", _) => Type::Float32,
+                ("Float64", _) => Type::Float64,
+                ("Rune", _) => Type::Rune,
+                ("Bool", _) => Type::Bool,
+                ("String", _) => Type::String,
+                ("Array", [elem]) => Type::Array(Box::new(elem.clone())),
+                ("Slice", [elem]) => Type::Slice(Box::new(elem.clone())),
+                ("Option", [inner]) => Type::Option(Box::new(inner.clone())),
+                ("Result", [ok, err]) => {
+                    Type::Result(Box::new(ok.clone()), Box::new(err.clone()))
+                }
+                ("Map", [key, value]) => {
+                    Type::Map(Box::new(key.clone()), Box::new(value.clone()))
+                }
+                _ => Type::Struct(target_type.to_string(), type_args.to_vec()),
+            }
+        }
+
         // cjc: extend<T> Array<T> — 可选的扩展泛型参数
         if self.check(&Token::Lt) {
             let _ = self.parse_type_params()?;
@@ -1621,7 +1680,8 @@ impl Parser {
             None => return self.bail(ParseError::UnexpectedEof),
         };
         // 目标类型的泛型实参 Array<T>
-        let _ = self.parse_opt_type_args()?;
+        let target_type_args = self.parse_opt_type_args()?.unwrap_or_default();
+        let receiver_ty = extend_receiver_type(&target_type, &target_type_args);
         // 可选: 实现的接口 (cjc: extend Type <: InterfaceName 或 <: InterfaceName<T>)
         // 兼容: <: 为 SubType；或 < 与 : 分开为 Lt+Colon；或误写为 < InterfaceName 即 Lt+Ident
         let interface = if self.check(&Token::Colon)
@@ -1797,7 +1857,7 @@ impl Parser {
                                 constraints: vec![],
                                 params: vec![Param {
                                     name: "this".to_string(),
-                                    ty: Type::Struct(target_type.clone(), vec![]),
+                                    ty: receiver_ty.clone(),
                                     default: None,
                                     variadic: false,
                                     is_named: false,
@@ -1840,7 +1900,7 @@ impl Parser {
                                 params: vec![
                                     Param {
                                         name: "this".to_string(),
-                                        ty: Type::Struct(target_type.clone(), vec![]),
+                                        ty: receiver_ty.clone(),
                                         default: None,
                                         variadic: false,
                                         is_named: false,
@@ -1896,7 +1956,7 @@ impl Parser {
                     0,
                     crate::ast::Param {
                         name: "this".to_string(),
-                        ty: Type::Struct(target_type.clone(), vec![]),
+                        ty: receiver_ty.clone(),
                         default: None,
                         variadic: false,
                         is_named: false,

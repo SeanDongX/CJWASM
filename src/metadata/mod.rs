@@ -43,6 +43,17 @@ pub fn stdlib_method_return_type(
             Some(Type::Struct("Iterator".to_string(), type_args.to_vec()))
         }
         ("ArrayList" | "LinkedList" | "ArrayStack", "toString") => Some(Type::String),
+        ("ArrayList", "getRawArray") => Some(Type::Array(Box::new(elem()))),
+        ("ArrayList", "updateVersion") => None,
+
+        // ── Collection / List / Iterable ────────────────────────────────────
+        ("Collection" | "List", "add" | "clear") => None,
+        ("Collection" | "List", "size") => Some(Type::Int64),
+        ("Collection" | "List", "isEmpty" | "contains") => Some(Type::Bool),
+        ("Collection" | "List", "toArray") => Some(Type::Array(Box::new(elem()))),
+        ("Collection" | "List" | "Iterable", "iterator") => {
+            Some(Type::Struct("Iterator".to_string(), type_args.to_vec()))
+        }
 
         // ── HashMap ──────────────────────────────────────────────────────────
         ("HashMap", "get") => Some(Type::Option(Box::new(vtype()))),
@@ -63,6 +74,14 @@ pub fn stdlib_method_return_type(
         ("HashSet", "isEmpty") => Some(Type::Bool),
         ("HashSet", "toArray") => Some(Type::Array(Box::new(elem()))),
         ("HashSet", "iterator") => Some(Type::Struct("Iterator".to_string(), type_args.to_vec())),
+
+        // ── String ───────────────────────────────────────────────────────────
+        ("String", "trim" | "replace" | "toString") => Some(Type::String),
+        ("String", "startsWith" | "endsWith" | "contains" | "isEmpty" | "isBlank") => {
+            Some(Type::Bool)
+        }
+        ("String", "size" | "length" | "indexOf" | "lastIndexOf") => Some(Type::Int64),
+        ("String", "split") => Some(Type::Array(Box::new(Type::String))),
 
         // ── StringBuilder ────────────────────────────────────────────────────
         ("StringBuilder", "append" | "prepend" | "insert" | "deleteCharAt" | "clear") => {
@@ -151,7 +170,13 @@ pub fn stdlib_method_return_type(
         }
 
         // ── Random ───────────────────────────────────────────────────────────
+        ("Random", "nextInt8") => Some(Type::Int8),
+        ("Random", "nextInt16") => Some(Type::Int16),
         ("Random", "nextInt64" | "nextInt32" | "nextInt" | "nextLong") => Some(Type::Int64),
+        ("Random", "nextUInt8") => Some(Type::UInt8),
+        ("Random", "nextUInt16") => Some(Type::UInt16),
+        ("Random", "nextUInt32") => Some(Type::UInt32),
+        ("Random", "nextUInt64") => Some(Type::UInt64),
         ("Random", "nextFloat64" | "nextDouble" | "nextFloat") => Some(Type::Float64),
         ("Random", "nextBool") => Some(Type::Bool),
         ("Random", "nextBytes") => Some(Type::Array(Box::new(Type::UInt8))),
@@ -197,6 +222,14 @@ pub fn stdlib_method_return_type(
         ("TreeSet", "contains" | "isEmpty") => Some(Type::Bool),
         ("TreeSet", "size") => Some(Type::Int64),
 
+        // ── Core object / exception hierarchy ───────────────────────────────
+        ("Object", "toString") => Some(Type::String),
+        ("Object", "hashCode") => Some(Type::Int64),
+        ("Exception" | "Error", "getClassName" | "getStackTraceMessage" | "toString") => {
+            Some(Type::String)
+        }
+        ("Exception" | "Error", "printStackTrace") => None,
+
         _ => None,
     }
 }
@@ -229,6 +262,14 @@ pub fn stdlib_field_type(type_name: &str, type_args: &[Type], field: &str) -> Op
         // Channel 字段
         ("Channel", "capacity" | "size") => Some(Type::Int64),
         ("Channel", "isClosed") => Some(Type::Bool),
+
+        // Collection/List fields
+        ("Collection" | "List" | "ArrayList" | "LinkedList", "size") => Some(Type::Int64),
+        ("HashMap" | "HashSet" | "TreeMap" | "TreeSet", "size") => Some(Type::Int64),
+        ("String", "size" | "length") => Some(Type::Int64),
+
+        // Range fields
+        ("Range", "start" | "end" | "step") => Some(Type::Int64),
 
         // File 字段
         ("File", "name" | "absolutePath" | "path" | "parent") => Some(Type::String),
@@ -368,6 +409,22 @@ mod tests {
         );
         assert_eq!(
             stdlib_method_return_type("HashSet", &type_args, "size"),
+            Some(Type::Int64)
+        );
+    }
+
+    #[test]
+    fn test_string_methods() {
+        assert_eq!(
+            stdlib_method_return_type("String", &[], "trim"),
+            Some(Type::String)
+        );
+        assert_eq!(
+            stdlib_method_return_type("String", &[], "startsWith"),
+            Some(Type::Bool)
+        );
+        assert_eq!(
+            stdlib_method_return_type("String", &[], "size"),
             Some(Type::Int64)
         );
     }
@@ -605,6 +662,14 @@ mod tests {
             stdlib_field_type("DateTime", &[], "year"),
             Some(Type::Int64)
         );
+    }
+
+    #[test]
+    fn test_collection_and_range_fields() {
+        assert_eq!(stdlib_field_type("HashMap", &[], "size"), Some(Type::Int64));
+        assert_eq!(stdlib_field_type("HashSet", &[], "size"), Some(Type::Int64));
+        assert_eq!(stdlib_field_type("String", &[], "size"), Some(Type::Int64));
+        assert_eq!(stdlib_field_type("Range", &[], "start"), Some(Type::Int64));
     }
 
     #[test]

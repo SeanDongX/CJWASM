@@ -4100,7 +4100,9 @@ impl CodeGen {
 
                 self.compile_expr(cond, locals, func, loop_ctx);
                 // 条件必须是 i32；仅当 AST 类型确认为 i64 时才 wrap（TypeParam 保守不 wrap）
-                if self.needs_i64_to_i32_wrap(cond, locals) {
+                if self.needs_i64_to_i32_wrap(cond, locals)
+                    && self.infer_type_with_locals(cond, locals) == ValType::I64
+                {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 func.instruction(&Instruction::I32Eqz);
@@ -6195,7 +6197,9 @@ impl CodeGen {
             } => {
                 self.compile_expr(cond, locals, func, loop_ctx);
                 // 条件必须是 i32；仅当 AST 类型确认为 i64 时才 wrap（TypeParam 保守不 wrap）
-                if self.needs_i64_to_i32_wrap(cond, locals) {
+                if self.needs_i64_to_i32_wrap(cond, locals)
+                    && self.infer_type_with_locals(cond, locals) == ValType::I64
+                {
                     func.instruction(&Instruction::I32WrapI64);
                 }
 

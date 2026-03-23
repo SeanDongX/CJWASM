@@ -286,9 +286,18 @@ impl CodeGen {
             self.type_aliases.insert(name.clone(), ty.clone());
         }
 
+        let global_type_ctx = crate::chir::type_inference::TypeInferenceContext::from_program(program);
+
         // 注册全局变量类型（顶层 let/var 声明）
         for c in &program.constants {
-            self.global_var_types.insert(c.name.clone(), c.ty.clone());
+            self.global_var_types.insert(
+                c.name.clone(),
+                global_type_ctx
+                    .globals
+                    .get(&c.name)
+                    .cloned()
+                    .unwrap_or_else(|| c.ty.clone()),
+            );
         }
 
         // 保存全局变量的初始化表达式，用于类型推断
