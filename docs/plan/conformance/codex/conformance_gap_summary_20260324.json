@@ -1,0 +1,262 @@
+{
+  "title": "CJWasm2 Conformance Gap Summary",
+  "metadata": {
+    "created": "2026-03-24",
+    "owner": "codex",
+    "baseline_report": "docs/plan/conformance/baseline/20260321_201540/report_20260321_201540.md",
+    "baseline_json": "docs/plan/conformance/baseline/20260321_201540/cjc.log.json",
+    "current_run_dir": "target/conformance/20260323_195920",
+    "current_json": "target/conformance/20260323_195920/cjwasm.log.json",
+    "diff_report": "target/conformance/20260323_195920/diff_vs_20260321_201540.txt",
+    "total_tests": 29060
+  },
+  "baseline": {
+    "passed": 23080,
+    "failed": 2672,
+    "incomplete": 3304,
+    "errored": 2,
+    "skipped": 2,
+    "pass_rate": "79.42%"
+  },
+  "current": {
+    "passed": 15855,
+    "failed": 10846,
+    "incomplete": 2356,
+    "errored": 1,
+    "skipped": 2,
+    "pass_rate": "54.56%"
+  },
+  "delta_vs_baseline": {
+    "passed": -7225,
+    "failed": 8174,
+    "incomplete": -948,
+    "errored": -1,
+    "skipped": 0,
+    "pass_rate_points": "-24.86"
+  },
+  "diff_summary": {
+    "different_results": 10250,
+    "same_results": 18810,
+    "baseline_better_total": 9211,
+    "current_better_total": 1039,
+    "transitions": [
+      {
+        "transition": "PASSED -> FAILED",
+        "count": 7581,
+        "meaning": "Positive tests passed by cjc but rejected by cjwasm."
+      },
+      {
+        "transition": "INCOMPLETE -> FAILED",
+        "count": 1630,
+        "meaning": "Tests only warning/incomplete in cjc but hard-failed in cjwasm."
+      },
+      {
+        "transition": "FAILED -> INCOMPLETE",
+        "count": 682,
+        "meaning": "cjwasm is more permissive or warning-only compared to cjc."
+      },
+      {
+        "transition": "FAILED -> PASSED",
+        "count": 356,
+        "meaning": "cjwasm now succeeds where cjc baseline failed."
+      },
+      {
+        "transition": "ERRORED -> FAILED",
+        "count": 1,
+        "meaning": "One baseline harness error is a normal compile failure in cjwasm."
+      }
+    ]
+  },
+  "top_problem_clusters": [
+    {
+      "rank": 1,
+      "cluster": "src/tests/06_class_and_interface/01_class/02_class_members",
+      "transition": "PASSED -> FAILED",
+      "count": 1669,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/06_class_and_interface/01_class/02_class_members/04_member_functions_in_the_class/a05/test_a05_19.cj"
+    },
+    {
+      "rank": 2,
+      "cluster": "src/tests/02_types/01_value_types/10_struct_type",
+      "transition": "PASSED -> FAILED",
+      "count": 511,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/02_types/01_value_types/10_struct_type/05_instances_of_struct_types/a05/test_a05_08.cj"
+    },
+    {
+      "rank": 3,
+      "cluster": "src/tests/04_expressions/16_relational_expressions/a02",
+      "transition": "PASSED -> FAILED",
+      "count": 472,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/04_expressions/16_relational_expressions/a02/test_a02_0450.cj"
+    },
+    {
+      "rank": 4,
+      "cluster": "src/tests/11_packages_and_module_management/01_packages/05_package_in_the_root_directory_of_source_files",
+      "transition": "PASSED -> FAILED",
+      "count": 325,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/11_packages_and_module_management/01_packages/05_package_in_the_root_directory_of_source_files/01_program_entry_point/a03/a03_01/test_a03_01.cj"
+    },
+    {
+      "rank": 5,
+      "cluster": "src/tests/06_class_and_interface/02_interfaces/04_implementation_of_interfaces",
+      "transition": "PASSED -> FAILED",
+      "count": 306,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/06_class_and_interface/02_interfaces/04_implementation_of_interfaces/01_overriding_and_overloading_when_a_class_implements_interfaces/a05/test_a05_099.cj"
+    },
+    {
+      "rank": 6,
+      "cluster": "src/tests/04_expressions/15_arithmetic_expressions/a07",
+      "transition": "PASSED -> FAILED",
+      "count": 280,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/04_expressions/15_arithmetic_expressions/a07/test_a07_378.cj"
+    },
+    {
+      "rank": 7,
+      "cluster": "src/tests/04_expressions/18_bitwise_expressions/a13",
+      "transition": "PASSED -> FAILED",
+      "count": 256,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/04_expressions/18_bitwise_expressions/a13/test_a13_144.cj"
+    },
+    {
+      "rank": 8,
+      "cluster": "src/tests/04_expressions/21_coalescing_expressions/a03",
+      "transition": "PASSED -> FAILED",
+      "count": 210,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/04_expressions/21_coalescing_expressions/a03/test_a03_031.cj"
+    },
+    {
+      "rank": 9,
+      "cluster": "src/tests/02_types/01_value_types/01_numeric_types",
+      "transition": "PASSED -> FAILED",
+      "count": 185,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/02_types/01_value_types/01_numeric_types/03_operators_supported_by_floating_point_types/a01/test_a01_18.cj"
+    },
+    {
+      "rank": 10,
+      "cluster": "src/tests/04_expressions/18_bitwise_expressions/a02",
+      "transition": "PASSED -> FAILED",
+      "count": 184,
+      "dominant_signature": "unexpected compile success (negative test accepted)",
+      "sample_test": "src/tests/04_expressions/18_bitwise_expressions/a02/test_a02_029.cj"
+    }
+  ],
+  "top_error_signatures": [
+    {
+      "rank": 1,
+      "transition": "PASSED -> FAILED",
+      "signature": "unexpected compile success (negative test accepted)",
+      "count": 7476
+    },
+    {
+      "rank": 2,
+      "transition": "FAILED -> INCOMPLETE",
+      "signature": "unexpected compile success (negative test accepted)",
+      "count": 682
+    },
+    {
+      "rank": 3,
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "syntax: 意外的 token: Semicolon, 期望: struct、interface、class、enum、extend、func 或 foreign func",
+      "count": 377
+    },
+    {
+      "rank": 4,
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "chir: mismatched types",
+      "count": 206
+    },
+    {
+      "rank": 5,
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "chir: invalid binary operator '**' on type 'Range' and 'Int64'",
+      "count": 167
+    },
+    {
+      "rank": 6,
+      "transition": "FAILED -> PASSED",
+      "signature": "chir: mismatched types",
+      "count": 147
+    },
+    {
+      "rank": 7,
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "syntax: 意外的 token: Public, 期望: Func",
+      "count": 74
+    },
+    {
+      "rank": 8,
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "syntax: 意外的 token: Dot, 期望: 表达式",
+      "count": 59
+    },
+    {
+      "rank": 9,
+      "transition": "PASSED -> FAILED",
+      "signature": "chir: mismatched types",
+      "count": 35
+    },
+    {
+      "rank": 10,
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "chir: main containing throw must declare an explicit return type",
+      "count": 34
+    }
+  ],
+  "top_non_negative_acceptance_clusters": [
+    {
+      "rank": 1,
+      "cluster": "src/tests/13_multi_language_interoperability/01_c_interoperability/03_type_mapping",
+      "transition": "FAILED -> PASSED",
+      "signature": "chir: mismatched types",
+      "count": 144,
+      "sample_test": "src/tests/13_multi_language_interoperability/01_c_interoperability/03_type_mapping/02_pointers/a04/test_a04_270.cj"
+    },
+    {
+      "rank": 2,
+      "cluster": "src/tests/04_expressions/18_bitwise_expressions/a09",
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "chir: invalid binary operator '**' on type 'Range' and 'Int64'",
+      "count": 64,
+      "sample_test": "src/tests/04_expressions/18_bitwise_expressions/a09/test_a09_025.cj"
+    },
+    {
+      "rank": 3,
+      "cluster": "src/tests/04_expressions/18_bitwise_expressions/a13",
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "chir: invalid binary operator '**' on type 'Range' and 'Int64'",
+      "count": 64,
+      "sample_test": "src/tests/04_expressions/18_bitwise_expressions/a13/test_a13_004.cj"
+    },
+    {
+      "rank": 4,
+      "cluster": "src/tests/02_types/01_value_types/01_numeric_types",
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "chir: mismatched types",
+      "count": 32,
+      "sample_test": "src/tests/02_types/01_value_types/01_numeric_types/a05/test_a05_02.cj"
+    },
+    {
+      "rank": 5,
+      "cluster": "src/tests/03_names_scopes_variables_and_modifiers/03_variables/02_initialization_of_variables",
+      "transition": "INCOMPLETE -> FAILED",
+      "signature": "syntax: 意外的 token: Public, 期望: Func",
+      "count": 28,
+      "sample_test": "src/tests/03_names_scopes_variables_and_modifiers/03_variables/02_initialization_of_variables/02_initializing_global_variables_and_static_variables/a05/test_a05_02/test_a05_02.cj"
+    }
+  ],
+  "key_takeaways": [
+    "The dominant gap is still semantic under-validation: most losses come from negative tests that should fail but are accepted.",
+    "Class/interface, struct/type, relational/arithmetic/bitwise/coalescing, and package-entry rules remain the largest regression domains.",
+    "Parser and CHIR typing issues still exist, but they are secondary compared with missing negative-test diagnostics.",
+    "There are meaningful gains in some FFI/type-mapping areas, but they are outweighed by the large PASSED -> FAILED backlog."
+  ]
+}

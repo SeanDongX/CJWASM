@@ -1,0 +1,1218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Conformance JSON Viewer</title>
+  <style>
+    :root {
+      --bg: #f5f1e8;
+      --panel: #fffaf0;
+      --panel-strong: #f0e4c8;
+      --text: #1f1d19;
+      --muted: #6b665c;
+      --accent: #9a3412;
+      --accent-soft: #f59e0b;
+      --border: #d9ccb5;
+      --good: #166534;
+      --warn: #92400e;
+      --bad: #991b1b;
+      --shadow: rgba(52, 40, 20, 0.08);
+      --mono: "SFMono-Regular", ui-monospace, "Cascadia Code", "Roboto Mono", Menlo, monospace;
+      --sans: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, Georgia, serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(245, 158, 11, 0.16), transparent 28%),
+        linear-gradient(180deg, #f8f4ea 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+
+    .shell {
+      width: min(1280px, calc(100vw - 32px));
+      margin: 24px auto 48px;
+    }
+
+    .hero {
+      padding: 28px;
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background:
+        linear-gradient(135deg, rgba(154, 52, 18, 0.08), rgba(245, 158, 11, 0.14)),
+        var(--panel);
+      box-shadow: 0 16px 40px var(--shadow);
+    }
+
+    .hero h1 {
+      margin: 0 0 8px;
+      font-size: clamp(28px, 4vw, 46px);
+      line-height: 1.05;
+      letter-spacing: 0.02em;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.6;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 20px;
+      align-items: center;
+    }
+
+    button,
+    .file-label {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      padding: 10px 14px;
+      border-radius: 999px;
+      cursor: pointer;
+      font: inherit;
+      transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
+    }
+
+    button:hover,
+    .file-label:hover {
+      transform: translateY(-1px);
+      border-color: var(--accent-soft);
+      background: #fff6df;
+    }
+
+    button.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fffaf4;
+    }
+
+    .file-label input {
+      display: none;
+    }
+
+    .meta-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .chip {
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255, 250, 240, 0.72);
+      border: 1px solid var(--border);
+    }
+
+    .status {
+      margin-top: 16px;
+      min-height: 22px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .status.error {
+      color: var(--bad);
+    }
+
+    .status.ok {
+      color: var(--good);
+    }
+
+    .overview-grid,
+    .cards-grid,
+    .visual-grid {
+      display: grid;
+      gap: 16px;
+      margin-top: 20px;
+    }
+
+    .overview-grid {
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+
+    .cards-grid {
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    }
+
+    .visual-grid {
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 20px;
+      padding: 18px;
+      box-shadow: 0 10px 28px var(--shadow);
+    }
+
+    .card.wide {
+      grid-column: 1 / -1;
+    }
+
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .card-header h3 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+    }
+
+    .card-subtitle {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 14px;
+      margin-bottom: 6px;
+    }
+
+    .metric-value {
+      font-size: 32px;
+      line-height: 1;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .metric-value.good {
+      color: var(--good);
+    }
+
+    .metric-value.warn {
+      color: var(--warn);
+    }
+
+    .metric-value.bad {
+      color: var(--bad);
+    }
+
+    .metric-delta {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .section {
+      margin-top: 22px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 24px;
+      box-shadow: 0 14px 36px var(--shadow);
+      overflow: hidden;
+    }
+
+    .section-header {
+      padding: 18px 20px;
+      background: linear-gradient(90deg, rgba(154, 52, 18, 0.08), rgba(245, 158, 11, 0.08));
+      border-bottom: 1px solid var(--border);
+    }
+
+    .section-header h2 {
+      margin: 0;
+      font-size: 22px;
+    }
+
+    .section-body {
+      padding: 18px 20px 22px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      text-align: left;
+      vertical-align: top;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(217, 204, 181, 0.8);
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      background: rgba(240, 228, 200, 0.42);
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+      gap: 8px 16px;
+      align-items: start;
+    }
+
+    .key {
+      color: var(--muted);
+      font-size: 14px;
+      word-break: break-word;
+    }
+
+    .value {
+      font-size: 14px;
+      word-break: break-word;
+    }
+
+    .value code,
+    .mono {
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    pre {
+      margin: 0;
+      padding: 14px;
+      border-radius: 16px;
+      background: #f6efe2;
+      border: 1px solid var(--border);
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    details {
+      border: 1px solid rgba(217, 204, 181, 0.85);
+      border-radius: 18px;
+      padding: 14px 16px;
+      background: rgba(255, 250, 240, 0.82);
+    }
+
+    details + details {
+      margin-top: 12px;
+    }
+
+    summary {
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .ring-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-top: 6px;
+    }
+
+    .ring-card {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 12px 0;
+    }
+
+    .ring-svg {
+      width: 108px;
+      height: 108px;
+      flex: 0 0 auto;
+    }
+
+    .ring-center-big {
+      font-size: 14px;
+      font-weight: 700;
+      fill: var(--text);
+      text-anchor: middle;
+    }
+
+    .ring-center-small {
+      font-size: 11px;
+      fill: var(--muted);
+      text-anchor: middle;
+    }
+
+    .legend {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .legend-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+    }
+
+    .legend-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      color: var(--muted);
+    }
+
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }
+
+    .legend-value {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    .stack-chart {
+      display: grid;
+      gap: 14px;
+    }
+
+    .stack-row {
+      display: grid;
+      grid-template-columns: 100px minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+    }
+
+    .stack-label {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .stack-bar {
+      position: relative;
+      display: flex;
+      height: 18px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #efe4cf;
+      border: 1px solid rgba(217, 204, 181, 0.9);
+    }
+
+    .stack-seg {
+      height: 100%;
+      min-width: 2px;
+    }
+
+    .seg-passed { background: linear-gradient(90deg, #22c55e, #15803d); }
+    .seg-failed { background: linear-gradient(90deg, #ef4444, #991b1b); }
+    .seg-incomplete { background: linear-gradient(90deg, #f59e0b, #b45309); }
+    .seg-errored { background: linear-gradient(90deg, #7c3aed, #5b21b6); }
+    .seg-skipped { background: linear-gradient(90deg, #94a3b8, #64748b); }
+
+    .stack-caption {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .bar-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .bar-row {
+      display: grid;
+      gap: 6px;
+    }
+
+    .bar-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 13px;
+      align-items: baseline;
+    }
+
+    .bar-title {
+      min-width: 0;
+      font-weight: 600;
+    }
+
+    .bar-meta {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .bar-track {
+      position: relative;
+      height: 12px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #efe5d2;
+      border: 1px solid rgba(217, 204, 181, 0.9);
+    }
+
+    .bar-fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      border-radius: inherit;
+    }
+
+    .fill-bad { background: linear-gradient(90deg, #dc2626, #991b1b); }
+    .fill-warn { background: linear-gradient(90deg, #f59e0b, #b45309); }
+    .fill-good { background: linear-gradient(90deg, #22c55e, #15803d); }
+    .fill-accent { background: linear-gradient(90deg, #ea580c, #c2410c); }
+    .fill-cool { background: linear-gradient(90deg, #0ea5e9, #0369a1); }
+
+    .transition-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #fff7e7;
+      font-size: 12px;
+      color: var(--muted);
+      margin-right: 8px;
+      margin-bottom: 8px;
+    }
+
+    .phase-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .phase-card {
+      border: 1px solid rgba(217, 204, 181, 0.9);
+      border-radius: 18px;
+      padding: 14px;
+      background: rgba(255, 250, 240, 0.82);
+    }
+
+    .phase-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .phase-name {
+      font-weight: 700;
+      font-size: 15px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      border: 1px solid rgba(217, 204, 181, 0.9);
+      background: #fff7e7;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .pill.p0 { color: var(--bad); border-color: rgba(153, 27, 27, 0.25); background: rgba(254, 226, 226, 0.9); }
+    .pill.p1 { color: var(--warn); border-color: rgba(146, 64, 14, 0.2); background: rgba(254, 243, 199, 0.9); }
+    .pill.deferred { color: #6b21a8; border-color: rgba(107, 33, 168, 0.2); background: rgba(245, 243, 255, 0.95); }
+
+    .phase-goal {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .mini-kv {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .mini-kv .card {
+      padding: 14px;
+      box-shadow: none;
+      background: #fff8ec;
+    }
+
+    .hint {
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    @media (max-width: 720px) {
+      .shell {
+        width: min(100vw - 20px, 1280px);
+        margin-top: 12px;
+      }
+
+      .hero,
+      .section-body,
+      .section-header {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+
+      .kv {
+        grid-template-columns: 1fr;
+      }
+
+      .stack-row {
+        grid-template-columns: 1fr;
+      }
+
+      .ring-card {
+        flex-direction: column;
+        align-items: start;
+      }
+
+      th,
+      td {
+        padding: 9px 8px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <h1>Conformance JSON Viewer</h1>
+      <p>用于查看 `docs/plan/conformance/codex/` 下的 JSON 计划与差异摘要。默认支持直接加载仓内文件，也支持手动选择本地 JSON。</p>
+      <div class="toolbar">
+        <button type="button" data-json="conformance_gap_summary_20260324.json" class="active">Gap Summary</button>
+        <button type="button" data-json="std_compat_plan.json">Std Compat Plan</button>
+        <label class="file-label">
+          打开本地 JSON
+          <input id="file-input" type="file" accept=".json,application/json">
+        </label>
+      </div>
+      <div class="meta-bar">
+        <div class="chip">目录: <span class="mono">docs/plan/conformance/codex</span></div>
+        <div class="chip">支持: 相对路径加载 / 本地文件回退</div>
+      </div>
+      <div id="status" class="status"></div>
+      <div class="hint">
+        如果浏览器从 `file://` 打开时拦截 `fetch`，请直接使用“打开本地 JSON”，或者在仓库根目录运行
+        <span class="mono">python3 -m http.server</span>
+        后通过 `http://localhost:8000/` 打开本页。
+      </div>
+    </section>
+
+    <div id="app"></div>
+  </div>
+
+  <script>
+    const app = document.getElementById("app");
+    const statusNode = document.getElementById("status");
+    const fileInput = document.getElementById("file-input");
+    const buttons = Array.from(document.querySelectorAll("button[data-json]"));
+
+    const predefinedFiles = [
+      "conformance_gap_summary_20260324.json",
+      "std_compat_plan.json"
+    ];
+
+    function setStatus(message, kind = "") {
+      statusNode.textContent = message || "";
+      statusNode.className = kind ? `status ${kind}` : "status";
+    }
+
+    function activateButton(fileName) {
+      buttons.forEach((button) => {
+        button.classList.toggle("active", button.dataset.json === fileName);
+      });
+    }
+
+    function guessMetricTone(label, value) {
+      const text = `${label} ${value}`.toLowerCase();
+      if (/(passed|pass_rate|same_results|current_better_total)/.test(text)) return "good";
+      if (/(failed|different_results|baseline_better_total|errored)/.test(text)) return "bad";
+      if (/(incomplete|skipped|delta)/.test(text)) return "warn";
+      return "";
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function renderOverview(data) {
+      const cards = [];
+
+      if (data.baseline && data.current && data.diff_summary) {
+        cards.push(
+          { label: "Baseline Passed", value: data.baseline.passed },
+          { label: "Current Passed", value: data.current.passed },
+          { label: "Different Results", value: data.diff_summary.different_results },
+          { label: "Same Results", value: data.diff_summary.same_results },
+          { label: "Baseline Better", value: data.diff_summary.baseline_better_total },
+          { label: "Current Better", value: data.diff_summary.current_better_total }
+        );
+      } else if (data.metadata && data.metadata.baseline) {
+        const baseline = data.metadata.baseline;
+        cards.push(
+          { label: "Compile Pass", value: baseline.compile_pass },
+          { label: "Compile Fail", value: baseline.compile_fail },
+          { label: "Known Skip", value: baseline.known_skip },
+          { label: "Total Files", value: baseline.total_test_files },
+          { label: "Pass Rate", value: baseline.compile_pass_rate },
+          { label: "WASM Validate Pass", value: baseline.wasm_validate_pass }
+        );
+      }
+
+      if (!cards.length) return "";
+
+      return `
+        <section class="section">
+          <div class="section-header"><h2>Overview</h2></div>
+          <div class="section-body">
+            <div class="overview-grid">
+              ${cards.map((card) => `
+                <div class="card">
+                  <div class="metric-label">${escapeHtml(card.label)}</div>
+                  <div class="metric-value ${guessMetricTone(card.label, card.value)}">${escapeHtml(card.value)}</div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        </section>
+      `;
+    }
+
+    function toNumber(value) {
+      if (typeof value === "number") return value;
+      if (typeof value === "string") {
+        const cleaned = value.replace(/[^0-9.-]/g, "");
+        return cleaned ? Number(cleaned) : NaN;
+      }
+      return NaN;
+    }
+
+    function arcPath(cx, cy, r, startAngle, endAngle) {
+      const toXY = (angle) => {
+        const rad = (angle - 90) * Math.PI / 180;
+        return {
+          x: cx + r * Math.cos(rad),
+          y: cy + r * Math.sin(rad)
+        };
+      };
+      const start = toXY(startAngle);
+      const end = toXY(endAngle);
+      const largeArcFlag = endAngle - startAngle > 180 ? 1 : 0;
+      return `M ${start.x} ${start.y} A ${r} ${r} 0 ${largeArcFlag} 1 ${end.x} ${end.y}`;
+    }
+
+    function renderDonutCard(title, centerPrimary, centerSecondary, segments) {
+      const validSegments = segments.filter((segment) => segment.value > 0);
+      const total = validSegments.reduce((sum, segment) => sum + segment.value, 0) || 1;
+      let angle = 0;
+      const arcs = validSegments.map((segment) => {
+        const sweep = (segment.value / total) * 360;
+        const start = angle;
+        const end = angle + sweep;
+        angle = end;
+        return `
+          <path
+            d="${arcPath(60, 60, 42, start, end)}"
+            fill="none"
+            stroke="${segment.color}"
+            stroke-width="14"
+            stroke-linecap="round"
+          ></path>
+        `;
+      }).join("");
+
+      return `
+        <div class="card">
+          <div class="card-header">
+            <h3>${escapeHtml(title)}</h3>
+          </div>
+          <div class="ring-card">
+            <svg class="ring-svg" viewBox="0 0 120 120" aria-hidden="true">
+              <circle cx="60" cy="60" r="42" fill="none" stroke="#ebdfca" stroke-width="14"></circle>
+              ${arcs}
+              <text x="60" y="56" class="ring-center-big">${escapeHtml(centerPrimary)}</text>
+              <text x="60" y="74" class="ring-center-small">${escapeHtml(centerSecondary)}</text>
+            </svg>
+            <div class="legend">
+              ${validSegments.map((segment) => `
+                <div class="legend-item">
+                  <div class="legend-label">
+                    <span class="swatch" style="background:${segment.color}"></span>
+                    <span>${escapeHtml(segment.label)}</span>
+                  </div>
+                  <div class="legend-value">${escapeHtml(segment.display)}</div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderStackComparison(title, baseline, current) {
+      const states = [
+        { key: "passed", label: "Passed", className: "seg-passed" },
+        { key: "failed", label: "Failed", className: "seg-failed" },
+        { key: "incomplete", label: "Incomplete", className: "seg-incomplete" },
+        { key: "errored", label: "Errored", className: "seg-errored" },
+        { key: "skipped", label: "Skipped", className: "seg-skipped" }
+      ];
+
+      const makeBar = (label, source) => {
+        const total = states.reduce((sum, state) => sum + (toNumber(source[state.key]) || 0), 0) || 1;
+        return `
+          <div class="stack-row">
+            <div class="stack-label">${escapeHtml(label)}</div>
+            <div class="stack-bar">
+              ${states.map((state) => {
+                const value = toNumber(source[state.key]) || 0;
+                const width = total ? (value / total) * 100 : 0;
+                return `<div class="stack-seg ${state.className}" style="width:${width}%"></div>`;
+              }).join("")}
+            </div>
+          </div>
+        `;
+      };
+
+      return `
+        <div class="card wide">
+          <div class="card-header">
+            <div>
+              <h3>${escapeHtml(title)}</h3>
+              <div class="card-subtitle">按结果类型对比 baseline 与 current 的分布。</div>
+            </div>
+          </div>
+          <div class="stack-chart">
+            ${makeBar("Baseline", baseline)}
+            ${makeBar("Current", current)}
+          </div>
+          <div class="stack-caption">
+            ${states.map((state) => `
+              <span class="transition-chip">
+                <span class="swatch ${state.className}"></span>
+                ${escapeHtml(state.label)}
+              </span>
+            `).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderBarList(title, subtitle, items, options = {}) {
+      if (!items || !items.length) return "";
+      const max = Math.max(...items.map((item) => toNumber(item[options.valueKey || "count"]) || 0), 1);
+      const color = options.colorClass || "fill-accent";
+      return `
+        <div class="card ${options.wide ? "wide" : ""}">
+          <div class="card-header">
+            <div>
+              <h3>${escapeHtml(title)}</h3>
+              ${subtitle ? `<div class="card-subtitle">${escapeHtml(subtitle)}</div>` : ""}
+            </div>
+          </div>
+          <div class="bar-list">
+            ${items.map((item) => {
+              const value = toNumber(item[options.valueKey || "count"]) || 0;
+              const width = (value / max) * 100;
+              const titleText = options.titleFormatter ? options.titleFormatter(item) : (item.title || item.cluster || item.transition || item.signature || item.phase || "Item");
+              const metaText = options.metaFormatter ? options.metaFormatter(item) : String(value);
+              return `
+                <div class="bar-row">
+                  <div class="bar-head">
+                    <div class="bar-title">${escapeHtml(titleText)}</div>
+                    <div class="bar-meta">${escapeHtml(metaText)}</div>
+                  </div>
+                  <div class="bar-track">
+                    <div class="bar-fill ${color}" style="width:${width}%"></div>
+                  </div>
+                </div>
+              `;
+            }).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderGapVisuals(data) {
+      const baseline = data.baseline;
+      const current = data.current;
+      const diff = data.diff_summary;
+      if (!baseline || !current || !diff) return "";
+
+      const baselineTotal = ["passed", "failed", "incomplete", "errored", "skipped"]
+        .reduce((sum, key) => sum + (toNumber(baseline[key]) || 0), 0);
+      const currentTotal = ["passed", "failed", "incomplete", "errored", "skipped"]
+        .reduce((sum, key) => sum + (toNumber(current[key]) || 0), 0);
+
+      const rings = `
+        <div class="ring-grid">
+          ${renderDonutCard("Baseline Distribution", `${baseline.passed}`, baseline.pass_rate || "baseline", [
+            { label: "Passed", value: toNumber(baseline.passed) || 0, color: "#15803d", display: `${baseline.passed}` },
+            { label: "Failed", value: toNumber(baseline.failed) || 0, color: "#b91c1c", display: `${baseline.failed}` },
+            { label: "Incomplete", value: toNumber(baseline.incomplete) || 0, color: "#d97706", display: `${baseline.incomplete}` },
+            { label: "Errored", value: toNumber(baseline.errored) || 0, color: "#6d28d9", display: `${baseline.errored}` },
+            { label: "Skipped", value: toNumber(baseline.skipped) || 0, color: "#64748b", display: `${baseline.skipped}` }
+          ])}
+          ${renderDonutCard("Current Distribution", `${current.passed}`, current.pass_rate || "current", [
+            { label: "Passed", value: toNumber(current.passed) || 0, color: "#15803d", display: `${current.passed}` },
+            { label: "Failed", value: toNumber(current.failed) || 0, color: "#b91c1c", display: `${current.failed}` },
+            { label: "Incomplete", value: toNumber(current.incomplete) || 0, color: "#d97706", display: `${current.incomplete}` },
+            { label: "Errored", value: toNumber(current.errored) || 0, color: "#6d28d9", display: `${current.errored}` },
+            { label: "Skipped", value: toNumber(current.skipped) || 0, color: "#64748b", display: `${current.skipped}` }
+          ])}
+        </div>
+      `;
+
+      const passRateDelta = data.delta_vs_baseline && data.delta_vs_baseline.pass_rate_points
+        ? data.delta_vs_baseline.pass_rate_points
+        : "n/a";
+
+      const transitions = renderBarList(
+        "Result Transitions",
+        "不同结果之间的迁移数量，越靠前越值得优先排查。",
+        diff.transitions || [],
+        {
+          titleFormatter: (item) => item.transition,
+          metaFormatter: (item) => `${item.count}`,
+          colorClass: "fill-bad"
+        }
+      );
+
+      const clusters = renderBarList(
+        "Top Problem Clusters",
+        "当前与基线差异最大的目录簇。",
+        (data.top_problem_clusters || []).slice(0, 10),
+        {
+          wide: true,
+          titleFormatter: (item) => `${item.rank}. ${item.cluster}`,
+          metaFormatter: (item) => `${item.count} | ${item.transition}`,
+          colorClass: "fill-accent"
+        }
+      );
+
+      const signatures = renderBarList(
+        "Top Error Signatures",
+        "主导差异的错误签名。",
+        (data.top_error_signatures || []).slice(0, 10),
+        {
+          titleFormatter: (item) => `${item.rank}. ${item.signature}`,
+          metaFormatter: (item) => `${item.count} | ${item.transition}`,
+          colorClass: "fill-warn"
+        }
+      );
+
+      return `
+        <section class="section">
+          <div class="section-header"><h2>Visual Dashboard</h2></div>
+          <div class="section-body">
+            ${rings}
+            <div class="visual-grid">
+              <div class="card">
+                <div class="card-header">
+                  <div>
+                    <h3>Pass Rate Delta</h3>
+                    <div class="card-subtitle">当前与基线的通过率差。</div>
+                  </div>
+                </div>
+                <div class="metric-value bad">${escapeHtml(passRateDelta)}</div>
+                <div class="metric-delta">percentage points</div>
+              </div>
+              ${renderStackComparison("Baseline vs Current", baseline, current)}
+              ${transitions}
+              ${signatures}
+              ${clusters}
+            </div>
+          </div>
+        </section>
+      `;
+    }
+
+    function renderPlanVisuals(data) {
+      if (!Array.isArray(data.phases) || !data.phases.length) return "";
+
+      const coverage = data.coverage_assessment || {};
+      const failureBuckets = coverage.current_failure_buckets || [];
+      const phases = data.phases.slice(0, 6);
+
+      return `
+        <section class="section">
+          <div class="section-header"><h2>Visual Dashboard</h2></div>
+          <div class="section-body">
+            <div class="visual-grid">
+              ${failureBuckets.length ? renderBarList(
+                "Failure Buckets",
+                "当前失败模块按规模排序。",
+                failureBuckets,
+                {
+                  titleFormatter: (item) => item.module,
+                  metaFormatter: (item) => `${item.failures} fail`,
+                  valueKey: "failures",
+                  colorClass: "fill-bad"
+                }
+              ) : ""}
+              ${coverage.directly_targeted_failures ? `
+                <div class="card">
+                  <div class="card-header">
+                    <div>
+                      <h3>Target Coverage</h3>
+                      <div class="card-subtitle">A-D 直接瞄准的失败范围。</div>
+                    </div>
+                  </div>
+                  <div class="metric-value good">${escapeHtml(coverage.directly_targeted_failures.count)}</div>
+                  <div class="metric-delta">${escapeHtml(coverage.directly_targeted_failures.percentage_of_current_failures)} of current failures</div>
+                </div>
+              ` : ""}
+              ${coverage.explicitly_not_closed_by_A_to_D ? `
+                <div class="card">
+                  <div class="card-header">
+                    <div>
+                      <h3>Deferred Backlog</h3>
+                      <div class="card-subtitle">A-D 明确不闭环的失败。</div>
+                    </div>
+                  </div>
+                  <div class="metric-value bad">${escapeHtml(coverage.explicitly_not_closed_by_A_to_D.count)}</div>
+                  <div class="metric-delta">${escapeHtml(coverage.explicitly_not_closed_by_A_to_D.reason || "")}</div>
+                </div>
+              ` : ""}
+              <div class="card wide">
+                <div class="card-header">
+                  <div>
+                    <h3>Phase Roadmap</h3>
+                    <div class="card-subtitle">计划阶段与优先级。</div>
+                  </div>
+                </div>
+                <div class="phase-list">
+                  ${phases.map((phase) => {
+                    const priorityRaw = String(phase.priority || "").toLowerCase();
+                    const pillClass =
+                      priorityRaw === "p0" ? "p0" :
+                      priorityRaw === "p1" || priorityRaw === "p2" ? "p1" :
+                      priorityRaw.includes("defer") ? "deferred" : "";
+                    return `
+                      <div class="phase-card">
+                        <div class="phase-top">
+                          <div class="phase-name">${escapeHtml(`${phase.phase}: ${phase.name}`)}</div>
+                          <div class="pill ${pillClass}">${escapeHtml(phase.priority || "n/a")}</div>
+                        </div>
+                        <div class="phase-goal">${escapeHtml(phase.goal || "")}</div>
+                      </div>
+                    `;
+                  }).join("")}
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      `;
+    }
+
+    function renderVisualDashboard(data) {
+      if (data.baseline && data.current && data.diff_summary) {
+        return renderGapVisuals(data);
+      }
+      if (Array.isArray(data.phases) && data.metadata && data.metadata.baseline) {
+        return renderPlanVisuals(data);
+      }
+      return "";
+    }
+
+    function arrayOfObjectsTable(items) {
+      if (!items.length) return "<div class=\"value\">[]</div>";
+      const keys = Array.from(
+        items.reduce((set, item) => {
+          Object.keys(item || {}).forEach((key) => set.add(key));
+          return set;
+        }, new Set())
+      );
+
+      return `
+        <table>
+          <thead>
+            <tr>${keys.map((key) => `<th>${escapeHtml(key)}</th>`).join("")}</tr>
+          </thead>
+          <tbody>
+            ${items.map((item) => `
+              <tr>
+                ${keys.map((key) => `<td>${renderInlineValue(item ? item[key] : "")}</td>`).join("")}
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function renderInlineValue(value) {
+      if (value === null) return "<span class=\"value\">null</span>";
+      if (value === undefined) return "<span class=\"value\">-</span>";
+      if (Array.isArray(value)) {
+        return `<span class="value mono">${escapeHtml(JSON.stringify(value))}</span>`;
+      }
+      if (typeof value === "object") {
+        return `<pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre>`;
+      }
+      return `<span class="value">${escapeHtml(value)}</span>`;
+    }
+
+    function renderValue(value) {
+      if (value === null) return "<div class=\"value\">null</div>";
+      if (value === undefined) return "<div class=\"value\">-</div>";
+
+      if (Array.isArray(value)) {
+        if (!value.length) return "<div class=\"value\">[]</div>";
+        if (value.every((item) => item && typeof item === "object" && !Array.isArray(item))) {
+          return arrayOfObjectsTable(value);
+        }
+        return `
+          <div class="cards-grid">
+            ${value.map((item, index) => `
+              <div class="card">
+                <div class="metric-label">Item ${index + 1}</div>
+                ${renderValue(item)}
+              </div>
+            `).join("")}
+          </div>
+        `;
+      }
+
+      if (typeof value === "object") {
+        const entries = Object.entries(value);
+        if (!entries.length) return "<div class=\"value\">{}</div>";
+        return `
+          <div class="kv">
+            ${entries.map(([key, inner]) => `
+              <div class="key">${escapeHtml(key)}</div>
+              <div class="value">${renderInlineValue(inner)}</div>
+            `).join("")}
+          </div>
+        `;
+      }
+
+      return `<div class="value">${escapeHtml(value)}</div>`;
+    }
+
+    function renderSections(data) {
+      return Object.entries(data)
+        .filter(([key]) => key !== "title")
+        .map(([key, value]) => `
+          <section class="section">
+            <div class="section-header">
+              <h2>${escapeHtml(key)}</h2>
+            </div>
+            <div class="section-body">
+              ${Array.isArray(value) && value.length > 8
+                ? `<details open><summary>${escapeHtml(key)} (${value.length})</summary>${renderValue(value)}</details>`
+                : renderValue(value)}
+            </div>
+          </section>
+        `)
+        .join("");
+    }
+
+    function renderDocument(data, sourceLabel) {
+      const title = data.title || sourceLabel || "JSON Document";
+      app.innerHTML = `
+        <section class="section">
+          <div class="section-header"><h2>${escapeHtml(title)}</h2></div>
+          <div class="section-body">
+            <div class="cards-grid">
+              <div class="card">
+                <div class="metric-label">Source</div>
+                <div class="value mono">${escapeHtml(sourceLabel)}</div>
+              </div>
+              <div class="card">
+                <div class="metric-label">Top-level Keys</div>
+                <div class="value mono">${escapeHtml(Object.keys(data).join(", "))}</div>
+              </div>
+            </div>
+          </div>
+        </section>
+        ${renderOverview(data)}
+        ${renderVisualDashboard(data)}
+        ${renderSections(data)}
+      `;
+    }
+
+    async function loadPredefined(fileName) {
+      activateButton(fileName);
+      setStatus(`加载 ${fileName} ...`);
+      try {
+        const response = await fetch(fileName, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        renderDocument(data, fileName);
+        setStatus(`已加载 ${fileName}`, "ok");
+      } catch (error) {
+        app.innerHTML = "";
+        setStatus(`加载失败: ${fileName} (${error.message})`, "error");
+      }
+    }
+
+    async function loadLocalFile(file) {
+      if (!file) return;
+      activateButton("");
+      setStatus(`读取本地文件 ${file.name} ...`);
+      try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+        renderDocument(data, file.name);
+        setStatus(`已加载本地文件 ${file.name}`, "ok");
+      } catch (error) {
+        app.innerHTML = "";
+        setStatus(`本地 JSON 解析失败: ${error.message}`, "error");
+      }
+    }
+
+    buttons.forEach((button) => {
+      button.addEventListener("click", () => loadPredefined(button.dataset.json));
+    });
+
+    fileInput.addEventListener("change", (event) => {
+      const file = event.target.files && event.target.files[0];
+      loadLocalFile(file);
+    });
+
+    const url = new URL(window.location.href);
+    const requested = url.searchParams.get("json");
+    const initial = requested && predefinedFiles.includes(requested)
+      ? requested
+      : "conformance_gap_summary_20260324.json";
+    loadPredefined(initial);
+  </script>
+</body>
+</html>
