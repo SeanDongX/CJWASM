@@ -1,0 +1,500 @@
+{
+  "title": "CJWasm2 Std Compatibility Improvement Plan",
+  "metadata": {
+    "created": "2026-03-23",
+    "owner": "codex",
+    "scope": "LLT/API/std L1 compatibility tracked by scripts/std_test.sh",
+    "status": "proposed-closure-aware",
+    "baseline": {
+      "compile_pass": 99,
+      "compile_fail": 88,
+      "known_skip": 18,
+      "total_test_files": 187,
+      "compile_pass_rate": "52%",
+      "wasm_validate_pass": 89,
+      "wasm_validate_fail": 10
+    },
+    "sources": [
+      "scripts/std_test.sh",
+      "third_party/cangjie_test/testsuites/LLT/API/std",
+      "target/std_test"
+    ]
+  },
+  "executive_summary": {
+    "problem": "Current std compatibility is limited less by parser basics and more by incomplete standard-library semantic modeling across type inference, CHIR lowering, and runtime/codegen stubs.",
+    "primary_driver": "The compiler can handle a subset of hard-coded std shapes, but many real std APIs are still missing object models, method signatures, interface semantics, and byte/string/stream behaviors.",
+    "strategy": "Raise compatibility by first completing console/io object APIs and byte-stream semantics, then closing collection-interface and unicode gaps, and finally tackling binary APIs. Macro-dependent modules remain a separate architecture backlog.",
+    "closure_statement": "This plan is expected to remove most non-architectural std failures, but it is not by itself a guarantee of 100% std compatibility. A post-A-D reassessment and tail-cleanup phase is required."
+  },
+  "coverage_assessment": {
+    "current_failure_buckets": [
+      {
+        "module": "io",
+        "failures": 53,
+        "covered_by": [
+          "Phase A"
+        ],
+        "notes": "Largest failure source; dominated by missing stream objects, byte buffers, readToEnd, and array-byte semantics."
+      },
+      {
+        "module": "console",
+        "failures": 5,
+        "covered_by": [
+          "Phase A"
+        ],
+        "notes": "Mostly object-method forms over stdIn/stdErr rather than global print/readln helpers."
+      },
+      {
+        "module": "sort",
+        "failures": 8,
+        "covered_by": [
+          "Phase B"
+        ],
+        "notes": "Depends on List/Collection/Iterator/Comparable contracts and Ordering behavior."
+      },
+      {
+        "module": "unicode",
+        "failures": 6,
+        "covered_by": [
+          "Phase C"
+        ],
+        "notes": "Currently blocked by missing Rune/String unicode method modeling."
+      },
+      {
+        "module": "binary",
+        "failures": 1,
+        "covered_by": [
+          "Phase D"
+        ],
+        "notes": "Single bucket but broad API surface; requires endian and bit-level helpers."
+      },
+      {
+        "module": "deriving",
+        "failures": 15,
+        "covered_by": [
+          "Phase E"
+        ],
+        "notes": "Architecture backlog due to macro/annotation dependency; not expected to be fixed by A-D."
+      }
+    ],
+    "directly_targeted_failures": {
+      "count": 73,
+      "percentage_of_current_failures": "83.0%",
+      "includes_modules": [
+        "io",
+        "console",
+        "sort",
+        "unicode",
+        "binary"
+      ]
+    },
+    "explicitly_not_closed_by_A_to_D": {
+      "count": 15,
+      "percentage_of_current_failures": "17.0%",
+      "includes_modules": [
+        "deriving"
+      ],
+      "reason": "Requires macro/annotation architecture, not just std semantic modeling."
+    },
+    "known_skip_context": {
+      "known_skip_files": 18,
+      "notes": "Known skip entries in std_test.sh are not valid short-term closure targets for compatibility percentage."
+    }
+  },
+  "root_causes": [
+    {
+      "id": "RC1",
+      "category": "Console/IO Object Model Gaps",
+      "severity": "critical",
+      "symptoms": [
+        "Console.stdIn.read() / readln() object methods not modeled",
+        "Console.stdErr.write() / writeln() stream methods not modeled",
+        "ByteBuffer, BufferedInputStream, BufferedOutputStream, StringReader, StringWriter APIs lack type and lowering support",
+        "Global helpers like readToEnd(...) are not recognized consistently"
+      ],
+      "sample_failures": [
+        "third_party/cangjie_test/testsuites/LLT/API/std/console/stdin/stdReadAndReadln.cj",
+        "third_party/cangjie_test/testsuites/LLT/API/std/console/stderr/consoleWriteStream6.cj",
+        "third_party/cangjie_test/testsuites/LLT/API/std/io/BufferedInputStream/BufferedInputStream_capacity1.cj"
+      ],
+      "likely_modules_affected": [
+        "console",
+        "io"
+      ]
+    },
+    {
+      "id": "RC2",
+      "category": "Collection Interface Semantics Are Incomplete",
+      "severity": "high",
+      "symptoms": [
+        "Built-in interface names exist only as partial whitelists",
+        "List<T>/Collection<T>/Iterator<T>/Comparable<T> are not fully treated as implementable semantic contracts",
+        "sort-related tests rely on interface inheritance, properties, iterators, and Ordering behavior not fully modeled"
+      ],
+      "sample_failures": [
+        "third_party/cangjie_test/testsuites/LLT/API/std/sort/test_sort_list.cj",
+        "third_party/cangjie_test/testsuites/LLT/API/std/sort/test_sort_array.cj",
+        "third_party/cangjie_test/testsuites/LLT/API/std/sort/test_sort_arraylist.cj"
+      ],
+      "likely_modules_affected": [
+        "sort",
+        "collection"
+      ]
+    },
+    {
+      "id": "RC3",
+      "category": "Unicode Method Coverage Is Missing",
+      "severity": "high",
+      "symptoms": [
+        "Rune unicode case APIs are not modeled",
+        "String unicode helpers like toUpper()/toTitle() are not modeled",
+        "Bool/Int64 mismatches appear because unicode method return types fall back to incorrect defaults"
+      ],
+      "sample_failures": [
+        "third_party/cangjie_test/testsuites/LLT/API/std/unicode/unicode.cj",
+        "third_party/cangjie_test/testsuites/LLT/API/std/unicode/test_rune_toLower_toTitle_toUpper.cj",
+        "third_party/cangjie_test/testsuites/LLT/API/std/unicode/test_string_toLower_toTitle_toUpper.cj"
+      ],
+      "likely_modules_affected": [
+        "unicode"
+      ]
+    },
+    {
+      "id": "RC4",
+      "category": "Binary APIs Are Largely Unimplemented",
+      "severity": "high",
+      "symptoms": [
+        "Endian read/write APIs are absent",
+        "swapBytes/fromBits style helpers are absent",
+        "Array<Byte> and numeric conversion expectations are only partially represented"
+      ],
+      "sample_failures": [
+        "third_party/cangjie_test/testsuites/LLT/API/std/binary/binary_test.cj"
+      ],
+      "likely_modules_affected": [
+        "binary"
+      ]
+    },
+    {
+      "id": "RC5",
+      "category": "Macro/Annotation-Dependent Std Tests",
+      "severity": "known-limit",
+      "symptoms": [
+        "deriving and argOpt tests depend on macro expansion or custom annotations outside the current architecture"
+      ],
+      "sample_failures": [
+        "third_party/cangjie_test/testsuites/LLT/API/std/deriving/annotated_test.cj",
+        "third_party/cangjie_test/testsuites/LLT/API/std/argOpt/test_argopt.cj"
+      ],
+      "likely_modules_affected": [
+        "deriving",
+        "argOpt"
+      ]
+    }
+  ],
+  "phases": [
+    {
+      "phase": "Phase A",
+      "name": "Console and Byte-Stream Compatibility",
+      "priority": "P0",
+      "goal": "Raise compile pass rate materially by making console/io object APIs compile end-to-end.",
+      "success_metrics": [
+        "Console module compile failures reduced from 5 to <= 1",
+        "IO module compile pass count improved beyond 37/90",
+        "No regression in cargo test or scripts/system_test.sh"
+      ],
+      "workstreams": [
+        {
+          "id": "A1",
+          "title": "Introduce pseudo std stream object types",
+          "targets": [
+            "Console.stdIn",
+            "Console.stdErr",
+            "Console.stdOut"
+          ],
+          "files": [
+            "src/chir/type_inference.rs",
+            "src/codegen/expr.rs"
+          ],
+          "changes": [
+            "Teach field access inference to recognize Console static fields as built-in stream objects",
+            "Assign stable pseudo types for input and output streams",
+            "Prevent fallback to Int32/Function for these fields"
+          ]
+        },
+        {
+          "id": "A2",
+          "title": "Model stream method signatures",
+          "targets": [
+            "read",
+            "readln",
+            "readToEnd",
+            "write",
+            "writeln",
+            "flush",
+            "readUntil",
+            "readByte"
+          ],
+          "files": [
+            "src/metadata/mod.rs",
+            "src/chir/type_inference.rs",
+            "src/codegen/expr.rs"
+          ],
+          "changes": [
+            "Add return types for input/output stream methods",
+            "Represent Option-like read APIs correctly where needed",
+            "Add compile-safe fallbacks for methods that are only required to compile std tests"
+          ]
+        },
+        {
+          "id": "A3",
+          "title": "Lower console/io built-ins in CHIR",
+          "targets": [
+            "Console.stdIn.read()",
+            "Console.stdIn.readln()",
+            "Console.stdErr.write()",
+            "Console.stdErr.writeln()",
+            "ByteBuffer constructor/read/write helpers"
+          ],
+          "files": [
+            "src/chir/lower_expr.rs",
+            "src/codegen/mod.rs",
+            "src/codegen/chir_codegen.rs"
+          ],
+          "changes": [
+            "Add try_lower_builtin_method branches for pseudo stream objects",
+            "Map writable stream methods to existing print/eprint runtimes where possible",
+            "Introduce zero-value or empty-buffer-safe stubs only where runtime parity is not yet required"
+          ]
+        },
+        {
+          "id": "A4",
+          "title": "Fix byte-array and readToEnd semantics",
+          "targets": [
+            "Array<Byte> equality",
+            "readToEnd(outputStream)",
+            "ByteBuffer readAllBytes/readAllString"
+          ],
+          "files": [
+            "src/chir/type_inference.rs",
+            "src/chir/lower_expr.rs",
+            "src/codegen/expr.rs"
+          ],
+          "changes": [
+            "Infer readToEnd(...) as Array<UInt8>",
+            "Support byte-array equality without incorrect Int32 fallback",
+            "Ensure slice/toArray chains over byte buffers preserve byte element types"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": "Phase B",
+      "name": "Collection Interface and Sort Semantics",
+      "priority": "P1",
+      "goal": "Compile std.sort and collection-style tests that depend on generic interfaces and iterator contracts.",
+      "success_metrics": [
+        "sort module compile failures reduced from 8 to <= 2",
+        "List/Collection/Iterator no longer trigger undeclared-type failures in std tests"
+      ],
+      "workstreams": [
+        {
+          "id": "B1",
+          "title": "Treat built-in collection interfaces as first-class semantic interfaces",
+          "files": [
+            "src/chir/lower.rs",
+            "src/chir/type_inference.rs"
+          ],
+          "changes": [
+            "Allow struct/class constraint and implementation validation against built-in interfaces",
+            "Handle interface property and method completeness checks consistently",
+            "Remove undeclared type errors for List/Collection/Iterator in supported std scenarios"
+          ]
+        },
+        {
+          "id": "B2",
+          "title": "Model Ordering and compare-style APIs",
+          "files": [
+            "src/metadata/mod.rs",
+            "src/chir/type_inference.rs",
+            "src/chir/lower_expr.rs"
+          ],
+          "changes": [
+            "Add Ordering-related return types and compare semantics",
+            "Make sort comparator signatures infer correctly",
+            "Preserve generic method/property types for custom List implementations"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": "Phase C",
+      "name": "Unicode API Coverage",
+      "priority": "P1",
+      "goal": "Eliminate unicode module failures caused by missing method metadata and wrong fallback types.",
+      "success_metrics": [
+        "unicode module compile failures reduced from 6 to 0"
+      ],
+      "workstreams": [
+        {
+          "id": "C1",
+          "title": "Add Rune unicode method support",
+          "files": [
+            "src/metadata/mod.rs",
+            "src/chir/type_inference.rs",
+            "src/chir/lower_expr.rs"
+          ],
+          "changes": [
+            "Model isLowerCase/isUpperCase/isTitleCase as Bool",
+            "Model toUpperCase/toTitleCase as Rune",
+            "Avoid Bool/Int64 fallback mismatches in unary/binary conditions"
+          ]
+        },
+        {
+          "id": "C2",
+          "title": "Add String unicode method support",
+          "files": [
+            "src/metadata/mod.rs",
+            "src/chir/type_inference.rs",
+            "src/chir/lower_expr.rs"
+          ],
+          "changes": [
+            "Model toUpper/toTitle/isBlank accurately",
+            "Map to available runtime helpers or compile-safe stubs",
+            "Verify string-returning methods keep I32 string pointer semantics through lowering"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": "Phase D",
+      "name": "Binary API Implementation",
+      "priority": "P2",
+      "goal": "Enable compilation of std.binary by implementing the missing endian and bit-level helpers.",
+      "success_metrics": [
+        "binary module compile failures reduced from 1 to 0"
+      ],
+      "workstreams": [
+        {
+          "id": "D1",
+          "title": "Add endian read/write helpers",
+          "files": [
+            "src/metadata/mod.rs",
+            "src/chir/type_inference.rs",
+            "src/chir/lower_expr.rs",
+            "src/codegen/mod.rs"
+          ],
+          "changes": [
+            "Implement readLittleEndian/readBigEndian signatures for integer and float types",
+            "Implement writeLittleEndian/writeBigEndian signatures and codegen",
+            "Support swapBytes/fromBits helper families needed by std.binary tests"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": "Phase E",
+      "name": "Macro-Dependent Modules",
+      "priority": "deferred",
+      "goal": "Track but do not block on deriving/argOpt until macro support strategy is decided.",
+      "success_metrics": [
+        "Known-skip list remains explicit and accurate"
+      ],
+      "workstreams": [
+        {
+          "id": "E1",
+          "title": "Keep deriving/argOpt out of short-term compatibility KPIs",
+          "files": [
+            "scripts/std_test.sh",
+            "docs/plan/conformance/codex/std_compat_plan.json"
+          ],
+          "changes": [
+            "Treat macro-based failures as architecture backlog",
+            "Expand skip annotations only when the unsupported mechanism is confirmed, not as a workaround for ordinary semantic gaps"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": "Phase F",
+      "name": "Post-Fix Reassessment and Tail Cleanup",
+      "priority": "P1",
+      "goal": "Re-run std compatibility after A-D, re-cluster any residual non-macro failures, and create the final closure pass.",
+      "success_metrics": [
+        "Residual non-macro failures are enumerated with concrete root causes",
+        "A-D hidden follow-on failures are converted into explicit work items",
+        "Remaining failures after excluding macro/known-skip items are small and localized"
+      ],
+      "workstreams": [
+        {
+          "id": "F1",
+          "title": "Re-baseline std compatibility after Phases A-D",
+          "files": [
+            "scripts/std_test.sh",
+            "docs/plan/conformance/codex/std_compat_plan.json"
+          ],
+          "changes": [
+            "Run std_test again and record the new failure set",
+            "Separate architecture-blocked failures from ordinary semantic/runtime gaps",
+            "Produce a residual-failure report by module and error signature"
+          ]
+        },
+        {
+          "id": "F2",
+          "title": "Create the final tail-fix batch",
+          "files": [
+            "docs/plan/conformance/codex/std_compat_plan.json"
+          ],
+          "changes": [
+            "Append remaining non-macro issues as concrete tasks with file ownership and validation commands",
+            "Use this phase to close any issues revealed only after the major API surfaces are implemented"
+          ]
+        }
+      ]
+    }
+  ],
+  "recommended_execution_order": [
+    "Phase A",
+    "Phase B",
+    "Phase C",
+    "Phase D",
+    "Phase E",
+    "Phase F"
+  ],
+  "delivery_expectations": {
+    "what_A_to_D_should_achieve": [
+      "Resolve the majority of current compile failures in non-macro std modules",
+      "Substantially raise the default L1 std compile pass rate from the current 52%",
+      "Remove the largest structural blockers in io, console, sort, unicode, and binary"
+    ],
+    "what_A_to_D_will_not_guarantee": [
+      "Full closure of macro/annotation dependent modules",
+      "100% std compatibility without a residual-tail cleanup pass",
+      "Perfect runtime fidelity for every newly compiling std test on the first pass"
+    ],
+    "closure_condition": "The plan should be considered complete only after Phase F confirms that all remaining non-skip failures are either resolved or explicitly reclassified as architecture backlog."
+  },
+  "verification": {
+    "fast_loop": [
+      "cargo run -- third_party/cangjie_test/testsuites/LLT/API/std/console/stdin/stdReadAndReadln.cj",
+      "cargo run -- third_party/cangjie_test/testsuites/LLT/API/std/console/stderr/consoleWriteStream6.cj",
+      "cargo run -- third_party/cangjie_test/testsuites/LLT/API/std/io/BufferedInputStream/BufferedInputStream_capacity1.cj",
+      "cargo run -- third_party/cangjie_test/testsuites/LLT/API/std/sort/test_sort_list.cj",
+      "cargo run -- third_party/cangjie_test/testsuites/LLT/API/std/unicode/unicode.cj",
+      "cargo run -- third_party/cangjie_test/testsuites/LLT/API/std/binary/binary_test.cj"
+    ],
+    "suite_checks": [
+      "cargo test",
+      "./scripts/system_test.sh",
+      "./scripts/std_test.sh",
+      "./scripts/std_test.sh --validate"
+    ]
+  },
+  "notes": [
+    "This plan is for std compatibility only and does not replace the broader conformance negative-test roadmap.",
+    "Compile-rate wins should come before runtime-perfect fidelity in std_test, but system_test.sh must remain green.",
+    "Avoid broad fallback-to-Int32 behavior in any new std modeling; every new API should carry an explicit type.",
+    "Phases A-D are intentionally scoped to the 73 currently identified non-macro failures, not to the full 88-failure set.",
+    "Any claim that the plan can fix everything would be inaccurate until Phase F residual reassessment is done."
+  ]
+}
