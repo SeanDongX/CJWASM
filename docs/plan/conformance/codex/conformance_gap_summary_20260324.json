@@ -4,7 +4,7 @@
     "created": "2026-03-24",
     "owner": "codex",
     "baseline_report": "docs/plan/conformance/baseline/20260321_201540/report_20260321_201540.md",
-    "baseline_json": "docs/plan/conformance/baseline/20260321_201540/cjc.log.json",
+    "baseline_json": "omitted from git; use the local/generated baseline artifact when needed",
     "current_run_dir": "target/conformance/20260323_195920",
     "current_json": "target/conformance/20260323_195920/cjwasm.log.json",
     "diff_report": "target/conformance/20260323_195920/diff_vs_20260321_201540.txt",
