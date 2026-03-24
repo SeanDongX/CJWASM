@@ -375,7 +375,8 @@
     {
       "phase": "Phase D",
       "name": "Binary API Implementation",
-      "status": "pending",
+      "status": "completed",
+      "completed_on": "2026-03-25",
       "priority": "P2",
       "goal": "Enable compilation of std.binary by implementing the missing endian and bit-level helpers.",
       "success_metrics": [
