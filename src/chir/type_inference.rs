@@ -87,6 +87,12 @@ impl TypeInferenceContext {
                 "stdErr" => Some(Type::Struct("ConsoleStdErr".to_string(), vec![])),
                 _ => None,
             },
+            Expr::Var(name) if name == "Ordering" => match field {
+                "LT" => Some(Type::Int64),
+                "EQ" => Some(Type::Int64),
+                "GT" => Some(Type::Int64),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -640,6 +646,9 @@ impl TypeInferenceContext {
 
             // 变量
             Expr::Var(name) => {
+                if matches!(name.as_str(), "LT" | "EQ" | "GT") {
+                    return Ok(Type::Int64);
+                }
                 // 先查局部变量
                 if let Some(ty) = self.locals.get(name) {
                     return Ok(ty.clone());
@@ -1273,6 +1282,13 @@ impl TypeInferenceContext {
                 }
             }
             match (obj_type_name, method) {
+                ("Int8" | "Int16" | "Int32" | "Int64", "compare" | "compareTo") => {
+                    return Ok(Type::Int64);
+                }
+                (
+                    "UInt8" | "UInt16" | "UInt32" | "UInt64" | "IntNative" | "UIntNative",
+                    "compare" | "compareTo",
+                ) => return Ok(Type::Int64),
                 ("Rune", "toString") => return Ok(Type::String),
                 // ArrayList
                 ("ArrayList", "append" | "set" | "clear") => return Ok(Type::Unit),

@@ -366,6 +366,9 @@ impl Parser {
                 if name == "Byte" {
                     return Ok(Type::UInt8);
                 }
+                if name == "Ordering" {
+                    return Ok(Type::Int64);
+                }
 
                 if self.check(&Token::Lt) {
                     self.advance();

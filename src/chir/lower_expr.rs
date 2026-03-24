@@ -1354,6 +1354,15 @@ impl<'a> LoweringContext<'a> {
                         ));
                     }
                 }
+                if matches!(object.as_ref(), Expr::Var(name) if name == "Ordering") {
+                    let value = match field.as_str() {
+                        "LT" => -1,
+                        "EQ" => 0,
+                        "GT" => 1,
+                        _ => 0,
+                    };
+                    return Ok(CHIRExpr::int_const(value, crate::ast::Type::Int64));
+                }
                 let obj_ty = if let Expr::Var(name) = object.as_ref() {
                     self.local_ast_types.get(name).cloned().unwrap_or_else(|| {
                         self.type_ctx
@@ -3632,6 +3641,20 @@ impl<'a> LoweringContext<'a> {
                         )));
                     }
                     "compareTo" if args.len() == 1 => {
+                        let left = self.lower_expr(object)?;
+                        let left = self.insert_cast_if_needed(left, ValType::I64);
+                        let right = self.lower_expr(&args[0])?;
+                        let right = self.insert_cast_if_needed(right, ValType::I64);
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::BuiltinCompareTo {
+                                left: Box::new(left),
+                                right: Box::new(right),
+                            },
+                            Type::Int64,
+                            ValType::I64,
+                        )));
+                    }
+                    "compare" if args.len() == 1 => {
                         let left = self.lower_expr(object)?;
                         let left = self.insert_cast_if_needed(left, ValType::I64);
                         let right = self.lower_expr(&args[0])?;

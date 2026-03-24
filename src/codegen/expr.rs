@@ -20,6 +20,10 @@ impl CodeGen {
                 "stdErr" => Some(Type::Struct("ConsoleStdErr".to_string(), vec![])),
                 _ => None,
             },
+            Expr::Var(name) if name == "Ordering" => match field {
+                "LT" | "EQ" | "GT" => Some(Type::Int64),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1247,7 +1251,7 @@ impl CodeGen {
                     "toString" | "format" => Some(Type::String),
                     "toFloat64" => Some(Type::Float64),
                     "abs" => obj_type.cloned(),
-                    "compareTo" | "hashCode" => Some(Type::Int64),
+                    "compare" | "compareTo" | "hashCode" => Some(Type::Int64),
                     _ => None,
                 }
             }

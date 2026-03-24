@@ -1585,7 +1585,7 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
     for iface in &program.interfaces {
         let mut seen = HashSet::new();
         for parent in &iface.parents {
-            if !interface_map.contains_key(parent.as_str()) {
+            if !interface_map.contains_key(parent.as_str()) && !is_builtin_interface(parent) {
                 return Err(format!("undeclared type name '{}'", parent));
             }
             if !seen.insert(parent.clone()) {
@@ -1659,6 +1659,8 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
                 parent = Some(ext.clone());
             } else if matches!(ext.as_str(), "Error" | "Exception" | "Object" | "Any") {
                 parent = Some(ext.clone());
+            } else if is_builtin_interface(ext) {
+                interfaces.push(ext.clone());
             } else if interface_map.contains_key(ext.as_str()) {
                 interfaces.push(ext.clone());
             } else {
@@ -1905,7 +1907,7 @@ fn validate_class_interface_semantics(program: &Program) -> Result<(), String> {
 
         let mut seen = HashSet::new();
         for iface in &implemented_ifaces {
-            if !interface_map.contains_key(iface.as_str()) {
+            if !interface_map.contains_key(iface.as_str()) && !is_builtin_interface(iface) {
                 return Err(format!("undeclared type name '{}'", iface));
             }
             if !seen.insert(iface.clone()) {
