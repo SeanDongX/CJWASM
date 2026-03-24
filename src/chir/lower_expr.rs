@@ -1442,6 +1442,18 @@ impl<'a> LoweringContext<'a> {
                     }
                 }
 
+                // `obj.method` can be used as a bound function value in std tests
+                // (for example `let f: () -> Int32 = RANDOM.nextInt32`).
+                // We lower it as a compile-safe function-typed placeholder so later
+                // assignments and call_indirect sites see the expected function type.
+                let inferred_member_ty = self.type_ctx.infer_expr(&Expr::Field {
+                    object: object.clone(),
+                    field: field.clone(),
+                })?;
+                if matches!(inferred_member_ty, crate::ast::Type::Function { .. }) {
+                    return Ok(self.zero_value_expr(&inferred_member_ty));
+                }
+
                 let obj_chir = self.lower_expr(object)?;
                 let offset = self.get_field_offset(&obj_ty, field)?;
                 let field_ty = self.type_ctx.infer_field_type(&obj_ty, field)?;

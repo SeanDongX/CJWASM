@@ -322,7 +322,10 @@ impl Parser {
                         let end = if self.check(&Token::RBracket) {
                             Expr::Integer(i64::MAX)
                         } else {
-                            self.parse_expr()?
+                            self.suppress_primary_range += 1;
+                            let end = self.parse_expr();
+                            self.suppress_primary_range -= 1;
+                            end?
                         };
                         self.expect(Token::RBracket)?;
                         expr = Expr::SliceExpr {
@@ -331,7 +334,10 @@ impl Parser {
                             end: Box::new(end),
                         };
                     } else {
-                        let first = self.parse_expr()?;
+                        self.suppress_primary_range += 1;
+                        let first = self.parse_expr();
+                        self.suppress_primary_range -= 1;
+                        let first = first?;
                         if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                             self.advance(); // consume .. or ..=
                                             // 支持 arr[start..] 语法（从 start 到结尾）
@@ -339,7 +345,10 @@ impl Parser {
                                 // arr[start..] - 到数组末尾
                                 Expr::Integer(i64::MAX) // 使用最大值表示到末尾
                             } else {
-                                self.parse_expr()?
+                                self.suppress_primary_range += 1;
+                                let end = self.parse_expr();
+                                self.suppress_primary_range -= 1;
+                                end?
                             };
                             self.expect(Token::RBracket)?;
                             expr = Expr::SliceExpr {

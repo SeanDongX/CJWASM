@@ -196,6 +196,8 @@
     {
       "phase": "Phase A",
       "name": "Console and Byte-Stream Compatibility",
+      "status": "completed",
+      "completed_on": "2026-03-24",
       "priority": "P0",
       "goal": "Raise compile pass rate materially by making console/io object APIs compile end-to-end.",
       "success_metrics": [
@@ -291,6 +293,8 @@
     {
       "phase": "Phase B",
       "name": "Collection Interface and Sort Semantics",
+      "status": "completed",
+      "completed_on": "2026-03-25",
       "priority": "P1",
       "goal": "Compile std.sort and collection-style tests that depend on generic interfaces and iterator contracts.",
       "success_metrics": [
@@ -330,6 +334,7 @@
     {
       "phase": "Phase C",
       "name": "Unicode API Coverage",
+      "status": "pending",
       "priority": "P1",
       "goal": "Eliminate unicode module failures caused by missing method metadata and wrong fallback types.",
       "success_metrics": [
@@ -369,6 +374,7 @@
     {
       "phase": "Phase D",
       "name": "Binary API Implementation",
+      "status": "pending",
       "priority": "P2",
       "goal": "Enable compilation of std.binary by implementing the missing endian and bit-level helpers.",
       "success_metrics": [
@@ -395,6 +401,7 @@
     {
       "phase": "Phase E",
       "name": "Macro-Dependent Modules",
+      "status": "deferred",
       "priority": "deferred",
       "goal": "Track but do not block on deriving/argOpt until macro support strategy is decided.",
       "success_metrics": [
@@ -418,6 +425,7 @@
     {
       "phase": "Phase F",
       "name": "Post-Fix Reassessment and Tail Cleanup",
+      "status": "pending",
       "priority": "P1",
       "goal": "Re-run std compatibility after A-D, re-cluster any residual non-macro failures, and create the final closure pass.",
       "success_metrics": [

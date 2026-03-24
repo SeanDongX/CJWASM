@@ -1119,6 +1119,50 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_slice_end_keeps_arithmetic_expression() {
+        let source = r#"
+            func main(): Int64 {
+                let n = 10
+                let arr = [1, 2, 3]
+                let xs = arr[0..n * 9 / 10]
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        match &program.functions[0].body[2] {
+            Stmt::Let {
+                value:
+                    Expr::SliceExpr {
+                        start,
+                        end,
+                        ..
+                    },
+                ..
+            } => {
+                assert!(matches!(start.as_ref(), Expr::Integer(0)));
+                assert!(matches!(
+                    end.as_ref(),
+                    Expr::Binary {
+                        op: BinOp::Div,
+                        left,
+                        right
+                    } if matches!(left.as_ref(), Expr::Binary {
+                        op: BinOp::Mul,
+                        left: mul_left,
+                        right: mul_right
+                    } if matches!(mul_left.as_ref(), Expr::Var(name) if name == "n")
+                        && matches!(mul_right.as_ref(), Expr::Integer(9)))
+                        && matches!(right.as_ref(), Expr::Integer(10))
+                ));
+            }
+            other => panic!("expected slice expression, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_match_arms() {
         let source = r#"
             func main(): Int64 {
