@@ -82,6 +82,7 @@ pub fn stdlib_method_return_type(
         }
         ("String", "size" | "length" | "indexOf" | "lastIndexOf") => Some(Type::Int64),
         ("String", "split") => Some(Type::Array(Box::new(Type::String))),
+        ("Rune", "toString") => Some(Type::String),
 
         // ── StringBuilder ────────────────────────────────────────────────────
         ("StringBuilder", "append" | "prepend" | "insert" | "deleteCharAt" | "clear") => {
@@ -168,6 +169,23 @@ pub fn stdlib_method_return_type(
         ("File", "openWrite" | "openAppend") => {
             Some(Type::Struct("FileWriter".to_string(), vec![]))
         }
+
+        // ── Console pseudo streams / Byte streams ───────────────────────────
+        ("ConsoleStdIn", "read") => Some(Type::Option(Box::new(Type::Rune))),
+        ("ConsoleStdIn", "readln" | "readUntil") => Some(Type::Option(Box::new(Type::String))),
+        ("ConsoleStdIn", "readToEnd") => Some(Type::String),
+        ("ConsoleStdOut" | "ConsoleStdErr", "write" | "writeln" | "flush") => None,
+        ("ByteBuffer", "read" | "readByte") => Some(Type::Int64),
+        (
+            "ByteBuffer" | "BufferedOutputStream" | "BufferedInputStream" | "StringWriter",
+            "write" | "writeByte" | "flush" | "clear" | "reserve" | "setLength" | "reset"
+            | "seek" | "close",
+        ) => None,
+        ("ByteBuffer", "bytes" | "readAllBytes") => Some(Type::Array(Box::new(Type::UInt8))),
+        ("ByteBuffer" | "StringReader", "readToEnd" | "readAllString") => Some(Type::String),
+        ("ByteBuffer", "clone") => Some(Type::Struct("ByteBuffer".to_string(), vec![])),
+        ("BufferedInputStream", "read" | "readByte") => Some(Type::Int64),
+        ("StringReader", "read" | "readByte") => Some(Type::Int64),
 
         // ── Random ───────────────────────────────────────────────────────────
         ("Random", "nextInt8") => Some(Type::Int8),
@@ -267,6 +285,7 @@ pub fn stdlib_field_type(type_name: &str, type_args: &[Type], field: &str) -> Op
         ("Collection" | "List" | "ArrayList" | "LinkedList", "size") => Some(Type::Int64),
         ("HashMap" | "HashSet" | "TreeMap" | "TreeSet", "size") => Some(Type::Int64),
         ("String", "size" | "length") => Some(Type::Int64),
+        ("ByteBuffer", "length" | "capacity" | "position" | "remainLength") => Some(Type::Int64),
 
         // Range fields
         ("Range", "start" | "end" | "step") => Some(Type::Int64),
@@ -309,6 +328,13 @@ pub fn stdlib_constructor_type(name: &str, type_args: &[Type]) -> Option<Type> {
         "FileReader" => Some(Type::Struct("FileReader".to_string(), vec![])),
         "BufferedReader" => Some(Type::Struct("BufferedReader".to_string(), vec![])),
         "BufferedWriter" => Some(Type::Struct("BufferedWriter".to_string(), vec![])),
+        "ByteBuffer" => Some(Type::Struct("ByteBuffer".to_string(), vec![])),
+        "BufferedInputStream" => Some(Type::Struct("BufferedInputStream".to_string(), vec![])),
+        "BufferedOutputStream" => Some(Type::Struct("BufferedOutputStream".to_string(), vec![])),
+        "StringReader" => Some(Type::Struct("StringReader".to_string(), vec![])),
+        "StringWriter" => Some(Type::Struct("StringWriter".to_string(), vec![])),
+        "ChainedInputStream" => Some(Type::Struct("ChainedInputStream".to_string(), vec![])),
+        "MultiOutputStream" => Some(Type::Struct("MultiOutputStream".to_string(), vec![])),
         "Queue" | "Deque" | "PriorityQueue" => {
             Some(Type::Struct(name.to_string(), type_args.to_vec()))
         }

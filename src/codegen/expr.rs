@@ -12,6 +12,68 @@ use wasm_encoder::{BlockType, Function as WasmFunc, Instruction, MemArg, ValType
 use super::{CodeGen, LocalsBuilder, IOVEC_OFFSET, NWRITTEN_OFFSET};
 
 impl CodeGen {
+    fn builtin_console_field_type(object: &Expr, field: &str) -> Option<Type> {
+        match object {
+            Expr::Var(name) if name == "Console" => match field {
+                "stdIn" => Some(Type::Struct("ConsoleStdIn".to_string(), vec![])),
+                "stdOut" => Some(Type::Struct("ConsoleStdOut".to_string(), vec![])),
+                "stdErr" => Some(Type::Struct("ConsoleStdErr".to_string(), vec![])),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn builtin_stream_method_return_type(
+        obj_type: Option<&Type>,
+        method: &str,
+        args_len: usize,
+    ) -> Option<Type> {
+        match obj_type {
+            Some(Type::Struct(name, _)) if name == "ConsoleStdIn" => match method {
+                "read" if args_len == 0 => Some(Type::Option(Box::new(Type::Rune))),
+                "read" => Some(Type::Int64),
+                "readln" => Some(Type::Option(Box::new(Type::String))),
+                "readUntil" => Some(Type::Option(Box::new(Type::String))),
+                "readToEnd" => Some(Type::String),
+                _ => None,
+            },
+            Some(Type::Struct(name, _))
+                if matches!(name.as_str(), "ConsoleStdOut" | "ConsoleStdErr") =>
+            {
+                match method {
+                    "write" | "writeln" | "flush" => Some(Type::Unit),
+                    _ => None,
+                }
+            }
+            Some(Type::Struct(name, _))
+                if matches!(
+                    name.as_str(),
+                    "ByteBuffer"
+                        | "BufferedInputStream"
+                        | "BufferedOutputStream"
+                        | "StringReader"
+                        | "StringWriter"
+                        | "ChainedInputStream"
+                        | "MultiOutputStream"
+                ) =>
+            {
+                match method {
+                    "read" | "readByte" => Some(Type::Int64),
+                    "write" | "writeByte" | "writeln" | "flush" | "clear" | "reserve"
+                    | "setLength" | "reset" | "seek" | "close" => Some(Type::Unit),
+                    "bytes" => Some(Type::Array(Box::new(Type::UInt8))),
+                    "readToEnd" | "readAllString" => Some(Type::String),
+                    "readAllBytes" => Some(Type::Array(Box::new(Type::UInt8))),
+                    "clone" => obj_type.cloned(),
+                    "length" | "capacity" | "position" | "remainLength" => Some(Type::Int64),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// 递归收集模式中的所有绑定变量
     fn collect_pattern_bindings(
         &self,
@@ -817,11 +879,10 @@ impl CodeGen {
                         return Some(Type::Array(Box::new(elem)));
                     }
                     "ArrayList" | "LinkedList" | "ArrayStack" => {
-                        let elem = type_args
-                            .as_ref()
-                            .and_then(|ta| ta.first().cloned())
-                            .unwrap_or(Type::Int64);
-                        return Some(Type::Array(Box::new(elem)));
+                        return Some(Type::Struct(
+                            name.clone(),
+                            type_args.clone().unwrap_or_default(),
+                        ));
                     }
                     "HashMap" => {
                         let k = type_args
@@ -840,6 +901,18 @@ impl CodeGen {
                             .and_then(|ta| ta.first().cloned())
                             .unwrap_or(Type::Int64);
                         return Some(Type::Map(Box::new(elem), Box::new(Type::Int64)));
+                    }
+                    "ByteBuffer"
+                    | "BufferedInputStream"
+                    | "BufferedOutputStream"
+                    | "StringReader"
+                    | "StringWriter"
+                    | "ChainedInputStream"
+                    | "MultiOutputStream" => {
+                        return Some(Type::Struct(
+                            name.clone(),
+                            type_args.clone().unwrap_or_default(),
+                        ));
                     }
                     // P5: Atomic/Mutex 桩类型（infer_ast_type）
                     "AtomicInt64" | "AtomicBool" | "Mutex" | "ReentrantMutex" => {
@@ -874,16 +947,18 @@ impl CodeGen {
                     "Bool" => return Some(Type::Bool),
                     "Rune" => return Some(Type::Rune),
                     "readln" | "getEnv" => return Some(Type::String),
+                    "readToEnd" => return Some(Type::Array(Box::new(Type::UInt8))),
+                    "readString" | "readStringUnchecked" => return Some(Type::String),
+                    "copy" => return Some(Type::Int64),
                     "now" | "randomInt64" => return Some(Type::Int64),
                     "randomFloat64" => return Some(Type::Float64),
                     "getArgs" => return Some(Type::Array(Box::new(Type::String))),
                     // P4: 集合类型推断
-                    "ArrayList" => {
-                        let elem = type_args
-                            .as_ref()
-                            .and_then(|ta| ta.first().cloned())
-                            .unwrap_or(Type::Int64);
-                        return Some(Type::Array(Box::new(elem)));
+                    "ArrayList" | "LinkedList" | "ArrayStack" => {
+                        return Some(Type::Struct(
+                            name.clone(),
+                            type_args.clone().unwrap_or_default(),
+                        ));
                     }
                     "HashMap" => {
                         let k = type_args
@@ -909,6 +984,18 @@ impl CodeGen {
                             .and_then(|ta| ta.first().cloned())
                             .unwrap_or(Type::Int64);
                         return Some(Type::Array(Box::new(elem)));
+                    }
+                    "ByteBuffer"
+                    | "BufferedInputStream"
+                    | "BufferedOutputStream"
+                    | "StringReader"
+                    | "StringWriter"
+                    | "ChainedInputStream"
+                    | "MultiOutputStream" => {
+                        return Some(Type::Struct(
+                            name.clone(),
+                            type_args.clone().unwrap_or_default(),
+                        ));
                     }
                     _ => {}
                 }
@@ -945,6 +1032,13 @@ impl CodeGen {
             Expr::MethodCall { object, method, .. } => {
                 // Phase 7.2: 先检查内建类型方法返回类型
                 let obj_ty = self.infer_ast_type(object);
+                if let Expr::MethodCall { args, .. } = expr {
+                    if let Some(ret) =
+                        Self::builtin_stream_method_return_type(obj_ty.as_ref(), method, args.len())
+                    {
+                        return Some(ret);
+                    }
+                }
                 if let Some(ret) = Self::builtin_method_return_type(obj_ty.as_ref(), method) {
                     return Some(ret);
                 }
@@ -1078,6 +1172,9 @@ impl CodeGen {
             }
             // P4.4: Field 类型推断（不依赖 locals，仅用结构体 / 类全局信息）
             Expr::Field { object, field } => {
+                if let Some(ty) = Self::builtin_console_field_type(object, field) {
+                    return Some(ty);
+                }
                 let obj_ty = self.infer_ast_type(object)?;
                 if let Type::Struct(ref s, ref type_args) = obj_ty {
                     let lookup_name = if !type_args.is_empty() {
@@ -1166,6 +1263,10 @@ impl CodeGen {
                 _ => None,
             },
             Some(Type::Bool) => match method {
+                "toString" => Some(Type::String),
+                _ => None,
+            },
+            Some(Type::Rune) => match method {
                 "toString" => Some(Type::String),
                 _ => None,
             },
@@ -1515,6 +1616,18 @@ impl CodeGen {
                             .unwrap_or(Type::Int64);
                         return Some(Type::Map(Box::new(elem), Box::new(Type::Int64)));
                     }
+                    "ByteBuffer"
+                    | "BufferedInputStream"
+                    | "BufferedOutputStream"
+                    | "StringReader"
+                    | "StringWriter"
+                    | "ChainedInputStream"
+                    | "MultiOutputStream" => {
+                        return Some(Type::Struct(
+                            name.clone(),
+                            type_args.clone().unwrap_or_default(),
+                        ));
+                    }
                     // P5: Atomic/Mutex 桩类型（infer_ast_type_with_locals）
                     "AtomicInt64" | "AtomicBool" | "Mutex" | "ReentrantMutex" => {
                         return Some(Type::Struct(name.clone(), vec![]));
@@ -1548,6 +1661,9 @@ impl CodeGen {
                     "Bool" => return Some(Type::Bool),
                     "Rune" => return Some(Type::Rune),
                     "readln" | "getEnv" => return Some(Type::String),
+                    "readToEnd" => return Some(Type::Array(Box::new(Type::UInt8))),
+                    "readString" | "readStringUnchecked" => return Some(Type::String),
+                    "copy" => return Some(Type::Int64),
                     "now" | "randomInt64" => return Some(Type::Int64),
                     "randomFloat64" => return Some(Type::Float64),
                     "getArgs" => return Some(Type::Array(Box::new(Type::String))),
@@ -1583,6 +1699,18 @@ impl CodeGen {
                             .and_then(|ta| ta.first().cloned())
                             .unwrap_or(Type::Int64);
                         return Some(Type::Array(Box::new(elem)));
+                    }
+                    "ByteBuffer"
+                    | "BufferedInputStream"
+                    | "BufferedOutputStream"
+                    | "StringReader"
+                    | "StringWriter"
+                    | "ChainedInputStream"
+                    | "MultiOutputStream" => {
+                        return Some(Type::Struct(
+                            name.clone(),
+                            type_args.clone().unwrap_or_default(),
+                        ));
                     }
                     _ => {}
                 }
@@ -1621,6 +1749,13 @@ impl CodeGen {
             Expr::MethodCall { object, method, .. } => {
                 // Phase 7.2: 先检查内建类型方法返回类型
                 let obj_ty = self.infer_ast_type_with_locals(object, locals);
+                if let Expr::MethodCall { args, .. } = expr {
+                    if let Some(ret) =
+                        Self::builtin_stream_method_return_type(obj_ty.as_ref(), method, args.len())
+                    {
+                        return Some(ret);
+                    }
+                }
                 if let Some(ret) = Self::builtin_method_return_type(obj_ty.as_ref(), method) {
                     return Some(ret);
                 }
@@ -1675,6 +1810,9 @@ impl CodeGen {
             Expr::IsType { .. } => Some(Type::Bool),
             Expr::IfLet { then_branch, .. } => self.infer_ast_type_with_locals(then_branch, locals),
             Expr::Field { object, field, .. } => {
+                if let Some(ty) = Self::builtin_console_field_type(object, field) {
+                    return Some(ty);
+                }
                 // Phase 7.2: 内建类型属性
                 let obj_ty = self.infer_ast_type_with_locals(object, locals);
                 if field == "size"

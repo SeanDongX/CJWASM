@@ -299,6 +299,26 @@ impl<'a> LoweringContext<'a> {
                 ));
             }
 
+            Expr::Binary {
+                op: crate::ast::BinOp::Add,
+                left,
+                right,
+            } if matches!(ty, crate::ast::Type::String) => {
+                let left_raw = self.lower_expr(left)?;
+                let right_raw = self.lower_expr(right)?;
+                let left_chir = self.to_string_expr(left_raw);
+                let right_chir = self.to_string_expr(right_raw);
+                let func_idx = self.func_indices.get("__str_concat").copied().unwrap_or(0);
+                return Ok(CHIRExpr::new(
+                    CHIRExprKind::Call {
+                        func_idx,
+                        args: vec![left_chir, right_chir],
+                    },
+                    crate::ast::Type::String,
+                    ValType::I32,
+                ));
+            }
+
             // 二元运算
             Expr::Binary { op, left, right } => {
                 let left_chir = self.lower_expr(left)?;
@@ -456,6 +476,19 @@ impl<'a> LoweringContext<'a> {
                             crate::ast::Type::String,
                             ValType::I32,
                         ));
+                    }
+                    "readToEnd" => {
+                        return Ok(
+                            self.zero_value_expr(&crate::ast::Type::Array(Box::new(
+                                crate::ast::Type::UInt8,
+                            ))),
+                        );
+                    }
+                    "readString" | "readStringUnchecked" => {
+                        return Ok(self.zero_value_expr(&crate::ast::Type::String));
+                    }
+                    "copy" => {
+                        return Ok(self.zero_value_expr(&crate::ast::Type::Int64));
                     }
                     "min" | "max" if args.len() == 2 => {
                         let a = self.lower_expr(&args[0])?;
@@ -1303,6 +1336,24 @@ impl<'a> LoweringContext<'a> {
 
             // 字段访问
             Expr::Field { object, field } => {
+                if matches!(object.as_ref(), Expr::Var(name) if name == "Console") {
+                    let pseudo_ty = match field.as_str() {
+                        "stdIn" => Some(crate::ast::Type::Struct("ConsoleStdIn".into(), vec![])),
+                        "stdOut" => Some(crate::ast::Type::Struct("ConsoleStdOut".into(), vec![])),
+                        "stdErr" => Some(crate::ast::Type::Struct("ConsoleStdErr".into(), vec![])),
+                        _ => None,
+                    };
+                    if let Some(ty) = pseudo_ty {
+                        return Ok(CHIRExpr::int_const(
+                            match field.as_str() {
+                                "stdOut" => 1,
+                                "stdErr" => 2,
+                                _ => 0,
+                            },
+                            ty,
+                        ));
+                    }
+                }
                 let obj_ty = if let Expr::Var(name) = object.as_ref() {
                     self.local_ast_types.get(name).cloned().unwrap_or_else(|| {
                         self.type_ctx
@@ -1315,6 +1366,26 @@ impl<'a> LoweringContext<'a> {
 
                 // String.size → load i32 length at offset 0, then extend to i64
                 if matches!(obj_ty, crate::ast::Type::String) && field == "size" {
+                    let obj_chir = self.lower_expr(object)?;
+                    let obj_chir = self.insert_cast_if_needed(obj_chir, ValType::I32);
+                    let i32_load = CHIRExpr::new(
+                        CHIRExprKind::FieldGet {
+                            object: Box::new(obj_chir),
+                            field_offset: 0,
+                            field_ty: crate::ast::Type::Int32,
+                        },
+                        crate::ast::Type::Int32,
+                        ValType::I32,
+                    );
+                    return Ok(self.insert_cast_if_needed(i32_load, ValType::I64));
+                }
+
+                if matches!(
+                    &obj_ty,
+                    crate::ast::Type::Struct(name, _)
+                        if matches!(name.as_str(), "ArrayList" | "LinkedList" | "ArrayStack")
+                ) && field == "size"
+                {
                     let obj_chir = self.lower_expr(object)?;
                     let obj_chir = self.insert_cast_if_needed(obj_chir, ValType::I32);
                     let i32_load = CHIRExpr::new(
@@ -1497,6 +1568,18 @@ impl<'a> LoweringContext<'a> {
 
             // 构造函数调用
             Expr::ConstructorCall { name, args, .. } => {
+                if matches!(
+                    name.as_str(),
+                    "ByteBuffer"
+                        | "BufferedInputStream"
+                        | "BufferedOutputStream"
+                        | "StringReader"
+                        | "StringWriter"
+                        | "ChainedInputStream"
+                        | "MultiOutputStream"
+                ) {
+                    return Ok(self.zero_value_expr(&ty));
+                }
                 // ArrayList<T>() → __arraylist_new
                 if name == "ArrayList" && args.is_empty() {
                     if let Some(&idx) = self.func_indices.get("__arraylist_new") {
@@ -1505,7 +1588,7 @@ impl<'a> LoweringContext<'a> {
                                 func_idx: idx,
                                 args: vec![],
                             },
-                            crate::ast::Type::Array(Box::new(crate::ast::Type::Int64)),
+                            ty.clone(),
                             ValType::I32,
                         ));
                     }
@@ -1518,7 +1601,7 @@ impl<'a> LoweringContext<'a> {
                                 func_idx: idx,
                                 args: vec![],
                             },
-                            crate::ast::Type::Struct(name.to_string(), vec![]),
+                            ty.clone(),
                             ValType::I32,
                         ));
                     }
@@ -3239,6 +3322,68 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
+    fn zero_value_expr(&self, ty: &Type) -> CHIRExpr {
+        match ty {
+            Type::Unit | Type::Nothing => CHIRExpr::new(CHIRExprKind::Nop, ty.clone(), ValType::I32),
+            Type::Bool => CHIRExpr::bool_const(false),
+            Type::String => CHIRExpr::new(CHIRExprKind::String(String::new()), Type::String, ValType::I32),
+            Type::Float16 | Type::Float32 => CHIRExpr::new(CHIRExprKind::Float32(0.0), ty.clone(), ValType::F32),
+            Type::Float64 => CHIRExpr::new(CHIRExprKind::Float(0.0), Type::Float64, ValType::F64),
+            _ => CHIRExpr::int_const(0, ty.clone()),
+        }
+    }
+
+    fn to_string_expr(&mut self, expr: CHIRExpr) -> CHIRExpr {
+        if matches!(expr.ty, Type::String) {
+            return expr;
+        }
+        match expr.wasm_ty {
+            ValType::I64 => {
+                if let Some(&idx) = self.func_indices.get("__i64_to_str") {
+                    CHIRExpr::new(
+                        CHIRExprKind::Call {
+                            func_idx: idx,
+                            args: vec![expr],
+                        },
+                        Type::String,
+                        ValType::I32,
+                    )
+                } else {
+                    self.zero_value_expr(&Type::String)
+                }
+            }
+            ValType::F64 => {
+                if let Some(&idx) = self.func_indices.get("__f64_to_str") {
+                    CHIRExpr::new(
+                        CHIRExprKind::Call {
+                            func_idx: idx,
+                            args: vec![expr],
+                        },
+                        Type::String,
+                        ValType::I32,
+                    )
+                } else {
+                    self.zero_value_expr(&Type::String)
+                }
+            }
+            ValType::I32 if matches!(expr.ty, Type::Bool) => {
+                if let Some(&idx) = self.func_indices.get("__bool_to_str") {
+                    CHIRExpr::new(
+                        CHIRExprKind::Call {
+                            func_idx: idx,
+                            args: vec![expr],
+                        },
+                        Type::String,
+                        ValType::I32,
+                    )
+                } else {
+                    self.zero_value_expr(&Type::String)
+                }
+            }
+            _ => self.zero_value_expr(&Type::String),
+        }
+    }
+
     /// 获取字段偏移（对未知结构体或未知字段均返回 0，避免 lowering 中断）
     pub fn get_field_offset(&self, obj_ty: &Type, field: &str) -> Result<u32, String> {
         match obj_ty {
@@ -3300,6 +3445,149 @@ impl<'a> LoweringContext<'a> {
     ) -> Result<Option<CHIRExpr>, String> {
         use crate::ast::Type;
         match obj_ty {
+            Type::Option(inner) => match method {
+                "getOrThrow" | "unwrap" if args.is_empty() => {
+                    let obj = self.lower_expr(object)?;
+                    let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                    let tmp = self.alloc_local_typed("__opt_get_tmp".into(), ValType::I32);
+                    let tmp_get = || CHIRExpr::new(CHIRExprKind::Local(tmp), Type::Int32, ValType::I32);
+                    let cond = CHIRExpr::new(
+                        CHIRExprKind::Load {
+                            ptr: Box::new(tmp_get()),
+                            offset: 0,
+                            align: 2,
+                        },
+                        Type::Int32,
+                        ValType::I32,
+                    );
+                    let inner_wasm = inner.to_wasm();
+                    let align = if matches!(inner_wasm, ValType::I64 | ValType::F64) { 3 } else { 2 };
+                    let then_value = CHIRExpr::new(
+                        CHIRExprKind::Load {
+                            ptr: Box::new(tmp_get()),
+                            offset: 4,
+                            align,
+                        },
+                        inner.as_ref().clone(),
+                        inner_wasm,
+                    );
+                    let else_value = self.zero_value_expr(inner);
+                    return Ok(Some(CHIRExpr::new(
+                        CHIRExprKind::Block(crate::chir::CHIRBlock {
+                            stmts: vec![crate::chir::CHIRStmt::Let {
+                                local_idx: tmp,
+                                value: obj,
+                            }],
+                            result: Some(Box::new(CHIRExpr::new(
+                                CHIRExprKind::If {
+                                    cond: Box::new(cond),
+                                    then_block: crate::chir::CHIRBlock::from_expr(then_value),
+                                    else_block: Some(crate::chir::CHIRBlock::from_expr(else_value)),
+                                },
+                                inner.as_ref().clone(),
+                                inner_wasm,
+                            ))),
+                        }),
+                        inner.as_ref().clone(),
+                        inner_wasm,
+                    )));
+                }
+                "isSome" if args.is_empty() => {
+                    let obj = self.lower_expr(object)?;
+                    let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                    return Ok(Some(CHIRExpr::new(
+                        CHIRExprKind::Load {
+                            ptr: Box::new(obj),
+                            offset: 0,
+                            align: 2,
+                        },
+                        Type::Bool,
+                        ValType::I32,
+                    )));
+                }
+                "isNone" if args.is_empty() => {
+                    let obj = self.lower_expr(object)?;
+                    let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                    let tag = CHIRExpr::new(
+                        CHIRExprKind::Load {
+                            ptr: Box::new(obj),
+                            offset: 0,
+                            align: 2,
+                        },
+                        Type::Int32,
+                        ValType::I32,
+                    );
+                    return Ok(Some(CHIRExpr::new(
+                        CHIRExprKind::Unary {
+                            op: crate::ast::UnaryOp::Not,
+                            expr: Box::new(tag),
+                        },
+                        Type::Bool,
+                        ValType::I32,
+                    )));
+                }
+                _ => {}
+            },
+            Type::Struct(name, _) if name == "ConsoleStdIn" => match method {
+                "read" if args.is_empty() => {
+                    return Ok(Some(self.zero_value_expr(&Type::Option(Box::new(Type::Rune)))));
+                }
+                "read" => return Ok(Some(self.zero_value_expr(&Type::Int64))),
+                "readln" | "readUntil" => {
+                    return Ok(Some(self.zero_value_expr(&Type::Option(Box::new(Type::String)))));
+                }
+                "readToEnd" => return Ok(Some(self.zero_value_expr(&Type::String))),
+                _ => {}
+            },
+            Type::Struct(name, _) if matches!(name.as_str(), "ConsoleStdOut" | "ConsoleStdErr") => {
+                match method {
+                    "write" | "writeln" => {
+                        let fd = if name == "ConsoleStdErr" { 2 } else { 1 };
+                        let arg = args.first().map(|expr| self.lower_expr(expr)).transpose()?;
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::Print {
+                                arg: arg.map(Box::new),
+                                newline: method == "writeln",
+                                fd,
+                            },
+                            Type::Unit,
+                            ValType::I32,
+                        )));
+                    }
+                    "flush" => {
+                        return Ok(Some(CHIRExpr::new(CHIRExprKind::Nop, Type::Unit, ValType::I32)));
+                    }
+                    _ => {}
+                }
+            }
+            Type::Struct(name, _)
+                if matches!(
+                    name.as_str(),
+                    "ByteBuffer"
+                        | "BufferedInputStream"
+                        | "BufferedOutputStream"
+                        | "StringReader"
+                        | "StringWriter"
+                        | "ChainedInputStream"
+                        | "MultiOutputStream"
+                ) =>
+            {
+                match method {
+                    "read" | "readByte" => return Ok(Some(self.zero_value_expr(&Type::Int64))),
+                    "write" | "writeByte" | "writeln" | "flush" | "clear" | "reserve"
+                    | "setLength" | "reset" | "seek" | "close" => {
+                        return Ok(Some(CHIRExpr::new(CHIRExprKind::Nop, Type::Unit, ValType::I32)));
+                    }
+                    "bytes" | "readAllBytes" => {
+                        return Ok(Some(self.zero_value_expr(&Type::Array(Box::new(Type::UInt8)))));
+                    }
+                    "readToEnd" | "readAllString" => {
+                        return Ok(Some(self.zero_value_expr(&Type::String)));
+                    }
+                    "clone" => return Ok(Some(self.zero_value_expr(obj_ty))),
+                    _ => {}
+                }
+            }
             Type::Int64 | Type::Int32 | Type::Int8 | Type::Int16 => {
                 match method {
                     "format" if args.len() == 1 => {
@@ -3431,6 +3719,11 @@ impl<'a> LoweringContext<'a> {
                             ValType::I32,
                         )));
                     }
+                }
+            }
+            Type::Rune => {
+                if method == "toString" {
+                    return Ok(Some(self.zero_value_expr(&Type::String)));
                 }
             }
             Type::String => {

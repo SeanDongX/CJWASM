@@ -363,6 +363,10 @@ impl Parser {
                 }
 
                 // 单个标识符的处理
+                if name == "Byte" {
+                    return Ok(Type::UInt8);
+                }
+
                 if self.check(&Token::Lt) {
                     self.advance();
                     let mut type_args = Vec::new();

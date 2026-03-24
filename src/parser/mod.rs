@@ -980,6 +980,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_byte_alias_as_uint8() {
+        let source = r#"
+            func main() {
+                let data: Array<Byte> = [1u8, 2u8]
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        let stmt = &program.functions[0].body[0];
+        match stmt {
+            crate::ast::Stmt::Let { ty: Some(crate::ast::Type::Array(inner)), .. } => {
+                assert_eq!(inner.as_ref(), &crate::ast::Type::UInt8);
+            }
+            other => panic!("unexpected stmt: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_super_call() {
         let source = r#"
             open class Base {

@@ -79,6 +79,63 @@ pub struct TypeInferenceContext {
 }
 
 impl TypeInferenceContext {
+    fn builtin_console_field_type(object: &Expr, field: &str) -> Option<Type> {
+        match object {
+            Expr::Var(name) if name == "Console" => match field {
+                "stdIn" => Some(Type::Struct("ConsoleStdIn".to_string(), vec![])),
+                "stdOut" => Some(Type::Struct("ConsoleStdOut".to_string(), vec![])),
+                "stdErr" => Some(Type::Struct("ConsoleStdErr".to_string(), vec![])),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn builtin_stream_method_return(obj_ty: &Type, method: &str, args: &[Expr]) -> Option<Type> {
+        match obj_ty {
+            Type::Struct(name, _) if name == "ConsoleStdIn" => match method {
+                "read" if args.is_empty() => Some(Type::Option(Box::new(Type::Rune))),
+                "read" => Some(Type::Int64),
+                "readln" => Some(Type::Option(Box::new(Type::String))),
+                "readUntil" => Some(Type::Option(Box::new(Type::String))),
+                "readToEnd" => Some(Type::String),
+                _ => None,
+            },
+            Type::Struct(name, _)
+                if matches!(name.as_str(), "ConsoleStdOut" | "ConsoleStdErr") =>
+            {
+                match method {
+                    "write" | "writeln" | "flush" => Some(Type::Unit),
+                    _ => None,
+                }
+            }
+            Type::Struct(name, _)
+                if matches!(
+                    name.as_str(),
+                    "ByteBuffer"
+                        | "BufferedInputStream"
+                        | "BufferedOutputStream"
+                        | "StringReader"
+                        | "StringWriter"
+                        | "ChainedInputStream"
+                        | "MultiOutputStream"
+                ) =>
+            {
+                match method {
+                    "read" | "readByte" => Some(Type::Int64),
+                    "write" | "writeByte" | "writeln" | "flush" | "clear" | "reserve"
+                    | "setLength" | "reset" | "seek" | "close" => Some(Type::Unit),
+                    "bytes" => Some(Type::Array(Box::new(Type::UInt8))),
+                    "readToEnd" | "readAllString" => Some(Type::String),
+                    "readAllBytes" => Some(Type::Array(Box::new(Type::UInt8))),
+                    "clone" => Some(obj_ty.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// 创建新的类型推断上下文
     pub fn new() -> Self {
         TypeInferenceContext {
@@ -639,6 +696,9 @@ impl TypeInferenceContext {
                 match name.as_str() {
                     "println" | "print" | "eprintln" | "eprint" => Ok(Type::Unit),
                     "readln" => Ok(Type::String),
+                    "readToEnd" => Ok(Type::Array(Box::new(Type::UInt8))),
+                    "readString" | "readStringUnchecked" => Ok(Type::String),
+                    "copy" => Ok(Type::Int64),
                     "exit" => Ok(Type::Nothing),
                     "abs" | "min" | "max" if !args.is_empty() => self.infer_expr(&args[0]),
                     "sqrt" | "floor" | "ceil" | "trunc" | "nearest" | "sin" | "cos" | "exp"
@@ -681,6 +741,9 @@ impl TypeInferenceContext {
 
             // 字段访问
             Expr::Field { object, field } => {
+                if let Some(ty) = Self::builtin_console_field_type(object, field) {
+                    return Ok(ty);
+                }
                 let obj_ty = self.infer_expr(object)?;
                 if matches!(obj_ty, Type::Array(_)) && matches!(field.as_str(), "size" | "length") {
                     return Ok(Type::Int64);
@@ -787,13 +850,20 @@ impl TypeInferenceContext {
                             .unwrap_or(Type::Int64);
                         Ok(Type::Array(Box::new(elem_ty)))
                     }
-                    "ArrayList" | "LinkedList" => {
-                        let elem_ty = type_args
-                            .as_ref()
-                            .and_then(|ta| ta.first().cloned())
-                            .unwrap_or(Type::Int64);
-                        Ok(Type::Array(Box::new(elem_ty)))
-                    }
+                    "ArrayList" | "LinkedList" | "ArrayStack" => Ok(Type::Struct(
+                        name.clone(),
+                        type_args.clone().unwrap_or_default(),
+                    )),
+                    "ByteBuffer"
+                    | "BufferedInputStream"
+                    | "BufferedOutputStream"
+                    | "StringReader"
+                    | "StringWriter"
+                    | "ChainedInputStream"
+                    | "MultiOutputStream" => Ok(Type::Struct(
+                        name.clone(),
+                        type_args.clone().unwrap_or_default(),
+                    )),
                     _ => Ok(Type::Struct(
                         name.clone(),
                         type_args.clone().unwrap_or_default(),
@@ -955,7 +1025,10 @@ impl TypeInferenceContext {
                 }
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow => {
-                if matches!((left, right), (Type::String, Type::String)) && matches!(op, BinOp::Add)
+                if matches!(op, BinOp::Add)
+                    && (matches!(left, Type::String) || matches!(right, Type::String))
+                    && !matches!(left, Type::Unit | Type::Nothing)
+                    && !matches!(right, Type::Unit | Type::Nothing)
                 {
                     return Ok(Type::String);
                 }
@@ -1146,8 +1219,25 @@ impl TypeInferenceContext {
         &self,
         obj_ty: &Type,
         method: &str,
-        _args: &[Expr],
+        args: &[Expr],
     ) -> Result<Type, String> {
+        match obj_ty {
+            Type::Option(inner) => match method {
+                "getOrThrow" | "unwrap" | "getOrDefault" => return Ok(inner.as_ref().clone()),
+                "isNone" | "isSome" => return Ok(Type::Bool),
+                _ => {}
+            },
+            Type::Result(ok, err) => match method {
+                "getOrThrow" | "unwrap" => return Ok(ok.as_ref().clone()),
+                "isOk" | "isErr" => return Ok(Type::Bool),
+                "errOrThrow" => return Ok(err.as_ref().clone()),
+                _ => {}
+            },
+            _ => {}
+        }
+        if let Some(ret) = Self::builtin_stream_method_return(obj_ty, method, args) {
+            return Ok(ret);
+        }
         // 优先按对象类型分派
         let obj_type_name = match obj_ty {
             Type::Struct(n, _) => Some(n.as_str()),
@@ -1183,6 +1273,7 @@ impl TypeInferenceContext {
                 }
             }
             match (obj_type_name, method) {
+                ("Rune", "toString") => return Ok(Type::String),
                 // ArrayList
                 ("ArrayList", "append" | "set" | "clear") => return Ok(Type::Unit),
                 ("ArrayList", "get" | "remove" | "size") => return Ok(Type::Int64),
@@ -2072,6 +2163,42 @@ mod tests {
             field: "start".into(),
         };
         assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    #[test]
+    fn test_infer_option_get_or_throw_returns_inner_type() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local("opt".into(), Type::Option(Box::new(Type::String)));
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("opt".into())),
+            method: "getOrThrow".into(),
+            args: vec![],
+            type_args: None,
+            named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
+    }
+
+    #[test]
+    fn test_infer_console_stdin_readln_chain() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::MethodCall {
+                object: Box::new(Expr::Field {
+                    object: Box::new(Expr::Var("Console".into())),
+                    field: "stdIn".into(),
+                }),
+                method: "readln".into(),
+                args: vec![],
+                type_args: None,
+                named_args: vec![],
+            }),
+            method: "getOrThrow".into(),
+            args: vec![],
+            type_args: None,
+            named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
     }
 
     #[test]
