@@ -2,7 +2,7 @@
 
 use crate::ast::{Function, Param, Program, Type, TypeConstraint, Visibility};
 use crate::chir::lower_expr::LoweringContext;
-use crate::chir::type_inference::TypeInferenceContext;
+use crate::chir::type_inference::{resolve_function_return_type, TypeInferenceContext};
 use crate::chir::{CHIRFunction, CHIRParam, CHIRProgram};
 use std::collections::{HashMap, HashSet};
 
@@ -2050,7 +2050,10 @@ pub fn lower_function(
     let body = ctx.lower_stmts_to_block(&func.body)?;
 
     // 返回类型
-    let return_ty = func.return_type.clone().unwrap_or(Type::Unit);
+    let return_ty = func_return_types
+        .get(&func.name)
+        .cloned()
+        .unwrap_or_else(|| resolve_function_return_type(func, &type_ctx));
     let return_wasm_ty = match &return_ty {
         Type::Unit | Type::Nothing => wasm_encoder::ValType::I32, // 占位，Unit 函数无返回值
         t => t.to_wasm(),
@@ -2388,9 +2391,8 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     // 构建函数返回类型表
     let mut func_return_types: HashMap<String, crate::ast::Type> = HashMap::new();
     for func in &all_funcs {
-        if let Some(ref ret_ty) = func.return_type {
-            func_return_types.insert(func.name.clone(), ret_ty.clone());
-        }
+        let ret_ty = resolve_function_return_type(func, &type_ctx);
+        func_return_types.insert(func.name.clone(), ret_ty);
     }
 
     // 构建类继承关系图
@@ -2418,6 +2420,9 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         let current_class_name = method_class_map.get(&func.name).map(|s| s.as_str());
         let lambda_base = global_lambda_offset;
         global_lambda_offset += lambda_counts[fi];
+        if std::env::var("CJWASM_DEBUG_LOWER").is_ok() {
+            eprintln!("[lower] {}", func.name);
+        }
         match lower_function(
             func,
             &type_ctx,
@@ -2447,7 +2452,10 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
                     stmts: vec![],
                     result: None,
                 };
-                let return_ty = func.return_type.clone().unwrap_or(Type::Unit);
+                let return_ty = func_return_types
+                    .get(&func.name)
+                    .cloned()
+                    .unwrap_or(Type::Unit);
                 let return_wasm_ty = match &return_ty {
                     Type::Unit | Type::Nothing => wasm_encoder::ValType::I32,
                     t => t.to_wasm(),

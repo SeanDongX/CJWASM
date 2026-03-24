@@ -20,6 +20,7 @@ fn infer_return_type_from_stmt(stmt: &Stmt, ctx: &TypeInferenceContext) -> Optio
             .infer_expr(expr)
             .ok()
             .filter(|t| !matches!(t, Type::Unit | Type::Nothing)),
+        Stmt::Expr(expr) => infer_return_type_from_expr(expr, ctx),
         Stmt::While { body, .. } | Stmt::Loop { body } | Stmt::For { body, .. } => {
             for s in body {
                 if let Some(ty) = infer_return_type_from_stmt(s, ctx) {
@@ -30,6 +31,75 @@ fn infer_return_type_from_stmt(stmt: &Stmt, ctx: &TypeInferenceContext) -> Optio
         }
         _ => None,
     }
+}
+
+fn infer_return_type_from_expr(expr: &Expr, ctx: &TypeInferenceContext) -> Option<Type> {
+    match expr {
+        Expr::Return(Some(inner)) => ctx
+            .infer_expr(inner)
+            .ok()
+            .filter(|t| !matches!(t, Type::Unit | Type::Nothing)),
+        Expr::Block(stmts, result) => {
+            for stmt in stmts {
+                if let Some(ty) = infer_return_type_from_stmt(stmt, ctx) {
+                    return Some(ty);
+                }
+            }
+            result
+                .as_deref()
+                .and_then(|expr| infer_return_type_from_expr(expr, ctx))
+        }
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => infer_return_type_from_expr(then_branch, ctx)
+            .or_else(|| else_branch.as_deref().and_then(|expr| infer_return_type_from_expr(expr, ctx))),
+        Expr::IfLet {
+            then_branch,
+            else_branch,
+            ..
+        } => infer_return_type_from_expr(then_branch, ctx)
+            .or_else(|| else_branch.as_deref().and_then(|expr| infer_return_type_from_expr(expr, ctx))),
+        Expr::Match { arms, .. } => arms
+            .iter()
+            .find_map(|arm| infer_return_type_from_expr(&arm.body, ctx)),
+        Expr::TryBlock {
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            for stmt in body {
+                if let Some(ty) = infer_return_type_from_stmt(stmt, ctx) {
+                    return Some(ty);
+                }
+            }
+            for stmt in catch_body {
+                if let Some(ty) = infer_return_type_from_stmt(stmt, ctx) {
+                    return Some(ty);
+                }
+            }
+            if let Some(finally_body) = finally_body {
+                for stmt in finally_body {
+                    if let Some(ty) = infer_return_type_from_stmt(stmt, ctx) {
+                        return Some(ty);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub fn resolve_function_return_type(func: &Function, base_ctx: &TypeInferenceContext) -> Type {
+    if let Some(ret_ty) = &func.return_type {
+        return ret_ty.clone();
+    }
+    let mut fn_ctx = base_ctx.clone();
+    fn_ctx.collect_locals_from_function(func);
+    infer_return_type_from_body(&func.body, &fn_ctx).unwrap_or(Type::Unit)
 }
 
 /// 函数签名
@@ -353,6 +423,75 @@ impl TypeInferenceContext {
                 .insert(class_def.name.clone(), method_returns);
         }
 
+        // 二次精化无显式返回类型的函数/方法返回类型，避免把隐式返回函数固定成 Unit。
+        for func in &program.functions {
+            if func.return_type.is_none() {
+                let ret_ty = resolve_function_return_type(func, &ctx);
+                let mangled = format!("{}${}", func.name, func.params.len());
+                if let Some(sig) = ctx.functions.get_mut(&mangled) {
+                    sig.return_ty = ret_ty.clone();
+                }
+                if let Some(sig) = ctx.functions.get_mut(&func.name) {
+                    sig.return_ty = ret_ty.clone();
+                }
+                if let Some(dot_pos) = func.name.find('.') {
+                    let type_name = &func.name[..dot_pos];
+                    let method_name = &func.name[dot_pos + 1..];
+                    ctx.class_method_returns
+                        .entry(type_name.to_string())
+                        .or_default()
+                        .insert(method_name.to_string(), ret_ty);
+                }
+            }
+        }
+
+        for ext in &program.extends {
+            for method in &ext.methods {
+                if method.return_type.is_none() {
+                    let ret_ty = resolve_function_return_type(method, &ctx);
+                    let short_name = method
+                        .name
+                        .rsplit_once('.')
+                        .map(|(_, short)| short.to_string())
+                        .unwrap_or_else(|| method.name.clone());
+                    let mangled = format!("{}${}", short_name, method.params.len());
+                    if let Some(sig) = ctx.functions.get_mut(&mangled) {
+                        sig.return_ty = ret_ty.clone();
+                    }
+                    if let Some(sig) = ctx.functions.get_mut(&short_name) {
+                        sig.return_ty = ret_ty.clone();
+                    }
+                    ctx.class_method_returns
+                        .entry(ext.target_type.clone())
+                        .or_default()
+                        .insert(short_name, ret_ty);
+                }
+            }
+        }
+
+        for class_def in &program.classes {
+            for method in &class_def.methods {
+                if method.func.return_type.is_none() {
+                    let ret_ty = resolve_function_return_type(&method.func, &ctx);
+                    let full_name = &method.func.name;
+                    let short_name = full_name
+                        .strip_prefix(&format!("{}.", class_def.name))
+                        .unwrap_or(full_name);
+                    let mangled = format!("{}${}", full_name, method.func.params.len());
+                    if let Some(sig) = ctx.functions.get_mut(&mangled) {
+                        sig.return_ty = ret_ty.clone();
+                    }
+                    if let Some(sig) = ctx.functions.get_mut(full_name) {
+                        sig.return_ty = ret_ty.clone();
+                    }
+                    ctx.class_method_returns
+                        .entry(class_def.name.clone())
+                        .or_default()
+                        .insert(short_name.to_string(), ret_ty);
+                }
+            }
+        }
+
         for enum_def in &program.enums {
             let enum_ty = Type::Struct(enum_def.name.clone(), vec![]);
             for variant in &enum_def.variants {
@@ -465,6 +604,8 @@ impl TypeInferenceContext {
         }
 
         match (sub, sup) {
+            (Type::TypeParam(a), Type::Struct(name, args)) if args.is_empty() && a == name => true,
+            (Type::Struct(name, args), Type::TypeParam(a)) if args.is_empty() && a == name => true,
             (Type::Array(sub_t), Type::Array(sup_t)) => self.is_subtype(sub_t, sup_t),
             (Type::Slice(sub_t), Type::Slice(sup_t)) => self.is_subtype(sub_t, sup_t),
             (Type::Map(sub_k, sub_v), Type::Map(sup_k, sup_v)) => {
@@ -701,6 +842,9 @@ impl TypeInferenceContext {
                 {
                     return Ok(sig.return_ty.clone());
                 }
+                if let Some(Type::Function { ret, .. }) = self.globals.get(name) {
+                    return Ok(ret.as_ref().as_ref().cloned().unwrap_or(Type::Unit));
+                }
                 // 内置函数
                 match name.as_str() {
                     "println" | "print" | "eprintln" | "eprint" => Ok(Type::Unit),
@@ -746,6 +890,26 @@ impl TypeInferenceContext {
             } => {
                 let obj_ty = self.infer_expr(object)?;
                 self.infer_method_return(&obj_ty, method, args)
+            }
+
+            Expr::Lambda {
+                params,
+                return_type,
+                body,
+            } => {
+                let mut lambda_ctx = self.clone();
+                for (name, ty) in params {
+                    lambda_ctx.add_local_with_mutability(name.clone(), ty.clone(), false);
+                }
+                let ret = if let Some(ret_ty) = return_type {
+                    Some(ret_ty.clone())
+                } else {
+                    Some(lambda_ctx.infer_expr(body)?)
+                };
+                Ok(Type::Function {
+                    params: params.iter().map(|(_, ty)| ty.clone()).collect(),
+                    ret: Box::new(ret),
+                })
             }
 
             // 字段访问
@@ -839,6 +1003,18 @@ impl TypeInferenceContext {
                 Ok(Type::Tuple(types?))
             }
 
+            Expr::Block(stmts, result) => {
+                let mut block_ctx = self.clone();
+                for stmt in stmts {
+                    block_ctx.collect_locals_from_stmt(stmt);
+                }
+                if let Some(expr) = result {
+                    block_ctx.infer_expr(expr)
+                } else {
+                    Ok(Type::Unit)
+                }
+            }
+
             // 结构体初始化
             Expr::StructInit { name, .. } => Ok(Type::Struct(name.clone(), vec![])),
 
@@ -846,6 +1022,9 @@ impl TypeInferenceContext {
             Expr::ConstructorCall {
                 name, type_args, ..
             } => {
+                if let Some(Type::Function { ret, .. }) = self.globals.get(name) {
+                    return Ok(ret.as_ref().as_ref().cloned().unwrap_or(Type::Unit));
+                }
                 match name.as_str() {
                     // 类型转换构造函数
                     "Float32" => return Ok(Type::Float32),
@@ -1009,7 +1188,8 @@ impl TypeInferenceContext {
             }
             BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
                 if (left == right
-                    && (Self::is_numeric(left) || matches!(left, Type::Rune | Type::String)))
+                    && (Self::is_numeric(left)
+                        || matches!(left, Type::Rune | Type::String | Type::TypeParam(_))))
                     || (Self::is_integral(left) && Self::is_integral(right))
                 {
                     Ok(Type::Bool)
@@ -2501,6 +2681,23 @@ mod tests {
         assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Float32);
     }
 
+    #[test]
+    fn test_infer_lambda_returns_function_type() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Lambda {
+            params: vec![("x".into(), Type::Int64)],
+            return_type: None,
+            body: Box::new(Expr::Var("x".into())),
+        };
+        assert_eq!(
+            ctx.infer_expr(&expr).unwrap(),
+            Type::Function {
+                params: vec![Type::Int64],
+                ret: Box::new(Some(Type::Int64)),
+            }
+        );
+    }
+
     // ─── If/Match 推断 ───
 
     #[test]
@@ -2512,6 +2709,25 @@ mod tests {
             else_branch: Some(Box::new(Expr::Integer(2))),
         };
         assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    #[test]
+    fn test_infer_block_returns_result_expr_type() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Block(vec![], Some(Box::new(Expr::Integer(1))));
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
+    }
+
+    #[test]
+    fn test_infer_if_with_block_branch_preserves_type_param() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local_with_mutability("v".into(), Type::TypeParam("T".into()), true);
+        let expr = Expr::If {
+            cond: Box::new(Expr::Bool(true)),
+            then_branch: Box::new(Expr::Block(vec![], Some(Box::new(Expr::Var("v".into()))))),
+            else_branch: Some(Box::new(Expr::Var("v".into()))),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::TypeParam("T".into()));
     }
 
     #[test]
@@ -2874,6 +3090,28 @@ mod tests {
         }];
         let result = infer_return_type_from_body(&body, &ctx);
         assert_eq!(result, Some(Type::String));
+    }
+
+    #[test]
+    fn test_resolve_function_return_type_through_if_blocks() {
+        let ctx = TypeInferenceContext::new();
+        let func = make_function(
+            "queryLike",
+            vec![make_param("flag", Type::Bool)],
+            None,
+            vec![Stmt::Expr(Expr::If {
+                cond: Box::new(Expr::Var("flag".into())),
+                then_branch: Box::new(Expr::Block(
+                    vec![Stmt::Return(Some(Expr::Integer(1)))],
+                    None,
+                )),
+                else_branch: Some(Box::new(Expr::Block(
+                    vec![Stmt::Return(Some(Expr::Integer(2)))],
+                    None,
+                ))),
+            })],
+        );
+        assert_eq!(resolve_function_return_type(&func, &ctx), Type::Int64);
     }
 
     // ─── Default trait ───

@@ -967,6 +967,12 @@ impl<'a> LoweringContext<'a> {
                                 ret_wasm,
                             ));
                         }
+                        if let Some(crate::ast::Type::Function { ret, .. }) =
+                            self.type_ctx.globals.get(name)
+                        {
+                            let ret_ty = ret.as_ref().as_ref().cloned().unwrap_or(Type::Unit);
+                            return Ok(self.zero_value_expr(&ret_ty));
+                        }
                         // 未知函数：生成与返回类型匹配的零值占位，避免误用 fd_write
                         return Ok(CHIRExpr::new(CHIRExprKind::Nop, ty, wasm_ty));
                     }
@@ -1577,6 +1583,10 @@ impl<'a> LoweringContext<'a> {
 
             // 构造函数调用
             Expr::ConstructorCall { name, args, .. } => {
+                if let Some(crate::ast::Type::Function { ret, .. }) = self.type_ctx.globals.get(name) {
+                    let ret_ty = ret.as_ref().as_ref().cloned().unwrap_or(Type::Unit);
+                    return Ok(self.zero_value_expr(&ret_ty));
+                }
                 if matches!(
                     name.as_str(),
                     "ByteBuffer"

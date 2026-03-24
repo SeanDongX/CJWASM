@@ -713,7 +713,9 @@ impl Parser {
                     n
                 };
                 // 检查是否是范围表达式
-                if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
+                if self.suppress_primary_range == 0
+                    && (self.check(&Token::DotDot) || self.check(&Token::DotDotEq))
+                {
                     let inclusive = self.check(&Token::DotDotEq);
                     self.advance();
                     // 支持开放式范围 2.. (没有结束值)
@@ -2091,14 +2093,24 @@ impl Parser {
 
     /// 解析 for 循环的可迭代表达式（支持范围 expr..expr : step）
     pub(crate) fn parse_for_iterable(&mut self) -> Result<Expr, ParseErrorAt> {
-        let start = self.parse_expr()?;
+        self.suppress_primary_range += 1;
+        let start = self.parse_expr();
+        self.suppress_primary_range -= 1;
+        let start = start?;
         if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
             let inclusive = self.check(&Token::DotDotEq);
             self.advance();
-            let end = self.parse_expr()?;
+            self.suppress_primary_range += 1;
+            let end = self.parse_expr();
+            self.suppress_primary_range -= 1;
+            let end = end?;
             let step = if self.check(&Token::Colon) {
                 self.advance();
-                Some(Box::new(self.parse_expr()?))
+                self.suppress_primary_range += 1;
+                let step = self.parse_expr();
+                self.suppress_primary_range -= 1;
+                let step = step?;
+                Some(Box::new(step))
             } else {
                 None
             };

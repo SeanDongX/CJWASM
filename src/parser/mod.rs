@@ -20,6 +20,8 @@ pub struct Parser {
     receiver_name: Option<String>,
     /// 当前泛型作用域的类型参数名，用于将 Ident 解析为 TypeParam
     current_type_params: Vec<String>,
+    /// 为了在特定上下文（如 for-in）中手动处理 range，允许临时关闭 primary 上的整数 range 解析
+    suppress_primary_range: usize,
     /// struct/enum 内部方法，解析完成后合并到 functions
     pending_struct_methods: Vec<Function>,
     /// P2.2: 类型别名映射 (alias_name -> actual_type)
@@ -38,6 +40,7 @@ impl Parser {
             pushback: None,
             receiver_name: None,
             current_type_params: Vec::new(),
+            suppress_primary_range: 0,
             pending_struct_methods: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
             parsing_operator_func: false,
@@ -1067,6 +1070,52 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let program = parser.parse_program().unwrap();
         assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_for_in_descending_range_with_expression_start() {
+        let source = r#"
+            func main(): Int64 {
+                let mySize = 3
+                for (i in mySize - 1..=0 : -1) { }
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        match &program.functions[0].body[1] {
+            Stmt::For { iterable, .. } => match iterable {
+                Expr::Range {
+                    start,
+                    end,
+                    inclusive,
+                    step,
+                } => {
+                    assert!(matches!(
+                        start.as_ref(),
+                        Expr::Binary {
+                            op: BinOp::Sub,
+                            left,
+                            right
+                        } if matches!(left.as_ref(), Expr::Var(name) if name == "mySize")
+                            && matches!(right.as_ref(), Expr::Integer(1))
+                    ));
+                    assert!(matches!(end.as_ref(), Expr::Integer(0)));
+                    assert!(*inclusive);
+                    assert!(matches!(
+                        step.as_ref().and_then(|expr| Some(expr.as_ref())),
+                        Some(Expr::Unary {
+                            op: UnaryOp::Neg,
+                            expr
+                        }) if matches!(expr.as_ref(), Expr::Integer(1))
+                    ));
+                }
+                other => panic!("expected range iterable, got {other:?}"),
+            },
+            other => panic!("expected for statement, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3265,6 +3314,57 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let program = parser.parse_program().unwrap();
         assert!(!program.extends.is_empty());
+    }
+
+    #[test]
+    fn test_pg_extend_method_signature_uses_extend_type_params() {
+        let source = r#"
+            extend<T> Array<T> {
+                func id(value: T): T { value }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        let method = &program.extends[0].methods[0];
+        assert_eq!(method.params[1].ty, crate::ast::Type::TypeParam("T".to_string()));
+        assert_eq!(
+            method.return_type,
+            Some(crate::ast::Type::TypeParam("T".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_pg_extend_method_body_uses_extend_type_params() {
+        let source = r#"
+            extend<T> Array<T> {
+                func cmp(i1: Int64, i2: Int64): Bool {
+                    var a: T = this[i1]
+                    var b: T = this[i2]
+                    a > b
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        let method = &program.extends[0].methods[0];
+
+        match &method.body[0] {
+            Stmt::Var { ty: Some(ty), .. } => {
+                assert_eq!(ty, &crate::ast::Type::TypeParam("T".to_string()));
+            }
+            other => panic!("expected typed var declaration, got {:?}", other),
+        }
+
+        match &method.body[1] {
+            Stmt::Var { ty: Some(ty), .. } => {
+                assert_eq!(ty, &crate::ast::Type::TypeParam("T".to_string()));
+            }
+            other => panic!("expected typed var declaration, got {:?}", other),
+        }
     }
 
     #[test]

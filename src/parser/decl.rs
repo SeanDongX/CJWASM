@@ -554,7 +554,9 @@ impl Parser {
         let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
         let where_constraints = self.parse_where_clause()?;
         constraints.extend(where_constraints);
-        let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
+        let mut merged_type_params = self.current_type_params.clone();
+        merged_type_params.extend(type_params.clone());
+        let prev_params = std::mem::replace(&mut self.current_type_params, merged_type_params);
 
         // 兜底: where 中 Bound<T> 的 <T> 若未消费，此处消费
         if self.check(&Token::Lt) {
@@ -1084,7 +1086,9 @@ impl Parser {
         let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
         let where_constraints = self.parse_where_clause()?;
         constraints.extend(where_constraints);
-        let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
+        let mut merged_type_params = self.current_type_params.clone();
+        merged_type_params.extend(type_params.clone());
+        let prev_params = std::mem::replace(&mut self.current_type_params, merged_type_params);
         // 兜底: where 中 Bound<T> 的 <T> 若未消费，此处消费
         if self.check(&Token::Lt) {
             self.advance();
@@ -1653,9 +1657,13 @@ impl Parser {
         }
 
         // cjc: extend<T> Array<T> — 可选的扩展泛型参数
-        if self.check(&Token::Lt) {
-            let _ = self.parse_type_params()?;
-        }
+        let extend_type_params = if self.check(&Token::Lt) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
+        let prev_type_params =
+            std::mem::replace(&mut self.current_type_params, extend_type_params.clone());
         let target_type = match self.advance() {
             Some(Token::BacktickStringLit(StringOrInterpolated::Plain(n))) => n,
             Some(Token::Ident(n)) => n,
@@ -1978,12 +1986,14 @@ impl Parser {
             });
         }
         self.expect(Token::RBrace)?;
-        Ok(crate::ast::ExtendDef {
+        let result = Ok(crate::ast::ExtendDef {
             target_type,
             interface,
             assoc_type_bindings,
             methods,
-        })
+        });
+        self.current_type_params = prev_type_params;
+        result
     }
 
     /// 解析类定义
@@ -2019,7 +2029,10 @@ impl Parser {
         };
         // 解析可选的泛型类型参数 <T, U: Bound, ...>
         let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
-        let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
+        let mut merged_type_params = self.current_type_params.clone();
+        merged_type_params.extend(type_params.clone());
+        let prev_params =
+            std::mem::replace(&mut self.current_type_params, merged_type_params);
         // cjc: 使用 <: 表示继承 (class Foo <: Base & Interface1 & Interface2)
         let (extends, implements) = if self.check(&Token::SubType) {
             self.advance();
@@ -2988,7 +3001,9 @@ impl Parser {
             }
         };
 
-        let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
+        let mut merged_type_params = self.current_type_params.clone();
+        merged_type_params.extend(type_params.clone());
+        let prev_params = std::mem::replace(&mut self.current_type_params, merged_type_params);
 
         self.expect(Token::LParen)?;
         let params = self.parse_params()?;

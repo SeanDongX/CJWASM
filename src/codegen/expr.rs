@@ -874,6 +874,9 @@ impl CodeGen {
             Expr::ConstructorCall {
                 name, type_args, ..
             } => {
+                if let Some(Type::Function { ret, .. }) = self.global_var_types.get(name) {
+                    return ret.as_ref().as_ref().cloned();
+                }
                 match name.as_str() {
                     "Array" => {
                         let elem = type_args
@@ -1029,6 +1032,15 @@ impl CodeGen {
                         .or_else(|| {
                             let ta = type_args.as_deref().unwrap_or(&[]);
                             crate::metadata::stdlib_constructor_type(name, ta)
+                        })
+                        .or_else(|| {
+                            self.global_var_types.get(name).and_then(|ty| {
+                                if let Type::Function { ret, .. } = ty {
+                                    ret.as_ref().as_ref().cloned()
+                                } else {
+                                    None
+                                }
+                            })
                         })
                 }
             }
