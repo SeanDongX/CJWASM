@@ -60,7 +60,7 @@ pub fn stdlib_method_return_type(
         ("HashMap", "getOrDefault" | "getOrThrow") => Some(vtype()),
         ("HashMap", "remove") => Some(Type::Option(Box::new(vtype()))),
         ("HashMap", "put" | "putAll" | "clear") => None,
-        ("HashMap", "containsKey" | "containsValue" | "isEmpty") => Some(Type::Bool),
+        ("HashMap", "contains" | "containsKey" | "containsValue" | "isEmpty") => Some(Type::Bool),
         ("HashMap", "size") => Some(Type::Int64),
         ("HashMap", "keys") => Some(Type::Array(Box::new(ktype()))),
         ("HashMap", "values") => Some(Type::Array(Box::new(vtype()))),
@@ -75,14 +75,37 @@ pub fn stdlib_method_return_type(
         ("HashSet", "toArray") => Some(Type::Array(Box::new(elem()))),
         ("HashSet", "iterator") => Some(Type::Struct("Iterator".to_string(), type_args.to_vec())),
 
+        // ── Array ────────────────────────────────────────────────────────────
+        ("Array", "clone" | "toArray" | "slice") => {
+            Some(Type::Array(Box::new(elem())))
+        }
+        ("Array", "contains" | "isEmpty") => Some(Type::Bool),
+        ("Array", "size" | "indexOf" | "lastIndexOf") => Some(Type::Int64),
+
         // ── String ───────────────────────────────────────────────────────────
-        ("String", "trim" | "replace" | "toString") => Some(Type::String),
+        ("String", "trim" | "replace" | "toString" | "toLower" | "toUpper" | "toTitle") => {
+            Some(Type::String)
+        }
         ("String", "startsWith" | "endsWith" | "contains" | "isEmpty" | "isBlank") => {
             Some(Type::Bool)
         }
         ("String", "size" | "length" | "indexOf" | "lastIndexOf") => Some(Type::Int64),
         ("String", "split") => Some(Type::Array(Box::new(Type::String))),
+        ("String", "runes" | "toRuneArray") => Some(Type::Array(Box::new(Type::Rune))),
         ("Rune", "toString") => Some(Type::String),
+        (
+            "Rune",
+            "isLetter"
+                | "isNumber"
+                | "isLowerCase"
+                | "isUpperCase"
+                | "isTitleCase"
+                | "isWhiteSpace",
+        ) => Some(Type::Bool),
+        (
+            "Rune",
+            "toUpperCase" | "toLowerCase" | "toTitleCase",
+        ) => Some(Type::Rune),
 
         // ── StringBuilder ────────────────────────────────────────────────────
         ("StringBuilder", "append" | "prepend" | "insert" | "deleteCharAt" | "clear") => {

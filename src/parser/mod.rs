@@ -1163,6 +1163,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_newline_before_bracket_starts_new_expression() {
+        let source = r#"
+            func main(): Int64 {
+                var jumpNext = false
+                var needJump = true
+                jumpNext = needJump
+                [1]
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens).with_source(source);
+        let program = parser.parse_program().unwrap();
+        assert!(matches!(
+            &program.functions[0].body[2],
+            Stmt::Assign {
+                target: AssignTarget::Var(name),
+                value: Expr::Var(value_name)
+            } if name == "jumpNext" && value_name == "needJump"
+        ));
+        assert!(matches!(
+            &program.functions[0].body[3],
+            Stmt::Expr(Expr::Array(items)) if items.len() == 1
+        ));
+    }
+
+    #[test]
     fn test_parse_match_arms() {
         let source = r#"
             func main(): Int64 {

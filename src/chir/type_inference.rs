@@ -157,6 +157,12 @@ impl TypeInferenceContext {
                 "stdErr" => Some(Type::Struct("ConsoleStdErr".to_string(), vec![])),
                 _ => None,
             },
+            Expr::Var(name) if name == "CasingOption" => match field {
+                "TR" | "AZ" | "LT" | "Other" => {
+                    Some(Type::Struct("CasingOption".to_string(), vec![]))
+                }
+                _ => None,
+            },
             Expr::Var(name) if name == "Ordering" => match field {
                 "LT" => Some(Type::Int64),
                 "EQ" => Some(Type::Int64),
@@ -787,9 +793,6 @@ impl TypeInferenceContext {
 
             // 变量
             Expr::Var(name) => {
-                if matches!(name.as_str(), "LT" | "EQ" | "GT") {
-                    return Ok(Type::Int64);
-                }
                 // 先查局部变量
                 if let Some(ty) = self.locals.get(name) {
                     return Ok(ty.clone());
@@ -807,6 +810,9 @@ impl TypeInferenceContext {
                 }
                 if let Some(enum_ty) = self.enum_variant_types.get(name) {
                     return Ok(enum_ty.clone());
+                }
+                if matches!(name.as_str(), "LT" | "EQ" | "GT") {
+                    return Ok(Type::Int64);
                 }
                 // 类/结构体名称 → 类型引用
                 if self.struct_fields.contains_key(name.as_str())
@@ -862,6 +868,8 @@ impl TypeInferenceContext {
                     // 浮点类型转换构造函数
                     "Float16" | "Float32" => Ok(Type::Float32),
                     "Float64" => Ok(Type::Float64),
+                    "Rune" => Ok(Type::Rune),
+                    "String" => Ok(Type::String),
                     // 字符串相关
                     "toString" | "format" => Ok(Type::String),
                     // WASI 运行时函数
@@ -1427,6 +1435,9 @@ impl TypeInferenceContext {
         if let Some(ret) = Self::builtin_stream_method_return(obj_ty, method, args) {
             return Ok(ret);
         }
+        if matches!(method, "getOrThrow" | "unwrap") && args.is_empty() {
+            return Ok(obj_ty.clone());
+        }
         // 优先按对象类型分派
         let obj_type_name = match obj_ty {
             Type::Struct(n, _) => Some(n.as_str()),
@@ -1472,20 +1483,47 @@ impl TypeInferenceContext {
                 ("Rune", "toString") => return Ok(Type::String),
                 // ArrayList
                 ("ArrayList", "append" | "set" | "clear") => return Ok(Type::Unit),
-                ("ArrayList", "get" | "remove" | "size") => return Ok(Type::Int64),
+                ("ArrayList", "get" | "remove") => {
+                    if let Type::Struct(_, type_args) = obj_ty {
+                        return Ok(type_args.first().cloned().unwrap_or(Type::Int64));
+                    }
+                    return Ok(Type::Int64);
+                }
+                ("ArrayList", "size") => return Ok(Type::Int64),
                 ("ArrayList", "isEmpty") => return Ok(Type::Bool),
                 // HashMap
                 ("HashMap", "put" | "clear") => return Ok(Type::Unit),
-                ("HashMap", "get" | "remove" | "size") => return Ok(Type::Int64),
-                ("HashMap", "containsKey") => return Ok(Type::Int64),
+                ("HashMap", "get" | "remove") => {
+                    if let Type::Struct(_, type_args) = obj_ty {
+                        return Ok(type_args.get(1).cloned().unwrap_or(Type::Int64));
+                    }
+                    return Ok(Type::Int64);
+                }
+                ("HashMap", "size") => return Ok(Type::Int64),
+                ("HashMap", "contains" | "containsKey") => return Ok(Type::Bool),
                 // HashSet
                 ("HashSet", "add" | "clear") => return Ok(Type::Unit),
                 ("HashSet", "size") => return Ok(Type::Int64),
-                ("HashSet", "contains") => return Ok(Type::Int64),
+                ("HashSet", "contains") => return Ok(Type::Bool),
                 // Array
                 ("Array", "push" | "append" | "set" | "clear") => return Ok(Type::Unit),
-                ("Array", "get" | "size" | "length") => return Ok(Type::Int64),
-                ("Array", "isEmpty") => return Ok(Type::Bool),
+                ("Array", "get") => {
+                    if let Type::Array(elem_ty) = obj_ty {
+                        return Ok((**elem_ty).clone());
+                    }
+                    return Ok(Type::Int64);
+                }
+                ("Array", "size" | "length") => return Ok(Type::Int64),
+                ("Array", "contains" | "isEmpty") => return Ok(Type::Bool),
+                ("Rune", "isLetter" | "isNumber" | "isLowerCase" | "isUpperCase"
+                    | "isTitleCase" | "isWhiteSpace") => return Ok(Type::Bool),
+                ("Rune", "toUpperCase" | "toLowerCase" | "toTitleCase") => {
+                    return Ok(Type::Rune);
+                }
+                ("String", "toLower" | "toUpper" | "toTitle") => return Ok(Type::String),
+                ("String", "runes" | "toRuneArray") => {
+                    return Ok(Type::Array(Box::new(Type::Rune)));
+                }
                 _ => {}
             }
             if let Some(ret_ty) = self.lookup_method_return(obj_ty, method) {
@@ -1609,10 +1647,47 @@ impl TypeInferenceContext {
         }
     }
 
+    pub(crate) fn infer_iterable_element_type(&self, iterable: &Expr) -> Type {
+        match iterable {
+            Expr::Range { .. } => Type::Int64,
+            Expr::Array(elems) => elems
+                .first()
+                .and_then(|expr| self.infer_expr(expr).ok())
+                .unwrap_or(Type::Int64),
+            _ => match self.infer_expr(iterable) {
+                Ok(Type::Array(elem_ty)) | Ok(Type::Slice(elem_ty)) => *elem_ty,
+                Ok(Type::Map(key_ty, value_ty)) => Type::Tuple(vec![*key_ty, *value_ty]),
+                Ok(Type::String) => Type::Rune,
+                Ok(Type::Struct(name, type_args)) => match name.as_str() {
+                    "ArrayList"
+                    | "LinkedList"
+                    | "ArrayStack"
+                    | "Collection"
+                    | "List"
+                    | "Iterable"
+                    | "Iterator"
+                    | "HashSet"
+                    | "TreeSet"
+                    | "Queue"
+                    | "Deque"
+                    | "PriorityQueue"
+                    | "Stack" => type_args.first().cloned().unwrap_or(Type::Int64),
+                    "HashMap" | "TreeMap" => Type::Tuple(vec![
+                        type_args.first().cloned().unwrap_or(Type::Int64),
+                        type_args.get(1).cloned().unwrap_or(Type::Int64),
+                    ]),
+                    _ => Type::Int32,
+                },
+                _ => Type::Int32,
+            },
+        }
+    }
+
     /// 从语句中收集局部变量
     fn collect_locals_from_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let { pattern, ty, value } | Stmt::Var { pattern, ty, value } => {
+                self.collect_locals_from_expr(value);
                 let var_ty = if let Some(t) = ty {
                     t.clone()
                 } else if let Ok(inferred) = self.infer_expr(value) {
@@ -1630,14 +1705,7 @@ impl TypeInferenceContext {
                 }
             }
             Stmt::For { var, iterable, body } => {
-                let iter_ty = match iterable {
-                    Expr::Range { .. } => Type::Int64,
-                    Expr::Array(elems) => elems
-                        .first()
-                        .and_then(|expr| self.infer_expr(expr).ok())
-                        .unwrap_or(Type::Int64),
-                    _ => Type::Int32,
-                };
+                let iter_ty = self.infer_iterable_element_type(iterable);
                 self.add_local_with_mutability(var.clone(), iter_ty, true);
                 for s in body {
                     self.collect_locals_from_stmt(s);
@@ -2398,6 +2466,19 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_enum_variant_lt_takes_precedence_over_ordering_fallback() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.enum_variant_types.insert(
+            "LT".into(),
+            Type::Struct("CasingOption".to_string(), vec![]),
+        );
+        assert_eq!(
+            ctx.infer_expr(&Expr::Var("LT".into())).unwrap(),
+            Type::Struct("CasingOption".to_string(), vec![])
+        );
+    }
+
+    #[test]
     fn test_infer_method_return_extension_on_primitive_type() {
         let mut ctx = TypeInferenceContext::new();
         ctx.add_local("n".into(), Type::Int64);
@@ -2446,7 +2527,7 @@ mod tests {
         };
 
         assert_eq!(ctx.infer_expr(&get_expr).unwrap(), Type::Int64);
-        assert_eq!(ctx.infer_expr(&contains_expr).unwrap(), Type::Int64);
+        assert_eq!(ctx.infer_expr(&contains_expr).unwrap(), Type::Bool);
     }
 
     // ─── 字段推断 ───
@@ -2944,6 +3025,30 @@ mod tests {
         ctx.collect_locals_from_function(&func);
         assert_eq!(ctx.get_local("inner").unwrap(), &Type::Bool);
         assert!(ctx.get_local("i").is_some());
+    }
+
+    #[test]
+    fn test_collect_locals_for_uses_iterable_element_type() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local(
+            "ops".into(),
+            Type::Array(Box::new(Type::Struct("CasingOption".into(), vec![]))),
+        );
+        let func = make_function(
+            "test",
+            vec![],
+            None,
+            vec![Stmt::For {
+                var: "op".into(),
+                iterable: Expr::Var("ops".into()),
+                body: vec![],
+            }],
+        );
+        ctx.collect_locals_from_function(&func);
+        assert_eq!(
+            ctx.get_local("op"),
+            Some(&Type::Struct("CasingOption".into(), vec![]))
+        );
     }
 
     #[test]

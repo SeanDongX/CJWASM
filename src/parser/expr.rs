@@ -313,7 +313,7 @@ impl Parser {
     pub(crate) fn parse_postfix_from_expr(&mut self, mut expr: Expr) -> Result<Expr, ParseErrorAt> {
         loop {
             match self.peek() {
-                Some(Token::LBracket) => {
+                Some(Token::LBracket) if !self.newline_before_current() => {
                     self.advance();
                     // 支持 arr[..end] 语法（从开头到 end）
                     if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
@@ -1699,20 +1699,11 @@ impl Parser {
         if self.check(&Token::RBrace) {
             return Ok(fields);
         }
-
-        eprintln!(
-            "DEBUG parse_struct_fields: current token = {:?}",
-            self.peek()
-        );
         loop {
             let name = match self.advance_ident() {
                 Some(name) => name,
                 None => {
                     let tok = self.advance().unwrap_or(Token::Semicolon);
-                    eprintln!(
-                        "DEBUG parse_struct_fields: unexpected token {:?} at position",
-                        tok
-                    );
                     return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()));
                 }
             };

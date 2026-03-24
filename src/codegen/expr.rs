@@ -20,6 +20,12 @@ impl CodeGen {
                 "stdErr" => Some(Type::Struct("ConsoleStdErr".to_string(), vec![])),
                 _ => None,
             },
+            Expr::Var(name) if name == "CasingOption" => match field {
+                "TR" | "AZ" | "LT" | "Other" => {
+                    Some(Type::Struct("CasingOption".to_string(), vec![]))
+                }
+                _ => None,
+            },
             Expr::Var(name) if name == "Ordering" => match field {
                 "LT" | "EQ" | "GT" => Some(Type::Int64),
                 _ => None,
@@ -953,6 +959,7 @@ impl CodeGen {
                     "Float64" => return Some(Type::Float64),
                     "Bool" => return Some(Type::Bool),
                     "Rune" => return Some(Type::Rune),
+                    "String" => return Some(Type::String),
                     "readln" | "getEnv" => return Some(Type::String),
                     "readToEnd" => return Some(Type::Array(Box::new(Type::UInt8))),
                     "readString" | "readStringUnchecked" => return Some(Type::String),
@@ -1284,6 +1291,9 @@ impl CodeGen {
             },
             Some(Type::Rune) => match method {
                 "toString" => Some(Type::String),
+                "isLetter" | "isNumber" | "isLowerCase" | "isUpperCase" | "isTitleCase"
+                | "isWhiteSpace" => Some(Type::Bool),
+                "toUpperCase" | "toLowerCase" | "toTitleCase" => Some(Type::Rune),
                 _ => None,
             },
             Some(Type::String) => match method {
@@ -1291,7 +1301,9 @@ impl CodeGen {
                 "toInt64" | "indexOf" => Some(Type::Int64),
                 "toFloat64" => Some(Type::Float64),
                 "size" => Some(Type::Int64),
-                "toString" | "replace" | "toArray" | "trim" => Some(Type::String),
+                "toString" | "replace" | "toArray" | "trim" | "toLower" | "toUpper"
+                | "toTitle" => Some(Type::String),
+                "runes" | "toRuneArray" => Some(Type::Array(Box::new(Type::Rune))),
                 "split" => Some(Type::Array(Box::new(Type::String))),
                 _ => None,
             },

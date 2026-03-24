@@ -70,6 +70,16 @@ impl<'a> LoweringContext<'a> {
                             ),
                         )))
                     }
+                    Pattern::Tuple(patterns) => {
+                        let multi = self.lower_tuple_deconstruction(patterns, value_chir)?;
+                        Ok(multi.into_iter().next().unwrap_or(CHIRStmt::Expr(
+                            crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Nop,
+                                crate::ast::Type::Unit,
+                                wasm_encoder::ValType::I32,
+                            ),
+                        )))
+                    }
                     _ => Ok(CHIRStmt::Expr(value_chir)),
                 }
             }
@@ -120,6 +130,16 @@ impl<'a> LoweringContext<'a> {
                             local_idx,
                             value: value_chir,
                         })
+                    }
+                    Pattern::Tuple(patterns) => {
+                        let multi = self.lower_tuple_deconstruction(patterns, value_chir)?;
+                        Ok(multi.into_iter().next().unwrap_or(CHIRStmt::Expr(
+                            crate::chir::CHIRExpr::new(
+                                crate::chir::CHIRExprKind::Nop,
+                                crate::ast::Type::Unit,
+                                wasm_encoder::ValType::I32,
+                            ),
+                        )))
                     }
                     _ => Ok(CHIRStmt::Expr(value_chir)),
                 }
@@ -392,6 +412,13 @@ impl<'a> LoweringContext<'a> {
                     // let __arr = arr; let __idx = 0; let __len = arr.length;
                     // while (__idx < __len) { let elem = arr[__idx]; body; __idx++ }
                     let arr_chir = self.lower_expr(iterable)?;
+                    let elem_ast_ty = self.type_ctx.infer_iterable_element_type(iterable);
+                    let elem_wasm_ty = match &elem_ast_ty {
+                        crate::ast::Type::Unit | crate::ast::Type::Nothing => {
+                            wasm_encoder::ValType::I32
+                        }
+                        ty => ty.to_wasm(),
+                    };
                     let arr_local = self.alloc_local_typed(
                         format!("__for_arr_{}", var),
                         wasm_encoder::ValType::I32,
@@ -404,8 +431,9 @@ impl<'a> LoweringContext<'a> {
                         format!("__for_len_{}", var),
                         wasm_encoder::ValType::I64,
                     );
-                    let elem_local =
-                        self.alloc_local_typed(var.clone(), wasm_encoder::ValType::I64);
+                    self.local_ast_types
+                        .insert(var.clone(), elem_ast_ty.clone());
+                    let elem_local = self.alloc_local_typed(var.clone(), elem_wasm_ty);
 
                     let arr_init = CHIRStmt::Let {
                         local_idx: arr_local,
@@ -473,8 +501,8 @@ impl<'a> LoweringContext<'a> {
                                 wasm_encoder::ValType::I64,
                             )),
                         },
-                        crate::ast::Type::Int64,
-                        wasm_encoder::ValType::I64,
+                        elem_ast_ty,
+                        elem_wasm_ty,
                     );
                     let elem_assign = CHIRStmt::Let {
                         local_idx: elem_local,
@@ -813,6 +841,58 @@ impl<'a> LoweringContext<'a> {
         Ok(stmts)
     }
 
+    fn lower_tuple_deconstruction(
+        &mut self,
+        patterns: &[crate::ast::Pattern],
+        value_chir: crate::chir::CHIRExpr,
+    ) -> Result<Vec<CHIRStmt>, String> {
+        let tuple_ty = value_chir.ty.clone();
+        let tuple_wasm = value_chir.wasm_ty;
+        let elem_types = match &tuple_ty {
+            crate::ast::Type::Tuple(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        let tuple_local = self.alloc_local_typed("__tuple_destruct".into(), tuple_wasm);
+        let mut stmts = vec![CHIRStmt::Let {
+            local_idx: tuple_local,
+            value: self.insert_cast_if_needed(value_chir, tuple_wasm),
+        }];
+        for (idx, pattern) in patterns.iter().enumerate() {
+            let crate::ast::Pattern::Binding(bind_name) = pattern else {
+                continue;
+            };
+            let elem_ty = elem_types
+                .get(idx)
+                .cloned()
+                .unwrap_or(crate::ast::Type::Int64);
+            let elem_wasm = match &elem_ty {
+                crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
+                t => t.to_wasm(),
+            };
+            self.local_ast_types
+                .insert(bind_name.clone(), elem_ty.clone());
+            let bind_local = self.alloc_local_typed(bind_name.clone(), elem_wasm);
+            let tuple_ref = crate::chir::CHIRExpr::new(
+                crate::chir::CHIRExprKind::Local(tuple_local),
+                tuple_ty.clone(),
+                tuple_wasm,
+            );
+            let tuple_get = crate::chir::CHIRExpr::new(
+                crate::chir::CHIRExprKind::TupleGet {
+                    tuple: Box::new(tuple_ref),
+                    index: idx,
+                },
+                elem_ty,
+                elem_wasm,
+            );
+            stmts.push(CHIRStmt::Let {
+                local_idx: bind_local,
+                value: tuple_get,
+            });
+        }
+        Ok(stmts)
+    }
+
     /// 降低赋值目标
     fn lower_assign_target(&mut self, target: &AssignTarget) -> Result<CHIRLValue, String> {
         match target {
@@ -963,6 +1043,28 @@ impl<'a> LoweringContext<'a> {
             {
                 let value_chir = self.lower_expr(value)?;
                 let multi = self.lower_struct_deconstruction(name, fields, value_chir)?;
+                chir_stmts.extend(multi);
+                continue;
+            }
+            if let Stmt::Let {
+                pattern: Pattern::Tuple(patterns),
+                value,
+                ..
+            } = stmt
+            {
+                let value_chir = self.lower_expr(value)?;
+                let multi = self.lower_tuple_deconstruction(patterns, value_chir)?;
+                chir_stmts.extend(multi);
+                continue;
+            }
+            if let Stmt::Var {
+                pattern: Pattern::Tuple(patterns),
+                value,
+                ..
+            } = stmt
+            {
+                let value_chir = self.lower_expr(value)?;
+                let multi = self.lower_tuple_deconstruction(patterns, value_chir)?;
                 chir_stmts.extend(multi);
                 continue;
             }
@@ -1389,6 +1491,40 @@ mod tests {
         let stmts = vec![Stmt::Expr(Expr::Integer(42))];
         let block = ctx.lower_stmts_to_block(&stmts).unwrap();
         assert!(block.result.is_some());
+    }
+
+    #[test]
+    fn test_lower_tuple_destructure_binds_element_locals() {
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("pair".into(), Type::Tuple(vec![Type::Int64, Type::Bool]));
+        let fi = HashMap::new();
+        let fp = HashMap::new();
+        let so = HashMap::new();
+        let co = HashMap::new();
+        let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let block = ctx
+            .lower_stmts_to_block(&[
+                Stmt::Let {
+                    pattern: Pattern::Tuple(vec![
+                        Pattern::Binding("a".into()),
+                        Pattern::Binding("b".into()),
+                    ]),
+                    ty: None,
+                    value: Expr::Var("pair".into()),
+                },
+                Stmt::Assign {
+                    target: AssignTarget::Var("b".into()),
+                    value: Expr::Bool(true),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(block.stmts.len(), 4);
+        assert!(matches!(block.stmts[1], CHIRStmt::Let { .. }));
+        assert!(matches!(block.stmts[2], CHIRStmt::Let { .. }));
+        assert!(matches!(block.stmts[3], CHIRStmt::Assign { .. }));
     }
 
     #[test]

@@ -334,7 +334,8 @@
     {
       "phase": "Phase C",
       "name": "Unicode API Coverage",
-      "status": "pending",
+      "status": "completed",
+      "completed_on": "2026-03-25",
       "priority": "P1",
       "goal": "Eliminate unicode module failures caused by missing method metadata and wrong fallback types.",
       "success_metrics": [

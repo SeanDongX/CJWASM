@@ -212,9 +212,57 @@ impl<'a> LoweringContext<'a> {
                             ));
                         }
                     }
+                    if let Some(crate::ast::Type::Struct(enum_name, _)) =
+                        self.type_ctx.enum_variant_types.get(name)
+                    {
+                        let disc = self
+                            .enum_defs
+                            .iter()
+                            .find(|e| e.name == *enum_name)
+                            .and_then(|e| e.variant_index(name))
+                            .unwrap_or(0) as i64;
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Integer(disc),
+                            crate::ast::Type::Struct(enum_name.clone(), vec![]),
+                            ValType::I32,
+                        ));
+                    }
+                    if matches!(name.as_str(), "LT" | "EQ" | "GT") {
+                        let value = match name.as_str() {
+                            "LT" => -1,
+                            "EQ" => 0,
+                            "GT" => 1,
+                            _ => 0,
+                        };
+                        return Ok(CHIRExpr::int_const(value, crate::ast::Type::Int64));
+                    }
                     // 不是类字段，视为全局
                     CHIRExprKind::Global(name.clone())
                 } else {
+                    if let Some(crate::ast::Type::Struct(enum_name, _)) =
+                        self.type_ctx.enum_variant_types.get(name)
+                    {
+                        let disc = self
+                            .enum_defs
+                            .iter()
+                            .find(|e| e.name == *enum_name)
+                            .and_then(|e| e.variant_index(name))
+                            .unwrap_or(0) as i64;
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Integer(disc),
+                            crate::ast::Type::Struct(enum_name.clone(), vec![]),
+                            ValType::I32,
+                        ));
+                    }
+                    if matches!(name.as_str(), "LT" | "EQ" | "GT") {
+                        let value = match name.as_str() {
+                            "LT" => -1,
+                            "EQ" => 0,
+                            "GT" => 1,
+                            _ => 0,
+                        };
+                        return Ok(CHIRExpr::int_const(value, crate::ast::Type::Int64));
+                    }
                     // 全局变量或未定义
                     CHIRExprKind::Global(name.clone())
                 }
@@ -1369,6 +1417,14 @@ impl<'a> LoweringContext<'a> {
                     };
                     return Ok(CHIRExpr::int_const(value, crate::ast::Type::Int64));
                 }
+                if matches!(object.as_ref(), Expr::Var(name) if name == "CasingOption")
+                    && matches!(field.as_str(), "TR" | "AZ" | "LT" | "Other")
+                {
+                    return Ok(self.zero_value_expr(&crate::ast::Type::Struct(
+                        "CasingOption".to_string(),
+                        vec![],
+                    )));
+                }
                 let obj_ty = if let Expr::Var(name) = object.as_ref() {
                     self.local_ast_types.get(name).cloned().unwrap_or_else(|| {
                         self.type_ctx
@@ -2507,7 +2563,7 @@ impl<'a> LoweringContext<'a> {
                         let result = Some(Box::new(tmp_get()));
                         return Ok(CHIRExpr::new(
                             CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result }),
-                            crate::ast::Type::Int32,
+                            ty.clone(),
                             ValType::I32,
                         ));
                     } else {
@@ -2543,14 +2599,14 @@ impl<'a> LoweringContext<'a> {
                         let result = Some(Box::new(tmp_get()));
                         return Ok(CHIRExpr::new(
                             CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result }),
-                            crate::ast::Type::Int32,
+                            ty.clone(),
                             ValType::I32,
                         ));
                     }
                 } else {
                     return Ok(CHIRExpr::new(
                         CHIRExprKind::Integer(disc),
-                        crate::ast::Type::Int32,
+                        ty.clone(),
                         ValType::I32,
                     ));
                 }
@@ -3475,6 +3531,12 @@ impl<'a> LoweringContext<'a> {
         args: &[Expr],
     ) -> Result<Option<CHIRExpr>, String> {
         use crate::ast::Type;
+        if matches!(method, "getOrThrow" | "unwrap") && args.is_empty() {
+            match obj_ty {
+                Type::Option(_) | Type::Result(_, _) => {}
+                _ => return Ok(Some(self.lower_expr(object)?)),
+            }
+        }
         match obj_ty {
             Type::Option(inner) => match method {
                 "getOrThrow" | "unwrap" if args.is_empty() => {
@@ -3766,11 +3828,15 @@ impl<'a> LoweringContext<'a> {
                     }
                 }
             }
-            Type::Rune => {
-                if method == "toString" {
-                    return Ok(Some(self.zero_value_expr(&Type::String)));
+            Type::Rune => match method {
+                "toString" => return Ok(Some(self.zero_value_expr(&Type::String))),
+                "isLetter" | "isNumber" | "isLowerCase" | "isUpperCase" | "isTitleCase"
+                | "isWhiteSpace" => return Ok(Some(self.zero_value_expr(&Type::Bool))),
+                "toUpperCase" | "toLowerCase" | "toTitleCase" => {
+                    return Ok(Some(self.zero_value_expr(&Type::Rune)));
                 }
-            }
+                _ => {}
+            },
             Type::String => {
                 match method {
                     "toInt64" => {
@@ -3927,6 +3993,130 @@ impl<'a> LoweringContext<'a> {
                             return Ok(Some(CHIRExpr::new(
                                 CHIRExprKind::BuiltinStringIsEmpty {
                                     val: Box::new(trimmed),
+                                },
+                                Type::Bool,
+                                ValType::I32,
+                            )));
+                        }
+                    }
+                    "toLower" | "toUpper" | "toTitle" => {
+                        return Ok(Some(self.zero_value_expr(&Type::String)));
+                    }
+                    "runes" | "toRuneArray" => {
+                        return Ok(Some(self.zero_value_expr(&Type::Array(Box::new(Type::Rune)))));
+                    }
+                    _ => {}
+                }
+            }
+            Type::Struct(name, type_args) if name == "HashMap" => {
+                let value_ty = type_args.get(1).cloned().unwrap_or(Type::Int64);
+                let value_wasm = value_ty.to_wasm();
+                match method {
+                    "put" if args.len() == 2 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashmap_put") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let key = self.lower_expr(&args[0])?;
+                            let key = self.insert_cast_if_needed(key, ValType::I64);
+                            let val = self.lower_expr(&args[1])?;
+                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call {
+                                    func_idx,
+                                    args: vec![obj, key, val],
+                                },
+                                Type::Unit,
+                                ValType::I32,
+                            )));
+                        }
+                    }
+                    "get" | "remove" if args.len() == 1 => {
+                        let runtime_name = if method == "get" {
+                            "__hashmap_get"
+                        } else {
+                            "__hashmap_remove"
+                        };
+                        if let Some(&func_idx) = self.func_indices.get(runtime_name) {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let key = self.lower_expr(&args[0])?;
+                            let key = self.insert_cast_if_needed(key, ValType::I64);
+                            let result = CHIRExpr::new(
+                                CHIRExprKind::Call {
+                                    func_idx,
+                                    args: vec![obj, key],
+                                },
+                                value_ty.clone(),
+                                ValType::I64,
+                            );
+                            return Ok(Some(if value_wasm == ValType::I64 {
+                                result
+                            } else {
+                                self.insert_cast_if_needed(result, value_wasm)
+                            }));
+                        }
+                    }
+                    "contains" | "containsKey" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashmap_contains") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let key = self.lower_expr(&args[0])?;
+                            let key = self.insert_cast_if_needed(key, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call {
+                                    func_idx,
+                                    args: vec![obj, key],
+                                },
+                                Type::Bool,
+                                ValType::I32,
+                            )));
+                        }
+                    }
+                    "size" if args.is_empty() => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashmap_size") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call {
+                                    func_idx,
+                                    args: vec![obj],
+                                },
+                                Type::Int64,
+                                ValType::I64,
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Type::Struct(name, _) if name == "HashSet" => {
+                match method {
+                    "add" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashset_add") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let val = self.lower_expr(&args[0])?;
+                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call {
+                                    func_idx,
+                                    args: vec![obj, val],
+                                },
+                                Type::Unit,
+                                ValType::I32,
+                            )));
+                        }
+                    }
+                    "contains" if args.len() == 1 => {
+                        if let Some(&func_idx) = self.func_indices.get("__hashset_contains") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let val = self.lower_expr(&args[0])?;
+                            let val = self.insert_cast_if_needed(val, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call {
+                                    func_idx,
+                                    args: vec![obj, val],
                                 },
                                 Type::Bool,
                                 ValType::I32,
@@ -6005,6 +6195,26 @@ mod tests {
         let expr = Expr::Tuple(vec![Expr::Integer(1), Expr::Bool(true)]);
         let chir = ctx.lower_expr(&expr).unwrap();
         assert!(matches!(chir.kind, CHIRExprKind::TupleNew { .. }));
+    }
+
+    #[test]
+    fn test_lower_variant_const_preserves_enum_ast_type() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new();
+        let fp = HashMap::new();
+        let so = HashMap::new();
+        let co = HashMap::new();
+        let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::VariantConst {
+            enum_name: "CasingOption".into(),
+            variant_name: "TR".into(),
+            arg: None,
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert_eq!(chir.ty, Type::Struct("CasingOption".into(), vec![]));
+        assert_eq!(chir.wasm_ty, ValType::I32);
     }
 
     #[test]
