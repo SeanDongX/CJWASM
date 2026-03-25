@@ -75,6 +75,32 @@ pub struct LoweringContext<'a> {
 }
 
 impl<'a> LoweringContext<'a> {
+    fn try_lower_builtin_static_method(
+        &mut self,
+        object: &Expr,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<Option<CHIRExpr>, String> {
+        use crate::ast::Type;
+
+        match object {
+            Expr::Var(name) if name == "String" => match method {
+                "fromUtf8" if args.len() == 1 => Ok(Some(self.zero_value_expr(&Type::String))),
+                _ => Ok(None),
+            },
+            Expr::Var(name) if name == "File" => match method {
+                "readFrom" if args.len() == 1 => {
+                    Ok(Some(self.zero_value_expr(&Type::Array(Box::new(Type::UInt8)))))
+                }
+                "writeTo" if args.len() == 2 => {
+                    Ok(Some(CHIRExpr::new(CHIRExprKind::Nop, Type::Unit, ValType::I32)))
+                }
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
     /// 创建新的降低上下文
     pub fn new(
         type_ctx: &'a TypeInferenceContext,
@@ -1177,6 +1203,9 @@ impl<'a> LoweringContext<'a> {
                 named_args,
                 ..
             } => {
+                if let Some(result) = self.try_lower_builtin_static_method(object, method, args)? {
+                    return Ok(result);
+                }
                 // ── 静态方法调用：ClassName.method(args) ──
                 if let Expr::Var(cls_name) = object.as_ref() {
                     let is_class = self.class_field_info.contains_key(cls_name.as_str())
@@ -6215,6 +6244,38 @@ mod tests {
         let chir = ctx.lower_expr(&expr).unwrap();
         assert_eq!(chir.ty, Type::Struct("CasingOption".into(), vec![]));
         assert_eq!(chir.wasm_ty, ValType::I32);
+    }
+
+    #[test]
+    fn test_lower_builtin_static_file_and_string_methods() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new();
+        let fp = HashMap::new();
+        let so = HashMap::new();
+        let co = HashMap::new();
+        let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let read_expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("File".into())),
+            method: "readFrom".into(),
+            args: vec![Expr::String("x".into())],
+            type_args: None,
+            named_args: vec![],
+        };
+        let from_utf8_expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("String".into())),
+            method: "fromUtf8".into(),
+            args: vec![Expr::Array(vec![])],
+            type_args: None,
+            named_args: vec![],
+        };
+
+        assert_eq!(
+            ctx.lower_expr(&read_expr).unwrap().ty,
+            Type::Array(Box::new(Type::UInt8))
+        );
+        assert_eq!(ctx.lower_expr(&from_utf8_expr).unwrap().ty, Type::String);
     }
 
     #[test]

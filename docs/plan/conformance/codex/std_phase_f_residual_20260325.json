@@ -13,13 +13,24 @@
     ]
   },
   "current_l1_snapshot": {
-    "compile_pass": 141,
-    "compile_fail": 46,
+    "compile_pass": 170,
+    "compile_fail": 17,
     "known_skip": 18,
     "total_test_files": 187,
-    "compile_pass_rate": "75%",
-    "wasm_validate_pass": 125,
+    "compile_pass_rate": "90%",
+    "wasm_validate_pass": 154,
     "wasm_validate_fail": 16
+  },
+  "progress_since_phase_f_start": {
+    "initial_non_macro_failures": 31,
+    "current_non_macro_failures": 2,
+    "io_compile_pass_delta": "60 -> 89",
+    "console_compile_pass_delta": "54 -> 54",
+    "resolved_clusters": [
+      "StringWriter UTF8 suite",
+      "ChainedInputStream suite",
+      "MultiOutputStream suite"
+    ]
   },
   "status_summary": {
     "completed_phases": [
@@ -28,11 +39,11 @@
       "Phase C",
       "Phase D"
     ],
-    "remaining_non_macro_compile_failures": 31,
+    "remaining_non_macro_compile_failures": 2,
     "remaining_non_macro_modules": [
       {
         "module": "io",
-        "failures": 30
+        "failures": 1
       },
       {
         "module": "console",
@@ -53,107 +64,6 @@
     ]
   },
   "residual_clusters": [
-    {
-      "id": "F-IO-STRINGWRITER",
-      "summary": "StringWriter UTF8 overloads and readback-to-string comparison are still not modeled end-to-end",
-      "affected_module": "io",
-      "affected_count": 18,
-      "representative_errors": [
-        "CHIR 转换失败: invalid binary operator '!=' on type 'Int64' and 'String'",
-        "CHIR 转换失败: invalid binary operator '!=' on type 'String' and 'Int64'"
-      ],
-      "affected_files": [
-        "io/StringWriter/StringWriter_UTF8_Bool.cj",
-        "io/StringWriter/StringWriter_UTF8_Char.cj",
-        "io/StringWriter/StringWriter_UTF8_Float16.cj",
-        "io/StringWriter/StringWriter_UTF8_Float32.cj",
-        "io/StringWriter/StringWriter_UTF8_Float64.cj",
-        "io/StringWriter/StringWriter_UTF8_Int16.cj",
-        "io/StringWriter/StringWriter_UTF8_Int32.cj",
-        "io/StringWriter/StringWriter_UTF8_Int64.cj",
-        "io/StringWriter/StringWriter_UTF8_Int8.cj",
-        "io/StringWriter/StringWriter_UTF8_String.cj",
-        "io/StringWriter/StringWriter_UTF8_SubString.cj",
-        "io/StringWriter/StringWriter_UTF8_ToString.cj",
-        "io/StringWriter/StringWriter_UTF8_UInt16.cj",
-        "io/StringWriter/StringWriter_UTF8_UInt32.cj",
-        "io/StringWriter/StringWriter_UTF8_UInt64.cj",
-        "io/StringWriter/StringWriter_UTF8_UInt8.cj",
-        "io/StringWriter/StringWriter_UTF8_newline.cj",
-        "io/StringWriter/stringWriter_unreachable_branch_test.cj"
-      ],
-      "likely_root_causes": [
-        "StringWriter.write/writeln overload coverage is still compile-safe only, not type-accurate for scalar and string overload families",
-        "Static or constructor-style String conversion/readback paths such as String.fromUtf8(...) are still falling back to Int64 in some method-call shapes",
-        "Byte-array to String readback comparisons are not consistently typed as String on both sides"
-      ],
-      "likely_target_files": [
-        "src/chir/type_inference.rs",
-        "src/chir/lower_expr.rs",
-        "src/codegen/expr.rs",
-        "src/metadata/mod.rs"
-      ],
-      "recommended_next_action": "Implement StringWriter overload typing plus String.fromUtf8/readback return typing, then re-run the whole StringWriter bucket."
-    },
-    {
-      "id": "F-IO-CHAINEDINPUT",
-      "summary": "ChainedInputStream still loses array-byte and stream-read semantics across read loops",
-      "affected_module": "io",
-      "affected_count": 6,
-      "representative_errors": [
-        "CHIR 转换失败: mismatched types",
-        "CHIR 转换失败: invalid binary operator '!=' on type 'Int64' and 'Array<UInt8>'"
-      ],
-      "affected_files": [
-        "io/ChainedInputStream/ChainedInputStream1.cj",
-        "io/ChainedInputStream/ChainedInputStream2.cj",
-        "io/ChainedInputStream/ChainedInputStream3.cj",
-        "io/ChainedInputStream/ChainedInputStream4.cj",
-        "io/ChainedInputStream/ChainedInputStream5.cj",
-        "io/ChainedInputStream/chainedInputStream_unreachable_branch_test.cj"
-      ],
-      "likely_root_causes": [
-        "Built-in nominal subtype relations such as File/FileReader/BufferedReader <: InputStream are not registered, so Array<InputStream> = [file1, file2, ...] still trips mismatched-types checks",
-        "ChainedInputStream constructor and read(Array<Byte>) contract are not modeled precisely enough",
-        "File.readFrom(...) and Array<Byte> equality/flow typing still fall back to Int64 in some chained stream paths",
-        "InputStream array element typing is likely incomplete in constructor/lowering paths"
-      ],
-      "likely_target_files": [
-        "src/chir/type_inference.rs",
-        "src/chir/lower_expr.rs",
-        "src/codegen/expr.rs",
-        "src/metadata/mod.rs"
-      ],
-      "recommended_next_action": "Model ChainedInputStream(Array<InputStream>) and File.readFrom(...) as true byte-array paths, then re-check looped read/write chaining."
-    },
-    {
-      "id": "F-IO-MULTIOUTPUT",
-      "summary": "MultiOutputStream broadcast write semantics remain stubbed or mistyped",
-      "affected_module": "io",
-      "affected_count": 5,
-      "representative_errors": [
-        "CHIR 转换失败: mismatched types"
-      ],
-      "affected_files": [
-        "io/MultiOutputStream/MultiOutputStream1.cj",
-        "io/MultiOutputStream/MultiOutputStream2.cj",
-        "io/MultiOutputStream/MultiOutputStream3.cj",
-        "io/MultiOutputStream/MultiOutputStream4.cj",
-        "io/MultiOutputStream/MultiOutputStream5.cj"
-      ],
-      "likely_root_causes": [
-        "Built-in nominal subtype relations such as File/FileWriter/BufferedWriter <: OutputStream are not registered, so Array<OutputStream> = [file1, file2, ...] still fails before lowering",
-        "MultiOutputStream(Array<OutputStream>) constructor path is not modeled with the right container element semantics",
-        "write(Array<Byte>) and flush() on broadcast streams are still handled as opaque stubs, not as typed stream operations",
-        "OutputStream array element typing in for-in/constructor flows is still incomplete"
-      ],
-      "likely_target_files": [
-        "src/chir/type_inference.rs",
-        "src/chir/lower_expr.rs",
-        "src/metadata/mod.rs"
-      ],
-      "recommended_next_action": "Add explicit MultiOutputStream pseudo-object semantics and align OutputStream-array constructor typing with the existing byte-stream model."
-    },
     {
       "id": "F-CONSOLE-FLOAT",
       "summary": "Console stdout float overloads are still mismatched",
@@ -199,32 +109,16 @@
   ],
   "proposed_tail_fix_batches": [
     {
-      "batch": "F1",
-      "title": "Close StringWriter and console write overload semantics",
-      "expected_failure_reduction": 19,
-      "target_files": [
-        "src/chir/type_inference.rs",
-        "src/chir/lower_expr.rs",
-        "src/codegen/expr.rs",
-        "src/metadata/mod.rs"
-      ],
-      "verification": [
-        "./scripts/std_test.sh StringWriter console"
-      ]
-    },
-    {
       "batch": "F2",
-      "title": "Add built-in stream subtype relations and close ChainedInputStream/MultiOutputStream typing",
-      "expected_failure_reduction": 11,
+      "title": "Route console float write/writeln through numeric formatting",
+      "expected_failure_reduction": 1,
       "target_files": [
-        "src/chir/type_inference.rs",
-        "src/chir/lower.rs",
         "src/chir/lower_expr.rs",
         "src/codegen/expr.rs",
-        "src/metadata/mod.rs"
+        "src/chir/type_inference.rs"
       ],
       "verification": [
-        "./scripts/std_test.sh io"
+        "./scripts/std_test.sh console"
       ]
     },
     {
@@ -240,7 +134,7 @@
     }
   ],
   "notes": [
-    "Phase F currently converts the remaining non-macro compile failures into concrete work clusters.",
+    "Phase F reduced the non-macro compile-failure set from 31 to 2 in its first implementation batch.",
     "WASM validation still has 16 failures among compile-passing std files; those are not yet decomposed in this first residual report.",
     "The dominant next payoff remains io, not parser or generic conformance work.",
     "scripts/std_test.sh currently names wasm outputs as mod + basename, which makes duplicate names under console/stdout and console/stderr hard to distinguish during diagnosis."

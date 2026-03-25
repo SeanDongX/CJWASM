@@ -84,6 +84,21 @@ impl CodeGen {
         }
     }
 
+    fn builtin_static_method_return_type(object: &Expr, method: &str, args_len: usize) -> Option<Type> {
+        match object {
+            Expr::Var(name) if name == "String" => match method {
+                "fromUtf8" if args_len == 1 => Some(Type::String),
+                _ => None,
+            },
+            Expr::Var(name) if name == "File" => match method {
+                "readFrom" if args_len == 1 => Some(Type::Array(Box::new(Type::UInt8))),
+                "writeTo" if args_len == 2 => Some(Type::Unit),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// 递归收集模式中的所有绑定变量
     fn collect_pattern_bindings(
         &self,
@@ -1057,6 +1072,11 @@ impl CodeGen {
                 let obj_ty = self.infer_ast_type(object);
                 if let Expr::MethodCall { args, .. } = expr {
                     if let Some(ret) =
+                        Self::builtin_static_method_return_type(object, method, args.len())
+                    {
+                        return Some(ret);
+                    }
+                    if let Some(ret) =
                         Self::builtin_stream_method_return_type(obj_ty.as_ref(), method, args.len())
                     {
                         return Some(ret);
@@ -1778,6 +1798,11 @@ impl CodeGen {
                 // Phase 7.2: 先检查内建类型方法返回类型
                 let obj_ty = self.infer_ast_type_with_locals(object, locals);
                 if let Expr::MethodCall { args, .. } = expr {
+                    if let Some(ret) =
+                        Self::builtin_static_method_return_type(object, method, args.len())
+                    {
+                        return Some(ret);
+                    }
                     if let Some(ret) =
                         Self::builtin_stream_method_return_type(obj_ty.as_ref(), method, args.len())
                     {

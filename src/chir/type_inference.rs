@@ -149,6 +149,36 @@ pub struct TypeInferenceContext {
 }
 
 impl TypeInferenceContext {
+    fn builtin_nominal_supertypes() -> &'static [(&'static str, &'static [&'static str])] {
+        &[
+            ("File", &["InputStream", "OutputStream"]),
+            ("FileReader", &["InputStream"]),
+            ("BufferedReader", &["InputStream"]),
+            ("StringReader", &["InputStream"]),
+            ("BufferedInputStream", &["InputStream"]),
+            ("ChainedInputStream", &["InputStream"]),
+            ("ConsoleStdIn", &["InputStream"]),
+            ("FileWriter", &["OutputStream"]),
+            ("BufferedWriter", &["OutputStream"]),
+            ("StringWriter", &["OutputStream"]),
+            ("BufferedOutputStream", &["OutputStream"]),
+            ("MultiOutputStream", &["OutputStream"]),
+            ("ConsoleStdOut", &["OutputStream"]),
+            ("ConsoleStdErr", &["OutputStream"]),
+            ("ByteBuffer", &["InputStream", "OutputStream"]),
+            ("IOException", &["Exception", "Error", "Object"]),
+            ("Exception", &["Error", "Object"]),
+        ]
+    }
+
+    fn register_builtin_nominal_supertypes(&mut self) {
+        for (ty, parents) in Self::builtin_nominal_supertypes() {
+            for parent in *parents {
+                self.add_nominal_supertype((*ty).to_string(), (*parent).to_string());
+            }
+        }
+    }
+
     fn builtin_console_field_type(object: &Expr, field: &str) -> Option<Type> {
         match object {
             Expr::Var(name) if name == "Console" => match field {
@@ -218,9 +248,24 @@ impl TypeInferenceContext {
         }
     }
 
+    fn builtin_static_method_return(object: &Expr, method: &str, args: &[Expr]) -> Option<Type> {
+        match object {
+            Expr::Var(name) if name == "String" => match method {
+                "fromUtf8" if args.len() == 1 => Some(Type::String),
+                _ => None,
+            },
+            Expr::Var(name) if name == "File" => match method {
+                "readFrom" if args.len() == 1 => Some(Type::Array(Box::new(Type::UInt8))),
+                "writeTo" if args.len() == 2 => Some(Type::Unit),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// 创建新的类型推断上下文
     pub fn new() -> Self {
-        TypeInferenceContext {
+        let mut ctx = TypeInferenceContext {
             locals: HashMap::new(),
             local_mutability: HashMap::new(),
             nominal_supertypes: HashMap::new(),
@@ -232,7 +277,9 @@ impl TypeInferenceContext {
             enum_variant_types: HashMap::new(),
             current_return_ty: None,
             globals: HashMap::new(),
-        }
+        };
+        ctx.register_builtin_nominal_supertypes();
+        ctx
     }
 
     /// 从程序构建上下文
@@ -896,6 +943,9 @@ impl TypeInferenceContext {
                 args,
                 ..
             } => {
+                if let Some(ret) = Self::builtin_static_method_return(object, method, args) {
+                    return Ok(ret);
+                }
                 let obj_ty = self.infer_expr(object)?;
                 self.infer_method_return(&obj_ty, method, args)
             }
@@ -2466,6 +2516,30 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_builtin_static_file_and_string_methods() {
+        let ctx = TypeInferenceContext::new();
+        let read_expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("File".into())),
+            method: "readFrom".into(),
+            args: vec![Expr::String("x".into())],
+            type_args: None,
+            named_args: vec![],
+        };
+        let from_utf8_expr = Expr::MethodCall {
+            object: Box::new(Expr::Var("String".into())),
+            method: "fromUtf8".into(),
+            args: vec![Expr::Var("bytes".into())],
+            type_args: None,
+            named_args: vec![],
+        };
+        assert_eq!(
+            ctx.infer_expr(&read_expr).unwrap(),
+            Type::Array(Box::new(Type::UInt8))
+        );
+        assert_eq!(ctx.infer_expr(&from_utf8_expr).unwrap(), Type::String);
+    }
+
+    #[test]
     fn test_infer_enum_variant_lt_takes_precedence_over_ordering_fallback() {
         let mut ctx = TypeInferenceContext::new();
         ctx.enum_variant_types.insert(
@@ -2854,6 +2928,27 @@ mod tests {
         assert!(ctx.get_local("x").is_none());
         ctx.add_local("x".into(), Type::Bool);
         assert_eq!(ctx.get_local("x").unwrap(), &Type::Bool);
+    }
+
+    #[test]
+    fn test_builtin_stream_nominal_supertypes_are_registered() {
+        let ctx = TypeInferenceContext::new();
+        assert!(ctx.is_assignable_type(
+            &Type::Struct("InputStream".into(), vec![]),
+            &Type::Struct("File".into(), vec![])
+        ));
+        assert!(ctx.is_assignable_type(
+            &Type::Struct("OutputStream".into(), vec![]),
+            &Type::Struct("File".into(), vec![])
+        ));
+        assert!(ctx.is_assignable_type(
+            &Type::Struct("InputStream".into(), vec![]),
+            &Type::Struct("ChainedInputStream".into(), vec![])
+        ));
+        assert!(ctx.is_assignable_type(
+            &Type::Struct("OutputStream".into(), vec![]),
+            &Type::Struct("MultiOutputStream".into(), vec![])
+        ));
     }
 
     // ─── from_program ───
