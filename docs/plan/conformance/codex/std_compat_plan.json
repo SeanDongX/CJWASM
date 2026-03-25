@@ -427,7 +427,8 @@
     {
       "phase": "Phase F",
       "name": "Post-Fix Reassessment and Tail Cleanup",
-      "status": "pending",
+      "status": "in_progress",
+      "started_on": "2026-03-25",
       "priority": "P1",
       "goal": "Re-run std compatibility after A-D, re-cluster any residual non-macro failures, and create the final closure pass.",
       "success_metrics": [
