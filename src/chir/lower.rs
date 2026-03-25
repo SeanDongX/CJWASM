@@ -1227,11 +1227,13 @@ fn expr_contains_throw(expr: &crate::ast::Expr) -> bool {
             resources,
             body,
             catch_body,
+            catch_var,
+            catch_type,
             finally_body,
-            ..
         } => {
+            let catches_throw = !catch_body.is_empty() || catch_var.is_some() || catch_type.is_some();
             resources.iter().any(|(_, expr)| expr_contains_throw(expr))
-                || body.iter().any(stmt_contains_throw)
+                || (!catches_throw && body.iter().any(stmt_contains_throw))
                 || catch_body.iter().any(stmt_contains_throw)
                 || finally_body
                     .as_ref()
@@ -4371,6 +4373,25 @@ mod tests {
 
         let err = lower_program(&program).unwrap_err();
         assert!(err.contains("main containing throw must declare an explicit return type"));
+    }
+
+    #[test]
+    fn test_lower_program_accepts_main_with_handled_throw_without_explicit_return_type() {
+        let source = r#"
+            main() {
+                try {
+                    throw Exception()
+                } catch (e: Exception) {
+                    println("ok")
+                }
+            }
+        "#;
+
+        let mut program = crate::pipeline::parse_source(source).unwrap();
+        crate::optimizer::optimize_program(&mut program);
+        crate::monomorph::monomorphize_program(&mut program);
+
+        assert!(lower_program(&program).is_ok());
     }
 
     #[test]

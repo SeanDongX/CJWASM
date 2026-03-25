@@ -1,7 +1,7 @@
 {
   "title": "CJWasm2 Std Phase F Residual Failure Report",
   "metadata": {
-    "generated_on": "2026-03-25",
+    "generated_on": "2026-03-26",
     "owner": "codex",
     "scope": "scripts/std_test.sh L1 modules after Phases A-D",
     "source_commands": [
@@ -14,22 +14,24 @@
   },
   "current_l1_snapshot": {
     "compile_pass": 170,
-    "compile_fail": 17,
+    "compile_fail": 15,
     "known_skip": 18,
     "total_test_files": 187,
-    "compile_pass_rate": "90%",
-    "wasm_validate_pass": 154,
+    "compile_pass_rate": "91%",
+    "wasm_validate_pass": 156,
     "wasm_validate_fail": 16
   },
   "progress_since_phase_f_start": {
     "initial_non_macro_failures": 31,
-    "current_non_macro_failures": 2,
-    "io_compile_pass_delta": "60 -> 89",
-    "console_compile_pass_delta": "54 -> 54",
+    "current_non_macro_failures": 0,
+    "io_compile_pass_delta": "60 -> 90",
+    "console_compile_pass_delta": "54 -> 55",
     "resolved_clusters": [
       "StringWriter UTF8 suite",
       "ChainedInputStream suite",
-      "MultiOutputStream suite"
+      "MultiOutputStream suite",
+      "ioException handled throw rule",
+      "console stdout float writes"
     ]
   },
   "status_summary": {
@@ -39,15 +41,18 @@
       "Phase C",
       "Phase D"
     ],
-    "remaining_non_macro_compile_failures": 2,
-    "remaining_non_macro_modules": [
+    "remaining_non_macro_compile_failures": 0,
+    "remaining_non_macro_modules": [],
+    "validation_backlog": [
       {
-        "module": "io",
-        "failures": 1
+        "module": "overflow",
+        "wasm_validate_failures": 10,
+        "notes": "Representative errors are i32.wrap_i64 and i64.store stack-type mismatches."
       },
       {
-        "module": "console",
-        "failures": 1
+        "module": "unicode",
+        "wasm_validate_failures": 6,
+        "notes": "Representative errors are i32.store operand loss, i64.and mixed-width operands, and stray i32.wrap_i64."
       }
     ],
     "architecture_backlog": [
@@ -65,77 +70,55 @@
   },
   "residual_clusters": [
     {
-      "id": "F-CONSOLE-FLOAT",
-      "summary": "Console stdout float overloads are still mismatched",
-      "affected_module": "console",
-      "affected_count": 1,
+      "id": "F-VALIDATE-OVERFLOW-UNICODE",
+      "summary": "Compile compatibility is closed, but validate-only failures remain in overflow and unicode",
+      "affected_module": "overflow/unicode",
+      "affected_count": 16,
       "representative_errors": [
-        "CHIR 转换失败: mismatched types"
+        "type mismatch in i32.wrap_i64, expected [i64] but got [i32]",
+        "type mismatch in i64.store, expected [i32, i64] but got [i32, i32]",
+        "type mismatch in i32.store, expected [i32, i32] but got [i32]",
+        "type mismatch in i64.and, expected [i64, i64] but got [... i64, i32]"
       ],
       "affected_files": [
-        "console/stdout/stdoutwrite_float.cj"
+        "overflow/checked_test.cj",
+        "overflow/carrying_test.cj",
+        "overflow/throwing_test.cj",
+        "unicode/unicode.cj",
+        "unicode/unicode_toLower.cj",
+        "unicode/test_rune_toLower_toTitle_toUpper.cj"
       ],
       "likely_root_causes": [
-        "Console.stdOut.write/writeln currently lower to Print without normalizing float overloads to string output",
-        "Float16/Float32/Float64 console stream overloads are not being routed through the existing numeric-to-string machinery"
+        "CHIR/codegen still inserts stale width-conversion operators in some Option/overflow/unicode paths",
+        "Some store operations are emitted after value-stack erosion, leaving only the pointer operand",
+        "These are validate-only codegen defects, not compile-time type inference gaps"
       ],
       "likely_target_files": [
+        "src/codegen/chir_codegen.rs",
         "src/chir/lower_expr.rs",
-        "src/codegen/expr.rs",
-        "src/chir/type_inference.rs"
+        "src/codegen/expr.rs"
       ],
-      "recommended_next_action": "Route Console.stdOut.write(Float*) and writeln(Float*) through the same formatting path already used by print/println."
-    },
-    {
-      "id": "F-IO-MAIN-THROW",
-      "summary": "ioException is blocked by the explicit-main-return rule, not by stream semantics",
-      "affected_module": "io",
-      "affected_count": 1,
-      "representative_errors": [
-        "CHIR 转换失败: main containing throw must declare an explicit return type"
-      ],
-      "affected_files": [
-        "io/ioexception/ioException.cj"
-      ],
-      "likely_root_causes": [
-        "The main-function throw rule in src/chir/lower.rs is stricter than the std test expects for try/catch-contained throws",
-        "This is a semantic-policy issue rather than an io runtime gap"
-      ],
-      "likely_target_files": [
-        "src/chir/lower.rs"
-      ],
-      "recommended_next_action": "Revisit the main throw restriction to allow fully handled throws in Unit-returning main, or explicitly classify this test as a policy mismatch."
+      "recommended_next_action": "Track this as a separate validate-focused follow-up after std compatibility closure."
     }
   ],
   "proposed_tail_fix_batches": [
     {
-      "batch": "F2",
-      "title": "Route console float write/writeln through numeric formatting",
-      "expected_failure_reduction": 1,
+      "batch": "F-Validate",
+      "title": "Decompose remaining validate-only overflow/unicode backend defects",
+      "expected_failure_reduction": 16,
       "target_files": [
+        "src/codegen/chir_codegen.rs",
         "src/chir/lower_expr.rs",
-        "src/codegen/expr.rs",
-        "src/chir/type_inference.rs"
+        "src/codegen/expr.rs"
       ],
       "verification": [
-        "./scripts/std_test.sh console"
-      ]
-    },
-    {
-      "batch": "F3",
-      "title": "Resolve handled-throw policy mismatch in main",
-      "expected_failure_reduction": 1,
-      "target_files": [
-        "src/chir/lower.rs"
-      ],
-      "verification": [
-        "cargo run -- third_party/cangjie_test/testsuites/LLT/API/std/io/ioexception/ioException.cj"
+        "./scripts/std_test.sh --validate overflow unicode"
       ]
     }
   ],
   "notes": [
-    "Phase F reduced the non-macro compile-failure set from 31 to 2 in its first implementation batch.",
-    "WASM validation still has 16 failures among compile-passing std files; those are not yet decomposed in this first residual report.",
+    "Phase F reduced the non-macro compile-failure set from 31 to 0 and therefore closed the compile-compatibility portion of the std plan.",
+    "WASM validation still has 16 failures among compile-passing std files; those now form a separate validate-focused backend backlog.",
     "The dominant next payoff remains io, not parser or generic conformance work.",
     "scripts/std_test.sh currently names wasm outputs as mod + basename, which makes duplicate names under console/stdout and console/stderr hard to distinguish during diagnosis."
   ]

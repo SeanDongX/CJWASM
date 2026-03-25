@@ -642,6 +642,10 @@ impl TypeInferenceContext {
             // 数值上下文下允许整型宽度互通（如 Int64 字面量赋给 Int32）
             return true;
         }
+        if Self::is_floating(sub) && Self::is_floating(sup) {
+            // 浮点上下文下允许显式声明类型接收不同宽度的浮点字面量
+            return true;
+        }
         if matches!(sup, Type::TypeParam(_) | Type::This | Type::Qualified(_)) {
             // lowering 阶段对未单态化类型保持保守放行
             return true;
@@ -1344,6 +1348,10 @@ impl TypeInferenceContext {
                 | Type::Float64
                 | Type::Rune
         )
+    }
+
+    fn is_floating(ty: &Type) -> bool {
+        matches!(ty, Type::Float16 | Type::Float32 | Type::Float64)
     }
 
     fn is_integral(ty: &Type) -> bool {
@@ -2059,6 +2067,13 @@ mod tests {
             ctx.infer_expr(&Expr::Var("unknown".into())).unwrap(),
             Type::Int32
         );
+    }
+
+    #[test]
+    fn test_float_assignability_allows_unsuffixed_literal_to_declared_float_type() {
+        let ctx = TypeInferenceContext::new();
+        assert!(ctx.is_assignable_type(&Type::Float16, &Type::Float64));
+        assert!(ctx.is_assignable_type(&Type::Float32, &Type::Float64));
     }
 
     // ─── 二元运算推断 ───
