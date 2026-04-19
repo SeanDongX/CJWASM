@@ -1,0 +1,145 @@
+{
+  "id": "2026-04-19-115928",
+  "generated_at": "2026-04-19T03:59:28.647138Z",
+  "language": "zh",
+  "pages": [
+    {
+      "slug": "1-xiang-mu-gai-shu",
+      "title": "项目概述",
+      "file": "1-xiang-mu-gai-shu.md",
+      "section": "入门指南",
+      "level": "Beginner"
+    },
+    {
+      "slug": "2-kuai-su-kai-shi",
+      "title": "快速开始",
+      "file": "2-kuai-su-kai-shi.md",
+      "section": "入门指南",
+      "level": "Beginner"
+    },
+    {
+      "slug": "3-ming-ling-xing-gong-ju",
+      "title": "命令行工具",
+      "file": "3-ming-ling-xing-gong-ju.md",
+      "section": "入门指南",
+      "level": "Beginner"
+    },
+    {
+      "slug": "4-xiang-mu-gong-cheng-guan-li",
+      "title": "项目工程管理",
+      "file": "4-xiang-mu-gong-cheng-guan-li.md",
+      "section": "入门指南",
+      "level": "Beginner"
+    },
+    {
+      "slug": "5-ci-fa-fen-xi-qi",
+      "title": "词法分析器",
+      "file": "5-ci-fa-fen-xi-qi.md",
+      "section": "深入理解",
+      "group": "编译器核心架构",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "6-yu-fa-jie-xi-qi",
+      "title": "语法解析器",
+      "file": "6-yu-fa-jie-xi-qi.md",
+      "section": "深入理解",
+      "group": "编译器核心架构",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "7-chou-xiang-yu-fa-shu",
+      "title": "抽象语法树",
+      "file": "7-chou-xiang-yu-fa-shu.md",
+      "section": "深入理解",
+      "group": "编译器核心架构",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "8-bian-yi-liu-shui-xian",
+      "title": "编译流水线",
+      "file": "8-bian-yi-liu-shui-xian.md",
+      "section": "深入理解",
+      "group": "编译器核心架构",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "9-chir-zhong-jian-biao-shi",
+      "title": "CHIR 中间表示",
+      "file": "9-chir-zhong-jian-biao-shi.md",
+      "section": "深入理解",
+      "group": "中间表示与优化",
+      "level": "Advanced"
+    },
+    {
+      "slug": "10-ast-you-hua-qi",
+      "title": "AST 优化器",
+      "file": "10-ast-you-hua-qi.md",
+      "section": "深入理解",
+      "group": "中间表示与优化",
+      "level": "Advanced"
+    },
+    {
+      "slug": "11-fan-xing-dan-tai-hua",
+      "title": "泛型单态化",
+      "file": "11-fan-xing-dan-tai-hua.md",
+      "section": "深入理解",
+      "group": "中间表示与优化",
+      "level": "Advanced"
+    },
+    {
+      "slug": "12-webassembly-dai-ma-sheng-cheng-qi",
+      "title": "WebAssembly 代码生成器",
+      "file": "12-webassembly-dai-ma-sheng-cheng-qi.md",
+      "section": "深入理解",
+      "group": "代码生成",
+      "level": "Advanced"
+    },
+    {
+      "slug": "13-lei-xing-jian-cha-yu-lei-xing-tui-duan",
+      "title": "类型检查与类型推断",
+      "file": "13-lei-xing-jian-cha-yu-lei-xing-tui-duan.md",
+      "section": "深入理解",
+      "group": "代码生成",
+      "level": "Advanced"
+    },
+    {
+      "slug": "14-biao-da-shi-dai-ma-sheng-cheng",
+      "title": "表达式代码生成",
+      "file": "14-biao-da-shi-dai-ma-sheng-cheng.md",
+      "section": "深入理解",
+      "group": "代码生成",
+      "level": "Advanced"
+    },
+    {
+      "slug": "15-nei-cun-guan-li-yu-la-ji-hui-shou",
+      "title": "内存管理与垃圾回收",
+      "file": "15-nei-cun-guan-li-yu-la-ji-hui-shou.md",
+      "section": "深入理解",
+      "group": "运行时支持",
+      "level": "Advanced"
+    },
+    {
+      "slug": "16-biao-zhun-ku-zhi-chi",
+      "title": "标准库支持",
+      "file": "16-biao-zhun-ku-zhi-chi.md",
+      "section": "深入理解",
+      "group": "运行时支持",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "17-ce-shi-kuang-jia",
+      "title": "测试框架",
+      "file": "17-ce-shi-kuang-jia.md",
+      "section": "测试与验证",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "18-yu-yan-te-xing-shi-li",
+      "title": "语言特性示例",
+      "file": "18-yu-yan-te-xing-shi-li.md",
+      "section": "测试与验证",
+      "level": "Intermediate"
+    }
+  ]
+}
