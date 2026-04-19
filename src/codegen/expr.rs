@@ -2180,10 +2180,11 @@ impl CodeGen {
     /// 仅当 AST 类型确认为 Int64/UInt64/IntNative/UIntNative 时才 wrap；
     /// TypeParam 即使 to_wasm() = I64，也可能已单态化为 i32，保守不 wrap。
     fn needs_i64_to_i32_wrap(&self, expr: &Expr, locals: &LocalsBuilder) -> bool {
-        matches!(
-            self.infer_ast_type_with_locals(expr, locals).as_ref(),
-            Some(Type::Int64 | Type::UInt64 | Type::IntNative | Type::UIntNative)
-        )
+        self.infer_type_with_locals(expr, locals) == ValType::I64
+            && matches!(
+                self.infer_ast_type_with_locals(expr, locals).as_ref(),
+                Some(Type::Int64 | Type::UInt64 | Type::IntNative | Type::UIntNative)
+            )
     }
 
     fn emit_type_coercion(&self, func: &mut WasmFunc, src: ValType, dst: ValType) {

@@ -183,7 +183,7 @@ pub struct CHIRCodeGen {
 
 impl CHIRCodeGen {
     fn cond_needs_i32_wrap(cond: &CHIRExpr) -> bool {
-        cond.wasm_ty == ValType::I64 && !matches!(cond.ty, Type::Bool)
+        Self::actual_wasm_ty(cond) == ValType::I64 && !matches!(cond.ty, Type::Bool)
     }
 
     pub fn new() -> Self {
@@ -3969,6 +3969,9 @@ impl CHIRCodeGen {
     /// 对于指针/对象类型（Array, Struct, String 等），实际 WASM 类型始终是 I32，
     /// 即使 CHIR lowering 错误地标记为 I64。
     fn actual_wasm_ty(expr: &CHIRExpr) -> ValType {
+        if let CHIRExprKind::Cast { to_ty, .. } = &expr.kind {
+            return *to_ty;
+        }
         if matches!(expr.ty, Type::Unit | Type::Nothing) {
             return expr.wasm_ty;
         }
@@ -4017,8 +4020,9 @@ impl CHIRCodeGen {
                 emit_zero(expected_ty, func);
             } else {
                 self.emit_expr(result, func);
-                if result.wasm_ty != expected_ty {
-                    self.emit_cast(result.wasm_ty, expected_ty, func);
+                let actual_ty = Self::actual_wasm_ty(result);
+                if actual_ty != expected_ty {
+                    self.emit_cast(actual_ty, expected_ty, func);
                 }
             }
         } else {
@@ -4096,14 +4100,20 @@ impl CHIRCodeGen {
                 // 若操作数为 void（Unit/Nothing），补零值作为默认值
                 if !self.expr_produces_wasm_value_ctx(left) {
                     emit_zero(operand_ty, func);
-                } else if left.wasm_ty != operand_ty {
-                    self.emit_cast(left.wasm_ty, operand_ty, func);
+                } else {
+                    let left_ty = Self::actual_wasm_ty(left);
+                    if left_ty != operand_ty {
+                        self.emit_cast(left_ty, operand_ty, func);
+                    }
                 }
                 self.emit_expr(right, func);
                 if !self.expr_produces_wasm_value_ctx(right) {
                     emit_zero(operand_ty, func);
-                } else if right.wasm_ty != operand_ty {
-                    self.emit_cast(right.wasm_ty, operand_ty, func);
+                } else {
+                    let right_ty = Self::actual_wasm_ty(right);
+                    if right_ty != operand_ty {
+                        self.emit_cast(right_ty, operand_ty, func);
+                    }
                 }
                 self.emit_binary_op(op, operand_ty, func);
                 // Binary op result type: comparisons/logical produce I32, arithmetic produces operand_ty
@@ -4155,7 +4165,10 @@ impl CHIRCodeGen {
                     self.emit_expr(inner, func);
                     if !self.expr_produces_wasm_value_ctx(inner) {
                         emit_zero(ValType::I32, func);
-                    } else if matches!(op, UnaryOp::Not) && inner.wasm_ty == ValType::I64 {
+                    } else if matches!(op, UnaryOp::Not)
+                        && Self::actual_wasm_ty(inner) == ValType::I64
+                        && expr.wasm_ty != ValType::I64
+                    {
                         func.instruction(&Instruction::I32WrapI64);
                     }
                     self.emit_unary_op(op, expr.wasm_ty, func);
@@ -4633,7 +4646,7 @@ impl CHIRCodeGen {
                 self.emit_expr(ptr, func);
                 if !self.expr_produces_wasm_value_ctx(ptr) {
                     emit_zero(ValType::I32, func);
-                } else if ptr.wasm_ty == ValType::I64 {
+                } else if Self::actual_wasm_ty(ptr) == ValType::I64 {
                     func.instruction(&Instruction::I32WrapI64);
                 }
                 if *offset > 0 {
@@ -4641,10 +4654,11 @@ impl CHIRCodeGen {
                     func.instruction(&Instruction::I32Add);
                 }
                 self.emit_expr(value, func);
+                let value_ty = Self::actual_wasm_ty(value);
                 if !self.expr_produces_wasm_value_ctx(value) {
-                    emit_zero(value.wasm_ty, func);
+                    emit_zero(value_ty, func);
                 }
-                match value.wasm_ty {
+                match value_ty {
                     ValType::I64 => func.instruction(&Instruction::I64Store(MemArg {
                         offset: 0,
                         align: *align,
@@ -5025,7 +5039,7 @@ impl CHIRCodeGen {
                     emit_zero(local_ty, func);
                     local_ty
                 } else {
-                    value.wasm_ty
+                    Self::actual_wasm_ty(value)
                 };
                 let local_ty_opt = self.current_local_types.borrow().get(local_idx).copied();
                 if let Some(local_ty) = local_ty_opt {
@@ -5203,7 +5217,11 @@ impl CHIRCodeGen {
         const MATCH_SAVE: i32 = 60;
         func.instruction(&Instruction::I32Const(MATCH_SAVE));
         self.emit_expr(subject, func);
-        match subject.wasm_ty {
+        let subject_ty = Self::actual_wasm_ty(subject);
+        if !self.expr_produces_wasm_value_ctx(subject) {
+            emit_zero(subject_ty, func);
+        }
+        match subject_ty {
             ValType::I64 => func.instruction(&Instruction::I64Store(MemArg {
                 offset: 0,
                 align: 3,
@@ -5238,7 +5256,7 @@ impl CHIRCodeGen {
                 CHIRPattern::Wildcard | CHIRPattern::Binding(_) => {
                     if let CHIRPattern::Binding(local_idx) = &arm.pattern {
                         func.instruction(&Instruction::I32Const(MATCH_SAVE));
-                        let loaded_ty = match subject.wasm_ty {
+                        let loaded_ty = match subject_ty {
                             ValType::I64 => {
                                 func.instruction(&Instruction::I64Load(MemArg {
                                     offset: 0,
@@ -5882,6 +5900,10 @@ impl CHIRCodeGen {
 
     fn emit_unary_op(&self, op: &UnaryOp, ty: ValType, func: &mut wasm_encoder::Function) {
         match (op, ty) {
+            (UnaryOp::Not, ValType::I64) => {
+                func.instruction(&Instruction::I64Eqz);
+                func.instruction(&Instruction::I64ExtendI32S);
+            }
             (UnaryOp::Not, _) => {
                 func.instruction(&Instruction::I32Eqz);
             }

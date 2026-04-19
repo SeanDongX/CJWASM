@@ -2467,6 +2467,22 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_method_return_string_to_array() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::String("abc".into())),
+            method: "toArray".into(),
+            args: vec![],
+            type_args: None,
+            named_args: vec![],
+        };
+        assert_eq!(
+            ctx.infer_expr(&expr).unwrap(),
+            Type::Array(Box::new(Type::Int64))
+        );
+    }
+
+    #[test]
     fn test_infer_method_return_tostring() {
         let ctx = TypeInferenceContext::new();
         let expr = Expr::MethodCall {

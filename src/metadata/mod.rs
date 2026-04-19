@@ -91,6 +91,7 @@ pub fn stdlib_method_return_type(
         }
         ("String", "size" | "length" | "indexOf" | "lastIndexOf") => Some(Type::Int64),
         ("String", "split") => Some(Type::Array(Box::new(Type::String))),
+        ("String", "toArray") => Some(Type::Array(Box::new(Type::Int64))),
         ("String", "runes" | "toRuneArray") => Some(Type::Array(Box::new(Type::Rune))),
         ("Rune", "toString") => Some(Type::String),
         (
