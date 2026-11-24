@@ -2444,7 +2444,9 @@ impl Parser {
                         is_static: false,
                         is_open: false,
                         is_abstract: false,
-                        has_body: true,
+                        // 无体属性声明（抽象属性）的访问器没有实现体：
+                        // has_body=false 使父类型的抽象访问器被视为可覆写/可实现。
+                        has_body: false,
                         is_const: false,
                         func: crate::ast::Function {
                             visibility: member_vis.clone(),
@@ -2474,7 +2476,8 @@ impl Parser {
                             is_static: false,
                             is_open: false,
                             is_abstract: false,
-                            has_body: true,
+                            // 无体 mut 属性的抽象 setter 同样没有实现体。
+                            has_body: false,
                             is_const: false,
                             func: crate::ast::Function {
                                 visibility: member_vis.clone(),

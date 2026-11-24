@@ -4165,6 +4165,7 @@ mod tests {
         }
     }
 
+
     // ─── infer_expr: literals ─────────────────────────────────────────────────
 
     #[test]
@@ -4176,6 +4177,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_infer_expr_float() {
         let known = HashMap::new();
@@ -4184,6 +4186,7 @@ mod tests {
             Some(Type::Float64)
         );
     }
+
 
     #[test]
     fn test_infer_expr_float32() {
@@ -4194,17 +4197,20 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_infer_expr_bool() {
         let known = HashMap::new();
         assert_eq!(infer_expr(&Expr::Bool(true), &known), Some(Type::Bool));
     }
 
+
     #[test]
     fn test_infer_expr_rune() {
         let known = HashMap::new();
         assert_eq!(infer_expr(&Expr::Rune('x'), &known), Some(Type::Rune));
     }
+
 
     #[test]
     fn test_infer_expr_string() {
@@ -4215,12 +4221,14 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_infer_expr_interpolate() {
         let known = HashMap::new();
         let expr = Expr::Interpolate(vec![InterpolatePart::Literal("hi".to_string())]);
         assert_eq!(infer_expr(&expr, &known), Some(Type::String));
     }
+
 
     // ─── infer_expr: Cast, IsType ────────────────────────────────────────────
 
@@ -4234,6 +4242,7 @@ mod tests {
         assert_eq!(infer_expr(&expr, &known), Some(Type::Float64));
     }
 
+
     #[test]
     fn test_infer_expr_is_type() {
         let known = HashMap::new();
@@ -4243,6 +4252,7 @@ mod tests {
         };
         assert_eq!(infer_expr(&expr, &known), Some(Type::Bool));
     }
+
 
     // ─── infer_expr: Some, Ok, Err, None ─────────────────────────────────────
 
@@ -4255,6 +4265,7 @@ mod tests {
             Some(Type::Option(Box::new(Type::Int64)))
         );
     }
+
 
     #[test]
     fn test_infer_expr_ok() {
@@ -4269,6 +4280,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_infer_expr_err() {
         let known = HashMap::new();
@@ -4282,11 +4294,13 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_infer_expr_none() {
         let known = HashMap::new();
         assert_eq!(infer_expr(&Expr::None, &known), None);
     }
+
 
     // ─── infer_expr: StructInit, ConstructorCall ───────────────────────────────
 
@@ -4310,6 +4324,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_infer_expr_constructor_call() {
         let known = HashMap::new();
@@ -4328,6 +4343,7 @@ mod tests {
         );
     }
 
+
     // ─── infer_expr: Call ─────────────────────────────────────────────────────
 
     #[test]
@@ -4342,6 +4358,7 @@ mod tests {
         };
         assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
     }
+
 
     #[test]
     fn test_infer_expr_call_uppercase_constructor() {
@@ -4358,6 +4375,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_infer_expr_call_unknown() {
         let known = HashMap::new();
@@ -4369,6 +4387,7 @@ mod tests {
         };
         assert_eq!(infer_expr(&expr, &known), None);
     }
+
 
     // ─── infer_expr: Var ──────────────────────────────────────────────────────
 
@@ -4382,11 +4401,13 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_infer_expr_var_unknown() {
         let known = HashMap::new();
         assert_eq!(infer_expr(&Expr::Var("y".to_string()), &known), None);
     }
+
 
     // ─── infer_expr: Binary ──────────────────────────────────────────────────
 
@@ -4401,6 +4422,7 @@ mod tests {
         assert_eq!(infer_expr(&expr, &known), Some(Type::Bool));
     }
 
+
     #[test]
     fn test_infer_expr_binary_add_string() {
         let known = HashMap::new();
@@ -4412,6 +4434,7 @@ mod tests {
         assert_eq!(infer_expr(&expr, &known), Some(Type::String));
     }
 
+
     #[test]
     fn test_infer_expr_binary_add_integers() {
         let known = HashMap::new();
@@ -4422,6 +4445,7 @@ mod tests {
         };
         assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
     }
+
 
     // ─── infer_expr: Unary ───────────────────────────────────────────────────
 
@@ -4435,6 +4459,7 @@ mod tests {
         assert_eq!(infer_expr(&expr, &known), Some(Type::Bool));
     }
 
+
     #[test]
     fn test_infer_expr_unary_neg() {
         let known = HashMap::new();
@@ -4444,6 +4469,7 @@ mod tests {
         };
         assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
     }
+
 
     // ─── infer_expr: If, Block, Match ──────────────────────────────────────────
 
@@ -4458,6 +4484,7 @@ mod tests {
         assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
     }
 
+
     #[test]
     fn test_infer_expr_block_with_trailing() {
         let known = HashMap::new();
@@ -4467,6 +4494,7 @@ mod tests {
         );
         assert_eq!(infer_expr(&expr, &known), Some(Type::String));
     }
+
 
     #[test]
     fn test_infer_expr_match() {
@@ -4481,6 +4509,7 @@ mod tests {
         };
         assert_eq!(infer_expr(&expr, &known), Some(Type::String));
     }
+
 
     // ─── infer_expr: Tuple, Array ──────────────────────────────────────────────
 
@@ -4497,6 +4526,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_infer_expr_array() {
         let known = HashMap::new();
@@ -4509,6 +4539,7 @@ mod tests {
             Some(Type::Array(Box::new(Type::Int64)))
         );
     }
+
 
     // ─── infer_expr: Lambda ───────────────────────────────────────────────────
 
@@ -4529,6 +4560,7 @@ mod tests {
         );
     }
 
+
     // ─── infer_expr: Try, NullCoalesce ─────────────────────────────────────────
 
     #[test]
@@ -4537,6 +4569,7 @@ mod tests {
         let expr = Expr::Try(Box::new(Expr::Integer(42)));
         assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
     }
+
 
     #[test]
     fn test_infer_expr_null_coalesce() {
@@ -4547,6 +4580,7 @@ mod tests {
         };
         assert_eq!(infer_expr(&expr, &known), Some(Type::Int64));
     }
+
 
     // ─── analyze ──────────────────────────────────────────────────────────────
 
@@ -4595,6 +4629,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_analyze_function_with_return_stmt() {
         let program = Program {
@@ -4625,6 +4660,7 @@ mod tests {
             Some(&Type::String)
         );
     }
+
 
     #[test]
     fn test_analyze_class_method_inference() {
@@ -4684,6 +4720,7 @@ mod tests {
         );
     }
 
+
     // ─── validate_program: 语义校验 ─────────────────────────────────────────
 
     /// 直接走 lexer + parser 得到 AST（不经过 pipeline 的校验），便于测试 validate_program。
@@ -4697,12 +4734,14 @@ mod tests {
             .expect("语法分析应成功")
     }
 
+
     fn assert_valid(source: &str) {
         let program = program_of(source);
         if let Err(errs) = validate_program(&program) {
             panic!("合法程序被误判: {:?}", errs);
         }
     }
+
 
     fn assert_invalid(source: &str) -> Vec<SemanticError> {
         let program = program_of(source);
@@ -4711,6 +4750,7 @@ mod tests {
             Err(errs) => errs,
         }
     }
+
 
     #[test]
     fn test_validate_duplicate_class_method() {
@@ -4722,6 +4762,7 @@ mod tests {
              main() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_legal_overload_not_rejected() {
@@ -4735,6 +4776,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_static_instance_same_name() {
         let errs = assert_invalid(
@@ -4747,12 +4789,14 @@ mod tests {
         assert!(errs.iter().any(|e| e.message.contains("静态成员函数与实例成员函数同名")));
     }
 
+
     #[test]
     fn test_validate_duplicate_top_level_function() {
         assert_invalid(
             "func f(a: Int64) {}\nfunc f(b: Int64) {}\nmain() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_generic_vs_non_generic_not_redefinition() {
@@ -4764,6 +4808,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_generic_type_param_order_not_redefinition() {
         // 5.1.6(7): func f<X,Y>(a:X,b:Y) 与 func f<Y,X>(a:X,b:Y) 不构成重定义
@@ -4773,6 +4818,7 @@ mod tests {
              main() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_duplicate_interface_generic_method() {
@@ -4786,11 +4832,13 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_override_without_parent() {
         let errs = assert_invalid("class A {\n    override func f() {}\n}\nmain() {}\n");
         assert!(errs.iter().any(|e| e.message.contains("不存在可覆盖的同名函数")));
     }
+
 
     #[test]
     fn test_validate_override_signature_mismatch() {
@@ -4805,6 +4853,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_override_matching_signature_ok() {
         assert_valid(
@@ -4817,6 +4866,7 @@ mod tests {
              main() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_override_covariant_return_ok() {
@@ -4833,6 +4883,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_interface_missing_implementation() {
         assert_invalid(
@@ -4845,6 +4896,7 @@ mod tests {
              main() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_interface_implementation_ok() {
@@ -4859,6 +4911,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_struct_interface_missing_implementation() {
         assert_invalid(
@@ -4871,6 +4924,7 @@ mod tests {
              main() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_property_type_mismatch() {
@@ -4888,10 +4942,12 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_enum_duplicate_variant() {
         assert_invalid("enum E {\n    A(Int8)\n    A(Int8)\n}\nmain() {}\n");
     }
+
 
     #[test]
     fn test_validate_enum_variant_overload_ok() {
@@ -4899,10 +4955,12 @@ mod tests {
         assert_valid("enum E {\n    A\n    A(Int8)\n}\nmain() {}\n");
     }
 
+
     #[test]
     fn test_validate_duplicate_field() {
         assert_invalid("class A {\n    var x: Int64 = 1\n    var x: Int64 = 2\n}\nmain() {}\n");
     }
+
 
     // ─── validate_program: 类/接口规则补强（06 章） ─────────────────────────
 
@@ -4914,6 +4972,7 @@ mod tests {
         assert!(errs.iter().any(|e| e.message.contains("抽象类") && e.message.contains("实例化")));
     }
 
+
     #[test]
     fn test_validate_interface_instantiation() {
         let errs = assert_invalid(
@@ -4921,6 +4980,7 @@ mod tests {
         );
         assert!(errs.iter().any(|e| e.message.contains("接口") && e.message.contains("实例化")));
     }
+
 
     #[test]
     fn test_validate_abstract_class_as_type_ok() {
@@ -4930,6 +4990,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_shadowed_type_name_not_instantiation() {
         // 局部函数遮蔽同名接口时，该调用不是接口实例化（避免误伤遮蔽用例）
@@ -4937,6 +4998,7 @@ mod tests {
             "interface I {}\nmain() {\n    func I(): Int64 { 1 }\n    let x = I()\n}\n",
         );
     }
+
 
     #[test]
     fn test_validate_multiple_inheritance() {
@@ -4946,6 +5008,7 @@ mod tests {
         assert!(errs.iter().any(|e| e.message.contains("单继承")));
     }
 
+
     #[test]
     fn test_validate_interface_before_superclass() {
         // 接口写在父类之前：解析器把首个当成 extends，类名落入 implements
@@ -4954,16 +5017,19 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_inherit_non_open_class() {
         let errs = assert_invalid("class A {}\nclass B <: A {}\nmain() {}\n");
         assert!(errs.iter().any(|e| e.message.contains("非 open")));
     }
 
+
     #[test]
     fn test_validate_inherit_open_class_ok() {
         assert_valid("open class A {}\nclass B <: A {}\nmain() {}\n");
     }
+
 
     #[test]
     fn test_validate_inherit_sealed_class_same_file_ok() {
@@ -4971,10 +5037,12 @@ mod tests {
         assert_valid("sealed class A {}\nclass B <: A {}\nmain() {}\n");
     }
 
+
     #[test]
     fn test_validate_inherit_struct() {
         assert_invalid("struct S {}\nclass C <: S {}\nmain() {}\n");
     }
+
 
     #[test]
     fn test_validate_override_lowers_visibility() {
@@ -4984,12 +5052,14 @@ mod tests {
         assert!(errs.iter().any(|e| e.message.contains("降低")));
     }
 
+
     #[test]
     fn test_validate_override_raises_visibility_ok() {
         assert_valid(
             "open class P {\n    protected open func f() {}\n}\nclass C <: P {\n    public override func f() {}\n}\nmain() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_static_redef_lowers_visibility() {
@@ -4998,6 +5068,7 @@ mod tests {
             "open class P {\n    protected static func f() {}\n}\nclass C <: P {\n    private static func f() {}\n}\nmain() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_struct_interface_property_type_mismatch() {
@@ -5018,6 +5089,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_struct_interface_property_type_ok() {
         assert_valid(
@@ -5035,12 +5107,14 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_enum_missing_interface_function() {
         assert_invalid(
             "interface I {\n    func f(): Int64\n}\nenum E <: I {\n    A\n}\nmain() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_enum_implements_interface_ok() {
@@ -5056,6 +5130,7 @@ mod tests {
         );
     }
 
+
     // ─── 06 章：成员修饰符 / 遮蔽 / 访问控制 / This / 构造参数顺序 ────────────
 
     #[test]
@@ -5063,20 +5138,24 @@ mod tests {
         assert_invalid("class A {\n    static func f(): Int64\n}\nmain() {}\n");
     }
 
+
     #[test]
     fn test_validate_static_member_func_with_body_ok() {
         assert_valid("class A {\n    static func f(): Int64 { 1 }\n}\nmain() {}\n");
     }
+
 
     #[test]
     fn test_validate_no_body_func_in_non_abstract_class() {
         assert_invalid("class A {\n    public func f(): Int64\n}\nmain() {}\n");
     }
 
+
     #[test]
     fn test_validate_no_body_func_in_abstract_class_ok() {
         assert_valid("abstract class A {\n    func f(): Int64\n}\nmain() {}\n");
     }
+
 
     #[test]
     fn test_validate_open_static_func_conflict() {
@@ -5085,12 +5164,14 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_override_non_open_func_rejected() {
         assert_invalid(
             "open class A {\n    public func f() {}\n}\nclass B <: A {\n    override public func f() {}\n}\nmain() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_override_open_func_ok() {
@@ -5099,12 +5180,14 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_static_redef_non_open_ok() {
         assert_valid(
             "open class A {\n    public static func f() {}\n}\nclass B <: A {\n    public redef static func f() {}\n}\nmain() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_member_shadowing_kind_conflict() {
@@ -5118,12 +5201,14 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_shadowing_private_parent_field_ok() {
         assert_valid(
             "open class A {\n    private let x = 1\n}\nclass B <: A {\n    let x = 2\n}\nmain() {}\n",
         );
     }
+
 
     #[test]
     fn test_validate_interface_implementation_lowers_visibility() {
@@ -5135,6 +5220,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_validate_static_func_access_instance_member() {
         assert_invalid("class A {\n    let x = 1\n    static func f() { x }\n}\nmain() {}\n");
@@ -5144,6 +5230,7 @@ mod tests {
         assert_valid("class A {\n    static let x = 1\n    static func f() { x }\n}\nmain() {}\n");
     }
 
+
     #[test]
     fn test_validate_ctor_regular_param_after_member_param() {
         // 命名构造函数：普通参数位于成员变量参数之后。
@@ -5152,6 +5239,7 @@ mod tests {
         assert_invalid("class A(let a: Int64, x: Bool) {}\nmain() {}\n");
         assert_valid("class A {\n    A(x: Bool, let a: Int64) {}\n}\nmain() {}\n");
     }
+
 
     #[test]
     fn test_validate_this_type_placement() {
@@ -5166,6 +5254,7 @@ mod tests {
         // 类的实例成员函数返回 This 合法。
         assert_valid("class A {\n    func f(): This { this }\n}\nmain() {}\n");
     }
+
 
     #[test]
     fn test_validate_private_parent_member_access() {
@@ -5183,6 +5272,7 @@ mod tests {
             "open class A {\n    private func f() {}\n}\nclass B <: A {\n    func f() {}\n    func g() { f() }\n}\nmain() {}\n",
         );
     }
+
 
     #[test]
     fn test_w5c_const_interface_func_requires_const_impl() {
@@ -5207,6 +5297,7 @@ mod tests {
         );
     }
 
+
     // ── w6a: 泛型约束/型变（09 章 + 6.2.4.1(5)/6.3.4.1(5)）─────────────────
 
     #[test]
@@ -5218,6 +5309,7 @@ mod tests {
         assert!(errs.iter().any(|e| e.message.contains("类型参数重名")));
         assert_valid("class GenericClass<T1, T2> {\n}\nmain() {}\n");
     }
+
 
     #[test]
     fn test_w6a_constraint_lhs_must_be_type_variable() {
@@ -5240,6 +5332,7 @@ mod tests {
              main() {}\n",
         );
     }
+
 
     #[test]
     fn test_w6a_impl_may_not_strengthen_generic_constraints() {
@@ -5296,6 +5389,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_w6a_override_may_not_strengthen_generic_constraints() {
         // 6.3.4.1(5)：类重定义父类泛型函数时不得添加约束。
@@ -5318,4 +5412,67 @@ mod tests {
              main() {}\n",
         );
     }
+
+
+    #[test]
+    fn test_validate_abstract_property_accessors_overridable() {
+        // 抽象类中的无体属性脱糖出的访问器是抽象成员，子类实现/覆写不应被误判为
+        // “覆写了父类型中不可覆写（非 open/abstract）的函数”。（对应 07_property 下正测试。）
+        // 隐式实现抽象属性（无需 override 关键字）。
+        assert_valid(
+            "abstract class I {\n\
+             \x20   protected prop i1: Int64\n\
+             \x20   protected mut prop i2: Int64\n\
+             }\n\
+             class C <: I {\n\
+             \x20   protected prop i1: Int64 { get() { 0 } }\n\
+             \x20   protected mut prop i2: Int64 { get() { 0 } set(v) {} }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 抽象属性存在带默认实现的兄弟属性。
+        assert_valid(
+            "abstract class A {\n\
+             \x20   protected prop a1: Int64\n\
+             \x20   protected mut prop a2: Int64 { get() { 5 } set(v) {} }\n\
+             }\n\
+             class C <: A {\n\
+             \x20   protected prop a1: Int64 { get() { 6 } }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 显式 override 抽象不可变属性。
+        assert_valid(
+            "abstract class A {\n\
+             \x20   public prop aaa: Int32\n\
+             }\n\
+             class B <: A {\n\
+             \x20   override public prop aaa: Int32 { get() { 0 } }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 显式 override 抽象可变属性。
+        assert_valid(
+            "abstract class A {\n\
+             \x20   public mut prop aaa: Int32\n\
+             }\n\
+             class B <: A {\n\
+             \x20   override public mut prop aaa: Int32 { get() { 0 } set(v) {} }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+
+    #[test]
+    fn test_validate_no_body_property_requires_abstract_class() {
+        // 非抽象类不能声明无体属性（其访问器没有实现）。
+        assert_invalid(
+            "class C {\n\
+             \x20   prop x: Int64\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
 }
