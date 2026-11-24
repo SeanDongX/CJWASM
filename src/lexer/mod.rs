@@ -162,12 +162,14 @@ fn lex_block_comment(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<(), (
 /// 解析多行字符串 """..."""，支持转义（`\"` `\\` `\$` `\n` `\t`）。
 ///
 /// 终止条件是未被反斜杠转义的 `"""`；`\"""` 中的 `\"` 是转义引号，不构成终止。
-/// `${...}` 在多行字符串中按普通文本处理（不做插值展开），以兼容官方测试集。
-fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
+/// `${...}` 按插值处理（与普通字符串一致）；无插值时返回 Ok(Plain)。
+fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, Vec<StringPart>>> {
     let remainder = lex.remainder();
     let bytes = remainder.as_bytes();
     let mut pos = 0usize;
     let mut current = String::new();
+    let mut parts: Vec<StringPart> = Vec::new();
+    let mut has_interpolation = false;
 
     while pos < bytes.len() {
         // 终止符 """（到达此处时一定未被转义，因为转义引号已在下面消耗）
@@ -177,7 +179,13 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
             && bytes[pos + 2] == b'"'
         {
             lex.bump(pos + 3);
-            return Some(process_multiline_string(&current));
+            if !has_interpolation {
+                return Some(Ok(process_multiline_string(&current)));
+            }
+            if !current.is_empty() {
+                parts.push(StringPart::Literal(process_multiline_string(&current)));
+            }
+            return Some(Err(parts));
         }
 
         let c = bytes[pos];
@@ -196,6 +204,43 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
                 }
             }
             pos += 2;
+        } else if c == b'$' && pos + 1 < bytes.len() && bytes[pos + 1] == b'{' {
+            // 插值开始 ${
+            has_interpolation = true;
+            if !current.is_empty() {
+                parts.push(StringPart::Literal(process_multiline_string(&current)));
+                current.clear();
+            }
+            pos += 2;
+            let mut brace_depth = 1;
+            let expr_start = pos;
+            while pos < bytes.len() && brace_depth > 0 {
+                match bytes[pos] {
+                    b'{' => brace_depth += 1,
+                    b'}' => brace_depth -= 1,
+                    b'"' => {
+                        // 跳过内嵌字符串
+                        pos += 1;
+                        while pos < bytes.len() && bytes[pos] != b'"' {
+                            if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
+                                pos += 2;
+                            } else {
+                                pos += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if brace_depth > 0 {
+                    pos += 1;
+                }
+            }
+            if brace_depth != 0 {
+                return None; // 未闭合的 ${
+            }
+            let expr_text = std::str::from_utf8(&bytes[expr_start..pos]).ok()?;
+            parts.push(StringPart::Interpolation(expr_text.to_string()));
+            pos += 1; // 跳过 }
         } else {
             // 按 UTF-8 字符复制
             let ch = remainder[pos..].chars().next()?;
@@ -204,6 +249,17 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
         }
     }
     None // 未找到结束引号
+}
+
+/// 词法分析入口：多行字符串（可能含 ${...} 插值）
+fn lex_any_multiline_string(
+    lex: &mut logos::Lexer<Token>,
+) -> logos::FilterResult<StringOrInterpolated, ()> {
+    match lex_multiline_string(lex) {
+        Some(Ok(s)) => logos::FilterResult::Emit(StringOrInterpolated::Plain(s)),
+        Some(Err(parts)) => logos::FilterResult::Emit(StringOrInterpolated::Interpolated(parts)),
+        None => logos::FilterResult::Error(()),
+    }
 }
 
 /// 解析字符串（普通或插值）
@@ -808,9 +864,9 @@ pub enum Token {
     #[token("false")]
     False,
 
-    // 多行字符串 """..."""（strip 公共缩进；支持转义，${...} 按普通文本）
-    #[token(r#"""""#, lex_multiline_string)]
-    MultiLineStringLit(String),
+    // 多行字符串 """..."""（strip 公共缩进；支持转义与 ${...} 插值）
+    #[token(r#"""""#, lex_any_multiline_string)]
+    MultiLineStringLit(StringOrInterpolated),
 
     // 原始字符串 r"..."（不处理转义）
     #[regex(r#"r"([^"]*)""#, |lex| {
@@ -1149,7 +1205,9 @@ mod tests {
 
         assert_eq!(
             tokens[3],
-            Token::MultiLineStringLit("hello\nworld".to_string())
+            Token::MultiLineStringLit(StringOrInterpolated::Plain(
+                "hello\nworld".to_string()
+            ))
         );
     }
 
@@ -1161,8 +1219,30 @@ mod tests {
 
         assert_eq!(
             tokens[3],
-            Token::MultiLineStringLit("hello world".to_string())
+            Token::MultiLineStringLit(StringOrInterpolated::Plain(
+                "hello world".to_string()
+            ))
         );
+    }
+
+    #[test]
+    fn test_multiline_string_interpolation() {
+        // 多行字符串内的 ${...} 按插值解析（支持换行/分号）
+        let source = "let s = \"\"\"\n${\"a\"}${b}\"\"\"";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        match &tokens[3] {
+            Token::MultiLineStringLit(StringOrInterpolated::Interpolated(parts)) => {
+                let exprs: Vec<&StringPart> = parts
+                    .iter()
+                    .filter(|p| matches!(p, StringPart::Interpolation(_)))
+                    .collect();
+                assert_eq!(exprs.len(), 2);
+                assert_eq!(exprs[0], &StringPart::Interpolation("\"a\"".to_string()));
+                assert_eq!(exprs[1], &StringPart::Interpolation("b".to_string()));
+            }
+            other => panic!("期望多行插值字符串，实际: {:?}", other),
+        }
     }
 
     #[test]
@@ -1711,7 +1791,9 @@ mod tests {
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(
             tokens[3],
-            Token::MultiLineStringLit("abc\"\"\" def".to_string())
+            Token::MultiLineStringLit(StringOrInterpolated::Plain(
+                "abc\"\"\" def".to_string()
+            ))
         );
     }
 }

@@ -781,6 +781,7 @@ mod tests {
             static_init: None,
             methods: vec![ClassMethod {
                 override_: false,
+                is_const: false,
                 func: class_method_func,
             }],
             primary_ctor_params: vec![],

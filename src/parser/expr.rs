@@ -715,6 +715,7 @@ impl Parser {
                             Expr::Call { .. }
                                 | Expr::MethodCall { .. }
                                 | Expr::Field { .. }
+                                | Expr::OptionalChain { .. }
                                 | Expr::Var(_)
                                 | Expr::ConstructorCall { .. }
                                 | Expr::Invoke { .. }
@@ -762,7 +763,14 @@ impl Parser {
                                     }
                                     None => return self.bail(ParseError::UnexpectedEof),
                                 };
-                                params.push((name, Type::Int64)); // 默认使用 Int64，避免 TypeParam
+                                // 参数可带类型注解：{ a, b: Int32 => ... }
+                                let ty = if self.check(&Token::Colon) {
+                                    self.advance();
+                                    self.parse_type()?
+                                } else {
+                                    Type::Int64 // 默认使用 Int64，避免 TypeParam
+                                };
+                                params.push((name, ty));
                                 if self.check(&Token::FatArrow) {
                                     self.advance();
                                     break;
@@ -1147,7 +1155,8 @@ impl Parser {
             Some(Token::StringLit(s)) | Some(Token::BacktickStringLit(s)) => {
                 self.parse_string_or_interpolated(s)
             }
-            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => {
+            Some(Token::MultiLineStringLit(s)) => self.parse_multiline_string(s),
+            Some(Token::RawStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => {
                 Ok(Expr::String(s))
             }
             // Option/Result 构造器（允许 Some(e1,e2,...) 解析为 Some(Tuple(...))）
@@ -1605,6 +1614,11 @@ impl Parser {
                                 named_args: Vec::new(),
                             });
                         }
+                        // 花括号内容不是字段初始化（如 `Column { stmt; stmt }`）时，
+                        // 这是 `f { ... }` 尾随闭包调用而非结构体字面量。
+                        if !self.looks_like_struct_init_body() {
+                            return Ok(Expr::Var(name));
+                        }
                         // 仅对类型名（首字母大写）解析为结构体初始化
                         self.advance();
                         let fields = self.parse_struct_fields()?;
@@ -1741,15 +1755,15 @@ impl Parser {
                 // 检查是否是 Lambda: { x: T => body } 或 { x => body }（单参无类型）或 { a, b => body }（多参无类型）
                 // 也支持 { _: T, x: T => body }（第一个参数为通配符）
                 // 注意：当前 { 已被 advance() 消费，用 peek() 看第一个 token，peek_at(1) 看第二个；仅当第二个 token 为 : , 或 => 时才按 lambda 解析，否则按块解析
-                let second = self.peek_at(1);
+                let second = self.peek_at(1).cloned();
                 let is_lambda =
                     matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
                         && matches!(
-                            second,
+                            &second,
                             Some(Token::Colon) | Some(Token::Comma) | Some(Token::FatArrow)
                         );
                 if is_lambda {
-                    if matches!(second, Some(Token::Colon)) {
+                    if matches!(&second, Some(Token::Colon)) {
                         // Lambda { x: T, y: T => body }；{ 已消费，解析参数
                         let params = self.parse_lambda_params()?;
                         self.expect(Token::FatArrow)?;
@@ -1759,7 +1773,7 @@ impl Parser {
                             return_type: None,
                             body: Box::new(body),
                         });
-                    } else if matches!(second, Some(Token::Comma)) {
+                    } else if matches!(&second, Some(Token::Comma)) {
                         // 多参无类型 Lambda { a, b, c => body }
                         let mut params = Vec::new();
                         loop {
@@ -1774,7 +1788,14 @@ impl Parser {
                                 }
                                 None => return self.bail(ParseError::UnexpectedEof),
                             };
-                            params.push((name, Type::Int64)); // 默认使用 Int64
+                            // 参数可带类型注解：{ a, b: Int32 => ... }
+                            let ty = if self.check(&Token::Colon) {
+                                self.advance();
+                                self.parse_type()?
+                            } else {
+                                Type::Int64 // 默认使用 Int64
+                            };
+                            params.push((name, ty));
                             if self.check(&Token::FatArrow) {
                                 self.advance();
                                 break;
@@ -1793,7 +1814,7 @@ impl Parser {
                             return_type: None,
                             body: Box::new(body),
                         });
-                    } else if matches!(second, Some(Token::FatArrow)) {
+                    } else if matches!(&second, Some(Token::FatArrow)) {
                         // 单参无类型 Lambda { name => body }
                         let name = self.advance_ident().expect("Ident");
                         self.advance(); // consume =>
@@ -2456,7 +2477,8 @@ impl Parser {
             Some(Token::StringLit(s)) | Some(Token::BacktickStringLit(s)) => {
                 self.parse_string_or_interpolated(s)?
             }
-            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => Expr::String(s),
+            Some(Token::MultiLineStringLit(s)) => self.parse_multiline_string(s)?,
+            Some(Token::RawStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => Expr::String(s),
             Some(Token::Ident(name)) => {
                 // 泛型实参形式的主体：match (A<Bool>)
                 if self.check(&Token::Lt) {
@@ -2736,6 +2758,39 @@ impl Parser {
         }
     }
 
+    /// 解析多行字符串（可能含 ${...} 插值）。
+    ///
+    /// 任一插值表达式无法按表达式解析时，整体回退为普通字符串字面量，
+    /// 避免含声明等未支持语法的多行插值导致编译失败。
+    pub(crate) fn parse_multiline_string(
+        &mut self,
+        s: StringOrInterpolated,
+    ) -> Result<Expr, ParseErrorAt> {
+        let parts = match s {
+            StringOrInterpolated::Plain(text) => return Ok(Expr::String(text)),
+            StringOrInterpolated::Interpolated(parts) => parts,
+        };
+        let parseable = parts.iter().all(|part| match part {
+            StringPart::Interpolation(text) => self.parse_interpolation_expr(text).is_ok(),
+            StringPart::Literal(_) => true,
+        });
+        if !parseable {
+            let mut raw = String::new();
+            for part in &parts {
+                match part {
+                    StringPart::Literal(t) => raw.push_str(t),
+                    StringPart::Interpolation(t) => {
+                        raw.push_str("${");
+                        raw.push_str(t);
+                        raw.push('}');
+                    }
+                }
+            }
+            return Ok(Expr::String(raw));
+        }
+        self.parse_string_or_interpolated(StringOrInterpolated::Interpolated(parts))
+    }
+
     /// 解析插值表达式内的文本。
     ///
     /// 规范允许 `${...}` 内前导分号（如 `${;;;1 + 2}`），但插值内容必须是表达式；
@@ -2752,6 +2807,10 @@ impl Parser {
         })?;
 
         let mut parser = Parser::new(tokens);
+        // 插值表达式在原上下文中求值：继承 `this` 可用性与当前泛型参数，
+        // 避免方法体 `"${this.x}"` 被误判为“this 仅可在方法体内使用”。
+        parser.receiver_name = self.receiver_name.clone();
+        parser.current_type_params = self.current_type_params.clone();
         // 跳过前导分号（`${;;;expr}`）
         while parser.check(&Token::Semicolon) {
             parser.advance();
@@ -2779,6 +2838,21 @@ impl Parser {
             None
         };
         Ok(Expr::Block(stmts, result))
+    }
+
+    /// 当前 token 为 `{` 时，判断花括号内容是否像结构体字段初始化列表。
+    ///
+    /// 用于区分 `S { x: 1 }`（结构体字面量）与 `Column { stmt; stmt }`（尾随闭包调用）。
+    /// 字段形态：`name:`、`name =`、简写 `name,` / `name }`；空 `{}` 视为字段列表。
+    fn looks_like_struct_init_body(&self) -> bool {
+        match self.peek_next() {
+            Some(Token::RBrace) => true,
+            Some(Token::Ident(_)) => matches!(
+                self.peek_at(2),
+                Some(Token::Colon) | Some(Token::Assign) | Some(Token::Comma) | Some(Token::RBrace)
+            ),
+            _ => false,
+        }
     }
 
     /// 检查 < 后面是否看起来像泛型方法调用
@@ -2829,6 +2903,30 @@ impl Parser {
             Some(n) => n,
             None => return false,
         };
+        // `x < Float64.NaN` 这类比较：`<` 后的基础类型紧跟 '.'（静态成员访问）时
+        // 是右值，不是类型实参。
+        if matches!(
+            next,
+            Token::TypeInt8
+                | Token::TypeInt16
+                | Token::TypeInt32
+                | Token::TypeInt64
+                | Token::TypeIntNative
+                | Token::TypeUInt8
+                | Token::TypeUInt16
+                | Token::TypeUInt32
+                | Token::TypeUInt64
+                | Token::TypeUIntNative
+                | Token::TypeFloat16
+                | Token::TypeFloat32
+                | Token::TypeFloat64
+                | Token::TypeRune
+                | Token::TypeBool
+                | Token::TypeString
+        ) && matches!(self.peek_at(2), Some(Token::Dot))
+        {
+            return false;
+        }
         // 内置类型关键字（非 Ident）在表达式中不能作为比较右值，肯定是类型实参
         if matches!(
             next,

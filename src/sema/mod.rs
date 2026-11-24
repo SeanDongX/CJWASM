@@ -686,6 +686,9 @@ fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<Semant
     // 接口实现完整性
     check_interface_implementation(cls, index, errors);
 
+    // 接口 const 函数必须由 const 函数实现
+    check_const_interface_impls(cls, index, errors);
+
     // 父类型来源合法性：单继承、可继承性、不能继承 struct/enum
     check_class_supertypes(cls, index, errors);
 }
@@ -1913,6 +1916,59 @@ fn check_interface_implementation(
     check_abstract_methods_implemented(&cls.name, own_impls, &parents, index, errors);
 }
 
+/// 接口的 const 函数必须由 const 函数实现（16.4(6) 约束）。
+///
+/// 同名同签名但未声明 const 的类方法不能实现接口的 const 函数。
+fn check_const_interface_impls(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut queue: Vec<String> = Vec::new();
+    if let Some(p) = cls.extends.as_deref() {
+        if index.interfaces.contains_key(p) {
+            queue.push(p.to_string());
+        }
+    }
+    for i in &cls.implements {
+        if index.interfaces.contains_key(i.as_str()) {
+            queue.push(i.clone());
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(name) = queue.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(iface) = index.interfaces.get(name.as_str()) else {
+            continue;
+        };
+        for m in &iface.methods {
+            if !m.is_const || is_synthetic_member(&m.name) {
+                continue;
+            }
+            let isig = sig_of_interface_method(m);
+            for cm in &cls.methods {
+                if cm.is_const {
+                    continue;
+                }
+                let csig = sig_of_function(&cm.func, &cls.type_params);
+                if csig.name == isig.name && signature_matches(&csig, &isig, true, index) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的 '{}' 实现接口 '{}' 的 const 函数时必须声明为 const",
+                            cls.name, csig.display, name
+                        ),
+                    });
+                }
+            }
+        }
+        for p in &iface.parents {
+            queue.push(p.clone());
+        }
+    }
+}
+
 /// 收集一组接口（含传递父接口）的方法；任一接口无法本地解析时返回 None。
 fn collect_interface_methods<'a>(
     names: &[&'a str],
@@ -2547,6 +2603,7 @@ mod tests {
                 primary_ctor_params: vec![],
                 methods: vec![ClassMethod {
                     override_: false,
+                    is_const: false,
                     func: Function {
                         visibility: Visibility::default(),
                         name: "Foo.getVal".to_string(),
@@ -2941,6 +2998,29 @@ mod tests {
              enum E <: I {\n\
              \x20   A\n\
              \x20   public func f(): Int64 { 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w5c_const_interface_func_requires_const_impl() {
+        // 接口 const 函数必须由 const 函数实现
+        assert_invalid(
+            "interface I {\n\
+             \x20   const static func f(): Int64\n\
+             }\n\
+             class C <: I {\n\
+             \x20   public static func f() { 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "interface I {\n\
+             \x20   const static func f(): Int64\n\
+             }\n\
+             class C <: I {\n\
+             \x20   public const static func f() { 1 }\n\
              }\n\
              main() {}\n",
         );

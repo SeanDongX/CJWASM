@@ -1634,6 +1634,7 @@ pub fn monomorphize_program(program: &mut Program) {
                 };
                 ClassMethod {
                     override_: m.override_,
+                    is_const: m.is_const,
                     func: Function {
                         visibility: m.func.visibility.clone(),
                         name: method_name,
@@ -2340,6 +2341,7 @@ mod tests {
                     static_init: None,
                     methods: vec![crate::ast::ClassMethod {
                         override_: false,
+                        is_const: false,
                         func: Function {
                             visibility: Visibility::default(),
                             name: "Wrapper.get".to_string(),

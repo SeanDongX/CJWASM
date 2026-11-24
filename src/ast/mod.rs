@@ -555,6 +555,8 @@ pub struct InterfaceMethod {
     pub return_type: Option<Type>,
     /// 默认实现体（若有则为 Some）
     pub default_body: Option<Vec<Stmt>>,
+    /// 是否为 const 函数（const func）。const 接口函数必须由 const 函数实现。
+    pub is_const: bool,
 }
 
 /// 接口关联类型定义（如 type Element）
@@ -633,6 +635,8 @@ pub struct InitDef {
 #[derive(Debug, Clone)]
 pub struct ClassMethod {
     pub override_: bool,
+    /// 是否为 const 函数（const func / const static func）
+    pub is_const: bool,
     pub func: Function,
 }
 

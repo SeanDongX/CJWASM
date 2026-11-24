@@ -7728,6 +7728,7 @@ mod tests {
                 static_init: None,
                 methods: vec![ClassMethod {
                     override_: false,
+                    is_const: false,
                     func: FuncDef {
                         visibility: Visibility::default(),
                         name: "get_size".to_string(),
@@ -8138,6 +8139,7 @@ mod tests {
                     params: vec![],
                     return_type: Some(Type::Int64),
                     default_body: Some(vec![Stmt::Return(Some(Expr::Integer(0)))]),
+                    is_const: false,
                 }],
                 assoc_types: vec![],
             }],
@@ -8197,6 +8199,7 @@ mod tests {
                     params: vec![],
                     return_type: Some(Type::Unit),
                     default_body: None,
+                    is_const: false,
                 }],
                 assoc_types: vec![],
             }],

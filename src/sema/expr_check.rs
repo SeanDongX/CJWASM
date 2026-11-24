@@ -240,6 +240,11 @@ fn global_const_ty(c: &crate::ast::ConstDef) -> Ty {
     let declared = ty_of(&c.ty);
     if c.ty == Type::Int64 {
         let init_ty = static_expr_ty(&c.init);
+        // 无类型标注的整数常量（占位 Int64，如 `let N = 101u64`）按整数字面量处理，
+        // 使其可与任意整数类型共同参与运算，避免把 UInt64*常量 误判为类型不匹配。
+        if init_ty == Ty::IntLit {
+            return Ty::IntLit;
+        }
         if matches!(
             init_ty,
             Ty::Bool
@@ -532,6 +537,10 @@ struct Checker<'a> {
     class_fields: HashMap<String, HashMap<String, bool>>,
     /// 当前函数声明的返回类型（用于 `return expr` 类型检查）
     ret_ty: Option<Ty>,
+    /// 属于多构造器枚举的变体名集合：不可反驳绑定（let/var）不可使用这些变体模式。
+    multi_variant_names: HashSet<String>,
+    /// class 名 → 是否定义显式 init（常量构造要求目标类型有 const init）。
+    class_has_init: HashMap<String, bool>,
 }
 
 /// 对整个 Program 做表达式/赋值类型检查，错误追加到 `errors`。
@@ -548,17 +557,25 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         type_names.insert(i.name.clone());
     }
     let mut enum_names: HashSet<String> = HashSet::new();
+    let mut multi_variant_names: HashSet<String> = HashSet::new();
     for e in &program.enums {
         type_names.insert(e.name.clone());
         enum_names.insert(e.name.clone());
+        if e.variants.len() > 1 {
+            for v in &e.variants {
+                multi_variant_names.insert(v.name.clone());
+            }
+        }
     }
     // class 名 → 字段名 → 是否可变（用于 `C.x = v` 静态字段赋值检查）。
     let mut class_fields: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    let mut class_has_init: HashMap<String, bool> = HashMap::new();
     for c in &program.classes {
         class_fields.insert(
             c.name.clone(),
             c.fields.iter().map(|f| (f.name.clone(), f.is_mut)).collect(),
         );
+        class_has_init.insert(c.name.clone(), c.init.is_some());
     }
 
     let mut globals = HashMap::new();
@@ -598,6 +615,8 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         enum_names,
         class_fields,
         ret_ty: None,
+        multi_variant_names,
+        class_has_init,
     };
 
     for func in &program.functions {
@@ -1056,6 +1075,7 @@ impl<'a> Checker<'a> {
                 }
                 let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
                 let cinit = if deferred { None } else { literal_int(value) };
+                self.check_irrefutable_pattern(pattern);
                 self.bind_pattern_const(pattern, bind_ty, deferred, cinit);
             }
             Stmt::Var { pattern, ty, value } => {
@@ -1071,10 +1091,12 @@ impl<'a> Checker<'a> {
                 }
                 let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
                 let cinit = if deferred { None } else { literal_int(value) };
+                self.check_irrefutable_pattern(pattern);
                 self.bind_pattern_const(pattern, bind_ty, true, cinit);
             }
             Stmt::Const { name, ty, value } => {
                 let value_ty = self.check_expr(value);
+                self.check_const_init_ctors(value);
                 let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
                 if let Some(ann) = ann_ty.as_ref() {
                     self.check_assignable(ann, &value_ty, "常量初始化");
@@ -1196,6 +1218,74 @@ impl<'a> Checker<'a> {
 
     fn bind_pattern(&mut self, pattern: &Pattern, ty: Ty, mutable: bool) {
         self.bind_pattern_const(pattern, ty, mutable, None)
+    }
+
+    /// 不可反驳绑定（let/var）的 pattern 不能使用多构造器枚举的变体模式。
+    fn check_irrefutable_pattern(&mut self, pattern: &Pattern) {
+        match pattern {
+            Pattern::Variant {
+                enum_name,
+                variant_name,
+                ..
+            } => {
+                if enum_name.is_empty() && self.multi_variant_names.contains(variant_name) {
+                    self.err(format!(
+                        "不可反驳绑定不能使用多构造器枚举的变体模式 '{}'",
+                        variant_name
+                    ));
+                }
+            }
+            Pattern::Tuple(ps) => {
+                for p in ps {
+                    self.check_irrefutable_pattern(p);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 常量初始化表达式若调用函数，其实参中的对象构造必须是 const 构造
+    /// （目标类定义了 init，按 const init 保守放行；struct 无法判定，保守放行）。
+    fn check_const_init_ctors(&mut self, value: &Expr) {
+        match value {
+            Expr::Call { args, .. }
+            | Expr::MethodCall { args, .. }
+            | Expr::ConstructorCall { args, .. } => {
+                for a in args {
+                    self.scan_non_const_ctor(a);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_non_const_ctor(&mut self, e: &Expr) {
+        match e {
+            Expr::ConstructorCall { name, args, .. } => {
+                if self.class_has_init.get(name) == Some(&false) {
+                    self.err(format!("常量初始化中调用了非 const 构造 '{}()'", name));
+                }
+                for a in args {
+                    self.scan_non_const_ctor(a);
+                }
+            }
+            Expr::Call { args, .. } | Expr::MethodCall { args, .. } => {
+                for a in args {
+                    self.scan_non_const_ctor(a);
+                }
+            }
+            Expr::Tuple(es) | Expr::Array(es) => {
+                for x in es {
+                    self.scan_non_const_ctor(x);
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                self.scan_non_const_ctor(left);
+                self.scan_non_const_ctor(right);
+            }
+            Expr::Unary { expr, .. } => self.scan_non_const_ctor(expr),
+            _ => {}
+        }
     }
 
     fn bind_pattern_const(
@@ -2069,6 +2159,8 @@ fn int_bit_width(t: &Ty) -> Option<i64> {
         Ty::Int16 | Ty::UInt16 => Some(16),
         Ty::Int32 | Ty::UInt32 => Some(32),
         Ty::Int64 | Ty::UInt64 | Ty::IntNative | Ty::UIntNative => Some(64),
+        // 整数字面量 / 无类型标注整数常量按 Int64 位宽参与越界检查。
+        Ty::IntLit => Some(64),
         _ => None,
     }
 }
@@ -2572,6 +2664,41 @@ mod tests {
             "重定义",
         );
         assert_ok("class C { operator func +(x: Int64): C { this } }\nmain() {}");
+    }
+
+    // ─── w5c-final-pos：常量/模式/移位边界 ─────────────────────────────
+
+    #[test]
+    fn test_w5c_untyped_int_global_const_adapts() {
+        // 无类型标注的 u64 常量按整数字面量参与运算
+        assert_ok("let N = 101u64\nmain() { var x: UInt64 = 1; let y = x * N }");
+        assert_ok("let N = 101u64\nmain() { var x: UInt64 = 1; let y = x % N }");
+    }
+
+    #[test]
+    fn test_w5c_shift_negative_constant_from_intlit_var() {
+        // 整数字面量型变量作左操作数时仍按 Int64 位宽检查负移位
+        assert_err("main() { let x = 3; let y = x << -2 }", "不能为负数");
+    }
+
+    #[test]
+    fn test_w5c_var_multi_variant_pattern_rejected() {
+        assert_err(
+            "enum E { A(Int64) | B(Int64) }\nmain() { var A(x) = A(1) }",
+            "不可反驳绑定",
+        );
+        assert_ok("enum E { A(Int64) }\nmain() { var A(x) = A(1) }");
+    }
+
+    #[test]
+    fn test_w5c_const_init_non_const_ctor_arg_rejected() {
+        // 常量初始化中调用函数，其对象构造成员必须有 init（const 构造）
+        assert_err(
+            "class C() { }\nstruct S { const static func f(x: C): Int64 { 1 } }\n\
+             main() { const c = S.f(C()) }",
+            "非 const 构造",
+        );
+        assert_ok("class C { const init() { } }\nmain() { const o = C() }");
     }
 }
 
