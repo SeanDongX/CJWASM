@@ -5,6 +5,37 @@ use crate::ast::{AssignTarget, BinOp, Expr, Pattern, Stmt, Type, Visibility};
 use crate::lexer::Token;
 
 impl Parser {
+    /// 跳过成对分组 `open ... close`（支持嵌套），若当前 token 不是 `open` 则什么也不做。
+    /// 用于宏调用的 `[...]` 输入与 `(...)` 参数：内容可能是任意语法，只做平衡消费。
+    fn skip_balanced_group(
+        &mut self,
+        open: &Token,
+        close: &Token,
+    ) -> Result<(), ParseErrorAt> {
+        if !self.check(open) {
+            return Ok(());
+        }
+        self.advance();
+        let mut depth = 1u32;
+        while depth > 0 {
+            match self.advance() {
+                Some(t)
+                    if std::mem::discriminant(&t) == std::mem::discriminant(open) =>
+                {
+                    depth += 1
+                }
+                Some(t)
+                    if std::mem::discriminant(&t) == std::mem::discriminant(close) =>
+                {
+                    depth -= 1
+                }
+                Some(_) => {}
+                None => return self.bail(ParseError::UnexpectedEof),
+            }
+        }
+        Ok(())
+    }
+
     /// 将语句列表转换为 Expr：
     /// - 空列表 → Expr::Integer(0) 回退值
     /// - 只有一条 Expr 语句且无前置语句 → 直接使用该表达式
@@ -446,6 +477,19 @@ impl Parser {
                             })
                         }
                     }
+                    // 其他宏调用语句（如 @matchOrThrow[...](x)、@Twice(foo())、
+                    // @When[...] 注解等）：只做语法接纳，不展开宏。宏输入 [...] 和
+                    // 调用参数 (...) 中的内容按平衡括号整体跳过；若后面紧跟声明
+                    // （func/var/...），由后续语句解析正常处理。
+                    Some(Token::Ident(name)) => {
+                        self.advance(); // 宏名
+                        self.skip_balanced_group(&Token::LBracket, &Token::RBracket)?;
+                        self.skip_balanced_group(&Token::LParen, &Token::RParen)?;
+                        Ok(Stmt::Expr(Expr::Macro {
+                            name,
+                            args: Vec::new(),
+                        }))
+                    }
                     _ => self.bail(ParseError::UnexpectedToken(
                         Token::At,
                         "@Assert 或 @Expect".to_string(),
@@ -466,6 +510,8 @@ impl Parser {
                     Some(Token::AndEq) => (true, Some(BinOp::BitAnd)),
                     Some(Token::PipeEq) => (true, Some(BinOp::BitOr)),
                     Some(Token::CaretEq) => (true, Some(BinOp::BitXor)),
+                    // a **= b → a = a ** b（幂运算，右结合由 parse_power 保证）
+                    Some(Token::StarStarEq) => (true, Some(BinOp::Pow)),
                     // a ||= b → a = a || b（短路由 Binary(LogicalOr) 保证）
                     Some(Token::OrOrEq) => (true, Some(BinOp::LogicalOr)),
                     // a &&= b → a = a && b

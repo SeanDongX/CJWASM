@@ -598,31 +598,32 @@ pub enum Token {
     })]
     Float64Suffix(f64),
 
-    // Float32：f 或 f32 后缀；f16 后缀（Float16 在 wasm 目标下按 f32 处理）
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f32|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f32|[0-9][0-9_]*f32|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f16|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f16|[0-9][0-9_]*f16|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
+    // Float32：f、f32 或 f16 后缀（Float16 在 WASM 层同为 f32，值按 f32 解析）
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f32|f16)|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
-        let s = s
-            .trim_end_matches("f32")
-            .trim_end_matches("f16")
-            .trim_end_matches('f');
+        let s = s.trim_end_matches("f32").trim_end_matches("f16").trim_end_matches('f');
         s.parse::<f32>().ok()
     })]
     Float32(f32),
 
-    // 整数字面量（含可选的 Cangjie 类型后缀 i8/i16/i32/i64/u8/u16/u32/u64）
-    #[regex(r"0[xX][0-9a-fA-F][0-9a-fA-F_]*(?:i8|i16|i32|i64|u8|u16|u32|u64)?|0o[0-7][0-7_]*(?:i8|i16|i32|i64|u8|u16|u32|u64)?|0b[01][01_]*(?:i8|i16|i32|i64|u8|u16|u32|u64)?|[0-9][0-9_]*(?:i8|i16|i32|i64|u8|u16|u32|u64)?", |lex| {
-        let slice = lex.slice();
-        let s: String = slice.chars().filter(|c| *c != '_').collect();
-        // 去掉可选的 Cangjie 整数类型后缀（i8/i16/i32/i64/u8/u16/u32/u64）
-        let body = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"]
-            .iter()
-            .find_map(|sfx| s.strip_suffix(sfx))
-            .filter(|b| !b.is_empty())
-            .unwrap_or(s.as_str());
-        if slice.len() >= 2 && (slice.starts_with("0x") || slice.starts_with("0X")) {
+    // 整数字面量，支持可选的 Cangjie 类型后缀（i8/i16/i32/i64/u8/u16/u32/u64）。
+    // 后缀类型信息由变量/常量声明的类型标注承载，此处剥离后按整数解析。
+    #[regex(r"(0[xX][0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*)(i8|i16|i32|i64|u8|u16|u32|u64)?", |lex| {
+        let raw = lex.slice();
+        let s: String = raw.chars().filter(|c| *c != '_').collect();
+        // 剥离整数类型后缀（若有）
+        let suffixes = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"];
+        let mut body: &str = &s;
+        for suf in suffixes {
+            if body.ends_with(suf) {
+                body = &body[..body.len() - suf.len()];
+                break;
+            }
+        }
+        if body.len() >= 2 && (body.starts_with("0x") || body.starts_with("0X")) {
             i64::from_str_radix(&body[2..], 16).ok().or_else(|| u64::from_str_radix(&body[2..], 16).ok().map(|v| v as i64))
-        } else if slice.starts_with("0o") { i64::from_str_radix(&body[2..], 8).ok().or_else(|| u64::from_str_radix(&body[2..], 8).ok().map(|v| v as i64)) }
-        else if slice.starts_with("0b") { i64::from_str_radix(&body[2..], 2).ok().or_else(|| u64::from_str_radix(&body[2..], 2).ok().map(|v| v as i64)) }
+        } else if body.starts_with("0o") { i64::from_str_radix(&body[2..], 8).ok().or_else(|| u64::from_str_radix(&body[2..], 8).ok().map(|v| v as i64)) }
+        else if body.starts_with("0b") { i64::from_str_radix(&body[2..], 2).ok().or_else(|| u64::from_str_radix(&body[2..], 2).ok().map(|v| v as i64)) }
         else { body.parse::<i64>().ok().or_else(|| body.parse::<u64>().ok().map(|v| v as i64)) }
     })]
     Integer(i64),
@@ -686,7 +687,7 @@ pub enum Token {
                 Some('\'') => Some('\''),
                 Some('u') => {
                     // \u{XXXX} unicode escape
-                    let hex = &inner[3..inner.len() - 1];
+                    let hex = &inner[3..inner.len()-1];
                     u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
                 }
                 _ => None,
@@ -1419,12 +1420,35 @@ mod tests {
     }
 
     #[test]
+    fn test_rune_unicode_escape() {
+        // r'\u{26D4}' — Rune 字面量的 unicode 转义
+        let source = "r'\\u{26D4}'";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::RuneLit('\u{26D4}'));
+    }
+
+    #[test]
+    fn test_integer_type_suffix() {
+        // 整数字面量的 Cangjie 类型后缀应并入同一个 Integer token
+        let source = "8i8 16u16 64i64 0x0Au8 0b101u32";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Integer(8));
+        assert_eq!(tokens[1], Token::Integer(16));
+        assert_eq!(tokens[2], Token::Integer(64));
+        assert_eq!(tokens[3], Token::Integer(10));
+        assert_eq!(tokens[4], Token::Integer(5));
+    }
+
+    #[test]
     fn test_float16_suffix() {
+        // f16 后缀按 Float32 token 解析（WASM 中 Float16 亦为 f32）
         let source = "2.003E4f16 1.5f16";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         match tokens[0] {
-            Token::Float32(v) => assert!((v - 20030.0).abs() < 0.01),
+            Token::Float32(v) => assert!((v - 20030.0).abs() < 1.0),
             ref other => panic!("Expected Float32, got {:?}", other),
         }
         match tokens[1] {

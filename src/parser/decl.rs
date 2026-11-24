@@ -332,7 +332,7 @@ impl Parser {
                     }
                     Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
                     Some(Token::Extend) => extends.push(self.parse_extend()?),
-                    // P2.2: type Name = Type
+                    // P2.2: type Name = Type  /  type Name<T, U> = Type<T, U>
                     Some(Token::TypeAlias) => {
                         self.advance();
                         let alias_name = match self.advance() {
@@ -345,8 +345,18 @@ impl Parser {
                             }
                             None => return self.bail(ParseError::UnexpectedEof),
                         };
+                        // 类型别名可带泛型参数（如 type Arr<T> = Array<Int8>），
+                        // 目标类型中的 T 按类型参数解析。
+                        let (type_params, _) = self.parse_type_params_with_constraints()?;
+                        let prev_params =
+                            std::mem::replace(&mut self.current_type_params, type_params);
                         self.expect(Token::Assign)?;
                         let target_ty = self.parse_type()?;
+                        self.current_type_params = prev_params;
+                        // cjc 允许类型别名声明以分号结尾
+                        if self.check(&Token::Semicolon) {
+                            self.advance();
+                        }
                         self.type_aliases
                             .insert(alias_name.clone(), target_ty.clone());
                         type_aliases.push((alias_name, target_ty));
@@ -470,6 +480,10 @@ impl Parser {
             if self.check(&Token::Star) {
                 self.advance();
                 // import path.to.* → 导入所有项
+                // cjc 允许 import 语句以分号结尾，这里可选消费
+                if self.check(&Token::Semicolon) {
+                    self.advance();
+                }
                 return Ok(Import {
                     module_path,
                     items: None,
@@ -502,6 +516,10 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RBrace)?;
+                // cjc 允许 import 语句以分号结尾，这里可选消费
+                if self.check(&Token::Semicolon) {
+                    self.advance();
+                }
                 return Ok(Import {
                     module_path,
                     items: Some(items),
@@ -526,6 +544,10 @@ impl Parser {
         } else {
             None
         };
+        // cjc 允许 import 语句以分号结尾，这里可选消费
+        if self.check(&Token::Semicolon) {
+            self.advance();
+        }
         Ok(Import {
             module_path,
             items: None,
@@ -1251,48 +1273,45 @@ impl Parser {
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
-        // 解析接口继承 : Parent1, Parent2 或 <: Parent (cjc)
-        let parents = if self.check(&Token::Colon) || self.check(&Token::SubType) {
-            self.advance();
-            let mut ps = Vec::new();
+        // 解析泛型类型参数 <T, U: Bound, ...>（InterfaceDef 暂不存储类型参数）
+        let _ = self.parse_type_params_with_constraints()?;
+        // 解析接口继承 <: Parent1 & Parent2 或 : Parent1, Parent2 (cjc)
+        // 语法顺序: interface Name<T> [<: Parents] [where T <: Bound] { ... }
+        // 兼容 where 在 <: 之前出现的写法。
+        let mut parents = Vec::new();
+        let parse_parents = |this: &mut Self, parents: &mut Vec<String>| -> Result<(), ParseErrorAt> {
+            if !(this.check(&Token::Colon) || this.check(&Token::SubType)) {
+                return Ok(());
+            }
+            this.advance();
             loop {
-                ps.push(match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(tok, "父接口名".to_string()))
+                // 用 parse_type 消费父接口类型（支持泛型参数，如 I1<U>）
+                match this.parse_type()? {
+                    Type::Struct(n, _) => parents.push(n),
+                    Type::TypeParam(n) => parents.push(n),
+                    Type::Qualified(path) => parents.push(path.join(".")),
+                    _ => {
+                        return this
+                            .bail(ParseError::UnexpectedToken(
+                                this.peek().cloned().unwrap_or(Token::Ident(String::new())),
+                                "父接口名".to_string(),
+                            ))
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
-                });
+                }
                 // cjc: 多继承用 & 分隔 (interface Foo <: A & B)；也兼容逗号
-                if self.check(&Token::And) || self.check(&Token::Comma) {
-                    self.advance();
+                if this.check(&Token::And) || this.check(&Token::Comma) {
+                    this.advance();
                 } else {
                     break;
                 }
             }
-            ps
-        } else {
-            Vec::new()
+            Ok(())
         };
-        // 兜底: 父接口名后 <T> 若未消费，此处消费（如 interface Foo <: Bar<T> {）
-        if self.check(&Token::Lt) {
-            self.advance();
-            loop {
-                let _ = self.parse_type()?;
-                if self.check(&Token::Gt) {
-                    self.advance();
-                    break;
-                }
-                if self.check(&Token::Comma) {
-                    self.advance();
-                } else {
-                    return self.bail(ParseError::UnexpectedToken(
-                        self.peek().cloned().unwrap_or(Token::Comma),
-                        "`,` 或 `>`".to_string(),
-                    ));
-                }
-            }
-        }
+        parse_parents(self, &mut parents)?;
+        let _ = self.parse_where_clause()?;
+        // 兼容 where 之后仍跟 <: 的写法
+        parse_parents(self, &mut parents)?;
+        let _ = self.parse_where_clause()?;
         self.expect(Token::LBrace)?;
         let mut methods = Vec::new();
         let mut assoc_types = Vec::new();
@@ -1448,7 +1467,6 @@ impl Parser {
             } else {
                 None
             };
-            // 可选 where 子句（如 func write<T>(v: T): Unit where T <: ToString { ... }）
             let _ = self.parse_where_clause()?;
             if self.check(&Token::Lt) {
                 self.advance();

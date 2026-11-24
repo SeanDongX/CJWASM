@@ -2316,6 +2316,37 @@ mod tests {
     }
 
     #[test]
+    fn test_p_starstar_eq_compound_assign() {
+        // a **= b 展开为 a = a ** b
+        let source = r#"
+            func main(): Int64 {
+                var a: Int64 = 2
+                var b: UInt64 = 3
+                a **= b
+                return a
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        match &program.functions[0].body[2] {
+            Stmt::Assign { target, value } => {
+                assert!(matches!(target, AssignTarget::Var(name) if name == "a"));
+                match value {
+                    Expr::Binary { op: BinOp::Pow, left, right } => {
+                        assert!(matches!(left.as_ref(), Expr::Var(name) if name == "a"));
+                        assert!(matches!(right.as_ref(), Expr::Var(name) if name == "b"));
+                    }
+                    other => panic!("expected `a ** b`, got {:?}", other),
+                }
+            }
+            other => panic!("expected Assign stmt, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_p_less_than_builtin_max_is_comparison() {
         // a < UInt32.Max 必须解析为比较，而不是泛型实参
         let source = r#"
@@ -3548,5 +3579,170 @@ mod tests {
             &program.functions[0].body[0],
             Stmt::Expr(Expr::TryBlock { .. })
         ));
+    }
+    // w2c-declpos: interface 声明的位置语法
+    #[test]
+    fn test_interface_type_params_and_where() {
+        let program = parse_ok(
+            "interface I<T> where T <: Any { func f(x: T): T }",
+        );
+        assert_eq!(program.interfaces.len(), 1);
+        assert_eq!(program.interfaces[0].name, "I");
+    }
+
+    #[test]
+    fn test_interface_generic_inheritance() {
+        let program = parse_ok("interface J<U> <: I1<U> & I2<Int32> {}");
+        assert_eq!(program.interfaces.len(), 1);
+        assert_eq!(program.interfaces[0].parents, vec!["I1", "I2"]);
+    }
+
+    #[test]
+    fn test_interface_inheritance_then_where() {
+        let program = parse_ok("interface I10<T> <: I2 where T <: Any {}");
+        assert_eq!(program.interfaces[0].parents, vec!["I2"]);
+    }
+
+    #[test]
+    fn test_interface_generic_method_and_where() {
+        let program = parse_ok(
+            r#"
+            interface I<T> {
+                func f(x: T): T
+                static func s<U>(): Unit
+                func g<V>(x: V): Unit where V <: Any
+            }
+            "#,
+        );
+        assert_eq!(program.interfaces[0].methods.len(), 3);
+        assert_eq!(program.interfaces[0].methods[1].name, "s");
+    }
+
+    // w2c-declpos: 泛型类型别名
+    #[test]
+    fn test_type_alias_generic_params() {
+        let program = parse_ok("type Arr<T> = Array<Int8>");
+        assert_eq!(program.type_aliases.len(), 1);
+        assert_eq!(program.type_aliases[0].0, "Arr");
+        assert!(matches!(program.type_aliases[0].1, Type::Array(_)));
+    }
+
+    #[test]
+    fn test_type_alias_generic_params_used_in_target() {
+        let program = parse_ok("type Class3<V> = GenericClassC<Int64, V>");
+        match &program.type_aliases[0].1 {
+            Type::Struct(name, args) => {
+                assert_eq!(name, "GenericClassC");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[1], Type::TypeParam(ref p) if p == "V"));
+            }
+            other => panic!("expected Struct, got {:?}", other),
+        }
+    }
+
+    // w2c-declpos: 宏调用语句只做语法接纳
+    #[test]
+    fn test_macro_invocation_statement_with_input_and_args() {
+        let program = parse_ok(
+            r#"
+            func main() {
+                @matchOrThrow [id] (e)
+                @Twice(foo())
+                @MacroWithoutParens
+            }
+            "#,
+        );
+        let body = &program.functions[0].body;
+        assert_eq!(body.len(), 3);
+        match &body[0] {
+            Stmt::Expr(Expr::Macro { name, .. }) => assert_eq!(name, "matchOrThrow"),
+            other => panic!("expected macro stmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_macro_attribute_before_local_func() {
+        let program = parse_ok(
+            r#"
+            func main() {
+                @When[backend == "cjnative"]
+                func foo(): Unit { }
+                foo()
+            }
+            "#,
+        );
+        let body = &program.functions[0].body;
+        // body[0] 是 @When 宏语句，body[1] 才是被注解的局部函数
+        assert!(matches!(body[0], Stmt::Expr(Expr::Macro { .. })));
+        assert!(matches!(body[1], Stmt::LocalFunc(_)));
+    }
+
+    #[test]
+    fn test_parse_import_trailing_semicolon() {
+        // cjc 样例常见 `import path.Item;`（带分号）形式
+        let source = "import utils.assert.Assert;\nmain() { }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.imports.len(), 1);
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_uint_var_assignment_after_int_init() {
+        // 回归：整数初始化后，下一行的变量名 u8/u16/... 不能被当作字面量后缀吞掉
+        let source = "main() { var u8: UInt8 = 0 u8 = 8 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions[0].body.len(), 2);
+        assert!(matches!(
+            program.functions[0].body[1],
+            Stmt::Assign { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_inout_call_argument() {
+        // C 互操作：调用 CFunc 时的 inout 实参（仅语法接纳）
+        let source = "main() { var x: Int32 = 0 func_01(inout x) }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert!(matches!(
+            program.functions[0].body[1],
+            Stmt::Expr(Expr::Call { .. })
+        ));
+    }
+
+    #[test]
+    fn test_parse_zero_arg_lambda_immediate_call() {
+        // `{ => expr }()` — 零参 lambda 立即调用，求值为其主体
+        let source = "main() { let x = { => 1 }() }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        if let Stmt::Let { value, .. } = &program.functions[0].body[0] {
+            assert!(matches!(value, Expr::Integer(1)));
+        } else {
+            panic!("应为 let 语句");
+        }
+    }
+
+    #[test]
+    fn test_parse_type_alias_trailing_semicolon() {
+        // cjc 允许类型别名声明以分号结尾：type T = Int64;
+        let source = "type TestedType = Int64;\nmain() { }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.type_aliases.len(), 1);
+        assert_eq!(program.type_aliases[0].0, "TestedType");
     }
 }

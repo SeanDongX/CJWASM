@@ -205,6 +205,12 @@ pub fn parse_source(source: &str) -> Result<Program, String> {
         .parse_program()
         .map_err(|e| format!("语法错误: {}", e))?;
 
+    // 语义校验：重定义 / static+实例同名重载 / override 签名 / 接口实现完整性。
+    crate::sema::validate_program(&program).map_err(|errs| {
+        let msgs: Vec<String> = errs.iter().map(|e| e.message.clone()).collect();
+        format!("语义错误: {}", msgs.join("; "))
+    })?;
+
     Ok(program)
 }
 

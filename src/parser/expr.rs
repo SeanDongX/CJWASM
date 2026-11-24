@@ -322,6 +322,23 @@ impl Parser {
     pub(crate) fn parse_postfix_from_expr(&mut self, mut expr: Expr) -> Result<Expr, ParseErrorAt> {
         loop {
             match self.peek() {
+                // 立即调用表达式，如零参 lambda `{ => expr }()`：
+                // 无捕获、无参数的 lambda 直接求值其主体（语义等价于立即调用）。
+                Some(Token::LParen) => {
+                    if let Expr::Lambda { params, body, .. } = &expr {
+                        if params.is_empty() {
+                            self.advance(); // consume (
+                            let (args, named_args) = self.parse_args()?;
+                            self.expect(Token::RParen)?;
+                            if args.is_empty() && named_args.is_empty() {
+                                expr = (**body).clone();
+                                continue;
+                            }
+                        }
+                    }
+                    // 其他形态的立即调用暂不支持
+                    break;
+                }
                 Some(Token::LBracket) => {
                     self.advance();
                     // 支持 arr[..end] 语法（从开头到 end）
@@ -701,18 +718,8 @@ impl Parser {
                 self.parse_macro_call()
             }
             Some(Token::Integer(n)) => {
-                // 可选后缀 u8/u16/...（如 0x0Au8），消费掉以便后续不把 u8 当独立 token
-                if matches!(self.peek(), Some(Token::Ident(ref s)) if s == "u8" || s == "u16" || s == "u32" || s == "u64")
-                    || matches!(
-                        self.peek(),
-                        Some(Token::TypeUInt8)
-                            | Some(Token::TypeUInt16)
-                            | Some(Token::TypeUInt32)
-                            | Some(Token::TypeUInt64)
-                    )
-                {
-                    self.advance();
-                }
+                // 整数字面量后缀（i8/u8/...）已在词法层并入同一个 token，
+                // 此处不再向后窥探并吞掉同名标识符（否则会跨行吞掉变量名）。
                 // 检查是否是范围表达式
                 if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                     let inclusive = self.check(&Token::DotDotEq);
@@ -1901,6 +1908,10 @@ impl Parser {
         }
 
         loop {
+            // C 互操作：inout 实参修饰符（按值传递，仅做语法接纳）
+            if self.check(&Token::Inout) {
+                self.advance();
+            }
             // P2.9: 命名参数 name!: value 或 name: value (cjc 兼容)
             if let Some(Token::Ident(_)) = self.peek() {
                 let next = self.peek_at(1).cloned();
