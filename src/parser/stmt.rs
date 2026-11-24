@@ -449,51 +449,64 @@ impl Parser {
             }
             Some(Token::At) => {
                 let (at_start, _) = self.at();
-                self.advance();
-                match self.peek().cloned() {
-                    Some(Token::Ident(name)) if name == "Assert" || name == "Expect" => {
-                        let is_assert = name == "Assert";
-                        self.advance();
-                        self.expect(Token::LParen)?;
-                        let left = self.parse_expr()?;
-                        let right = if self.check(&Token::Comma) {
-                            self.advance();
-                            self.parse_expr()?
-                        } else {
-                            Expr::Bool(true)
-                        };
-                        self.expect(Token::RParen)?;
-                        if is_assert {
-                            Ok(Stmt::Assert {
-                                left,
-                                right,
-                                line: at_start,
-                            })
-                        } else {
-                            Ok(Stmt::Expect {
-                                left,
-                                right,
-                                line: at_start,
-                            })
+                self.advance(); // @
+                let name = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => {
+                        return self.bail(ParseError::UnexpectedToken(
+                            tok,
+                            "宏名称".to_string(),
+                        ))
+                    }
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                // 可选的宏属性/类型实参列表：@Assert[validator]、@AssertThrows[Exception]
+                if self.check(&Token::LBracket) {
+                    self.skip_balanced_mixed()?;
+                }
+                // 可选的实参列表
+                let args = if self.check(&Token::LParen) {
+                    self.parse_macro_args()?
+                } else {
+                    Vec::new()
+                };
+                match name.as_str() {
+                    // @Assert(...) / @Expect(...) 保留结构化语句（已有语义/代码生成）
+                    "Assert" => {
+                        let mut it = args.into_iter();
+                        let left = it.next().unwrap_or(Expr::Bool(true));
+                        let right = it.next().unwrap_or(Expr::Bool(true));
+                        Ok(Stmt::Assert {
+                            left,
+                            right,
+                            line: at_start,
+                        })
+                    }
+                    "Expect" => {
+                        let mut it = args.into_iter();
+                        let left = it.next().unwrap_or(Expr::Bool(true));
+                        let right = it.next().unwrap_or(Expr::Bool(true));
+                        Ok(Stmt::Expect {
+                            left,
+                            right,
+                            line: at_start,
+                        })
+                    }
+                    // 其余 unittest 宏（@PowerAssert/@Fail/@AssertThrows/@FailExpect/@On/@Called 等）
+                    // 仅做语法接纳，不展开语义。CHIR 对未知宏降级为 Nop。
+                    // 继续解析后缀（如 @On(...).returns(0)、@Called(...).times(2)）。
+                    _ => {
+                        let mut all_args = args;
+                        // 宏的尾随块参数：@EnsurePreparedToMock { => ... }
+                        if self.check(&Token::LBrace) && self.brace_starts_lambda() {
+                            all_args.push(self.parse_primary()?);
                         }
-                    }
-                    // 其他宏调用语句（如 @matchOrThrow[...](x)、@Twice(foo())、
-                    // @When[...] 注解等）：只做语法接纳，不展开宏。宏输入 [...] 和
-                    // 调用参数 (...) 中的内容按平衡括号整体跳过；若后面紧跟声明
-                    // （func/var/...），由后续语句解析正常处理。
-                    Some(Token::Ident(name)) => {
-                        self.advance(); // 宏名
-                        self.skip_balanced_group(&Token::LBracket, &Token::RBracket)?;
-                        self.skip_balanced_group(&Token::LParen, &Token::RParen)?;
-                        Ok(Stmt::Expr(Expr::Macro {
+                        let expr = self.parse_postfix_from_expr(Expr::Macro {
                             name,
-                            args: Vec::new(),
-                        }))
+                            args: all_args,
+                        })?;
+                        Ok(Stmt::Expr(expr))
                     }
-                    _ => self.bail(ParseError::UnexpectedToken(
-                        Token::At,
-                        "@Assert 或 @Expect".to_string(),
-                    )),
                 }
             }
             _ => {
