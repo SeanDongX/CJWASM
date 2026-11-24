@@ -321,7 +321,7 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
 // 所有规则都能在单文件内基于 AST 判定，父类型无法在本地解析时保守跳过。
 
 use crate::ast::{
-    AssignTarget, ClassDef, ClassMethod, EnumDef, Function, InterfaceDef, InterfaceMethod,
+    AssignTarget, ClassDef, ClassMethod, EnumDef, Function, InterfaceDef, InterfaceMethod, Pattern,
     StructDef, Visibility,
 };
 use std::collections::HashSet;
@@ -349,6 +349,14 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     let index = ProgramIndex::new(program);
 
     check_function_groups(program, &index, &mut errors);
+    // 11.1.5.1(8)：程序入口点 main 的签名。
+    check_main_signature(program, &mut errors);
+    // 3.1(3)：顶层名称共享命名空间，禁止重复/跨类别冲突。
+    check_top_level_name_collisions(program, &mut errors);
+    // 3.1(3)：同一作用域内局部变量重复声明。
+    check_duplicate_local_bindings(program, &mut errors);
+    // 3.2.3.2(3)/(6)：局部变量 / 局部函数先使用后声明。
+    check_use_before_declaration(program, &mut errors);
     for cls in &program.classes {
         check_class(cls, &index, &mut errors);
         check_ctor_param_order(cls, &mut errors);
@@ -687,6 +695,973 @@ fn check_function_groups(
         for group in by_name.values() {
             check_signature_group(owner_desc, group, check_static, errors);
         }
+    }
+}
+
+// ─── 11.1.5.1(8)：程序入口点 main 的签名 ──────────────────────────────────
+
+/// main 允许的返回类型：Unit 或各类整数类型（含 Native）。
+fn is_valid_main_return(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Unit
+            | Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::IntNative
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::UIntNative
+    )
+}
+
+/// 从 main 函数体的 `return` 语句保守推断返回类型。
+///
+/// 只在能确定类型时给出结果：整数字面量按 Int64、浮点按 Float64、布尔 / Rune /
+/// 字符串按对应基础类型；`return 变量` 仅在变量有显式类型标注时解析。其余形态
+/// （函数调用、方法调用、复杂表达式）一律返回 None，避免误判合法程序。
+fn infer_main_return(func: &Function) -> Option<Type> {
+    let mut locals: HashMap<String, Type> = HashMap::new();
+    collect_explicit_local_types(&func.body, &mut locals);
+
+    let mut found: Option<Type> = None;
+    for stmt in &func.body {
+        if let Stmt::Return(Some(e)) = stmt {
+            if let Some(t) = simple_expr_type(e, &locals) {
+                // 多次 return 类型不一致时不作判定。
+                match &found {
+                    Some(prev) if *prev != t => return None,
+                    _ => found = Some(t),
+                }
+            }
+        }
+    }
+    found
+}
+
+/// 收集函数体内（递归含嵌套块）带显式类型标注的局部变量类型。
+fn collect_explicit_local_types(stmts: &[Stmt], out: &mut HashMap<String, Type>) {
+    fn pattern_names(p: &Pattern, out: &mut Vec<String>) {
+        match p {
+            Pattern::Binding(n) => out.push(n.clone()),
+            Pattern::TypeTest { binding, .. } => out.push(binding.clone()),
+            Pattern::Tuple(ps) => ps.iter().for_each(|q| pattern_names(q, out)),
+            Pattern::Struct { fields, .. } => {
+                fields.iter().for_each(|(_, q)| pattern_names(q, out))
+            }
+            Pattern::Variant { payload: Some(q), .. } => pattern_names(q, out),
+            Pattern::Or(ps) => {
+                if let Some(q) = ps.first() {
+                    pattern_names(q, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let { pattern, ty: Some(ty), .. } | Stmt::Var { pattern, ty: Some(ty), .. } => {
+                let mut names = Vec::new();
+                pattern_names(pattern, &mut names);
+                for n in names {
+                    out.insert(n, ty.clone());
+                }
+            }
+            Stmt::Const { name, ty: Some(ty), .. } => {
+                out.insert(name.clone(), ty.clone());
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => collect_explicit_local_types(body, out),
+            Stmt::For { body, .. }
+            | Stmt::WhileLet { body, .. } => collect_explicit_local_types(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// 仅对可确定的基础类型表达式给出类型；其它返回 None（保守）。
+fn simple_expr_type(e: &Expr, locals: &HashMap<String, Type>) -> Option<Type> {
+    match e {
+        Expr::Integer(_) | Expr::IntegerSuffixed(_, _) => Some(Type::Int64),
+        Expr::Float(_) => Some(Type::Float64),
+        Expr::Float32(_) => Some(Type::Float32),
+        Expr::Bool(_) => Some(Type::Bool),
+        Expr::Rune(_) => Some(Type::Rune),
+        Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
+        Expr::Var(name) => locals.get(name).cloned(),
+        Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
+        _ => None,
+    }
+}
+
+/// 11.1.5.1(8)：主包中 `main` 只能无参或带一个 `Array<String>` 参数，返回类型
+/// 只能是 Unit 或整数类型。
+fn check_main_signature(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 只有主包（无 package 声明）的 main 才是程序入口；库包同样允许定义 main。
+    if program.package_name.is_some() {
+        return;
+    }
+    for func in &program.functions {
+        if func.name != "main" || func.extern_import.is_some() {
+            continue;
+        }
+        let params_ok = match func.params.as_slice() {
+            [] => true,
+            [p] => matches!(&p.ty, Type::Array(inner) if **inner == Type::String),
+            _ => false,
+        };
+        if !params_ok {
+            errors.push(SemanticError {
+                message: "程序入口 main 只能没有参数，或只有一个 Array<String> 类型的参数（11.1.5.1(8)）"
+                    .to_string(),
+            });
+        }
+        let ret = func
+            .return_type
+            .clone()
+            .or_else(|| infer_main_return(func));
+        if let Some(rt) = ret {
+            if !is_valid_main_return(&rt) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "程序入口 main 的返回类型必须为 Unit 或整数类型，不允许 '{}'（11.1.5.1(8)）",
+                        type_display(&rt)
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 轻量类型名显示（仅用于错误信息）。
+fn type_display(ty: &Type) -> String {
+    match ty {
+        Type::Array(inner) => format!("Array<{}>", type_display(inner)),
+        Type::Struct(name, _) => name.clone(),
+        other => format!("{:?}", other),
+    }
+}
+
+// ─── 3.1(3)：顶层名称共享同一命名空间的重复 / 冲突 ────────────────────────
+
+/// 3.1(3)：变量、函数、类型别名与类型声明在顶层共享同一命名空间，跨类别同名即冲突。
+///
+/// 只判定**不同类别**之间的冲突：同类别重复（如同名顶层函数的重载、宏展开或
+/// 平台条件编译生成的多份同名声明）不在此处判定，避免误伤；顶层函数同签名重复
+/// 由 `check_function_groups` 处理。
+fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticError>) {
+    fn record(
+        seen: &mut HashMap<String, (&'static str, String)>,
+        name: &str,
+        kind: &'static str,
+        desc: &str,
+        errors: &mut Vec<SemanticError>,
+    ) {
+        if name.is_empty() || name.starts_with("__") {
+            return;
+        }
+        match seen.get(name) {
+            None => {
+                seen.insert(name.to_string(), (kind, desc.to_string()));
+            }
+            Some((prev_kind, prev_desc)) => {
+                if *prev_kind == kind {
+                    // 同类别重复：由专门检查或宏展开负责，保守跳过。
+                    return;
+                }
+                errors.push(SemanticError {
+                    message: format!(
+                        "顶层名称 '{}' 在命名空间中重复或冲突（{} 与 {}，3.1(3)）",
+                        name, prev_desc, desc
+                    ),
+                });
+            }
+        }
+    }
+
+    let mut seen: HashMap<String, (&'static str, String)> = HashMap::new();
+    for c in &program.constants {
+        record(&mut seen, &c.name, "变量", "变量", errors);
+    }
+    for f in &program.functions {
+        // 仅顶层函数（成员方法以 `Type.method` 形式存储在同一列表中）。
+        if f.name.contains('.') || f.name.contains("::") {
+            continue;
+        }
+        record(&mut seen, &f.name, "函数", "函数", errors);
+    }
+    for c in &program.classes {
+        record(&mut seen, &c.name, "class", "class", errors);
+    }
+    for s in &program.structs {
+        record(&mut seen, &s.name, "struct", "struct", errors);
+    }
+    for e in &program.enums {
+        record(&mut seen, &e.name, "enum", "enum", errors);
+    }
+    for i in &program.interfaces {
+        record(&mut seen, &i.name, "interface", "interface", errors);
+    }
+    for (name, _) in &program.type_aliases {
+        record(&mut seen, name, "type", "type 别名", errors);
+    }
+}
+
+// ─── 3.1(3)：同一作用域内重复绑定局部变量 ─────────────────────────────────
+
+/// 3.1(3)：同一作用域内不允许重复声明同名变量（遮蔽只允许发生在外层作用域）。
+///
+/// 按块维护作用域栈，仅将 `let`/`var`/`const`/模式绑定的名字登记到最内层作用域；
+/// 子块、分支、匹配分支、lambda 体各自开启新作用域，因此合法遮蔽不会被误判。
+fn check_duplicate_local_bindings(program: &Program, errors: &mut Vec<SemanticError>) {
+    for f in &program.functions {
+        walk_body_for_dups(&f.body, errors);
+    }
+    for cls in &program.classes {
+        if let Some(init) = &cls.init {
+            walk_body_for_dups(&init.body, errors);
+        }
+        if let Some(d) = &cls.deinit {
+            walk_body_for_dups(d, errors);
+        }
+        if let Some(si) = &cls.static_init {
+            walk_body_for_dups(si, errors);
+        }
+        for m in &cls.methods {
+            if !m.func.body.is_empty() {
+                walk_body_for_dups(&m.func.body, errors);
+            }
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(body) = &m.default_body {
+                walk_body_for_dups(body, errors);
+            }
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            walk_body_for_dups(&f.body, errors);
+        }
+    }
+}
+
+fn walk_body_for_dups(stmts: &[Stmt], errors: &mut Vec<SemanticError>) {
+    let mut scopes: Vec<HashSet<String>> = Vec::new();
+    walk_block_for_dups(stmts, &mut scopes, errors);
+}
+
+fn pattern_binding_names(p: &Pattern, out: &mut Vec<String>) {
+    match p {
+        Pattern::Binding(n) => out.push(n.clone()),
+        Pattern::TypeTest { binding, .. } => out.push(binding.clone()),
+        Pattern::Tuple(ps) => ps.iter().for_each(|q| pattern_binding_names(q, out)),
+        Pattern::Struct { fields, .. } => {
+            fields.iter().for_each(|(_, q)| pattern_binding_names(q, out))
+        }
+        Pattern::Variant { payload: Some(q), .. } => pattern_binding_names(q, out),
+        Pattern::Or(ps) => {
+            if let Some(q) = ps.first() {
+                pattern_binding_names(q, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn declare_local_names(
+    names: &[String],
+    scopes: &mut Vec<HashSet<String>>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let Some(scope) = scopes.last_mut() else {
+        return;
+    };
+    // 同一模式内重复出现同名（如枚举变体模式 `(Year, Year)`）不是重复声明，
+    // 先去重；只有与同一作用域内先前声明冲突才算重复。
+    let mut seen_in_pattern: HashSet<&str> = HashSet::new();
+    for name in names {
+        if !seen_in_pattern.insert(name.as_str()) {
+            continue;
+        }
+        if !scope.insert(name.clone()) {
+            errors.push(SemanticError {
+                message: format!("同一作用域内变量 '{}' 被重复声明（3.1(3)）", name),
+            });
+        }
+    }
+}
+
+fn walk_block_for_dups(
+    stmts: &[Stmt],
+    scopes: &mut Vec<HashSet<String>>,
+    errors: &mut Vec<SemanticError>,
+) {
+    scopes.push(HashSet::new());
+    for s in stmts {
+        walk_stmt_for_dups(s, scopes, errors);
+    }
+    scopes.pop();
+}
+
+fn walk_stmt_for_dups(
+    stmt: &Stmt,
+    scopes: &mut Vec<HashSet<String>>,
+    errors: &mut Vec<SemanticError>,
+) {
+    match stmt {
+        Stmt::Let { pattern, value, .. } | Stmt::Var { pattern, value, .. } => {
+            walk_expr_for_dups(value, scopes, errors);
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, &mut names);
+            declare_local_names(&names, scopes, errors);
+        }
+        Stmt::Const { name, value, .. } => {
+            walk_expr_for_dups(value, scopes, errors);
+            declare_local_names(std::slice::from_ref(name), scopes, errors);
+        }
+        Stmt::Assign { target, value } => {
+            walk_expr_for_dups(value, scopes, errors);
+            walk_assign_target_for_dups(target, scopes, errors);
+        }
+        Stmt::Expr(e) => walk_expr_for_dups(e, scopes, errors),
+        Stmt::Return(Some(e)) => walk_expr_for_dups(e, scopes, errors),
+        Stmt::While { cond, body } => {
+            walk_expr_for_dups(cond, scopes, errors);
+            walk_block_for_dups(body, scopes, errors);
+        }
+        Stmt::DoWhile { body, cond } => {
+            walk_block_for_dups(body, scopes, errors);
+            walk_expr_for_dups(cond, scopes, errors);
+        }
+        Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+            walk_block_for_dups(body, scopes, errors);
+        }
+        Stmt::For {
+            var,
+            iterable,
+            body,
+        } => {
+            walk_expr_for_dups(iterable, scopes, errors);
+            scopes.push(HashSet::new());
+            if let Some(scope) = scopes.last_mut() {
+                scope.insert(var.clone());
+            }
+            walk_block_for_dups(body, scopes, errors);
+            scopes.pop();
+        }
+        Stmt::WhileLet {
+            pattern,
+            expr,
+            body,
+        } => {
+            walk_expr_for_dups(expr, scopes, errors);
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, &mut names);
+            scopes.push(HashSet::new());
+            declare_local_names(&names, scopes, errors);
+            walk_block_for_dups(body, scopes, errors);
+            scopes.pop();
+        }
+        Stmt::LocalFunc(f) => walk_body_for_dups(&f.body, errors),
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            walk_expr_for_dups(left, scopes, errors);
+            walk_expr_for_dups(right, scopes, errors);
+        }
+        Stmt::Break | Stmt::Continue | Stmt::Return(None) => {}
+    }
+}
+
+fn walk_assign_target_for_dups(
+    target: &AssignTarget,
+    scopes: &mut Vec<HashSet<String>>,
+    errors: &mut Vec<SemanticError>,
+) {
+    match target {
+        AssignTarget::Index { index, .. } => walk_expr_for_dups(index, scopes, errors),
+        AssignTarget::IndexPath { index, .. } => walk_expr_for_dups(index, scopes, errors),
+        AssignTarget::ExprIndex { expr, index } => {
+            walk_expr_for_dups(expr, scopes, errors);
+            walk_expr_for_dups(index, scopes, errors);
+        }
+        AssignTarget::ExprField { object, .. } => walk_expr_for_dups(object, scopes, errors),
+        _ => {}
+    }
+}
+
+fn walk_expr_for_dups(
+    expr: &Expr,
+    scopes: &mut Vec<HashSet<String>>,
+    errors: &mut Vec<SemanticError>,
+) {
+    match expr {
+        Expr::Block(stmts, trailing) => {
+            walk_block_for_dups(stmts, scopes, errors);
+            if let Some(t) = trailing {
+                walk_expr_for_dups(t, scopes, errors);
+            }
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            walk_expr_for_dups(cond, scopes, errors);
+            walk_expr_for_dups(then_branch, scopes, errors);
+            if let Some(eb) = else_branch {
+                walk_expr_for_dups(eb, scopes, errors);
+            }
+        }
+        Expr::IfLet {
+            pattern,
+            expr,
+            then_branch,
+            else_branch,
+        } => {
+            walk_expr_for_dups(expr, scopes, errors);
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, &mut names);
+            scopes.push(HashSet::new());
+            declare_local_names(&names, scopes, errors);
+            walk_expr_for_dups(then_branch, scopes, errors);
+            scopes.pop();
+            if let Some(eb) = else_branch {
+                walk_expr_for_dups(eb, scopes, errors);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            walk_expr_for_dups(expr, scopes, errors);
+            for arm in arms {
+                let mut names = Vec::new();
+                pattern_binding_names(&arm.pattern, &mut names);
+                scopes.push(HashSet::new());
+                declare_local_names(&names, scopes, errors);
+                if let Some(g) = &arm.guard {
+                    walk_expr_for_dups(g, scopes, errors);
+                }
+                walk_expr_for_dups(&arm.body, scopes, errors);
+                scopes.pop();
+            }
+        }
+        Expr::Lambda { params, body, .. } => {
+            scopes.push(HashSet::new());
+            let names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+            declare_local_names(&names, scopes, errors);
+            walk_expr_for_dups(body, scopes, errors);
+            scopes.pop();
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::IsType { expr, .. }
+        | Expr::OptionalChain { object: expr, .. } => walk_expr_for_dups(expr, scopes, errors),
+        Expr::Return(Some(e)) => walk_expr_for_dups(e, scopes, errors),
+        Expr::Binary { left, right, .. } | Expr::NullCoalesce { option: left, default: right } => {
+            walk_expr_for_dups(left, scopes, errors);
+            walk_expr_for_dups(right, scopes, errors);
+        }
+        Expr::Call { args, named_args, .. }
+        | Expr::ConstructorCall { args, named_args, .. }
+        | Expr::SuperCall { args, named_args, .. } => {
+            for a in args {
+                walk_expr_for_dups(a, scopes, errors);
+            }
+            for (_, a) in named_args {
+                walk_expr_for_dups(a, scopes, errors);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            walk_expr_for_dups(object, scopes, errors);
+            for a in args {
+                walk_expr_for_dups(a, scopes, errors);
+            }
+            for (_, a) in named_args {
+                walk_expr_for_dups(a, scopes, errors);
+            }
+        }
+        Expr::Field { object, .. } | Expr::TupleIndex { object, .. } => {
+            walk_expr_for_dups(object, scopes, errors)
+        }
+        Expr::Index { array, index } => {
+            walk_expr_for_dups(array, scopes, errors);
+            walk_expr_for_dups(index, scopes, errors);
+        }
+        Expr::Tuple(elems) | Expr::Array(elems) => {
+            for e in elems {
+                walk_expr_for_dups(e, scopes, errors);
+            }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields {
+                walk_expr_for_dups(e, scopes, errors);
+            }
+        }
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            walk_expr_for_dups(start, scopes, errors);
+            walk_expr_for_dups(end, scopes, errors);
+            if let Some(s) = step {
+                walk_expr_for_dups(s, scopes, errors);
+            }
+        }
+        Expr::VariantConst { arg: Some(a), .. } => walk_expr_for_dups(a, scopes, errors),
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(e) = p {
+                    walk_expr_for_dups(e, scopes, errors);
+                }
+            }
+        }
+        Expr::TryBlock {
+            resources,
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            for (_, e) in resources {
+                walk_expr_for_dups(e, scopes, errors);
+            }
+            walk_block_for_dups(body, scopes, errors);
+            walk_block_for_dups(catch_body, scopes, errors);
+            if let Some(fb) = finally_body {
+                walk_block_for_dups(fb, scopes, errors);
+            }
+        }
+        Expr::SliceExpr { array, start, end } => {
+            walk_expr_for_dups(array, scopes, errors);
+            walk_expr_for_dups(start, scopes, errors);
+            walk_expr_for_dups(end, scopes, errors);
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                walk_expr_for_dups(k, scopes, errors);
+                walk_expr_for_dups(v, scopes, errors);
+            }
+        }
+        Expr::Spawn { body } | Expr::Synchronized { body, .. } => {
+            walk_block_for_dups(body, scopes, errors)
+        }
+        Expr::TrailingClosure {
+            callee,
+            args,
+            closure,
+        } => {
+            walk_expr_for_dups(callee, scopes, errors);
+            for a in args {
+                walk_expr_for_dups(a, scopes, errors);
+            }
+            walk_expr_for_dups(closure, scopes, errors);
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            walk_expr_for_dups(callee, scopes, errors);
+            for a in args {
+                walk_expr_for_dups(a, scopes, errors);
+            }
+            for (_, a) in named_args {
+                walk_expr_for_dups(a, scopes, errors);
+            }
+        }
+        Expr::Macro { args, .. } => {
+            for a in args {
+                walk_expr_for_dups(a, scopes, errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ─── 3.2.3.2(3)：局部变量 / 局部函数“先使用后声明” ──────────────────────
+
+/// 3.2.3.2(3)/(6)：局部变量的作用域从声明处开始；在同一语句块内、声明之前
+/// 引用同名局部变量或调用尚未声明的局部函数属于非法。
+///
+/// 仅在“名字确实在同一块内稍后声明，且在当前作用域中不可见”时报错，因此合法的
+/// 外层遮蔽（外层已有同名绑定）不会被误判。对嵌套块、lambda、match 分支单独递归，
+/// 并携带外层已声明名字集合。
+fn check_use_before_declaration(program: &Program, errors: &mut Vec<SemanticError>) {
+    let globals = collect_global_identifiers(program);
+
+    for f in &program.functions {
+        if f.body.is_empty() {
+            continue;
+        }
+        // 成员方法以 `Type.method` 形式存储，其字段名在方法体内可直接引用。
+        let mut outer: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        if let Some((ty, _)) = f.name.split_once('.') {
+            add_type_field_names(program, ty, &mut outer);
+        }
+        order_body(&f.body, &outer, &globals, errors);
+    }
+
+    for cls in &program.classes {
+        let base: HashSet<String> = cls.fields.iter().map(|f| f.name.clone()).collect();
+        if let Some(init) = &cls.init {
+            let mut outer = base.clone();
+            outer.extend(init.params.iter().map(|p| p.name.clone()));
+            order_body(&init.body, &outer, &globals, errors);
+        }
+        if let Some(d) = &cls.deinit {
+            order_body(d, &base, &globals, errors);
+        }
+        if let Some(si) = &cls.static_init {
+            order_body(si, &base, &globals, errors);
+        }
+        for m in &cls.methods {
+            if m.func.body.is_empty() {
+                continue;
+            }
+            let mut outer = base.clone();
+            outer.extend(m.func.params.iter().map(|p| p.name.clone()));
+            order_body(&m.func.body, &outer, &globals, errors);
+        }
+    }
+
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(body) = &m.default_body {
+                let outer: HashSet<String> =
+                    m.params.iter().map(|p| p.name.clone()).collect();
+                order_body(body, &outer, &globals, errors);
+            }
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            let outer: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+            order_body(&f.body, &outer, &globals, errors);
+        }
+    }
+}
+
+/// 收集某用户类型的字段名到 `out`（供成员方法体引用）。
+fn add_type_field_names(program: &Program, type_name: &str, out: &mut HashSet<String>) {
+    if let Some(c) = program.classes.iter().find(|c| c.name == type_name) {
+        out.extend(c.fields.iter().map(|f| f.name.clone()));
+    }
+    if let Some(s) = program.structs.iter().find(|s| s.name == type_name) {
+        out.extend(s.fields.iter().map(|f| f.name.clone()));
+    }
+}
+
+/// 顶层可见标识符（函数、常量、类型、枚举变体、import 末段及常见内建名）。
+fn collect_global_identifiers(program: &Program) -> HashSet<String> {
+    let mut g: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        if !f.name.contains('.') && !f.name.contains("::") {
+            g.insert(f.name.clone());
+        }
+    }
+    for c in &program.constants {
+        g.insert(c.name.clone());
+    }
+    for c in &program.classes {
+        g.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        g.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        g.insert(e.name.clone());
+        for v in &e.variants {
+            g.insert(v.name.clone());
+        }
+    }
+    for i in &program.interfaces {
+        g.insert(i.name.clone());
+    }
+    for (n, _) in &program.type_aliases {
+        g.insert(n.clone());
+    }
+    for imp in &program.imports {
+        if let Some(alias) = &imp.alias {
+            g.insert(alias.clone());
+        }
+        if let Some(items) = &imp.items {
+            for it in items {
+                g.insert(it.clone());
+            }
+        } else if let Some(last) = imp.module_path.last() {
+            g.insert(last.clone());
+        }
+    }
+    for b in [
+        "print", "println", "panic", "assert", "Assert", "this", "super", "None", "Some", "Ok",
+        "Err",
+    ] {
+        g.insert(b.to_string());
+    }
+    g
+}
+
+/// 一个语句块内的直接声明名（仅本块直接 `let/var/const/局部函数`）。
+fn block_decl_names(stmt: &Stmt) -> Vec<String> {
+    let mut names = Vec::new();
+    match stmt {
+        Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+            pattern_binding_names(pattern, &mut names);
+        }
+        Stmt::Const { name, .. } => names.push(name.clone()),
+        Stmt::LocalFunc(f) => names.push(f.name.clone()),
+        _ => {}
+    }
+    names
+}
+
+fn order_body(
+    stmts: &[Stmt],
+    outer: &HashSet<String>,
+    globals: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 预扫描：本块内每个名字首次声明所在的语句下标。
+    let mut first: HashMap<String, usize> = HashMap::new();
+    for (i, s) in stmts.iter().enumerate() {
+        for n in block_decl_names(s) {
+            first.entry(n).or_insert(i);
+        }
+    }
+
+    let mut visible: HashSet<String> = outer.clone();
+    for (i, s) in stmts.iter().enumerate() {
+        let mut refs = Vec::new();
+        collect_stmt_direct_refs(s, &mut refs);
+        for r in &refs {
+            if visible.contains(r) || globals.contains(r) {
+                continue;
+            }
+            if let Some(&j) = first.get(r) {
+                // 只判定“严格晚于当前语句”的声明。同一语句内的自引用可能源于
+                // 解析器把下一行的前导运算符（如 `x = 1\n -y`）并入上一条初始化
+                // 表达式，属于解析器语义，不能据此判为使用前未声明。
+                if j > i {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "局部变量/函数 '{}' 在使用前尚未声明（3.2.3.2(3)/(6)）",
+                            r
+                        ),
+                    });
+                }
+            }
+        }
+
+        // 递归处理该语句携带的子块，携带“本条语句之后可见”的名字集合。
+        let mut child_outer = visible.clone();
+        for n in block_decl_names(s) {
+            child_outer.insert(n);
+        }
+        recurse_child_blocks(s, &child_outer, globals, errors);
+
+        for n in block_decl_names(s) {
+            visible.insert(n);
+        }
+    }
+}
+
+fn recurse_child_blocks(
+    stmt: &Stmt,
+    outer: &HashSet<String>,
+    globals: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    match stmt {
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::UnsafeBlock { body } => order_body(body, outer, globals, errors),
+        Stmt::For { var, body, .. } => {
+            let mut child = outer.clone();
+            child.insert(var.clone());
+            order_body(body, &child, globals, errors);
+        }
+        Stmt::WhileLet { pattern, body, .. } => {
+            let mut child = outer.clone();
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, &mut names);
+            child.extend(names);
+            order_body(body, &child, globals, errors);
+        }
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => recurse_expr_blocks(e, outer, globals, errors),
+        Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+            recurse_expr_blocks(value, outer, globals, errors)
+        }
+        Stmt::Const { value, .. } => recurse_expr_blocks(value, outer, globals, errors),
+        Stmt::Assign { value, .. } => recurse_expr_blocks(value, outer, globals, errors),
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            recurse_expr_blocks(left, outer, globals, errors);
+            recurse_expr_blocks(right, outer, globals, errors);
+        }
+        _ => {}
+    }
+}
+
+fn recurse_expr_blocks(
+    expr: &Expr,
+    outer: &HashSet<String>,
+    globals: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    match expr {
+        Expr::Block(stmts, trailing) => {
+            order_body(stmts, outer, globals, errors);
+            if let Some(t) = trailing {
+                recurse_expr_blocks(t, outer, globals, errors);
+            }
+        }
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            recurse_expr_blocks(then_branch, outer, globals, errors);
+            if let Some(eb) = else_branch {
+                recurse_expr_blocks(eb, outer, globals, errors);
+            }
+        }
+        Expr::Binary { left, right, .. } | Expr::NullCoalesce { option: left, default: right } => {
+            recurse_expr_blocks(left, outer, globals, errors);
+            recurse_expr_blocks(right, outer, globals, errors);
+        }
+        Expr::Call { args, .. } | Expr::ConstructorCall { args, .. } | Expr::SuperCall { args, .. } => {
+            for a in args {
+                recurse_expr_blocks(a, outer, globals, errors);
+            }
+        }
+        Expr::MethodCall { object, args, .. } => {
+            recurse_expr_blocks(object, outer, globals, errors);
+            for a in args {
+                recurse_expr_blocks(a, outer, globals, errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 收集语句直接表达式中的标识符引用（不进入嵌套块 / lambda / match 分支）。
+fn collect_stmt_direct_refs(stmt: &Stmt, out: &mut Vec<String>) {
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Var { value, .. } => collect_expr_direct_refs(value, out),
+        Stmt::Const { value, .. } => collect_expr_direct_refs(value, out),
+        Stmt::Assign { target, value } => {
+            collect_expr_direct_refs(value, out);
+            if let AssignTarget::Var(name) = target {
+                out.push(name.clone());
+            }
+        }
+        Stmt::Expr(e) => collect_expr_direct_refs(e, out),
+        Stmt::Return(Some(e)) => collect_expr_direct_refs(e, out),
+        Stmt::While { cond, .. } => collect_expr_direct_refs(cond, out),
+        Stmt::DoWhile { cond, .. } => collect_expr_direct_refs(cond, out),
+        Stmt::For { iterable, .. } => collect_expr_direct_refs(iterable, out),
+        Stmt::WhileLet { expr, .. } => collect_expr_direct_refs(expr, out),
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            collect_expr_direct_refs(left, out);
+            collect_expr_direct_refs(right, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_expr_direct_refs(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Var(name) => out.push(name.clone()),
+        Expr::Call {
+            name,
+            args,
+            named_args,
+            ..
+        } => {
+            out.push(name.clone());
+            for a in args {
+                collect_expr_direct_refs(a, out);
+            }
+            for (_, a) in named_args {
+                collect_expr_direct_refs(a, out);
+            }
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::IsType { expr, .. }
+        | Expr::Field { object: expr, .. }
+        | Expr::TupleIndex { object: expr, .. }
+        | Expr::OptionalChain { object: expr, .. } => collect_expr_direct_refs(expr, out),
+        Expr::Binary { left, right, .. } | Expr::NullCoalesce { option: left, default: right } => {
+            collect_expr_direct_refs(left, out);
+            collect_expr_direct_refs(right, out);
+        }
+        Expr::Return(Some(e)) => collect_expr_direct_refs(e, out),
+        Expr::Index { array, index } => {
+            collect_expr_direct_refs(array, out);
+            collect_expr_direct_refs(index, out);
+        }
+        Expr::Tuple(elems) | Expr::Array(elems) => {
+            for e in elems {
+                collect_expr_direct_refs(e, out);
+            }
+        }
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            collect_expr_direct_refs(start, out);
+            collect_expr_direct_refs(end, out);
+            if let Some(s) = step {
+                collect_expr_direct_refs(s, out);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            collect_expr_direct_refs(object, out);
+            for a in args {
+                collect_expr_direct_refs(a, out);
+            }
+            for (_, a) in named_args {
+                collect_expr_direct_refs(a, out);
+            }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields {
+                collect_expr_direct_refs(e, out);
+            }
+        }
+        // 嵌套块 / lambda / match 分支属于其它作用域，不在此处收集。
+        _ => {}
     }
 }
 
@@ -5473,6 +6448,97 @@ mod tests {
              }\n\
              main() {}\n",
         );
+    }
+
+    // ─── 11.1.5.1(8)：程序入口 main 签名 ──────────────────────────────────
+
+    #[test]
+    fn test_main_signature_valid_forms() {
+        assert_valid("main() {}");
+        assert_valid("main(args: Array<String>) {}");
+        assert_valid("main(): Unit {}");
+        assert_valid("main(): Int64 { 0 }");
+        assert_valid("main(): Int8 { var i: Int8 = 0\n return i }");
+        // 库包（有 package 声明）中的 main 不受入口点签名约束。
+        assert_valid("package pkg\nfunc main(x: Int64) {}");
+    }
+
+    #[test]
+    fn test_main_signature_invalid_param() {
+        // 11.1.5.1(8)：参数只能是 Array<String>。
+        assert_invalid("main(x: Int64) {}");
+        assert_invalid("main(args: Array<Int64>) {}");
+        assert_invalid("main(a: Array<String>, b: Array<String>) {}");
+    }
+
+    #[test]
+    fn test_main_signature_invalid_return() {
+        // 11.1.5.1(8)：返回类型只能是 Unit 或整数类型。
+        assert_invalid("main(): Float64 { 0.0 }");
+        assert_invalid("main(): Bool { true }");
+        assert_invalid("main(): String { \"x\" }");
+        // 推断出的返回类型非法同样应被拒绝。
+        assert_invalid("main() { var i: Float16 = 0.0\n return i }");
+        assert_invalid("main() { return true }");
+    }
+
+    // ─── 3.1(3)：顶层名称跨命名空间冲突 ──────────────────────────────────
+
+    #[test]
+    fn test_top_level_name_collision_invalid() {
+        assert_invalid("let name = 0\nclass name {}\nmain() {}");
+        assert_invalid("var name = 1\nfunc name() {}\nmain() {}");
+        assert_invalid("class name {}\nstruct name {}\nmain() {}");
+        assert_invalid("type name = (Int64, Int64)\nlet name = 0\nmain() {}");
+        assert_invalid("enum name { x }\ninterface name {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_top_level_function_overload_allowed() {
+        // 顶层函数互为重载，不视为名称冲突。
+        assert_valid("func name() {}\nfunc name(x: Int64) {}\nmain() {}");
+        assert_valid("class A {}\nfunc useA(a: A) {}\nmain() {}");
+    }
+
+    // ─── 3.1(3)：同一作用域内重复绑定局部变量 ────────────────────────────
+
+    #[test]
+    fn test_duplicate_local_binding_invalid() {
+        assert_invalid("main() {\n var x = 0\n var x = 1\n}");
+        assert_invalid("main() {\n let y = 1\n var y = 2\n}");
+        // 嵌套函数体内同块重复声明。
+        assert_invalid("main() {\n func f() {\n  let z = 1\n  let z = 2\n }\n}");
+    }
+
+    #[test]
+    fn test_shadowing_in_nested_scope_valid() {
+        // 遮蔽发生在外层作用域时合法。
+        assert_valid("main() {\n var x = 0\n if (true) { var x = 1 }\n}");
+        assert_valid("func g(x: Int64) { let y = x\n if (x > 0) { let y = 1 } }");
+        // 参数与函数体顶层块分属不同作用域（保守：不误判）。
+        assert_valid("func h(x: Int64) { let ok = x }");
+    }
+
+    // ─── 3.2.3.2(3)/(6)：先使用后声明 ────────────────────────────────────
+
+    #[test]
+    fn test_use_before_declaration_invalid() {
+        // 引用同一块内稍后才声明的局部变量。
+        assert_invalid("main() {\n var vv = tmp\n let tmp: Int64 = 0\n}");
+        // 调用同一块内稍后才定义的局部函数。
+        assert_invalid("main() {\n foo()\n func foo() {}\n}");
+        // 赋值给同一块内稍后才声明的变量。
+        assert_invalid("main() {\n x = 1\n let x = 0\n}");
+    }
+
+    #[test]
+    fn test_use_before_declaration_valid_cases() {
+        // 先声明后使用。
+        assert_valid("main() {\n let tmp = 0\n var vv = tmp\n}");
+        // 引用外层（参数）同名变量，不属于本块先使用后声明。
+        assert_valid("func f(tmp: Int64) {\n var vv = tmp\n let keep = 0\n}");
+        // 引用顶层函数。
+        assert_valid("func foo() {}\nmain() {\n foo()\n}");
     }
 
 }

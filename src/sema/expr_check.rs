@@ -621,6 +621,12 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         );
         class_has_init.insert(c.name.clone(), c.init.is_some());
     }
+    for s in &program.structs {
+        class_fields.insert(
+            s.name.clone(),
+            s.fields.iter().map(|f| (f.name.clone(), f.is_mut)).collect(),
+        );
+    }
 
     let mut globals = HashMap::new();
     for c in &program.constants {
@@ -728,6 +734,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     }
     for cls in &program.classes {
         // 类字段先入作用域，避免方法体内同名字段被解析成同名全局变量。
+        // 字段可变性来自声明（`var` 可写，`let`/`const` 不可写）。
         let fields: HashMap<String, VarInfo> = cls
             .fields
             .iter()
@@ -736,14 +743,49 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                     f.name.clone(),
                     VarInfo {
                         ty: field_ty(f),
-                        mutable: true,
+                        mutable: f.is_mut,
+                        const_int: None,
+                    },
+                )
+            })
+            .collect();
+        // 构造函数内允许为“无默认初始化器的实例 let 字段”首次赋值（延迟初始化），
+        // static 字段与已带初始化器的 let 字段仍保持不可写。
+        let ctor_fields: HashMap<String, VarInfo> = cls
+            .fields
+            .iter()
+            .map(|f| {
+                let deferred_let = !f.is_mut && !f.is_static && f.default.is_none();
+                (
+                    f.name.clone(),
+                    VarInfo {
+                        ty: field_ty(f),
+                        mutable: f.is_mut || deferred_let,
+                        const_int: None,
+                    },
+                )
+            })
+            .collect();
+        // static init 内允许为“无默认初始化器的 static let 字段”首次赋值（延迟静态
+        // 初始化）；其余字段保持声明时的可变性。
+        let static_init_fields: HashMap<String, VarInfo> = cls
+            .fields
+            .iter()
+            .map(|f| {
+                let deferred_static_let =
+                    !f.is_mut && f.is_static && f.default.is_none();
+                (
+                    f.name.clone(),
+                    VarInfo {
+                        ty: field_ty(f),
+                        mutable: f.is_mut || deferred_static_let,
                         const_int: None,
                     },
                 )
             })
             .collect();
         if let Some(init) = &cls.init {
-            checker.check_params_body_extra(&init.params, &init.body, Some(&fields), None);
+            checker.check_params_body_extra(&init.params, &init.body, Some(&ctor_fields), None);
         }
         if let Some(deinit) = &cls.deinit {
             checker.scopes.push(fields.clone());
@@ -753,7 +795,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             checker.scopes.pop();
         }
         if let Some(si) = &cls.static_init {
-            checker.scopes.push(fields.clone());
+            checker.scopes.push(static_init_fields.clone());
             for stmt in si {
                 checker.check_stmt(stmt);
             }
@@ -761,10 +803,18 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         }
         for m in &cls.methods {
             if !m.func.body.is_empty() {
+                // static init 体以 `Type.__static_init` 形式存放在 methods 中，
+                // 允许无初始化器的 static let 字段在此首次赋值。
+                let is_static_init = m.func.name.ends_with(".__static_init");
+                let field_scope = if is_static_init {
+                    &static_init_fields
+                } else {
+                    &fields
+                };
                 checker.check_params_body_extra(
                     &m.func.params,
                     &m.func.body,
-                    Some(&fields),
+                    Some(field_scope),
                     m.func.return_type.as_ref().map(|t| checker.ty_of_ann(t)),
                 );
             }
@@ -1793,12 +1843,28 @@ impl<'a> Checker<'a> {
     fn check_field_target(&mut self, object: &str, field: &str) {
         if self.enum_names.contains(object) {
             self.err(format!("enum 构造值 '{}.{}' 不可被赋值", object, field));
-        } else if let Some(fields_map) = self.class_fields.get(object) {
+            return;
+        }
+        // 情况一：`Type.field = v`——object 是类型名，用于 static 字段 / enum 构造值。
+        if let Some(fields_map) = self.class_fields.get(object) {
             if let Some(&is_mut) = fields_map.get(field) {
                 if !is_mut {
                     self.err(format!("不可变字段 '{}.{}' 不能被重新赋值", object, field));
                 }
             }
+            return;
+        }
+        // 情况二：`obj.field = v`——object 是类型为该用户类型的变量/参数。
+        let immutable = match self.lookup(object).map(|v| v.ty.clone()) {
+            Some(Ty::User(type_name)) => self
+                .class_fields
+                .get(&type_name)
+                .and_then(|m| m.get(field))
+                .map(|&is_mut| !is_mut),
+            _ => None,
+        };
+        if immutable == Some(true) {
+            self.err(format!("不可变字段 '{}.{}' 不能被重新赋值", object, field));
         }
     }
 
@@ -3643,6 +3709,59 @@ mod tests {
         assert_err("main() { var a: UInt8 = 1; let x = a << 8 }", "越界");
         assert_ok("main() { var a: UInt8 = 1; let x = a << 7 }");
         assert_err("main() { var a: UInt32 = 1; let x = a >> 32 }", "越界");
+    }
+
+    // ─── 3.3.1(7)：不可变（let）字段赋值 ──────────────────────────────────
+
+    #[test]
+    fn test_immutable_field_assigned_in_method() {
+        // 方法体中给已初始化 let 字段赋值非法。
+        assert_err(
+            "class C {\n let x: Int64 = 1\n C() {}\n func f() { x = 2 }\n}\nmain() {}",
+            "不可变",
+        );
+        // var 字段在方法体中可写。
+        assert_ok(
+            "class C {\n var x: Int64 = 1\n C() {}\n func f() { x = 2 }\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_immutable_field_in_constructor() {
+        // 带默认初始化器的 let 字段不能在构造函数中再次赋值。
+        assert_err(
+            "class C {\n let x: Int64 = 1\n C() { x = 2 }\n}\nmain() {}",
+            "不可变",
+        );
+        // 无初始化器的实例 let 字段允许在构造函数中首次赋值。
+        assert_ok("class C {\n let x: Int64\n C() { x = 2 }\n}\nmain() {}");
+        // static let 字段在构造函数中也不可赋值。
+        assert_err(
+            "class C {\n static let x: Int64 = 1\n C() { x = 2 }\n}\nmain() {}",
+            "不可变",
+        );
+        // 无初始化器的 static let 字段允许在 static init 中首次赋值。
+        assert_ok(
+            "class C {\n static let x: Int64\n static init() { x = 2 }\n}\nmain() {}",
+        );
+        // 带初始化器的 static let 字段在 static init 中不可再次赋值。
+        assert_err(
+            "class C {\n static let x: Int64 = 1\n static init() { x = 2 }\n}\nmain() {}",
+            "不可变",
+        );
+    }
+
+    #[test]
+    fn test_immutable_field_via_instance() {
+        // `obj.field = v` 中，字段不可变应报错。
+        assert_err(
+            "class C {\n let x: Int64 = 1\n C() {}\n}\nmain() {\n let o = C()\n o.x = 2\n}",
+            "不可变",
+        );
+        // 可变字段经实例赋值合法。
+        assert_ok(
+            "class C {\n var x: Int64 = 1\n C() {}\n}\nmain() {\n let o = C()\n o.x = 2\n}",
+        );
     }
 
 }
