@@ -481,7 +481,8 @@ if [[ -x "$STD_TEST_SCRIPT" && -z "$FILTER" && $NO_STD_TEST == false ]]; then
     std_test_args+=("--verbose")
   fi
 
-  if "$STD_TEST_SCRIPT" "${std_test_args[@]}"; then
+  # bash 3.2 (macOS) 在 set -u 下展开空数组会报 unbound variable，需用兼容写法
+  if "$STD_TEST_SCRIPT" ${std_test_args[@]+"${std_test_args[@]}"}; then
     printf "  %-28s ${GREEN}✓${NC}\n" "std_test.sh"
     ((PASS++)) || true
   else

@@ -4,15 +4,16 @@ English README: [README_EN.md](README_EN.md)
 
 仓颉语言（Cangjie）到 WebAssembly 的编译器前端，使用 Rust 编写。
 
-CJWasm 将仓颉源代码直接编译为 WASM 字节码，无需中间表示，生成的 `.wasm` 文件可在 wasmtime、浏览器等任何 WASM 运行时中执行。
+CJWasm 将仓颉源代码编译为 WASM 字节码：源码解析为 AST 后降级为 CHIR 中间表示，在 CHIR 层执行优化（小函数内联、冗余局部变量消除），再生成 `.wasm` 文件，可在 wasmtime、浏览器等任何 WASM 运行时中执行。
 
 ## 项目状态
 
 - ✅ **代码覆盖率**: **80.15%** 行覆盖率 / 89.93% 区域覆盖率
-- ✅ **测试数量**: 1,317 个测试全部通过（672 单元测试 + 631 集成测试 + 14 标准库测试）
-- ✅ **示例覆盖率**: 37/37 示例通过 (100%)，0 WASM 验证错误
-- ✅ **代码量**: ~47,200 行 Rust 代码（含测试）
+- ✅ **测试数量**: 1,320 个测试全部通过（675 单元测试 + 631 集成测试 + 14 标准库测试）
+- ✅ **示例覆盖率**: 40/40 系统测试通过 (100%)，0 WASM 验证错误
+- ✅ **代码量**: ~64,700 行 Rust 代码（含测试）
 - ✅ **AST 节点**: 91 个（Expr: 47, Stmt: 15, Pattern: 10, Type: 19）
+- ✅ **CHIR 优化器**: 小函数内联 + 冗余局部变量消除，重负载基准 wasmtime 1.22x / 解释器 ~1.7x 加速
 - ✅ **功能完成度**: ~98%
 
 ## 特性
@@ -45,6 +46,10 @@ CJWasm 将仓颉源代码直接编译为 WASM 字节码，无需中间表示，�
 - **类型协调** — 自动插入类型转换指令（i32 ↔ i64, Bool ↔ Int64）
 - **常量折叠** — 编译时常量计算
 - **死代码消除** — 未使用代码移除
+- **CHIR 小函数内联** — 纯表达式函数（无副作用、非递归、≤8 个表达式节点）的调用点直接替换为函数体表达式，消除 call 指令开销
+- **CHIR 冗余局部变量消除** — 单写单读且紧邻使用的纯值绑定消除 `local.set` + `local.get` 指令对
+
+> CHIR 优化默认开启，设置环境变量 `NO_CHIR_OPT=1` 可关闭；`NO_CHIR=1` 可整体回退到 AST 直出 WASM 的旧路径。
 
 ## 快速开始
 
@@ -121,8 +126,8 @@ wasmtime run --invoke main hello.wasm
 ./scripts/run_test.sh 5    # 全部测试
 
 # 也可以单独运行
-cargo test                     # 1,317 个单元/集成测试（全部通过）
-./scripts/system_test.sh       # 38 个系统测试（全部通过）
+cargo test                     # 1,320 个单元/集成测试（全部通过）
+./scripts/system_test.sh       # 40 个系统测试（全部通过）
 ./scripts/coverage.sh          # 测试覆盖率
 ./scripts/coverage.sh --html   # HTML 报告 → target/llvm-cov/html/
 ```
@@ -189,26 +194,31 @@ main(): Int64 {
 }
 ```
 
-更多示例见 [`tests/examples/`](tests/examples/) 目录（38 个示例文件，全部通过）。
+更多示例见 [`tests/examples/`](tests/examples/) 目录（36 个顶层示例 + multifile/project/std 子目录，全部通过）。
 
 ## 测试覆盖
 
-### 示例测试 (37/37 通过)
+### 系统测试 (40/40 通过)
 
 | 类别 | 示例 | 状态 |
 |------|------|------|
-| **基础语法** | hello.cj, variables.cj, functions.cj, recursion.cj | ✅ |
-| **控制流** | if_else.cj, loops.cj, match.cj, pattern_matching.cj | ✅ |
-| **数据结构** | arrays.cj, tuples.cj, structs.cj, enums.cj | ✅ |
-| **面向对象** | classes.cj, inheritance.cj, interfaces.cj, properties.cj | ✅ |
-| **泛型** | generics.cj, generic_constraints.cj, generic_advanced.cj | ✅ |
-| **错误处理** | option_result.cj, try_catch.cj, error_propagation.cj | ✅ |
-| **集合类型** | p3_collections.cj, p4_collections.cj (ArrayList/HashMap/HashSet) | ✅ |
-| **高级特性** | lambda.cj, closures.cj, operator_overload.cj, type_conversion.cj | ✅ |
-| **字符串** | strings.cj, string_interpolation.cj, string_methods.cj | ✅ |
-| **标准库** | std_math.cj, std_features.cj, type_methods.cj | ✅ |
-| **P6 特性** | p6_new_features.cj (可选链、尾随闭包、范围操作) | ✅ |
-| **多文件** | multifile/ (跨文件编译) | ✅ |
+| **基础语法** | hello.cj, println.cj, literals.cj, advanced.cj | ✅ |
+| **控制流** | control_flow.cj, loop_control.cj, for_in_and_guards.cj | ✅ |
+| **函数与方法** | functions.cj, methods.cj | ✅ |
+| **面向对象** | class.cj, inheritance.cj, interface.cj, phase5_interface.cj | ✅ |
+| **数据结构与模式** | enum.cj, patterns.cj | ✅ |
+| **泛型** | generic.cj, generic_advanced.cj | ✅ |
+| **错误处理** | error_handling.cj, phase6_error_module.cj | ✅ |
+| **集合类型** | p3_collections.cj, p4_collections.cj, p3_option_tuple.cj (ArrayList/HashMap/HashSet) | ✅ |
+| **运算符与字符串** | operators.cj, strings.cj, str_methods_test.cj | ✅ |
+| **并发** | p5_concurrent.cj (spawn/synchronized/Atomic) | ✅ |
+| **标准库** | std_math.cj, std_features.cj, p5_stdlib.cj, type_methods.cj | ✅ |
+| **P2/P6 特性** | p2_features.cj, phase2_types.cj, p6_new_features.cj (可选链、尾随闭包、范围操作) | ✅ |
+| **内存与模块** | memory_management.cj, modules.cj, math.cj | ✅ |
+| **多文件/工程** | multifile/ (跨文件编译), project/ (cjpm 工程), std/ (L1 标准库) | ✅ |
+| **std 兼容性** | std_test.sh — `third_party/cangjie_test` L1 模块 100% | ✅ |
+
+> std 兼容性测试需要先初始化子模块：`git submodule update --init third_party/cangjie_test`。
 
 ### 代码覆盖率
 
@@ -234,11 +244,11 @@ main(): Int64 {
 ./scripts/coverage.sh --html   # HTML 报告 → target/llvm-cov/html/
 ```
 
-### 单元 & 集成测试 (1,317 个全部通过)
+### 单元 & 集成测试 (1,320 个全部通过)
 
 ```bash
 cargo test
-# 672 passed (单元测试) + 631 passed (集成测试) + 14 passed (标准库测试)
+# 675 passed (单元测试) + 631 passed (集成测试) + 14 passed (标准库测试)
 ```
 
 | 类别 | 测试数 | 说明 |
@@ -284,12 +294,24 @@ cjwasm/
 │   ├── ast/               # 抽象语法树定义
 │   │   ├── mod.rs         # Expr, Stmt, Pattern 等枚举（91 个节点）
 │   │   └── type_.rs       # Type 枚举（19 个类型）
-│   ├── optimizer/         # 编译优化
+│   ├── sema/              # 语义分析（表达式推断、函数分析）
+│   ├── typeck/            # 类型检查（变量解析、类型推断）
+│   ├── metadata/          # 标准库类型元数据
+│   ├── chir/              # CHIR 中间表示（默认代码生成路径）
+│   │   ├── types.rs       # CHIR 数据结构定义
+│   │   ├── builder.rs     # CHIR 构建器
+│   │   ├── lower.rs       # AST → CHIR 降级入口
+│   │   ├── lower_expr.rs  # 表达式降级
+│   │   ├── lower_stmt.rs  # 语句降级
+│   │   ├── type_inference.rs # CHIR 层类型推断
+│   │   └── optimize.rs    # CHIR 优化 pass（小函数内联 + 冗余 local 消除）
+│   ├── optimizer/         # AST 层编译优化
 │   │   └── mod.rs         # 常量折叠 & 死代码消除
 │   ├── monomorph/         # 泛型单态化
 │   │   └── mod.rs         # 类型参数替换 & 实例生成
 │   ├── codegen/           # WASM 代码生成（基于 wasm-encoder）
-│   │   ├── mod.rs         # CodeGen 主逻辑
+│   │   ├── mod.rs         # CodeGen 主逻辑（旧路径：AST → WASM）
+│   │   ├── chir_codegen.rs # CHIR CodeGen（默认路径：CHIR → WASM）
 │   │   ├── expr.rs        # 表达式代码生成
 │   │   ├── decl.rs        # 声明代码生成
 │   │   ├── type_.rs       # 类型代码生成
@@ -328,7 +350,7 @@ cjwasm/
 │   └── ...
 ├── benches/               # 性能基准测试
 │   ├── compile_bench.rs   # Criterion 微基准（各编译阶段）
-│   ├── fixtures/          # 基准测试用仓颉源文件
+│   ├── fixtures/          # 基准测试用仓颉源文件（含 bench_heavy.cj 重负载基准）
 │   └── report.html        # 性能对比报告（自动生成）
 ├── scripts/
 │   ├── run_test.sh        # 测试运行器（交互式菜单，选择测试级别）
@@ -371,11 +393,19 @@ cjwasm/
   Monomorphizer         泛型单态化
     │
     ▼
-  CodeGen (wasm-encoder) AST → WASM 字节码（含 WASI 运行时函数）
+  CHIR Lowering         AST → CHIR 中间表示
+    │
+    ▼
+  CHIR Optimizer        小函数内联 / 冗余局部变量消除（默认开启）
+    │
+    ▼
+  CHIR CodeGen (wasm-encoder) CHIR → WASM 字节码（含 WASI 运行时函数）
     │
     ▼
   .wasm 文件            可直接运行于 wasmtime / 浏览器
 ```
+
+> 默认走 CHIR 路径；`NO_CHIR=1` 回退到 AST 直接生成 WASM 的旧路径，`NO_CHIR_OPT=1` 仅关闭 CHIR 优化 pass。
 
 ## 已支持的仓颉语法
 
@@ -415,17 +445,42 @@ CJWasm 编译速度和输出大小与仓颉原生编译器 (cjc) 的对比：
 
 > cjwasm 是轻量级前端编译器，仅生成 WASM 字节码；cjc 是完整原生编译器，生成含标准库的可执行文件。两者定位不同。
 
+### CHIR 优化效果
+
+在 `bench_heavy.cj`（100,000 次密集小函数调用：identity / double / square / addOne / Counter.get 等）上对比：
+
+| 版本 | wasmtime 耗时 | WASM 大小 |
+|------|---------------|-----------|
+| CHIR + 优化（默认） | 28.17 ms | 9012 B |
+| CHIR 无优化（`NO_CHIR_OPT=1`） | 34.49 ms | 9028 B |
+
+- **wasmtime（JIT）加速 1.22x** — JIT 会对两个版本都做本地优化，差异被部分抹平
+- **解释器模式（wasm-interp，无 JIT）约 1.7x 加速** — 更能反映指令级优化效果
+
+### 运行时性能（wasmtime vs cjc native）
+
+| 规模 | wasmtime | cjc native | 比率 |
+|------|----------|------------|------|
+| 小规模（27 行） | 24.19 ms | 37.02 ms | wasm 1.5x 快 |
+| 中规模（100 行） | 23.61 ms | 37.30 ms | wasm 1.6x 快 |
+| 大规模（311 行） | 24.20 ms | 37.00 ms | wasm 1.5x 快 |
+| 高负载（89 行） | 28.13 ms | 83.35 ms | wasm 3.0x 快 |
+
+> 端到端进程耗时（含启动）；wasmtime 时间包含 JIT 编译开销，native 包含进程启动开销。
+
 运行完整基准测试：
 
 ```bash
-# 综合对比（编译速度 + 输出大小 + 运行时）
+# 综合对比（编译速度 + 输出大小 + 运行时 + CHIR 优化对比）
 ./scripts/benchmark.sh
 
 # 快速模式
 ./scripts/benchmark.sh --quick
 
-# 仅运行时性能（需要 wasmtime）
-./scripts/benchmark.sh --runtime
+# 仅对比某一项
+./scripts/benchmark.sh --compile    # 仅编译速度
+./scripts/benchmark.sh --runtime    # 仅运行时性能
+./scripts/benchmark.sh --size       # 仅输出大小
 
 # Criterion 微基准（各编译阶段耗时）
 cargo bench
@@ -440,10 +495,9 @@ cargo bench
 | 脚本 | 用途 | 用法 |
 |------|------|------|
 | `run_test.sh` | 测试运行器，交互式选择测试级别 | `./scripts/run_test.sh [1-5]` |
-| `system_test.sh` | 编译运行 28 个 .cj 示例并验证返回值 | `./scripts/system_test.sh [--verbose]` |
-| `benchmark.sh` | CJWasm vs CJC 性能对比（编译/运行/大小） | `./scripts/benchmark.sh [--quick]` |
+| `system_test.sh` | 系统测试：编译所有 .cj 示例 + WASM 验证 + 运行 + 预期值校验 | `./scripts/system_test.sh [--verbose] [file.cj]` |
+| `benchmark.sh` | CJWasm vs CJC 性能对比（编译/运行/大小/CHIR 优化） | `./scripts/benchmark.sh [--quick\|--compile\|--runtime\|--size\|--criterion]` |
 | `coverage.sh` | 生成测试覆盖率报告 | `./scripts/coverage.sh [--html]` |
-| `system_test.sh` | 系统测试（编译+WASM验证+运行+预期值校验） | `./scripts/system_test.sh [--compile] [--verbose]` |
 
 ## 开发
 
@@ -453,7 +507,7 @@ cargo bench
 # 构建
 cargo build --release
 
-# 运行全部测试（1,317 个）
+# 运行全部测试（1,320 个）
 cargo test
 
 # 交互式测试菜单

@@ -4,15 +4,16 @@
 
 A Cangjie-to-WebAssembly compiler frontend written in Rust.
 
-CJWasm compiles Cangjie source code directly into WASM bytecode without an intermediate IR. The generated `.wasm` files can run in wasmtime, browsers, and other WebAssembly runtimes.
+CJWasm compiles Cangjie source code into WASM bytecode: sources are parsed into an AST, lowered to the CHIR intermediate representation, optimized at the CHIR level (small-function inlining, redundant local elimination), and then emitted as a `.wasm` file that runs in wasmtime, browsers, and other WebAssembly runtimes.
 
 ## Project Status
 
 - ✅ **Coverage**: **80.15%** line coverage / 89.93% region coverage
-- ✅ **Tests**: 1,317 tests passing (672 unit + 631 integration + 14 stdlib)
-- ✅ **Examples**: 37/37 examples passing (100%), 0 WASM validation errors
-- ✅ **Code Size**: ~47,200 lines of Rust including tests
+- ✅ **Tests**: 1,320 tests passing (675 unit + 631 integration + 14 stdlib)
+- ✅ **Examples**: 40/40 system tests passing (100%), 0 WASM validation errors
+- ✅ **Code Size**: ~64,700 lines of Rust including tests
 - ✅ **AST Nodes**: 91 nodes (Expr: 47, Stmt: 15, Pattern: 10, Type: 19)
+- ✅ **CHIR Optimizer**: small-function inlining + redundant local elimination; 1.22x on wasmtime / ~1.7x on an interpreter for the heavy benchmark
 - ✅ **Completion**: ~98%
 
 ## Features
@@ -45,6 +46,10 @@ CJWasm compiles Cangjie source code directly into WASM bytecode without an inter
 - **Type coercion**: automatic conversion instructions (i32 ↔ i64, Bool ↔ Int64)
 - **Constant folding**
 - **Dead code elimination**
+- **CHIR small-function inlining**: call sites of pure single-expression functions (no side effects, non-recursive, ≤ 8 expression nodes) are replaced by the function body, removing call overhead
+- **CHIR redundant local elimination**: `local.set` + `local.get` pairs for single-write/single-read adjacent pure bindings are eliminated
+
+> CHIR optimizations are on by default; set `NO_CHIR_OPT=1` to disable them, or `NO_CHIR=1` to fall back to the legacy direct AST → WASM path.
 
 ## Quick Start
 
@@ -193,22 +198,27 @@ More examples are available under [`tests/examples/`](tests/examples/).
 
 ## Test Coverage
 
-### Example Tests (37/37 Passing)
+### System Tests (40/40 Passing)
 
 | Category | Examples | Status |
 |------|------|------|
-| **Basic syntax** | hello.cj, variables.cj, functions.cj, recursion.cj | ✅ |
-| **Control flow** | if_else.cj, loops.cj, match.cj, pattern_matching.cj | ✅ |
-| **Data structures** | arrays.cj, tuples.cj, structs.cj, enums.cj | ✅ |
-| **OOP** | classes.cj, inheritance.cj, interfaces.cj, properties.cj | ✅ |
-| **Generics** | generics.cj, generic_constraints.cj, generic_advanced.cj | ✅ |
-| **Error handling** | option_result.cj, try_catch.cj, error_propagation.cj | ✅ |
-| **Collections** | p3_collections.cj, p4_collections.cj | ✅ |
-| **Advanced features** | lambda.cj, closures.cj, operator_overload.cj, type_conversion.cj | ✅ |
-| **Strings** | strings.cj, string_interpolation.cj, string_methods.cj | ✅ |
-| **Stdlib** | std_math.cj, std_features.cj, type_methods.cj | ✅ |
-| **P6 features** | p6_new_features.cj | ✅ |
-| **Multi-file** | multifile/ | ✅ |
+| **Basics** | hello.cj, println.cj, literals.cj, advanced.cj | ✅ |
+| **Control flow** | control_flow.cj, loop_control.cj, for_in_and_guards.cj | ✅ |
+| **Functions & methods** | functions.cj, methods.cj | ✅ |
+| **OOP** | class.cj, inheritance.cj, interface.cj, phase5_interface.cj | ✅ |
+| **Data structures & patterns** | enum.cj, patterns.cj | ✅ |
+| **Generics** | generic.cj, generic_advanced.cj | ✅ |
+| **Error handling** | error_handling.cj, phase6_error_module.cj | ✅ |
+| **Collections** | p3_collections.cj, p4_collections.cj, p3_option_tuple.cj | ✅ |
+| **Operators & strings** | operators.cj, strings.cj, str_methods_test.cj | ✅ |
+| **Concurrency** | p5_concurrent.cj | ✅ |
+| **Stdlib** | std_math.cj, std_features.cj, p5_stdlib.cj, type_methods.cj | ✅ |
+| **P2/P6 features** | p2_features.cj, phase2_types.cj, p6_new_features.cj | ✅ |
+| **Memory & modules** | memory_management.cj, modules.cj, math.cj | ✅ |
+| **Multi-file / project** | multifile/, project/ (cjpm), std/ (L1 stdlib) | ✅ |
+| **Std compatibility** | std_test.sh — `third_party/cangjie_test`, L1 modules 100% | ✅ |
+
+> The std compatibility test requires the submodule: `git submodule update --init third_party/cangjie_test`.
 
 ### Code Coverage
 
@@ -234,7 +244,7 @@ Total line coverage is **80.15%** and region coverage is **89.93%**.
 ./scripts/coverage.sh --html
 ```
 
-### Unit and Integration Tests (1,317 Passing)
+### Unit and Integration Tests (1,320 Passing)
 
 ```bash
 cargo test
@@ -272,9 +282,14 @@ cjwasm/
 │   ├── lexer/
 │   ├── parser/
 │   ├── ast/
-│   ├── optimizer/
+│   ├── sema/              # semantic analysis
+│   ├── typeck/            # type checking
+│   ├── metadata/          # stdlib type metadata
+│   ├── chir/              # CHIR intermediate representation (default codegen path)
+│   │   └── optimize.rs    # CHIR optimization passes
+│   ├── optimizer/         # AST-level optimizations
 │   ├── monomorph/
-│   ├── codegen/
+│   ├── codegen/           # incl. chir_codegen.rs (default) and legacy path
 │   ├── memory.rs
 │   └── pipeline.rs
 ├── tests/examples/
@@ -303,11 +318,19 @@ Cangjie source (.cj)
   Monomorphizer         generic instantiation
     │
     ▼
-  CodeGen (wasm-encoder) AST → WASM bytecode (including WASI runtime helpers)
+  CHIR Lowering         AST → CHIR intermediate representation
+    │
+    ▼
+  CHIR Optimizer        small-function inlining / redundant local elimination (on by default)
+    │
+    ▼
+  CHIR CodeGen (wasm-encoder) CHIR → WASM bytecode (including WASI runtime helpers)
     │
     ▼
   .wasm                 runnable in wasmtime / browsers
 ```
+
+> The CHIR path is the default; `NO_CHIR=1` falls back to the legacy direct AST → WASM path and `NO_CHIR_OPT=1` disables just the CHIR optimization passes.
 
 ## Supported Cangjie Syntax
 
@@ -347,10 +370,42 @@ Comparison against the native Cangjie compiler (`cjc`):
 
 > CJWasm is a lightweight frontend that only emits WASM bytecode. `cjc` is a full native compiler that produces executables bundled with the standard library. The two tools have different goals.
 
+### CHIR Optimization Impact
+
+Measured on `bench_heavy.cj` (100,000 dense small-function calls: identity / double / square / addOne / Counter.get, …):
+
+| Build | wasmtime time | WASM size |
+|------|---------------|-----------|
+| CHIR + optimization (default) | 28.17 ms | 9012 B |
+| CHIR without optimization (`NO_CHIR_OPT=1`) | 34.49 ms | 9028 B |
+
+- **1.22x faster under wasmtime (JIT)** — the JIT optimizes both builds, partially masking the difference
+- **~1.7x faster in interpreter mode (wasm-interp, no JIT)** — a better reflection of the instruction-level gains
+
+### Runtime Performance (wasmtime vs cjc native)
+
+| Workload | wasmtime | cjc native | Ratio |
+|------|----------|------------|------|
+| Small (27 lines) | 24.19 ms | 37.02 ms | wasm 1.5x faster |
+| Medium (100 lines) | 23.61 ms | 37.30 ms | wasm 1.6x faster |
+| Large (311 lines) | 24.20 ms | 37.00 ms | wasm 1.5x faster |
+| Heavy (89 lines) | 28.13 ms | 83.35 ms | wasm 3.0x faster |
+
+> End-to-end process time; wasmtime figures include JIT compilation, native figures include process startup.
+
 ```bash
+# Full comparison (compile speed + size + runtime + CHIR optimization)
 ./scripts/benchmark.sh
+
+# Quick mode
 ./scripts/benchmark.sh --quick
-./scripts/benchmark.sh --runtime
+
+# Single dimension
+./scripts/benchmark.sh --compile    # compile speed only
+./scripts/benchmark.sh --runtime    # runtime only
+./scripts/benchmark.sh --size       # output size only
+
+# Criterion micro-benchmarks (per-stage timings)
 cargo bench
 ```
 
@@ -363,8 +418,8 @@ Outputs:
 | Script | Purpose | Usage |
 |------|------|------|
 | `run_test.sh` | test runner with interactive levels | `./scripts/run_test.sh [1-5]` |
-| `system_test.sh` | compile and run example `.cj` files | `./scripts/system_test.sh [--verbose]` |
-| `benchmark.sh` | CJWasm vs CJC benchmarking | `./scripts/benchmark.sh [--quick]` |
+| `system_test.sh` | compile + validate + run all example `.cj` files | `./scripts/system_test.sh [--verbose] [file.cj]` |
+| `benchmark.sh` | CJWasm vs CJC benchmarking (compile/runtime/size/CHIR opts) | `./scripts/benchmark.sh [--quick\|--compile\|--runtime\|--size\|--criterion]` |
 | `coverage.sh` | coverage report generation | `./scripts/coverage.sh [--html]` |
 
 ## Development
