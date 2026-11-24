@@ -1192,6 +1192,8 @@ impl Parser {
                 }
             }
         }
+        // 解析可选的 where 子句（如 interface Foo<T> where T <: Bar<T> { ... }）
+        let _ = self.parse_where_clause()?;
         self.expect(Token::LBrace)?;
         let mut methods = Vec::new();
         let mut assoc_types = Vec::new();
@@ -1338,6 +1340,10 @@ impl Parser {
                 }
                 None => return self.bail(ParseError::UnexpectedEof),
             };
+            // 可选泛型参数 func m<T>(...)（接口默认/抽象方法）
+            if self.check(&Token::Lt) {
+                let _ = self.parse_type_params()?;
+            }
             self.expect(Token::LParen)?;
             let params = self.parse_params()?;
             self.expect(Token::RParen)?;
@@ -2385,6 +2391,14 @@ impl Parser {
                 let is_operator = self.check(&Token::Operator);
                 if is_operator {
                     self.advance(); // 消费 operator
+                }
+                // operator 后仍可能跟 override/open/unsafe 修饰符
+                // （如 public operator override func ==(...)）
+                while self.check(&Token::Override)
+                    || self.check(&Token::Open)
+                    || self.check(&Token::Unsafe)
+                {
+                    self.advance();
                 }
                 self.expect(Token::Func)?;
                 let (m_name, type_params) = if is_operator {

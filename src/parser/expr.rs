@@ -444,7 +444,7 @@ impl Parser {
                         }
                         self.expect(Token::Gt)?;
 
-                        // 泛型参数后面必须跟 (
+                        // 泛型参数后面必须跟 ( 或尾随闭包 { ... }
                         if self.check(&Token::LParen) {
                             self.advance();
                             let (args, named_args) = self.parse_args()?;
@@ -456,11 +456,34 @@ impl Parser {
                                 named_args,
                                 type_args: Some(types),
                             };
+                        } else if self.check(&Token::LBrace) {
+                            // obj.method<T> { ... } — 泛型方法调用 + 尾随闭包，
+                            // 例如 std.unittest 的 Generators.generate<Int64> { ... }
+                            let closure = match self.parse_primary()? {
+                                e @ Expr::Lambda { .. } => e,
+                                body => Expr::Lambda {
+                                    params: vec![],
+                                    return_type: None,
+                                    body: Box::new(body),
+                                },
+                            };
+                            expr = Expr::MethodCall {
+                                object: Box::new(expr),
+                                method: name,
+                                args: vec![closure],
+                                named_args: vec![],
+                                type_args: Some(types),
+                            };
                         } else {
-                            return self.bail(ParseError::UnexpectedToken(
-                                self.peek().cloned().unwrap_or(Token::Semicolon),
-                                "( after generic type arguments".to_string(),
-                            ));
+                            // 泛型方法引用：obj.method<T>（无调用括号）
+                            // 例如 std.unittest mock 中的 let f = x.FUNC_GENERIC<E>
+                            expr = Expr::MethodCall {
+                                object: Box::new(expr),
+                                method: name,
+                                args: vec![],
+                                named_args: vec![],
+                                type_args: Some(types),
+                            };
                         }
                     } else {
                         // 字段访问 obj.field
@@ -697,6 +720,10 @@ impl Parser {
             Some(Token::At) => {
                 self.pos -= 1; // 回退，让 parse_macro_call 重新消费 @
                 self.parse_macro_call()
+            }
+            // unittest mock DSL：宏实参中的 `_` 通配符（如 @On(a.intOpt(_))）
+            Some(Token::Underscore) if self.allow_wildcard_expr => {
+                Ok(Expr::Var("_".to_string()))
             }
             Some(Token::Integer(n)) => {
                 // 可选后缀 u8/u16/...（如 0x0Au8），消费掉以便后续不把 u8 当独立 token
@@ -1099,6 +1126,17 @@ impl Parser {
                 self.expect(Token::LBrace)?;
                 let catch_body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
+                // 多个 catch 子句（try { } catch (...) { } catch (...) { }）：
+                // AST 仅保留第一个 catch，其余做语法接纳后丢弃。
+                while self.check(&Token::Catch) {
+                    self.advance();
+                    if self.check(&Token::LParen) {
+                        self.skip_balanced_group()?;
+                    }
+                    self.expect(Token::LBrace)?;
+                    let _ = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                }
                 // 解析可选的 finally 块
                 let finally_body = if self.check(&Token::Finally) {
                     self.advance();
@@ -1152,7 +1190,11 @@ impl Parser {
                     if let Some(Token::Ident(ref v)) = self.peek_next() {
                         let variant_looks_like_type =
                             v.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
-                        if variant_looks_like_type {
+                        // `Type.Method<T>` 形式更可能是泛型方法引用而非枚举变体，
+                        // 交给 postfix 的泛型方法调用路径处理。
+                        let followed_by_type_args =
+                            matches!(self.peek_at(2), Some(Token::Lt));
+                        if variant_looks_like_type && !followed_by_type_args {
                             self.advance();
                             let variant = match self.advance() {
                                 Some(Token::Ident(v)) => v,
@@ -1215,8 +1257,10 @@ impl Parser {
                             })
                         }
                     }
-                    Some(Token::LBrace) if looks_like_type => {
-                        // 仅对类型名（首字母大写）解析为结构体初始化
+                    Some(Token::LBrace) if looks_like_type && !self.brace_starts_lambda() => {
+                        // 仅对类型名（首字母大写）解析为结构体初始化；
+                        // `{ => ... }` / `{ x => ... }` 形式的尾随闭包除外（如
+                        // GenerateEachInputProvider {=> array.clone()}）。
                         self.advance();
                         let fields = self.parse_struct_fields()?;
                         self.expect(Token::RBrace)?;
@@ -2144,6 +2188,46 @@ impl Parser {
     }
 
     /// 检查 < 后面是否看起来像泛型方法调用
+    /// 当前 token 为 `{` 时，判断该花括号是否开始一个闭包（lambda），
+    /// 形如 `{ => ... }`、`{ x => ... }`、`{ _ => ... }`、`{ x: T => ... }`、
+    /// `{ a, b => ... }`。用于区分结构体初始化与尾随闭包。
+    pub(crate) fn brace_starts_lambda(&self) -> bool {
+        match self.peek_next() {
+            Some(Token::FatArrow) => true,
+            Some(Token::Ident(_)) | Some(Token::Underscore) => {
+                // `{ x => ... }`：参数名后直接 =>
+                if matches!(self.peek_at(2), Some(Token::FatArrow)) {
+                    return true;
+                }
+                // `{ x: T => ... }` / `{ a, b => ... }` 与结构体初始化 `{ x: value }`
+                // 形似，需向前扫描顶层是否存在 `=>` 才能区分。
+                if matches!(
+                    self.peek_at(2),
+                    Some(Token::Colon) | Some(Token::Comma)
+                ) {
+                    let mut depth = 0i32;
+                    let mut i = self.pos;
+                    while i < self.tokens.len() {
+                        match &self.tokens[i].1 {
+                            Token::LBrace => depth += 1,
+                            Token::RBrace => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            Token::FatArrow if depth == 1 => return true,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// 用于区分 obj.method<T>() 和 obj.field < value
     fn looks_like_generic_method_call(&self) -> bool {
         // 启发式：区分 obj.method<Type>(args) 与比较运算符 obj.field < value

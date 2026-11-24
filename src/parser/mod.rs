@@ -28,6 +28,8 @@ pub struct Parser {
     parsing_operator_func: bool,
     /// 原始源码（用于检测跨行表达式边界）
     source: String,
+    /// 是否允许把 `_` 作为表达式通配符解析（仅在 unittest mock 宏实参中启用）
+    allow_wildcard_expr: bool,
 }
 
 impl Parser {
@@ -42,6 +44,7 @@ impl Parser {
             type_aliases: std::collections::HashMap::new(),
             parsing_operator_func: false,
             source: String::new(),
+            allow_wildcard_expr: false,
         }
     }
 
@@ -206,6 +209,29 @@ impl Parser {
             .unwrap_or(false)
     }
 
+    /// 跳过当前处于开括号位置的一整组平衡括号（含混合嵌套的 () [] {}）。
+    /// Skip one balanced group starting at the current opening token. Handles
+    /// mixed nesting of `()`, `[]` and `{}` so macro/attribute argument lists
+    /// containing lambdas, array literals or type arguments are consumed safely.
+    fn skip_balanced_group(&mut self) -> Result<(), ParseErrorAt> {
+        let mut depth = 0i32;
+        loop {
+            match self.advance() {
+                Some(Token::LParen) | Some(Token::LBracket) | Some(Token::LBrace) => {
+                    depth += 1
+                }
+                Some(Token::RParen) | Some(Token::RBracket) | Some(Token::RBrace) => {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return Ok(());
+                    }
+                }
+                Some(_) => {}
+                None => return self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
+            }
+        }
+    }
+
     /// 跳过可选的属性注解 @Ident [ ... ]（如 @Deprecated[message: "..."]]），不解析内容
     /// Skip `@Attr` or `@Attr[...]` annotations.
     /// Returns `true` if the following declaration should be skipped
@@ -250,6 +276,11 @@ impl Parser {
                     }
                 }
             }
+        }
+        // 声明形式的宏调用参数：@UnittestOption[Bool](opt, "desc")。
+        // 属性后直接跟平衡括号参数列表时整体跳过（不做宏展开）。
+        if self.check(&Token::LParen) {
+            self.skip_balanced_group()?;
         }
         Ok(should_skip_next)
     }
@@ -3079,5 +3110,181 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let program = parser.parse_program().unwrap();
         assert_eq!(program.enums.len(), 1);
+    }
+
+    /// @UnittestOption[Type](args) 顶层声明应当被整体跳过，且不影响后续声明。
+    #[test]
+    fn test_parse_unittest_option_top_level() {
+        let source = r#"
+            @UnittestOption[Bool](public opt, "the option")
+            @Test
+            func foo() {}
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].name, "foo");
+    }
+
+    /// 语句位 unittest 宏（@PowerAssert/@Fail/@Assert[...]）应被语法接纳。
+    #[test]
+    fn test_parse_unittest_macro_statements() {
+        let source = r#"
+            func f() {
+                @PowerAssert(false)
+                @Assert[checkNotNone](a)
+                @AssertThrows[ArithmeticException]({ throw Exception() })
+                @Fail("must fail")
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].body.len(), 4);
+    }
+
+    /// 泛型方法调用 + 尾随闭包：Generators.generate<Int64> { ... }
+    #[test]
+    fn test_parse_generic_method_trailing_closure() {
+        let source = r#"
+            func f() {
+                let g = Generators.generate<Int64> {
+                    i.value++
+                    i.value
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].body.len(), 1);
+    }
+
+    /// operator 与 override 修饰符可任意顺序出现：public operator override func
+    #[test]
+    fn test_parse_operator_override() {
+        let source = r#"
+            class C {
+                public operator override func ==(other: C): Bool { true }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 1);
+        assert_eq!(program.classes[0].methods.len(), 1);
+    }
+
+    /// 类成员前的 unittest 注解（含方括号参数）应被跳过。
+    #[test]
+    fn test_parse_class_member_unittest_attrs() {
+        let source = r#"
+            @Test
+            class C {
+                @TestCase
+                @Timeout[Duration.second]
+                func f() {
+                    @Expect(false)
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.classes.len(), 1);
+        assert_eq!(program.classes[0].methods.len(), 1);
+    }
+
+    /// interface 泛型约束 where 子句：interface Foo<T> where T <: Bar<T> { ... }
+    #[test]
+    fn test_parse_interface_where_clause() {
+        let source = r#"
+            interface SignedInteger<T> where T <: ArbitraryRange<T> & ToString {
+                func toInt64(): Int64
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.interfaces.len(), 1);
+    }
+
+    /// 多个 catch 子句：try { } catch (e: A | B) { } catch (_) { } —— 语法接纳
+    #[test]
+    fn test_parse_try_multiple_catch() {
+        let source = r#"
+            func f() {
+                let x = try {
+                    1
+                } catch (e: IllegalStateException | IllegalArgumentException) {
+                    2
+                } catch (_) {
+                    3
+                }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    /// 宏的尾随块参数：@EnsurePreparedToMock { => ... }
+    #[test]
+    fn test_parse_macro_trailing_block() {
+        let source = r#"
+            func f(): Int64 {
+                let x = @EnsurePreparedToMock {
+                    => return 1
+                }
+                return x
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    /// 泛型方法引用（无调用括号）：let f = x.FUNC_GENERIC<E>
+    #[test]
+    fn test_parse_generic_method_reference() {
+        let source = r#"
+            func f() {
+                let g = x.FUNC_GENERIC<Int64>
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    /// 接口中的泛型默认方法：func m<T>(x: T): String { ... }
+    #[test]
+    fn test_parse_interface_generic_method() {
+        let source = r#"
+            interface I {
+                func FUNC_GENERIC<T>(x: T): String { "original" }
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.interfaces.len(), 1);
+        assert_eq!(program.interfaces[0].methods.len(), 1);
     }
 }
