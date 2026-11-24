@@ -771,6 +771,7 @@ impl CodeGen {
     pub(crate) fn infer_ast_type(&self, expr: &Expr) -> Option<Type> {
         match expr {
             Expr::Integer(_) => Some(Type::Int64),
+            Expr::IntegerSuffixed(_, _) => Some(Type::Int64),
             Expr::Float(_) => Some(Type::Float64),
             Expr::Float32(_) => Some(Type::Float32),
             Expr::Bool(_) => Some(Type::Bool),
@@ -1440,6 +1441,7 @@ impl CodeGen {
                 })
             }
             Expr::Integer(_) => Some(Type::Int64),
+            Expr::IntegerSuffixed(_, _) => Some(Type::Int64),
             Expr::Float(_) => Some(Type::Float64),
             Expr::Float32(_) => Some(Type::Float32),
             Expr::Bool(_) => Some(Type::Bool),
@@ -2263,6 +2265,7 @@ impl CodeGen {
         }
         match expr {
             Expr::Integer(_) => ValType::I64,
+            Expr::IntegerSuffixed(_, _) => ValType::I64,
             Expr::Float(_) => ValType::F64,
             Expr::Float32(_) => ValType::F32,
             Expr::Bool(_) => ValType::I32,
@@ -4125,6 +4128,7 @@ impl CodeGen {
                     let actual = match expr {
                         // Integer 字面量始终产生 I64
                         Expr::Integer(_) => Some(ValType::I64),
+                        Expr::IntegerSuffixed(_, _) => Some(ValType::I64),
                         // Var：用 locals 中的实际 WASM 类型
                         Expr::Var(name) => locals.get_valtype(name),
                         // Bool 始终产生 I32
@@ -4718,6 +4722,10 @@ impl CodeGen {
     ) {
         match expr {
             Expr::Integer(n) => {
+                func.instruction(&Instruction::I64Const(*n));
+            }
+            Expr::IntegerSuffixed(n, _) => {
+                // 后缀只影响语义层类型判定；WASM 侧所有整型统一以 i64 表示。
                 func.instruction(&Instruction::I64Const(*n));
             }
             Expr::Float32(f) => {

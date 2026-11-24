@@ -157,6 +157,8 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
     match expr {
         // ── 字面量 ──────────────────────────────────────────────────────────
         Expr::Integer(_) => Some(Type::Int64),
+        // 带后缀整数字面量的类型由后缀决定（如 `1u8` → UInt8）。
+        Expr::IntegerSuffixed(_, s) => Some(s.ty()),
         Expr::Float(_) => Some(Type::Float64),
         Expr::Float32(_) => Some(Type::Float32),
         Expr::Bool(_) => Some(Type::Bool),
@@ -1452,6 +1454,7 @@ impl<'a, 'i> InstantiationScan<'a, 'i> {
                 }
             }
             Expr::Integer(_)
+            | Expr::IntegerSuffixed(_, _)
             | Expr::Float(_)
             | Expr::Float32(_)
             | Expr::Bool(_)

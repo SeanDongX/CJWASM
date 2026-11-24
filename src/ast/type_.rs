@@ -2,6 +2,56 @@
 
 use wasm_encoder::ValType;
 
+/// 整数字面量的显式类型后缀（如 `1u8`、`1i64`）。
+///
+/// 词法器在扫描整数字面量时保留后缀信息，供语义分析判定该字面量的具体
+/// 类型；无后缀的整数字面量仍按可适配任意整型的字面量处理（`Ty::IntLit`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntSuffix {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+}
+
+impl IntSuffix {
+    /// 后缀对应的仓颉整型。
+    pub fn ty(self) -> Type {
+        match self {
+            IntSuffix::I8 => Type::Int8,
+            IntSuffix::I16 => Type::Int16,
+            IntSuffix::I32 => Type::Int32,
+            IntSuffix::I64 => Type::Int64,
+            IntSuffix::U8 => Type::UInt8,
+            IntSuffix::U16 => Type::UInt16,
+            IntSuffix::U32 => Type::UInt32,
+            IntSuffix::U64 => Type::UInt64,
+        }
+    }
+
+    /// 后缀类型对应的位宽（字节数 * 8）。
+    pub fn bit_width(self) -> u32 {
+        match self {
+            IntSuffix::I8 | IntSuffix::U8 => 8,
+            IntSuffix::I16 | IntSuffix::U16 => 16,
+            IntSuffix::I32 | IntSuffix::U32 => 32,
+            IntSuffix::I64 | IntSuffix::U64 => 64,
+        }
+    }
+
+    /// 是否为无符号整数。
+    pub fn is_unsigned(self) -> bool {
+        matches!(
+            self,
+            IntSuffix::U8 | IntSuffix::U16 | IntSuffix::U32 | IntSuffix::U64
+        )
+    }
+}
+
 /// 仓颉语言类型 (与 cjc release/1.0 对齐)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {

@@ -150,13 +150,15 @@ impl Parser {
                     payload,
                 })
             }
-            Some(Token::Integer(n)) => {
+            Some(Token::Integer(n)) | Some(Token::IntegerSuffixed((n, _))) => {
                 let n = *n;
                 self.advance();
                 if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                     let inclusive = self.check(&Token::DotDotEq);
                     self.advance();
-                    if let Some(Token::Integer(end)) = self.advance() {
+                    if let Some(Token::Integer(end)) | Some(Token::IntegerSuffixed((end, _))) =
+                        self.advance()
+                    {
                         return Ok(Pattern::Range {
                             start: Literal::Integer(n),
                             end: Literal::Integer(end),

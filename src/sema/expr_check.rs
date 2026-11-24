@@ -20,7 +20,7 @@
 //! 规则整体关闭，避免误伤合法重载。
 
 use super::SemanticError;
-use crate::ast::{BinOp, Expr, Function, Pattern, Program, Stmt, Type, UnaryOp};
+use crate::ast::{BinOp, Expr, Function, IntSuffix, Pattern, Program, Stmt, Type, UnaryOp};
 use std::collections::{HashMap, HashSet};
 
 /// 轻量类型表示：只区分规范中参与运算符规则的基础类型，
@@ -159,14 +159,31 @@ impl Ty {
 fn literal_int(e: &Expr) -> Option<i64> {
     match e {
         Expr::Integer(n) if *n >= 0 => Some(*n),
+        // 带后缀整数字面量数值与无后缀一致，仅类型不同。
+        Expr::IntegerSuffixed(n, _) if *n >= 0 => Some(*n),
         Expr::Unary {
             op: UnaryOp::Neg,
             expr,
         } => match &**expr {
             Expr::Integer(n) if *n > 0 => n.checked_neg(),
+            Expr::IntegerSuffixed(n, _) if *n > 0 => n.checked_neg(),
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// 字面量类型后缀 → 具体整型 `Ty`。
+fn suffix_ty(s: IntSuffix) -> Ty {
+    match s {
+        IntSuffix::I8 => Ty::Int8,
+        IntSuffix::I16 => Ty::Int16,
+        IntSuffix::I32 => Ty::Int32,
+        IntSuffix::I64 => Ty::Int64,
+        IntSuffix::U8 => Ty::UInt8,
+        IntSuffix::U16 => Ty::UInt16,
+        IntSuffix::U32 => Ty::UInt32,
+        IntSuffix::U64 => Ty::UInt64,
     }
 }
 
@@ -260,6 +277,7 @@ fn global_const_ty(c: &crate::ast::ConstDef) -> Ty {
 fn static_expr_ty(e: &Expr) -> Ty {
     match e {
         Expr::Integer(_) => Ty::IntLit,
+        Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
         Expr::Float(_) => Ty::FloatLit,
         Expr::Float32(_) => Ty::FloatLit,
         Expr::Bool(_) => Ty::Bool,
@@ -379,6 +397,7 @@ fn is_comparison_expr(e: &Expr) -> bool {
 fn simple_operand(e: &Expr) -> bool {
     match e {
         Expr::Integer(_)
+        | Expr::IntegerSuffixed(_, _)
         | Expr::Float(_)
         | Expr::Float32(_)
         | Expr::Bool(_)
@@ -943,6 +962,7 @@ impl<'a> Checker<'a> {
     fn operand_known(&self, e: &Expr) -> bool {
         match e {
             Expr::Integer(_)
+            | Expr::IntegerSuffixed(_, _)
             | Expr::Float(_)
             | Expr::Float32(_)
             | Expr::Bool(_)
@@ -1176,6 +1196,7 @@ impl<'a> Checker<'a> {
     fn check_expr_ty_peek(&self, e: &Expr) -> Ty {
         match e {
             Expr::Integer(_) => Ty::IntLit,
+            Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
             Expr::Float(_) | Expr::Float32(_) => Ty::FloatLit,
             Expr::Bool(_) => Ty::Bool,
             Expr::Rune(_) => Ty::Rune,
@@ -1344,6 +1365,7 @@ impl<'a> Checker<'a> {
     fn check_expr(&mut self, expr: &Expr) -> Ty {
         match expr {
             Expr::Integer(_) => Ty::IntLit,
+            Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
             Expr::Float(_) => Ty::FloatLit,
             Expr::Float32(_) => Ty::FloatLit,
             Expr::Bool(_) => Ty::Bool,
@@ -1834,6 +1856,7 @@ impl<'a> Checker<'a> {
             }
             // 字面量等非左值：直接拒绝。
             Expr::Integer(_)
+            | Expr::IntegerSuffixed(_, _)
             | Expr::Float(_)
             | Expr::Float32(_)
             | Expr::Bool(_)
@@ -2230,6 +2253,54 @@ mod tests {
     fn test_arith_literal_adapts() {
         assert_ok("main() { var a: Int8 = 1; let c = a + 1 }");
         assert_ok("main() { var a: Float64 = 1.0; let c = a * 2.0 }");
+    }
+
+    // ─── 整数字面量类型后缀（1u8 / 1i64）────────────────────────────────
+
+    #[test]
+    fn test_suffix_literal_decl_ok() {
+        // 后缀类型与声明类型一致时允许。
+        assert_ok("main() { let a: UInt8 = 1u8 }");
+        assert_ok("main() { let a: Int64 = 1i64 }");
+        assert_ok("main() { let a: UInt8 = 1u8 + 2u8 }");
+        // 无后缀字面量仍可适配任意整数类型。
+        assert_ok("main() { let a: UInt8 = 1 }");
+    }
+
+    #[test]
+    fn test_suffix_narrow_decl_mismatch() {
+        // 后缀类型与声明类型不一致时报错（不隐式跨宽度转换）。
+        assert_err("main() { let a: Int64 = 1u8 }", "类型不匹配");
+        assert_err("main() { let a: UInt8 = 1i32 }", "类型不匹配");
+        // 整型后缀字面量不能赋给浮点类型。
+        assert_err("main() { let a: Float16 = -100i16 }", "类型不匹配");
+    }
+
+    #[test]
+    fn test_mixed_suffix_arith() {
+        // 混合后缀算术：两侧后缀类型不同即报错。
+        assert_err("main() { let v = 1u8 + 1i64 }", "操作数类型不匹配");
+        assert_err("main() { let v = 1i16 % 1u32 }", "操作数类型不匹配");
+        // 相同后缀或一侧无后缀（可适配）时允许。
+        assert_ok("main() { let v = 1u8 + 2u8 }");
+        assert_ok("main() { let v = 1u8 + 2 }");
+    }
+
+    #[test]
+    fn test_suffix_return_type_match() {
+        assert_err(
+            "func f(): Int64 { return 1u8 + 2u8 }",
+            "返回类型不匹配",
+        );
+        assert_ok("func f(): UInt8 { return 1u8 + 2u8 }");
+    }
+
+    #[test]
+    fn test_shift_count_overflow_suffixed() {
+        // 后缀字面量携带位宽，移位计数越界可在编译期发现（含无符号）。
+        assert_err("main() { let x = 1u8 << 8 }", "越界");
+        assert_ok("main() { let x = 1u8 << 7 }");
+        assert_err("main() { let x = 1u64 << 64 }", "越界");
     }
 
     #[test]
