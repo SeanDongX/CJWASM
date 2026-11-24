@@ -1643,6 +1643,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     is_open: m.is_open,
                     is_abstract: m.is_abstract,
                     has_body: m.has_body,
+                    is_const: m.is_const,
                     func: Function {
                         visibility: m.func.visibility.clone(),
                         name: method_name,
@@ -2357,6 +2358,7 @@ mod tests {
                         is_open: false,
                         is_abstract: false,
                         has_body: true,
+                        is_const: false,
                         func: Function {
                             visibility: Visibility::default(),
                             name: "Wrapper.get".to_string(),

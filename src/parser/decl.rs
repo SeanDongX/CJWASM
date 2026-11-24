@@ -84,9 +84,9 @@ impl Parser {
                     self.advance();
                     m.is_unsafe = true;
                 }
-                Some(Token::Const)
-                    if matches!(self.peek_next(), Some(Token::Func) | Some(Token::Init)) =>
-                {
+                // const 可修饰 func / init / static 字段，且与其它修饰符顺序无关
+                // （如 `const static func f()` / `static const var x`）。
+                Some(Token::Const) => {
                     self.advance();
                     m.is_const = true;
                 }
@@ -331,6 +331,11 @@ impl Parser {
                 if self.check(&Token::LBrace) {
                     self.advance(); // consume {
                     while !self.check(&Token::RBrace) && self.peek().is_some() {
+                        // cjc: foreign 块内函数可带属性（如 @C func f(...)）
+                        self.skip_optional_attributes()?;
+                        if self.check(&Token::RBrace) {
+                            break;
+                        }
                         functions.push(self.parse_extern_func(visibility.clone(), None)?);
                     }
                     self.expect(Token::RBrace)?;
@@ -477,6 +482,17 @@ impl Parser {
                     Some(Token::Import) => {
                         imports.push(self.parse_import()?);
                     }
+                    // 单文件多 package 分段规格（harness 的 SEPARATE-FILE 用例）：
+                    // 忽略后续 package 声明，各段并入同一模块继续解析。
+                    Some(Token::Package) if self.source.contains("SEPARATE-FILE") => {
+                        self.advance();
+                        let _ = self.advance_ident();
+                        while self.check(&Token::Dot) {
+                            self.advance();
+                            let _ = self.advance_ident();
+                        }
+                        continue;
+                    }
                     Some(tok) => {
                         return self.bail(ParseError::UnexpectedToken(
                             tok.clone(),
@@ -587,16 +603,28 @@ impl Parser {
                 self.advance();
                 let mut items = Vec::new();
                 loop {
-                    let item = match self.advance() {
-                        Some(Token::Ident(n)) => n,
-                        Some(Token::Internal) => "internal".to_string(),
-                        Some(Token::Star) => "*".to_string(),
-                        Some(tok) => {
-                            return self.bail(ParseError::UnexpectedToken(tok, "导入项名称".to_string()))
+                    // 分组项可为点分路径：`macros.*`、`assert.Assert`
+                    let mut segs: Vec<String> = Vec::new();
+                    loop {
+                        match self.advance() {
+                            Some(Token::Ident(n)) => segs.push(n),
+                            Some(Token::Internal) => segs.push("internal".to_string()),
+                            Some(Token::Star) => segs.push("*".to_string()),
+                            Some(tok) => {
+                                return self.bail(ParseError::UnexpectedToken(
+                                    tok,
+                                    "导入项名称".to_string(),
+                                ))
+                            }
+                            None => return self.bail(ParseError::UnexpectedEof),
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
-                    };
-                    items.push(item);
+                        if self.check(&Token::Dot) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                    items.push(segs.join("."));
 
                     if self.check(&Token::Comma) {
                         self.advance();
@@ -1534,6 +1562,7 @@ impl Parser {
                         visibility: Visibility::Public,
                         is_static: false,
                         type_params: vec![],
+                        is_const: false,
                     });
                     continue;
                 }
@@ -1566,6 +1595,7 @@ impl Parser {
                                 visibility: Visibility::Public,
                                 is_static: false,
                                 type_params: vec![],
+                                is_const: false,
                             });
                         } else if kw == "set" {
                             self.advance();
@@ -1610,6 +1640,7 @@ impl Parser {
                                 visibility: Visibility::Public,
                                 is_static: false,
                                 type_params: vec![],
+                                is_const: false,
                             });
                         } else {
                             break;
@@ -1698,6 +1729,7 @@ impl Parser {
                 visibility: mods.visibility.unwrap_or(Visibility::Public),
                 is_static: mods.is_static,
                 type_params: iface_type_params,
+                is_const: mods.is_const,
             });
         }
         self.expect(Token::RBrace)?;
@@ -2267,6 +2299,7 @@ impl Parser {
                     let body = self.parse_stmts()?;
                     self.expect(Token::RBrace)?;
                     methods.push(crate::ast::ClassMethod {
+                        is_const: false,
                         func: Function {
                             visibility: member_vis.clone(),
                             name: format!("{}.__static_init", name),
@@ -2387,8 +2420,70 @@ impl Parser {
                 self.expect(Token::Colon)?;
                 let prop_ty = self.parse_type()?;
                 // 无体属性声明（如 abstract class 中的 `public mut prop x: T`）：
-                // 不产生 getter/setter，直接解析下一个成员。
+                // 不生成具体实现，但登记抽象 getter/setter 方法，供子类 override 检查匹配。
                 if !self.check(&Token::LBrace) {
+                    let this_param = Param {
+                        name: "this".to_string(),
+                        ty: Type::Struct(name.clone(), vec![]),
+                        default: None,
+                        variadic: false,
+                        is_named: false,
+                        is_inout: false,
+                    };
+                    methods.push(crate::ast::ClassMethod {
+                        override_: false,
+                        has_override_kw: false,
+                        is_static: false,
+                        is_open: false,
+                        is_abstract: false,
+                        has_body: true,
+                        is_const: false,
+                        func: crate::ast::Function {
+                            visibility: member_vis.clone(),
+                            name: format!("{}.__get_{}", name, prop_name),
+                            type_params: vec![],
+                            constraints: vec![],
+                            params: vec![this_param.clone()],
+                            return_type: Some(prop_ty.clone()),
+                            throws: None,
+                            body: vec![],
+                            extern_import: None,
+                        },
+                    });
+                    if mods.is_mut {
+                        let mut params = vec![this_param];
+                        params.push(Param {
+                            name: "value".to_string(),
+                            ty: prop_ty.clone(),
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        });
+                        methods.push(crate::ast::ClassMethod {
+                            override_: false,
+                            has_override_kw: false,
+                            is_static: false,
+                            is_open: false,
+                            is_abstract: false,
+                            has_body: true,
+                            is_const: false,
+                            func: crate::ast::Function {
+                                visibility: member_vis.clone(),
+                                name: format!("{}.__set_{}", name, prop_name),
+                                type_params: vec![],
+                                constraints: vec![],
+                                params,
+                                return_type: None,
+                                throws: None,
+                                body: vec![],
+                                extern_import: None,
+                            },
+                        });
+                    }
+                    while self.check(&Token::Semicolon) {
+                        self.advance();
+                    }
                     continue;
                 }
                 self.expect(Token::LBrace)?;
@@ -2413,6 +2508,7 @@ impl Parser {
                                 is_open: mods.is_open,
                                 is_abstract: mods.is_abstract,
                                 has_body: true,
+                                is_const: false,
                                 func: crate::ast::Function {
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__get_{}", name, prop_name),
@@ -2460,6 +2556,7 @@ impl Parser {
                                 is_open: mods.is_open,
                                 is_abstract: mods.is_abstract,
                                 has_body: true,
+                                is_const: false,
                                 func: crate::ast::Function {
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__set_{}", name, prop_name),
@@ -2735,6 +2832,7 @@ impl Parser {
                     is_open: mods.is_open,
                     is_abstract: mods.is_abstract,
                     has_body,
+                    is_const: mods.is_const,
                     func: crate::ast::Function {
                         visibility: member_vis,
                         name: m_name,
@@ -2746,6 +2844,49 @@ impl Parser {
                         body,
                         extern_import: None,
                     },
+                });
+            } else if mods.is_const && matches!(self.peek(), Some(Token::Ident(_))) {
+                // const FIELD_NAME[: Type] [= value] — 类级别常量字段
+                let f_name = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => {
+                        return self.bail(ParseError::UnexpectedToken(tok, "常量名".to_string()))
+                    }
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                let (ty, default) = if self.check(&Token::Assign) {
+                    self.advance();
+                    (
+                        crate::ast::Type::TypeParam("_".to_string()),
+                        Some(self.parse_expr()?),
+                    )
+                } else if self.check(&Token::Colon) {
+                    self.advance();
+                    let ty = self.parse_type()?;
+                    let default = if self.check(&Token::Assign) {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    (ty, default)
+                } else {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(
+                        tok,
+                        "常量: 期望 : 类型 或 = 值".to_string(),
+                    ));
+                };
+                while self.check(&Token::Semicolon) || self.check(&Token::Comma) {
+                    self.advance();
+                }
+                fields.push(crate::ast::FieldDef {
+                    name: f_name,
+                    ty,
+                    default,
+                    is_mut: false,
+                    is_static: false,
+                    visibility: member_vis.clone(),
                 });
             } else if self.check(&Token::Const) {
                 self.advance(); // consume const

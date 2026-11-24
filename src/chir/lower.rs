@@ -786,6 +786,7 @@ mod tests {
                 is_open: false,
                 is_abstract: false,
                 has_body: true,
+                is_const: false,
                 func: class_method_func,
             }],
             primary_ctor_params: vec![],

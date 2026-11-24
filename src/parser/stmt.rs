@@ -94,6 +94,89 @@ impl Parser {
         Ok(stmts)
     }
 
+    /// 无类型标注的 let/var 直接绑定 Lambda 时，若 Lambda 参数混用“带标注/省略标注”，
+    /// 编译器无法从上下文推断省略参数的类型，需报错（5.5(10)）。
+    fn check_unannotated_lambda_binding(
+        &mut self,
+        ty: &Option<Type>,
+        value: &Expr,
+        value_start: usize,
+    ) -> Result<(), ParseErrorAt> {
+        if ty.is_none()
+            && matches!(value, Expr::Lambda { .. })
+            && self.lambda_tokens_mixed_annotations(value_start)
+        {
+            return self.bail(ParseError::UnknownType(
+                "无法从上下文推断 Lambda 参数类型：参数类型标注必须全部省略或全部标注"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 扫描 `[value_start, self.pos)` 中的 `{ params => ... }`，判断参数是否混用类型标注。
+    ///
+    /// 仅做 token 级判定：按顶层逗号切分参数，参数名后出现顶层 `:` 视为带标注；
+    /// 泛型 `<>`、括号/方括号内的逗号与冒号不计入顶层。
+    fn lambda_tokens_mixed_annotations(&self, value_start: usize) -> bool {
+        let end = self.pos.min(self.tokens.len());
+        if value_start >= end {
+            return false;
+        }
+        let toks: Vec<&Token> = (value_start..end).map(|i| &self.tokens[i].1).collect();
+        if !matches!(toks.first(), Some(Token::LBrace)) {
+            return false;
+        }
+        let mut any_annot = false;
+        let mut any_unannot = false;
+        let mut has_name = false;
+        let mut has_colon = false;
+        let mut angle = 0i32;
+        let mut paren = 0i32;
+        let mut bracket = 0i32;
+        for tok in toks.iter().skip(1) {
+            let top = angle == 0 && paren == 0 && bracket == 0;
+            match tok {
+                Token::FatArrow if top => {
+                    if has_name {
+                        if has_colon {
+                            any_annot = true;
+                        } else {
+                            any_unannot = true;
+                        }
+                    }
+                    break;
+                }
+                Token::Comma if top => {
+                    if has_name {
+                        if has_colon {
+                            any_annot = true;
+                        } else {
+                            any_unannot = true;
+                        }
+                    }
+                    has_name = false;
+                    has_colon = false;
+                }
+                Token::Colon if top => has_colon = true,
+                Token::Lt => angle += 1,
+                Token::Gt => angle = (angle - 1).max(0),
+                Token::Shr => angle = (angle - 2).max(0),
+                Token::LParen => paren += 1,
+                Token::RParen => paren = (paren - 1).max(0),
+                Token::LBracket => bracket += 1,
+                Token::RBracket => bracket = (bracket - 1).max(0),
+                Token::Ident(_) | Token::Underscore
+                    if top && !has_name && !has_colon =>
+                {
+                    has_name = true;
+                }
+                _ => {}
+            }
+        }
+        any_annot && any_unannot
+    }
+
     /// 解析语句
     pub(crate) fn parse_stmt(&mut self) -> Result<Stmt, ParseErrorAt> {
         match self.peek() {
@@ -181,8 +264,10 @@ impl Parser {
                     None
                 };
                 // 支持无初始化的 let 声明: let x: Type（延迟赋值，常见于 try 块前）
+                let mut value_start = self.pos;
                 let value = if self.check(&Token::Assign) {
                     self.advance();
+                    value_start = self.pos;
                     self.parse_expr()?
                 } else {
                     if let Some(ref t) = ty {
@@ -194,12 +279,14 @@ impl Parser {
                         ));
                     }
                 };
+                self.check_unannotated_lambda_binding(&ty, &value, value_start)?;
                 Ok(Stmt::Let { pattern, ty, value })
             }
             Some(Token::Var) => {
                 self.advance();
-                // var 声明只允许元组解构；构造器模式（如 var Workday(x) = ...）非法
-                let pattern = if self.check(&Token::LParen) {
+                // var 声明允许元组解构与（单构造器）枚举构造器模式：var C(c) = C(16)。
+                // 多构造器枚举的构造器模式不可反驳性由语义检查（irrefutable 规则）拒绝。
+                let pattern = if self.check(&Token::LParen) || self.looks_like_variant_pattern() {
                     self.parse_pattern()?
                 } else {
                     // cjc: var _ = expr — 求值右侧后丢弃（丢弃绑定）
@@ -229,8 +316,10 @@ impl Parser {
                     None
                 };
                 // 支持无初始化的变量声明: var x: Int64
+                let mut value_start = self.pos;
                 let value = if self.check(&Token::Assign) {
                     self.advance();
+                    value_start = self.pos;
                     self.parse_expr()?
                 } else {
                     // 无初始化值，使用类型的默认值
@@ -243,6 +332,7 @@ impl Parser {
                         ));
                     }
                 };
+                self.check_unannotated_lambda_binding(&ty, &value, value_start)?;
                 Ok(Stmt::Var { pattern, ty, value })
             }
             Some(Token::Return) => {
@@ -527,6 +617,11 @@ impl Parser {
                 self.advance();
                 if self.check(&Token::Var) || self.check(&Token::Let) {
                     self.advance();
+                }
+                // cjc: 局部 const func Name(...) { ... } — const 修饰的局部函数声明
+                if self.check(&Token::Func) {
+                    let f = self.parse_function_with_visibility(Visibility::default())?;
+                    return Ok(Stmt::LocalFunc(f));
                 }
                 let name = match self.advance_ident() {
                     Some(n) => n,

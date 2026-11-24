@@ -570,6 +570,8 @@ pub struct InterfaceMethod {
     pub is_static: bool,
     /// 方法级泛型参数名（如 `func f<T>()` 的 ["T"]）。
     pub type_params: Vec<String>,
+    /// 是否为 const 函数（const func）。const 接口函数必须由 const 函数实现。
+    pub is_const: bool,
 }
 
 /// 接口关联类型定义（如 type Element）
@@ -663,6 +665,8 @@ pub struct ClassMethod {
     pub is_abstract: bool,
     /// 是否声明了函数体（`{}` 也算有体）。无体声明用于抽象方法。
     pub has_body: bool,
+    /// 是否为 const 函数（const func / const static func）
+    pub is_const: bool,
     pub func: Function,
 }
 

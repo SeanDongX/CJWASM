@@ -266,7 +266,7 @@ impl Parser {
             match self.peek() {
                 None => return self.bail(ParseError::UnexpectedEof),
                 Some(Token::Comma) | Some(Token::Gt) if depth == 0 => break,
-                Some(Token::Shr) if depth == 0 => break,
+                Some(Token::Shr) | Some(Token::GtEq) if depth == 0 => break,
                 Some(tok) => {
                     match tok {
                         Token::LParen | Token::LBracket | Token::LBrace => depth += 1,
@@ -366,6 +366,11 @@ impl Parser {
                 } else if self.check(&Token::Shr) {
                     self.advance();
                     self.pushback = Some(Token::Gt);
+                } else if self.check(&Token::GtEq) {
+                    // 无空格写法 `VArray<Int64, $2>=[...]` 词法上是 `>=`，
+                    // 拆分为类型实参结束 `>` 与初始化 `=`。
+                    self.advance();
+                    self.pushback = Some(Token::Assign);
                 } else {
                     return self.bail(ParseError::UnexpectedToken(
                         self.peek().cloned().unwrap_or(Token::Gt),

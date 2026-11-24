@@ -209,7 +209,21 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::Literal(Literal::String(s_str)))
             }
-            Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => {
+            Some(Token::MultiLineStringLit(s)) => {
+                let s = match s.clone() {
+                    StringOrInterpolated::Plain(t) => t,
+                    StringOrInterpolated::Interpolated(parts) => parts
+                        .iter()
+                        .map(|p| match p {
+                            crate::lexer::StringPart::Literal(t) => t.clone(),
+                            crate::lexer::StringPart::Interpolation(t) => format!("${{{}}}", t),
+                        })
+                        .collect::<String>(),
+                };
+                self.advance();
+                Ok(Pattern::Literal(Literal::String(s)))
+            }
+            Some(Token::RawStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => {
                 let s = s.clone();
                 self.advance();
                 Ok(Pattern::Literal(Literal::String(s)))

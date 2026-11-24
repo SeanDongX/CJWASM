@@ -4036,4 +4036,124 @@ mod tests {
             panic!("应为 let 语句");
         }
     }
+    // ─── w5c-final-pos: 正测试收尾修复的单测 ───
+
+    #[test]
+    fn test_w5c_local_const_func() {
+        // 局部 `const func` 声明按普通局部函数解析
+        let program = parse_ok("main() { const func f() { 1 } let x = f() }");
+        assert!(matches!(
+            program.functions[0].body[0],
+            Stmt::LocalFunc(_)
+        ));
+    }
+
+    #[test]
+    fn test_w5c_const_static_func_modifier_order() {
+        // `const static func` / `static const func` 修饰符顺序无关（class 与 struct）
+        let program = parse_ok(
+            "class G<T> { const static func f() { 3 } const init() { } }\n\
+             struct S { const func f() { 4 } }\n\
+             main() { }",
+        );
+        assert_eq!(program.classes.len(), 1);
+        assert_eq!(program.structs.len(), 1);
+        let static_f = program.classes[0]
+            .methods
+            .iter()
+            .find(|m| m.func.name.ends_with(".f"))
+            .expect("应解析出 static f");
+        assert!(static_f.is_const);
+    }
+
+    #[test]
+    fn test_w5c_foreign_block_attribute_func() {
+        // foreign { ... } 块内的 @C 属性函数
+        let program = parse_ok(
+            "foreign { func func_01(x: Int32): Int32\n @C func func_02(x: Int32): Int32 }\n\
+             main() { }",
+        );
+        let externs: Vec<_> = program
+            .functions
+            .iter()
+            .filter(|f| f.extern_import.is_some())
+            .collect();
+        assert_eq!(externs.len(), 2);
+    }
+
+    #[test]
+    fn test_w5c_group_import_dotted_items() {
+        // `import pkg.{a.*, b.C}` 分组点分导入项
+        let program = parse_ok("import utils.{macros.*, assert.Assert}\nmain() { }");
+        assert_eq!(program.imports.len(), 1);
+        let items = program.imports[0].items.as_ref().expect("分组导入项");
+        assert_eq!(items, &vec!["macros.*".to_string(), "assert.Assert".to_string()]);
+    }
+
+    #[test]
+    fn test_w5c_var_constructor_pattern() {
+        // 单构造器枚举允许不可反驳的构造器模式绑定
+        let program = parse_ok(
+            "enum MyEnum { C(Int64) }\nmain() { var C(c) = C(16) c++ }",
+        );
+        assert!(matches!(program.functions[0].body[0], Stmt::Var { .. }));
+    }
+
+    #[test]
+    fn test_w5c_lambda_mixed_param_annotations() {
+        // 多参 lambda 允许部分参数带类型注解
+        parse_ok("main() { var l: (Int32, Int32) -> Int32 = {a, b: Int32 => a + b} }");
+        parse_ok("main() { var l: (Int32, Int32) -> Int32 = {a: Int32, b => a + b} }");
+    }
+
+    #[test]
+    fn test_w5c_trailing_closure_statement_body() {
+        // `Column { 语句块 }` 按尾随闭包调用解析（而非结构体字面量）
+        let program = parse_ok(
+            "func Column(c: () -> Unit) {}\n\
+             main() { Column { println(1) } }",
+        );
+        match &program.functions[1].body[0] {
+            Stmt::Expr(Expr::Call { args, .. }) => {
+                assert!(matches!(args.as_slice(), [Expr::Lambda { .. }]))
+            }
+            other => panic!("应为尾随闭包调用，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_w5c_optional_chain_empty_closure() {
+        // `s?.f{}` 可选链尾随空闭包
+        parse_ok(
+            "class FunctionsSet { operator func() () { 5 } }\n\
+             struct S { var vf: FunctionsSet = FunctionsSet() }\n\
+             main() { let s: ?S = S() let x = s?.vf{} }",
+        );
+    }
+
+    #[test]
+    fn test_w5c_varray_type_close_gt_adjacent_assign() {
+        // `VArray<Int64, $2>=[...]` 中 `>=` 需拆分为 `>` 与 `=`
+        parse_ok("main() { let a: VArray<Int64, $2>=[0, 1] }");
+    }
+
+    #[test]
+    fn test_w5c_multiline_string_interpolation() {
+        // 多行字符串支持 ${...} 插值
+        let program = parse_ok("main() { let s = \"\"\"\n${1 + 2}\"\"\" }");
+        assert!(matches!(
+            program.functions[0].body[0],
+            Stmt::Let { value: Expr::Interpolate(_), .. }
+        ));
+    }
+
+    #[test]
+    fn test_w5c_extra_package_decl_requires_separate_file_marker() {
+        // 仅在 SEPARATE-FILE 规格中允许单文件出现多个 package 声明
+        parse_should_fail("package a\nfunc f() {}\npackage b\nmain() { }");
+        let source = "// SEPARATE-FILE: other.cj\npackage a\nfunc f() {}\npackage b\nmain() { }";
+        let tokens: Vec<_> = Lexer::new(source).filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens).with_source(source);
+        parser.parse_program().expect("SEPARATE-FILE 规格应允许额外 package");
+    }
 }

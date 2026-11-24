@@ -7736,6 +7736,7 @@ mod tests {
                     is_open: false,
                     is_abstract: false,
                     has_body: true,
+                    is_const: false,
                     func: FuncDef {
                         visibility: Visibility::default(),
                         name: "get_size".to_string(),
@@ -8150,6 +8151,7 @@ mod tests {
                     visibility: Visibility::Public,
                     is_static: false,
                     type_params: vec![],
+                    is_const: false,
                 }],
                 assoc_types: vec![],
             }],
@@ -8212,6 +8214,7 @@ mod tests {
                     visibility: Visibility::Public,
                     is_static: false,
                     type_params: vec![],
+                    is_const: false,
                 }],
                 assoc_types: vec![],
             }],

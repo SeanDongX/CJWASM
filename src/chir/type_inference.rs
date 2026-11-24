@@ -1150,6 +1150,7 @@ mod tests {
                 is_open: false,
                 is_abstract: false,
                 has_body: true,
+                is_const: false,
                 func: make_function("Counter.get", vec![
                     make_param("this", Type::Struct("Counter".into(), vec![])),
                 ], Some(Type::Int64), vec![]),
