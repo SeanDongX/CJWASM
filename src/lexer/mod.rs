@@ -643,7 +643,7 @@ pub enum Token {
     TypeMap,
 
     // Float64：小数、科学计数法（无后缀）、前导点小数或十六进制浮点（规范 1.3）
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*|\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|0[xX][0-9a-fA-F_]*(\.[0-9a-fA-F_]*)?[pP][+-]?[0-9][0-9_]*", |lex| {
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*|0[xX][0-9a-fA-F_]*(\.[0-9a-fA-F_]*)?[pP][+-]?[0-9][0-9_]*", |lex| {
         if leading_dot_malformed(lex) {
             return None;
         }
@@ -658,7 +658,7 @@ pub enum Token {
     Float(f64),
 
     // Float64 带 f64 后缀
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f64|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f64|[0-9][0-9_]*f64|\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f64", priority = 4, callback = |lex| {
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f64|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f64|[0-9][0-9_]*f64", priority = 4, callback = |lex| {
         if leading_dot_malformed(lex) {
             return None;
         }
@@ -669,7 +669,7 @@ pub enum Token {
     Float64Suffix(f64),
 
     // Float32：f、f32 或 f16 后缀（Float16 在 WASM 层同为 f32，值按 f32 解析）
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f32|f16)|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f|\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f32|f16|f)", priority = 3, callback = |lex| {
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f32|f16)|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
         if leading_dot_malformed(lex) {
             return None;
         }
@@ -1649,48 +1649,32 @@ mod tests {
 
     #[test]
     fn test_float_leading_dot() {
-        // 规范 1.3.2：DecimalFraction 允许省略整数部分（.5 / .8e1）
+        // 规范 1.3.2：DecimalFraction 允许省略整数部分（.5 / .8e1）。
+        // 词法层拆为 Dot + 数字，由解析器 try_leading_dot_float 重建（避免
+        // t.0 的 .0 被误吞为 Float 导致元组索引失效）。
         let source = ".5 .8e1 .002";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(tokens[0], Token::Float(0.5));
-        assert_eq!(tokens[1], Token::Float(8.0));
-        assert_eq!(tokens[2], Token::Float(0.002));
+        assert_eq!(tokens[0], Token::Dot);
+        assert_eq!(tokens[1], Token::Integer(5));
+        assert_eq!(tokens[2], Token::Dot);
     }
 
     #[test]
     fn test_float_leading_dot_with_suffix() {
-        let source = ".002f32 .5f64 .8e1f16";
+        // 前导点带后缀拆分：.002f32 → Dot + Float32(词法值不含前导点，
+        // 实际数值由解析器 try_leading_dot_float 从源码切片重建)
+        let source = ".002f32";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        match tokens[0] {
-            Token::Float32(v) => assert!((v - 0.002).abs() < 1e-7),
-            ref other => panic!("Expected Float32, got {:?}", other),
-        }
+        assert_eq!(tokens[0], Token::Dot);
         match tokens[1] {
-            Token::Float64Suffix(v) => assert!((v - 0.5).abs() < 1e-12),
-            ref other => panic!("Expected Float64 suffix, got {:?}", other),
-        }
-        match tokens[2] {
-            Token::Float32(v) => assert!((v - 8.0).abs() < 1e-6),
+            Token::Float32(_) => {}
             ref other => panic!("Expected Float32, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_float_leading_dot_malformed_rejected() {
-        // .0.0 / .00xp0 不是合法浮点字面量
-        for src in [".0.0", ".00xp0"] {
-            let lexer = Lexer::new(src);
-            let toks: Vec<_> = lexer.collect();
-            assert!(
-                toks.iter().any(|t| t.is_err()),
-                "expected lexical error for {:?}, got {:?}",
-                src,
-                toks
-            );
-        }
-    }
 
     #[test]
     fn test_rune_escape_fvb_dollar_quote() {

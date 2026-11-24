@@ -153,9 +153,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Unit 类型不能转换为 WASM")]
-    fn test_to_wasm_unit_panic() {
-        Type::Unit.to_wasm();
+    fn test_to_wasm_unit_as_i32() {
+        // Unit 兼容降级为 i32（w3d: 表达式语境中 Unit 需要有 wasm 表示）
+        assert_eq!(Type::Unit.to_wasm(), ValType::I32);
     }
 
     #[test]
