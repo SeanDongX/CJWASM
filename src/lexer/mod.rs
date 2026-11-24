@@ -1,3 +1,4 @@
+use crate::ast::IntSuffix;
 use logos::Logos;
 
 /// 字符串插值的部分
@@ -108,6 +109,29 @@ fn parse_decimal_float(s: &str) -> Option<f64> {
         format!("0{}", s).parse::<f64>().ok()
     } else {
         s.parse::<f64>().ok()
+    }
+}
+
+/// 解析整数字面量正文（已移除下划线，且不含类型后缀）为 i64。
+///
+/// 超出 i64 但可表示为 u64 的无符号字面量按位折叠为 i64（与既有行为一致）。
+fn parse_integer_literal(body: &str) -> Option<i64> {
+    if body.len() >= 2 && (body.starts_with("0x") || body.starts_with("0X")) {
+        i64::from_str_radix(&body[2..], 16)
+            .ok()
+            .or_else(|| u64::from_str_radix(&body[2..], 16).ok().map(|v| v as i64))
+    } else if body.starts_with("0o") || body.starts_with("0O") {
+        i64::from_str_radix(&body[2..], 8)
+            .ok()
+            .or_else(|| u64::from_str_radix(&body[2..], 8).ok().map(|v| v as i64))
+    } else if body.starts_with("0b") || body.starts_with("0B") {
+        i64::from_str_radix(&body[2..], 2)
+            .ok()
+            .or_else(|| u64::from_str_radix(&body[2..], 2).ok().map(|v| v as i64))
+    } else {
+        body.parse::<i64>()
+            .ok()
+            .or_else(|| body.parse::<u64>().ok().map(|v| v as i64))
     }
 }
 
@@ -680,27 +704,39 @@ pub enum Token {
     })]
     Float32(f32),
 
-    // 整数字面量，支持可选的 Cangjie 类型后缀（i8/i16/i32/i64/u8/u16/u32/u64）。
-    // 后缀类型信息由变量/常量声明的类型标注承载，此处剥离后按整数解析。
-    #[regex(r"(0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[oO][0-7][0-7_]*|0[bB][01][01_]*|[0-9][0-9_]*)(i8|i16|i32|i64|u8|u16|u32|u64)?", |lex| {
-        let raw = lex.slice();
-        let s: String = raw.chars().filter(|c| *c != '_').collect();
-        // 剥离整数类型后缀（若有）
-        let suffixes = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"];
-        let mut body: &str = &s;
-        for suf in suffixes {
-            if body.ends_with(suf) {
-                body = &body[..body.len() - suf.len()];
-                break;
-            }
-        }
-        if body.len() >= 2 && (body.starts_with("0x") || body.starts_with("0X")) {
-            i64::from_str_radix(&body[2..], 16).ok().or_else(|| u64::from_str_radix(&body[2..], 16).ok().map(|v| v as i64))
-        } else if body.starts_with("0o") || body.starts_with("0O") { i64::from_str_radix(&body[2..], 8).ok().or_else(|| u64::from_str_radix(&body[2..], 8).ok().map(|v| v as i64)) }
-        else if body.starts_with("0b") || body.starts_with("0B") { i64::from_str_radix(&body[2..], 2).ok().or_else(|| u64::from_str_radix(&body[2..], 2).ok().map(|v| v as i64)) }
-        else { body.parse::<i64>().ok().or_else(|| body.parse::<u64>().ok().map(|v| v as i64)) }
+    // 整数字面量（无类型后缀）。带类型后缀的形态由下面的 `IntegerSuffixed`
+    // 变体按最长匹配优先识别。
+    #[regex(r"(0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[oO][0-7][0-7_]*|0[bB][01][01_]*|[0-9][0-9_]*)", |lex| {
+        let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
+        parse_integer_literal(&s)
     })]
     Integer(i64),
+
+    // 整数字面量带 Cangjie 类型后缀（i8/i16/i32/i64/u8/u16/u32/u64）。
+    // 保留后缀类型供语义分析判定字面量的具体整型；代码生成与 `Integer` 等价。
+    #[regex(r"(0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[oO][0-7][0-7_]*|0[bB][01][01_]*|[0-9][0-9_]*)(i8|i16|i32|i64|u8|u16|u32|u64)", priority = 5, callback = |lex| {
+        let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
+        let suffixes = [
+            ("i8", IntSuffix::I8),
+            ("i16", IntSuffix::I16),
+            ("i32", IntSuffix::I32),
+            ("i64", IntSuffix::I64),
+            ("u8", IntSuffix::U8),
+            ("u16", IntSuffix::U16),
+            ("u32", IntSuffix::U32),
+            ("u64", IntSuffix::U64),
+        ];
+        for (suf, ty) in suffixes {
+            if s.ends_with(suf) {
+                let body = &s[..s.len() - suf.len()];
+                if let Some(v) = parse_integer_literal(body) {
+                    return Some((v, ty));
+                }
+            }
+        }
+        None
+    })]
+    IntegerSuffixed((i64, IntSuffix)),
 
     // 字节字面量 b'x' (Cangjie 语法，支持转义，含 \u{XX} 十六进制字节)
     #[regex(r#"b'[^'\\]'|b'\\[ntrbfv0'"\\]'|b'\\u\{[0-9a-fA-F]{1,2}\}'"#, |lex| {
@@ -1540,11 +1576,11 @@ mod tests {
         let source = "55i8 300i32 0b110111_i8 0x1Fi8 7u64";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(tokens[0], Token::Integer(55));
-        assert_eq!(tokens[1], Token::Integer(300));
-        assert_eq!(tokens[2], Token::Integer(55));
-        assert_eq!(tokens[3], Token::Integer(31));
-        assert_eq!(tokens[4], Token::Integer(7));
+        assert_eq!(tokens[0], Token::IntegerSuffixed((55, IntSuffix::I8)));
+        assert_eq!(tokens[1], Token::IntegerSuffixed((300, IntSuffix::I32)));
+        assert_eq!(tokens[2], Token::IntegerSuffixed((55, IntSuffix::I8)));
+        assert_eq!(tokens[3], Token::IntegerSuffixed((31, IntSuffix::I8)));
+        assert_eq!(tokens[4], Token::IntegerSuffixed((7, IntSuffix::U64)));
     }
 
     #[test]
@@ -1558,15 +1594,27 @@ mod tests {
 
     #[test]
     fn test_integer_type_suffix() {
-        // 整数字面量的 Cangjie 类型后缀应并入同一个 Integer token
+        // 整数字面量的 Cangjie 类型后缀由独立的 IntegerSuffixed token 保留
         let source = "8i8 16u16 64i64 0x0Au8 0b101u32";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(tokens[0], Token::Integer(8));
-        assert_eq!(tokens[1], Token::Integer(16));
-        assert_eq!(tokens[2], Token::Integer(64));
-        assert_eq!(tokens[3], Token::Integer(10));
-        assert_eq!(tokens[4], Token::Integer(5));
+        assert_eq!(tokens[0], Token::IntegerSuffixed((8, IntSuffix::I8)));
+        assert_eq!(tokens[1], Token::IntegerSuffixed((16, IntSuffix::U16)));
+        assert_eq!(tokens[2], Token::IntegerSuffixed((64, IntSuffix::I64)));
+        assert_eq!(tokens[3], Token::IntegerSuffixed((10, IntSuffix::U8)));
+        assert_eq!(tokens[4], Token::IntegerSuffixed((5, IntSuffix::U32)));
+    }
+
+    #[test]
+    fn test_integer_suffix_preserved_no_leak() {
+        // 后缀 token 保留类型；无后缀整数仍为 Integer；相邻标识符不被吞并。
+        let source = "1i64 2u8 x3 4";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::IntegerSuffixed((1, IntSuffix::I64)));
+        assert_eq!(tokens[1], Token::IntegerSuffixed((2, IntSuffix::U8)));
+        assert_eq!(tokens[2], Token::Ident("x3".to_string()));
+        assert_eq!(tokens[3], Token::Integer(4));
     }
 
     #[test]
@@ -1643,9 +1691,9 @@ mod tests {
         let source = "0O371u8 0B1111i64 0XFAu64";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(tokens[0], Token::Integer(0o371));
-        assert_eq!(tokens[1], Token::Integer(15));
-        assert_eq!(tokens[2], Token::Integer(0xFA));
+        assert_eq!(tokens[0], Token::IntegerSuffixed((0o371, IntSuffix::U8)));
+        assert_eq!(tokens[1], Token::IntegerSuffixed((15, IntSuffix::I64)));
+        assert_eq!(tokens[2], Token::IntegerSuffixed((0xFA, IntSuffix::U64)));
     }
 
     #[test]

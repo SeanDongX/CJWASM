@@ -4013,4 +4013,27 @@ mod tests {
         assert_eq!(program.type_aliases.len(), 1);
         assert_eq!(program.type_aliases[0].0, "TestedType");
     }
+
+    #[test]
+    fn test_parse_integer_literal_suffix_into_ast() {
+        // 带类型后缀的整数字面量在 AST 中保留后缀（1u8 → IntegerSuffixed）。
+        let source = "main() { let a = 1u8 let b = 2 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        if let Stmt::Let { value, .. } = &program.functions[0].body[0] {
+            assert!(matches!(
+                value,
+                Expr::IntegerSuffixed(1, crate::ast::IntSuffix::U8)
+            ));
+        } else {
+            panic!("应为 let 语句");
+        }
+        if let Stmt::Let { value, .. } = &program.functions[0].body[1] {
+            assert!(matches!(value, Expr::Integer(2)));
+        } else {
+            panic!("应为 let 语句");
+        }
+    }
 }

@@ -163,6 +163,7 @@ impl<'a> LoweringContext<'a> {
         let kind = match expr {
             // 字面量
             Expr::Integer(n) => CHIRExprKind::Integer(*n),
+            Expr::IntegerSuffixed(n, _) => CHIRExprKind::Integer(*n),
             Expr::Float(f) => CHIRExprKind::Float(*f),
             Expr::Float32(f) => CHIRExprKind::Float32(*f),
             Expr::Bool(b) => CHIRExprKind::Bool(*b),

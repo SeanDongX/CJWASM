@@ -1004,6 +1004,41 @@ impl Parser {
         Some(value)
     }
 
+    /// 整数字面量作为表达式主元，并在其后识别范围表达式（`a..b` / `a..=b`）。
+    ///
+    /// `lit` 为已构造好的字面量表达式（保留无后缀 / 带后缀的区分）。
+    fn finish_int_primary(&mut self, lit: Expr) -> Result<Expr, ParseErrorAt> {
+        if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
+            let inclusive = self.check(&Token::DotDotEq);
+            self.advance();
+            // 支持开放式范围 2.. (没有结束值)
+            let end = if self.check(&Token::RBracket)
+                || self.check(&Token::RParen)
+                || self.check(&Token::Comma)
+            {
+                // 2.. 后面是 ] 或 ) 或 , 说明是开放式范围
+                Box::new(Expr::Integer(i64::MAX))
+            } else {
+                // 结束值：范围运算符优先级最低，按完整表达式解析（如 1..3 + 3）
+                Box::new(self.parse_pipeline()?)
+            };
+            // P2.6: 可选步长 `: step`（支持负步长 -1）
+            let step = if self.check(&Token::Colon) {
+                self.advance();
+                Some(Box::new(self.parse_pipeline()?))
+            } else {
+                None
+            };
+            return Ok(Expr::Range {
+                start: Box::new(lit),
+                end,
+                inclusive,
+                step,
+            });
+        }
+        Ok(lit)
+    }
+
     /// 解析基础表达式
     pub(crate) fn parse_primary(&mut self) -> Result<Expr, ParseErrorAt> {
         // 循环表达式作为值使用（如 `let x = for (...) { ... }`）：
@@ -1035,38 +1070,12 @@ impl Parser {
                 Ok(Expr::Var("_".to_string()))
             }
             Some(Token::Integer(n)) => {
-                // 整数字面量后缀（i8/u8/...）已在词法层并入同一个 token，
+                // 整数字面量后缀已在词法层识别为独立 token（`IntegerSuffixed`），
                 // 此处不再向后窥探并吞掉同名标识符（否则会跨行吞掉变量名）。
-                // 检查是否是范围表达式
-                if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
-                    let inclusive = self.check(&Token::DotDotEq);
-                    self.advance();
-                    // 支持开放式范围 2.. (没有结束值)
-                    let end = if self.check(&Token::RBracket)
-                        || self.check(&Token::RParen)
-                        || self.check(&Token::Comma)
-                    {
-                        // 2.. 后面是 ] 或 ) 或 , 说明是开放式范围
-                        Box::new(Expr::Integer(i64::MAX))
-                    } else {
-                        // 结束值：范围运算符优先级最低，按完整表达式解析（如 1..3 + 3）
-                        Box::new(self.parse_pipeline()?)
-                    };
-                    // P2.6: 可选步长 `: step`（支持负步长 -1）
-                    let step = if self.check(&Token::Colon) {
-                        self.advance();
-                        Some(Box::new(self.parse_pipeline()?))
-                    } else {
-                        None
-                    };
-                    return Ok(Expr::Range {
-                        start: Box::new(Expr::Integer(n)),
-                        end,
-                        inclusive,
-                        step,
-                    });
-                }
-                Ok(Expr::Integer(n))
+                self.finish_int_primary(Expr::Integer(n))
+            }
+            Some(Token::IntegerSuffixed((n, suf))) => {
+                self.finish_int_primary(Expr::IntegerSuffixed(n, suf))
             }
             Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Ok(Expr::Float(f)),
             Some(Token::Float32(f)) => Ok(Expr::Float32(f)),
@@ -2443,6 +2452,7 @@ impl Parser {
         // 不解析结构体初始化 (因为 { 会被误认为 match body)
         let mut expr = match self.advance() {
             Some(Token::Integer(n)) => Expr::Integer(n),
+            Some(Token::IntegerSuffixed((n, suf))) => Expr::IntegerSuffixed(n, suf),
             Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Expr::Float(f),
             Some(Token::Float32(f)) => Expr::Float32(f),
             Some(Token::This) => match self.receiver_name.clone() {

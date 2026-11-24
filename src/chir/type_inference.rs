@@ -228,6 +228,7 @@ impl TypeInferenceContext {
         match expr {
             // 字面量
             Expr::Integer(_) => Ok(Type::Int64),
+            Expr::IntegerSuffixed(_, _) => Ok(Type::Int64),
             Expr::Float(_) => Ok(Type::Float64),
             Expr::Float32(_) => Ok(Type::Float32),
             Expr::Bool(_) => Ok(Type::Bool),

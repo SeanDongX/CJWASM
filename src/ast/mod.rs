@@ -1,6 +1,6 @@
 mod type_;
 
-pub use type_::Type;
+pub use type_::{IntSuffix, Type};
 
 /// 一元运算符
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +50,11 @@ pub enum InterpolatePart {
 pub enum Expr {
     /// 整数字面量
     Integer(i64),
+    /// 带显式类型后缀的整数字面量（如 `1u8`、`1i64`）。
+    ///
+    /// 语义分析据此判定字面量的具体整型（用于混合后缀运算检测、窄类型
+    /// 声明/返回类型匹配）；代码生成与 [`Expr::Integer`] 完全等价。
+    IntegerSuffixed(i64, IntSuffix),
     /// 浮点数字面量 (Float64)
     Float(f64),
     /// Float32 字面量 (后缀 f)
