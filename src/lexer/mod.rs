@@ -1080,7 +1080,35 @@ impl<'a> Iterator for Lexer<'a> {
                 {
                     return Some(Ok((span.start, Token::Ident(s.clone()), span.end)));
                 }
-                Ok(tok) => return Some(Ok((span.start, tok, span.end))),
+                Ok(tok) => {
+                    // 数字字面量不能直接紧贴标识符字符：
+                    // `0a12345`（非法十进制前缀）、`654f32`/`0f16`（纯整数加浮点后缀）
+                    // 均为规范负例。十六进制浮点可带 f16/f32/f64 后缀，
+                    // 本词法器把后缀留给后续标识符，故对含 p/P 的十六进制浮点跳过。
+                    if matches!(
+                        tok,
+                        Token::Integer(_)
+                            | Token::IntegerSuffixed(_)
+                            | Token::Float(_)
+                            | Token::Float32(_)
+                            | Token::Float64Suffix(_)
+                    ) {
+                        let prev = self.inner.source()[..span.start].chars().next_back();
+                        let float_suffix = matches!(
+                            tok,
+                            Token::Float32(_) | Token::Float64Suffix(_)
+                        );
+                        if let Some(msg) = invalid_numeric_tail(
+                            self.inner.slice(),
+                            self.inner.remainder(),
+                            prev,
+                            float_suffix,
+                        ) {
+                            return Some(Err(msg));
+                        }
+                    }
+                    return Some(Ok((span.start, tok, span.end)));
+                }
                 Err(_) => {
                     return Some(Err(format!(
                         "未知字符: '{}'",
@@ -1104,6 +1132,45 @@ fn is_raw_identifier(s: &str) -> bool {
         return false;
     }
     s.chars().all(|c| c == '_' || c.is_alphanumeric())
+}
+
+/// 数字字面量非法形态检测。
+///
+/// 规范 1.3.1/1.3.2：十进制字面量不能以 `0` + 非前缀字母开头
+/// （`0a12345`），整数部分不能直接接浮点后缀（`654f32`、`0f16`）。
+/// 十六进制浮点允许 `f16/f32/f64` 后缀，词法正则未包含该后缀，
+/// 因此字符串中含 `p/P` 的十六进制浮点跳过检查。
+fn invalid_numeric_tail(
+    slice: &str,
+    remainder: &str,
+    prev: Option<char>,
+    float_suffix: bool,
+) -> Option<String> {
+    // 纯整数直接带浮点后缀（`654f32` / `0f16`）非法；前导点小数
+    // （`.002f32`，此时前一个 token 是 `.`）是合法的分数部分形态。
+    if float_suffix {
+        let pure_int = !slice.contains('.')
+            && !slice.contains('e')
+            && !slice.contains('E')
+            && !slice.contains('p')
+            && !slice.contains('P');
+        if pure_int && prev != Some('.') {
+            return Some(format!(
+                "无效的数字字面量: '{}'（浮点后缀不能用于整数）",
+                slice
+            ));
+        }
+    }
+    let next = remainder.chars().next()?;
+    if !(next.is_ascii_alphabetic() || next == '_') {
+        return None;
+    }
+    let is_hex_float = (slice.starts_with("0x") || slice.starts_with("0X"))
+        && (slice.contains('p') || slice.contains('P'));
+    if is_hex_float {
+        return None;
+    }
+    Some(format!("无效的数字字面量: '{}{}'", slice, next))
 }
 
 #[cfg(test)]
@@ -1466,7 +1533,9 @@ mod tests {
     /// 不得把尾部数字拆成 Integer。
     #[test]
     fn test_lexer_float16_literal() {
-        let source = "1.2f16 0.11f16 3f16";
+        // 纯整数不能直接带浮点后缀（`3f16` 非法，见 1.3.2(3)），
+        // 合法形态需带小数或指数部分。
+        let source = "1.2f16 0.11f16 3e0f16";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(tokens.len(), 3);
@@ -1868,5 +1937,21 @@ mod batch04_tests {
         assert_eq!(toks[0], Token::Let);
         assert_eq!(toks[1], Token::Ident("a".to_string()));
         assert_eq!(toks[2], Token::Assign);
+    }
+
+    #[test]
+    fn test_w7b_invalid_numeric_literal_forms() {
+        // 1.3.1/1.3.2 负例：`0` + 非前缀字母、纯整数直接接浮点后缀。
+        let err_count = |s: &str| Lexer::new(s).filter(|r| r.is_err()).count();
+        assert!(err_count("0a12345") > 0);
+        assert!(err_count("0F12") > 0);
+        assert!(err_count("654f32") > 0);
+        assert!(err_count("0f16") > 0);
+        // 合法形态不受影响：前缀、类型后缀、小数/指数浮点、前导点小数、
+        // 十六进制浮点（允许 f16/f32/f64 后缀）。
+        assert_eq!(
+            err_count("0x1F 0b101 0o77 0i64 0.5f32 .5f16 1e3f64 0x1p1f32 0.0f16"),
+            0
+        );
     }
 }

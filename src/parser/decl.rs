@@ -21,6 +21,9 @@ pub(crate) struct MemberModifiers {
     pub is_operator: bool,
     pub is_unsafe: bool,
     pub is_mut: bool,
+    /// 已消费的修饰符 token 个数（用于诊断重复/多个修饰符的非法组合，
+    /// 如结构体主构造函数只允许一个可访问性修饰符）。
+    pub count: usize,
 }
 
 impl Parser {
@@ -30,6 +33,7 @@ impl Parser {
     pub(crate) fn parse_member_modifiers(&mut self) -> MemberModifiers {
         let mut m = MemberModifiers::default();
         loop {
+            let pos_before = self.pos;
             match self.peek() {
                 Some(Token::Public) => {
                     self.advance();
@@ -91,6 +95,9 @@ impl Parser {
                     m.is_const = true;
                 }
                 _ => break,
+            }
+            if self.pos != pos_before {
+                m.count += 1;
             }
         }
         m
@@ -896,6 +903,11 @@ impl Parser {
         let mut fields = Vec::new();
         let mut methods = Vec::new();
 
+        // 结构体构造函数：主构造函数至多一个；构造函数之间不得签名重复
+        // （规范 2.1.10.2(29)：其它构造函数须与主构造函数构成重载）。
+        let mut primary_seen = false;
+        let mut ctor_sigs: Vec<Vec<Type>> = Vec::new();
+
         while !self.check(&Token::RBrace) {
             // 容忍成员声明后的多余分号（如 `init(...) {...};`）
             if self.check(&Token::Semicolon) {
@@ -908,8 +920,33 @@ impl Parser {
             if matches!(self.peek(), Some(Token::Ident(ref n)) if n == &name)
                 && matches!(self.peek_next(), Some(Token::LParen))
             {
+                // 2.1.10.2(2)：主构造函数只允许一个可访问性修饰符；
+                // static/open/abstract/override/redef/sealed/operator/unsafe/mut 均非法。
+                if primary_seen {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Ident(name.clone()),
+                        "结构体只能有一个主构造函数".to_string(),
+                    ));
+                }
+                primary_seen = true;
+                if mods.count > 2
+                    || mods.is_static
+                    || mods.is_open
+                    || mods.is_abstract
+                    || mods.is_override
+                    || mods.is_sealed
+                    || mods.is_operator
+                    || mods.is_unsafe
+                    || mods.is_mut
+                {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Ident(name.clone()),
+                        "非法的结构体主构造函数修饰符".to_string(),
+                    ));
+                }
                 self.advance(); // consume struct name
                 self.expect(Token::LParen)?;
+                let mut primary_sig: Vec<Type> = Vec::new();
                 // 解析 (public|private|...)? (var|let)? name: Type, ... 作为主构造参数，并转为 fields
                 while !self.check(&Token::RParen) {
                     if self.check(&Token::Public) || self.check(&Token::Private)
@@ -936,6 +973,7 @@ impl Parser {
                     }
                     self.expect(Token::Colon)?;
                     let ty = self.parse_type()?;
+                    primary_sig.push(ty.clone());
                     let default = if self.check(&Token::Assign) {
                         self.advance();
                         Some(self.parse_expr()?)
@@ -954,6 +992,7 @@ impl Parser {
                     self.advance();
                 }
                 self.expect(Token::RParen)?;
+                ctor_sigs.push(primary_sig);
                 // 跳过可选的 { body } 或 ;
                 if self.check(&Token::LBrace) {
                     self.advance();
@@ -974,9 +1013,36 @@ impl Parser {
 
             // cjc 兼容: init 构造函数（const init 的 const 已由修饰符收集）— 解析并忽略 body
             if self.check(&Token::Init) {
+                // 2.1.10.2(2)：init 构造函数同样只允许一个可访问性修饰符
+                // （以及 const/static 组合），open/abstract/override/redef/
+                // sealed/operator/unsafe/mut 均非法。
+                if mods.is_open
+                    || mods.is_abstract
+                    || mods.is_override
+                    || mods.is_sealed
+                    || mods.is_operator
+                    || mods.is_unsafe
+                    || mods.is_mut
+                {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Init,
+                        "非法的结构体 init 构造函数修饰符".to_string(),
+                    ));
+                }
                 self.advance(); // consume 'init'
                 self.expect(Token::LParen)?;
-                let _params = self.parse_params()?;
+                let params = self.parse_params()?;
+                let sig: Vec<Type> = params.iter().map(|p| p.ty.clone()).collect();
+                // static init 是静态初始化器，不参与构造函数重载签名比较。
+                if !mods.is_static {
+                    if ctor_sigs.contains(&sig) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Init,
+                            "结构体构造函数签名重复".to_string(),
+                        ));
+                    }
+                    ctor_sigs.push(sig);
+                }
                 self.expect(Token::RParen)?;
                 self.expect(Token::LBrace)?;
                 // 跳过 init body（平衡大括号）

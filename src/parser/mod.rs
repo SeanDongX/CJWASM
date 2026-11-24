@@ -4156,4 +4156,35 @@ mod tests {
         let mut parser = Parser::new(tokens).with_source(source);
         parser.parse_program().expect("SEPARATE-FILE 规格应允许额外 package");
     }
+
+    #[test]
+    fn test_w7b_struct_ctor_modifier_validation() {
+        let parses = |s: &str| {
+            let tokens: Vec<_> = Lexer::new(s).filter_map(|r| r.ok()).collect();
+            Parser::new(tokens).with_source(s).parse_program().is_ok()
+        };
+        // 2.1.10.2(2)：主构造函数 / init 构造函数的非法修饰符。
+        assert!(!parses("struct S { static S() {} }"));
+        assert!(!parses("struct S { open init() {} }"));
+        assert!(!parses("struct S { private private private S() {} }"));
+        assert!(!parses("struct S { unsafe init() {} }"));
+        // 合法：可访问性修饰符、const/static init。
+        assert!(parses("struct S { private S(x: Int64) {} }"));
+        assert!(parses("struct S { S() {} static init() {} }"));
+        assert!(parses("struct S { const init() {} }"));
+    }
+
+    #[test]
+    fn test_w7b_struct_ctor_duplicate_signature() {
+        let parses = |s: &str| {
+            let tokens: Vec<_> = Lexer::new(s).filter_map(|r| r.ok()).collect();
+            Parser::new(tokens).with_source(s).parse_program().is_ok()
+        };
+        // 2.1.10.2(29)：构造函数之间须构成重载，签名不能重复。
+        assert!(!parses("struct S { init() {} init() {} }"));
+        assert!(!parses("struct S { S() {} init() {} }"));
+        assert!(!parses("struct S { init(x: Int64) {} init(y: Int64) {} }"));
+        assert!(parses("struct S { init(x: Int64) {} init(x: Bool) {} }"));
+        assert!(parses("struct S { S(x: Int64) {} init(y: Bool) {} }"));
+    }
 }
