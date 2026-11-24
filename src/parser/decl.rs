@@ -1088,11 +1088,15 @@ impl Parser {
             }
         }
         // cjc: enum Name <: Protocol<Type> { ... } — 消费可选的 <: Bound 或 <: Bound<T>
+        let super_uses_subtype = self.check(&Token::SubType);
         if self.check(&Token::SubType)
             || self.check(&Token::Colon)
             || (self.check(&Token::Lt)
                 && matches!(self.peek_next(), Some(Token::Colon) | Some(Token::Ident(_))))
         {
+            // `<:` 后面的名字是枚举实现的父接口，记录到约束中供语义检查使用
+            // （`:` 形式可能是泛型约束等，不复用）。
+            let mut super_bounds: Vec<String> = Vec::new();
             if self.check(&Token::Lt)
                 && matches!(self.peek_next(), Some(Token::Colon) | Some(Token::Ident(_)))
             {
@@ -1103,8 +1107,12 @@ impl Parser {
             } else {
                 self.advance();
             }
-            let _ = match self.advance() {
-                Some(Token::Ident(_)) => (),
+            match self.advance() {
+                Some(Token::Ident(b)) => {
+                    if super_uses_subtype {
+                        super_bounds.push(b);
+                    }
+                }
                 Some(tok) => {
                     return self.bail(ParseError::UnexpectedToken(tok, "协议/约束名".to_string()))
                 }
@@ -1133,7 +1141,11 @@ impl Parser {
                 self.advance(); // consume &
                 // 消费下一个约束名
                 match self.advance() {
-                    Some(Token::Ident(_)) => (),
+                    Some(Token::Ident(b)) => {
+                        if super_uses_subtype {
+                            super_bounds.push(b);
+                        }
+                    }
                     Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "协议/约束名".to_string())),
                     None => return self.bail(ParseError::UnexpectedEof),
                 }
@@ -1146,6 +1158,12 @@ impl Parser {
                         if self.check(&Token::Comma) { self.advance(); } else { break; }
                     }
                 }
+            }
+            if super_uses_subtype && !super_bounds.is_empty() {
+                constraints.push(TypeConstraint {
+                    param: name.clone(),
+                    bounds: super_bounds,
+                });
             }
         }
         self.expect(Token::LBrace)?;

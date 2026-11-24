@@ -318,7 +318,9 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
 //
 // 所有规则都能在单文件内基于 AST 判定，父类型无法在本地解析时保守跳过。
 
-use crate::ast::{ClassDef, EnumDef, Function, InterfaceDef, InterfaceMethod, StructDef};
+use crate::ast::{
+    AssignTarget, ClassDef, EnumDef, Function, InterfaceDef, InterfaceMethod, StructDef, Visibility,
+};
 use std::collections::HashSet;
 
 mod expr_check;
@@ -355,7 +357,11 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     }
     for en in &program.enums {
         check_enum_variants(en, &mut errors);
+        check_enum_interfaces(en, program, &index, &mut errors);
     }
+
+    // 不允许实例化抽象类 / 接口；不能继承 struct/enum。
+    check_instantiation_targets(program, &mut errors);
 
     // 表达式/赋值类型检查：运算符操作数类型、可赋值性、不可变绑定等。
     expr_check::check_program(program, &mut errors);
@@ -385,6 +391,8 @@ struct Sig {
     tp_order: Vec<String>,
     /// 是否为静态函数（无实例接收者）。
     is_static: bool,
+    /// 声明可见性；`None` 表示语言层不可见（接口方法在 AST 中不保存可见性）。
+    vis: Option<Visibility>,
     /// 用于错误消息的全名。
     display: String,
 }
@@ -422,6 +430,7 @@ fn sig_of_function(func: &Function, outer_tp: &[String]) -> Sig {
         generic: Some(!func.type_params.is_empty()),
         tp_order,
         is_static,
+        vis: Some(func.visibility.clone()),
         display: func.name.clone(),
     }
 }
@@ -438,6 +447,8 @@ fn sig_of_interface_method(method: &InterfaceMethod) -> Sig {
         tp_order: Vec::new(),
         // 接口的 static 修饰符不进入 AST，static/实例区分不可用。
         is_static: false,
+        // 接口方法在 AST 中不保存可见性。
+        vis: None,
         display: method.name.clone(),
     }
 }
@@ -654,11 +665,592 @@ fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<Semant
     // override / redef 签名校验
     check_class_overrides(cls, index, errors);
 
+    // 覆写/重定义不得降低访问级别
+    check_member_visibility_lowering(cls, index, errors);
+
+    // 实现接口属性时类型必须完全一致
+    if let Some(parents) = collect_parent_methods(cls, index) {
+        if parents.iter().any(|p| p.is_interface) {
+            let own: Vec<Sig> = cls
+                .methods
+                .iter()
+                .map(|m| sig_of_function(&m.func, &cls.type_params))
+                .collect();
+            check_interface_property_types(&cls.name, &own, &parents, index, errors);
+        }
+    }
+
     // 与父类同名函数的 static/实例冲突
     check_inherited_static_conflicts(cls, index, errors);
 
     // 接口实现完整性
     check_interface_implementation(cls, index, errors);
+
+    // 父类型来源合法性：单继承、可继承性、不能继承 struct/enum
+    check_class_supertypes(cls, index, errors);
+}
+
+/// 可见性级别：private < internal(默认) < protected < public。
+fn visibility_rank(v: &Visibility) -> u8 {
+    match v {
+        Visibility::Private => 0,
+        Visibility::Internal => 1,
+        Visibility::Protected => 2,
+        Visibility::Public => 3,
+    }
+}
+
+/// 校验 class 的父类型来源（6.1.1.2(1)、6.1.1.2(11)、6.1.1.3(2)(4)、6.1.1.1(6)）：
+/// - 类只能单继承：`implements` 中出现的名字不得解析为本地类；
+/// - 只能继承 open / abstract / sealed 类（sealed 在同包内可继承）；
+/// - 不得继承 struct / enum，也不得把 struct / enum 当作接口实现。
+///
+/// 父类型无法在本地解析时保守跳过。
+fn check_class_supertypes(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if let Some(parent) = cls.extends.as_deref() {
+        if index.classes.contains_key(parent) {
+            let p = index.classes[parent];
+            // sealed 类允许在同一包（单文件视为同包）内被继承；abstract 类天然可继承。
+            if !p.is_open && !p.is_abstract && !p.is_sealed {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 不能继承非 open/abstract/sealed 类 '{}'",
+                        cls.name, parent
+                    ),
+                });
+            }
+        } else if index.structs.contains(parent) || index.enums.contains(parent) {
+            errors.push(SemanticError {
+                message: format!("类 '{}' 不能继承 struct/enum 类型 '{}'", cls.name, parent),
+            });
+        }
+    }
+    for name in &cls.implements {
+        if let Some(p) = index.classes.get(name.as_str()) {
+            // 抽象类可能被误解析进 implements（如多模板标注用例）；仅对非抽象类报错，
+            // 避免误伤合法/宏相关用例。open 类出现在 implements 一定是多继承。
+            if !p.is_abstract {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 只能单继承，不能从另一个类 '{}' 继承（父类须位于 <: 列表首位）",
+                        cls.name, name
+                    ),
+                });
+            }
+        } else if index.structs.contains(name.as_str()) || index.enums.contains(name.as_str()) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 不能将 struct/enum 类型 '{}' 当作接口实现",
+                    cls.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 扫描所有函数体，禁止实例化抽象类或接口。
+fn check_instantiation_targets(
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    let abstract_classes: HashSet<&str> = program
+        .classes
+        .iter()
+        .filter(|c| c.is_abstract)
+        .map(|c| c.name.as_str())
+        .collect();
+    let interfaces: HashSet<&str> = program.interfaces.iter().map(|i| i.name.as_str()).collect();
+    if abstract_classes.is_empty() && interfaces.is_empty() {
+        return;
+    }
+
+    // 可能遮蔽类型名的可调用名/成员名。若调用的裸名与这些名字重名，按“调用函数
+    // 而非实例化类型”处理并跳过判定（名称遮蔽用例不得误伤）。
+    let mut shadowed: HashSet<&str> = HashSet::new();
+    for f in &program.functions {
+        shadowed.insert(f.name.rsplit('.').next().unwrap_or(f.name.as_str()));
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            shadowed.insert(m.func.name.rsplit('.').next().unwrap_or(m.func.name.as_str()));
+        }
+        for f in &cls.fields {
+            shadowed.insert(f.name.as_str());
+        }
+        for p in &cls.primary_ctor_params {
+            shadowed.insert(p.name.as_str());
+        }
+    }
+    for st in &program.structs {
+        for f in &st.fields {
+            shadowed.insert(f.name.as_str());
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            shadowed.insert(f.name.rsplit('.').next().unwrap_or(f.name.as_str()));
+        }
+    }
+
+    let mut ctx = InstantiationScan {
+        abstract_classes,
+        interfaces,
+        shadowed,
+        scopes: Vec::new(),
+        errors,
+    };
+
+    for func in &program.functions {
+        ctx.scan_function(func);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            ctx.scan_function(&m.func);
+        }
+        if let Some(init) = &cls.init {
+            ctx.push_scope();
+            for p in &init.params {
+                ctx.bind(&p.name);
+                if let Some(d) = &p.default {
+                    ctx.scan_expr(d);
+                }
+            }
+            for s in &init.body {
+                ctx.scan_stmt(s);
+            }
+            ctx.pop_scope();
+        }
+        if let Some(body) = &cls.deinit {
+            ctx.scan_stmts(body);
+        }
+        if let Some(body) = &cls.static_init {
+            ctx.scan_stmts(body);
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            ctx.scan_function(f);
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(body) = &m.default_body {
+                ctx.scan_stmts(body);
+            }
+        }
+    }
+    for c in &program.constants {
+        ctx.scan_expr(&c.init);
+    }
+}
+
+/// 递归扫描函数体中的调用，识别对抽象类/接口的实例化。
+struct InstantiationScan<'a, 'i> {
+    abstract_classes: HashSet<&'a str>,
+    interfaces: HashSet<&'a str>,
+    /// 可能与类型名重名的可调用/成员名（遮蔽时跳过实例化判定）。
+    shadowed: HashSet<&'a str>,
+    /// 局部作用域栈：记录参数、局部变量、局部函数等名字。
+    scopes: Vec<HashSet<String>>,
+    errors: &'i mut Vec<SemanticError>,
+}
+
+impl<'a, 'i> InstantiationScan<'a, 'i> {
+    fn push_scope(&mut self) {
+        self.scopes.push(HashSet::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn bind(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string());
+        }
+    }
+
+    fn bind_pattern(&mut self, pattern: &crate::ast::Pattern) {
+        use crate::ast::Pattern;
+        match pattern {
+            Pattern::Binding(n) => self.bind(n),
+            Pattern::Struct { fields, .. } => {
+                for (_, p) in fields {
+                    self.bind_pattern(p);
+                }
+            }
+            Pattern::Tuple(items) | Pattern::Or(items) => {
+                for p in items {
+                    self.bind_pattern(p);
+                }
+            }
+            Pattern::Variant { payload, .. } => {
+                if let Some(p) = payload {
+                    self.bind_pattern(p);
+                }
+            }
+            Pattern::TypeTest { binding, .. } => self.bind(binding),
+            _ => {}
+        }
+    }
+
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.shadowed.contains(name) || self.scopes.iter().any(|s| s.contains(name))
+    }
+
+    fn scan_function(&mut self, func: &Function) {
+        self.push_scope();
+        for p in &func.params {
+            self.bind(&p.name);
+            if let Some(d) = &p.default {
+                self.scan_expr(d);
+            }
+        }
+        // 函数体与参数共享同一作用域，避免为参数再压一层。
+        for stmt in &func.body {
+            self.scan_stmt(stmt);
+        }
+        self.pop_scope();
+    }
+
+    fn scan_stmts(&mut self, stmts: &[Stmt]) {
+        self.push_scope();
+        for stmt in stmts {
+            self.scan_stmt(stmt);
+        }
+        self.pop_scope();
+    }
+
+    fn scan_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let { pattern, value, .. } | Stmt::Var { pattern, value, .. } => {
+                self.scan_expr(value);
+                self.bind_pattern(pattern);
+            }
+            Stmt::Const { name, value, .. } => {
+                self.scan_expr(value);
+                self.bind(name);
+            }
+            Stmt::Assign { target, value } => {
+                self.scan_assign_target(target);
+                self.scan_expr(value);
+            }
+            Stmt::Expr(e) => self.scan_expr(e),
+            Stmt::Return(Some(e)) => self.scan_expr(e),
+            Stmt::While { cond, body } => {
+                self.scan_expr(cond);
+                self.scan_stmts(body);
+            }
+            Stmt::WhileLet { pattern, expr, body } => {
+                self.scan_expr(expr);
+                self.push_scope();
+                self.bind_pattern(pattern);
+                for s in body {
+                    self.scan_stmt(s);
+                }
+                self.pop_scope();
+            }
+            Stmt::DoWhile { body, cond } => {
+                self.scan_stmts(body);
+                self.scan_expr(cond);
+            }
+            Stmt::For { var, iterable, body } => {
+                self.scan_expr(iterable);
+                self.push_scope();
+                self.bind(var);
+                for s in body {
+                    self.scan_stmt(s);
+                }
+                self.pop_scope();
+            }
+            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => self.scan_stmts(body),
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                self.scan_expr(left);
+                self.scan_expr(right);
+            }
+            Stmt::LocalFunc(f) => {
+                let simple = f.name.rsplit('.').next().unwrap_or(f.name.as_str()).to_string();
+                self.bind(&simple);
+                self.scan_function(f);
+            }
+            Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
+        }
+    }
+
+    fn scan_assign_target(&mut self, target: &AssignTarget) {
+        match target {
+            AssignTarget::Index { index, .. } => self.scan_expr(index),
+            AssignTarget::IndexPath { index, .. } => self.scan_expr(index),
+            AssignTarget::ExprIndex { expr, index } => {
+                self.scan_expr(expr);
+                self.scan_expr(index);
+            }
+            AssignTarget::ExprField { object, .. } => self.scan_expr(object),
+            AssignTarget::Slice { array, start, end } => {
+                self.scan_expr(array);
+                self.scan_expr(start);
+                self.scan_expr(end);
+            }
+            AssignTarget::Tuple(items) => {
+                for t in items {
+                    self.scan_assign_target(t);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_ctor_name(&mut self, name: &str) {
+        if name.contains('.') || self.is_shadowed(name) {
+            return;
+        }
+        if self.abstract_classes.contains(name) {
+            self.errors.push(SemanticError {
+                message: format!("抽象类 '{}' 不能被实例化", name),
+            });
+        } else if self.interfaces.contains(name) {
+            self.errors.push(SemanticError {
+                message: format!("接口 '{}' 不能被实例化", name),
+            });
+        }
+    }
+
+    fn scan_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Call { name, args, named_args, .. }
+            | Expr::ConstructorCall { name, args, named_args, .. } => {
+                self.check_ctor_name(name);
+                self.scan_exprs(args);
+                self.scan_named(named_args);
+            }
+            Expr::MethodCall { object, args, named_args, .. } => {
+                self.scan_expr(object);
+                self.scan_exprs(args);
+                self.scan_named(named_args);
+            }
+            Expr::SuperCall { args, named_args, .. } => {
+                self.scan_exprs(args);
+                self.scan_named(named_args);
+            }
+            Expr::Unary { expr, .. }
+            | Expr::Try(expr)
+            | Expr::Throw(expr)
+            | Expr::Cast { expr, .. }
+            | Expr::IsType { expr, .. }
+            | Expr::PostfixIncr(expr)
+            | Expr::PostfixDecr(expr)
+            | Expr::PrefixIncr(expr)
+            | Expr::PrefixDecr(expr)
+            | Expr::Field { object: expr, .. }
+            | Expr::OptionalChain { object: expr, .. }
+            | Expr::TupleIndex { object: expr, .. } => self.scan_expr(expr),
+            Expr::Binary { left, right, .. } => {
+                self.scan_expr(left);
+                self.scan_expr(right);
+            }
+            Expr::If { cond, then_branch, else_branch } => {
+                self.scan_expr(cond);
+                self.scan_expr(then_branch);
+                if let Some(e) = else_branch {
+                    self.scan_expr(e);
+                }
+            }
+            Expr::IfLet { expr, then_branch, else_branch, .. } => {
+                self.scan_expr(expr);
+                self.scan_expr(then_branch);
+                if let Some(e) = else_branch {
+                    self.scan_expr(e);
+                }
+            }
+            Expr::Block(stmts, tail) => {
+                self.scan_stmts(stmts);
+                if let Some(e) = tail {
+                    self.scan_expr(e);
+                }
+            }
+            Expr::Tuple(items) | Expr::Array(items) => self.scan_exprs(items),
+            Expr::Index { array, index } => {
+                self.scan_expr(array);
+                self.scan_expr(index);
+            }
+            Expr::StructInit { fields, .. } => {
+                for (_, e) in fields {
+                    self.scan_expr(e);
+                }
+            }
+            Expr::Range { start, end, step, .. } => {
+                self.scan_expr(start);
+                self.scan_expr(end);
+                if let Some(s) = step {
+                    self.scan_expr(s);
+                }
+            }
+            Expr::VariantConst { arg, .. } => {
+                if let Some(a) = arg {
+                    self.scan_expr(a);
+                }
+            }
+            Expr::Match { expr, arms } => {
+                self.scan_expr(expr);
+                for arm in arms {
+                    self.push_scope();
+                    self.bind_pattern(&arm.pattern);
+                    if let Some(g) = &arm.guard {
+                        self.scan_expr(g);
+                    }
+                    self.scan_expr(&arm.body);
+                    self.pop_scope();
+                }
+            }
+            Expr::Lambda { params, body, .. } => {
+                self.push_scope();
+                for (n, _) in params {
+                    self.bind(n);
+                }
+                self.scan_expr(body);
+                self.pop_scope();
+            }
+            Expr::Some(e) | Expr::Ok(e) | Expr::Err(e) => self.scan_expr(e),
+            Expr::NullCoalesce { option, default } => {
+                self.scan_expr(option);
+                self.scan_expr(default);
+            }
+            Expr::Return(Some(e)) => self.scan_expr(e),
+            Expr::TryBlock {
+                resources,
+                body,
+                catch_var,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                for (n, e) in resources {
+                    self.bind(n);
+                    self.scan_expr(e);
+                }
+                self.scan_stmts(body);
+                self.push_scope();
+                if let Some(v) = catch_var {
+                    self.bind(v);
+                }
+                for s in catch_body {
+                    self.scan_stmt(s);
+                }
+                self.pop_scope();
+                if let Some(f) = finally_body {
+                    self.scan_stmts(f);
+                }
+            }
+            Expr::SliceExpr { array, start, end } => {
+                self.scan_expr(array);
+                self.scan_expr(start);
+                self.scan_expr(end);
+            }
+            Expr::MapLiteral { entries } => {
+                for (k, v) in entries {
+                    self.scan_expr(k);
+                    self.scan_expr(v);
+                }
+            }
+            Expr::Spawn { body } => self.scan_stmts(body),
+            Expr::Synchronized { lock, body } => {
+                self.scan_expr(lock);
+                self.scan_stmts(body);
+            }
+            Expr::TrailingClosure { callee, args, closure } => {
+                self.scan_expr(callee);
+                self.scan_exprs(args);
+                self.scan_expr(closure);
+            }
+            Expr::Invoke { callee, args, named_args } => {
+                self.scan_expr(callee);
+                self.scan_exprs(args);
+                self.scan_named(named_args);
+            }
+            Expr::Macro { args, .. } => self.scan_exprs(args),
+            Expr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ast::InterpolatePart::Expr(e) = p {
+                        self.scan_expr(e);
+                    }
+                }
+            }
+            Expr::Integer(_)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Bool(_)
+            | Expr::Rune(_)
+            | Expr::String(_)
+            | Expr::Var(_)
+            | Expr::SuperFieldAccess { .. }
+            | Expr::None
+            | Expr::Return(None)
+            | Expr::Break
+            | Expr::Continue => {}
+        }
+    }
+
+    fn scan_exprs(&mut self, exprs: &[Expr]) {
+        for e in exprs {
+            self.scan_expr(e);
+        }
+    }
+
+    fn scan_named(&mut self, named: &[(String, Expr)]) {
+        for (_, e) in named {
+            self.scan_expr(e);
+        }
+    }
+}
+
+/// 实现接口属性时，属性类型必须与接口声明完全一致（6.2.4.1(7)）。
+///
+/// 既覆盖抽象属性（已有签名匹配逻辑），也覆盖带默认实现的属性：
+/// 后者不会进入“必须实现”的集合，但仍要求同类型（不允许协变/逆变）。
+fn check_interface_property_types(
+    owner: &str,
+    own_sigs: &[Sig],
+    parents: &[ParentMethod],
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for p in parents.iter().filter(|p| p.is_interface) {
+        let is_get = p.sig.name.starts_with("__get_");
+        if !is_get && !p.sig.name.starts_with("__set_") {
+            continue;
+        }
+        for s in own_sigs {
+            if s.name != p.sig.name || s.params.len() != p.sig.params.len() {
+                continue;
+            }
+            let comparable = s
+                .params
+                .iter()
+                .chain(s.ret.iter())
+                .chain(p.sig.params.iter())
+                .chain(p.sig.ret.iter())
+                .all(|t| type_is_comparable(t, index));
+            if !comparable {
+                continue;
+            }
+            let (sp, sr) = canon_signature(s);
+            let (pp, pr) = canon_signature(&p.sig);
+            let ok = sp == pp && (!is_get || sr == pr);
+            if !ok {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类型 '{}' 实现的属性 '{}' 类型与接口声明不一致（属性类型不允许协变/逆变）",
+                        owner, p.sig.display
+                    ),
+                });
+                break;
+            }
+        }
+    }
 }
 
 fn check_duplicate_fields<'a, I: Iterator<Item = &'a str>>(
@@ -1105,6 +1697,52 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
     }
 }
 
+/// 覆写 / 重定义（含未写 override 关键字的同名静态重定义）不得降低可见性（6.3.5(2)）。
+fn check_member_visibility_lowering(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let Some(parents) = collect_parent_methods(cls, index) else {
+        return;
+    };
+    for method in &cls.methods {
+        let sig = sig_of_function(&method.func, &cls.type_params);
+        if is_synthetic_member(&sig.name) {
+            continue;
+        }
+        let Some(child_rank) = sig.vis.as_ref().map(visibility_rank) else {
+            continue;
+        };
+        // 属性的 setter 只有父接口可能只声明 getter。
+        let alt_getter = sig
+            .name
+            .strip_prefix("__set_")
+            .map(|rest| format!("__get_{}", rest));
+        let parent_rank = parents
+            .iter()
+            .filter(|p| !p.is_interface)
+            .filter(|p| {
+                p.sig.is_static == sig.is_static
+                    && (p.sig.name == sig.name || alt_getter.as_deref() == Some(p.sig.name.as_str()))
+                    && (signature_matches(&sig, &p.sig, p.strict_types, index)
+                        || alt_getter.as_deref() == Some(p.sig.name.as_str()))
+            })
+            .filter_map(|p| p.sig.vis.as_ref().map(visibility_rank))
+            .max();
+        if let Some(parent_rank) = parent_rank {
+            if child_rank < parent_rank {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的 '{}' 覆写/重定义时降低了访问级别（父类型更宽松）",
+                        cls.name, sig.display
+                    ),
+                });
+            }
+        }
+    }
+}
+
 /// 检查类自身方法与父类（非接口）方法之间的 static/实例同名冲突
 /// （6.3.2(1) 中“包括继承自父类”的部分）。
 fn check_inherited_static_conflicts(
@@ -1326,9 +1964,6 @@ fn check_struct_interfaces<'a>(
     let Some(parents) = collect_interface_methods(&bounds, index) else {
         return;
     };
-    if !parents.iter().any(|p| p.abstract_) {
-        return;
-    }
     let mut own_impls: Vec<Sig> = program
         .functions
         .iter()
@@ -1340,7 +1975,57 @@ fn check_struct_interfaces<'a>(
             own_impls.push(sig_of_function(f, &st.type_params));
         }
     }
-    check_abstract_methods_implemented(&st.name, own_impls, &parents, index, errors);
+    if parents.iter().any(|p| p.abstract_) {
+        check_abstract_methods_implemented(&st.name, own_impls.clone(), &parents, index, errors);
+    }
+    check_interface_property_types(&st.name, &own_impls, &parents, index, errors);
+}
+
+fn is_property_method_name(name: &str) -> bool {
+    name.starts_with("__get_") || name.starts_with("__set_")
+}
+
+/// 枚举通过 `enum E <: I` 实现接口时，必须实现接口的抽象函数。
+///
+/// 枚举的 `prop` 成员解析时被丢弃（未脱糖为方法），因此跳过接口属性相关检查，
+/// 只校验抽象函数，避免误判。
+fn check_enum_interfaces<'a>(
+    en: &'a EnumDef,
+    program: &'a Program,
+    index: &ProgramIndex<'a>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let bounds: Vec<&'a str> = en
+        .constraints
+        .iter()
+        .filter(|c| c.param == en.name)
+        .flat_map(|c| c.bounds.iter().map(|b| b.as_str()))
+        .collect();
+    if bounds.is_empty() {
+        return;
+    }
+    let Some(parents) = collect_interface_methods(&bounds, index) else {
+        return;
+    };
+    let parents: Vec<ParentMethod> = parents
+        .into_iter()
+        .filter(|p| !is_property_method_name(&p.sig.name))
+        .collect();
+    if !parents.iter().any(|p| p.abstract_) {
+        return;
+    }
+    let mut own_impls: Vec<Sig> = program
+        .functions
+        .iter()
+        .filter(|f| owner_name(&f.name) == Some(en.name.as_str()))
+        .map(|f| sig_of_function(f, &en.type_params))
+        .collect();
+    if let Some(exts) = index.extends.get(en.name.as_str()) {
+        for f in exts {
+            own_impls.push(sig_of_function(f, &en.type_params));
+        }
+    }
+    check_abstract_methods_implemented(&en.name, own_impls, &parents, index, errors);
 }
 
 #[cfg(test)]
@@ -2093,5 +2778,157 @@ mod tests {
     #[test]
     fn test_validate_duplicate_field() {
         assert_invalid("class A {\n    var x: Int64 = 1\n    var x: Int64 = 2\n}\nmain() {}\n");
+    }
+
+    // ─── validate_program: 类/接口规则补强（06 章） ─────────────────────────
+
+    #[test]
+    fn test_validate_abstract_class_instantiation() {
+        let errs = assert_invalid(
+            "abstract class A {}\nmain() {\n    let a = A()\n}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("抽象类") && e.message.contains("实例化")));
+    }
+
+    #[test]
+    fn test_validate_interface_instantiation() {
+        let errs = assert_invalid(
+            "interface I {\n    func f(): Int64\n}\nmain() {\n    let x = I()\n}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("接口") && e.message.contains("实例化")));
+    }
+
+    #[test]
+    fn test_validate_abstract_class_as_type_ok() {
+        // 仅作为类型使用（不实例化）是合法的
+        assert_valid(
+            "abstract class A {}\nfunc f(a: A) {}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_shadowed_type_name_not_instantiation() {
+        // 局部函数遮蔽同名接口时，该调用不是接口实例化（避免误伤遮蔽用例）
+        assert_valid(
+            "interface I {}\nmain() {\n    func I(): Int64 { 1 }\n    let x = I()\n}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_multiple_inheritance() {
+        let errs = assert_invalid(
+            "open class A {}\nopen class B {}\nclass C <: A & B {}\nmain() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("单继承")));
+    }
+
+    #[test]
+    fn test_validate_interface_before_superclass() {
+        // 接口写在父类之前：解析器把首个当成 extends，类名落入 implements
+        assert_invalid(
+            "interface I {}\nopen class A {}\nclass B <: I & A {}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_inherit_non_open_class() {
+        let errs = assert_invalid("class A {}\nclass B <: A {}\nmain() {}\n");
+        assert!(errs.iter().any(|e| e.message.contains("非 open")));
+    }
+
+    #[test]
+    fn test_validate_inherit_open_class_ok() {
+        assert_valid("open class A {}\nclass B <: A {}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_inherit_sealed_class_same_file_ok() {
+        // sealed 类允许在同包（单文件）内被继承
+        assert_valid("sealed class A {}\nclass B <: A {}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_inherit_struct() {
+        assert_invalid("struct S {}\nclass C <: S {}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_override_lowers_visibility() {
+        let errs = assert_invalid(
+            "open class P {\n    public open func f() {}\n}\nclass C <: P {\n    override func f() {}\n}\nmain() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("降低")));
+    }
+
+    #[test]
+    fn test_validate_override_raises_visibility_ok() {
+        assert_valid(
+            "open class P {\n    protected open func f() {}\n}\nclass C <: P {\n    public override func f() {}\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_static_redef_lowers_visibility() {
+        // 未写 override 关键字的同名静态重定义也受可见性约束（6.3.5(2)）
+        assert_invalid(
+            "open class P {\n    protected static func f() {}\n}\nclass C <: P {\n    private static func f() {}\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_struct_interface_property_type_mismatch() {
+        assert_invalid(
+            "open class Sup {}\n\
+             class Sub <: Sup {}\n\
+             interface I {\n\
+             \x20   prop p: Sub {\n\
+             \x20       get() { Sub() }\n\
+             \x20   }\n\
+             }\n\
+             struct A <: I {\n\
+             \x20   public prop p: Sup {\n\
+             \x20       get() { Sub() }\n\
+             \x20   }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_struct_interface_property_type_ok() {
+        assert_valid(
+            "interface I {\n\
+             \x20   prop p: Int64 {\n\
+             \x20       get() { 0 }\n\
+             \x20   }\n\
+             }\n\
+             struct A <: I {\n\
+             \x20   public prop p: Int64 {\n\
+             \x20       get() { 1 }\n\
+             \x20   }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_enum_missing_interface_function() {
+        assert_invalid(
+            "interface I {\n    func f(): Int64\n}\nenum E <: I {\n    A\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_enum_implements_interface_ok() {
+        assert_valid(
+            "interface I {\n\
+             \x20   func f(): Int64\n\
+             }\n\
+             enum E <: I {\n\
+             \x20   A\n\
+             \x20   public func f(): Int64 { 1 }\n\
+             }\n\
+             main() {}\n",
+        );
     }
 }
