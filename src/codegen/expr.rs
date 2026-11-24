@@ -3941,6 +3941,93 @@ impl CodeGen {
                             memory_index: 0,
                         }));
                     }
+                    AssignTarget::ExprField { object, field } => {
+                        // expr.field = value（expr 为方法调用/索引等复杂表达式）
+                        self.compile_expr(object, locals, func, loop_ctx);
+                        if self.infer_type_with_locals(object, locals) == ValType::I64 {
+                            func.instruction(&Instruction::I32WrapI64);
+                        }
+                        let (offset, field_ty) = self
+                            .infer_ast_type_with_locals(object, locals)
+                            .and_then(|ty| match ty {
+                                Type::Struct(name, type_args) => {
+                                    let lookup_name = if !type_args.is_empty() {
+                                        let mangled =
+                                            crate::monomorph::mangle_name(&name, &type_args);
+                                        if self.classes.contains_key(&mangled)
+                                            || self.structs.contains_key(&mangled)
+                                        {
+                                            mangled
+                                        } else {
+                                            name.clone()
+                                        }
+                                    } else {
+                                        name.clone()
+                                    };
+                                    if let Some(ci) = self.classes.get(&lookup_name) {
+                                        ci.field_offset(field)
+                                            .and_then(|off| ci.field_type(field).map(|ft| (off, ft.clone())))
+                                    } else {
+                                        self.structs.get(&lookup_name).and_then(|def| {
+                                            def.field_offset(field)
+                                                .and_then(|off| def.field_type(field).map(|ft| (off, ft.clone())))
+                                        })
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or((0, Type::Int64));
+                        func.instruction(&Instruction::I32Const(offset as i32));
+                        func.instruction(&Instruction::I32Add);
+                        self.compile_expr(value, locals, func, loop_ctx);
+                        let val_wasm_ty = self.infer_type_with_locals(value, locals);
+                        self.emit_type_coercion(func, val_wasm_ty, field_ty.to_wasm());
+                        self.emit_store_by_type(func, &field_ty);
+                    }
+                    AssignTarget::Slice { array, start, end } => {
+                        let val_ty = self.infer_ast_type_with_locals(value, locals);
+                        if matches!(val_ty, Some(Type::Array(_)) | Some(Type::Slice(_))) {
+                            self.compile_expr(array, locals, func, loop_ctx);
+                            if self.infer_type_with_locals(array, locals) == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
+                            func.instruction(&Instruction::I32Const(4));
+                            func.instruction(&Instruction::I32Add);
+                            self.compile_expr(start, locals, func, loop_ctx);
+                            if self.infer_type_with_locals(start, locals) == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
+                            func.instruction(&Instruction::I32Const(8));
+                            func.instruction(&Instruction::I32Mul);
+                            func.instruction(&Instruction::I32Add);
+                            self.compile_expr(value, locals, func, loop_ctx);
+                            if self.infer_type_with_locals(value, locals) == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
+                            func.instruction(&Instruction::I32Const(4));
+                            func.instruction(&Instruction::I32Add);
+                            self.compile_expr(end, locals, func, loop_ctx);
+                            if self.infer_type_with_locals(end, locals) == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
+                            self.compile_expr(start, locals, func, loop_ctx);
+                            if self.infer_type_with_locals(start, locals) == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
+                            func.instruction(&Instruction::I32Sub);
+                            func.instruction(&Instruction::I32Const(8));
+                            func.instruction(&Instruction::I32Mul);
+                            func.instruction(&Instruction::MemoryCopy {
+                                src_mem: 0,
+                                dst_mem: 0,
+                            });
+                        } else {
+                            self.compile_expr(value, locals, func, loop_ctx);
+                            if self.expr_produces_value(value) {
+                                func.instruction(&Instruction::Drop);
+                            }
+                        }
+                    }
                     AssignTarget::Tuple(ref targets) => {
                         // (a, b) = expr：先编译 expr，栈上得到元组各元素（最后元素在栈顶），逆序赋给各目标
                         self.compile_expr(value, locals, func, loop_ctx);
@@ -8268,6 +8355,35 @@ impl CodeGen {
                     },
                 };
                 self.compile_expr(&call_expr, locals, func, loop_ctx);
+            }
+            Expr::Invoke {
+                callee,
+                args,
+                named_args,
+            } => {
+                // 函数值调用：先压参数，再压 table index，最后 call_indirect
+                let mut all_args: Vec<Expr> = args.clone();
+                for (_, e) in named_args {
+                    all_args.push(e.clone());
+                }
+                for a in &all_args {
+                    self.compile_expr(a, locals, func, loop_ctx);
+                }
+                self.compile_expr(callee, locals, func, loop_ctx);
+                let wasm_params: Vec<ValType> = all_args
+                    .iter()
+                    .map(|a| self.infer_type_with_locals(a, locals))
+                    .collect();
+                let wasm_results = if self.expr_produces_value(expr) {
+                    vec![self.infer_type_with_locals(expr, locals)]
+                } else {
+                    vec![]
+                };
+                let type_idx = self.find_or_create_func_type_idx(&wasm_params, &wasm_results);
+                func.instruction(&Instruction::CallIndirect {
+                    type_index: type_idx,
+                    table_index: 0,
+                });
             }
         }
     }

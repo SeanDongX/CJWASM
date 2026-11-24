@@ -1108,6 +1108,17 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
 
+            Expr::Invoke { callee, args, named_args } => {
+                self.check_expr(callee);
+                for a in args {
+                    self.check_expr(a);
+                }
+                for (_, a) in named_args {
+                    self.check_expr(a);
+                }
+                Ty::Unknown
+            }
+
             Expr::Index { array, index } => {
                 self.check_expr(array);
                 self.check_expr(index);

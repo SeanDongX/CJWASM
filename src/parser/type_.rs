@@ -58,7 +58,23 @@ impl Parser {
         self.advance();
         let mut args = Vec::new();
         loop {
-            args.push(self.parse_type()?);
+            // VArray 表达式中的长度实参 `$N`（如 VArray<Int64, $5>）
+            if self.check(&Token::Dollar) {
+                self.advance();
+                let len = match self.advance() {
+                    Some(Token::Integer(n)) => n,
+                    Some(tok) => {
+                        return self.bail(ParseError::UnexpectedToken(
+                            tok,
+                            "VArray 长度".to_string(),
+                        ))
+                    }
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                args.push(Type::TypeParam(format!("${}", len)));
+            } else {
+                args.push(self.parse_type()?);
+            }
             if self.check(&Token::Comma) {
                 self.advance();
             } else if self.check(&Token::Gt) {
@@ -196,12 +212,23 @@ impl Parser {
 
     /// 解析类型（含 ?T 前缀和 T? 后缀 → Option<T>）
     pub(crate) fn parse_type(&mut self) -> Result<Type, ParseErrorAt> {
-        if self.check(&Token::Question) {
-            self.advance();
-            let inner = self.parse_base_type()?;
-            return Ok(Type::Option(Box::new(inner)));
+        // 前缀 Option 简写：`?T`、`??T`（词法层 `??` 是单个 token）、`???T` 等
+        let mut prefix_wraps = 0usize;
+        loop {
+            if self.check(&Token::Question) {
+                self.advance();
+                prefix_wraps += 1;
+            } else if self.check(&Token::QuestionQuestion) {
+                self.advance();
+                prefix_wraps += 2;
+            } else {
+                break;
+            }
         }
         let mut ty = self.parse_base_type()?;
+        for _ in 0..prefix_wraps {
+            ty = Type::Option(Box::new(ty));
+        }
         while self.check(&Token::Question) {
             self.advance();
             ty = Type::Option(Box::new(ty));
