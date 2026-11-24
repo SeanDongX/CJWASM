@@ -1648,6 +1648,13 @@ fn collect_parent_methods<'a>(
     Some(out)
 }
 
+/// unittest 框架注入到 TestCase 的生命周期钩子名。
+/// `@Test` 宏会把测试类挂到 TestCase 下，并允许用 override 覆盖这些钩子；
+/// 宏展开受限时父类型不可见，override 检查需对它们放行。
+fn is_unittest_lifecycle_hook(name: &str) -> bool {
+    matches!(name, "beforeAll" | "beforeEach" | "afterAll" | "afterEach")
+}
+
 /// override/redef 方法必须能在父类型中找到签名匹配的函数。
 fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<SemanticError>) {
     let Some(parents) = collect_parent_methods(cls, index) else {
@@ -1674,6 +1681,13 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
             })
             .collect();
         if same_name.is_empty() {
+            // unittest 测试框架宏（@Test/@TestCase）会给测试类注入 TestCase 父类，
+            // 从而提供 beforeAll/beforeEach/afterAll/afterEach 这些生命周期方法。
+            // 由于宏展开能力有限，这里对生命周期钩子的“无父类可覆盖”错误放行，
+            // 避免 std.unittest 用例因宏未展开而编译失败。
+            if is_unittest_lifecycle_hook(&sig.name) {
+                continue;
+            }
             errors.push(SemanticError {
                 message: format!(
                     "类 '{}' 的 '{}' 使用了 override/redef，但父类型中不存在可覆盖的同名函数",

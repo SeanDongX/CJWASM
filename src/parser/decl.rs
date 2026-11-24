@@ -138,10 +138,13 @@ impl Parser {
 
         // 解析可选的 package 声明（cjc: package prefix.path，支持点分路径）
         // cjc: macro package 宏包 — 忽略 macro 修饰符
-        if self.check(&Token::Macro) {
+        // 仅在紧跟 package 时按 `macro package` 处理，否则 macro 属于后续声明
+        if self.check(&Token::Macro) && matches!(self.peek_at(1), Some(Token::Package)) {
             self.advance(); // 消费 macro
         }
-        if self.check(&Token::Protected) {
+        // protected package 仅在紧跟 package 时才按包声明处理；
+        // 否则 `protected` 是后续声明的可见性修饰符（如 protected class）
+        if self.check(&Token::Protected) && matches!(self.peek_at(1), Some(Token::Package)) {
             self.advance();
             if !self.check(&Token::Package) {
                 return self.bail(ParseError::UnexpectedToken(
@@ -191,7 +194,7 @@ impl Parser {
             }
             package_name = Some(name);
         }
-        if self.check(&Token::Protected) {
+        if self.check(&Token::Protected) && matches!(self.peek_at(1), Some(Token::Package)) {
             self.advance();
             if !self.check(&Token::Package) {
                 return self.bail(ParseError::UnexpectedToken(
@@ -472,6 +475,8 @@ impl Parser {
         // 或 import path.to.{Item1, Item2, ...}
         let first = match self.advance() {
             Some(Token::Ident(n)) => n,
+            // `internal` 是关键字，但也可作为包路径段（如 std.unittest.mock.internal）
+            Some(Token::Internal) => "internal".to_string(),
             Some(tok) => {
                 return self.bail(ParseError::UnexpectedToken(tok, "导入路径".to_string()))
             }
@@ -502,6 +507,7 @@ impl Parser {
                 loop {
                     let item = match self.advance() {
                         Some(Token::Ident(n)) => n,
+                        Some(Token::Internal) => "internal".to_string(),
                         Some(Token::Star) => "*".to_string(),
                         Some(tok) => {
                             return self.bail(ParseError::UnexpectedToken(tok, "导入项名称".to_string()))
@@ -533,6 +539,7 @@ impl Parser {
             }
             let part = match self.advance() {
                 Some(Token::Ident(n)) => n,
+                Some(Token::Internal) => "internal".to_string(),
                 Some(tok) => {
                     return self.bail(ParseError::UnexpectedToken(tok, "导入路径".to_string()))
                 }
@@ -2150,6 +2157,11 @@ impl Parser {
                 // cjc: ~init 析构函数
                 self.advance(); // consume ~
                 self.expect(Token::Init)?; // consume init
+                // 析构函数可写成 `~init() { ... }` 或 `~init { ... }`
+                if self.check(&Token::LParen) {
+                    self.advance();
+                    self.expect(Token::RParen)?;
+                }
                 self.expect(Token::LBrace)?;
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
@@ -2166,6 +2178,11 @@ impl Parser {
                 };
                 self.expect(Token::Colon)?;
                 let prop_ty = self.parse_type()?;
+                // 无体属性声明（如 abstract class 中的 `public mut prop x: T`）：
+                // 不产生 getter/setter，直接解析下一个成员。
+                if !self.check(&Token::LBrace) {
+                    continue;
+                }
                 self.expect(Token::LBrace)?;
                 // 解析 get/set 块
                 while !self.check(&Token::RBrace) {

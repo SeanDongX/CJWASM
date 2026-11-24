@@ -434,7 +434,7 @@ impl TypeInferenceContext {
     }
 
     /// 推断二元运算结果类型
-    fn infer_binary_result(&self, op: &BinOp, left: &Type, _right: &Type) -> Result<Type, String> {
+    fn infer_binary_result(&self, op: &BinOp, left: &Type, right: &Type) -> Result<Type, String> {
         match op {
             // 比较运算符返回 Bool
             BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
@@ -442,6 +442,12 @@ impl TypeInferenceContext {
             }
             // 逻辑运算符返回 Bool
             BinOp::LogicalAnd | BinOp::LogicalOr => Ok(Type::Bool),
+            // String * 整数：字符串重复重载，结果仍为 String
+            BinOp::Mul
+                if matches!(left, Type::String) || matches!(right, Type::String) =>
+            {
+                Ok(Type::String)
+            }
             // 算术运算符返回操作数类型
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                 // 简化：返回左操作数类型
@@ -1264,5 +1270,30 @@ mod tests {
         let ctx = TypeInferenceContext::default();
         assert!(ctx.locals.is_empty());
         assert!(ctx.functions.is_empty());
+    }
+
+    // ─── String 重复运算符 ───
+
+    #[test]
+    fn test_infer_string_repeat_mul() {
+        // `"f" * 16` 走 String 重复重载，结果类型仍为 String
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Binary {
+            op: BinOp::Mul,
+            left: Box::new(Expr::String("f".into())),
+            right: Box::new(Expr::Integer(16)),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
+    }
+
+    #[test]
+    fn test_infer_numeric_mul_still_numeric() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Binary {
+            op: BinOp::Mul,
+            left: Box::new(Expr::Integer(6)),
+            right: Box::new(Expr::Integer(7)),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Int64);
     }
 }

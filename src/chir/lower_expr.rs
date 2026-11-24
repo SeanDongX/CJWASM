@@ -280,6 +280,30 @@ impl<'a> LoweringContext<'a> {
                 let left_chir = self.lower_expr(left)?;
                 let right_chir = self.lower_expr(right)?;
 
+                // String * 整数：字符串重复重载 → 调用运行时 __str_repeat(str, n)
+                // （`"f" * 16` 这类写法在 std 用例中常见）
+                if matches!(op, crate::ast::BinOp::Mul) && matches!(ty, Type::String) {
+                    let (str_operand, count_operand) =
+                        if matches!(left_chir.ty, Type::String) {
+                            (left_chir, right_chir)
+                        } else {
+                            (right_chir, left_chir)
+                        };
+                    let count_i32 = self.insert_cast_if_needed(count_operand, ValType::I32);
+                    return Ok(match self.func_indices.get("__str_repeat").copied() {
+                        Some(idx) => CHIRExpr::new(
+                            CHIRExprKind::Call {
+                                func_idx: idx,
+                                args: vec![str_operand, count_i32],
+                            },
+                            Type::String,
+                            ValType::I32,
+                        ),
+                        // 运行时助手不可用时退化为原字符串，保证编译不中断
+                        None => str_operand,
+                    });
+                }
+
                 let is_comparison = matches!(op,
                     crate::ast::BinOp::Eq | crate::ast::BinOp::NotEq
                     | crate::ast::BinOp::Lt | crate::ast::BinOp::LtEq

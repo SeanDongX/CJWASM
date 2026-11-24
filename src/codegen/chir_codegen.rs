@@ -79,6 +79,7 @@ const RT_STR_INDEX_OF: &str = "__str_index_of";
 const RT_STR_REPLACE: &str = "__str_replace";
 const RT_POW_I64: &str = "__pow_i64";
 const RT_POW_F64: &str = "__pow_f64";
+const RT_STR_REPEAT: &str = "__str_repeat";
 // Collection runtime functions
 const RT_ARRAYLIST_NEW: &str = "__arraylist_new";
 const RT_ARRAYLIST_APPEND: &str = "__arraylist_append";
@@ -116,6 +117,7 @@ const RT_NAMES: &[&str] = &[
     RT_HASHMAP_NEW, RT_HASHMAP_PUT, RT_HASHMAP_GET, RT_HASHMAP_CONTAINS, RT_HASHMAP_REMOVE, RT_HASHMAP_SIZE,
     RT_HASHSET_NEW, RT_HASHSET_ADD, RT_HASHSET_CONTAINS, RT_HASHSET_SIZE,
     RT_POW_I64, RT_POW_F64,
+    RT_STR_REPEAT,
 ];
 
 // ─── CHIRCodeGen ──────────────────────────────────────────────────────────────
@@ -492,6 +494,7 @@ impl CHIRCodeGen {
             &[ValType::I32],                          // __hashset_size
             &[ValType::I64, ValType::I64],            // __pow_i64
             &[ValType::F64, ValType::F64],            // __pow_f64
+            &[ValType::I32, ValType::I32],            // __str_repeat (str_ptr, count)
         ];
         for (i, name) in RT_NAMES.iter().enumerate() {
             let idx = IMPORT_COUNT + user_count + i as u32;
@@ -852,6 +855,9 @@ impl CHIRCodeGen {
         types.ty().function(vec![ValType::F64, ValType::F64], vec![ValType::F64]);
         functions.function(ty_f64f64_f64);
         rt_type_indices.push(ty_f64f64_f64);
+        // (i32, i32) → i32: __str_repeat
+        functions.function(ty_i32i32_i32);
+        rt_type_indices.push(ty_i32i32_i32);
         rt_type_indices
     }
 
@@ -945,6 +951,8 @@ impl CHIRCodeGen {
         let exp_idx2 = self.func_indices[RT_MATH_EXP];
         let log_idx2 = self.func_indices[RT_MATH_LOG];
         codes.function(&Self::build_rt_math_pow(exp_idx2, log_idx2));
+        // __str_repeat (must match RT_NAMES order)
+        codes.function(&Self::build_rt_str_repeat(alloc_idx));
     }
 
     /// 生成 I/O 辅助 MemArg
@@ -1787,6 +1795,82 @@ impl CHIRCodeGen {
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::LocalGet(3));
         f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        // return new_ptr
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// __str_repeat(ptr: i32, n: i32) -> i32
+    ///
+    /// 字符串重复（`str * n`）。字符串布局与 __str_concat 一致：`[len:i32][utf8 bytes...]`。
+    /// n <= 0 时返回空串。
+    fn build_rt_str_repeat(alloc_idx: u32) -> wasm_encoder::Function {
+        // locals: 2=len(字节) 3=i 4=total 5=new_ptr 6=dst 7=nc(>=0 的计数)
+        let mut f = wasm_encoder::Function::new(vec![(6, ValType::I32)]);
+        let mem = |offset: u64, align: u32| MemArg { offset, align, memory_index: 0 };
+        // nc = n > 0 ? n : 0   （select: [a=n, b=0, cond=n>0]）
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32GtS);
+        f.instruction(&Instruction::Select);
+        f.instruction(&Instruction::LocalSet(7));
+        // len = mem[ptr]
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(mem(0, 2)));
+        f.instruction(&Instruction::LocalSet(2));
+        // total = len * nc
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::LocalSet(4));
+        // new_ptr = __alloc(total + 4)
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(5));
+        // mem[new_ptr] = total
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+        // i = 0
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(3));
+        // block { loop { if i >= nc break; memcpy(new_ptr+4+i*len, ptr+4, len); i++ } }
+        f.instruction(&Instruction::Block(BlockType::Empty));
+        f.instruction(&Instruction::Loop(BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+        // dst = new_ptr + 4 + i * len
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Mul);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(6));
+        // memory.copy(dst, ptr + 4, len)
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        // i++
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(3));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::End);
         // return new_ptr
         f.instruction(&Instruction::LocalGet(5));
         f.instruction(&Instruction::Return);

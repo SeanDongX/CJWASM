@@ -268,7 +268,8 @@ impl Parser {
                         ));
                     }
                     self.advance();
-                    let expr = Box::new(self.parse_match_subject()?);
+                    // 括号内是完整表达式上下文，可用 parse_expr 支持二元表达式
+                    let expr = Box::new(self.parse_expr()?);
                     self.expect(Token::RParen)?;
                     self.expect(Token::LBrace)?;
                     let body = self.parse_stmts()?;
@@ -288,7 +289,12 @@ impl Parser {
                         ));
                     }
                     self.advance();
-                    let expr = Box::new(self.parse_match_subject()?);
+                    // 非括号 while-let 主体后紧跟 `{` 是循环体，禁止尾随 `{` 当作 lambda
+                    let saved_no_lambda = self.no_trailing_lambda;
+                    self.no_trailing_lambda = true;
+                    let subject = self.parse_match_subject();
+                    self.no_trailing_lambda = saved_no_lambda;
+                    let expr = Box::new(subject?);
                     self.expect(Token::LBrace)?;
                     let body = self.parse_stmts()?;
                     self.expect(Token::RBrace)?;
@@ -298,7 +304,12 @@ impl Parser {
                         body,
                     })
                 } else {
-                    let cond = self.parse_expr()?;
+                    // 非括号条件后紧跟 `{` 是循环体，禁止尾随 `{` 当作 lambda
+                    let saved_no_lambda = self.no_trailing_lambda;
+                    self.no_trailing_lambda = true;
+                    let cond = self.parse_expr();
+                    self.no_trailing_lambda = saved_no_lambda;
+                    let cond = cond?;
                     self.expect(Token::LBrace)?;
                     let body = self.parse_stmts()?;
                     self.expect(Token::RBrace)?;
@@ -375,12 +386,18 @@ impl Parser {
                     (v, Vec::new(), None)
                 };
                 self.expect(Token::In)?;
+                // 非括号 for 的迭代表达式后 `{` 是循环体，禁止尾随 `{` 当作 lambda
+                let saved_no_lambda = self.no_trailing_lambda;
+                if !has_paren {
+                    self.no_trailing_lambda = true;
+                }
                 let iterable = self.parse_for_iterable()?;
                 // cjc: for (x in iter where cond) { ... } — 跳过 where 过滤子句
                 if self.check(&Token::Where) {
                     self.advance();
                     self.parse_expr()?; // 解析并丢弃 where 条件
                 }
+                self.no_trailing_lambda = saved_no_lambda;
                 if has_paren {
                     self.expect(Token::RParen)?;
                 }
@@ -453,7 +470,13 @@ impl Parser {
                 if has_paren {
                     self.advance();
                 }
-                let cond = self.parse_expr()?;
+                let saved_no_lambda = self.no_trailing_lambda;
+                if !has_paren {
+                    self.no_trailing_lambda = true;
+                }
+                let cond = self.parse_expr();
+                self.no_trailing_lambda = saved_no_lambda;
+                let cond = cond?;
                 if has_paren {
                     self.expect(Token::RParen)?;
                 }

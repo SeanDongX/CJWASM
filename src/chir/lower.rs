@@ -209,6 +209,7 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         "__hashmap_new", "__hashmap_put", "__hashmap_get", "__hashmap_contains", "__hashmap_remove", "__hashmap_size",
         "__hashset_new", "__hashset_add", "__hashset_contains", "__hashset_size",
         "__pow_i64", "__pow_f64",
+        "__str_repeat",
     ];
     for (i, name) in rt_names.iter().enumerate() {
         func_indices.insert(name.to_string(), rt_base + i as u32);
