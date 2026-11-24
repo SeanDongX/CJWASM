@@ -634,7 +634,13 @@ pub struct ClassDef {
     pub implements: Vec<String>,
     pub fields: Vec<FieldDef>,
     /// init 构造函数（无方法名，参数列表 + body）
+    ///
+    /// 仅保留“首选”构造函数以兼容既有代码生成；若类定义了多个构造函数，
+    /// 全部构造函数（按声明顺序，含主构造函数展开）记录在 `inits` 中。
     pub init: Option<InitDef>,
+    /// 全部构造函数定义（按声明顺序，含主构造函数展开）。
+    /// 语义校验（6.1.2.1 构造器规则）应遍历 `inits` 而非单个 `init`。
+    pub inits: Vec<InitDef>,
     /// deinit 析构函数
     pub deinit: Option<Vec<Stmt>>,
     /// P3.11: static init() 静态初始化块

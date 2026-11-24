@@ -1141,6 +1141,7 @@ mod tests {
             extends: None, implements: vec![],
             fields: vec![make_field("count", Type::Int64)],
             init: None, deinit: None, static_init: None,
+            inits: vec![],
             primary_ctor_params: vec![],
             primary_ctor_member_flags: vec![],
             methods: vec![ClassMethod {
@@ -1173,6 +1174,7 @@ mod tests {
             extends: None, implements: vec![],
             fields: vec![make_field("id", Type::Int64)],
             init: None, deinit: None, static_init: None,
+            inits: vec![],
             primary_ctor_params: vec![], methods: vec![],
             primary_ctor_member_flags: vec![],
         };
@@ -1183,6 +1185,7 @@ mod tests {
             extends: Some("Base".into()), implements: vec![],
             fields: vec![make_field("name", Type::String)],
             init: None, deinit: None, static_init: None,
+            inits: vec![],
             primary_ctor_params: vec![], methods: vec![],
             primary_ctor_member_flags: vec![],
         };

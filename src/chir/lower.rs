@@ -789,6 +789,7 @@ mod tests {
                 is_const: false,
                 func: class_method_func,
             }],
+            inits: vec![],
             primary_ctor_params: vec![],
             primary_ctor_member_flags: vec![],
         };

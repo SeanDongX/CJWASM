@@ -209,9 +209,15 @@ fn ty_of(ty: &Type) -> Ty {
         Type::Rune => Ty::Rune,
         Type::String => Ty::String,
         Type::Unit => Ty::Unit,
+        // `Nothing` 是底类型，但与 `Unit` 等具体类型并不相同：用于构造实参匹配时
+        // 必须能区分（`A(())` 不能赋给 `Nothing` 形参）。用独立 `User` 名表示。
+        Type::Nothing => Ty::User("Nothing".to_string()),
         Type::Tuple(_) => Ty::Agg("tuple"),
         Type::Array(_) => Ty::Agg("array"),
         Type::Range => Ty::Agg("range"),
+        // 函数类型：与元组/数组等聚合类型互不可赋值；lambda 实参推断为 Unknown，
+        // 因此不会误伤把 lambda 传给函数形参的合法调用。
+        Type::Function { .. } => Ty::Agg("function"),
         Type::Option(inner) => Ty::Option(Box::new(ty_of(inner))),
         // 少数场景下基础类型名以 Struct 形式出现（如未识别的别名），按名字兜底。
         Type::Struct(name, args) if args.is_empty() => match name.as_str() {
@@ -345,8 +351,75 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
     }
 }
 
-/// 二元算术/位运算的结果类型：优先取具体一侧，否则保留字面量标记。
-/// 任一侧类型未知时结果视为未知（保守跳过后续检查）。
+/// 构造调用实参与一个构造函数签名的匹配判定（6.1.2.1(8)/(9)）。
+/// 返回 `Ok(())` 表示匹配；`Err(..)` 给出首要不匹配原因。
+fn ctor_match(sig: &CtorSig, pos: &[Ty], named: &[(String, Ty)]) -> Result<(), String> {
+    // 变参构造函数无法精确匹配，保守跳过。
+    if sig.params.iter().any(|p| p.variadic) {
+        return Ok(());
+    }
+    let positional: Vec<&CtorParam> = sig.params.iter().filter(|p| !p.is_named).collect();
+    let named_params: Vec<&CtorParam> = sig.params.iter().filter(|p| p.is_named).collect();
+
+    // 位置实参按顺序填入非命名形参。
+    if pos.len() > positional.len() {
+        // 多出的位置实参可能是想传给命名参数（必须写成命名形式）——报错。
+        return Err(format!(
+            "位置实参过多：期望至多 {} 个，实际 {} 个（命名参数须以 `名字:` 形式传入）",
+            positional.len(),
+            pos.len()
+        ));
+    }
+    for (i, aty) in pos.iter().enumerate() {
+        let p = positional[i];
+        if !compatible(aty, &p.ty) {
+            return Err(format!(
+                "第 {} 个位置实参类型 {} 与形参 '{}' 的类型 {} 不匹配",
+                i + 1,
+                aty.name(),
+                p.name,
+                p.ty.name()
+            ));
+        }
+    }
+    // 未提供的位置形参必须带默认值。
+    if pos.len() < positional.len() {
+        for p in positional[pos.len()..].iter() {
+            if !p.has_default {
+                return Err(format!("缺少必需的位置实参（形参 '{}'）", p.name));
+            }
+        }
+    }
+
+    // 命名实参：必须对应到命名形参。
+    let mut provided_named: HashSet<&str> = HashSet::new();
+    for (n, t) in named {
+        if let Some(p) = named_params.iter().find(|p| &p.name == n) {
+            provided_named.insert(n.as_str());
+            if !compatible(t, &p.ty) {
+                return Err(format!(
+                    "命名实参 '{}' 的类型 {} 与形参类型 {} 不匹配",
+                    n,
+                    t.name(),
+                    p.ty.name()
+                ));
+            }
+        } else if positional.iter().any(|p| &p.name == n) {
+            return Err(format!("形参 '{}' 不是命名参数，不能按名字传参", n));
+        } else {
+            return Err(format!("不存在名为 '{}' 的形参", n));
+        }
+    }
+    // 必需命名形参必须全部提供。
+    for p in &named_params {
+        if !p.has_default && !provided_named.contains(p.name.as_str()) {
+            return Err(format!("缺少必需的命名实参 '{}'", p.name));
+        }
+    }
+    Ok(())
+}
+
+/// 二元算术/位运算的结果类型：优先取具体一侧，否则保留字面量标记。/// 任一侧类型未知时结果视为未知（保守跳过后续检查）。
 fn merged(a: &Ty, b: &Ty) -> Ty {
     if matches!(a, Ty::Unknown) || matches!(b, Ty::Unknown) {
         return Ty::Unknown;
@@ -578,6 +651,8 @@ struct Checker<'a> {
     alias_types: HashMap<String, Type>,
     /// 用户类型名 → 直接父类型名（含 extend 实现的接口），用于约束满足判定。
     constraint_parents: HashMap<String, Vec<String>>,
+    /// 类名 → 全部构造函数签名（用于构造调用实参匹配，6.1.2.1(8)/(9)）。
+    class_ctors: HashMap<String, Vec<CtorSig>>,
 }
 
 /// 泛型定义的类型参数与约束（实例化约束检查用）。
@@ -585,6 +660,23 @@ struct Checker<'a> {
 struct GenericDef {
     type_params: Vec<String>,
     constraints: Vec<TypeConstraint>,
+}
+
+/// 构造函数形参（用于构造调用实参匹配，6.1.2.1(8)/(9)）。
+#[derive(Clone)]
+struct CtorParam {
+    name: String,
+    ty: Ty,
+    /// 是否为“命名参数”（声明带 `!`）。
+    is_named: bool,
+    has_default: bool,
+    variadic: bool,
+}
+
+/// 一个构造函数的形参签名。
+#[derive(Clone)]
+struct CtorSig {
+    params: Vec<CtorParam>,
 }
 
 /// 对整个 Program 做表达式/赋值类型检查，错误追加到 `errors`。
@@ -700,6 +792,34 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         .collect();
     let constraint_parents = collect_constraint_parents(program);
 
+    // 各类的全部构造函数签名（含主构造函数展开），用于构造调用实参匹配。
+    let mut class_ctors: HashMap<String, Vec<CtorSig>> = HashMap::new();
+    for c in &program.classes {
+        let init_refs: Vec<&crate::ast::InitDef> = if c.inits.is_empty() {
+            c.init.iter().collect()
+        } else {
+            c.inits.iter().collect()
+        };
+        let mut sigs: Vec<CtorSig> = Vec::new();
+        for init in init_refs {
+            let params = init
+                .params
+                .iter()
+                .map(|p| CtorParam {
+                    name: p.name.clone(),
+                    ty: ty_of_known(&p.ty, &type_names),
+                    is_named: p.is_named,
+                    has_default: p.default.is_some(),
+                    variadic: p.variadic,
+                })
+                .collect();
+            sigs.push(CtorSig { params });
+        }
+        if !sigs.is_empty() {
+            class_ctors.insert(c.name.clone(), sigs);
+        }
+    }
+
     let mut checker = Checker {
         globals,
         funcs,
@@ -721,6 +841,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         generic_defs,
         alias_types,
         constraint_parents,
+        class_ctors,
     };
 
     for func in &program.functions {
@@ -1336,6 +1457,29 @@ fn check_builtin_operator_redefinitions(program: &Program, errors: &mut Vec<Sema
 impl<'a> Checker<'a> {
     fn err(&mut self, message: String) {
         self.errors.push(SemanticError { message });
+    }
+
+    /// 6.1.2.1(8)/(9)：校验构造调用 `ClassName(args, named: ..)` 与某个构造函数
+    /// 形参匹配（类型 / 个数 / 命名）。只要存在一个可匹配的重载即视为合法。
+    /// 类型未知的实参/形参视为兼容，绝不误伤。
+    fn check_ctor_call(&mut self, name: &str, pos: &[Ty], named: &[(String, Ty)]) {
+        let Some(sigs) = self.class_ctors.get(name) else {
+            return;
+        };
+        let mut first_reason: Option<String> = None;
+        for sig in sigs {
+            match ctor_match(sig, pos, named) {
+                Ok(()) => return,
+                Err(reason) => {
+                    if first_reason.is_none() {
+                        first_reason = Some(reason);
+                    }
+                }
+            }
+        }
+        if let Some(reason) = first_reason {
+            self.err(format!("构造调用 '{}' 的实参与构造函数不匹配：{}", name, reason));
+        }
     }
 
     fn lookup(&self, name: &str) -> Option<&VarInfo> {
@@ -2228,13 +2372,18 @@ impl<'a> Checker<'a> {
                 args,
                 named_args,
             } => {
+                let mut pos_tys = Vec::with_capacity(args.len());
                 for a in args {
-                    self.check_expr(a);
+                    pos_tys.push(self.check_expr(a));
                 }
-                for (_, a) in named_args {
-                    self.check_expr(a);
+                let mut named_tys = Vec::with_capacity(named_args.len());
+                for (n, a) in named_args {
+                    let t = self.check_expr(a);
+                    named_tys.push((n.clone(), t));
                 }
                 self.check_type_instantiation(name, type_args.as_deref());
+                // 6.1.2.1(8)/(9)：构造调用实参的类型/个数/命名匹配。
+                self.check_ctor_call(name, &pos_tys, &named_tys);
                 // 用户类型构造调用 `T()`：结果类型即该类型，便于后续复合赋值
                 // 运算符返回类型校验确定左操作数类型。
                 if self.ctor_types.contains(name) {

@@ -2165,9 +2165,12 @@ impl Parser {
                 };
                 // cjc: 必需命名参数 name!: Type（此处仅消费 `!`，不改变调用匹配，
                 // 保证默认值仍可按位置调用）
-                if self.check(&Token::Bang) {
+                let is_required_named = if self.check(&Token::Bang) {
                     self.advance();
-                }
+                    true
+                } else {
+                    false
+                };
                 let (pty, pdefault) = if self.check(&Token::Colon) {
                     self.advance();
                     let pty = self.parse_type()?;
@@ -2192,7 +2195,7 @@ impl Parser {
                     ty: pty,
                     default: pdefault,
                     variadic: false,
-                    is_named: false,
+                    is_named: is_required_named,
                     is_inout: false,
                 });
                 primary_ctor_member_flags.push(is_member);
@@ -2231,6 +2234,7 @@ impl Parser {
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         let mut init = None;
+        let mut inits: Vec<crate::ast::InitDef> = Vec::new();
         let mut deinit = None;
         let mut methods = Vec::new();
         while !self.check(&Token::RBrace) {
@@ -2358,11 +2362,13 @@ impl Parser {
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
                 self.receiver_name = None;
-                init = Some(crate::ast::InitDef {
+                let idef = crate::ast::InitDef {
                     params,
                     body,
                     member_param_flags: vec![],
-                });
+                };
+                inits.push(idef.clone());
+                init = Some(idef);
             } else if self.check(&Token::Tilde) {
                 // 规范 6.1.2.5(4)(5)：finalizer 不能带参数/返回类型/泛型参数/任何修饰符，
                 // 且 open/abstract/sealed 类不能定义 finalizer。
@@ -2693,11 +2699,13 @@ impl Parser {
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
                 self.receiver_name = None;
-                init = Some(crate::ast::InitDef {
+                let idef = crate::ast::InitDef {
                     params,
                     body,
                     member_param_flags,
-                });
+                };
+                inits.push(idef.clone());
+                init = Some(idef);
             } else if self.check(&Token::At) {
                 self.skip_optional_attributes()?;
                 continue; // 跳过属性后重新循环，下一次会看到 Func 等
@@ -2913,11 +2921,13 @@ impl Parser {
                     let body = self.parse_stmts()?;
                     self.expect(Token::RBrace)?;
                     self.receiver_name = None;
-                    init = Some(crate::ast::InitDef {
+                    let idef = crate::ast::InitDef {
                         params,
                         body,
                         member_param_flags: vec![],
-                    });
+                    };
+                    inits.push(idef.clone());
+                    init = Some(idef);
                 } else {
                     // const FIELD_NAME: Type = value — 类级别常量，当作字段处理
                     let f_name = match self.advance() {
@@ -2981,6 +2991,7 @@ impl Parser {
             implements,
             fields,
             init,
+            inits,
             deinit,
             static_init: None, // P3.11: TODO - 从 class body 中解析 static init()
             methods,
@@ -3010,11 +3021,13 @@ impl Parser {
                         value: Expr::Var(p.name.clone()),
                     })
                     .collect();
-                class_def.init = Some(InitDef {
+                let implicit = InitDef {
                     params: primary_ctor_params,
                     body: init_body,
                     member_param_flags: primary_ctor_member_flags,
-                });
+                };
+                class_def.inits.push(implicit.clone());
+                class_def.init = Some(implicit);
             }
         }
         Ok(class_def)

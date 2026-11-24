@@ -1736,6 +1736,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     .collect()
             }),
             methods,
+            inits: vec![],
             primary_ctor_params: vec![],
             primary_ctor_member_flags: vec![],
         });
@@ -2378,6 +2379,7 @@ mod tests {
                             extern_import: None,
                         },
                     }],
+                    inits: vec![],
                     primary_ctor_params: vec![],
                     primary_ctor_member_flags: vec![],
                 },

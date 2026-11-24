@@ -321,8 +321,8 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
 // 所有规则都能在单文件内基于 AST 判定，父类型无法在本地解析时保守跳过。
 
 use crate::ast::{
-    AssignTarget, ClassDef, ClassMethod, EnumDef, Function, InterfaceDef, InterfaceMethod,
-    StructDef, Visibility,
+    AssignTarget, ClassDef, ClassMethod, EnumDef, Function, InitDef, InterfaceDef,
+    InterfaceMethod, Param, StructDef, Visibility,
 };
 use std::collections::HashSet;
 
@@ -352,6 +352,16 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     for cls in &program.classes {
         check_class(cls, &index, &mut errors);
         check_ctor_param_order(cls, &mut errors);
+        // 6.1.2.1(55)：构造函数返回前须初始化全部实例成员变量。
+        check_ctor_definite_assignment(cls, &mut errors);
+        // 6.1.2.1(22)/(8)/(9)：构造参数命名顺序、形参不可重新赋值。
+        check_ctor_param_rules(cls, &mut errors);
+        // 6.1.2.1(54)：super 成员访问时机 / 静态上下文禁用 super。
+        check_super_access_rules(cls, &mut errors);
+        // 6.1.2.1(58)/(26)：全部成员初始化完成前的受限使用。
+        check_use_before_init(cls, &mut errors);
+        // 6.1.2.1(57)：open/abstract 类构造函数中 this 不得逃逸。
+        check_this_escape_open(cls, &mut errors);
         check_static_member_access(cls, program, &index, &mut errors);
         check_private_parent_access(cls, program, &index, &mut errors);
         // 6.1.2.3(3)(4)：实例成员变量初始化表达式的引用限制。
@@ -1006,6 +1016,1186 @@ fn check_ctor_param_order(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
     check(&cls.primary_ctor_member_flags, "主构造函数");
     if let Some(init) = &cls.init {
         check(&init.member_param_flags, "构造函数");
+    }
+}
+
+/// 6.1.2.1(55)：若构造函数未显式调用其它构造函数，必须在返回前初始化本类声明的
+/// 全部实例成员变量。这里实现保守的“确定赋值”分析——只统计必然执行的赋值：
+/// - 顺序语句累积；
+/// - `if` 两支都赋才算赋值（一支提前 `return` 时按另一支）；
+/// - 循环体不视为必然执行（`while`/`for` 可能 0 次）；
+/// - `this(...)` 委托其它构造函数视为已初始化全部字段；
+/// - 每条 `return` 及正常返回处检查尚未确定的字段。
+fn check_ctor_definite_assignment(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    let inits: Vec<&InitDef> = if cls.inits.is_empty() {
+        cls.init.iter().collect()
+    } else {
+        cls.inits.iter().collect()
+    };
+    if inits.is_empty() {
+        return;
+    }
+    // 主构造函数中的“普通参数”会被 parser 当作字段加入 `fields`（P6 展开），
+    // 但它们不是实例成员变量，从字段集合中排除。
+    let mut nonmember: HashSet<&str> = HashSet::new();
+    for (p, flag) in cls
+        .primary_ctor_params
+        .iter()
+        .zip(cls.primary_ctor_member_flags.iter())
+    {
+        if !*flag {
+            nonmember.insert(p.name.as_str());
+        }
+    }
+    let mut fields: HashSet<String> = HashSet::new();
+    let mut auto: HashSet<String> = HashSet::new();
+    for f in &cls.fields {
+        if f.is_static || nonmember.contains(f.name.as_str()) {
+            continue;
+        }
+        fields.insert(f.name.clone());
+        if f.default.is_some() {
+            auto.insert(f.name.clone());
+        }
+    }
+    if fields.is_empty() {
+        return;
+    }
+    // 主构造函数的成员变量参数对所有构造函数均视为已初始化（保守）。
+    for (p, flag) in cls
+        .primary_ctor_params
+        .iter()
+        .zip(cls.primary_ctor_member_flags.iter())
+    {
+        if *flag {
+            auto.insert(p.name.clone());
+        }
+    }
+    let required: HashSet<String> = fields.difference(&auto).cloned().collect();
+    if required.is_empty() {
+        return;
+    }
+    for init in inits {
+        let mut start = auto.clone();
+        for (p, flag) in init.params.iter().zip(init.member_param_flags.iter()) {
+            if *flag {
+                start.insert(p.name.clone());
+            }
+        }
+        let mut viol: Vec<String> = Vec::new();
+        let (cur, flows) = da_stmt_list(&init.body, start, &required, &fields, &mut viol);
+        if flows {
+            for name in &required {
+                if !cur.contains(name) {
+                    viol.push(name.clone());
+                }
+            }
+        }
+        // 去重后报告。
+        viol.sort();
+        viol.dedup();
+        for name in viol {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的构造函数返回前未初始化实例成员变量 '{}'（6.1.2.1(55)）",
+                    cls.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 确定赋值分析：按顺序处理语句块。
+/// 返回 (必然已赋值的字段集合, 是否可能正常落到块末尾)。
+fn da_stmt_list(
+    stmts: &[Stmt],
+    mut cur: HashSet<String>,
+    required: &HashSet<String>,
+    fields: &HashSet<String>,
+    viol: &mut Vec<String>,
+) -> (HashSet<String>, bool) {
+    for s in stmts {
+        let (next, flows) = da_stmt(s, cur, required, fields, viol);
+        cur = next;
+        if !flows {
+            return (cur, false);
+        }
+    }
+    (cur, true)
+}
+
+/// 确定赋值分析：单条语句。
+fn da_stmt(
+    stmt: &Stmt,
+    cur: HashSet<String>,
+    required: &HashSet<String>,
+    fields: &HashSet<String>,
+    viol: &mut Vec<String>,
+) -> (HashSet<String>, bool) {
+    match stmt {
+        Stmt::Assign { target, value } => {
+            let mut next = cur;
+            da_target(target, &mut next, fields);
+            da_expr(value, next, required, fields, viol)
+        }
+        Stmt::Expr(e) => da_expr(e, cur, required, fields, viol),
+        Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Const { value, .. } => {
+            da_expr(value, cur, required, fields, viol)
+        }
+        Stmt::Return(_) => {
+            for name in required {
+                if !cur.contains(name) {
+                    viol.push(name.clone());
+                }
+            }
+            (cur, false)
+        }
+        // 循环体可能一次都不执行：只分析其中 return 路径的违规，不把其中赋值
+        // 视为必然发生。
+        Stmt::While { body, .. }
+        | Stmt::WhileLet { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::DoWhile { body, .. } => {
+            let _ = da_stmt_list(body, cur.clone(), required, fields, viol);
+            (cur, true)
+        }
+        Stmt::UnsafeBlock { body } => da_stmt_list(body, cur, required, fields, viol),
+        _ => (cur, true),
+    }
+}
+
+/// 确定赋值分析：表达式（处理 `if`/块/`match`/`this(...)` 委托）。
+fn da_expr(
+    expr: &Expr,
+    cur: HashSet<String>,
+    required: &HashSet<String>,
+    fields: &HashSet<String>,
+    viol: &mut Vec<String>,
+) -> (HashSet<String>, bool) {
+    match expr {
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let (t_out, t_flow) = da_expr(then_branch, cur.clone(), required, fields, viol);
+            let (e_out, e_flow) = match else_branch {
+                Some(eb) => da_expr(eb, cur.clone(), required, fields, viol),
+                None => (cur.clone(), true),
+            };
+            match (t_flow, e_flow) {
+                (true, true) => (da_intersect(&t_out, &e_out), true),
+                (true, false) => (t_out, true),
+                (false, true) => (e_out, true),
+                (false, false) => (cur, false),
+            }
+        }
+        Expr::Block(stmts, trailing) => {
+            let (c, flows) = da_stmt_list(stmts, cur, required, fields, viol);
+            if !flows {
+                return (c, false);
+            }
+            match trailing {
+                Some(t) => da_expr(t, c, required, fields, viol),
+                None => (c, true),
+            }
+        }
+        // `this(...)`：委托其它构造函数，视为已初始化全部字段。
+        Expr::Call { name, .. } if name == "this" => {
+            let mut c = cur;
+            c.extend(required.iter().cloned());
+            (c, true)
+        }
+        // `this(...)` 也可能解析为 Invoke（callee 为 `this`/`self`）。
+        Expr::Invoke { callee, .. }
+            if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self") =>
+        {
+            let mut c = cur;
+            c.extend(required.iter().cloned());
+            (c, true)
+        }
+        Expr::Match { arms, .. } => {
+            // 各分支取交集；未能正常落地（提前 return）的分支忽略。
+            let mut merged: Option<HashSet<String>> = None;
+            let mut any_falls = false;
+            for arm in arms {
+                let (out, flows) = da_expr(&arm.body, cur.clone(), required, fields, viol);
+                if flows {
+                    any_falls = true;
+                    merged = Some(match merged.take() {
+                        Some(prev) => da_intersect(&prev, &out),
+                        None => out,
+                    });
+                }
+            }
+            match (merged, any_falls) {
+                (Some(m), true) => (m, true),
+                (None, false) => (cur, false),
+                _ => (cur, true),
+            }
+        }
+        // `synchronized(lock) { .. }` 同步执行一次：其内部赋值必然发生。
+        Expr::Synchronized { body, .. } => da_stmt_list(body, cur, required, fields, viol),
+        // 其余可能包含语句块/闭包体的表达式（spawn / lambda / try / 尾随闭包 / 宏）：
+        // 其中对字段的赋值按“可能发生”处理（并集），避免把经闭包赋值的合法程序误判。
+        Expr::Spawn { body } => {
+            let (out, _) = da_stmt_list(body, cur.clone(), required, fields, &mut Vec::new());
+            let mut c = cur;
+            c.extend(out);
+            (c, true)
+        }
+        Expr::Lambda { body, .. } => {
+            let mut c = cur.clone();
+            if let Expr::Block(stmts, _) = body.as_ref() {
+                let (out, _) = da_stmt_list(stmts, cur, required, fields, &mut Vec::new());
+                c.extend(out);
+            }
+            (c, true)
+        }
+        Expr::TryBlock {
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            let mut c = cur.clone();
+            let mut sets: Vec<HashSet<String>> = Vec::new();
+            let (out, _) = da_stmt_list(body, cur.clone(), required, fields, &mut Vec::new());
+            sets.push(out);
+            let (out, _) = da_stmt_list(catch_body, cur.clone(), required, fields, &mut Vec::new());
+            sets.push(out);
+            if let Some(fb) = finally_body {
+                let (out, _) = da_stmt_list(fb, cur.clone(), required, fields, &mut Vec::new());
+                sets.push(out);
+            }
+            for s in sets {
+                c.extend(s);
+            }
+            (c, true)
+        }
+        Expr::TrailingClosure { closure, .. } => {
+            let mut c = cur.clone();
+            if let Expr::Lambda { body, .. } = closure.as_ref() {
+                if let Expr::Block(stmts, _) = body.as_ref() {
+                    let (out, _) = da_stmt_list(stmts, cur, required, fields, &mut Vec::new());
+                    c.extend(out);
+                }
+            }
+            (c, true)
+        }
+        Expr::Macro { args, .. } => {
+            let mut c = cur;
+            for a in args {
+                if let Expr::Block(stmts, _) = a {
+                    let (out, _) = da_stmt_list(stmts, c.clone(), required, fields, &mut Vec::new());
+                    c.extend(out);
+                }
+            }
+            (c, true)
+        }
+        _ => (cur, true),
+    }
+}
+/// 收集赋值目标必然初始化的字段。
+fn da_target(t: &AssignTarget, cur: &mut HashSet<String>, fields: &HashSet<String>) {
+    match t {
+        AssignTarget::Var(name) => {
+            if fields.contains(name) {
+                cur.insert(name.clone());
+            }
+        }
+        AssignTarget::Field { object, field } => {
+            if (object == "this" || object == "self") && fields.contains(field) {
+                cur.insert(field.clone());
+            }
+        }
+        AssignTarget::FieldPath { base, fields: path } => {
+            if (base == "this" || base == "self") && path.len() == 1 {
+                if fields.contains(&path[0]) {
+                    cur.insert(path[0].clone());
+                }
+            }
+        }
+        AssignTarget::Tuple(ts) => {
+            for sub in ts {
+                da_target(sub, cur, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn da_intersect(a: &HashSet<String>, b: &HashSet<String>) -> HashSet<String> {
+    a.intersection(b).cloned().collect()
+}
+
+/// 6.1.2.1(22)：命名参数必须位于所有普通参数之后。
+/// 6.1.2.1(8)/(9)：构造函数形参在构造函数体内不可被重新赋值。
+fn check_ctor_param_rules(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    let report_order = |idx: usize, what: &str, errors: &mut Vec<SemanticError>| {
+        errors.push(SemanticError {
+            message: format!(
+                "类 '{}' 的{}第 {} 个普通参数位于命名参数之后（6.1.2.1(22)）",
+                cls.name,
+                what,
+                idx + 1
+            ),
+        });
+    };
+    if let Some(idx) = first_unnamed_after_named(&cls.primary_ctor_params) {
+        report_order(idx, "主构造函数", errors);
+    }
+    let inits: Vec<&InitDef> = if cls.inits.is_empty() {
+        cls.init.iter().collect()
+    } else {
+        cls.inits.iter().collect()
+    };
+    for init in &inits {
+        if let Some(idx) = first_unnamed_after_named(&init.params) {
+            report_order(idx, "构造函数", errors);
+        }
+        // 形参不可在构造函数体内重新赋值。
+        let names: HashSet<&str> = init.params.iter().map(|p| p.name.as_str()).collect();
+        if names.is_empty() {
+            continue;
+        }
+        let mut assigned: Vec<String> = Vec::new();
+        for s in &init.body {
+            collect_param_assigns_stmt(s, &names, &mut assigned);
+        }
+        assigned.sort();
+        assigned.dedup();
+        for name in assigned {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的构造函数形参 '{}' 不能被重新赋值（6.1.2.1(8)/(9)）",
+                    cls.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 返回第一个“出现在命名参数之后的普通参数”的下标（6.1.2.1(22)）。
+fn first_unnamed_after_named(params: &[Param]) -> Option<usize> {
+    let mut seen_named = false;
+    for (i, p) in params.iter().enumerate() {
+        if p.is_named {
+            seen_named = true;
+        } else if seen_named {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 6.1.2.1(54)：父类实例成员只能在调用本类/父类构造函数之后通过 `super.f` 访问；
+/// 静态上下文（static 字段初始化、static 方法/属性/static init）中不得使用 `super`。
+fn check_super_access_rules(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    let mut report = |what: &str, name: &str, errors: &mut Vec<SemanticError>| {
+        errors.push(SemanticError {
+            message: format!(
+                "类 '{}' 的{}中不能使用 '{}'（静态上下文不允许访问父类实例成员）（6.1.2.1(54)）",
+                cls.name, what, name
+            ),
+        });
+    };
+    // 静态字段初始化表达式。
+    for f in &cls.fields {
+        if f.is_static {
+            if let Some(d) = &f.default {
+                if let Some(name) = super_use_in_expr(d) {
+                    report(&format!("静态字段 '{}' 的初始化表达式", f.name), &name, errors);
+                }
+            }
+        }
+    }
+    // 静态方法 / 静态属性 / static init 块。
+    for m in &cls.methods {
+        if m.is_static {
+            let mut name: Option<String> = None;
+            for p in &m.func.params {
+                if let Some(d) = &p.default {
+                    if name.is_none() {
+                        name = super_use_in_expr(d);
+                    }
+                }
+            }
+            if name.is_none() {
+                name = super_use_in_stmts(&m.func.body);
+            }
+            if let Some(n) = name {
+                let base = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+                report(&format!("静态成员 '{}'", base), &n, errors);
+            }
+        }
+    }
+    if let Some(si) = &cls.static_init {
+        if let Some(n) = super_use_in_stmts(si) {
+            report("static init 块", &n, errors);
+        }
+    }
+
+    // 实例构造函数：若存在显式 `this(...)`/`super(...)` 调用，则它之前不得访问 super 成员。
+    let inits: Vec<&InitDef> = if cls.inits.is_empty() {
+        cls.init.iter().collect()
+    } else {
+        cls.inits.iter().collect()
+    };
+    for init in &inits {
+        let has_call = init
+            .body
+            .iter()
+            .any(|s| stmt_has_explicit_ctor_call(s));
+        if !has_call {
+            continue;
+        }
+        let mut called = false;
+        for s in &init.body {
+            if !called {
+                if let Some(name) = super_member_use_in_stmt(s) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的构造函数在调用本类/父类构造函数之前不能访问 '{}'（6.1.2.1(54)）",
+                            cls.name, name
+                        ),
+                    });
+                }
+            }
+            if stmt_has_explicit_ctor_call(s) {
+                called = true;
+            }
+        }
+    }
+}
+
+/// 在表达式树中查找 `super` 成员/构造访问，返回其展示名。
+fn super_use_in_expr(e: &Expr) -> Option<String> {
+    let mut found: Option<String> = None;
+    walk_expr(e, &mut |sub| {
+        if found.is_none() {
+            found = super_use_of(sub);
+        }
+    });
+    found
+}
+
+fn super_use_in_stmts(stmts: &[Stmt]) -> Option<String> {
+    let mut found: Option<String> = None;
+    walk_stmts(stmts, &mut |sub| {
+        if found.is_none() {
+            found = super_use_of(sub);
+        }
+    });
+    found
+}
+
+fn super_member_use_in_stmt(s: &Stmt) -> Option<String> {
+    let mut found: Option<String> = None;
+    walk_stmt(s, &mut |sub| {
+        if found.is_none() {
+            found = match sub {
+                Expr::SuperFieldAccess { field } => Some(format!("super.{}", field)),
+                Expr::SuperCall { method, .. } if method != "init" => {
+                    Some(format!("super.{}", method))
+                }
+                _ => None,
+            };
+        }
+    });
+    found
+}
+
+fn super_use_of(e: &Expr) -> Option<String> {
+    match e {
+        Expr::SuperFieldAccess { field } => Some(format!("super.{}", field)),
+        Expr::SuperCall { method, .. } => Some(if method == "init" {
+            "super(...)".to_string()
+        } else {
+            format!("super.{}", method)
+        }),
+        _ => None,
+    }
+}
+
+fn stmt_has_explicit_ctor_call(s: &Stmt) -> bool {
+    let mut found = false;
+    walk_stmt(s, &mut |e| {
+        if is_explicit_ctor_call(e) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// 是否为显式构造函数调用 `this(...)` 或 `super(...)`。
+fn is_explicit_ctor_call(e: &Expr) -> bool {
+    match e {
+        Expr::Call { name, .. } => name == "this",
+        // `this(...)` 通常解析为 Invoke（callee 为 `this`/`self`）。
+        Expr::Invoke { callee, .. } => {
+            matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self")
+        }
+        Expr::SuperCall { method, .. } => method == "init",
+        _ => false,
+    }
+}
+
+/// 6.1.2.1(58)/(26)：在全部实例成员变量初始化完成之前，构造函数中不得：
+/// - 调用实例成员函数 / 属性 getter（`this.f()`、裸 `f()`、`this.p`、`super.f()` 等）；
+/// - 以值的形式引用实例成员函数（裸 `f`、`this.f`、`f<T>`）；
+/// - 读取尚未初始化的成员变量（`this.m` 或裸 `m`；已初始化的可读）；
+/// - 单独使用 `this` 表达式、在 lambda/局部函数中捕获 `this`。
+fn check_use_before_init(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    // 字段集合（排除 parser 为主构造普通参数误加的“字段”）。
+    let mut nonmember: HashSet<&str> = HashSet::new();
+    for (p, flag) in cls
+        .primary_ctor_params
+        .iter()
+        .zip(cls.primary_ctor_member_flags.iter())
+    {
+        if !*flag {
+            nonmember.insert(p.name.as_str());
+        }
+    }
+    let mut field_names: HashSet<String> = HashSet::new();
+    let mut auto: HashSet<String> = HashSet::new();
+    for f in &cls.fields {
+        if f.is_static || nonmember.contains(f.name.as_str()) {
+            continue;
+        }
+        field_names.insert(f.name.clone());
+        if f.default.is_some() {
+            auto.insert(f.name.clone());
+        }
+    }
+    for (p, flag) in cls
+        .primary_ctor_params
+        .iter()
+        .zip(cls.primary_ctor_member_flags.iter())
+    {
+        if *flag {
+            auto.insert(p.name.clone());
+        }
+    }
+    // 实例方法名 / 属性名（属性访问器脱糖为 __get_p / __set_p）。
+    let mut method_names: HashSet<String> = HashSet::new();
+    let mut prop_names: HashSet<String> = HashSet::new();
+    for m in &cls.methods {
+        if m.is_static {
+            continue;
+        }
+        let base = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+        if let Some(p) = base.strip_prefix("__get_").or_else(|| base.strip_prefix("__set_")) {
+            prop_names.insert(p.to_string());
+        } else {
+            method_names.insert(base.to_string());
+        }
+    }
+    let inits: Vec<&InitDef> = if cls.inits.is_empty() {
+        cls.init.iter().collect()
+    } else {
+        cls.inits.iter().collect()
+    };
+    for init in &inits {
+        let mut start = auto.clone();
+        for (p, flag) in init.params.iter().zip(init.member_param_flags.iter()) {
+            if *flag {
+                start.insert(p.name.clone());
+            }
+        }
+        let tracked: HashSet<String> = field_names.difference(&start).cloned().collect();
+        if tracked.is_empty() {
+            continue;
+        }
+        let param_names: HashSet<String> = init.params.iter().map(|p| p.name.clone()).collect();
+        let mut cur = start;
+        for s in &init.body {
+            let all_init = tracked.is_subset(&cur);
+            if !all_init {
+                if let Some(reason) = stmt_use_reason(
+                    s,
+                    &cur,
+                    &tracked,
+                    &field_names,
+                    &method_names,
+                    &prop_names,
+                    &param_names,
+                ) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的构造函数在所有实例成员变量初始化之前使用了 {}（6.1.2.1(58)/(26)）",
+                            cls.name, reason
+                        ),
+                    });
+                }
+            }
+            // 推进“必然已初始化”集合。
+            let (nc, flows) = da_stmt(s, cur.clone(), &tracked, &field_names, &mut Vec::new());
+            cur = nc;
+            if !flows {
+                break;
+            }
+        }
+    }
+}
+
+/// 单条语句中是否出现“未全部初始化前”禁止的使用，返回原因描述。
+fn stmt_use_reason(
+    s: &Stmt,
+    cur: &HashSet<String>,
+    tracked: &HashSet<String>,
+    field_names: &HashSet<String>,
+    methods: &HashSet<String>,
+    props: &HashSet<String>,
+    params: &HashSet<String>,
+) -> Option<String> {
+    match s {
+        Stmt::Expr(e) => expr_use_reason(e, cur, tracked, field_names, methods, props, params),
+        Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Const { value, .. } => {
+            expr_use_reason(value, cur, tracked, field_names, methods, props, params)
+        }
+        Stmt::Assign { value, .. } => {
+            expr_use_reason(value, cur, tracked, field_names, methods, props, params)
+        }
+        Stmt::Return(Some(e)) => {
+            expr_use_reason(e, cur, tracked, field_names, methods, props, params)
+        }
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            expr_use_reason(left, cur, tracked, field_names, methods, props, params)
+                .or_else(|| expr_use_reason(right, cur, tracked, field_names, methods, props, params))
+        }
+        Stmt::LocalFunc(f) => {
+            if stmts_contain_this(&f.body) {
+                Some("捕获 this 的局部函数".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn expr_use_reason(
+    e: &Expr,
+    cur: &HashSet<String>,
+    tracked: &HashSet<String>,
+    field_names: &HashSet<String>,
+    methods: &HashSet<String>,
+    props: &HashSet<String>,
+    params: &HashSet<String>,
+) -> Option<String> {
+    // 若该表达式内部对字段有赋值（控制流/顺序不确定），保守跳过。
+    if expr_has_field_assign(e, field_names) {
+        return None;
+    }
+    use_scan(e, cur, tracked, methods, props, params)
+}
+
+/// 结构感知扫描：在 receiver 位置（`this.x`、`this.f()` 的 object）上的 `this`
+/// 不算“单独 this”，其余位置的 `this`/未初始化成员/方法引用均视为违规使用。
+fn use_scan(
+    e: &Expr,
+    cur: &HashSet<String>,
+    tracked: &HashSet<String>,
+    methods: &HashSet<String>,
+    props: &HashSet<String>,
+    params: &HashSet<String>,
+) -> Option<String> {
+    match e {
+        Expr::Var(n) if n == "this" || n == "self" => Some("单独的 this 表达式".to_string()),
+        Expr::Var(n) => {
+            if params.contains(n) {
+                None
+            } else if methods.contains(n) {
+                Some(format!("实例成员函数 '{}'", n))
+            } else if props.contains(n) {
+                Some(format!("属性 '{}'", n))
+            } else if tracked.contains(n) && !cur.contains(n) {
+                Some(format!("未初始化的成员变量 '{}'", n))
+            } else {
+                None
+            }
+        }
+        Expr::Field { object, field } => {
+            if let Expr::Var(o) = object.as_ref() {
+                if o == "this" || o == "self" {
+                    if props.contains(field) {
+                        return Some(format!("属性 '{}'", field));
+                    }
+                    if tracked.contains(field) && !cur.contains(field) {
+                        return Some(format!("未初始化的成员变量 '{}'", field));
+                    }
+                    return None;
+                }
+            }
+            use_scan(object, cur, tracked, methods, props, params)
+        }
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            named_args,
+            ..
+        } => {
+            if let Expr::Var(o) = object.as_ref() {
+                if o == "this" || o == "self" {
+                    return Some(format!("实例成员函数 '{}'", method));
+                }
+                if o == "super" {
+                    return Some(format!("super.{}", method));
+                }
+            }
+            if let Some(r) = use_scan(object, cur, tracked, methods, props, params) {
+                return Some(r);
+            }
+            for a in args {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            for (_, a) in named_args {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        // 父类实例成员变量经 super 读取是允许的（父类构造函数隐式先执行）；
+        // 父类函数/属性访问由 `SuperCall`（方法）分支约束。
+        Expr::SuperFieldAccess { .. } => None,
+        Expr::SuperCall { method, .. } if method != "init" => Some(format!("super.{}", method)),
+        Expr::Call {
+            name,
+            args,
+            named_args,
+            ..
+        } => {
+            if !params.contains(name) && methods.contains(name) {
+                return Some(format!("实例成员函数 '{}'", name));
+            }
+            for a in args {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            for (_, a) in named_args {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self") {
+                return None; // this(...) 委托构造函数
+            }
+            if let Some(r) = use_scan(callee, cur, tracked, methods, props, params) {
+                return Some(r);
+            }
+            for a in args {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            for (_, a) in named_args {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        Expr::Lambda { body, .. } => {
+            if expr_contains_this(body) {
+                Some("捕获 this 的 lambda".to_string())
+            } else {
+                None
+            }
+        }
+        Expr::Binary { left, right, .. } => use_scan(left, cur, tracked, methods, props, params)
+            .or_else(|| use_scan(right, cur, tracked, methods, props, params)),
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsType { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Throw(expr)
+        | Expr::Try(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::TupleIndex { object: expr, .. }
+        | Expr::OptionalChain { object: expr, .. } => {
+            use_scan(expr, cur, tracked, methods, props, params)
+        }
+        Expr::Tuple(es) | Expr::Array(es) => {
+            for x in es {
+                if let Some(r) = use_scan(x, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        Expr::Index { array, index } => use_scan(array, cur, tracked, methods, props, params)
+            .or_else(|| use_scan(index, cur, tracked, methods, props, params)),
+        Expr::Range {
+            start, end, step, ..
+        } => use_scan(start, cur, tracked, methods, props, params)
+            .or_else(|| use_scan(end, cur, tracked, methods, props, params))
+            .or_else(|| {
+                step.as_ref()
+                    .and_then(|s| use_scan(s, cur, tracked, methods, props, params))
+            }),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => use_scan(cond, cur, tracked, methods, props, params)
+            .or_else(|| use_scan(then_branch, cur, tracked, methods, props, params))
+            .or_else(|| {
+                else_branch
+                    .as_ref()
+                    .and_then(|b| use_scan(b, cur, tracked, methods, props, params))
+            }),
+        Expr::IfLet {
+            expr,
+            then_branch,
+            else_branch,
+            ..
+        } => use_scan(expr, cur, tracked, methods, props, params)
+            .or_else(|| use_scan(then_branch, cur, tracked, methods, props, params))
+            .or_else(|| {
+                else_branch
+                    .as_ref()
+                    .and_then(|b| use_scan(b, cur, tracked, methods, props, params))
+            }),
+        Expr::Match { expr, arms } => use_scan(expr, cur, tracked, methods, props, params).or_else(
+            || {
+                for arm in arms {
+                    if let Some(r) = use_scan(&arm.body, cur, tracked, methods, props, params) {
+                        return Some(r);
+                    }
+                }
+                None
+            },
+        ),
+        Expr::NullCoalesce { option, default } => {
+            use_scan(option, cur, tracked, methods, props, params)
+                .or_else(|| use_scan(default, cur, tracked, methods, props, params))
+        }
+        Expr::ConstructorCall { args, named_args, .. } => {
+            for a in args {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            for (_, a) in named_args {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, a) in fields {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// 表达式内是否出现对某字段的赋值（用于控制流保守跳过）。
+fn expr_has_field_assign(e: &Expr, fields: &HashSet<String>) -> bool {
+    match e {
+        Expr::Block(stmts, _) => stmts_have_field_assign(stmts, fields),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_has_field_assign(then_branch, fields)
+                || else_branch
+                    .as_ref()
+                    .map(|b| expr_has_field_assign(b, fields))
+                    .unwrap_or(false)
+        }
+        Expr::IfLet {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_has_field_assign(then_branch, fields)
+                || else_branch
+                    .as_ref()
+                    .map(|b| expr_has_field_assign(b, fields))
+                    .unwrap_or(false)
+        }
+        Expr::Match { arms, .. } => arms
+            .iter()
+            .any(|a| expr_has_field_assign(&a.body, fields)),
+        _ => false,
+    }
+}
+
+fn stmts_have_field_assign(stmts: &[Stmt], fields: &HashSet<String>) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Assign { target, .. } => {
+            let mut set = HashSet::new();
+            da_target(target, &mut set, fields);
+            !set.is_empty()
+        }
+        Stmt::While { body, .. }
+        | Stmt::WhileLet { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::UnsafeBlock { body } => stmts_have_field_assign(body, fields),
+        Stmt::Expr(e) => expr_has_field_assign(e, fields),
+        _ => false,
+    })
+}
+
+/// 表达式（或其中嵌套语句）内是否引用了 `this`/`self`。
+fn expr_contains_this(e: &Expr) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |sub| {
+        if matches!(sub, Expr::Var(n) if n == "this" || n == "self") {
+            found = true;
+        }
+    });
+    found
+}
+
+fn stmts_contain_this(stmts: &[Stmt]) -> bool {
+    let mut found = false;
+    walk_stmts(stmts, &mut |sub| {
+        if matches!(sub, Expr::Var(n) if n == "this" || n == "self") {
+            found = true;
+        }
+    });
+    found
+}
+
+/// 6.1.2.1(57)：`this` 不得逃逸出 open/abstract 类的构造函数
+/// （通过 lambda / 局部函数捕获，或作为值传出——赋值、返回、实参等）。
+fn check_this_escape_open(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    if !(cls.is_open || cls.is_abstract) {
+        return;
+    }
+    let inits: Vec<&InitDef> = if cls.inits.is_empty() {
+        cls.init.iter().collect()
+    } else {
+        cls.inits.iter().collect()
+    };
+    for init in &inits {
+        if init.body.iter().any(stmt_escapes_this) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的构造函数中 this 不能逃逸（open/abstract 类禁止通过 lambda/局部函数捕获或作为值传出）（6.1.2.1(57)）",
+                    cls.name
+                ),
+            });
+        }
+    }
+}
+
+fn stmt_escapes_this(s: &Stmt) -> bool {
+    match s {
+        Stmt::LocalFunc(f) => stmts_contain_this(&f.body),
+        Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Const { value, .. } => {
+            expr_escapes_this(value)
+        }
+        Stmt::Assign { value, .. } => expr_escapes_this(value),
+        Stmt::Expr(e) => expr_escapes_this(e),
+        Stmt::Return(Some(e)) => expr_escapes_this(e),
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            expr_escapes_this(left) || expr_escapes_this(right)
+        }
+        Stmt::While { body, .. }
+        | Stmt::WhileLet { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::UnsafeBlock { body } => body.iter().any(stmt_escapes_this),
+        _ => false,
+    }
+}
+
+/// `this` 是否以“值”的形式出现在该表达式中（receiver 位置的 `this.x`/`this.f()`
+/// 不算逃逸；lambda/局部函数捕获 this 算逃逸）。
+fn expr_escapes_this(e: &Expr) -> bool {
+    match e {
+        Expr::Lambda { body, .. } => expr_contains_this(body),
+        Expr::TrailingClosure { closure, .. } => expr_contains_this(closure),
+        Expr::Var(n) if n == "this" || n == "self" => true,
+        Expr::Field { .. } | Expr::TupleIndex { .. } | Expr::OptionalChain { .. } => false,
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            if let Expr::Var(o) = object.as_ref() {
+                if o == "this" || o == "self" {
+                    return args.iter().any(expr_escapes_this)
+                        || named_args.iter().any(|(_, a)| expr_escapes_this(a));
+                }
+            }
+            expr_escapes_this(object)
+                || args.iter().any(expr_escapes_this)
+                || named_args.iter().any(|(_, a)| expr_escapes_this(a))
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self") {
+                return args.iter().any(expr_escapes_this)
+                    || named_args.iter().any(|(_, a)| expr_escapes_this(a));
+            }
+            expr_escapes_this(callee)
+                || args.iter().any(expr_escapes_this)
+                || named_args.iter().any(|(_, a)| expr_escapes_this(a))
+        }
+        Expr::Call {
+            args, named_args, ..
+        }
+        | Expr::ConstructorCall {
+            args, named_args, ..
+        }
+        | Expr::SuperCall {
+            args, named_args, ..
+        } => {
+            args.iter().any(expr_escapes_this)
+                || named_args.iter().any(|(_, a)| expr_escapes_this(a))
+        }
+        Expr::StructInit { fields, .. } => fields.iter().any(|(_, a)| expr_escapes_this(a)),
+        Expr::Binary { left, right, .. } => expr_escapes_this(left) || expr_escapes_this(right),
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsType { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Throw(expr)
+        | Expr::Try(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixDecr(expr) => expr_escapes_this(expr),
+        Expr::Tuple(es) | Expr::Array(es) => es.iter().any(expr_escapes_this),
+        Expr::Index { array, index } => expr_escapes_this(array) || expr_escapes_this(index),
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            expr_escapes_this(start)
+                || expr_escapes_this(end)
+                || step.as_ref().map(|s| expr_escapes_this(s)).unwrap_or(false)
+        }
+        Expr::NullCoalesce { option, default } => {
+            expr_escapes_this(option) || expr_escapes_this(default)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_escapes_this(cond)
+                || expr_escapes_this(then_branch)
+                || else_branch.as_ref().map(|b| expr_escapes_this(b)).unwrap_or(false)
+        }
+        Expr::IfLet {
+            expr,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_escapes_this(expr)
+                || expr_escapes_this(then_branch)
+                || else_branch.as_ref().map(|b| expr_escapes_this(b)).unwrap_or(false)
+        }
+        Expr::Match { expr, arms } => {
+            expr_escapes_this(expr) || arms.iter().any(|a| expr_escapes_this(&a.body))
+        }
+        _ => false,
+    }
+}
+
+
+/// 递归查找对指定名称（构造函数形参）的裸变量赋值。
+fn collect_param_assigns_stmt(stmt: &Stmt, names: &HashSet<&str>, out: &mut Vec<String>) {
+    match stmt {
+        Stmt::Assign {
+            target: AssignTarget::Var(n),
+            ..
+        } => {
+            if names.contains(n.as_str()) {
+                out.push(n.clone());
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::WhileLet { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::UnsafeBlock { body } => {
+            for s in body {
+                collect_param_assigns_stmt(s, names, out);
+            }
+        }
+        Stmt::Expr(e) => collect_param_assigns_expr(e, names, out),
+        _ => {}
+    }
+}
+
+fn collect_param_assigns_expr(expr: &Expr, names: &HashSet<&str>, out: &mut Vec<String>) {
+    match expr {
+        Expr::Block(stmts, trailing) => {
+            for s in stmts {
+                collect_param_assigns_stmt(s, names, out);
+            }
+            if let Some(t) = trailing {
+                collect_param_assigns_expr(t, names, out);
+            }
+        }
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_param_assigns_expr(then_branch, names, out);
+            if let Some(eb) = else_branch {
+                collect_param_assigns_expr(eb, names, out);
+            }
+        }
+        Expr::IfLet {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_param_assigns_expr(then_branch, names, out);
+            if let Some(eb) = else_branch {
+                collect_param_assigns_expr(eb, names, out);
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for arm in arms {
+                collect_param_assigns_expr(&arm.body, names, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -4683,6 +5873,7 @@ mod tests {
                 init: None,
                 deinit: None,
                 static_init: None,
+                inits: vec![],
                 primary_ctor_params: vec![],
                 primary_ctor_member_flags: vec![],
                 methods: vec![ClassMethod {
@@ -5470,6 +6661,215 @@ mod tests {
         assert_invalid(
             "class C {\n\
              \x20   prop x: Int64\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    // ── w7a: 构造器规则 6.1.2.1 系 ──────────────────────────────────────────
+
+    #[test]
+    fn test_w7a_ctor_definite_assignment_rejects_uninitialized_field() {
+        // 6.1.2.1(55)：构造函数返回前未初始化无默认值的实例字段。
+        assert_invalid(
+            "class A {\n\
+             \x20   init() {}\n\
+             \x20   var x: Int64\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_definite_assignment_accepts_initialized_field() {
+        assert_valid(
+            "class A {\n\
+             \x20   init() { x = 1 }\n\
+             \x20   var x: Int64\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_definite_assignment_conditional_all_branches_ok() {
+        // if 两支都赋值 → 确定赋值成立。
+        assert_valid(
+            "class A {\n\
+             \x20   init(c: Bool) { if (c) { x = 1 } else { x = 2 } }\n\
+             \x20   var x: Int64\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_definite_assignment_conditional_missing_branch() {
+        // 仅一支赋值 → 不确定，非法。
+        assert_invalid(
+            "class A {\n\
+             \x20   init(c: Bool) { if (c) { x = 1 } }\n\
+             \x20   var x: Int64\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_definite_assignment_multiple_ctors_one_missing() {
+        // 每个构造函数都需初始化；其中一个漏掉即非法。
+        assert_invalid(
+            "class A {\n\
+             \x20   init() {}\n\
+             \x20   init(a: Int64) { x = a }\n\
+             \x20   var x: Int64\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_call_arg_type_mismatch() {
+        // 6.1.2.1(8)/(9)：实参类型与形参不匹配。
+        assert_invalid(
+            "class A {\n\
+             \x20   A(x: Int64) {}\n\
+             }\n\
+             main() { let a = A(()) }\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_call_arg_type_ok() {
+        assert_valid(
+            "class A {\n\
+             \x20   A(x: Int64) {}\n\
+             }\n\
+             main() { let a = A(1) }\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_called_named_param_must_be_named() {
+        // 命名形参必须用 `名字:` 传入。
+        assert_invalid(
+            "class A {\n\
+             \x20   A(x!: Int64) {}\n\
+             }\n\
+             main() { let a = A(1) }\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_called_named_param_ok() {
+        assert_valid(
+            "class A {\n\
+             \x20   A(x!: Int64) {}\n\
+             }\n\
+             main() { let a = A(x: 1) }\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_unnamed_param_cannot_be_named() {
+        assert_invalid(
+            "class A {\n\
+             \x20   A(x: Int64) {}\n\
+             }\n\
+             main() { let a = A(x: 1) }\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_ctor_named_param_order() {
+        // 6.1.2.1(22)：命名参数必须位于普通参数之后。
+        assert_invalid(
+            "class A {\n\
+             \x20   A(x!: Int64, y: Int64) {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_super_member_before_ctor_call() {
+        // 6.1.2.1(54)：在显式 this()/super() 之前访问 super 成员。
+        assert_invalid(
+            "open class P { var x = 1 }\n\
+             class A <: P {\n\
+             \x20   init() {}\n\
+             \x20   init(x: Int64) { super.x\nthis() }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_static_context_cannot_use_super() {
+        // 6.1.2.1(54)：静态字段初始化不能使用 super。
+        assert_invalid(
+            "open class P { var x = 1 }\n\
+             class A <: P {\n\
+             \x20   static let y = super.x\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_use_uninitialized_member_before_init() {
+        // 6.1.2.1(58)：初始化前读取未初始化成员。
+        assert_invalid(
+            "class A {\n\
+             \x20   init() { let t = this.x\n this.x = 1 }\n\
+             \x20   var x: Int64\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_call_instance_method_before_init() {
+        // 6.1.2.1(26)：初始化前调用实例成员函数。
+        assert_invalid(
+            "class A {\n\
+             \x20   init() { f()\n this.x = 1 }\n\
+             \x20   var x: Int64\n\
+             \x20   func f() {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_call_instance_method_after_init_ok() {
+        assert_valid(
+            "class A {\n\
+             \x20   init() { this.x = 1\n this.f() }\n\
+             \x20   var x: Int64\n\
+             \x20   func f() {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_this_escape_open_class() {
+        // 6.1.2.1(57)：open 类构造函数中 lambda 捕获 this。
+        assert_invalid(
+            "open class A {\n\
+             \x20   init() { let t = { => this } }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w7a_this_escape_non_open_class_allowed() {
+        // 非 open/abstract 类允许 this 逃逸。
+        assert_valid(
+            "class A {\n\
+             \x20   init() { let t = { => this } }\n\
              }\n\
              main() {}\n",
         );
