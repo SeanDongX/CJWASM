@@ -1562,6 +1562,7 @@ impl Parser {
                         visibility: Visibility::Public,
                         is_static: false,
                         type_params: vec![],
+                        constraints: vec![],
                         is_const: false,
                     });
                     continue;
@@ -1595,6 +1596,7 @@ impl Parser {
                                 visibility: Visibility::Public,
                                 is_static: false,
                                 type_params: vec![],
+                                constraints: vec![],
                                 is_const: false,
                             });
                         } else if kw == "set" {
@@ -1640,6 +1642,7 @@ impl Parser {
                                 visibility: Visibility::Public,
                                 is_static: false,
                                 type_params: vec![],
+                                constraints: vec![],
                                 is_const: false,
                             });
                         } else {
@@ -1672,7 +1675,8 @@ impl Parser {
                 }
             };
             // 泛型方法签名：func name<A, B: Bound>(...)
-            let (iface_type_params, _) = self.parse_type_params_with_constraints()?;
+            let (iface_type_params, mut iface_constraints) =
+                self.parse_type_params_with_constraints()?;
             let prev_type_params = std::mem::replace(
                 &mut self.current_type_params,
                 iface_type_params.clone(),
@@ -1686,7 +1690,7 @@ impl Parser {
             } else {
                 None
             };
-            let _ = self.parse_where_clause()?;
+            iface_constraints.extend(self.parse_where_clause()?);
             if self.check(&Token::Lt) {
                 self.advance();
                 loop {
@@ -1729,6 +1733,7 @@ impl Parser {
                 visibility: mods.visibility.unwrap_or(Visibility::Public),
                 is_static: mods.is_static,
                 type_params: iface_type_params,
+                constraints: iface_constraints,
                 is_const: mods.is_const,
             });
         }

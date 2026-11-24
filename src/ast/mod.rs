@@ -570,6 +570,9 @@ pub struct InterfaceMethod {
     pub is_static: bool,
     /// 方法级泛型参数名（如 `func f<T>()` 的 ["T"]）。
     pub type_params: Vec<String>,
+    /// 方法级泛型约束（`<T: Bound>` / `where T <: Bound`）。
+    /// 用于校验实现函数的约束不得比接口声明更严格（6.2.4.1(5)）。
+    pub constraints: Vec<TypeConstraint>,
     /// 是否为 const 函数（const func）。const 接口函数必须由 const 函数实现。
     pub is_const: bool,
 }
