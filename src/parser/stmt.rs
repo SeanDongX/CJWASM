@@ -118,15 +118,14 @@ impl Parser {
                 let pattern = if self.check(&Token::LParen) {
                     self.parse_pattern()?
                 } else {
-                    let first = match self.advance() {
-                        Some(Token::Ident(name)) => name,
-                        Some(tok) => {
+                    let first = match self.advance_binding_ident() {
+                        Some(name) => name,
+                        None => {
                             return self.bail(ParseError::UnexpectedToken(
-                                tok,
+                                self.peek().cloned().unwrap_or(Token::Ident(String::new())),
                                 "变量名或类型名".to_string(),
                             ))
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     };
                     if self.check(&Token::LBrace) {
                         self.advance();
@@ -202,15 +201,20 @@ impl Parser {
                 let pattern = if self.check(&Token::LParen) {
                     self.parse_pattern()?
                 } else {
-                    match self.advance() {
-                        Some(Token::Ident(name)) => Pattern::Binding(name),
-                        // cjc: var _ = expr — 求值右侧后丢弃（丢弃绑定）
-                        Some(Token::Underscore) => Pattern::Wildcard,
-                        Some(tok) => {
-                            return self
-                                .bail(ParseError::UnexpectedToken(tok, "变量名".to_string()))
+                    // cjc: var _ = expr — 求值右侧后丢弃（丢弃绑定）
+                    if self.check(&Token::Underscore) {
+                        self.advance();
+                        Pattern::Wildcard
+                    } else {
+                        match self.advance_binding_ident() {
+                            Some(name) => Pattern::Binding(name),
+                            None => {
+                                return self.bail(ParseError::UnexpectedToken(
+                                    self.peek().cloned().unwrap_or(Token::Assign),
+                                    "变量名".to_string(),
+                                ))
+                            }
                         }
-                        None => return self.bail(ParseError::UnexpectedEof),
                     }
                 };
                 // cjc: var x!: T — `!` 表示确定赋值声明（无初始化式），仅作语法修饰

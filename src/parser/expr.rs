@@ -126,7 +126,8 @@ impl Parser {
                 // 类型关键字后跟 `.`（如 `x < UInt32.Min`）说明是比较而非泛型实参
                 && !matches!(self.peek_at(2), Some(Token::Dot));
                 let is_generic_ident = matches!(next, Some(Token::Ident(_)))
-                    && matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
+                    && matches!(self.peek_at(2), Some(Token::Gt | Token::Comma))
+                    && self.has_generic_close();
                 if is_type_keyword || is_generic_ident {
                     None
                 } else {
@@ -1244,11 +1245,12 @@ impl Parser {
                 // 解析可选类型实参 (如 identity<Int64> 或 Pair<Int64,String>)
                 // 但 `a < UInt32.Max` 这类比较：`<` 后基础类型再跟 `.`，不能当作泛型实参
                 let type_args = if matches!(self.peek(), Some(Token::Lt))
-                    && matches!(self.peek_at(2), Some(Token::Dot))
+                    && !matches!(self.peek_at(2), Some(Token::Dot))
+                    && self.has_generic_close()
                 {
-                    None
-                } else {
                     self.parse_opt_type_args()?
+                } else {
+                    None
                 };
                 // 检查是否是函数调用、构造函数调用或结构体初始化
                 match self.peek() {
@@ -2266,7 +2268,10 @@ impl Parser {
         }
     }
 
-    /// 解析插值表达式内的文本
+    /// 解析插值表达式内的文本。
+    ///
+    /// 规范允许 `${...}` 内前导分号（如 `${;;;1 + 2}`），但插值内容必须是表达式；
+    /// 含声明的插值需要类型检查，这里不展开，交由表达式解析器判定。
     pub(crate) fn parse_interpolation_expr(&self, expr_text: &str) -> Result<Expr, ParseErrorAt> {
         use crate::lexer::Lexer;
 
@@ -2279,6 +2284,17 @@ impl Parser {
         })?;
 
         let mut parser = Parser::new(tokens);
+        // 跳过前导分号（`${;;;expr}`）
+        while parser.check(&Token::Semicolon) {
+            parser.advance();
+        }
+        if parser.peek().is_none() {
+            return Err(ParseErrorAt {
+                error: ParseError::UnexpectedEof,
+                byte_start: self.at_prev().0,
+                byte_end: self.at_prev().1,
+            });
+        }
         parser.parse_expr()
     }
 
