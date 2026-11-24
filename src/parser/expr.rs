@@ -450,8 +450,23 @@ impl Parser {
                         };
                     } else {
                         let first = self.parse_expr()?;
-                        // parse_expr 可能已把 `start..end` 解析为范围表达式
-                        if let Expr::Range {
+                        // 多参数下标（自定义 operator[]）：op[a, b, c]
+                        if self.check(&Token::Comma) {
+                            let mut elems = vec![first];
+                            while self.check(&Token::Comma) {
+                                self.advance();
+                                // 容错尾随逗号
+                                if self.check(&Token::RBracket) {
+                                    break;
+                                }
+                                elems.push(self.parse_expr()?);
+                            }
+                            self.expect(Token::RBracket)?;
+                            expr = Expr::Index {
+                                array: Box::new(expr),
+                                index: Box::new(Expr::Tuple(elems)),
+                            };
+                        } else if let Expr::Range {
                             start,
                             end,
                             inclusive: _,
@@ -643,14 +658,17 @@ impl Parser {
                 // 支持 Call、MethodCall、Field（如 .any { x => ... }），以及 Var（如 map { x => f(x) }）
                 // 也支持 ConstructorCall（如 Array(n) { i => ... }）
                 Some(Token::LBrace)
-                    if matches!(
-                        &expr,
-                        Expr::Call { .. }
-                            | Expr::MethodCall { .. }
-                            | Expr::Field { .. }
-                            | Expr::Var(_)
-                            | Expr::ConstructorCall { .. }
-                    ) =>
+                    if !self.no_trailing_lambda
+                        && !self.newline_before_current()
+                        && matches!(
+                            &expr,
+                            Expr::Call { .. }
+                                | Expr::MethodCall { .. }
+                                | Expr::Field { .. }
+                                | Expr::Var(_)
+                                | Expr::ConstructorCall { .. }
+                                | Expr::Invoke { .. }
+                        ) =>
                 {
                     // Peek ahead to check if this looks like a lambda: { ident => ... } or { => ... }
                     let looks_like_lambda = matches!(self.peek_next(), Some(Token::FatArrow))
@@ -659,10 +677,10 @@ impl Parser {
                                 self.peek_at(2),
                                 Some(Token::FatArrow) | Some(Token::Colon) | Some(Token::Comma)
                             ));
-                    if looks_like_lambda {
+                    let closure = if looks_like_lambda {
                         // Consume { and parse the lambda body
                         self.advance(); // consume {
-                        let closure = if self.check(&Token::FatArrow) {
+                        if self.check(&Token::FatArrow) {
                             // { => body } — 无参 lambda；body 可为语句块
                             self.advance();
                             let body = self.parse_lambda_body()?;
@@ -715,76 +733,99 @@ impl Parser {
                                 return_type: None,
                                 body: Box::new(body),
                             }
-                        };
-                        expr = match expr {
+                        }
+                    } else {
+                        // 表达式体尾随 lambda：f{-1} / obj.m{expr} / f{ stmt; expr }
+                        // parse_primary 把 `{ ... }` 解析为 Lambda 或 Block，
+                        // Block 在尾随 lambda 语义下等价于零参 lambda 的表达式体。
+                        match self.parse_primary()? {
+                            e @ Expr::Lambda { .. } => e,
+                            body => Expr::Lambda {
+                                params: vec![],
+                                return_type: None,
+                                body: Box::new(body),
+                            },
+                        }
+                    };
+                    expr = match expr {
+                        Expr::Call {
+                            name,
+                            type_args,
+                            args,
+                            named_args: _,
+                        } => {
+                            let mut all_args = args;
+                            all_args.push(closure);
                             Expr::Call {
                                 name,
                                 type_args,
-                                args,
-                                named_args: _,
-                            } => {
-                                let mut all_args = args;
-                                all_args.push(closure);
-                                Expr::Call {
-                                    name,
-                                    type_args,
-                                    args: all_args,
-                                    named_args: vec![],
-                                }
+                                args: all_args,
+                                named_args: vec![],
                             }
+                        }
+                        Expr::MethodCall {
+                            object,
+                            method,
+                            args,
+                            named_args: _,
+                            type_args,
+                        } => {
+                            let mut all_args = args;
+                            all_args.push(closure);
                             Expr::MethodCall {
                                 object,
                                 method,
-                                args,
-                                named_args: _,
+                                args: all_args,
+                                named_args: vec![],
                                 type_args,
-                            } => {
-                                let mut all_args = args;
-                                all_args.push(closure);
-                                Expr::MethodCall {
-                                    object,
-                                    method,
-                                    args: all_args,
-                                    named_args: vec![],
-                                    type_args,
-                                }
                             }
-                            Expr::Field {
-                                object: obj,
-                                field: method_name,
-                            } => Expr::MethodCall {
-                                object: obj,
-                                method: method_name,
-                                args: vec![closure],
-                                named_args: vec![],
-                                type_args: None,
-                            },
-                            Expr::Var(func_name) => Expr::Call {
-                                name: func_name,
-                                type_args: None,
-                                args: vec![closure],
-                                named_args: vec![],
-                            },
+                        }
+                        Expr::Field {
+                            object: obj,
+                            field: method_name,
+                        } => Expr::MethodCall {
+                            object: obj,
+                            method: method_name,
+                            args: vec![closure],
+                            named_args: vec![],
+                            type_args: None,
+                        },
+                        Expr::Var(func_name) => Expr::Call {
+                            name: func_name,
+                            type_args: None,
+                            args: vec![closure],
+                            named_args: vec![],
+                        },
+                        Expr::ConstructorCall {
+                            name,
+                            type_args,
+                            args,
+                            named_args: _,
+                        } => {
+                            let mut all_args = args;
+                            all_args.push(closure);
                             Expr::ConstructorCall {
                                 name,
                                 type_args,
-                                args,
-                                named_args: _,
-                            } => {
-                                let mut all_args = args;
-                                all_args.push(closure);
-                                Expr::ConstructorCall {
-                                    name,
-                                    type_args,
-                                    args: all_args,
-                                    named_args: vec![],
-                                }
+                                args: all_args,
+                                named_args: vec![],
                             }
-                            _ => unreachable!(),
-                        };
-                    } else {
-                        break;
-                    }
+                        }
+                        Expr::Invoke {
+                            callee,
+                            args,
+                            named_args,
+                        } => {
+                            let mut all_args = args;
+                            all_args.push(closure);
+                            Expr::Invoke {
+                                callee,
+                                args: all_args,
+                                named_args,
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
                 }
                 _ => break,
             }
@@ -922,8 +963,10 @@ impl Parser {
                 self.pos -= 1; // 回退，让 parse_macro_call 重新消费 @
                 self.parse_macro_call()
             }
-            // unittest mock DSL：宏实参中的 `_` 通配符（如 @On(a.intOpt(_))）
-            Some(Token::Underscore) if self.allow_wildcard_expr => {
+            // `_` 通配符表达式：宏实参（如 @On(a.intOpt(_))）以及
+            // 解构赋值左侧（如 `(c.f, _) = pair`）。仅在此处作为 Var("_") 接纳，
+            // 后续由赋值目标转换/宏处理决定其语义。
+            Some(Token::Underscore) => {
                 Ok(Expr::Var("_".to_string()))
             }
             Some(Token::Integer(n)) => {
@@ -1209,6 +1252,7 @@ impl Parser {
                 let value = if self.check(&Token::RBrace)
                     || self.check(&Token::Semicolon)
                     || self.check(&Token::Comma)
+                    || self.check(&Token::RParen)
                 {
                     None
                 } else {
@@ -1879,7 +1923,12 @@ impl Parser {
                     }
                     self.advance();
                     // 使用受限表达式解析，避免 { 被误认为结构体初始化
-                    let expr = Box::new(self.parse_match_subject()?);
+                    // 非括号 if-let 主体后 `{` 是 then 体，禁止尾随 lambda
+                    let saved_no_lambda = self.no_trailing_lambda;
+                    self.no_trailing_lambda = true;
+                    let subject = self.parse_match_subject();
+                    self.no_trailing_lambda = saved_no_lambda;
+                    let expr = Box::new(subject?);
                     self.expect(Token::LBrace)?;
                     let then_stmts = self.parse_stmts()?;
                     // P3: 将所有语句包装为 Block 表达式，保留副作用
@@ -1939,7 +1988,13 @@ impl Parser {
                     if has_paren {
                         self.advance();
                     }
+                    // 非括号条件后紧跟 `{` 是语句块体，禁止把尾随 `{` 当作 lambda
+                    let saved_no_lambda = self.no_trailing_lambda;
+                    if !has_paren {
+                        self.no_trailing_lambda = true;
+                    }
                     let cond = self.parse_expr()?;
+                    self.no_trailing_lambda = saved_no_lambda;
                     if has_paren {
                         self.expect(Token::RParen)?;
                     }
@@ -1980,13 +2035,22 @@ impl Parser {
                 if has_paren {
                     self.advance();
                 }
-                let expr = if self.check(&Token::LBrace) && self.peek_at(1) != Some(&Token::RBrace)
+                let expr = if has_paren {
+                    // 括号内是完整表达式上下文，`{` 不会被误认为 match 体，
+                    // 因此用 parse_expr 支持 `match (i % 4)` 等二元表达式主体。
+                    Box::new(self.parse_expr()?)
+                } else if self.check(&Token::LBrace) && self.peek_at(1) != Some(&Token::RBrace)
                 {
                     // match { case ... } 无主体，视为 match (()) { ... }
                     // 但 match {} 不是有效的无主体语法（空块应该是主体）
                     Box::new(Expr::Block(vec![], None))
                 } else {
-                    Box::new(self.parse_match_subject()?)
+                    // 非括号主体后紧跟 `{` 是 match 体，禁止把尾随 `{` 当作 lambda
+                    let saved_no_lambda = self.no_trailing_lambda;
+                    self.no_trailing_lambda = true;
+                    let subject = self.parse_match_subject();
+                    self.no_trailing_lambda = saved_no_lambda;
+                    Box::new(subject?)
                 };
                 if has_paren {
                     self.expect(Token::RParen)?;
@@ -2184,6 +2248,10 @@ impl Parser {
         }
 
         loop {
+            // 允许尾随逗号：f(a, b,)
+            if self.check(&Token::RParen) {
+                break;
+            }
             // C 互操作：inout 实参修饰符（按值传递，仅做语法接纳）
             if self.check(&Token::Inout) {
                 self.advance();
@@ -2215,6 +2283,22 @@ impl Parser {
                         _ => unreachable!(),
                     };
                     self.advance(); // skip :
+                    let value = self.parse_expr()?;
+                    named_args.push((name, value));
+                    if !self.check(&Token::Comma) {
+                        break;
+                    }
+                    self.advance();
+                    continue;
+                }
+                // 宏 DSL 实参（如 @PowerAssert 内的 materializeInt(b = 2)）：
+                // 仅在解析宏实参期间允许 `name = value` 形式
+                if self.allow_wildcard_expr && matches!(next, Some(Token::Assign)) {
+                    let name = match self.advance() {
+                        Some(Token::Ident(n)) => n,
+                        _ => unreachable!(),
+                    };
+                    self.advance(); // skip =
                     let value = self.parse_expr()?;
                     named_args.push((name, value));
                     if !self.check(&Token::Comma) {
@@ -2659,5 +2743,83 @@ impl Parser {
             return matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    fn parse_ok(src: &str) {
+        let tokens: Result<Vec<_>, _> = Lexer::new(src).collect();
+        let tokens = tokens.expect("lex error");
+        let mut parser = Parser::new(tokens).with_source(src);
+        parser
+            .parse_program()
+            .unwrap_or_else(|e| panic!("期望解析成功，实际报错: {:?}", e));
+    }
+
+    #[test]
+    fn test_match_paren_binary_subject() {
+        // match (i % 4) — 括号内主体支持完整二元表达式
+        parse_ok("func f(i: Int64) { let x = match (i % 4) { case _ => 0 } }");
+        parse_ok("func f(i: Int64) { let x = match (i + 1) { case _ => 0 } }");
+    }
+
+    #[test]
+    fn test_trailing_lambda_expression_body() {
+        // f{-1} / obj.m{expr} — 表达式体尾随 lambda
+        parse_ok("func f() { let x = foo{-1} }");
+        parse_ok("func f() { let x = obj.getOrDefault{-1} }");
+        parse_ok("func f() { let x = foo { stmt } }");
+    }
+
+    #[test]
+    fn test_call_trailing_comma() {
+        parse_ok("func f() { g(1, 2,) }");
+        parse_ok("func f() { g() }");
+    }
+
+    #[test]
+    fn test_multi_arg_index() {
+        // 自定义 operator[] 的多参数下标
+        parse_ok("func f(op: Int64) { let x = op[1, 2, false] }");
+    }
+
+    #[test]
+    fn test_destructor_with_parens() {
+        parse_ok("class A { ~init() {} }");
+        parse_ok("class A { ~init {} }");
+    }
+
+    #[test]
+    fn test_bodyless_prop_in_class() {
+        // 抽象/无体属性声明（无 get/set 块）
+        parse_ok("abstract class A { public mut prop x: Int64\n public prop y: Int64 }");
+    }
+
+    #[test]
+    fn test_import_internal_segment() {
+        parse_ok("import std.unittest.mock.internal.*");
+        parse_ok("import std.unittest.mock.internal.{createMock, createSpy}");
+    }
+
+    #[test]
+    fn test_protected_class_at_top_level() {
+        // `protected` 在顶层也可以是类的可见性修饰符，而非 protected package
+        parse_ok("protected class A {}");
+    }
+
+    #[test]
+    fn test_for_in_block_not_swallowed_as_lambda() {
+        // for x in arr { ... } 的 { 是循环体，不能被解析为尾随 lambda
+        parse_ok("func f() { for x in arr { x } }");
+    }
+
+    #[test]
+    fn test_return_as_paren_expression() {
+        // `(x ?? return)` — return 作为表达式，右括号终止其可选的返回值
+        parse_ok("func f(): Int64 { let m = (x ?? return)\n 0 }");
     }
 }

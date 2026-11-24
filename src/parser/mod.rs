@@ -30,6 +30,8 @@ pub struct Parser {
     source: String,
     /// 是否允许把 `_` 作为表达式通配符解析（仅在 unittest mock 宏实参中启用）
     allow_wildcard_expr: bool,
+    /// 条件/主体表达式中禁止把尾随 `{` 当作 lambda（避免 `if x { ... }` 的块被吞掉）
+    no_trailing_lambda: bool,
 }
 
 impl Parser {
@@ -45,6 +47,7 @@ impl Parser {
             parsing_operator_func: false,
             source: String::new(),
             allow_wildcard_expr: false,
+            no_trailing_lambda: false,
         }
     }
 

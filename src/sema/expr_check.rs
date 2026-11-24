@@ -844,6 +844,8 @@ impl<'a> Checker<'a> {
                         _ => Ty::Unknown,
                     },
                     Ty::IntLit => Ty::Int64,
+                    // String 的迭代元素是 Byte（UInt8）
+                    Ty::String => Ty::UInt8,
                     other => other,
                 };
                 let mut scope = HashMap::new();
@@ -1439,6 +1441,13 @@ impl<'a> Checker<'a> {
                 if *op == BinOp::Add && (*lt == Ty::String || *rt == Ty::String) {
                     return Ty::String;
                 }
+                // 仓颉 std.core 为 String 提供了 `operator func *(n: Int64): String`
+                // 字符串重复重载，允许 `"f" * 16` 这类写法。
+                if *op == BinOp::Mul
+                    && ((*lt == Ty::String && rt.is_int()) || (*rt == Ty::String && lt.is_int()))
+                {
+                    return Ty::String;
+                }
                 self.require_same_numeric(op, lt, rt);
                 merged(lt, rt)
             }
@@ -1746,6 +1755,19 @@ mod tests {
     fn test_arith_literal_adapts() {
         assert_ok("main() { var a: Int8 = 1; let c = a + 1 }");
         assert_ok("main() { var a: Float64 = 1.0; let c = a * 2.0 }");
+    }
+
+    #[test]
+    fn test_string_repeat_mul_ok() {
+        // std.core 为 String 提供 `operator func *(n: Int64): String` 重复重载
+        assert_ok("main() { let s = \"f\" * 16 }");
+        assert_ok("main() { let s = \"ab\" * 2 }");
+    }
+
+    #[test]
+    fn test_string_sub_still_rejected() {
+        // 仅 `*` 是字符串重载；`-` 仍应报非数值操作数错误
+        assert_err("main() { let s = \"a\" - 1 }", "必须为数值类型");
     }
 
     #[test]
