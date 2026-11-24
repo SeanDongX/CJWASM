@@ -1915,6 +1915,23 @@ impl<'a> LoweringContext<'a> {
                 }
             }
 
+            // 函数值调用：callee(args) → call_indirect
+            Expr::Invoke { callee, args, named_args } => {
+                let mut lowered_args = Vec::new();
+                for arg in args {
+                    lowered_args.push(self.lower_expr(arg)?);
+                }
+                for (_, arg) in named_args {
+                    lowered_args.push(self.lower_expr(arg)?);
+                }
+                let callee_chir = self.lower_expr(callee)?;
+                CHIRExprKind::CallIndirect {
+                    type_idx: 0,
+                    args: lowered_args,
+                    callee: Box::new(callee_chir),
+                }
+            }
+
             // Lambda → 返回 __lambda_N 的函数索引作为 i32 table index
             Expr::Lambda { .. } => {
                 let idx = self.lambda_counter;

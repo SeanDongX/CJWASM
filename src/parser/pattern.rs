@@ -31,7 +31,24 @@ impl Parser {
 
     /// 解析基础模式
     pub(crate) fn parse_primary_pattern(&mut self) -> Result<Pattern, ParseErrorAt> {
+        // 前置小数点浮点模式 `.8`（词法层拆成 Dot + 数字）
+        if self.check(&Token::Dot) {
+            if let Some(value) = self.try_leading_dot_float() {
+                return Ok(Pattern::Literal(Literal::Float(value)));
+            }
+        }
         match self.peek() {
+            // 浮点常量模式（Float64/Float32）
+            Some(Token::Float(_))
+            | Some(Token::Float64Suffix(_))
+            | Some(Token::Float32(_)) => {
+                let value = match self.advance() {
+                    Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => f,
+                    Some(Token::Float32(f)) => f as f64,
+                    _ => unreachable!(),
+                };
+                Ok(Pattern::Literal(Literal::Float(value)))
+            }
             Some(Token::Underscore) => {
                 self.advance();
                 // cjc: 支持匿名类型测试模式 case _: Type =>
@@ -242,6 +259,19 @@ impl Parser {
                     let postfix_expr = self.parse_postfix_from_expr(base)?;
                     let full_expr = self.parse_guard_binary_rest(postfix_expr)?;
                     return Ok(Pattern::Guard(Box::new(full_expr)));
+                } else if matches!(
+                    self.peek(),
+                    Some(Token::Lt)
+                        | Some(Token::Gt)
+                        | Some(Token::LtEq)
+                        | Some(Token::GtEq)
+                        | Some(Token::Eq)
+                        | Some(Token::NotEq)
+                ) {
+                    // 无选择器 match 的表达式模式：case score < 60 =>
+                    let base = Expr::Var(name.clone());
+                    let full_expr = self.parse_guard_binary_rest(base)?;
+                    Ok(Pattern::Guard(Box::new(full_expr)))
                 } else if looks_like_type && self.check(&Token::LParen) {
                     self.advance();
                     let payload = if self.check(&Token::RParen) {

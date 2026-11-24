@@ -418,6 +418,16 @@ impl TypeInferenceContext {
                 }
             }
 
+            // 函数值调用：返回被调用者函数类型的返回值类型
+            Expr::Invoke { callee, .. } => {
+                match self.infer_expr(callee) {
+                    Ok(Type::Function { ret, .. }) => {
+                        Ok(ret.as_ref().as_ref().cloned().unwrap_or(Type::Int64))
+                    }
+                    _ => Ok(Type::Int64),
+                }
+            }
+
             // 其他表达式：保守推断为对象引用 (I32)
             _ => Ok(Type::Int32),
         }

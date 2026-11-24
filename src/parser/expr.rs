@@ -5,9 +5,70 @@ use crate::ast::*;
 use crate::lexer::{StringOrInterpolated, StringPart, Token};
 
 impl Parser {
+    /// 将组合表达式 `a ~> b` 脱糖为单参闭包 `{ x => b(a(x)) }`
+    fn desugar_composition(left: Expr, right: Expr) -> Expr {
+        let arg = "__compose_arg".to_string();
+        let inner = Expr::Invoke {
+            callee: Box::new(left),
+            args: vec![Expr::Var(arg.clone())],
+            named_args: vec![],
+        };
+        let outer = Expr::Invoke {
+            callee: Box::new(right),
+            args: vec![inner],
+            named_args: vec![],
+        };
+        Expr::Lambda {
+            params: vec![(arg, Type::TypeParam("_".to_string()))],
+            return_type: None,
+            body: Box::new(outer),
+        }
+    }
+
     /// 解析表达式（顶层为管道，再空值合并）
     pub(crate) fn parse_expr(&mut self) -> Result<Expr, ParseErrorAt> {
-        self.parse_pipeline()
+        let mut left = self.parse_pipeline()?;
+        // 函数组合 a ~> b：脱糖为单参闭包 λx -> b(a(x))
+        while self.check(&Token::Composition) {
+            self.advance();
+            let right = self.parse_pipeline()?;
+            left = Self::desugar_composition(left, right);
+        }
+        // 通用范围表达式 a..b / a..=b（起点不限于整数字面量，如 `a..b`、`x..-1`）。
+        // 整数字面量开头的范围已在 parse_primary 中处理；此处覆盖变量/复杂表达式起点。
+        loop {
+            let inclusive = if self.check(&Token::DotDot) {
+                false
+            } else if self.check(&Token::DotDotEq) {
+                true
+            } else {
+                break;
+            };
+            self.advance();
+            let end = if self.check(&Token::RBracket)
+                || self.check(&Token::RParen)
+                || self.check(&Token::Comma)
+                || self.check(&Token::RBrace)
+            {
+                // 开放式范围 a..
+                Box::new(Expr::Integer(i64::MAX))
+            } else {
+                Box::new(self.parse_pipeline()?)
+            };
+            let step = if self.check(&Token::Colon) {
+                self.advance();
+                Some(Box::new(self.parse_pipeline()?))
+            } else {
+                None
+            };
+            left = Expr::Range {
+                start: Box::new(left),
+                end,
+                inclusive,
+                step,
+            };
+        }
+        Ok(left)
     }
 
     /// 解析管道 (|>): left |> right 表示 right(left)
@@ -71,24 +132,14 @@ impl Parser {
 
     /// 解析比较表达式
     pub(crate) fn parse_comparison(&mut self) -> Result<Expr, ParseErrorAt> {
-        let mut left = self.parse_bitwise_or()?;
-
-        // P3.4: 先检查 `is` 关键字 — expr is Type
-        if self.check(&Token::Is) {
-            self.advance();
-            let target_ty = self.parse_type()?;
-            return Ok(Expr::IsType {
-                expr: Box::new(left),
-                target_ty,
-            });
-        }
+        let mut left = self.parse_is_expr()?;
 
         // P6: `!in` 运算符 — expr !in collection
         if self.check(&Token::Bang) {
             if matches!(self.peek_next(), Some(Token::In)) {
                 self.advance(); // consume !
                 self.advance(); // consume in
-                let right = self.parse_bitwise_or()?;
+                let right = self.parse_is_expr()?;
                 return Ok(Expr::Binary {
                     op: BinOp::NotIn,
                     left: Box::new(left),
@@ -102,8 +153,7 @@ impl Parser {
             Some(Token::NotEq) => Some(BinOp::NotEq),
             Some(Token::Lt) => {
                 // 启发式区分泛型 Array<T> 与比较 a < b：
-                // 如果 < 后是类型关键字，视为泛型（返回 None，不当作比较）
-                // 如果 < 后是 Ident，再看其后第三个 token 是否 > 或 , （泛型上下文）
+                // 仅当 < 后是类型关键字且紧跟 > 或 , 时才视为泛型实参列表。
                 let next = self.peek_next();
                 let is_type_keyword = matches!(
                     next,
@@ -122,9 +172,7 @@ impl Parser {
                             | Token::TypeUInt64
                             | Token::TypeRune
                     )
-                )
-                // 类型关键字后跟 `.`（如 `x < UInt32.Min`）说明是比较而非泛型实参
-                && !matches!(self.peek_at(2), Some(Token::Dot));
+                ) && matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
                 let is_generic_ident = matches!(next, Some(Token::Ident(_)))
                     && matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
                 if is_type_keyword || is_generic_ident {
@@ -139,7 +187,7 @@ impl Parser {
             _ => None,
         } {
             self.advance();
-            let right = self.parse_bitwise_or()?;
+            let right = self.parse_is_expr()?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
@@ -147,6 +195,20 @@ impl Parser {
             };
         }
 
+        Ok(left)
+    }
+
+    /// 解析 `is` 类型检查（优先级高于 ==/!=，低于位运算）
+    pub(crate) fn parse_is_expr(&mut self) -> Result<Expr, ParseErrorAt> {
+        let mut left = self.parse_bitwise_or()?;
+        while self.check(&Token::Is) {
+            self.advance();
+            let target_ty = self.parse_type()?;
+            left = Expr::IsType {
+                expr: Box::new(left),
+                target_ty,
+            };
+        }
         Ok(left)
     }
 
@@ -285,6 +347,24 @@ impl Parser {
         if matches!(self.peek(), Some(Token::Minus)) {
             self.advance();
             let expr = self.parse_unary()?;
+            // `-a..b`：负号作用于范围起点而非整个范围
+            if let Expr::Range {
+                start,
+                end,
+                inclusive,
+                step,
+            } = expr
+            {
+                return Ok(Expr::Range {
+                    start: Box::new(Expr::Unary {
+                        op: UnaryOp::Neg,
+                        expr: start,
+                    }),
+                    end,
+                    inclusive,
+                    step,
+                });
+            }
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
                 expr: Box::new(expr),
@@ -336,7 +416,18 @@ impl Parser {
                             }
                         }
                     }
-                    // 其他形态的立即调用暂不支持
+                    // 函数值调用：任意表达式后跟 (args)，如 arr[0](x)、{x => x}(1)
+                    if !self.newline_before_current() {
+                        self.advance();
+                        let (args, named_args) = self.parse_args()?;
+                        self.expect(Token::RParen)?;
+                        expr = Expr::Invoke {
+                            callee: Box::new(expr),
+                            args,
+                            named_args,
+                        };
+                        continue;
+                    }
                     break;
                 }
                 Some(Token::LBracket) => {
@@ -358,7 +449,21 @@ impl Parser {
                         };
                     } else {
                         let first = self.parse_expr()?;
-                        if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
+                        // parse_expr 可能已把 `start..end` 解析为范围表达式
+                        if let Expr::Range {
+                            start,
+                            end,
+                            inclusive: _,
+                            step: _,
+                        } = first
+                        {
+                            self.expect(Token::RBracket)?;
+                            expr = Expr::SliceExpr {
+                                array: Box::new(expr),
+                                start,
+                                end,
+                            };
+                        } else if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                             self.advance(); // consume .. or ..=
                                             // 支持 arr[start..] 语法（从 start 到结尾）
                             let end = if self.check(&Token::RBracket) {
@@ -476,10 +581,11 @@ impl Parser {
                                 type_args: Some(types),
                             };
                         } else {
-                            return self.bail(ParseError::UnexpectedToken(
-                                self.peek().cloned().unwrap_or(Token::Semicolon),
-                                "( after generic type arguments".to_string(),
-                            ));
+                            // 泛型方法引用（无调用）：obj.method<T> 作为函数值
+                            expr = Expr::Field {
+                                object: Box::new(expr),
+                                field: name,
+                            };
                         }
                     } else {
                         // 字段访问 obj.field
@@ -667,6 +773,24 @@ impl Parser {
     /// 从已有的 postfix 表达式继续解析二元操作符（用于模式中的守卫表达式）
     /// 处理 &&、||、??、|> 等，优先级与正常表达式一致
     pub(crate) fn parse_guard_binary_rest(&mut self, mut left: Expr) -> Result<Expr, ParseErrorAt> {
+        // 比较运算（无选择器 match 的 case 表达式，如 `case score < 60 =>`）
+        while let Some(op) = match self.peek() {
+            Some(Token::Lt) => Some(BinOp::Lt),
+            Some(Token::Gt) => Some(BinOp::Gt),
+            Some(Token::LtEq) => Some(BinOp::LtEq),
+            Some(Token::GtEq) => Some(BinOp::GtEq),
+            Some(Token::Eq) => Some(BinOp::Eq),
+            Some(Token::NotEq) => Some(BinOp::NotEq),
+            _ => None,
+        } {
+            self.advance();
+            let right = self.parse_bitwise_or()?;
+            left = Expr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
         // && (比 || 优先级高)
         while self.check(&Token::AndAnd) {
             self.advance();
@@ -709,8 +833,66 @@ impl Parser {
         Ok(left)
     }
 
+    /// 词法层把以小数点开头的浮点字面量（`.5`、`.2e3`、`.23f32`）拆成了
+    /// `Dot` + 数字 token。当前 token 是 `Dot` 且下一个是数字时，用源码切片
+    /// 重建原始字面量文本并解析为浮点数。
+    ///
+    /// 调用前提：`self.peek()` 为 `Dot`。成功时消费两个 token 并返回数值。
+    pub(crate) fn try_leading_dot_float(&mut self) -> Option<f64> {
+        if !self.check(&Token::Dot) {
+            return None;
+        }
+        let numeric = matches!(
+            self.peek_next(),
+            Some(Token::Integer(_))
+                | Some(Token::Float(_))
+                | Some(Token::Float32(_))
+                | Some(Token::Float64Suffix(_))
+        );
+        if !numeric {
+            return None;
+        }
+        let tok_idx = self.pos;
+        let start = self.tokens.get(tok_idx)?.0;
+        let end = self.tokens.get(tok_idx + 1)?.2;
+        let raw = self.source.get(start..end)?.to_string();
+        let mut text: String = raw.chars().filter(|c| *c != '_').collect();
+        for suffix in ["f64", "f32", "f16"] {
+            if text.ends_with(suffix) {
+                text.truncate(text.len() - suffix.len());
+                break;
+            }
+        }
+        if text.ends_with('f') {
+            text.pop();
+        }
+        if !text.starts_with('.') {
+            return None;
+        }
+        let value = format!("0{}", text).parse::<f64>().ok()?;
+        self.advance(); // Dot
+        self.advance(); // 数字 token
+        Some(value)
+    }
+
     /// 解析基础表达式
     pub(crate) fn parse_primary(&mut self) -> Result<Expr, ParseErrorAt> {
+        // 循环表达式作为值使用（如 `let x = for (...) { ... }`）：
+        // 语句形式解析后包成 Block 表达式，类型为 Unit。
+        if matches!(
+            self.peek(),
+            Some(Token::For) | Some(Token::While) | Some(Token::Do)
+        ) || (self.check(&Token::Loop) && matches!(self.peek_next(), Some(Token::LBrace)))
+        {
+            let stmt = self.parse_stmt()?;
+            return Ok(Expr::Block(vec![stmt], None));
+        }
+        // 前置小数点浮点字面量 `.5`：词法层拆成 Dot + 数字
+        if self.check(&Token::Dot) {
+            if let Some(value) = self.try_leading_dot_float() {
+                return Ok(Expr::Float(value));
+            }
+        }
         match self.advance() {
             // 宏调用 @MacroName 或 @MacroName(args)
             Some(Token::At) => {
@@ -732,7 +914,8 @@ impl Parser {
                         // 2.. 后面是 ] 或 ) 或 , 说明是开放式范围
                         Box::new(Expr::Integer(i64::MAX))
                     } else {
-                        Box::new(self.parse_primary()?)
+                        // 结束值允许一元负号：`-10..-11`、`0..-1`
+                        Box::new(self.parse_unary()?)
                     };
                     // P2.6: 可选步长 `: step`（支持负步长 -1）
                     let step = if self.check(&Token::Colon) {
@@ -1248,6 +1431,19 @@ impl Parser {
                         }
                     }
                     Some(Token::LBrace) if looks_like_type => {
+                        // `TypeName<T...> { params => body }` 形式（如 VArray<Int64,$5>{i=>i}）
+                        // 是带尾随闭包的构造调用，不是结构体字面量。
+                        let is_lambda = matches!(self.peek_next(), Some(Token::FatArrow))
+                            || (matches!(self.peek_next(), Some(Token::Ident(_)))
+                                && matches!(self.peek_at(2), Some(Token::FatArrow)));
+                        if is_lambda {
+                            return Ok(Expr::ConstructorCall {
+                                name,
+                                type_args,
+                                args: Vec::new(),
+                                named_args: Vec::new(),
+                            });
+                        }
                         // 仅对类型名（首字母大写）解析为结构体初始化
                         self.advance();
                         let fields = self.parse_struct_fields()?;
@@ -1311,6 +1507,42 @@ impl Parser {
                     self.expect(Token::RParen)?;
                     Ok(Expr::Tuple(elements))
                 } else {
+                    // 括号中的赋值表达式：(x = v)、(x += v) —— 结果类型为 Unit
+                    let assign_bin = match self.peek() {
+                        Some(Token::Assign) => Some(None),
+                        Some(Token::PlusEq) => Some(Some(BinOp::Add)),
+                        Some(Token::MinusEq) => Some(Some(BinOp::Sub)),
+                        Some(Token::StarEq) => Some(Some(BinOp::Mul)),
+                        Some(Token::SlashEq) => Some(Some(BinOp::Div)),
+                        Some(Token::PercentEq) => Some(Some(BinOp::Mod)),
+                        Some(Token::ShlEq) => Some(Some(BinOp::Shl)),
+                        Some(Token::ShrEq) => Some(Some(BinOp::Shr)),
+                        Some(Token::AndEq) => Some(Some(BinOp::BitAnd)),
+                        Some(Token::PipeEq) => Some(Some(BinOp::BitOr)),
+                        Some(Token::CaretEq) => Some(Some(BinOp::BitXor)),
+                        Some(Token::StarStarEq) => Some(Some(BinOp::Pow)),
+                        Some(Token::OrOrEq) => Some(Some(BinOp::LogicalOr)),
+                        Some(Token::AndAndEq) => Some(Some(BinOp::LogicalAnd)),
+                        _ => None,
+                    };
+                    if let Some(bin_op) = assign_bin {
+                        self.advance();
+                        let rhs = self.parse_expr()?;
+                        let target = self.expr_to_assign_target(first)?;
+                        let value = match bin_op {
+                            None => rhs,
+                            Some(op) => Expr::Binary {
+                                op,
+                                left: Box::new(self.assign_target_to_expr(&target)),
+                                right: Box::new(rhs),
+                            },
+                        };
+                        self.expect(Token::RParen)?;
+                        return Ok(Expr::Block(
+                            vec![Stmt::Assign { target, value }],
+                            None,
+                        ));
+                    }
                     // 普通括号表达式
                     self.expect(Token::RParen)?;
                     Ok(first)
@@ -1451,6 +1683,23 @@ impl Parser {
                         ));
                     }
                     elem_len = Some((Some(elem_ty), len));
+                }
+                // `VArray<T, $N> { i => ... }`：尾随闭包初始化，等价于 Array(N) { i => ... }
+                let is_trailing_lambda = self.check(&Token::LBrace)
+                    && (matches!(self.peek_next(), Some(Token::FatArrow))
+                        || (matches!(self.peek_next(), Some(Token::Ident(_)))
+                            && matches!(
+                                self.peek_at(2),
+                                Some(Token::FatArrow | Token::Colon | Token::Comma)
+                            )));
+                if is_trailing_lambda {
+                    let (elem_ty, len) = elem_len.unwrap_or((None, 0));
+                    return Ok(Expr::ConstructorCall {
+                        name: "Array".to_string(),
+                        type_args: elem_ty.map(|t| vec![t]),
+                        args: vec![Expr::Integer(len)],
+                        named_args: vec![],
+                    });
                 }
                 self.expect(Token::LParen)?;
                 let (mut args, named_args) = self.parse_args()?;
@@ -1960,6 +2209,14 @@ impl Parser {
 
     /// 解析 match 的主题表达式 (不包括结构体初始化)
     pub(crate) fn parse_match_subject(&mut self) -> Result<Expr, ParseErrorAt> {
+        // 一元前缀：match (!x)、match (-x)
+        if matches!(
+            self.peek(),
+            Some(Token::Bang) | Some(Token::Minus) | Some(Token::Tilde)
+        ) {
+            let e = self.parse_unary()?;
+            return self.parse_postfix_from_expr(e);
+        }
         // 只解析简单表达式: 变量、字面量、函数调用、字段访问等
         // 不解析结构体初始化 (因为 { 会被误认为 match body)
         let mut expr = match self.advance() {
@@ -1979,6 +2236,10 @@ impl Parser {
             }
             Some(Token::RawStringLit(s)) | Some(Token::MultiLineStringLit(s)) | Some(Token::HashRawStringLit(s)) | Some(Token::SingleQuoteStringLit(s)) => Expr::String(s),
             Some(Token::Ident(name)) => {
+                // 泛型实参形式的主体：match (A<Bool>)
+                if self.check(&Token::Lt) {
+                    let _ = self.parse_opt_type_args()?;
+                }
                 if self.check(&Token::LParen) {
                     // 函数调用
                     self.advance();
@@ -1995,22 +2256,37 @@ impl Parser {
                 }
             }
             Some(Token::LParen) => {
-                let first = self.parse_expr()?;
-                let expr = if self.check(&Token::Comma) {
-                    let mut elts = vec![first];
-                    while self.check(&Token::Comma) {
-                        self.advance();
-                        elts.push(self.parse_expr()?);
-                    }
-                    Expr::Tuple(elts)
+                // `()` 空元组（如 while (let _ <- ())、match (())）
+                if self.check(&Token::RParen) {
+                    self.advance();
+                    Expr::Tuple(vec![])
                 } else {
-                    first
-                };
-                self.expect(Token::RParen)?;
-                expr
+                    let first = self.parse_expr()?;
+                    let expr = if self.check(&Token::Comma) {
+                        let mut elts = vec![first];
+                        while self.check(&Token::Comma) {
+                            self.advance();
+                            elts.push(self.parse_expr()?);
+                        }
+                        Expr::Tuple(elts)
+                    } else {
+                        first
+                    };
+                    self.expect(Token::RParen)?;
+                    expr
+                }
             }
-            Some(tok) => {
-                return self.bail(ParseError::UnexpectedToken(tok, "match 表达式".to_string()))
+            Some(Token::LBrace) if self.check(&Token::RBrace) => {
+                // match {} — 空块不能作为 match 主体
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::LBrace,
+                    "match 表达式".to_string(),
+                ));
+            }
+            Some(_) => {
+                // 其他表达式起点（Some/None/lambda 字面量等）：回退后走通用一元表达式解析
+                self.pos = self.pos.saturating_sub(1);
+                return self.parse_unary();
             }
             None => return self.bail(ParseError::UnexpectedEof),
         };

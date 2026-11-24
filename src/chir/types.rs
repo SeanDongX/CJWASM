@@ -214,6 +214,12 @@ pub enum CHIRLValue {
         array: Box<CHIRExpr>,
         index: Box<CHIRExpr>,
     },
+    /// 切片赋值 arr[start..end] = value
+    Slice {
+        array: Box<CHIRExpr>,
+        start: Box<CHIRExpr>,
+        end: Box<CHIRExpr>,
+    },
 }
 
 /// CHIR 基本块

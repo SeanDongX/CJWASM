@@ -76,7 +76,8 @@ impl Type {
             Type::Rune => ValType::I32,
             Type::Bool => ValType::I32,
             Type::Nothing => panic!("Nothing 类型不能转换为 WASM 值类型"),
-            Type::Unit => panic!("Unit 类型不能转换为 WASM 值类型"),
+            // Unit 作为字段/参数存储时以 i32 占位（与 () 的运行时表示一致）
+            Type::Unit => ValType::I32,
             Type::String => ValType::I32,
             Type::Array(_) => ValType::I32,
             Type::Tuple(_) => ValType::I32,

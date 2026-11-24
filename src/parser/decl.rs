@@ -249,6 +249,11 @@ impl Parser {
         }
 
         while let Some(_tok) = self.peek() {
+            // cjc 允许声明后出现多余分号（如 `class C {};`）
+            if self.check(&Token::Semicolon) {
+                self.advance();
+                continue;
+            }
             // 解析可见性修饰符
             let visibility = if self.check(&Token::Public) {
                 self.advance();
@@ -733,6 +738,11 @@ impl Parser {
         let mut methods = Vec::new();
 
         while !self.check(&Token::RBrace) {
+            // 容忍成员声明后的多余分号（如 `init(...) {...};`）
+            if self.check(&Token::Semicolon) {
+                self.advance();
+                continue;
+            }
             // 成员修饰符可任意顺序组合（public static var / static public var / ...）
             let mods = self.parse_member_modifiers();
             // cjc 兼容: struct 主构造函数 StructName(var a: T, var b: U) { } — 参数即字段
@@ -1011,7 +1021,8 @@ impl Parser {
                 default,
             });
 
-            if self.check(&Token::Comma) || self.check(&Token::Semicolon) {
+            // 成员之间允许逗号或分号分隔，也容忍 `;;`/`,;` 等重复分隔符
+            while self.check(&Token::Comma) || self.check(&Token::Semicolon) {
                 self.advance();
             }
         }
@@ -1044,9 +1055,11 @@ impl Parser {
         self.expect(Token::Enum)?;
         let name = match self.advance() {
             Some(Token::Ident(n)) => n,
-            // cjc: 允许关键字作为枚举名 (如 Result, Option 等)
+            // cjc: 允许关键字作为枚举名 (如 Result, Option, Tuple 等)
             Some(Token::TypeResult) => "Result".to_string(),
             Some(Token::TypeOption) => "Option".to_string(),
+            Some(Token::TypeTuple) => "Tuple".to_string(),
+            Some(Token::TypeUnit) => "Unit".to_string(),
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "枚举名".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
@@ -1138,6 +1151,11 @@ impl Parser {
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
         while !self.check(&Token::RBrace) {
+            // 容忍成员声明后的多余分号
+            if self.check(&Token::Semicolon) {
+                self.advance();
+                continue;
+            }
             // cjc 兼容: enum 成员修饰符可任意顺序（如 public operator func）
             let mods = self.parse_member_modifiers();
             // cjc 兼容: enum 内部 prop 声明，解析后丢弃
@@ -1246,7 +1264,7 @@ impl Parser {
                 name: v_name,
                 payload,
             });
-            if self.check(&Token::Comma) {
+            while self.check(&Token::Comma) || self.check(&Token::Semicolon) {
                 self.advance();
             }
         }
@@ -1651,6 +1669,11 @@ impl Parser {
         let mut methods = Vec::new();
         let mut assoc_type_bindings = Vec::new();
         while !self.check(&Token::RBrace) {
+            // 容忍成员声明后的多余分号
+            if self.check(&Token::Semicolon) {
+                self.advance();
+                continue;
+            }
             // 成员修饰符可任意顺序组合（public static func / static public ...）
             let mods = self.parse_member_modifiers();
             // 关联类型绑定: type Element = ConcreteType; (cjc: type 是保留字)
@@ -1974,6 +1997,11 @@ impl Parser {
         let mut deinit = None;
         let mut methods = Vec::new();
         while !self.check(&Token::RBrace) {
+            // 容忍成员声明后的多余分号（如 `init(...) {...};`）
+            if self.check(&Token::Semicolon) {
+                self.advance();
+                continue;
+            }
             // 成员修饰符可任意顺序组合（public static var / static public var / ...）
             let mods = self.parse_member_modifiers();
             let member_vis = mods.visibility.clone().unwrap_or_default();
@@ -2019,7 +2047,7 @@ impl Parser {
                         "字段: 期望 : 类型 或 = 值".to_string(),
                     ));
                 };
-                if self.check(&Token::Semicolon) {
+                while self.check(&Token::Semicolon) || self.check(&Token::Comma) {
                     self.advance();
                 }
                 fields.push(crate::ast::FieldDef {

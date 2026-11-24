@@ -3302,7 +3302,7 @@ mod tests {
     fn parse_ok(source: &str) -> crate::ast::Program {
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
-        let mut parser = Parser::new(tokens);
+        let mut parser = Parser::new(tokens).with_source(source);
         parser.parse_program().unwrap()
     }
 
@@ -3744,5 +3744,189 @@ mod tests {
         let program = parser.parse_program().unwrap();
         assert_eq!(program.type_aliases.len(), 1);
         assert_eq!(program.type_aliases[0].0, "TestedType");
+    }
+
+    // === batch-03: 表达式与类型语法缺口 ===
+
+    #[test]
+    fn test_leading_dot_float_literal() {
+        // `.5` / `.2e3` 词法层拆成 Dot + 数字，解析器重建浮点字面量
+        let program = parse_ok("main() { let a = .5\n let b = .2e3\n let c = .23 }");
+        if let Stmt::Let { value, .. } = &program.functions[0].body[0] {
+            assert!(matches!(value, Expr::Float(v) if (*v - 0.5).abs() < 1e-9));
+        } else {
+            panic!("应为 let 语句");
+        }
+    }
+
+    #[test]
+    fn test_float_and_leading_dot_patterns() {
+        let source = "main() { let x = .8\n match (x) { case .8 => 1\n case 3.14 => 2\n case _ => 3 } }";
+        let program = parse_ok(source);
+        let Stmt::Expr(Expr::Match { arms, .. }) = &program.functions[0].body[1] else {
+            panic!("应为 match 表达式");
+        };
+        assert!(matches!(arms[0].pattern, Pattern::Literal(Literal::Float(_))));
+        assert!(matches!(arms[1].pattern, Pattern::Literal(Literal::Float(_))));
+    }
+
+    #[test]
+    fn test_top_level_and_member_extra_semicolons() {
+        // 顶层 `class C {};`、struct 成员 `init(){};` 与成员后的重复分号
+        let source = "class C {};\nstruct S { let a: Int64 = 1;; init() { };\n }\nmain() { }";
+        let program = parse_ok(source);
+        assert_eq!(program.classes.len(), 1);
+        assert_eq!(program.structs.len(), 1);
+    }
+
+    #[test]
+    fn test_range_negative_end_and_variable_bounds() {
+        let program = parse_ok("func f(a: Int64, b: Int64) { a..b }\nmain() { let r = -10..-11 }");
+        assert!(matches!(
+            &program.functions[0].body[0],
+            Stmt::Expr(Expr::Range { .. })
+        ));
+        let Stmt::Let { value: Expr::Range { start, end, .. }, .. } =
+            &program.functions[1].body[0]
+        else {
+            panic!("应为范围 let 初始化");
+        };
+        assert!(matches!(**start, Expr::Unary { .. }));
+        assert!(matches!(**end, Expr::Unary { .. }));
+    }
+
+    #[test]
+    fn test_match_subject_unary_and_empty_tuple() {
+        let source = "main() { let b = false\n match (!b) { case true => 1\n case _ => 2 }\n while (let _ <- ()) { break } }";
+        let program = parse_ok(source);
+        assert!(matches!(&program.functions[0].body[1], Stmt::Expr(Expr::Match { .. })));
+        assert!(matches!(&program.functions[0].body[2], Stmt::WhileLet { .. }));
+    }
+
+    #[test]
+    fn test_double_question_type_prefix() {
+        // `??T`（词法层为 QuestionQuestion）等价 Option<Option<T>>
+        let program = parse_ok("type T = ??Int64\nmain() { var a: ??Int64 = None }");
+        assert_eq!(program.type_aliases.len(), 1);
+        match &program.type_aliases[0].1 {
+            Type::Option(inner) => assert!(matches!(**inner, Type::Option(_))),
+            other => panic!("应为双层 Option，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_loop_expression_as_value() {
+        let source = "main() { let a = for (i in 1..3) { break }\n let b = while (true) { break }\n let c = do { break } while (true) }";
+        let program = parse_ok(source);
+        for stmt in &program.functions[0].body {
+            if let Stmt::Let { value, .. } = stmt {
+                assert!(matches!(value, Expr::Block(..)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_varray_trailing_closure_constructor() {
+        let program = parse_ok("main() { let a: VArray<Int64, $5> = VArray<Int64, $5> { i => i } }");
+        let Stmt::Let { value, .. } = &program.functions[0].body[0] else {
+            panic!("应为 let 语句");
+        };
+        // VArray<Int64,$5>{i=>i} 降级为 Array(5, lambda) 构造调用
+        assert!(
+            matches!(value, Expr::ConstructorCall { args, .. } if args.iter().any(|a| matches!(a, Expr::Lambda { .. }))),
+            "实际: {:?}",
+            value
+        );
+    }
+
+    #[test]
+    fn test_for_in_destructuring_enum_pattern() {
+        let source = "enum E { Foo(Int32) }\nmain() { for (Foo(i) in [E.Foo(1)]) { } }";
+        let program = parse_ok(source);
+        let Stmt::For { var, body, .. } = &program.functions[0].body[0] else {
+            panic!("应为 for 语句");
+        };
+        assert_eq!(var, "__for_pat");
+        assert!(matches!(body[0], Stmt::Let { pattern: Pattern::Variant { .. }, .. }));
+    }
+
+    #[test]
+    fn test_composition_operator_desugars_to_lambda() {
+        let source = "func a(s: String) { s }\nfunc b(s: String) { s }\nmain() { let f = a ~> b }";
+        let program = parse_ok(source);
+        let Stmt::Let { value, .. } = &program.functions[2].body[0] else {
+            panic!("应为 let 语句");
+        };
+        assert!(matches!(value, Expr::Lambda { .. }));
+    }
+
+    #[test]
+    fn test_function_value_invoke() {
+        let program = parse_ok("main() { let t = (1, { x: Int64 => x })\n let y = t[1](1) }");
+        let Stmt::Let { value, .. } = &program.functions[0].body[1] else {
+            panic!("应为 let 语句");
+        };
+        assert!(matches!(value, Expr::Invoke { .. }));
+    }
+
+    #[test]
+    fn test_parenthesized_assignment_expression() {
+        let source = "main() { var x = 0\n let u = (x += 1) }";
+        let program = parse_ok(source);
+        let Stmt::Let { value, .. } = &program.functions[0].body[1] else {
+            panic!("应为 let 语句");
+        };
+        match value {
+            Expr::Block(stmts, None) => assert!(matches!(stmts[0], Stmt::Assign { .. })),
+            other => panic!("应为赋值块表达式，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_complex_field_and_slice_assign_targets() {
+        let source = "class C { var v = 0 }\nmain() { var a = [C()]\n a[0].v = 1\n var b = [1, 2, 3]\n b[0..2] = [4, 5] }";
+        let program = parse_ok(source);
+        let body = &program.functions[0].body;
+        assert!(matches!(&body[1], Stmt::Assign { target: AssignTarget::ExprField { .. }, .. }));
+        assert!(matches!(&body[3], Stmt::Assign { target: AssignTarget::Slice { .. }, .. }));
+    }
+
+    #[test]
+    fn test_wildcard_assignment_and_generic_method_reference() {
+        let source = "struct C { func gen<T>(t: T) { t } }\nmain() { _ = ()\n let c = C()\n let f = c.gen<String> }";
+        let program = parse_ok(source);
+        assert!(matches!(&program.functions[0].body[0], Stmt::Expr(Expr::Tuple(_))));
+        assert!(matches!(
+            &program.functions[0].body[2],
+            Stmt::Let { value: Expr::Field { .. }, .. }
+        ));
+    }
+
+    #[test]
+    fn test_is_operator_precedence() {
+        // `"hi" is String == true` 与 `true == "hi" is String` 都应可解析
+        let source = "main() { let a = \"hi\" is String == true\n let b = true == \"hi\" is String }";
+        let program = parse_ok(source);
+        let Stmt::Let { value, .. } = &program.functions[0].body[0] else {
+            panic!("应为 let 语句");
+        };
+        assert!(matches!(value, Expr::Binary { op: BinOp::Eq, .. }));
+    }
+
+    #[test]
+    fn test_enum_named_tuple() {
+        let program = parse_ok("enum Tuple { B((Bool, Bool)) }\nmain() { }");
+        assert_eq!(program.enums.len(), 1);
+        assert_eq!(program.enums[0].name, "Tuple");
+    }
+
+    #[test]
+    fn test_match_guard_comparison_pattern() {
+        let source = "main() { let score = 80\n var r = match { case score < 60 => 1\n case _ => 2 } }";
+        let program = parse_ok(source);
+        let Stmt::Var { value: Expr::Match { arms, .. }, .. } = &program.functions[0].body[1] else {
+            panic!("应为 match 表达式");
+        };
+        assert!(matches!(arms[0].pattern, Pattern::Guard(_)));
     }
 }

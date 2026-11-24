@@ -4564,6 +4564,53 @@ impl CHIRCodeGen {
                 }
                 emit_store(value.wasm_ty, func);
             }
+            CHIRLValue::Slice { array, start, end } => {
+                // 切片赋值：值为数组/Slice 时按元素拷贝；标量时仅求值（填充语义暂略）
+                if matches!(value.ty, Type::Array(_) | Type::Slice(_)) {
+                    // dest = array + 4 + start * 8
+                    self.emit_expr(array, func);
+                    if array.wasm_ty == ValType::I64 {
+                        func.instruction(&Instruction::I32WrapI64);
+                    }
+                    func.instruction(&Instruction::I32Const(4));
+                    func.instruction(&Instruction::I32Add);
+                    self.emit_expr(start, func);
+                    if start.wasm_ty == ValType::I64 {
+                        func.instruction(&Instruction::I32WrapI64);
+                    }
+                    func.instruction(&Instruction::I32Const(8));
+                    func.instruction(&Instruction::I32Mul);
+                    func.instruction(&Instruction::I32Add);
+                    // src = value + 4（跳过长度字段）
+                    self.emit_expr(value, func);
+                    if value.wasm_ty == ValType::I64 {
+                        func.instruction(&Instruction::I32WrapI64);
+                    }
+                    func.instruction(&Instruction::I32Const(4));
+                    func.instruction(&Instruction::I32Add);
+                    // len = (end - start) * 8
+                    self.emit_expr(end, func);
+                    if end.wasm_ty == ValType::I64 {
+                        func.instruction(&Instruction::I32WrapI64);
+                    }
+                    self.emit_expr(start, func);
+                    if start.wasm_ty == ValType::I64 {
+                        func.instruction(&Instruction::I32WrapI64);
+                    }
+                    func.instruction(&Instruction::I32Sub);
+                    func.instruction(&Instruction::I32Const(8));
+                    func.instruction(&Instruction::I32Mul);
+                    func.instruction(&Instruction::MemoryCopy {
+                        src_mem: 0,
+                        dst_mem: 0,
+                    });
+                } else {
+                    self.emit_expr(value, func);
+                    if self.expr_produces_wasm_value_ctx(value) {
+                        func.instruction(&Instruction::Drop);
+                    }
+                }
+            }
         }
     }
 

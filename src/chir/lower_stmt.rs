@@ -744,6 +744,28 @@ impl<'a> LoweringContext<'a> {
                 })
             }
 
+            AssignTarget::Slice { array, start, end } => {
+                let array_chir = self.lower_expr(array)?;
+                let start_chir = self.lower_expr(start)?;
+                let end_chir = self.lower_expr(end)?;
+                Ok(CHIRLValue::Slice {
+                    array: Box::new(array_chir),
+                    start: Box::new(start_chir),
+                    end: Box::new(end_chir),
+                })
+            }
+
+            AssignTarget::ExprField { object, field } => {
+                // 复杂表达式字段赋值，如 obj.method().field、arr[i].field
+                let obj_chir = self.lower_expr(object)?;
+                let obj_ty = self.type_ctx.infer_expr(object)?;
+                let offset = self.get_field_offset(&obj_ty, field)?;
+                Ok(CHIRLValue::Field {
+                    object: Box::new(obj_chir),
+                    offset,
+                })
+            }
+
             _ => {
                 // SuperField, Tuple 等暂不支持
                 Err("不支持的赋值目标".to_string())

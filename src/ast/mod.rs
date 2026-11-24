@@ -261,6 +261,12 @@ pub enum Expr {
         args: Vec<Expr>,
         closure: Box<Expr>,
     },
+    /// 函数值调用：任意表达式作为被调用者，如 arr[0](x)、{x => x}(1)、f?(7)
+    Invoke {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        named_args: Vec<(String, Expr)>,
+    },
     /// 宏调用 @MacroName(args)
     Macro {
         name: String,
@@ -419,6 +425,14 @@ pub enum AssignTarget {
     IndexPath { base: String, fields: Vec<String>, index: Box<Expr> },
     /// 复杂表达式索引 expr[i]（如 obj.method()[i]）
     ExprIndex { expr: Box<Expr>, index: Box<Expr> },
+    /// 复杂表达式的字段 expr.field（如 obj.method().field、arr[i].field）
+    ExprField { object: Box<Expr>, field: String },
+    /// 切片赋值 arr[start..end] = value
+    Slice {
+        array: Box<Expr>,
+        start: Box<Expr>,
+        end: Box<Expr>,
+    },
     /// 元组解构 (a, b) = expr
     Tuple(Vec<AssignTarget>),
     /// super 字段访问 super.field

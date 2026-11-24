@@ -242,7 +242,7 @@ impl Parser {
             }
             Some(Token::Return) => {
                 self.advance();
-                if self.check(&Token::RBrace) {
+                if self.check(&Token::RBrace) || self.check(&Token::Semicolon) {
                     Ok(Stmt::Return(None))
                 } else {
                     Ok(Stmt::Return(Some(self.parse_expr()?)))
@@ -307,7 +307,7 @@ impl Parser {
                 if has_paren {
                     self.advance();
                 }
-                let (var, tuple_vars) = if self.check(&Token::LParen) {
+                let (var, tuple_vars, binding_pattern) = if self.check(&Token::LParen) {
                     self.advance();
                     let mut names = Vec::new();
                     loop {
@@ -332,7 +332,30 @@ impl Parser {
                         }
                         self.advance();
                     }
-                    ("__for_tuple_destr".to_string(), names)
+                    ("__for_tuple_destr".to_string(), names, None)
+                } else if matches!(
+                    self.peek(),
+                    Some(Token::Ident(_))
+                        | Some(Token::Some)
+                        | Some(Token::None)
+                        | Some(Token::Ok)
+                        | Some(Token::Err)
+                        | Some(Token::Underscore)
+                ) && (matches!(self.peek_next(), Some(Token::LParen))
+                    || matches!(
+                        self.peek(),
+                        Some(Token::Some)
+                            | Some(Token::None)
+                            | Some(Token::Ok)
+                            | Some(Token::Err)
+                    ))
+                {
+                    // 解构模式循环变量：for (Foo(i) in ...)
+                    let pattern = self.parse_pattern()?;
+                    match pattern {
+                        Pattern::Binding(n) => (n, Vec::new(), None),
+                        other => ("__for_pat".to_string(), Vec::new(), Some(other)),
+                    }
                 } else {
                     let v = match self.advance() {
                         Some(Token::Ident(name)) => name,
@@ -345,7 +368,7 @@ impl Parser {
                         }
                         None => return self.bail(ParseError::UnexpectedEof),
                     };
-                    (v, Vec::new())
+                    (v, Vec::new(), None)
                 };
                 self.expect(Token::In)?;
                 let iterable = self.parse_for_iterable()?;
@@ -376,6 +399,17 @@ impl Parser {
                     }
                     prefix.extend(body);
                     body = prefix;
+                }
+                if let Some(pat) = binding_pattern {
+                    // 解构模式：插入 let <pattern> = __for_pat
+                    body.insert(
+                        0,
+                        Stmt::Let {
+                            pattern: pat,
+                            ty: None,
+                            value: Expr::Var(var.clone()),
+                        },
+                    );
                 }
                 Ok(Stmt::For {
                     var,
@@ -496,6 +530,13 @@ impl Parser {
                     )),
                 }
             }
+            // cjc: `_ = expr` 丢弃赋值——求值右侧后丢弃
+            Some(Token::Underscore) => {
+                self.advance();
+                self.expect(Token::Assign)?;
+                let value = self.parse_expr()?;
+                Ok(Stmt::Expr(value))
+            }
             _ => {
                 let expr = self.parse_expr()?;
                 let (is_assign, bin_op) = match self.peek() {
@@ -579,6 +620,15 @@ impl Parser {
             AssignTarget::ExprIndex { expr, index } => Expr::Index {
                 array: expr.clone(),
                 index: index.clone(),
+            },
+            AssignTarget::ExprField { object, field } => Expr::Field {
+                object: object.clone(),
+                field: field.clone(),
+            },
+            AssignTarget::Slice { array, start, end } => Expr::SliceExpr {
+                array: array.clone(),
+                start: start.clone(),
+                end: end.clone(),
             },
             AssignTarget::Tuple(targets) => {
                 let elts = targets
@@ -665,10 +715,18 @@ impl Parser {
                             current = *o;
                         }
                         _ => {
-                            return self.bail(ParseError::UnexpectedToken(
-                                Token::Assign,
-                                "简单字段访问".to_string(),
-                            ))
+                            // 复杂对象（方法调用/索引/可选链等）：expr.field 赋值目标
+                            let mut object = current;
+                            for f in path[1..].iter().rev() {
+                                object = Expr::Field {
+                                    object: Box::new(object),
+                                    field: f.clone(),
+                                };
+                            }
+                            return Ok(AssignTarget::ExprField {
+                                object: Box::new(object),
+                                field: path[0].clone(),
+                            });
                         }
                     }
                 }
@@ -717,13 +775,23 @@ impl Parser {
                             }
                         }
                     }
-                    _ => {
-                        return self.bail(ParseError::UnexpectedToken(
-                            Token::Assign,
-                            "简单数组访问".to_string(),
-                        ))
+                    other => {
+                        // 复杂对象（可选链/方法调用等）索引：expr[i] = value
+                        return Ok(AssignTarget::ExprIndex {
+                            expr: Box::new(other),
+                            index,
+                        });
                     }
                 }
+            }
+            Expr::SliceExpr { array, start, end } => Ok(AssignTarget::Slice {
+                array,
+                start,
+                end,
+            }),
+            Expr::OptionalChain { object, field } => {
+                // 可选链赋值 a?.b = v（语法接受；运行时语义由 codegen 处理）
+                Ok(AssignTarget::ExprField { object, field })
             }
             Expr::SuperFieldAccess { field } => {
                 // super.field = value

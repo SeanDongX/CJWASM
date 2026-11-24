@@ -479,6 +479,11 @@ fn subst_lvalue(
             array: Box::new(subst_expr(*array, params, args, caller_next_local, param_count)),
             index: Box::new(subst_expr(*index, params, args, caller_next_local, param_count)),
         },
+        CHIRLValue::Slice { array, start, end } => CHIRLValue::Slice {
+            array: Box::new(subst_expr(*array, params, args, caller_next_local, param_count)),
+            start: Box::new(subst_expr(*start, params, args, caller_next_local, param_count)),
+            end: Box::new(subst_expr(*end, params, args, caller_next_local, param_count)),
+        },
     }
 }
 
@@ -754,6 +759,11 @@ fn count_local_reads_in_stmt(stmt: &CHIRStmt, idx: u32) -> u32 {
                     CHIRLValue::Field { object, .. } => count_local_reads_in_expr(object, idx),
                     CHIRLValue::Index { array, index } => {
                         count_local_reads_in_expr(array, idx) + count_local_reads_in_expr(index, idx)
+                    }
+                    CHIRLValue::Slice { array, start, end } => {
+                        count_local_reads_in_expr(array, idx)
+                            + count_local_reads_in_expr(start, idx)
+                            + count_local_reads_in_expr(end, idx)
                     }
                 }
         }
