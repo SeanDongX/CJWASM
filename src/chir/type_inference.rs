@@ -676,7 +676,7 @@ mod tests {
     }
 
     fn make_field(name: &str, ty: Type) -> FieldDef {
-        FieldDef { name: name.into(), ty, default: None }
+        FieldDef { name: name.into(), ty, default: None, is_mut: true }
     }
 
     fn make_function(name: &str, params: Vec<Param>, return_type: Option<Type>, body: Vec<Stmt>) -> Function {

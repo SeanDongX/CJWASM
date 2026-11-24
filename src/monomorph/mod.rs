@@ -1548,6 +1548,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     .default
                     .as_ref()
                     .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                is_mut: f.is_mut,
             })
             .collect();
         new_structs.push(StructDef {
@@ -1618,6 +1619,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     .default
                     .as_ref()
                     .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
+                is_mut: f.is_mut,
             })
             .collect();
         let methods: Vec<ClassMethod> = def
@@ -2028,11 +2030,13 @@ mod tests {
                         name: "first".to_string(),
                         ty: Type::TypeParam("T".to_string()),
                         default: None,
+                        is_mut: true,
                     },
                     crate::ast::FieldDef {
                         name: "second".to_string(),
                         ty: Type::TypeParam("U".to_string()),
                         default: None,
+                        is_mut: true,
                     },
                 ],
             }],
@@ -2084,11 +2088,13 @@ mod tests {
                         name: "x".to_string(),
                         ty: Type::TypeParam("A".to_string()),
                         default: None,
+                        is_mut: true,
                     },
                     crate::ast::FieldDef {
                         name: "y".to_string(),
                         ty: Type::TypeParam("B".to_string()),
                         default: None,
+                        is_mut: true,
                     },
                 ],
             }],
@@ -2142,6 +2148,7 @@ mod tests {
                     name: "x".to_string(),
                     ty: Type::Int64,
                     default: None,
+                    is_mut: true,
                 }],
             }],
             interfaces: vec![],
@@ -2252,6 +2259,7 @@ mod tests {
                     name: "value".to_string(),
                     ty: Type::TypeParam("T".to_string()),
                     default: None,
+                    is_mut: true,
                 }],
             }],
             interfaces: vec![],
@@ -2309,6 +2317,7 @@ mod tests {
                         name: "data".to_string(),
                         ty: Type::TypeParam("T".to_string()),
                         default: None,
+                        is_mut: true,
                     }],
                     init: Some(InitDef {
                         params: vec![crate::ast::Param {
@@ -2407,11 +2416,13 @@ mod tests {
                         name: "a".to_string(),
                         ty: Type::TypeParam("A".to_string()),
                         default: None,
+                        is_mut: true,
                     },
                     crate::ast::FieldDef {
                         name: "b".to_string(),
                         ty: Type::TypeParam("B".to_string()),
                         default: None,
+                        is_mut: true,
                     },
                 ],
             }],
@@ -2637,6 +2648,7 @@ mod tests {
                     name: "v".to_string(),
                     ty: Type::TypeParam("T".to_string()),
                     default: None,
+                    is_mut: true,
                 }],
             }],
             interfaces: vec![],

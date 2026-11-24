@@ -446,6 +446,9 @@ pub struct FieldDef {
     pub ty: Type,
     /// cjc 兼容: 字段默认值 (如 `var x: Int64 = 0`)
     pub default: Option<Expr>,
+    /// 字段是否可变（`var` 为 true，`let`/`const` 为 false）。
+    /// 仅用于语义检查（不可变字段赋值），不影响代码生成。
+    pub is_mut: bool,
 }
 
 /// 顶层常量定义 (let/var name: Type = expr)
@@ -454,6 +457,8 @@ pub struct ConstDef {
     pub name: String,
     pub ty: Type,
     pub init: Expr,
+    /// 顶层绑定是否可变（`var` 为 true，`let`/`const` 为 false）。
+    pub is_mut: bool,
 }
 
 /// 结构体定义

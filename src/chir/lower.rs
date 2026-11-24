@@ -773,6 +773,7 @@ mod tests {
                 name: "n".to_string(),
                 ty: Type::Int64,
                 default: None,
+                is_mut: true,
             }],
             init: None,
             deinit: None,

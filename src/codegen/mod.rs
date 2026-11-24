@@ -390,6 +390,7 @@ impl CodeGen {
                     name: "message".to_string(),
                     ty: Type::String,
                     default: None,
+                    is_mut: true,
                 }],
                 static_init: None,
                 primary_ctor_params: vec![],
@@ -7027,11 +7028,13 @@ mod tests {
                         name: "x".to_string(),
                         ty: Type::Int64,
                         default: None,
+                        is_mut: true,
                     },
                     FieldDef {
                         name: "y".to_string(),
                         ty: Type::Int64,
                         default: None,
+                        is_mut: true,
                     },
                 ],
             }],
@@ -7092,11 +7095,13 @@ mod tests {
                         name: "x".to_string(),
                         ty: Type::Int64,
                         default: None,
+                        is_mut: true,
                     },
                     FieldDef {
                         name: "y".to_string(),
                         ty: Type::Int64,
                         default: None,
+                        is_mut: true,
                     },
                 ],
             }],
@@ -7700,6 +7705,7 @@ mod tests {
                     name: "size".to_string(),
                     ty: Type::Int64,
                     default: None,
+                    is_mut: true,
                 }],
                 init: Some(InitDef {
                     params: vec![Param {
@@ -8172,11 +8178,13 @@ mod tests {
                         name: "x".to_string(),
                         ty: Type::Int64,
                         default: None,
+                        is_mut: true,
                     },
                     FieldDef {
                         name: "y".to_string(),
                         ty: Type::Int64,
                         default: None,
+                        is_mut: true,
                     },
                 ],
             }],
@@ -8251,6 +8259,7 @@ mod tests {
                         name: "id".to_string(),
                         ty: Type::Int64,
                         default: None,
+                        is_mut: true,
                     }],
                     init: Some(InitDef {
                         params: vec![Param {
