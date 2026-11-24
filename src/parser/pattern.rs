@@ -29,8 +29,38 @@ impl Parser {
         Ok(pattern)
     }
 
-    /// 解析基础模式
+    /// 解析基础模式（含字面量常量模式后的比较守卫，如 case b'0' <= c && c <= b'9'）
     pub(crate) fn parse_primary_pattern(&mut self) -> Result<Pattern, ParseErrorAt> {
+        let pattern = self.parse_primary_pattern_base()?;
+        // 无选择器 match 的常量/表达式守卫：字面量开头后接比较/逻辑运算
+        if let Pattern::Literal(ref lit) = pattern {
+            if matches!(
+                self.peek(),
+                Some(Token::Lt)
+                    | Some(Token::Gt)
+                    | Some(Token::LtEq)
+                    | Some(Token::GtEq)
+                    | Some(Token::Eq)
+                    | Some(Token::NotEq)
+                    | Some(Token::AndAnd)
+                    | Some(Token::OrOr)
+            ) {
+                let base = match lit {
+                    Literal::Integer(n) => Expr::Integer(*n),
+                    Literal::Float(f) => Expr::Float(*f),
+                    Literal::Bool(b) => Expr::Bool(*b),
+                    Literal::String(s) => Expr::String(s.clone()),
+                    Literal::Rune(c) => Expr::Rune(*c),
+                };
+                let full = self.parse_guard_binary_rest(base)?;
+                return Ok(Pattern::Guard(Box::new(full)));
+            }
+        }
+        Ok(pattern)
+    }
+
+    /// 解析基础模式（不含顶层守卫转换）
+    fn parse_primary_pattern_base(&mut self) -> Result<Pattern, ParseErrorAt> {
         // 前置小数点浮点模式 `.8`（词法层拆成 Dot + 数字）
         if self.check(&Token::Dot) {
             if let Some(value) = self.try_leading_dot_float() {
@@ -272,7 +302,8 @@ impl Parser {
                     let base = Expr::Var(name.clone());
                     let full_expr = self.parse_guard_binary_rest(base)?;
                     Ok(Pattern::Guard(Box::new(full_expr)))
-                } else if looks_like_type && self.check(&Token::LParen) {
+                } else if self.check(&Token::LParen) {
+                    // 构造器/变体模式 Name(...)（仓颉枚举变体名可为小写，如 case add(y, m)）
                     self.advance();
                     let payload = if self.check(&Token::RParen) {
                         None
@@ -359,5 +390,47 @@ impl Parser {
         }
 
         Ok(fields)
+    }
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use crate::pipeline::parse_source;
+
+    fn ok(src: &str) {
+        if let Err(e) = parse_source(src) {
+            panic!("parse failed: {}\nsource:\n{}", e, src);
+        }
+    }
+
+    #[test]
+    fn test_constant_guard_pattern() {
+        ok(r#"
+func unhex(c: Byte): Byte {
+    match {
+        case b'0' <= c && c <= b'9' => c - b'0'
+        case b'a' <= c && c <= b'f' => c - b'a' + 10
+        case _ => 0
+    }
+}
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_lowercase_variant_pattern() {
+        ok(r#"
+enum Math {
+    | add(Int64, Int64)
+    | mul(Int64, Int64)
+}
+func doMath(p: Math) {
+    match (p) {
+        case add(y, m) => y + m
+        case mul(y, m) => y * m
+    }
+}
+main() {}
+"#);
     }
 }

@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::lexer::Token;
+use crate::lexer::{StringOrInterpolated, Token};
 
 mod decl;
 mod error;
@@ -32,6 +32,8 @@ pub struct Parser {
     allow_wildcard_expr: bool,
     /// 条件/主体表达式中禁止把尾随 `{` 当作 lambda（避免 `if x { ... }` 的块被吞掉）
     no_trailing_lambda: bool,
+    /// 当前是否在静态方法体内（静态方法不能使用 super）
+    in_static_method: bool,
 }
 
 impl Parser {
@@ -48,6 +50,7 @@ impl Parser {
             source: String::new(),
             allow_wildcard_expr: false,
             no_trailing_lambda: false,
+            in_static_method: false,
         }
     }
 
@@ -136,6 +139,18 @@ impl Parser {
                     None
                 }
             }
+            // 规范 1.1(5)：反引号原始标识符必须是合法标识符（如 `open`、`__`、`_5`），
+            // 含空格等非法字符（如 ` `）必须报错。
+            Some(Token::BacktickStringLit(StringOrInterpolated::Plain(ref s)))
+                if is_valid_raw_ident_text(s) =>
+            {
+                if let Some(Token::BacktickStringLit(StringOrInterpolated::Plain(n))) = self.advance()
+                {
+                    Some(n)
+                } else {
+                    None
+                }
+            }
             Some(Token::Main) => {
                 self.advance();
                 Some("main".to_string())
@@ -210,7 +225,7 @@ impl Parser {
     /// 但不允许 `main`/`case` 等其他关键字，也不允许 `_`（由调用方单独处理）。
     fn advance_binding_ident(&mut self) -> Option<String> {
         match self.peek() {
-            Some(Token::Ident(_)) => self.advance_ident(),
+            Some(Token::Ident(_)) | Some(Token::BacktickStringLit(_)) => self.advance_ident(),
             Some(
                 Token::Abstract
                 | Token::Open
@@ -221,6 +236,89 @@ impl Parser {
                 | Token::Redef
                 | Token::Sealed,
             ) => self.advance_ident(),
+            _ => None,
+        }
+    }
+
+    /// 在类型名/别名/扩展目标等位置消费标识符：允许普通标识符、反引号标识符，
+    /// 以及类型关键字（如 `type Tuple = (Int64, Int64)`、`extend Unit { ... }`）。
+    fn advance_type_name(&mut self) -> Option<String> {
+        let keyword = match self.peek() {
+            Some(Token::TypeInt8) => Some("Int8"),
+            Some(Token::TypeInt16) => Some("Int16"),
+            Some(Token::TypeInt32) => Some("Int32"),
+            Some(Token::TypeInt64) => Some("Int64"),
+            Some(Token::TypeIntNative) => Some("IntNative"),
+            Some(Token::TypeUInt8) => Some("UInt8"),
+            Some(Token::TypeUInt16) => Some("UInt16"),
+            Some(Token::TypeUInt32) => Some("UInt32"),
+            Some(Token::TypeUInt64) => Some("UInt64"),
+            Some(Token::TypeUIntNative) => Some("UIntNative"),
+            Some(Token::TypeFloat16) => Some("Float16"),
+            Some(Token::TypeFloat32) => Some("Float32"),
+            Some(Token::TypeFloat64) => Some("Float64"),
+            Some(Token::TypeRune) => Some("Rune"),
+            Some(Token::TypeBool) => Some("Bool"),
+            Some(Token::TypeString) => Some("String"),
+            Some(Token::TypeUnit) => Some("Unit"),
+            Some(Token::TypeNothing) => Some("Nothing"),
+            Some(Token::TypeTuple) => Some("Tuple"),
+            Some(Token::TypeArray) => Some("Array"),
+            Some(Token::TypeRange) => Some("Range"),
+            Some(Token::TypeVArray) => Some("VArray"),
+            Some(Token::TypeOption) => Some("Option"),
+            Some(Token::TypeResult) => Some("Result"),
+            Some(Token::TypeMap) => Some("Map"),
+            Some(Token::TypeSlice) => Some("Slice"),
+            Some(Token::TypeThis) => Some("This"),
+            _ => None,
+        };
+        match keyword {
+            Some(name) => {
+                self.advance();
+                Some(name.to_string())
+            }
+            None => self.advance_ident(),
+        }
+    }
+
+    /// 判断当前位置是否是 `Variant(...)` 形式的构造器模式起点
+    /// （用于 let/var 解构声明，如 `let Red(a) = ...`）。
+    fn looks_like_variant_pattern(&self) -> bool {
+        matches!(self.peek(), Some(Token::Ident(n)) if n.chars().next().map(|c| c.is_uppercase()).unwrap_or(false))
+            && matches!(self.peek_next(), Some(Token::LParen))
+    }
+
+    /// 类型别名名称：普通标识符/合法反引号标识符，以及库类型名（Tuple/Array/Range，
+    /// 它们是普通标识符而非关键字，规范允许 `type Array = Array<Int64>`），
+    /// 但拒绝 Unit/Float64/Nothing 等真正关键字及 main 等保留名。
+    fn advance_alias_name(&mut self) -> Option<String> {
+        match self.peek() {
+            Some(Token::TypeTuple) => {
+                self.advance();
+                Some("Tuple".to_string())
+            }
+            Some(Token::TypeArray) => {
+                self.advance();
+                Some("Array".to_string())
+            }
+            Some(Token::TypeRange) => {
+                self.advance();
+                Some("Range".to_string())
+            }
+            _ => self.advance_decl_name(),
+        }
+    }
+
+    /// 声明名（类名等）：普通标识符或合法反引号标识符；不允许关键字/保留名。
+    fn advance_decl_name(&mut self) -> Option<String> {
+        match self.peek() {
+            Some(Token::Ident(_)) => self.advance_ident(),
+            Some(Token::BacktickStringLit(StringOrInterpolated::Plain(ref s)))
+                if is_valid_raw_ident_text(s) =>
+            {
+                self.advance_ident()
+            }
             _ => None,
         }
     }
@@ -428,6 +526,21 @@ impl Parser {
         }
         Ok(())
     }
+}
+
+/// 反引号原始标识符的文本是否为合法标识符（规范 1.1(5)）：
+/// 以字母或下划线开头，后续为字母/数字/下划线。
+pub(crate) fn is_valid_raw_ident_text(s: &str) -> bool {
+    // `_` 是通配符关键字，反引号形式也不能作为名字
+    if s == "_" {
+        return false;
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_alphanumeric())
 }
 
 #[cfg(test)]
