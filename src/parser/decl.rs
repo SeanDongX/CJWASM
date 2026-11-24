@@ -1249,6 +1249,10 @@ impl Parser {
             if self.check(&Token::Comma) {
                 self.advance();
             }
+            // cjc 兼容: 枚举变体也可用 ';' 分隔（如 enum E { A ; | B ; | C }）
+            if self.check(&Token::Semicolon) {
+                self.advance();
+            }
         }
         self.expect(Token::RBrace)?;
         self.current_type_params = prev_params;

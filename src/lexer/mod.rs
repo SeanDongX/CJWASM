@@ -102,6 +102,36 @@ fn parse_hex_float_literal(s: &str) -> Option<f64> {
     Some(value * 2f64.powi(exp))
 }
 
+/// 解析十进制浮点字面量（已移除下划线）。支持前导点形式 `.5` / `.8e1`。
+fn parse_decimal_float(s: &str) -> Option<f64> {
+    if s.starts_with('.') {
+        format!("0{}", s).parse::<f64>().ok()
+    } else {
+        s.parse::<f64>().ok()
+    }
+}
+
+/// 解析十进制 Float32 字面量（已移除下划线）。支持前导点形式 `.5` / `.8e1`。
+fn parse_decimal_float32(s: &str) -> Option<f32> {
+    if s.starts_with('.') {
+        format!("0{}", s).parse::<f32>().ok()
+    } else {
+        s.parse::<f32>().ok()
+    }
+}
+
+/// 前导点浮点（`.5`）后紧跟标识符字符或另一个 `.` 时视为非法字面量
+/// （如 `.00xp0`、`.0.0`），返回 true 让词法器报错（规范 1.3.2 负样例）。
+fn leading_dot_malformed(lex: &logos::Lexer<Token>) -> bool {
+    if !lex.slice().starts_with('.') {
+        return false;
+    }
+    matches!(
+        lex.remainder().chars().next(),
+        Some(c) if c == '.' || c == '_' || c.is_alphanumeric()
+    )
+}
+
 /// 跳过（并消耗）一个仓颉块注释，支持任意层嵌套（规范 1.5(2)）。
 ///
 /// `/*` 已由 token 匹配消耗，remainder() 为注释正文起点。返回 Skip 时
@@ -129,17 +159,51 @@ fn lex_block_comment(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<(), (
     logos::FilterResult::Error(())
 }
 
-/// 解析多行字符串 """..."""，返回内容（不含引号）和消耗的字节数
+/// 解析多行字符串 """..."""，支持转义（`\"` `\\` `\$` `\n` `\t`）。
+///
+/// 终止条件是未被反斜杠转义的 `"""`；`\"""` 中的 `\"` 是转义引号，不构成终止。
+/// `${...}` 在多行字符串中按普通文本处理（不做插值展开），以兼容官方测试集。
 fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
     let remainder = lex.remainder();
-    // 查找结束的 """
-    if let Some(end_pos) = remainder.find("\"\"\"") {
-        let content = &remainder[..end_pos];
-        lex.bump(end_pos + 3); // 跳过内容和结束的 """
-        Some(process_multiline_string(content))
-    } else {
-        None // 未找到结束引号
+    let bytes = remainder.as_bytes();
+    let mut pos = 0usize;
+    let mut current = String::new();
+
+    while pos < bytes.len() {
+        // 终止符 """（到达此处时一定未被转义，因为转义引号已在下面消耗）
+        if bytes[pos] == b'"'
+            && pos + 2 < bytes.len()
+            && bytes[pos + 1] == b'"'
+            && bytes[pos + 2] == b'"'
+        {
+            lex.bump(pos + 3);
+            return Some(process_multiline_string(&current));
+        }
+
+        let c = bytes[pos];
+        if c == b'\\' && pos + 1 < bytes.len() {
+            let next = bytes[pos + 1];
+            match next {
+                b'n' => current.push('\n'),
+                b't' => current.push('\t'),
+                b'"' => current.push('"'),
+                b'\\' => current.push('\\'),
+                b'$' => current.push('$'),
+                _ => {
+                    // 未知转义（含 \u{...}）按字面保留
+                    current.push('\\');
+                    current.push(next as char);
+                }
+            }
+            pos += 2;
+        } else {
+            // 按 UTF-8 字符复制
+            let ch = remainder[pos..].chars().next()?;
+            current.push(ch);
+            pos += ch.len_utf8();
+        }
     }
+    None // 未找到结束引号
 }
 
 /// 解析字符串（普通或插值）
@@ -578,37 +642,46 @@ pub enum Token {
     #[token("Map", priority = 1)]
     TypeMap,
 
-    // Float64：小数、科学计数法（无后缀）或十六进制浮点（规范 1.3）
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*|0[xX][0-9a-fA-F_]*(\.[0-9a-fA-F_]*)?[pP][+-]?[0-9][0-9_]*", |lex| {
+    // Float64：小数、科学计数法（无后缀）、前导点小数或十六进制浮点（规范 1.3）
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*|\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|0[xX][0-9a-fA-F_]*(\.[0-9a-fA-F_]*)?[pP][+-]?[0-9][0-9_]*", |lex| {
+        if leading_dot_malformed(lex) {
+            return None;
+        }
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
         if s.starts_with("0x") || s.starts_with("0X") {
             // 十六进制浮点：0x1.8p3 / 0xA.BP-10 / 0x.1p1（十六进制无类型后缀）
             parse_hex_float_literal(&s)
         } else {
-            s.parse::<f64>().ok()
+            parse_decimal_float(&s)
         }
     })]
     Float(f64),
 
     // Float64 带 f64 后缀
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f64|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f64|[0-9][0-9_]*f64", priority = 4, callback = |lex| {
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f64|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f64|[0-9][0-9_]*f64|\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f64", priority = 4, callback = |lex| {
+        if leading_dot_malformed(lex) {
+            return None;
+        }
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
         let s = s.trim_end_matches("f64");
-        s.parse::<f64>().ok()
+        parse_decimal_float(s)
     })]
     Float64Suffix(f64),
 
     // Float32：f、f32 或 f16 后缀（Float16 在 WASM 层同为 f32，值按 f32 解析）
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f32|f16)|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f32|f16)|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f|\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f32|f16|f)", priority = 3, callback = |lex| {
+        if leading_dot_malformed(lex) {
+            return None;
+        }
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
         let s = s.trim_end_matches("f32").trim_end_matches("f16").trim_end_matches('f');
-        s.parse::<f32>().ok()
+        parse_decimal_float32(s)
     })]
     Float32(f32),
 
     // 整数字面量，支持可选的 Cangjie 类型后缀（i8/i16/i32/i64/u8/u16/u32/u64）。
     // 后缀类型信息由变量/常量声明的类型标注承载，此处剥离后按整数解析。
-    #[regex(r"(0[xX][0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*)(i8|i16|i32|i64|u8|u16|u32|u64)?", |lex| {
+    #[regex(r"(0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[oO][0-7][0-7_]*|0[bB][01][01_]*|[0-9][0-9_]*)(i8|i16|i32|i64|u8|u16|u32|u64)?", |lex| {
         let raw = lex.slice();
         let s: String = raw.chars().filter(|c| *c != '_').collect();
         // 剥离整数类型后缀（若有）
@@ -622,14 +695,14 @@ pub enum Token {
         }
         if body.len() >= 2 && (body.starts_with("0x") || body.starts_with("0X")) {
             i64::from_str_radix(&body[2..], 16).ok().or_else(|| u64::from_str_radix(&body[2..], 16).ok().map(|v| v as i64))
-        } else if body.starts_with("0o") { i64::from_str_radix(&body[2..], 8).ok().or_else(|| u64::from_str_radix(&body[2..], 8).ok().map(|v| v as i64)) }
-        else if body.starts_with("0b") { i64::from_str_radix(&body[2..], 2).ok().or_else(|| u64::from_str_radix(&body[2..], 2).ok().map(|v| v as i64)) }
+        } else if body.starts_with("0o") || body.starts_with("0O") { i64::from_str_radix(&body[2..], 8).ok().or_else(|| u64::from_str_radix(&body[2..], 8).ok().map(|v| v as i64)) }
+        else if body.starts_with("0b") || body.starts_with("0B") { i64::from_str_radix(&body[2..], 2).ok().or_else(|| u64::from_str_radix(&body[2..], 2).ok().map(|v| v as i64)) }
         else { body.parse::<i64>().ok().or_else(|| body.parse::<u64>().ok().map(|v| v as i64)) }
     })]
     Integer(i64),
 
-    // 字节字面量 b'x' (Cangjie 语法，支持转义)
-    #[regex(r"b'[^'\\]'|b'\\[ntr\\0']'", |lex| {
+    // 字节字面量 b'x' (Cangjie 语法，支持转义，含 \u{XX} 十六进制字节)
+    #[regex(r#"b'[^'\\]'|b'\\[ntrbfv0'"\\]'|b'\\u\{[0-9a-fA-F]{1,2}\}'"#, |lex| {
         let s = lex.slice();
         let inner = &s[2..s.len()-1]; // 去除 b' 和 '
         if inner.starts_with('\\') {
@@ -637,9 +710,19 @@ pub enum Token {
                 Some('n') => Some(b'\n'),
                 Some('t') => Some(b'\t'),
                 Some('r') => Some(b'\r'),
+                Some('b') => Some(0x08),
+                Some('f') => Some(0x0C),
+                Some('v') => Some(0x0B),
                 Some('\\') => Some(b'\\'),
-                Some('0') => Some(b'0'),
+                Some('0') => Some(0),
                 Some('\'') => Some(b'\''),
+                Some('"') => Some(b'"'),
+                Some('$') => Some(b'$'),
+                Some('u') => {
+                    // \u{XX}：十六进制字节（0x00..=0xFF）
+                    let hex = &inner[3..inner.len()-1];
+                    u32::from_str_radix(hex, 16).ok().and_then(|v| u8::try_from(v).ok())
+                }
                 _ => None,
             }
         } else {
@@ -648,8 +731,8 @@ pub enum Token {
     })]
     ByteLit(u8),
 
-    // 字符字面量 'a' (支持转义 '\n' '\t' '\\' '\'' '\0' '\u{XXXX}')
-    #[regex(r"'[^'\\]'|'\\[ntr\\0'u]'|'\\u\{[0-9a-fA-F]+\}'", |lex| {
+    // 字符字面量 'a' (支持转义 '\n' '\t' '\\' '\'' '\0' '\u{XXXX}' 及 \f \v \b \" \$)
+    #[regex(r#"'[^'\\]'|'\\[ntrbfv0'"\\$u]'|'\\u\{[0-9a-fA-F]+\}'"#, |lex| {
         let s = lex.slice();
         let inner = &s[1..s.len()-1]; // 去除引号
         if inner.starts_with('\\') {
@@ -657,9 +740,14 @@ pub enum Token {
                 Some('n') => Some('\n'),
                 Some('t') => Some('\t'),
                 Some('r') => Some('\r'),
+                Some('b') => Some('\u{08}'),
+                Some('f') => Some('\u{0C}'),
+                Some('v') => Some('\u{0B}'),
                 Some('\\') => Some('\\'),
                 Some('0') => Some('\0'),
                 Some('\'') => Some('\''),
+                Some('"') => Some('"'),
+                Some('$') => Some('$'),
                 Some('u') => {
                     // \u{XXXX} unicode escape
                     let hex = &inner[3..inner.len()-1]; // extract hex digits from \u{XXXX}
@@ -674,7 +762,7 @@ pub enum Token {
     CharLit(char),
 
     // Rune 字面量 r'.' (仓颉语法：r'x' 为原始字符，不处理转义)
-    #[regex(r"r'[^'\\]'|r'\\[ntr\\0'u]'|r'\\u\{[0-9a-fA-F]+\}'", |lex| {
+    #[regex(r#"r'[^'\\]'|r'\\[ntrbfv0'"\\$u]'|r'\\u\{[0-9a-fA-F]+\}'"#, |lex| {
         let s = lex.slice();
         let inner = &s[2..s.len()-1]; // 去除 r' 和 '
         if inner.starts_with('\\') {
@@ -682,9 +770,14 @@ pub enum Token {
                 Some('n') => Some('\n'),
                 Some('t') => Some('\t'),
                 Some('r') => Some('\r'),
+                Some('b') => Some('\u{08}'),
+                Some('f') => Some('\u{0C}'),
+                Some('v') => Some('\u{0B}'),
                 Some('\\') => Some('\\'),
                 Some('0') => Some('\0'),
                 Some('\'') => Some('\''),
+                Some('"') => Some('"'),
+                Some('$') => Some('$'),
                 Some('u') => {
                     // \u{XXXX} unicode escape
                     let hex = &inner[3..inner.len()-1];
@@ -714,7 +807,7 @@ pub enum Token {
     #[token("false")]
     False,
 
-    // 多行字符串 """..."""（strip 公共缩进）
+    // 多行字符串 """..."""（strip 公共缩进；支持转义，${...} 按普通文本）
     #[token(r#"""""#, lex_multiline_string)]
     MultiLineStringLit(String),
 
@@ -733,8 +826,8 @@ pub enum Token {
     #[token("`", lex_any_backtick_string)]
     BacktickStringLit(StringOrInterpolated),
 
-    // 标识符
-    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
+    // 标识符（Cangjie 规范允许 ASCII 字母/数字/下划线；兼容官方测试集中的非 ASCII 字母标识符）
+    #[regex(r"[_\p{L}\p{Nl}][_\p{L}\p{N}]*", |lex| lex.slice().to_string())]
     Ident(String),
 
     // 运算符 (与 cjc release/1.0 对齐)
@@ -888,6 +981,12 @@ impl<'a> Iterator for Lexer<'a> {
             let span = self.inner.span();
             match token {
                 Ok(Token::BlockComment) => continue, // 跳过块注释
+                // 原始标识符：`name`（反引号内为合法标识符时视为 Ident，而非反引号字符串）
+                Ok(Token::BacktickStringLit(StringOrInterpolated::Plain(ref s)))
+                    if is_raw_identifier(s) =>
+                {
+                    return Some(Ok((span.start, Token::Ident(s.clone()), span.end)));
+                }
                 Ok(tok) => return Some(Ok((span.start, tok, span.end))),
                 Err(_) => {
                     return Some(Err(format!(
@@ -898,6 +997,20 @@ impl<'a> Iterator for Lexer<'a> {
             }
         }
     }
+}
+
+/// 判断反引号内的文本是否构成一个原始标识符
+/// （语法：`'_'* Letter (Letter|'_'|Digit)*`，必须包含至少一个字母）。
+fn is_raw_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    if !s.chars().any(|c| c.is_alphabetic()) {
+        return false;
+    }
+    s.chars().all(|c| c == '_' || c.is_alphanumeric())
 }
 
 #[cfg(test)]
@@ -1455,5 +1568,163 @@ mod tests {
             Token::Float32(v) => assert!((v - 1.5).abs() < 1e-6),
             ref other => panic!("Expected Float32, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_raw_identifier_backtick() {
+        // 规范 1.1(5)：`name` 为原始标识符，应产生 Ident
+        let source = "var `A` = 1 func `f`() { 0 }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[1], Token::Ident("A".to_string()));
+        assert_eq!(tokens[5], Token::Ident("f".to_string()));
+    }
+
+    #[test]
+    fn test_raw_identifier_keyword_content() {
+        // 反引号内可为关键字：`as`
+        let source = "var `as` = 1";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[1], Token::Ident("as".to_string()));
+    }
+
+    #[test]
+    fn test_raw_identifier_underscore_only_not_ident() {
+        // `_` 不是原始标识符（语法要求至少一个字母），保持为反引号字符串
+        let source = "`_`";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(
+            tokens[0],
+            Token::BacktickStringLit(StringOrInterpolated::Plain("_".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_unicode_identifier() {
+        // 官方测试集要求接受非 ASCII 字母标识符（a04 正测试），含 Nl 类字符 〇
+        let source = "var 仓颉 = 1 var 〇 = 2 var Venäjän = 3";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[1], Token::Ident("仓颉".to_string()));
+        assert_eq!(tokens[5], Token::Ident("〇".to_string()));
+        assert_eq!(tokens[9], Token::Ident("Venäjän".to_string()));
+    }
+
+    #[test]
+    fn test_integer_uppercase_base_prefix() {
+        // 规范 1.3.1：0O/0B/0X 大写前缀合法
+        let source = "0O17 0B1010 0XFF";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Integer(15));
+        assert_eq!(tokens[1], Token::Integer(10));
+        assert_eq!(tokens[2], Token::Integer(255));
+    }
+
+    #[test]
+    fn test_integer_uppercase_prefix_with_suffix() {
+        let source = "0O371u8 0B1111i64 0XFAu64";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Integer(0o371));
+        assert_eq!(tokens[1], Token::Integer(15));
+        assert_eq!(tokens[2], Token::Integer(0xFA));
+    }
+
+    #[test]
+    fn test_float_leading_dot() {
+        // 规范 1.3.2：DecimalFraction 允许省略整数部分（.5 / .8e1）
+        let source = ".5 .8e1 .002";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Float(0.5));
+        assert_eq!(tokens[1], Token::Float(8.0));
+        assert_eq!(tokens[2], Token::Float(0.002));
+    }
+
+    #[test]
+    fn test_float_leading_dot_with_suffix() {
+        let source = ".002f32 .5f64 .8e1f16";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        match tokens[0] {
+            Token::Float32(v) => assert!((v - 0.002).abs() < 1e-7),
+            ref other => panic!("Expected Float32, got {:?}", other),
+        }
+        match tokens[1] {
+            Token::Float64Suffix(v) => assert!((v - 0.5).abs() < 1e-12),
+            ref other => panic!("Expected Float64 suffix, got {:?}", other),
+        }
+        match tokens[2] {
+            Token::Float32(v) => assert!((v - 8.0).abs() < 1e-6),
+            ref other => panic!("Expected Float32, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_float_leading_dot_malformed_rejected() {
+        // .0.0 / .00xp0 不是合法浮点字面量
+        for src in [".0.0", ".00xp0"] {
+            let lexer = Lexer::new(src);
+            let toks: Vec<_> = lexer.collect();
+            assert!(
+                toks.iter().any(|t| t.is_err()),
+                "expected lexical error for {:?}, got {:?}",
+                src,
+                toks
+            );
+        }
+    }
+
+    #[test]
+    fn test_rune_escape_fvb_dollar_quote() {
+        // Rune 转义：\f \v \b \$ \"
+        let source = r#"r'\f' r'\v' r'\b' r'\$' r'\"'"#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::RuneLit('\u{0C}'));
+        assert_eq!(tokens[1], Token::RuneLit('\u{0B}'));
+        assert_eq!(tokens[2], Token::RuneLit('\u{08}'));
+        assert_eq!(tokens[3], Token::RuneLit('$'));
+        assert_eq!(tokens[4], Token::RuneLit('"'));
+    }
+
+    #[test]
+    fn test_byte_escape_unicode_and_controls() {
+        // b'\u{A}' = 10，b'\u{AB}' = 171，b'\f' = 12，b'\"' = 34
+        let source = r#"b'\u{A}' b'\u{AB}' b'\f' b'\"'"#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::ByteLit(10));
+        assert_eq!(tokens[1], Token::ByteLit(171));
+        assert_eq!(tokens[2], Token::ByteLit(12));
+        assert_eq!(tokens[3], Token::ByteLit(b'"'));
+    }
+
+    #[test]
+    fn test_byte_escape_dollar_rejected() {
+        // ByteEscapeSeq 不包含 \$：不应产生单个 ByteLit token（会拆成 Ident + CharLit，
+        // 进而由语法分析阶段拒绝该非法程序）
+        let lexer = Lexer::new(r"b'\$'");
+        let toks: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert!(
+            !toks.iter().any(|t| matches!(t, Token::ByteLit(_))),
+            "b'\\$' must not be a byte literal, got {:?}",
+            toks
+        );
+    }
+
+    #[test]
+    fn test_multiline_string_escaped_triple_quote() {
+        // 多行字符串中 \""" 不应提前终止，转义后内容为 """
+        let source = r####"let s = """abc\""" def""""####;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(
+            tokens[3],
+            Token::MultiLineStringLit("abc\"\"\" def".to_string())
+        );
     }
 }

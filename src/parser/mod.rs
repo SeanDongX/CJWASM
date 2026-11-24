@@ -158,10 +158,63 @@ impl Parser {
                 self.advance();
                 Some("_".to_string())
             }
+            // Cangjie 规范 1.1(6): 以下修饰符关键字也可作为标识符使用
+            Some(Token::Abstract) => {
+                self.advance();
+                Some("abstract".to_string())
+            }
+            Some(Token::Open) => {
+                self.advance();
+                Some("open".to_string())
+            }
+            Some(Token::Override) => {
+                self.advance();
+                Some("override".to_string())
+            }
+            Some(Token::Private) => {
+                self.advance();
+                Some("private".to_string())
+            }
+            Some(Token::Protected) => {
+                self.advance();
+                Some("protected".to_string())
+            }
+            Some(Token::Public) => {
+                self.advance();
+                Some("public".to_string())
+            }
+            Some(Token::Redef) => {
+                self.advance();
+                Some("redef".to_string())
+            }
+            Some(Token::Sealed) => {
+                self.advance();
+                Some("sealed".to_string())
+            }
             Some(Token::Loop) => {
                 self.advance();
                 Some("loop".to_string())
             }
+            _ => None,
+        }
+    }
+
+    /// 消费绑定名（let/var 的变量名）：允许普通标识符及规范 1.1(6) 列出的
+    /// 修饰符关键字（abstract/open/override/private/protected/public/redef/sealed），
+    /// 但不允许 `main`/`case` 等其他关键字，也不允许 `_`（由调用方单独处理）。
+    fn advance_binding_ident(&mut self) -> Option<String> {
+        match self.peek() {
+            Some(Token::Ident(_)) => self.advance_ident(),
+            Some(
+                Token::Abstract
+                | Token::Open
+                | Token::Override
+                | Token::Private
+                | Token::Protected
+                | Token::Public
+                | Token::Redef
+                | Token::Sealed,
+            ) => self.advance_ident(),
             _ => None,
         }
     }
@@ -180,13 +233,27 @@ impl Parser {
     }
 
     fn expect(&mut self, expected: Token) -> Result<(), ParseErrorAt> {
-        // 类型上下文中的 >> 视为 > >，以便解析 Array<UInt32>> 等
-        if std::mem::discriminant(&expected) == std::mem::discriminant(&Token::Gt)
-            && self.peek() == Some(&Token::Shr)
-        {
-            self.advance(); // consume Shr
-            self.pushback = Some(Token::Gt);
-            return Ok(());
+        // 类型上下文中的 >> / >= / >>= 视为若干 > 与运算符的组合，
+        // 以便解析 Array<UInt32>>、Array<Int32>=... 等写法。
+        if std::mem::discriminant(&expected) == std::mem::discriminant(&Token::Gt) {
+            match self.peek() {
+                Some(Token::Shr) => {
+                    self.advance(); // consume Shr
+                    self.pushback = Some(Token::Gt);
+                    return Ok(());
+                }
+                Some(Token::GtEq) => {
+                    self.advance(); // consume GtEq, 留下 '='
+                    self.pushback = Some(Token::Assign);
+                    return Ok(());
+                }
+                Some(Token::ShrEq) => {
+                    self.advance(); // consume ShrEq, 留下 '>='
+                    self.pushback = Some(Token::GtEq);
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
         match self.advance() {
             Some(tok) if std::mem::discriminant(&tok) == std::mem::discriminant(&expected) => {
@@ -204,6 +271,58 @@ impl Parser {
         self.peek()
             .map(|t| std::mem::discriminant(t) == std::mem::discriminant(expected))
             .unwrap_or(false)
+    }
+
+    /// 从当前位置的 `<` 起扫描，判断是否在其后存在匹配的泛型实参结束符 `>`。
+    ///
+    /// 用于消解 `a < b, c` 这类比较表达式与泛型实参 `f<T, U>` 的歧义：
+    /// 若在遇到 `)`/`}`/`]`/`;` 等表达式终止符之前没有找到匹配的 `>`，则不是泛型。
+    /// `>>`/`>=`/`>>=` 按多个 `>` 与运算符拆分计深度。
+    fn has_generic_close(&self) -> bool {
+        let mut depth: i32 = 0;
+        let mut nest: i32 = 0; // ()/[]/{} 嵌套深度
+        let mut off = 0usize;
+        loop {
+            match self.peek_at(off) {
+                None => return false,
+                Some(Token::Lt) => depth += 1,
+                Some(Token::Gt) => {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return true;
+                    }
+                }
+                Some(Token::Shr) => {
+                    depth -= 2;
+                    if depth <= 0 {
+                        return true;
+                    }
+                }
+                Some(Token::GtEq) => {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return true;
+                    }
+                }
+                Some(Token::ShrEq) => {
+                    depth -= 2;
+                    if depth <= 0 {
+                        return true;
+                    }
+                }
+                Some(Token::LParen) | Some(Token::LBracket) | Some(Token::LBrace) => nest += 1,
+                Some(Token::RParen) | Some(Token::RBracket) | Some(Token::RBrace) => {
+                    if nest > 0 {
+                        nest -= 1;
+                    } else {
+                        return false;
+                    }
+                }
+                Some(Token::Semicolon) if nest == 0 => return false,
+                _ => {}
+            }
+            off += 1;
+        }
     }
 
     /// 跳过可选的属性注解 @Ident [ ... ]（如 @Deprecated[message: "..."]]），不解析内容
@@ -3744,5 +3863,67 @@ mod tests {
         let program = parser.parse_program().unwrap();
         assert_eq!(program.type_aliases.len(), 1);
         assert_eq!(program.type_aliases[0].0, "TestedType");
+    }
+
+    #[test]
+    fn test_generic_close_followed_by_assign() {
+        // Array<Int32>=... 中 >= 需在类型上下文拆成 > 与 =
+        let program = parse_ok("main() { var arr: Array<Int32>=[1, 2] }");
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_generic_nested_close_shr_eq() {
+        // 嵌套泛型后紧跟 =：Array<Array<Int32>>=...
+        let program = parse_ok("main() { var arr: Array<Array<Int32>>=[[1]] }");
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_less_than_comparison_in_call_args() {
+        // a < b, b < a 在实参位置应解析为比较，而非泛型实参
+        let program = parse_ok("func f(a: Int64, b: Int64): Bool { return g(a < b, b < a) }");
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_enum_semicolon_separated_variants() {
+        // 规范允许枚举变体以 ';' 及 '|' 分隔
+        let program = parse_ok("enum E { A ; | B ; | C }\nmain() { }");
+        assert_eq!(program.enums.len(), 1);
+        assert_eq!(program.enums[0].variants.len(), 3);
+    }
+
+    #[test]
+    fn test_binding_modifier_keyword_names() {
+        // 规范 1.1(6)：abstract/open 等修饰符关键字可作标识符
+        let program = parse_ok("main() { var abstract: Int64 = 1 var open: Int64 = 2 }");
+        let body = &program.functions[0].body;
+        assert!(matches!(&body[0], Stmt::Var { pattern: Pattern::Binding(n), .. } if n == "abstract"));
+        assert!(matches!(&body[1], Stmt::Var { pattern: Pattern::Binding(n), .. } if n == "open"));
+    }
+
+    #[test]
+    fn test_interpolation_leading_semicolons() {
+        // ${;;;expr} 允许前导分号
+        let program = parse_ok(r#"main() { let s = "${;;;1 + 2}" }"#);
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_interpolation_empty_rejected() {
+        let lexer = Lexer::new(r#"main() { let s = "${}" }"#);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse_program().is_err(), "empty interpolation should fail");
+    }
+
+    #[test]
+    fn test_option_function_type_arg() {
+        // Option<(Int64) -> Int64>：has_generic_close 需正确跳过括号内嵌套
+        let program = parse_ok(
+            "main() { let foo = 1 let f1 = Option<(Int64) -> Int64>.Some(foo) }",
+        );
+        assert_eq!(program.functions.len(), 1);
     }
 }
