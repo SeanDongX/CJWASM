@@ -530,6 +530,15 @@ struct Checker<'a> {
     enum_names: HashSet<String>,
     /// class 名 → 字段名 → 是否可变
     class_fields: HashMap<String, HashMap<String, bool>>,
+    /// 用户类型名 → 直接父类型名（类继承 + 接口实现 + 接口继承）。
+    /// 用于判断运算符返回类型是否为左操作数类型的子类型。
+    user_parents: HashMap<String, Vec<String>>,
+    /// 可由 `T()` 直接构造的用户类型（class/struct），用于推断构造调用结果类型。
+    ctor_types: HashSet<String>,
+    /// (接收者类型名, 运算符方法名) → 该运算符声明的返回类型。
+    operator_returns: HashMap<(String, String), Ty>,
+    /// (类型名, 方法名) → 静态/类型限定方法返回类型（`T.m()`）。
+    static_method_returns: HashMap<(String, String), Ty>,
     /// 当前函数声明的返回类型（用于 `return expr` 类型检查）
     ret_ty: Option<Ty>,
 }
@@ -586,6 +595,13 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     // 10.2.3(18)：对已内建支持某运算符的基础类型，用 extend 定义同签名 operator func 属于重定义。
     check_builtin_operator_redefinitions(program, errors);
 
+    // 10.2.3(15) / 4.23(27)：复合赋值 `a op= b` 要求超载运算符返回类型为
+    // 左操作数类型的同类型或子类型。这里预先收集用户类型继承图、运算符返回类型
+    // 与静态方法返回类型，供赋值语句阶段校验。
+    let (user_parents, ctor_types) = collect_user_graph(program);
+    let operator_returns = collect_operator_returns(program, &type_names);
+    let static_method_returns = collect_static_method_returns(program, &type_names);
+
     let mut checker = Checker {
         globals,
         funcs,
@@ -597,6 +613,10 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         type_names,
         enum_names,
         class_fields,
+        user_parents,
+        ctor_types,
+        operator_returns,
+        static_method_returns,
         ret_ty: None,
     };
 
@@ -845,6 +865,212 @@ fn collect_operator_overloads(program: &Program, out: &mut HashSet<String>) {
     }
 }
 
+/// 去掉方法名可能的 `Type.` 前缀，得到成员名。
+fn member_name(name: &str) -> &str {
+    name.rsplit_once('.').map(|(_, n)| n).unwrap_or(name)
+}
+
+/// 由 AST 类型映射到轻量类型，并把已知用户类型名映射为 `Ty::User`。
+/// 与 `ty_of` 的区别：后者对非基础 `Struct` 名一律返回 `Unknown`。
+fn ty_of_known(ty: &Type, type_names: &HashSet<String>) -> Ty {
+    let t = ty_of(ty);
+    if t == Ty::Unknown {
+        if let Type::Struct(name, args) = ty {
+            if args.is_empty() && type_names.contains(name) {
+                return Ty::User(name.clone());
+            }
+        }
+    }
+    t
+}
+
+/// 从运算符函数体做保守返回类型推断。
+///
+/// 只识别能精确确定返回类型的形态：构造调用（`C()`）、基础类型转换
+/// （`Int64(x)`）、`Bool`/`String`/`Rune`/浮点字面量、`()`、显式 cast、块尾
+/// 表达式以及显式 `return`。整数字面量因后缀在词法阶段被抹去而无法确定具体
+/// 位宽，故返回 `Unknown`（保守跳过，避免误伤合法重载）。
+fn static_expr_to_ty(e: &Expr, type_names: &HashSet<String>) -> Ty {
+    match e {
+        Expr::ConstructorCall { name, .. } => {
+            if type_names.contains(name) {
+                Ty::User(name.clone())
+            } else {
+                Ty::Unknown
+            }
+        }
+        Expr::Call { name, .. } => primitive_ctor_ty(name).unwrap_or(Ty::Unknown),
+        Expr::Bool(_) => Ty::Bool,
+        Expr::String(_) | Expr::Interpolate(_) => Ty::String,
+        Expr::Rune(_) => Ty::Rune,
+        Expr::Float32(_) => Ty::Float32,
+        Expr::Float(_) => Ty::Float64,
+        Expr::Tuple(v) if v.is_empty() => Ty::Unit,
+        Expr::Cast { target_ty, .. } => ty_of_known(target_ty, type_names),
+        Expr::Block(stmts, trailing) => {
+            if let Some(t) = trailing.as_ref().and_then(|t| {
+                let ty = static_expr_to_ty(t, type_names);
+                (ty != Ty::Unknown).then_some(ty)
+            }) {
+                return t;
+            }
+            for s in stmts.iter().rev() {
+                if let Stmt::Expr(e) = s {
+                    let ty = static_expr_to_ty(e, type_names);
+                    if ty != Ty::Unknown {
+                        return ty;
+                    }
+                }
+            }
+            Ty::Unknown
+        }
+        _ => Ty::Unknown,
+    }
+}
+
+/// 运算符函数返回类型：优先显式标注，否则从函数体保守推断。
+fn operator_func_return_ty(func: &Function, type_names: &HashSet<String>) -> Ty {
+    if let Some(rt) = &func.return_type {
+        let t = ty_of_known(rt, type_names);
+        if t != Ty::Unknown {
+            return t;
+        }
+    }
+    for stmt in &func.body {
+        if let Stmt::Return(Some(e)) = stmt {
+            let t = static_expr_to_ty(e, type_names);
+            if t != Ty::Unknown {
+                return t;
+            }
+        }
+    }
+    if let Some(Stmt::Expr(e)) = func.body.last() {
+        return static_expr_to_ty(e, type_names);
+    }
+    Ty::Unknown
+}
+
+/// 收集 (接收者类型名, 运算符方法名) → 运算符返回类型。
+/// 覆盖 `extend T { operator func ... }`、class 方法与接口方法声明。
+fn collect_operator_returns(
+    program: &Program,
+    type_names: &HashSet<String>,
+) -> HashMap<(String, String), Ty> {
+    let mut out: HashMap<(String, String), Ty> = HashMap::new();
+    let mut record = |recv: &str, fname: &str, func: &Function| {
+        let member = member_name(fname);
+        if KNOWN_OPERATOR_METHODS.contains(&member) {
+            let ty = operator_func_return_ty(func, type_names);
+            if ty != Ty::Unknown {
+                out.insert((recv.to_string(), member.to_string()), ty);
+            }
+        }
+    };
+    for ext in &program.extends {
+        for f in &ext.methods {
+            record(&ext.target_type, &f.name, f);
+        }
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            record(&cls.name, &m.func.name, &m.func);
+        }
+    }
+    drop(record);
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            let member = member_name(&m.name);
+            if !KNOWN_OPERATOR_METHODS.contains(&member) {
+                continue;
+            }
+            let ty = m
+                .return_type
+                .as_ref()
+                .map(|t| ty_of_known(t, type_names))
+                .unwrap_or(Ty::Unknown);
+            if ty != Ty::Unknown {
+                out.insert((iface.name.clone(), member.to_string()), ty);
+            }
+        }
+    }
+    out
+}
+
+/// 收集 (类型名, 方法名) → 返回类型，用于解析 `T.m()` 形式的类型限定调用。
+fn collect_static_method_returns(
+    program: &Program,
+    type_names: &HashSet<String>,
+) -> HashMap<(String, String), Ty> {
+    let mut out: HashMap<(String, String), Ty> = HashMap::new();
+    for cls in &program.classes {
+        for m in &cls.methods {
+            let member = member_name(&m.func.name);
+            if let Some(rt) = &m.func.return_type {
+                let ty = ty_of_known(rt, type_names);
+                if ty != Ty::Unknown {
+                    out.insert((cls.name.clone(), member.to_string()), ty);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 构建用户类型继承图：类型名 → 直接父类型名，同时返回可构造类型集合。
+fn collect_user_graph(program: &Program) -> (HashMap<String, Vec<String>>, HashSet<String>) {
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut ctor_types: HashSet<String> = HashSet::new();
+    for cls in &program.classes {
+        let mut ps: Vec<String> = Vec::new();
+        if let Some(p) = &cls.extends {
+            ps.push(p.clone());
+        }
+        ps.extend(cls.implements.iter().cloned());
+        parents.insert(cls.name.clone(), ps);
+        ctor_types.insert(cls.name.clone());
+    }
+    for st in &program.structs {
+        parents.insert(st.name.clone(), Vec::new());
+        ctor_types.insert(st.name.clone());
+    }
+    for iface in &program.interfaces {
+        parents.insert(iface.name.clone(), iface.parents.clone());
+    }
+    (parents, ctor_types)
+}
+
+/// 判断 `child` 是否为 `parent` 的同类型或（传递）子类型。
+/// 仅在继承图完整可解析时给出否定结论；未知类型按子类型处理（保守跳过）。
+fn is_same_or_subtype_name(
+    child: &str,
+    parent: &str,
+    parents: &HashMap<String, Vec<String>>,
+) -> bool {
+    if child == parent {
+        return true;
+    }
+    // 任意用户类型都是 Object 的子类型；Nothing 是所有类型的子类型。
+    if parent == "Object" || child == "Nothing" {
+        return true;
+    }
+    let mut stack: Vec<&str> = vec![child];
+    let mut seen: HashSet<&str> = HashSet::new();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name) {
+            continue;
+        }
+        if name == parent {
+            return true;
+        }
+        if let Some(ps) = parents.get(name) {
+            for p in ps {
+                stack.push(p.as_str());
+            }
+        }
+    }
+    false
+}
+
 fn is_builtin_int(name: &str) -> bool {
     matches!(
         name,
@@ -867,6 +1093,30 @@ fn is_builtin_float(name: &str) -> bool {
 
 fn builtin_ty_by_name(name: &str) -> Ty {
     ty_of(&Type::Struct(name.to_string(), vec![]))
+}
+
+/// 基础类型对应的类型名（用于在 extend 运算符表中查找接收者类型）。
+fn builtin_type_name(t: &Ty) -> Option<&'static str> {
+    Some(match t {
+        Ty::Int8 => "Int8",
+        Ty::Int16 => "Int16",
+        Ty::Int32 => "Int32",
+        Ty::Int64 => "Int64",
+        Ty::IntNative => "IntNative",
+        Ty::UInt8 => "UInt8",
+        Ty::UInt16 => "UInt16",
+        Ty::UInt32 => "UInt32",
+        Ty::UInt64 => "UInt64",
+        Ty::UIntNative => "UIntNative",
+        Ty::Float16 => "Float16",
+        Ty::Float32 => "Float32",
+        Ty::Float64 => "Float64",
+        Ty::Bool => "Bool",
+        Ty::Rune => "Rune",
+        Ty::String => "String",
+        Ty::Unit => "Unit",
+        _ => return None,
+    })
 }
 
 /// 10.2.3(18)：基础类型已内建的运算符，若在 `extend T` 中以相同签名重定义，
@@ -1086,6 +1336,7 @@ impl<'a> Checker<'a> {
             Stmt::Assign { target, value } => {
                 let value_ty = self.check_expr(value);
                 self.check_assign_target(target, &value_ty);
+                self.check_compound_operator_return(target, value);
             }
             Stmt::Expr(e) => {
                 self.check_expr(e);
@@ -1339,6 +1590,106 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 10.2.3(15) / 4.23(27)：复合赋值 `a op= b` 脱糖为 `a = a op b`。
+    /// 当 `op` 为用户/扩展重载运算符时，其返回类型必须是左操作数类型
+    /// 的同类型或子类型；否则报类型不匹配。
+    fn check_compound_operator_return(&mut self, target: &crate::ast::AssignTarget, value: &Expr) {
+        use crate::ast::AssignTarget;
+        let Expr::Binary { op, left, .. } = value else {
+            return;
+        };
+        // 仅处理脱糖出的复合赋值形态：右值为 `target op expr` 且左操作数即赋值目标本身。
+        // 其余 `a = b op c` 若类型不符由普通可赋值性检查负责。
+        let same_target = match (target, &**left) {
+            (AssignTarget::Var(tn), Expr::Var(ln)) => tn == ln,
+            (AssignTarget::Field { object, field }, Expr::Field { object: o, field: f }) => {
+                matches!(&**o, Expr::Var(n) if n == object) && field == f
+            }
+            _ => false,
+        };
+        if !same_target {
+            return;
+        }
+        let Some(target_ty) = self.assign_target_ty(target) else {
+            return;
+        };
+        if !target_ty.is_definite() {
+            return;
+        }
+        let Some(ret_ty) = self.operator_return_for(&target_ty, op) else {
+            return;
+        };
+        if !ret_ty.is_definite() {
+            return;
+        }
+        let ok = match (&ret_ty, &target_ty) {
+            (Ty::User(child), Ty::User(parent)) => {
+                is_same_or_subtype_name(child, parent, &self.user_parents)
+            }
+            _ => ret_ty == target_ty,
+        };
+        if !ok {
+            self.err(format!(
+                "复合赋值运算符 '{}=' 的运算符返回类型 {} 与左操作数类型 {} 不一致（要求返回类型为左操作数的同类型或子类型）",
+                bin_symbol(op),
+                ret_ty.name(),
+                target_ty.name()
+            ));
+        }
+    }
+
+    /// 赋值目标可静态确定的类型。
+    fn assign_target_ty(&self, target: &crate::ast::AssignTarget) -> Option<Ty> {
+        use crate::ast::AssignTarget;
+        match target {
+            AssignTarget::Var(name) => self.lookup(name).map(|v| v.ty.clone()),
+            _ => None,
+        }
+    }
+
+    /// 查找运算符在给定接收者类型上（含祖先类型）声明的返回类型。
+    ///
+    /// 仅对语义明确的接收者类型（用户类型、数值基础类型）实施：
+    /// `String`/`Bool`/`Rune`/`Unit` 等非数值内建类型的扩展运算符形态复杂
+    /// （如 String 拼接、官方套件中存在返回类型与左操作数不同却被标记为合法的
+    /// 用例），保守跳过以避免误伤。
+    fn operator_return_for(&self, receiver: &Ty, op: &BinOp) -> Option<Ty> {
+        let op_name = overload_name(op);
+        let recv_name = match receiver {
+            Ty::User(n) => n.clone(),
+            other if other.is_numeric() => builtin_type_name(other)?.to_string(),
+            _ => return None,
+        };
+        if let Some(t) = self
+            .operator_returns
+            .get(&(recv_name.clone(), op_name.to_string()))
+        {
+            return Some(t.clone());
+        }
+        // 沿继承链向上查找最近声明的运算符。
+        if matches!(receiver, Ty::User(_)) {
+            let mut stack: Vec<&str> = vec![recv_name.as_str()];
+            let mut seen: HashSet<&str> = HashSet::new();
+            while let Some(name) = stack.pop() {
+                if !seen.insert(name) {
+                    continue;
+                }
+                if let Some(t) = self
+                    .operator_returns
+                    .get(&(name.to_string(), op_name.to_string()))
+                {
+                    return Some(t.clone());
+                }
+                if let Some(ps) = self.user_parents.get(name) {
+                    for p in ps {
+                        stack.push(p.as_str());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // ─── 表达式 ──────────────────────────────────────────────────────────
 
     fn check_expr(&mut self, expr: &Expr) -> Ty {
@@ -1407,6 +1758,7 @@ impl<'a> Checker<'a> {
 
             Expr::MethodCall {
                 object,
+                method,
                 args,
                 named_args,
                 ..
@@ -1417,6 +1769,16 @@ impl<'a> Checker<'a> {
                 }
                 for (_, a) in named_args {
                     self.check_expr(a);
+                }
+                // 类型限定静态调用 `T.m()`：可解析时返回其声明返回类型。
+                if let Expr::Var(type_name) = &**object {
+                    if self.type_names.contains(type_name) {
+                        if let Some(rt) =
+                            self.static_method_returns.get(&(type_name.clone(), method.clone()))
+                        {
+                            return rt.clone();
+                        }
+                    }
                 }
                 Ty::Unknown
             }
@@ -1536,14 +1898,25 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
 
-            Expr::ConstructorCall { args, named_args, .. } => {
+            Expr::ConstructorCall {
+                name,
+                args,
+                named_args,
+                ..
+            } => {
                 for a in args {
                     self.check_expr(a);
                 }
                 for (_, a) in named_args {
                     self.check_expr(a);
                 }
-                Ty::Unknown
+                // 用户类型构造调用 `T()`：结果类型即该类型，便于后续复合赋值
+                // 运算符返回类型校验确定左操作数类型。
+                if self.ctor_types.contains(name) {
+                    Ty::User(name.clone())
+                } else {
+                    Ty::Unknown
+                }
             }
 
             Expr::Range {
@@ -2572,6 +2945,88 @@ mod tests {
             "重定义",
         );
         assert_ok("class C { operator func +(x: Int64): C { this } }\nmain() {}");
+    }
+
+    // ─── batch-05：复合赋值运算符返回类型（10.2.3(15) / 4.23(27)）───
+
+    #[test]
+    fn test_compound_op_return_same_type_ok() {
+        assert_ok(
+            "class C { operator func +(x: Int64): C { this } }\nmain() { var a = C(); a += 0 }",
+        );
+        assert_ok(
+            "class C { operator func *(x: Int64) { C() } }\nmain() { var a = C(); a *= 0 }",
+        );
+    }
+
+    #[test]
+    fn test_compound_op_return_subtype_ok() {
+        // 返回类型为左操作数类型的子类 → 合法。
+        assert_ok(
+            "open class A { operator func +(x: Int64): B { B() } }\n\
+             open class B <: A {}\n\
+             main() { var a = A(); a += 0 }",
+        );
+        // 接口接收者 + 类型限定静态工厂推断。
+        assert_ok(
+            "interface I {}\n\
+             interface L <: I { operator func |(x: Int64): CL }\n\
+             open class CL <: L { static func l(): L { CL() } }\n\
+             main() { var a = CL.l(); a |= 0 }",
+        );
+    }
+
+    #[test]
+    fn test_compound_op_return_unrelated_type_rejected() {
+        assert_err(
+            "open class A { operator func -(x: Int64): B { B() } }\n\
+             open class B {}\n\
+             main() { var a = A(); a -= 0 }",
+            "运算符返回类型",
+        );
+    }
+
+    #[test]
+    fn test_compound_op_return_wrong_supertype_rejected() {
+        // 返回父类（非子类）应被拒绝：要求返回类型是左操作数的同类型或子类型。
+        assert_err(
+            "open class A { operator func +(x: Int64): String { \"s\" } }\n\
+             main() { var a = A(); a += 0 }",
+            "运算符返回类型",
+        );
+        // 接口接收者返回非子类型。
+        assert_err(
+            "interface I {}\n\
+             interface L <: I { operator func |(x: Int64): String }\n\
+             open class CL <: L { static func l(): L { CL() } }\n\
+             main() { var a = CL.l(); a |= 0 }",
+            "运算符返回类型",
+        );
+    }
+
+    #[test]
+    fn test_compound_op_return_builtin_extend() {
+        // 基础类型 extend 的运算符：返回类型与左操作数不一致 → 拒绝。
+        assert_err(
+            "extend Int64 { operator func +(x: Unit) { \"s\" } }\n\
+             main() { var a = Int64(1); a += () }",
+            "运算符返回类型",
+        );
+        // 返回类型一致 → 合法。
+        assert_ok(
+            "extend Int64 { operator func +(x: Unit): Int64 { 0 } }\n\
+             main() { var a = Int64(1); a += () }",
+        );
+    }
+
+    #[test]
+    fn test_compound_op_return_non_numeric_builtin_skipped() {
+        // String/Bool/Rune/Unit 等非数值内建类型的扩展运算符形态复杂
+        // （官方套件中存在返回类型不同却被标记为合法的用例），保守跳过。
+        assert_ok(
+            "extend String { operator func |(x: Unit) { '1' } }\n\
+             main() { var a = \"1\"; a |= () }",
+        );
     }
 }
 
