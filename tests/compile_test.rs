@@ -118,7 +118,7 @@ fn test_compile_bitwise() {
 fn test_compile_float32() {
     let source = r#"
         func main() : Float32 {
-            return 1.0f + 1f
+            return 1.0f + 1.0f
         }
     "#;
     let wasm = compile_source(source);

@@ -535,6 +535,10 @@ struct VarInfo {
     /// 若绑定由整数字面量（或其负号形态）初始化且之后未被重新赋值，
     /// 记录其编译期常量值，用于移位越界 / 字面量越界检查。
     const_int: Option<i64>,
+    /// 是否由显式 `: Bool` 类型标注声明。解析器可能把换行后的 `is`/
+    /// 比较表达式并入上一条 `let` 的初始化式，使被绑定变量错误地呈现
+    /// 为 Bool；仅对显式 Bool 标注/布尔字面量实参做转换合法性检查。
+    explicit_bool: bool,
 }
 
 /// 单趟表达式类型检查器。
@@ -631,6 +635,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 // 顶层 `let`/`const` 不可重新赋值；`var` 可以。
                 mutable: c.is_mut,
                 const_int: literal_int(&c.init),
+                explicit_bool: matches!(c.ty, Type::Bool),
             },
         );
     }
@@ -738,6 +743,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         ty: field_ty(f),
                         mutable: true,
                         const_int: None,
+                    explicit_bool: false,
                     },
                 )
             })
@@ -779,6 +785,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         ty: checker.ty_of_ann(&p.ty),
                         mutable: true,
                         const_int: None,
+                    explicit_bool: false,
                     },
                 );
             }
@@ -801,6 +808,11 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         for func in &ext.methods {
             checker.check_function(func);
         }
+    }
+    // 顶层 `let`/`var`/`const` 的初始化表达式同样参与类型检查
+    // （如顶层 `let r = Int8(runeVar)` 的非法基础类型转换）。
+    for c in &program.constants {
+        checker.check_expr(&c.init);
     }
 }
 
@@ -1434,6 +1446,7 @@ impl<'a> Checker<'a> {
                     // 仅保证类型信息可用于运算符规则。
                     mutable: true,
                     const_int: None,
+                    explicit_bool: false,
                 },
             );
         }
@@ -1467,6 +1480,9 @@ impl<'a> Checker<'a> {
                 let cinit = if deferred { None } else { literal_int(value) };
                 self.check_irrefutable_pattern(pattern);
                 self.bind_pattern_const(pattern, bind_ty, deferred, cinit);
+                if matches!(ty.as_ref(), Some(Type::Bool)) {
+                    self.mark_explicit_bool(pattern);
+                }
             }
             Stmt::Var { pattern, ty, value } => {
                 let value_ty = self.check_expr(value);
@@ -1483,6 +1499,9 @@ impl<'a> Checker<'a> {
                 let cinit = if deferred { None } else { literal_int(value) };
                 self.check_irrefutable_pattern(pattern);
                 self.bind_pattern_const(pattern, bind_ty, true, cinit);
+                if matches!(ty.as_ref(), Some(Type::Bool)) {
+                    self.mark_explicit_bool(pattern);
+                }
             }
             Stmt::Const { name, ty, value } => {
                 let value_ty = self.check_expr(value);
@@ -1552,6 +1571,7 @@ impl<'a> Checker<'a> {
                         ty: elem_ty,
                         mutable: true,
                         const_int: None,
+                    explicit_bool: false,
                     },
                 );
                 self.scopes.push(scope);
@@ -1610,6 +1630,21 @@ impl<'a> Checker<'a> {
 
     fn bind_pattern(&mut self, pattern: &Pattern, ty: Ty, mutable: bool) {
         self.bind_pattern_const(pattern, ty, mutable, None)
+    }
+
+    /// 将刚绑定的简单变量标记为“显式 `: Bool` 标注”（仅用于区分解析器
+    /// 换行合并造成的伪 Bool 绑定）。
+    fn mark_explicit_bool(&mut self, pattern: &Pattern) {
+        let Pattern::Binding(name) = pattern else {
+            return;
+        };
+        let target = match self.scopes.last_mut() {
+            Some(scope) => scope,
+            None => &mut self.globals,
+        };
+        if let Some(info) = target.get_mut(name) {
+            info.explicit_bool = true;
+        }
     }
 
     /// 不可反驳绑定（let/var）的 pattern 不能使用多构造器枚举的变体模式。
@@ -1705,6 +1740,7 @@ impl<'a> Checker<'a> {
             ty,
             mutable,
             const_int,
+            explicit_bool: false,
         };
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.to_string(), info);
@@ -1878,11 +1914,30 @@ impl<'a> Checker<'a> {
     }
 
     /// 目标类型与值类型是否可赋值（无隐式跨类别/跨宽度转换）。
-    fn check_assignable(&mut self, target: &Ty, value: &Ty, ctx: &str) {        // Unit 类型语义特殊（允许 `var u: Unit` 等语法形态），不参与检查。
-        if *target == Ty::Unit {
+    fn check_assignable(&mut self, target: &Ty, value: &Ty, ctx: &str) {
+        if !target.is_concrete() || !value.is_definite() {
             return;
         }
-        if !target.is_concrete() || !value.is_definite() {
+        // 2.1.4(1)：Unit 只有一个值 `()`，其它类型的值不能赋给 Unit。
+        // （`var u: Unit` 无初始化式属于延迟赋值，已由 is_default_value 跳过。）
+        if *target == Ty::Unit {
+            if *value != Ty::Unit {
+                self.err(format!(
+                    "{}类型不匹配: 声明类型 Unit 与值类型 {}",
+                    ctx,
+                    value.name()
+                ));
+            }
+            return;
+        }
+        // 2.1.1.1(8)/2.1.1(1)：纯整数字面量不能隐式转换为浮点类型
+        // （`let f: Float64 = 983` 非法；浮点字面量需带小数或指数部分）。
+        if target.is_float() && *value == Ty::IntLit {
+            self.err(format!(
+                "{}类型不匹配: 整数类型不能隐式转换为 {}",
+                ctx,
+                target.name()
+            ));
             return;
         }
         if !compatible(target, value) {
@@ -2012,7 +2067,10 @@ impl<'a> Checker<'a> {
     fn check_expr(&mut self, expr: &Expr) -> Ty {
         match expr {
             Expr::Integer(_) => Ty::IntLit,
-            Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
+            Expr::IntegerSuffixed(v, s) => {
+                self.check_suffixed_int_literal(*v, *s, false);
+                suffix_ty(*s)
+            }
             Expr::Float(_) => Ty::FloatLit,
             Expr::Float32(_) => Ty::FloatLit,
             Expr::Bool(_) => Ty::Bool,
@@ -2025,6 +2083,14 @@ impl<'a> Checker<'a> {
                 .unwrap_or(Ty::Unknown),
 
             Expr::Unary { op, expr } => {
+                // `-128i8` 由一元负号作用于 `128i8`：后者超出 i8 上界但整体合法，
+                // 因此在负号上下文按“取负后的值”做范围检查，并跳过内层检查。
+                if matches!(op, UnaryOp::Neg) {
+                    if let Expr::IntegerSuffixed(v, s) = &**expr {
+                        self.check_suffixed_int_literal(*v, *s, true);
+                        return suffix_ty(*s);
+                    }
+                }
                 let t = self.check_expr(expr);
                 self.check_unary(op, &t)
             }
@@ -2065,12 +2131,15 @@ impl<'a> Checker<'a> {
                 named_args,
                 ..
             } => {
+                let mut arg_tys: Vec<Ty> = Vec::with_capacity(args.len());
                 for a in args {
-                    self.check_expr(a);
+                    arg_tys.push(self.check_expr(a));
                 }
                 for (_, a) in named_args {
                     self.check_expr(a);
                 }
+                // 2.1.3(4)/2.3.1(1)：基础类型转换的合法性（Bool↔数值、Rune↔数值）。
+                self.check_builtin_conversion(name, args, &arg_tys);
                 self.check_type_instantiation(name, type_args.as_deref());
                 self.call_return_ty(name, type_args.as_deref())
             }
@@ -2126,8 +2195,11 @@ impl<'a> Checker<'a> {
                     if t == Ty::Unknown {
                         return e;
                     }
+                    t
+                } else {
+                    // 无 else 分支的 if 表达式类型为 Unit（2.1.4 / 4.2）。
+                    Ty::Unit
                 }
-                t
             }
 
             Expr::IfLet {
@@ -2308,6 +2380,7 @@ impl<'a> Checker<'a> {
                             ty: pty,
                             mutable: true,
                             const_int: None,
+                    explicit_bool: false,
                         },
                     );
                 }
@@ -2511,6 +2584,122 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 带类型后缀的整数字面量范围检查（1.3.1 / 2.1.1）：字面量值必须落在
+    /// 后缀类型的取值范围内。`negated` 表示外层有一元负号（如 `-128i8`）。
+    ///
+    /// 保守跳过两类无法判定的值：负值（词法器把超出 i64 的十六进制/无符号
+    /// 字面量按位折叠为负，无法与真正的负值区分）与 `i64::MIN`。
+    fn check_suffixed_int_literal(&mut self, v: i64, s: IntSuffix, negated: bool) {
+        let (min, max): (i128, i128) = match s {
+            IntSuffix::I8 => (-128, 127),
+            IntSuffix::I16 => (-32768, 32767),
+            IntSuffix::I32 => (i32::MIN as i128, i32::MAX as i128),
+            IntSuffix::I64 => (i64::MIN as i128, i64::MAX as i128),
+            IntSuffix::U8 => (0, 255),
+            IntSuffix::U16 => (0, 65535),
+            IntSuffix::U32 => (0, u32::MAX as i128),
+            IntSuffix::U64 => (0, u64::MAX as i128),
+        };
+        if negated {
+            if v == i64::MIN || v < 0 {
+                return;
+            }
+            let val = -(v as i128);
+            if val < min || val > max {
+                self.err(format!(
+                    "整数字面量 -{} 超出类型 {} 的取值范围",
+                    v,
+                    suffix_ty(s).name()
+                ));
+            }
+        } else {
+            if v < 0 {
+                return;
+            }
+            let val = v as i128;
+            if val < min || val > max {
+                self.err(format!(
+                    "整数字面量 {} 超出类型 {} 的取值范围",
+                    v,
+                    suffix_ty(s).name()
+                ));
+            }
+        }
+    }
+
+    /// 基础类型转换 `T(expr)` 的合法性（2.1.3(4) / 2.3.1(1)(5)）。
+    ///
+    /// - 数值类型与 Bool 之间不存在类型转换；
+    /// - Rune 只能转换为 UInt32，其余数值/浮点类型均不支持；
+    /// - `Rune(num)` 在 num 为编译期整数常量时必须落在 Unicode 标量值范围内。
+    fn check_builtin_conversion(&mut self, name: &str, args: &[Expr], arg_tys: &[Ty]) {
+        let Some(target) = primitive_ctor_ty(name) else {
+            return;
+        };
+        if args.len() != 1 || arg_tys.len() != 1 {
+            return;
+        }
+        let at = &arg_tys[0];
+        // 解析器可能把换行后的比较表达式并入调用实参（官方正例中存在该形态），
+        // 此时 AST 类型不可靠；仅对“可静态确定”的简单实参套用下面的类别规则。
+        let simple = simple_operand(&args[0]);
+        // Bool 实参还要求来源明确（布尔字面量或显式 `: Bool` 标注变量），
+        // 以免把解析器换行合并造成的伪 Bool 绑定误判为真实 Bool 实参。
+        let bool_origin = match &args[0] {
+            Expr::Bool(_) => true,
+            Expr::Var(n) => self.lookup(n).map_or(false, |v| v.explicit_bool),
+            _ => false,
+        };
+        match &target {
+            Ty::Int8
+            | Ty::Int16
+            | Ty::Int32
+            | Ty::Int64
+            | Ty::IntNative
+            | Ty::UInt8
+            | Ty::UInt16
+            | Ty::UInt32
+            | Ty::UInt64
+            | Ty::UIntNative
+            | Ty::Float16
+            | Ty::Float32
+            | Ty::Float64 => {
+                if simple && *at == Ty::Rune && target != Ty::UInt32 {
+                    self.err(format!(
+                        "不支持从 Rune 到 {} 的类型转换（仅支持 Rune → UInt32）",
+                        target.name()
+                    ));
+                } else if simple && *at == Ty::Bool && bool_origin {
+                    self.err(format!(
+                        "不支持 Bool 与数值类型之间的类型转换（{} → {}）",
+                        at.name(),
+                        target.name()
+                    ));
+                }
+            }
+            Ty::Bool => {
+                if simple && at.is_numeric() {
+                    self.err(format!(
+                        "不支持 Bool 与数值类型之间的类型转换（{} → Bool）",
+                        at.name()
+                    ));
+                }
+            }
+            Ty::Rune => {
+                if let Some(v) = self.const_int_of(&args[0]) {
+                    let scalar = (0..=0xD7FF).contains(&v) || (0xE000..=0x10FFFF).contains(&v);
+                    if !scalar {
+                        self.err(format!(
+                            "Rune({}) 的值不在 Unicode 标量值范围内（0x0000-0xD7FF / 0xE000-0x10FFFF）",
+                            v
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn check_incr_decr(&mut self, operand: &Expr, t: &Ty, prefix: bool) {
         if prefix {
             self.err("自增/自减运算符只能作为后缀使用".to_string());
@@ -2530,14 +2719,17 @@ impl<'a> Checker<'a> {
                     ));
                 }
             }
-            // 字面量等非左值：直接拒绝。
+            // 字面量、类型转换调用及其它右值形态：非左值，直接拒绝。
+            // （2.1.1.2(13)：`++`/`--` 只能作用于整数变量。）
             Expr::Integer(_)
             | Expr::IntegerSuffixed(_, _)
             | Expr::Float(_)
             | Expr::Float32(_)
             | Expr::Bool(_)
             | Expr::Rune(_)
-            | Expr::String(_) => {
+            | Expr::String(_)
+            | Expr::Call { .. }
+            | Expr::Cast { .. } => {
                 self.err("自增/自减运算符只能作用于整数变量".to_string());
             }
             // 字段/索引等左值保守跳过。
@@ -2600,6 +2792,16 @@ impl<'a> Checker<'a> {
             | BinOp::Gt
             | BinOp::LtEq
             | BinOp::GtEq => {
+                // 2.1.4(2)：Unit 只定义了 `==` / `!=` / `=`，关系运算符非法。
+                if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq)
+                    && (*lt == Ty::Unit || *rt == Ty::Unit)
+                {
+                    self.err(format!(
+                        "运算符 '{}' 未对 Unit 类型定义（Unit 仅支持 == 与 !=）",
+                        bin_symbol(op)
+                    ));
+                    return Ty::Bool;
+                }
                 if lt.is_definite() && rt.is_definite() && !compatible(lt, rt) {
                     self.err(format!(
                         "运算符 '{}' 要求两侧操作数类型相同: {} 与 {}",
@@ -2856,6 +3058,7 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
                     ty: Ty::Unknown,
                     mutable: true,
                     const_int: None,
+                    explicit_bool: false,
                 },
             );
         }
@@ -2877,6 +3080,7 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
                     ty: Ty::Unknown,
                     mutable: true,
                     const_int: None,
+                    explicit_bool: false,
                 },
             );
         }
@@ -3643,6 +3847,62 @@ mod tests {
         assert_err("main() { var a: UInt8 = 1; let x = a << 8 }", "越界");
         assert_ok("main() { var a: UInt8 = 1; let x = a << 7 }");
         assert_err("main() { var a: UInt32 = 1; let x = a >> 32 }", "越界");
+    }
+
+    #[test]
+    fn test_w7b_unit_assignment_and_comparison() {
+        // 2.1.4(1)：只有 `()` 可赋给 Unit。
+        assert_err("main() { let s: Int64 = 1; let u: Unit = s }", "Unit");
+        assert_ok("main() { let u: Unit = () }");
+        assert_ok("func f(): Unit {} main() { let u: Unit = f() }");
+        // 无 else 的 if 表达式类型为 Unit。
+        assert_ok("main() { let x = 1; let u: Unit = if (x > 0) { } }");
+        // 2.1.4(2)：Unit 只定义 == / !=，关系运算符非法。
+        assert_err("main() { var a: Unit; var b: Unit; a >= b }", "Unit");
+        assert_ok("main() { var a: Unit; var b: Unit; let c = a == b }");
+    }
+
+    #[test]
+    fn test_w7b_builtin_value_conversions() {
+        // 2.1.3(4)：数值与 Bool 之间不存在类型转换。
+        assert_err(
+            "main() { var b: Bool = true; var n: Int32 = 0; n = Int32(b) }",
+            "Bool",
+        );
+        assert_err("main() { let b = Bool(5) }", "Bool");
+        assert_ok("main() { var b: Bool = true; b = Bool(true) }");
+        // 2.3.1(1)：Rune 只能转 UInt32。
+        assert_err("main() { let a = 'o'; let x = Int8(a) }", "Rune");
+        assert_ok("main() { let a = 'o'; let x = UInt32(a) }");
+        // 2.3.1(5)：Rune(常量) 必须落在 Unicode 标量值范围。
+        assert_err("main() { let r = Rune(-1) }", "Rune");
+        assert_ok("main() { let r = Rune(65) }");
+    }
+
+    #[test]
+    fn test_w7b_incr_decr_on_conversion_call() {
+        // 2.1.1.2(13)：++/-- 只能作用于整数变量。
+        assert_err("main() { UInt64(16)++ }", "自增/自减");
+        assert_err("main() { Int32(8) as Int64-- }", "自增/自减");
+        assert_ok("main() { var x: UInt64 = 1; x++ }");
+    }
+
+    #[test]
+    fn test_w7b_suffixed_int_literal_range() {
+        assert_err("main() { let x = 32768i16 }", "超出类型 Int16");
+        assert_ok("main() { let x = -32768i16 }");
+        assert_err("main() { let x = -129i8 }", "超出类型 Int8");
+        assert_err("main() { let x = 128i8 }", "超出类型 Int8");
+        assert_err("main() { let x = 256u8 }", "超出类型 UInt8");
+        assert_ok("main() { let x = 255u8 }");
+    }
+
+    #[test]
+    fn test_w7b_int_literal_not_float() {
+        // 2.1.1.1(8)：纯整数字面量不能初始化浮点变量。
+        assert_err("main() { let f: Float64 = 983 }", "Float64");
+        assert_ok("main() { let f: Float64 = 983.0 }");
+        assert_ok("main() { let f: Float32 = 1e3 }");
     }
 
 }
