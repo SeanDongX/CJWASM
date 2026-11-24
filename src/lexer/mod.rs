@@ -72,6 +72,63 @@ pub fn process_multiline_string(s: &str) -> String {
         .join("\n")
 }
 
+/// 解析十六进制浮点字面量（仓颉规范 1.3：0x<hex>(.<hex>)?[pP]<sign><digits>）
+///
+/// 例如 `0x1.8p3` = 1.5 * 2^3 = 12.0，`0x1p-2` = 0.25，`0x.1p1` = 0.125。
+/// 下划线分隔符在解析前移除；尾数不允许为空。
+fn parse_hex_float_literal(s: &str) -> Option<f64> {
+    let s: String = s.chars().filter(|c| *c != '_').collect();
+    let (mantissa, exp_text) = s.split_once(['p', 'P'])?;
+    let exp: i32 = exp_text.parse().ok()?;
+    let mantissa = mantissa
+        .strip_prefix("0x")
+        .or_else(|| mantissa.strip_prefix("0X"))?;
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    let mut value = 0.0f64;
+    for c in int_part.chars() {
+        value = value * 16.0 + c.to_digit(16)? as f64;
+    }
+    let mut scale = 1.0 / 16.0;
+    for c in frac_part.chars() {
+        value += c.to_digit(16)? as f64 * scale;
+        scale /= 16.0;
+    }
+    Some(value * 2f64.powi(exp))
+}
+
+/// 跳过（并消耗）一个仓颉块注释，支持任意层嵌套（规范 1.5(2)）。
+///
+/// `/*` 已由 token 匹配消耗，remainder() 为注释正文起点。返回 Skip 时
+/// logos 会同时消耗 bump() 推进的部分。
+fn lex_block_comment(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<(), ()> {
+    let remainder = lex.remainder();
+    let bytes = remainder.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                lex.bump(i);
+                return logos::FilterResult::Skip;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    logos::FilterResult::Error(())
+}
+
 /// 解析多行字符串 """..."""，返回内容（不含引号）和消耗的字节数
 fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<String> {
     let remainder = lex.remainder();
@@ -324,8 +381,8 @@ pub enum StringOrInterpolated {
 #[logos(skip r"[ \t\r\n]+")] // 跳过空白
 #[logos(skip r"//[^\n]*")] // 跳过单行注释
 pub enum Token {
-    // 块注释 /* ... */（在 next() 中过滤不发射，与 vendor 版权头兼容）
-    #[regex(r"/\*(?:[^*]|\*+[^*/])*\*/")]
+    // 块注释 /* ... */：支持嵌套（规范 1.5(2)），由 callback 手工计数深度后跳过
+    #[token("/*", lex_block_comment)]
     BlockComment,
     // 关键字
     #[token("func")]
@@ -521,10 +578,15 @@ pub enum Token {
     #[token("Map", priority = 1)]
     TypeMap,
 
-    // Float64：小数或科学计数法（无后缀）
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
+    // Float64：小数、科学计数法（无后缀）或十六进制浮点（规范 1.3）
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*|0[xX][0-9a-fA-F_]*(\.[0-9a-fA-F_]*)?[pP][+-]?[0-9][0-9_]*", |lex| {
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
-        s.parse::<f64>().ok()
+        if s.starts_with("0x") || s.starts_with("0X") {
+            // 十六进制浮点：0x1.8p3 / 0xA.BP-10 / 0x.1p1（十六进制无类型后缀）
+            parse_hex_float_literal(&s)
+        } else {
+            s.parse::<f64>().ok()
+        }
     })]
     Float(f64),
 
@@ -536,22 +598,32 @@ pub enum Token {
     })]
     Float64Suffix(f64),
 
-    // Float32：f 或 f32 后缀
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f32|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f32|[0-9][0-9_]*f32|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
+    // Float32：f 或 f32 后缀；f16 后缀（Float16 在 wasm 目标下按 f32 处理）
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f32|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f32|[0-9][0-9_]*f32|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f16|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f16|[0-9][0-9_]*f16|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
-        let s = s.trim_end_matches("f32").trim_end_matches('f');
+        let s = s
+            .trim_end_matches("f32")
+            .trim_end_matches("f16")
+            .trim_end_matches('f');
         s.parse::<f32>().ok()
     })]
     Float32(f32),
 
-    #[regex(r"0[xX][0-9a-fA-F][0-9a-fA-F_]*|0o[0-7][0-7_]*|0b[01][01_]*|[0-9][0-9_]*", |lex| {
+    // 整数字面量（含可选的 Cangjie 类型后缀 i8/i16/i32/i64/u8/u16/u32/u64）
+    #[regex(r"0[xX][0-9a-fA-F][0-9a-fA-F_]*(?:i8|i16|i32|i64|u8|u16|u32|u64)?|0o[0-7][0-7_]*(?:i8|i16|i32|i64|u8|u16|u32|u64)?|0b[01][01_]*(?:i8|i16|i32|i64|u8|u16|u32|u64)?|[0-9][0-9_]*(?:i8|i16|i32|i64|u8|u16|u32|u64)?", |lex| {
         let slice = lex.slice();
         let s: String = slice.chars().filter(|c| *c != '_').collect();
+        // 去掉可选的 Cangjie 整数类型后缀（i8/i16/i32/i64/u8/u16/u32/u64）
+        let body = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"]
+            .iter()
+            .find_map(|sfx| s.strip_suffix(sfx))
+            .filter(|b| !b.is_empty())
+            .unwrap_or(s.as_str());
         if slice.len() >= 2 && (slice.starts_with("0x") || slice.starts_with("0X")) {
-            i64::from_str_radix(&s[2..], 16).ok().or_else(|| u64::from_str_radix(&s[2..], 16).ok().map(|v| v as i64))
-        } else if slice.starts_with("0o") { i64::from_str_radix(&s[2..], 8).ok().or_else(|| u64::from_str_radix(&s[2..], 8).ok().map(|v| v as i64)) }
-        else if slice.starts_with("0b") { i64::from_str_radix(&s[2..], 2).ok().or_else(|| u64::from_str_radix(&s[2..], 2).ok().map(|v| v as i64)) }
-        else { s.parse::<i64>().ok().or_else(|| s.parse::<u64>().ok().map(|v| v as i64)) }
+            i64::from_str_radix(&body[2..], 16).ok().or_else(|| u64::from_str_radix(&body[2..], 16).ok().map(|v| v as i64))
+        } else if slice.starts_with("0o") { i64::from_str_radix(&body[2..], 8).ok().or_else(|| u64::from_str_radix(&body[2..], 8).ok().map(|v| v as i64)) }
+        else if slice.starts_with("0b") { i64::from_str_radix(&body[2..], 2).ok().or_else(|| u64::from_str_radix(&body[2..], 2).ok().map(|v| v as i64)) }
+        else { body.parse::<i64>().ok().or_else(|| body.parse::<u64>().ok().map(|v| v as i64)) }
     })]
     Integer(i64),
 
@@ -612,6 +684,11 @@ pub enum Token {
                 Some('\\') => Some('\\'),
                 Some('0') => Some('\0'),
                 Some('\'') => Some('\''),
+                Some('u') => {
+                    // \u{XXXX} unicode escape
+                    let hex = &inner[3..inner.len() - 1];
+                    u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                }
                 _ => None,
             }
         } else {
@@ -1200,5 +1277,159 @@ mod tests {
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(tokens[0], Token::RuneLit('A'));
         assert_eq!(tokens[1], Token::RuneLit('\n'));
+    }
+
+    #[test]
+    fn test_block_comment_nested_two_levels() {
+        // 规范 1.5(2)：/* /* inner */ */ 为单个注释，后续代码正常词法
+        let source = "let a = 1 /* /* inner */ */ let b = 2";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Let);
+        assert_eq!(tokens[1], Token::Ident("a".to_string()));
+        assert_eq!(tokens[3], Token::Integer(1));
+        // 注释整体被跳过，紧接着是 let b = 2
+        assert_eq!(tokens[4], Token::Let);
+        assert_eq!(tokens[5], Token::Ident("b".to_string()));
+        assert_eq!(tokens[7], Token::Integer(2));
+    }
+
+    #[test]
+    fn test_block_comment_nested_three_levels() {
+        let source = "/* outer /* middle /* inner */ middle */ outer */ let x = 7";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Let);
+        assert_eq!(tokens[1], Token::Ident("x".to_string()));
+        assert_eq!(tokens[3], Token::Integer(7));
+    }
+
+    #[test]
+    fn test_block_comment_nested_spans_whole_comment() {
+        // 保证嵌套注释被完整消耗（span 覆盖到最外层 */ 之后）
+        let source = "/* a /* b */ c */x";
+        let lexer = Lexer::new(source);
+        let toks: Vec<_> = lexer.collect();
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0], Ok((17, Token::Ident("x".to_string()), 18)));
+    }
+
+    #[test]
+    fn test_block_comment_unterminated_is_error() {
+        let source = "let a = 1 /* /* no end";
+        let lexer = Lexer::new(source);
+        let toks: Vec<_> = lexer.collect();
+        assert!(toks.iter().any(|t| t.is_err()));
+    }
+
+    #[test]
+    fn test_rune_literal_unicode() {
+        // CJK 字符（3 字节 UTF-8）与增补平面字符（4 字节 UTF-8）
+        let source = "r'严' r'𐐷'";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::RuneLit('严'));
+        assert_eq!(tokens[1], Token::RuneLit('𐐷'));
+    }
+
+    #[test]
+    fn test_rune_literal_unicode_escape() {
+        let source = r"r'\u{4e25}' r'\u{10437}'";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::RuneLit('严'));
+        assert_eq!(tokens[1], Token::RuneLit('𐐷'));
+    }
+
+    #[test]
+    fn test_char_literal_unicode() {
+        let source = "'严' '𐐷'";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::CharLit('严'));
+        assert_eq!(tokens[1], Token::CharLit('𐐷'));
+    }
+
+    #[test]
+    fn test_hex_float_literals() {
+        // 0x1.8p3 = 1.5 * 2^3 = 12.0；0x1p-2 = 0.25；0x.1p1 = 0.125
+        let source = "0x1.8p3 0x1p-2 0x.1p1";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        match tokens[0] {
+            Token::Float(v) => assert!((v - 12.0).abs() < 1e-12, "got {}", v),
+            ref other => panic!("Expected Float, got {:?}", other),
+        }
+        match tokens[1] {
+            Token::Float(v) => assert!((v - 0.25).abs() < 1e-12, "got {}", v),
+            ref other => panic!("Expected Float, got {:?}", other),
+        }
+        match tokens[2] {
+            Token::Float(v) => assert!((v - 0.125).abs() < 1e-12, "got {}", v),
+            ref other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hex_float_uppercase_and_negative_exp() {
+        // 0xA.BP-10 = (10 + 11/16) * 2^-10
+        let source = "0xA.BP-10 0X1P+4";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        match tokens[0] {
+            Token::Float(v) => {
+                let expected = (10.0 + 11.0 / 16.0) * 2f64.powi(-10);
+                assert!((v - expected).abs() < 1e-15, "got {}", v);
+            }
+            ref other => panic!("Expected Float, got {:?}", other),
+        }
+        assert_eq!(tokens[1], Token::Float(16.0));
+    }
+
+    #[test]
+    fn test_hex_float_with_underscores() {
+        let source = "0x1_0.8p1";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        // 0x10.8 = 16.5，* 2 = 33.0
+        assert_eq!(tokens[0], Token::Float(33.0));
+    }
+
+    #[test]
+    fn test_hex_integer_not_confused_with_hex_float() {
+        let source = "0x1F 0xABCD 0o17 0b1010";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Integer(0x1F));
+        assert_eq!(tokens[1], Token::Integer(0xABCD));
+        assert_eq!(tokens[2], Token::Integer(0o17));
+        assert_eq!(tokens[3], Token::Integer(0b1010));
+    }
+
+    #[test]
+    fn test_integer_type_suffixes() {
+        let source = "55i8 300i32 0b110111_i8 0x1Fi8 7u64";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Integer(55));
+        assert_eq!(tokens[1], Token::Integer(300));
+        assert_eq!(tokens[2], Token::Integer(55));
+        assert_eq!(tokens[3], Token::Integer(31));
+        assert_eq!(tokens[4], Token::Integer(7));
+    }
+
+    #[test]
+    fn test_float16_suffix() {
+        let source = "2.003E4f16 1.5f16";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        match tokens[0] {
+            Token::Float32(v) => assert!((v - 20030.0).abs() < 0.01),
+            ref other => panic!("Expected Float32, got {:?}", other),
+        }
+        match tokens[1] {
+            Token::Float32(v) => assert!((v - 1.5).abs() < 1e-6),
+            ref other => panic!("Expected Float32, got {:?}", other),
+        }
     }
 }

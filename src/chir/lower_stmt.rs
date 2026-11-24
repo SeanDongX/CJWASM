@@ -940,6 +940,39 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_var_wildcard_discard() {
+        // var _ = expr → 求值右侧并丢弃，降低为 CHIRStmt::Expr
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let stmt = Stmt::Var {
+            pattern: Pattern::Wildcard,
+            ty: None,
+            value: Expr::Integer(42),
+        };
+        let chir = ctx.lower_stmt(&stmt).unwrap();
+        assert!(matches!(chir, CHIRStmt::Expr(_)));
+    }
+
+    #[test]
+    fn test_lower_let_wildcard_discard() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let stmt = Stmt::Let {
+            pattern: Pattern::Wildcard,
+            ty: Some(Type::Int64),
+            value: Expr::Integer(7),
+        };
+        let chir = ctx.lower_stmt(&stmt).unwrap();
+        assert!(matches!(chir, CHIRStmt::Expr(_)));
+    }
+
+    #[test]
     fn test_lower_assign_local() {
         let mut type_ctx = TypeInferenceContext::new();
         type_ctx.add_local("x".into(), Type::Int64);

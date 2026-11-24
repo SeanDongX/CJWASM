@@ -212,6 +212,49 @@ impl Parser {
         Ok(ty)
     }
 
+    /// 解析 VArray<T, N> 中的长度实参（编译期常量，如 `4`、`$3`、常量名或简单常量表达式）。
+    ///
+    /// 兼容优先：只提取可直接识别的单个整数字面量（可带 `$` 前缀），其余常量表达式
+    /// token 全部消费但不求值，返回 None。调用返回后当前 token 停在顶层 `,`/`>`/`>>`。
+    pub(crate) fn parse_varray_len(&mut self) -> Result<Option<i64>, ParseErrorAt> {
+        let mut value = None;
+        if self.check(&Token::Dollar) {
+            self.advance();
+        }
+        // 仅当恰好是一个整数字面量时才记录长度值
+        if let Some(Token::Integer(n)) = self.peek().cloned() {
+            let is_single_literal = matches!(
+                self.peek_at(1),
+                Some(Token::Comma | Token::Gt | Token::Shr)
+            );
+            if is_single_literal {
+                value = Some(n);
+            }
+        }
+        // 消费剩余常量表达式 token（跟踪 (), [], {} 嵌套）
+        let mut depth: i32 = 0;
+        loop {
+            match self.peek() {
+                None => return self.bail(ParseError::UnexpectedEof),
+                Some(Token::Comma) | Some(Token::Gt) if depth == 0 => break,
+                Some(Token::Shr) if depth == 0 => break,
+                Some(tok) => {
+                    match tok {
+                        Token::LParen | Token::LBracket | Token::LBrace => depth += 1,
+                        Token::RParen | Token::RBracket | Token::RBrace => {
+                            if depth > 0 {
+                                depth -= 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.advance();
+                }
+            }
+        }
+        Ok(value)
+    }
+
     /// 解析基础类型（不含 ? ! 后缀）
     pub(crate) fn parse_base_type(&mut self) -> Result<Type, ParseErrorAt> {
         match self.advance() {
@@ -274,6 +317,25 @@ impl Parser {
                 self.expect(Token::Lt)?;
                 let elem_type = self.parse_type()?;
                 self.expect(Token::Gt)?;
+                Ok(Type::Array(Box::new(elem_type)))
+            }
+            // VArray<T, N>：值类型定长数组，兼容优先降级为 Array<T>（N 为编译期常量，仅消费不求值）
+            Some(Token::TypeVArray) => {
+                self.expect(Token::Lt)?;
+                let elem_type = self.parse_type()?;
+                self.expect(Token::Comma)?;
+                let _len = self.parse_varray_len()?;
+                if self.check(&Token::Gt) {
+                    self.advance();
+                } else if self.check(&Token::Shr) {
+                    self.advance();
+                    self.pushback = Some(Token::Gt);
+                } else {
+                    return self.bail(ParseError::UnexpectedToken(
+                        self.peek().cloned().unwrap_or(Token::Gt),
+                        "`>`".to_string(),
+                    ));
+                }
                 Ok(Type::Array(Box::new(elem_type)))
             }
             Some(Token::TypeTuple) => {

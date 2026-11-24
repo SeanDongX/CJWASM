@@ -3585,6 +3585,14 @@ impl CodeGen {
                 }
             }
             Stmt::Var { pattern, value, .. } => {
+                // var _ = expr → 编译表达式后 drop 结果值（丢弃绑定）
+                if matches!(pattern, Pattern::Wildcard) {
+                    self.compile_expr(value, locals, func, loop_ctx);
+                    if self.expr_produces_value(value) {
+                        func.instruction(&Instruction::Drop);
+                    }
+                    return;
+                }
                 self.compile_expr(value, locals, func, loop_ctx);
                 match pattern {
                     Pattern::Binding(name) => {

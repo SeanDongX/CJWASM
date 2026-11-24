@@ -140,6 +140,10 @@ impl Parser {
                         Pattern::Binding(first)
                     }
                 };
+                // cjc: let x!: T — `!` 表示确定赋值声明（无初始化式），仅作语法修饰
+                if self.check(&Token::Bang) {
+                    self.advance();
+                }
                 let ty = if self.check(&Token::Colon) {
                     self.advance();
                     Some(self.parse_type()?)
@@ -167,16 +171,21 @@ impl Parser {
                 let pattern = if self.check(&Token::LParen) {
                     self.parse_pattern()?
                 } else {
-                    let name = match self.advance() {
-                        Some(Token::Ident(name)) => name,
+                    match self.advance() {
+                        Some(Token::Ident(name)) => Pattern::Binding(name),
+                        // cjc: var _ = expr — 求值右侧后丢弃（丢弃绑定）
+                        Some(Token::Underscore) => Pattern::Wildcard,
                         Some(tok) => {
                             return self
                                 .bail(ParseError::UnexpectedToken(tok, "变量名".to_string()))
                         }
                         None => return self.bail(ParseError::UnexpectedEof),
-                    };
-                    Pattern::Binding(name)
+                    }
                 };
+                // cjc: var x!: T — `!` 表示确定赋值声明（无初始化式），仅作语法修饰
+                if self.check(&Token::Bang) {
+                    self.advance();
+                }
                 let ty = if self.check(&Token::Colon) {
                     self.advance();
                     Some(self.parse_type()?)
@@ -457,6 +466,10 @@ impl Parser {
                     Some(Token::AndEq) => (true, Some(BinOp::BitAnd)),
                     Some(Token::PipeEq) => (true, Some(BinOp::BitOr)),
                     Some(Token::CaretEq) => (true, Some(BinOp::BitXor)),
+                    // a ||= b → a = a || b（短路由 Binary(LogicalOr) 保证）
+                    Some(Token::OrOrEq) => (true, Some(BinOp::LogicalOr)),
+                    // a &&= b → a = a && b
+                    Some(Token::AndAndEq) => (true, Some(BinOp::LogicalAnd)),
                     _ => (false, None),
                 };
                 if is_assign {

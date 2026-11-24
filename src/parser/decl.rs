@@ -4,7 +4,126 @@ use super::{ParseError, ParseErrorAt, Parser};
 use crate::ast::*;
 use crate::lexer::{StringOrInterpolated, Token};
 
+/// 成员声明修饰符集合。仓颉允许成员修饰符以任意顺序出现
+/// （如 `static public var`、`public override open func`），因此统一循环收集。
+#[derive(Default, Clone)]
+pub(crate) struct MemberModifiers {
+    pub visibility: Option<Visibility>,
+    pub is_static: bool,
+    /// const 作为 func / init 的前缀修饰符（常量求值语义，本阶段按普通 func/init 处理）
+    pub is_const: bool,
+    pub is_override: bool,
+    pub is_open: bool,
+    pub is_operator: bool,
+    pub is_unsafe: bool,
+    pub is_mut: bool,
+}
+
 impl Parser {
+    /// 循环收集成员声明前的修饰符（任意顺序）。
+    /// 只消费确定属于修饰符的 token：`const` 仅在后跟 `func`/`init` 时作为修饰符消费，
+    /// 否则留给调用方按常量声明处理。
+    pub(crate) fn parse_member_modifiers(&mut self) -> MemberModifiers {
+        let mut m = MemberModifiers::default();
+        loop {
+            match self.peek() {
+                Some(Token::Public) => {
+                    self.advance();
+                    m.visibility = Some(Visibility::Public);
+                }
+                Some(Token::Private) => {
+                    self.advance();
+                    m.visibility = Some(Visibility::Private);
+                }
+                Some(Token::Protected) => {
+                    self.advance();
+                    m.visibility = Some(Visibility::Protected);
+                }
+                Some(Token::Internal) => {
+                    self.advance();
+                    m.visibility = Some(Visibility::Internal);
+                }
+                Some(Token::Static) => {
+                    self.advance();
+                    m.is_static = true;
+                }
+                Some(Token::Mut) => {
+                    self.advance();
+                    m.is_mut = true;
+                }
+                Some(Token::Override) => {
+                    self.advance();
+                    m.is_override = true;
+                }
+                Some(Token::Redef) => {
+                    self.advance();
+                    m.is_override = true;
+                }
+                Some(Token::Open) | Some(Token::Abstract) | Some(Token::Sealed) => {
+                    self.advance();
+                    m.is_open = true;
+                }
+                Some(Token::Operator) => {
+                    self.advance();
+                    m.is_operator = true;
+                }
+                Some(Token::Unsafe) => {
+                    self.advance();
+                    m.is_unsafe = true;
+                }
+                Some(Token::Const)
+                    if matches!(self.peek_next(), Some(Token::Func) | Some(Token::Init)) =>
+                {
+                    self.advance();
+                    m.is_const = true;
+                }
+                _ => break,
+            }
+        }
+        m
+    }
+
+    /// 将运算符重载声明中的运算符 token 转为内部方法名（如 `**` → `op_pow`）。
+    /// 调用前当前 token 应位于运算符处；`[]` / `()` 会额外消费右括号。
+    fn parse_operator_name(&mut self) -> Result<&'static str, ParseErrorAt> {
+        let op = match self.advance() {
+            Some(Token::Plus) => "op_add",
+            Some(Token::Minus) => "op_sub",
+            Some(Token::Star) => "op_mul",
+            Some(Token::StarStar) => "op_pow",
+            Some(Token::Slash) => "op_div",
+            Some(Token::Percent) => "op_mod",
+            Some(Token::Eq) => "op_eq",
+            Some(Token::NotEq) => "op_ne",
+            Some(Token::Lt) => "op_lt",
+            Some(Token::Gt) => "op_gt",
+            Some(Token::LtEq) => "op_le",
+            Some(Token::GtEq) => "op_ge",
+            Some(Token::Shl) => "op_shl",
+            Some(Token::Shr) => "op_shr",
+            Some(Token::Bang) => "op_not",
+            Some(Token::And) => "op_bitand",
+            Some(Token::Pipe) => "op_bitor",
+            Some(Token::Caret) => "op_bitxor",
+            Some(Token::AndAnd) => "op_and",
+            Some(Token::OrOr) => "op_or",
+            Some(Token::Tilde) => "op_bitnot",
+            Some(Token::LBracket) => {
+                self.expect(Token::RBracket)?;
+                "op_index"
+            }
+            Some(Token::LParen) => {
+                self.expect(Token::RParen)?;
+                "op_call"
+            }
+            Some(tok) => {
+                return self.bail(ParseError::UnexpectedToken(tok, "运算符".to_string()))
+            }
+            None => return self.bail(ParseError::UnexpectedEof),
+        };
+        Ok(op)
+    }
+
     pub fn parse_program(&mut self) -> Result<Program, ParseErrorAt> {
         let mut package_name = None;
         let mut imports = Vec::new();
@@ -290,6 +409,11 @@ impl Parser {
                     // cjc: main() 无需 func 关键字 (main 是保留字)
                     Some(Token::Main) => {
                         functions.push(self.parse_main_function(visibility)?);
+                    }
+                    // cjc: const func — const 作为函数前缀（常量求值语义），本阶段按普通函数解析
+                    Some(Token::Const) if matches!(self.peek_next(), Some(Token::Func)) => {
+                        self.advance(); // consume const
+                        functions.push(self.parse_function_with_visibility(visibility)?)
                     }
                     // cjc: 顶层常量 let/var/const name: Type = expr
                     Some(Token::Let) | Some(Token::Var) | Some(Token::Const) => {
@@ -587,12 +711,8 @@ impl Parser {
         let mut methods = Vec::new();
 
         while !self.check(&Token::RBrace) {
-            // cjc 兼容: 主构造函数前可有可见性，如 public StructName(...)
-            if self.check(&Token::Public) || self.check(&Token::Private)
-                || self.check(&Token::Protected) || self.check(&Token::Internal)
-            {
-                self.advance();
-            }
+            // 成员修饰符可任意顺序组合（public static var / static public var / ...）
+            let mods = self.parse_member_modifiers();
             // cjc 兼容: struct 主构造函数 StructName(var a: T, var b: U) { } — 参数即字段
             if matches!(self.peek(), Some(Token::Ident(ref n)) if n == &name)
                 && matches!(self.peek_next(), Some(Token::LParen))
@@ -617,12 +737,22 @@ impl Parser {
                                 .bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
                         }
                     };
+                    // cjc: 必需命名参数 name!: Type = default，或确定赋值声明
+                    if self.check(&Token::Bang) {
+                        self.advance();
+                    }
                     self.expect(Token::Colon)?;
                     let ty = self.parse_type()?;
+                    let default = if self.check(&Token::Assign) {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
                     fields.push(FieldDef {
                         name: param_name,
                         ty,
-                        default: None,
+                        default,
                     });
                     if !self.check(&Token::Comma) {
                         break;
@@ -648,12 +778,8 @@ impl Parser {
                 continue;
             }
 
-            // cjc 兼容: [const] init 构造函数 — 解析并忽略 body（cjwasm 通过字段顺序构造）
-            let is_const_init = self.check(&Token::Const) && matches!(self.peek_next(), Some(Token::Init));
-            if self.check(&Token::Init) || is_const_init {
-                if is_const_init {
-                    self.advance(); // consume 'const'
-                }
+            // cjc 兼容: init 构造函数（const init 的 const 已由修饰符收集）— 解析并忽略 body
+            if self.check(&Token::Init) {
                 self.advance(); // consume 'init'
                 self.expect(Token::LParen)?;
                 let _params = self.parse_params()?;
@@ -677,7 +803,12 @@ impl Parser {
                 // 预设 receiver_name 使方法体内 this 可用
                 let prev_receiver = self.receiver_name.clone();
                 self.receiver_name = Some("this".to_string());
-                let mut func = self.parse_function_with_visibility(Visibility::Public)?;
+                if mods.is_operator {
+                    self.parsing_operator_func = true;
+                }
+                let mut func = self.parse_function_with_visibility(
+                    mods.visibility.clone().unwrap_or(Visibility::Public),
+                )?;
                 self.receiver_name = prev_receiver;
                 // 重命名为 StructName.methodName
                 if !func.name.contains('.') {
@@ -711,35 +842,7 @@ impl Parser {
                 continue;
             }
 
-            // 普通字段
-            // cjc 兼容: 跳过可选的可见性、static、及 var/let 前缀 (public/private [static] var/let name: Type)
-            if self.check(&Token::Public) || self.check(&Token::Private)
-                || self.check(&Token::Protected) || self.check(&Token::Internal)
-            {
-                self.advance();
-            }
-            // static 后跟 let/var/const → 静态字段，消费 static；static 后跟 func/init 等 → 下一轮匹配 Func 等，消费 static 并 continue
-            if self.check(&Token::Static) {
-                match self.peek_next() {
-                    Some(Token::Let) | Some(Token::Var) | Some(Token::Const) => {
-                        self.advance(); // 静态字段
-                    }
-                    _ => {
-                        self.advance(); // static func / static init 等，交给下一轮
-                        continue;
-                    }
-                }
-            }
-            // public override operator func ... → 跳过修饰符，下一轮匹配 Func；若消费了 operator 则设标志供 parse_function 解析运算符名
-            while self.check(&Token::Override) || self.check(&Token::Operator) || self.check(&Token::Mut) {
-                if self.check(&Token::Operator) {
-                    self.parsing_operator_func = true;
-                }
-                self.advance();
-            }
-            if self.check(&Token::Func) {
-                continue; // 下一轮循环会匹配上面的「if self.check(&Token::Func)」并解析方法
-            }
+            // 普通字段（可见性/static/var/let 等修饰符已由 parse_member_modifiers 收集）
             // prop name: Type { get() { ... } set(value) { ... } } — 与带主构造分支相同逻辑
             if self.check(&Token::Prop) {
                 self.advance();
@@ -854,6 +957,10 @@ impl Parser {
                 }
                 None => return self.bail(ParseError::UnexpectedEof),
             };
+            // cjc: 字段确定赋值声明 name!: Type（`!` 仅作语法修饰）
+            if self.check(&Token::Bang) {
+                self.advance();
+            }
             // 支持 name = expr（无类型）或 name: Type [= expr]
             let (ty, default) = if self.check(&Token::Assign) {
                 self.advance();
@@ -1009,14 +1116,8 @@ impl Parser {
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
         while !self.check(&Token::RBrace) {
-            // cjc 兼容: 跳过 enum 内方法前的可见性修饰符（如 public operator func）
-            while self.check(&Token::Public)
-                || self.check(&Token::Private)
-                || self.check(&Token::Protected)
-                || self.check(&Token::Internal)
-            {
-                self.advance();
-            }
+            // cjc 兼容: enum 成员修饰符可任意顺序（如 public operator func）
+            let mods = self.parse_member_modifiers();
             // cjc 兼容: enum 内部 prop 声明，解析后丢弃
             if self.check(&Token::Prop) {
                 self.advance(); // consume prop
@@ -1038,16 +1139,16 @@ impl Parser {
                 }
                 continue;
             }
-            // cjc 兼容: operator func（与 class 一致，由 parse_function 按运算符解析）
-            if self.check(&Token::Operator) {
-                self.parsing_operator_func = true;
-                self.advance();
-            }
             // cjc 兼容: enum 内部方法 → 转为外部方法 func EnumName.method(this, ...)
             if self.check(&Token::Func) {
                 let prev_receiver = self.receiver_name.clone();
                 self.receiver_name = Some("this".to_string());
-                let mut func = self.parse_function_with_visibility(Visibility::Public)?;
+                if mods.is_operator {
+                    self.parsing_operator_func = true;
+                }
+                let mut func = self.parse_function_with_visibility(
+                    mods.visibility.clone().unwrap_or(Visibility::Public),
+                )?;
                 self.receiver_name = prev_receiver;
                 if !func.name.contains('.') {
                     func.name = format!("{}.{}", name, func.name);
@@ -1315,29 +1416,29 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 continue;
             }
-            // cjc: 接口方法可有 static / public / protected / override / mut 修饰符（忽略）
-            while self.check(&Token::Static)
-                || self.check(&Token::Public)
-                || self.check(&Token::Protected)
-                || self.check(&Token::Override)
-                || self.check(&Token::Open)
-                || self.check(&Token::Mut)
-            {
-                self.advance();
-            }
+            // cjc: 接口方法修饰符可任意顺序（static / public / override / mut / const / operator ...）
+            let mods = self.parse_member_modifiers();
             // After consuming modifiers, could still be prop or func
             if self.check(&Token::Prop) {
                 // continue循环头部会重新处理 prop
                 continue;
             }
             self.expect(Token::Func)?;
-            let m_name = match self.advance() {
-                Some(Token::Ident(n)) => n,
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string()))
+            let m_name = if mods.is_operator {
+                self.parse_operator_name()?.to_string()
+            } else {
+                match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => {
+                        return self.bail(ParseError::UnexpectedToken(tok, "方法名".to_string()))
+                    }
+                    None => return self.bail(ParseError::UnexpectedEof),
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
+            // 泛型方法签名：func name<A, B: Bound>(...)
+            let (iface_type_params, _) = self.parse_type_params_with_constraints()?;
+            let prev_type_params =
+                std::mem::replace(&mut self.current_type_params, iface_type_params);
             self.expect(Token::LParen)?;
             let params = self.parse_params()?;
             self.expect(Token::RParen)?;
@@ -1382,6 +1483,7 @@ impl Parser {
                 }
                 None
             };
+            self.current_type_params = prev_type_params;
             methods.push(crate::ast::InterfaceMethod {
                 name: m_name,
                 params,
@@ -1531,16 +1633,8 @@ impl Parser {
         let mut methods = Vec::new();
         let mut assoc_type_bindings = Vec::new();
         while !self.check(&Token::RBrace) {
-            // 跳过可见性修饰符 (public / private / protected / internal)
-            while matches!(
-                self.peek(),
-                Some(Token::Public)
-                    | Some(Token::Private)
-                    | Some(Token::Protected)
-                    | Some(Token::Internal)
-            ) {
-                self.advance();
-            }
+            // 成员修饰符可任意顺序组合（public static func / static public ...）
+            let mods = self.parse_member_modifiers();
             // 关联类型绑定: type Element = ConcreteType; (cjc: type 是保留字)
             if matches!(self.peek(), Some(Token::TypeAlias)) {
                 self.advance(); // consume "type"
@@ -1563,21 +1657,7 @@ impl Parser {
                 continue;
             }
             // 方法: [public/private/...] func name(args): Ret { body } (cjc 兼容)
-            let member_vis = if self.check(&Token::Public) {
-                self.advance();
-                crate::ast::Visibility::Public
-            } else if self.check(&Token::Private) {
-                self.advance();
-                crate::ast::Visibility::Private
-            } else if self.check(&Token::Protected) {
-                self.advance();
-                crate::ast::Visibility::Protected
-            } else if self.check(&Token::Internal) {
-                self.advance();
-                crate::ast::Visibility::Internal
-            } else {
-                crate::ast::Visibility::default()
-            };
+            let member_vis = mods.visibility.clone().unwrap_or_default();
             // prop in extend block: prop name: Type { get() { ... } set(v) { ... } }
             if self.check(&Token::Prop) {
                 self.advance();
@@ -1679,9 +1759,9 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 continue;
             }
-            // cjc 兼容: extend 内方法前可带 static / override / operator，跳过后由 parse_function 解析
-            while self.check(&Token::Static) || self.check(&Token::Override) || self.check(&Token::Operator) {
-                self.advance();
+            // cjc 兼容: extend 内方法修饰符（static / override / operator 等）已由 parse_member_modifiers 收集
+            if mods.is_operator {
+                self.parsing_operator_func = true;
             }
             let prev_receiver = self.receiver_name.clone();
             self.receiver_name = Some("this".to_string());
@@ -1806,6 +1886,11 @@ impl Parser {
                         return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string()));
                     }
                 };
+                // cjc: 必需命名参数 name!: Type（此处仅消费 `!`，不改变调用匹配，
+                // 保证默认值仍可按位置调用）
+                if self.check(&Token::Bang) {
+                    self.advance();
+                }
                 let (pty, pdefault) = if self.check(&Token::Colon) {
                     self.advance();
                     let pty = self.parse_type()?;
@@ -1871,25 +1956,9 @@ impl Parser {
         let mut deinit = None;
         let mut methods = Vec::new();
         while !self.check(&Token::RBrace) {
-            let member_vis = if self.check(&Token::Private) {
-                self.advance();
-                crate::ast::Visibility::Private
-            } else if self.check(&Token::Public) {
-                self.advance();
-                crate::ast::Visibility::Public
-            } else if self.check(&Token::Protected) {
-                self.advance();
-                crate::ast::Visibility::Protected
-            } else if self.check(&Token::Internal) {
-                self.advance();
-                crate::ast::Visibility::Internal
-            } else {
-                crate::ast::Visibility::default()
-            };
-            // 跳过 mut 修饰符（如 public mut prop）
-            if self.check(&Token::Mut) {
-                self.advance();
-            }
+            // 成员修饰符可任意顺序组合（public static var / static public var / ...）
+            let mods = self.parse_member_modifiers();
+            let member_vis = mods.visibility.clone().unwrap_or_default();
             if self.check(&Token::Var) || self.check(&Token::Let) {
                 self.advance();
                 let f_name = match self.advance() {
@@ -1899,6 +1968,10 @@ impl Parser {
                     }
                     None => return self.bail(ParseError::UnexpectedEof),
                 };
+                // cjc: 字段确定赋值声明 name!: Type（`!` 仅作语法修饰）
+                if self.check(&Token::Bang) {
+                    self.advance();
+                }
                 // 支持 let name = expr（无类型）或 let name: Type [= expr]
                 let (ty, default) = if self.check(&Token::Assign) {
                     self.advance();
@@ -1937,6 +2010,30 @@ impl Parser {
                     default,
                 });
             } else if self.check(&Token::Init) {
+                if mods.is_static {
+                    // static init() { ... } — 静态初始化块，编译为 ClassName.__static_init
+                    self.advance(); // consume init
+                    self.expect(Token::LParen)?;
+                    self.expect(Token::RParen)?;
+                    self.expect(Token::LBrace)?;
+                    let body = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    methods.push(crate::ast::ClassMethod {
+                        func: Function {
+                            visibility: member_vis.clone(),
+                            name: format!("{}.__static_init", name),
+                            type_params: vec![],
+                            constraints: vec![],
+                            params: vec![],
+                            return_type: None,
+                            throws: None,
+                            body,
+                            extern_import: None,
+                        },
+                        override_: false,
+                    });
+                    continue;
+                }
                 self.advance();
                 self.expect(Token::LParen)?;
                 let params = self.parse_params()?;
@@ -2004,7 +2101,7 @@ impl Parser {
                             self.receiver_name = None;
                             // 脱糖为 getter 方法: ClassName.__get_propName(this): Type
                             methods.push(crate::ast::ClassMethod {
-                                override_: false,
+                                override_: mods.is_override,
                                 func: crate::ast::Function {
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__get_{}", name, prop_name),
@@ -2046,7 +2143,7 @@ impl Parser {
                             self.receiver_name = None;
                             // 脱糖为 setter 方法: ClassName.__set_propName(this, value)
                             methods.push(crate::ast::ClassMethod {
-                                override_: false,
+                                override_: mods.is_override,
                                 func: crate::ast::Function {
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__set_{}", name, prop_name),
@@ -2173,244 +2270,15 @@ impl Parser {
             } else if self.check(&Token::At) {
                 self.skip_optional_attributes()?;
                 continue; // 跳过属性后重新循环，下一次会看到 Func 等
-            } else if self.check(&Token::Open)
-                || self.check(&Token::Static)
-                || self.check(&Token::Override)
-                || self.check(&Token::Unsafe)
-                || self.check(&Token::Func)
-                || self.check(&Token::Operator)
-            {
-                // cjc: open / static / override / operator 修饰符在方法前
-                if self.check(&Token::Open) {
-                    self.advance(); // 消费 open，cjwasm 不区分 open/非 open
-                }
-                // P2.4: 记录 static 修饰符
-                let is_static = self.check(&Token::Static);
-                if is_static {
-                    self.advance(); // 消费 static
-                                    // P3.11: static init() { ... } 静态初始化块
-                    if self.check(&Token::Init) {
-                        self.advance(); // 消费 init
-                        self.expect(Token::LParen)?;
-                        self.expect(Token::RParen)?;
-                        self.expect(Token::LBrace)?;
-                        let body = self.parse_stmts()?;
-                        self.expect(Token::RBrace)?;
-                        // 编译为类的静态初始化函数 ClassName.__static_init
-                        methods.push(crate::ast::ClassMethod {
-                            func: Function {
-                                visibility: member_vis.clone(),
-                                name: format!("{}.__static_init", name),
-                                type_params: vec![],
-                                constraints: vec![],
-                                params: vec![],
-                                return_type: None,
-                                throws: None,
-                                body,
-                                extern_import: None,
-                            },
-                            override_: false,
-                        });
-                        continue;
-                    }
-                    // static const NAME: Type = expr — 类级别常量，当作字段处理
-                    if self.check(&Token::Const)
-                        || self.check(&Token::Let)
-                        || self.check(&Token::Var)
-                    {
-                        self.advance(); // 消费 const/let/var
-                        let f_name = match self.advance() {
-                            Some(Token::Ident(n)) => n,
-                            Some(tok) => {
-                                return self
-                                    .bail(ParseError::UnexpectedToken(tok, "常量名".to_string()))
-                            }
-                            None => return self.bail(ParseError::UnexpectedEof),
-                        };
-                        let (ty, default) = if self.check(&Token::Assign) {
-                            self.advance();
-                            (Type::TypeParam("_".to_string()), Some(self.parse_expr()?))
-                        } else if self.check(&Token::Colon) {
-                            self.advance();
-                            let ty = self.parse_type()?;
-                            let default = if self.check(&Token::Assign) {
-                                self.advance();
-                                Some(self.parse_expr()?)
-                            } else {
-                                None
-                            };
-                            (ty, default)
-                        } else {
-                            let tok = self.advance().unwrap_or(Token::Semicolon);
-                            return self.bail(ParseError::UnexpectedToken(
-                                tok,
-                                "常量: 期望 : 类型 或 = 值".to_string(),
-                            ));
-                        };
-                        if self.check(&Token::Semicolon) {
-                            self.advance();
-                        }
-                        fields.push(crate::ast::FieldDef {
-                            name: f_name,
-                            ty,
-                            default,
-                        });
-                        continue;
-                    }
-                }
-                let override_ = self.check(&Token::Override);
-                if override_ {
-                    self.advance();
-                }
-                // override 后可能还有 open 修饰符 (protected override open func)
-                if self.check(&Token::Open) {
-                    self.advance();
-                }
-                // override prop — 带 override 的属性声明脱糖为 getter/setter 方法
-                if self.check(&Token::Prop) {
-                    self.advance(); // consume prop
-                    let prop_name = match self.advance() {
-                        Some(Token::Ident(n)) => n,
-                        Some(tok) => {
-                            return self
-                                .bail(ParseError::UnexpectedToken(tok, "属性名".to_string()))
-                        }
-                        None => return self.bail(ParseError::UnexpectedEof),
-                    };
-                    self.expect(Token::Colon)?;
-                    let prop_ty = self.parse_type()?;
-                    self.expect(Token::LBrace)?;
-                    while !self.check(&Token::RBrace) {
-                        if let Some(Token::Ident(ref kw)) = self.peek() {
-                            let kw = kw.clone();
-                            if kw == "get" {
-                                self.advance();
-                                self.expect(Token::LParen)?;
-                                self.expect(Token::RParen)?;
-                                self.receiver_name = Some("this".to_string());
-                                self.expect(Token::LBrace)?;
-                                let body = self.parse_stmts()?;
-                                self.expect(Token::RBrace)?;
-                                self.receiver_name = None;
-                                methods.push(crate::ast::ClassMethod {
-                                    override_: true,
-                                    func: crate::ast::Function {
-                                        visibility: member_vis.clone(),
-                                        name: format!("{}.__get_{}", name, prop_name),
-                                        type_params: vec![],
-                                        constraints: vec![],
-                                        params: vec![Param {
-                                            name: "this".to_string(),
-                                            ty: Type::Struct(name.clone(), vec![]),
-                                            default: None,
-                                            variadic: false,
-                                            is_named: false,
-                                            is_inout: false,
-                                        }],
-                                        return_type: Some(prop_ty.clone()),
-                                        throws: None,
-                                        body,
-                                        extern_import: None,
-                                    },
-                                });
-                            } else if kw == "set" {
-                                self.advance();
-                                self.expect(Token::LParen)?;
-                                let val_name = match self.advance() {
-                                    Some(Token::Ident(n)) => n,
-                                    Some(Token::Underscore) => "_".to_string(),
-                                    Some(tok) => {
-                                        return self.bail(ParseError::UnexpectedToken(
-                                            tok,
-                                            "setter 参数名".to_string(),
-                                        ))
-                                    }
-                                    None => return self.bail(ParseError::UnexpectedEof),
-                                };
-                                self.expect(Token::RParen)?;
-                                self.receiver_name = Some("this".to_string());
-                                self.expect(Token::LBrace)?;
-                                let body = self.parse_stmts()?;
-                                self.expect(Token::RBrace)?;
-                                self.receiver_name = None;
-                                methods.push(crate::ast::ClassMethod {
-                                    override_: true,
-                                    func: crate::ast::Function {
-                                        visibility: member_vis.clone(),
-                                        name: format!("{}.__set_{}", name, prop_name),
-                                        type_params: vec![],
-                                        constraints: vec![],
-                                        params: vec![
-                                            Param {
-                                                name: "this".to_string(),
-                                                ty: Type::Struct(name.clone(), vec![]),
-                                                default: None,
-                                                variadic: false,
-                                                is_named: false,
-                                                is_inout: false,
-                                            },
-                                            Param {
-                                                name: val_name,
-                                                ty: prop_ty.clone(),
-                                                default: None,
-                                                variadic: false,
-                                                is_named: false,
-                                                is_inout: false,
-                                            },
-                                        ],
-                                        return_type: None,
-                                        throws: None,
-                                        body,
-                                        extern_import: None,
-                                    },
-                                });
-                            } else {
-                                return self.bail(ParseError::UnexpectedToken(
-                                    Token::Ident(kw),
-                                    "get 或 set".to_string(),
-                                ));
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    self.expect(Token::RBrace)?;
-                    continue;
-                }
-                // P3.1: operator func +/-/*/==/</>/<=/>=
-                // cjc 兼容: unsafe func — 忽略 unsafe 修饰符，当普通方法处理
-                if self.check(&Token::Unsafe) {
-                    self.advance(); // 消费 unsafe
-                }
-                let is_operator = self.check(&Token::Operator);
-                if is_operator {
-                    self.advance(); // 消费 operator
-                }
+            } else if self.check(&Token::Func) || self.check(&Token::Operator) {
+                // 修饰符已由 parse_member_modifiers() 以任意顺序收集
+                let is_static = mods.is_static;
+                let override_ = mods.is_override;
+                let is_operator = mods.is_operator;
                 self.expect(Token::Func)?;
                 let (m_name, type_params) = if is_operator {
                     // 运算符方法名：解析运算符 token，转为 __op_xxx
-                    let op_name = match self.advance() {
-                        Some(Token::Plus) => "op_add",
-                        Some(Token::Minus) => "op_sub",
-                        Some(Token::Star) => "op_mul",
-                        Some(Token::Slash) => "op_div",
-                        Some(Token::Percent) => "op_mod",
-                        Some(Token::Eq) => "op_eq",
-                        Some(Token::NotEq) => "op_ne",
-                        Some(Token::Lt) => "op_lt",
-                        Some(Token::Gt) => "op_gt",
-                        Some(Token::LtEq) => "op_le",
-                        Some(Token::GtEq) => "op_ge",
-                        Some(Token::LBracket) => {
-                            self.expect(Token::RBracket)?;
-                            "op_index"
-                        }
-                        Some(tok) => {
-                            return self
-                                .bail(ParseError::UnexpectedToken(tok, "运算符".to_string()))
-                        }
-                        None => return self.bail(ParseError::UnexpectedEof),
-                    };
+                    let op_name = self.parse_operator_name()?;
                     (format!("{}.{}", name, op_name), vec![])
                 } else {
                     match self.advance() {
@@ -2660,27 +2528,7 @@ impl Parser {
 
         let (name, type_params, mut constraints) = if self.parsing_operator_func {
             self.parsing_operator_func = false;
-            let op_name = match self.advance() {
-                Some(Token::Plus) => "op_add",
-                Some(Token::Minus) => "op_sub",
-                Some(Token::Star) => "op_mul",
-                Some(Token::Slash) => "op_div",
-                Some(Token::Percent) => "op_mod",
-                Some(Token::Eq) => "op_eq",
-                Some(Token::NotEq) => "op_ne",
-                Some(Token::Lt) => "op_lt",
-                Some(Token::Gt) => "op_gt",
-                Some(Token::LtEq) => "op_le",
-                Some(Token::GtEq) => "op_ge",
-                Some(Token::LBracket) => {
-                    self.expect(Token::RBracket)?;
-                    "op_index"
-                }
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "运算符".to_string()))
-                }
-                None => return self.bail(ParseError::UnexpectedEof),
-            };
+            let op_name = self.parse_operator_name()?;
             (op_name.to_string(), vec![], vec![])
         } else {
             match self.advance_ident() {

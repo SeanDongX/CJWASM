@@ -2153,6 +2153,193 @@ mod tests {
     }
 
     #[test]
+    fn test_p_var_wildcard_discard() {
+        // var _ = expr — 丢弃绑定，求值后丢弃
+        let source = r#"
+            func main(): Int64 {
+                var _ = 42
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        match &program.functions[0].body[0] {
+            Stmt::Var { pattern, .. } => {
+                assert!(matches!(pattern, Pattern::Wildcard));
+            }
+            other => panic!("expected Var wildcard stmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_p_var_wildcard_with_type() {
+        // var _: String = expr — 带类型注解的丢弃绑定
+        let source = r#"
+            func main(): Int64 {
+                var _: Int64 = 7
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        match &program.functions[0].body[0] {
+            Stmt::Var { pattern, ty, .. } => {
+                assert!(matches!(pattern, Pattern::Wildcard));
+                assert!(matches!(ty, Some(Type::Int64)));
+            }
+            other => panic!("expected Var wildcard stmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_p_let_definite_assign_no_init() {
+        // let x!: T — 确定赋值声明，无初始化式
+        let source = r#"
+            func main(): Int64 {
+                let x!: Int64
+                x = 1
+                return x
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        match &program.functions[0].body[0] {
+            Stmt::Let { pattern, ty, .. } => {
+                assert!(matches!(pattern, Pattern::Binding(name) if name == "x"));
+                assert!(matches!(ty, Some(Type::Int64)));
+            }
+            other => panic!("expected Let stmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_p_var_definite_assign_no_init() {
+        // var x!: T — 确定赋值声明，无初始化式
+        let source = r#"
+            func main(): Int64 {
+                var x!: Int64
+                x = 2
+                return x
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        match &program.functions[0].body[0] {
+            Stmt::Var { pattern, ty, .. } => {
+                assert!(matches!(pattern, Pattern::Binding(name) if name == "x"));
+                assert!(matches!(ty, Some(Type::Int64)));
+            }
+            other => panic!("expected Var stmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_p_struct_primary_ctor_named_bang() {
+        // struct S { S(let a!: Int64 = 1) {} } — 主构造参数确定赋值/必需命名参数
+        let source = r#"
+            struct S {
+                S(let a!: Int64 = 1, var b!: String = "x") {}
+            }
+            func main(): Int64 { return 0 }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.structs.len(), 1);
+        assert_eq!(program.structs[0].fields.len(), 2);
+        assert!(program.structs[0].fields[0].default.is_some());
+        assert!(program.structs[0].fields[1].default.is_some());
+    }
+
+    #[test]
+    fn test_p_or_eq_compound_assign() {
+        // a ||= b 展开为 a = a || b
+        let source = r#"
+            func main(): Int64 {
+                var a: Bool = false
+                a ||= true
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        match &program.functions[0].body[1] {
+            Stmt::Assign { target, value } => {
+                assert!(matches!(target, AssignTarget::Var(name) if name == "a"));
+                match value {
+                    Expr::Binary { op: BinOp::LogicalOr, .. } => {}
+                    other => panic!("expected `a || b`, got {:?}", other),
+                }
+            }
+            other => panic!("expected Assign stmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_p_and_eq_compound_assign() {
+        // a &&= b 展开为 a = a && b
+        let source = r#"
+            func main(): Int64 {
+                var a: Bool = true
+                a &&= false
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        match &program.functions[0].body[1] {
+            Stmt::Assign { value, .. } => match value {
+                Expr::Binary { op: BinOp::LogicalAnd, .. } => {}
+                other => panic!("expected `a && b`, got {:?}", other),
+            },
+            other => panic!("expected Assign stmt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_p_less_than_builtin_max_is_comparison() {
+        // a < UInt32.Max 必须解析为比较，而不是泛型实参
+        let source = r#"
+            func main(): Int64 {
+                var a: UInt32 = 1
+                var c: Bool = a < UInt32.Max
+                return 0
+            }
+        "#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert_eq!(program.functions.len(), 1);
+        match &program.functions[0].body[1] {
+            Stmt::Var { value, .. } => match value {
+                Expr::Binary { op: BinOp::Lt, .. } => {}
+                other => panic!("expected `<` comparison, got {:?}", other),
+            },
+            other => panic!("expected Var stmt, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_p_while_let() {
         let source = r#"
             func main(): Int64 {
@@ -3079,5 +3266,287 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let program = parser.parse_program().unwrap();
         assert_eq!(program.enums.len(), 1);
+    }
+
+    fn parse_ok(source: &str) -> crate::ast::Program {
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        parser.parse_program().unwrap()
+    }
+
+    // ---- interface 内泛型方法 ----
+
+    #[test]
+    fn test_w1c_interface_generic_method() {
+        let program = parse_ok(
+            r#"
+            interface I {
+                static func myFunc<A>(a: A, b!: A): A
+                static func myFunc(a: Int32, b!: Int32): Int32
+            }
+        "#,
+        );
+        assert_eq!(program.interfaces.len(), 1);
+        let methods = &program.interfaces[0].methods;
+        assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0].name, "myFunc");
+        assert_eq!(methods[0].params.len(), 2);
+        assert!(matches!(methods[0].params[0].ty, crate::ast::Type::TypeParam(ref n) if n == "A"));
+        assert!(methods[0].params[1].is_named);
+    }
+
+    #[test]
+    fn test_w1c_interface_generic_method_with_constraint() {
+        let program = parse_ok(
+            r#"
+            interface I {
+                func write<T>(v: T): Unit where T <: ToString
+            }
+        "#,
+        );
+        assert_eq!(program.interfaces[0].methods.len(), 1);
+        assert!(matches!(
+            program.interfaces[0].methods[0].params[0].ty,
+            crate::ast::Type::TypeParam(ref n) if n == "T"
+        ));
+    }
+
+    // ---- 修饰符任意顺序 ----
+
+    #[test]
+    fn test_w1c_class_modifier_order() {
+        let program = parse_ok(
+            r#"
+            class C {
+                static public var a: Int32 = 0
+                public static var b: Int32 = 0
+                static protected var c: Int32 = 1
+                static private var d: Int32 = 2
+                public mut func f() {}
+                protected override func g() {}
+                override func h() {}
+            }
+        "#,
+        );
+        let class = &program.classes[0];
+        assert_eq!(class.fields.len(), 4);
+        assert_eq!(class.methods.len(), 3);
+        assert_eq!(class.methods[0].func.name, "C.f");
+        assert_eq!(class.methods[1].func.name, "C.g");
+        assert!(class.methods[1].override_);
+        assert_eq!(
+            class.methods[1].func.visibility,
+            crate::ast::Visibility::Protected
+        );
+        assert!(class.methods[2].override_);
+    }
+
+    #[test]
+    fn test_w1c_struct_modifier_order_and_generic_method() {
+        let program = parse_ok(
+            r#"
+            struct S {
+                static public var a: Int64 = 0
+                public static func f(): Int64 { 1 }
+                static private func g<Q>(x: Q): Q { x }
+            }
+        "#,
+        );
+        assert_eq!(program.structs[0].fields.len(), 1);
+        let names: Vec<_> = program.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"S.f"));
+        assert!(names.contains(&"S.g"));
+        let g = program.functions.iter().find(|f| f.name == "S.g").unwrap();
+        assert_eq!(g.type_params, vec!["Q".to_string()]);
+    }
+
+    // ---- const func / const init ----
+
+    #[test]
+    fn test_w1c_top_level_const_func() {
+        let program = parse_ok("const func f(): Int64 { 1 }");
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].name, "f");
+    }
+
+    #[test]
+    fn test_w1c_class_const_func_and_const_init() {
+        let program = parse_ok(
+            r#"
+            class C {
+                var v: Int64
+                const func f(): Int64 { 1 }
+                static const func g(): Int64 { 2 }
+                const init(x: Int64) { v = x }
+            }
+        "#,
+        );
+        let class = &program.classes[0];
+        let names: Vec<_> = class.methods.iter().map(|m| m.func.name.as_str()).collect();
+        assert!(names.contains(&"C.f"));
+        assert!(names.contains(&"C.g"));
+        assert!(class.init.is_some());
+        assert_eq!(class.init.as_ref().unwrap().params.len(), 1);
+    }
+
+    #[test]
+    fn test_w1c_struct_const_func() {
+        let program = parse_ok(
+            r#"
+            struct S {
+                static const func g(): Int64 { 1 }
+            }
+        "#,
+        );
+        assert!(program.functions.iter().any(|f| f.name == "S.g"));
+    }
+
+    // ---- ** 等运算符重载声明 ----
+
+    #[test]
+    fn test_w1c_operator_star_star() {
+        let program = parse_ok(
+            r#"
+            class Test {
+                operator func **(rhs: Test) { 6 }
+                operator func !() { 8 }
+                operator func ()() { 9 }
+                operator func [](idx: Int64) { 10 }
+            }
+        "#,
+        );
+        let names: Vec<_> = program.classes[0]
+            .methods
+            .iter()
+            .map(|m| m.func.name.as_str())
+            .collect();
+        assert!(names.contains(&"Test.op_pow"));
+        assert!(names.contains(&"Test.op_not"));
+        assert!(names.contains(&"Test.op_call"));
+        assert!(names.contains(&"Test.op_index"));
+    }
+
+    #[test]
+    fn test_w1c_enum_generic_method() {
+        let program = parse_ok(
+            r#"
+            enum E {
+                A
+                func myFunc<A>(a: A): A { a }
+            }
+        "#,
+        );
+        let f = program
+            .functions
+            .iter()
+            .find(|f| f.name == "E.myFunc")
+            .expect("enum method should be lowered to a function");
+        assert_eq!(f.type_params, vec!["A".to_string()]);
+        assert!(f.params.iter().any(|p| p.name == "this"));
+    }
+    #[test]
+    fn test_parse_varray_type_position() {
+        // VArray<T, N> 类型位置：降级为 Array<T>
+        let source = "func test() { let a: VArray<Int64, 4> = [] }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        match &program.functions[0].body[0] {
+            Stmt::Let {
+                ty: Some(Type::Array(inner)),
+                ..
+            } => assert_eq!(**inner, Type::Int64),
+            other => panic!("期望 VArray 类型降级为 Array，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_varray_type_dollar_len() {
+        // VArray<T, $0>：$前缀编译期常量长度
+        let source = "func test() { let c: VArray<Int64, $0> = [] }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        match &program.functions[0].body[0] {
+            Stmt::Let {
+                ty: Some(Type::Array(inner)),
+                ..
+            } => assert_eq!(**inner, Type::Int64),
+            other => panic!("期望 VArray 类型降级为 Array，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_varray_in_generic_type_arg() {
+        // 嵌套泛型实参位置：Array<VArray<T, N>>（>> 需正确拆分）
+        let source = "func test(): Array<VArray<Int64, 2>> { return [] }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        let ret = program.functions[0].return_type.as_ref().unwrap();
+        match ret {
+            Type::Array(inner) => match inner.as_ref() {
+                Type::Array(elem) => assert_eq!(**elem, Type::Int64),
+                other => panic!("期望内层降级为 Array，实际: {:?}", other),
+            },
+            other => panic!("期望外层为 Array，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_varray_constructor_expr() {
+        // VArray<T, N>(repeat: v) 构造表达式：降级为 Array<T>(N, v)
+        let source = "func test() { let a = VArray<Int64, 4>(repeat: 0) }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        match &program.functions[0].body[0] {
+            Stmt::Let {
+                value: Expr::ConstructorCall { name, args, .. },
+                ..
+            } => {
+                assert_eq!(name, "Array");
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0], Expr::Integer(4)));
+            }
+            other => panic!("期望 VArray 构造降级为 Array 构造，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_range_constructor_expr() {
+        // Range<T>(...) 构造表达式应可解析（兼容降级为构造调用）
+        let source = "func test() { let r = Range<Int64>(1, 5, 1, true, true, false) }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        match &program.functions[0].body[0] {
+            Stmt::Let {
+                value: Expr::ConstructorCall { name, .. },
+                ..
+            } => assert_eq!(name, "Range"),
+            other => panic!("期望 Range 构造表达式，实际: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_multi_catch() {
+        // 兼容多个连续 catch 子句
+        let source =
+            "func test() { try { let x = 1 } catch (e: E1) { } catch (e: E2) { } finally { } }";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse_program().unwrap();
+        assert!(matches!(
+            &program.functions[0].body[0],
+            Stmt::Expr(Expr::TryBlock { .. })
+        ));
     }
 }

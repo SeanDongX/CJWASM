@@ -66,26 +66,39 @@ fn strip_quote_contents(source: &str) -> String {
             out.push('"');
             i += 1;
             while i < len {
-                let sc = bytes[i];
-                if sc == b'\\' {
+                // 按 UTF-8 字符复制，避免把多字节字符（如中文 Rune/字符串）按字节拆坏
+                let c = match source[i..].chars().next() {
+                    Some(c) => c,
+                    None => break,
+                };
+                if c == '\\' {
                     out.push('\\');
                     i += 1;
                     if i < len {
-                        out.push(bytes[i] as char);
-                        i += 1;
+                        let esc = match source[i..].chars().next() {
+                            Some(c) => c,
+                            None => break,
+                        };
+                        out.push(esc);
+                        i += esc.len_utf8();
                     }
                     continue;
                 }
-                out.push(sc as char);
-                i += 1;
-                if sc == b'"' {
+                out.push(c);
+                i += c.len_utf8();
+                if c == '"' {
                     break;
                 }
             }
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // 普通字符同样按 UTF-8 字符复制（保持 CJK 标识符 / Rune 字面量原样）
+        let c = match source[i..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        out.push(c);
+        i += c.len_utf8();
     }
     out
 }
@@ -107,41 +120,55 @@ fn count_unmatched_quotes(bytes: &[u8], start: usize, end: usize) -> usize {
     count
 }
 
-/// 找到块注释的关闭位置（返回 */ 之后的位置）
+/// 找到块注释的关闭位置（返回 */ 之后的位置），支持嵌套块注释（规范 1.5(2)）
 ///
 /// 处理两种特殊情况：
 /// 1. `/*  "synchronized */`：`"` 未闭合，但 `*/` 是真正的注释关闭符
 /// 2. `/*  e.g. "/*xx*/" */`：`*/` 出现在字符串字面量内，外层 `*/` 才是注释关闭符
 ///
-/// 算法：当 `*/` 前有奇数个 `"` 时（可能在字符串内）：
-///   - 若 `*/` 后紧跟 `"` → 此 `*/` 确实在字符串内（如 `"/*xx*/"`），跳过
-///   - 若 `*/` 后不是 `"` → 此 `*/` 是真正的注释关闭（如 `"synchronized */`），关闭注释
+/// 嵌套的 `/*` 提高深度，`*/` 降低深度；深度归零即注释结束。引号内的注释
+/// 定界符仍按原有启发式处理（不影响嵌套计数）。
 fn find_comment_close(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
-    let mut first_skip_close = None;
+    let mut depth = 1usize;
     while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // 引号内（奇数个未匹配引号）的 /* 视作注释文本，不嵌套
+            if count_unmatched_quotes(bytes, start, i) % 2 == 0 {
+                depth += 1;
+            }
+            i += 2;
+            continue;
+        }
         if bytes[i] == b'*' && bytes[i + 1] == b'/' {
             let q = count_unmatched_quotes(bytes, start, i);
             if q % 2 == 0 {
-                // 偶数个引号：不在字符串内，关闭注释
-                return i + 2;
-            } else {
-                // 奇数个引号：可能在字符串内
-                let after = i + 2;
-                if after < bytes.len() && bytes[after] == b'"' {
-                    // */ 后紧跟 "，说明此 */ 在字符串内（如 "/*xx*/"），跳过
-                    first_skip_close.get_or_insert(i + 2);
-                    i += 2;
-                    continue;
-                } else {
-                    // */ 后不是 "，说明 " 只是注释内容（如 "synchronized），关闭注释
-                    return i + 2;
+                // 偶数个引号：不在字符串内，关闭当前层注释
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return i;
                 }
+                continue;
             }
+            // 奇数个引号：可能在字符串内
+            let after = i + 2;
+            if after < bytes.len() && bytes[after] == b'"' {
+                // */ 后紧跟 "，说明此 */ 在字符串内（如 "/*xx*/"），跳过
+                i += 2;
+                continue;
+            }
+            // */ 后不是 "，说明 " 只是注释内容（如 "synchronized），关闭当前层
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return i;
+            }
+            continue;
         }
         i += 1;
     }
-    first_skip_close.unwrap_or(bytes.len())
+    bytes.len()
 }
 
 /// 移除源码中的块注释 /* ... */，便于解析含版权头的 vendor 文件
@@ -837,5 +864,47 @@ extend<T> Array<T> <: SortByExtension<T> {
         let result = parse_source(source);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_source_with_nested_block_comment() {
+        // 规范 1.5(2)：嵌套块注释整体视为一个注释
+        let source = "/* outer /* inner */ still comment */ func main(): Int64 { return 0 }";
+        let result = parse_source(source);
+        assert!(result.is_ok(), "nested comment should parse: {:?}", result.err());
+        assert_eq!(result.unwrap().functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_source_with_deeply_nested_block_comment() {
+        let source =
+            "/* a /* b /* c */ b */ a */ func main(): Int64 { return 0 }";
+        let result = parse_source(source);
+        assert!(result.is_ok(), "3-level comment should parse: {:?}", result.err());
+        assert_eq!(result.unwrap().functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_source_preserves_cjk_rune_literal() {
+        // strip_quote_contents / strip_block_comments 必须按 UTF-8 字符复制，不能按字节拆坏 CJK
+        let source = "func main(): Int64 { let c = r'严'; let d = '文'; let s = \"中文\"; return 0 }";
+        let result = parse_source(source);
+        assert!(result.is_ok(), "CJK literals should parse: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_strip_quote_contents_preserves_utf8() {
+        let source = "let a = \"中文\" let b = r'严'";
+        let out = strip_quote_contents(source);
+        assert!(out.contains("中文"));
+        assert!(out.contains("r'严'"));
+    }
+
+    #[test]
+    fn test_find_comment_close_nested() {
+        let src = b"/* outer /* inner */ tail */x";
+        let end = find_comment_close(src, 2);
+        assert_eq!(end, src.len() - 1);
+        assert_eq!(&src[end..], b"x");
     }
 }

@@ -122,7 +122,9 @@ impl Parser {
                             | Token::TypeUInt64
                             | Token::TypeRune
                     )
-                );
+                )
+                // 类型关键字后跟 `.`（如 `x < UInt32.Min`）说明是比较而非泛型实参
+                && !matches!(self.peek_at(2), Some(Token::Dot));
                 let is_generic_ident = matches!(next, Some(Token::Ident(_)))
                     && matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
                 if is_type_keyword || is_generic_ident {
@@ -1097,8 +1099,24 @@ impl Parser {
                     (None, None)
                 };
                 self.expect(Token::LBrace)?;
-                let catch_body = self.parse_stmts()?;
+                let mut catch_body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
+                // 兼容：允许多个连续的 catch 子句（cjc 按异常类型选择）。
+                // 当前 AST 仅保留单个 catch，后续 catch 的语句并入首个 catch 体以保证可编译。
+                while self.check(&Token::Catch) {
+                    self.advance();
+                    if self.check(&Token::LParen) {
+                        self.advance();
+                        while !self.check(&Token::RParen) && self.peek().is_some() {
+                            self.advance();
+                        }
+                        self.expect(Token::RParen)?;
+                    }
+                    self.expect(Token::LBrace)?;
+                    let extra = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    catch_body.extend(extra);
+                }
                 // 解析可选的 finally 块
                 let finally_body = if self.check(&Token::Finally) {
                     self.advance();
@@ -1191,7 +1209,14 @@ impl Parser {
                     }
                 }
                 // 解析可选类型实参 (如 identity<Int64> 或 Pair<Int64,String>)
-                let type_args = self.parse_opt_type_args()?;
+                // 但 `a < UInt32.Max` 这类比较：`<` 后基础类型再跟 `.`，不能当作泛型实参
+                let type_args = if matches!(self.peek(), Some(Token::Lt))
+                    && matches!(self.peek_at(2), Some(Token::Dot))
+                {
+                    None
+                } else {
+                    self.parse_opt_type_args()?
+                };
                 // 检查是否是函数调用、构造函数调用或结构体初始化
                 match self.peek() {
                     Some(Token::LParen) => {
@@ -1394,6 +1419,81 @@ impl Parser {
                 Ok(Expr::ConstructorCall {
                     name: "Array".to_string(),
                     type_args: elem_type.map(|t| vec![t]),
+                    args,
+                    named_args,
+                })
+            }
+            // P6: VArray<T, N>(...) 值类型定长数组构造 — 兼容优先降级为 Array<T>(N, init)
+            // N 为编译期常量（如 `4`、`$0`、`$10000`），支持 `repeat:` 命名参数
+            Some(Token::TypeVArray) => {
+                let mut elem_len: Option<(Option<Type>, i64)> = None;
+                if self.check(&Token::Lt) {
+                    self.advance();
+                    let elem_ty = self.parse_type()?;
+                    self.expect(Token::Comma)?;
+                    let len = self.parse_varray_len()?.unwrap_or(0);
+                    if self.check(&Token::Gt) {
+                        self.advance();
+                    } else if self.check(&Token::Shr) {
+                        self.advance();
+                        self.pushback = Some(Token::Gt);
+                    } else {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::Gt),
+                            "`>`".to_string(),
+                        ));
+                    }
+                    elem_len = Some((Some(elem_ty), len));
+                }
+                self.expect(Token::LParen)?;
+                let (mut args, named_args) = self.parse_args()?;
+                self.expect(Token::RParen)?;
+                let mut init: Option<Expr> = None;
+                for (n, e) in named_args {
+                    if n == "repeat" {
+                        init = Some(e);
+                    }
+                }
+                // 兼容：若无可识别的 repeat 命名参数，退化为使用最后一个位置参数作为初值
+                let init = init.or_else(|| args.pop()).unwrap_or(Expr::Integer(0));
+                let (elem_ty, len) = elem_len.unwrap_or((None, 0));
+                Ok(Expr::ConstructorCall {
+                    name: "Array".to_string(),
+                    type_args: elem_ty.map(|t| vec![t]),
+                    args: vec![Expr::Integer(len), init],
+                    named_args: vec![],
+                })
+            }
+            // Range<T>(...) / Range(...) 构造表达式 — 兼容降级为同名构造调用
+            Some(Token::TypeRange) => {
+                let type_args = if self.check(&Token::Lt) {
+                    self.advance();
+                    let mut tys = vec![self.parse_type()?];
+                    while self.check(&Token::Comma) {
+                        self.advance();
+                        tys.push(self.parse_type()?);
+                    }
+                    if self.check(&Token::Gt) {
+                        self.advance();
+                    } else if self.check(&Token::Shr) {
+                        self.advance();
+                        self.pushback = Some(Token::Gt);
+                    } else {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::Gt),
+                            "`>`".to_string(),
+                        ));
+                    }
+                    Some(tys)
+                } else {
+                    None
+                };
+                self.expect(Token::LParen)?;
+                let (args, named_args) = self.parse_args()?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::ConstructorCall {
+                    name: "Range".to_string(),
+                    type_args,
                     args,
                     named_args,
                 })
