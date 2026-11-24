@@ -319,7 +319,8 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
 // 所有规则都能在单文件内基于 AST 判定，父类型无法在本地解析时保守跳过。
 
 use crate::ast::{
-    AssignTarget, ClassDef, EnumDef, Function, InterfaceDef, InterfaceMethod, StructDef, Visibility,
+    AssignTarget, ClassDef, ClassMethod, EnumDef, Function, InterfaceDef, InterfaceMethod,
+    StructDef, Visibility,
 };
 use std::collections::HashSet;
 
@@ -348,6 +349,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_function_groups(program, &index, &mut errors);
     for cls in &program.classes {
         check_class(cls, &index, &mut errors);
+        check_ctor_param_order(cls, &mut errors);
+        check_static_member_access(cls, program, &index, &mut errors);
+        check_private_parent_access(cls, program, &index, &mut errors);
     }
     for st in &program.structs {
         check_struct_interfaces(st, program, &index, &mut errors);
@@ -359,6 +363,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         check_enum_variants(en, &mut errors);
         check_enum_interfaces(en, program, &index, &mut errors);
     }
+
+    // `This` 类型只能作为类的实例成员函数返回类型（6.1.4(1)）。
+    check_this_type_usage(program, &mut errors);
 
     // 不允许实例化抽象类 / 接口；不能继承 struct/enum。
     check_instantiation_targets(program, &mut errors);
@@ -435,20 +442,31 @@ fn sig_of_function(func: &Function, outer_tp: &[String]) -> Sig {
     }
 }
 
-fn sig_of_interface_method(method: &InterfaceMethod) -> Sig {
-    let (params, _) = split_receiver(&method.params);
+/// 类成员函数签名：以 `ClassMethod.is_static` 为准（属性访问器的首参不一定是接收者）。
+fn sig_of_class_method(m: &ClassMethod, outer_tp: &[String]) -> Sig {
+    let mut sig = sig_of_function(&m.func, outer_tp);
+    sig.is_static = m.is_static;
+    sig
+}
+
+fn sig_of_interface_method(method: &InterfaceMethod) -> Sig {    // 接口方法的参数列表不含隐式接收者；若显式写了 this/self 也剥离。
+    let params = if method
+        .params
+        .first()
+        .map_or(false, |p| is_receiver_param(&p.name))
+    {
+        method.params[1..].iter().map(|p| p.ty.clone()).collect()
+    } else {
+        method.params.iter().map(|p| p.ty.clone()).collect()
+    };
     Sig {
         name: method.name.clone(),
         params,
         ret: method.return_type.clone(),
-        // 接口方法在 AST 中不保存泛型参数，无法判断泛型/非泛型，按未知处理。
-        generic: None,
-        // 接口的泛型参数未进入 AST，按首次出现顺序做 alpha 等价。
-        tp_order: Vec::new(),
-        // 接口的 static 修饰符不进入 AST，static/实例区分不可用。
-        is_static: false,
-        // 接口方法在 AST 中不保存可见性。
-        vis: None,
+        generic: Some(!method.type_params.is_empty()),
+        tp_order: method.type_params.clone(),
+        is_static: method.is_static,
+        vis: Some(method.visibility.clone()),
         display: method.name.clone(),
     }
 }
@@ -645,7 +663,7 @@ fn check_function_groups(
 fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<SemanticError>) {
     let mut by_name: HashMap<String, Vec<Sig>> = HashMap::new();
     for method in &cls.methods {
-        let sig = sig_of_function(&method.func, &cls.type_params);
+        let sig = sig_of_class_method(method, &cls.type_params);
         if is_synthetic_member(&sig.name) {
             continue;
         }
@@ -662,8 +680,14 @@ fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<Semant
         errors,
     );
 
+    // 成员级修饰符（open/abstract/static）与函数体的一致性
+    check_member_modifiers(cls, errors);
+
     // override / redef 签名校验
     check_class_overrides(cls, index, errors);
+
+    // 子类成员不得遮蔽父类型同名成员（6.3.3(1)）
+    check_member_shadowing(cls, index, errors);
 
     // 覆写/重定义不得降低访问级别
     check_member_visibility_lowering(cls, index, errors);
@@ -674,7 +698,7 @@ fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<Semant
             let own: Vec<Sig> = cls
                 .methods
                 .iter()
-                .map(|m| sig_of_function(&m.func, &cls.type_params))
+                .map(|m| sig_of_class_method(m, &cls.type_params))
                 .collect();
             check_interface_property_types(&cls.name, &own, &parents, index, errors);
         }
@@ -697,6 +721,254 @@ fn visibility_rank(v: &Visibility) -> u8 {
         Visibility::Internal => 1,
         Visibility::Protected => 2,
         Visibility::Public => 3,
+    }
+}
+
+/// 校验类成员函数的修饰符与函数体是否自洽（6.1.2.4 系列规则）：
+/// - `static` 成员函数必须有实现（6.1.2.4(21)）；
+/// - 无实现的成员函数只能声明在抽象类中（6.1.2.4(8)）；
+/// - 函数不能同时声明为 `open` 与 `static`（6.1.2.4(33)）；
+/// - `abstract` 成员函数只能出现在抽象类中，且不能有实现体。
+fn check_member_modifiers(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    for m in &cls.methods {
+        let sig = sig_of_class_method(m, &cls.type_params);
+        if is_synthetic_member(&sig.name) {
+            continue;
+        }
+        let is_static = m.is_static;
+        if m.is_open && is_static {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的成员函数 '{}' 不能同时声明为 open 和 static（6.1.2.4(33)）",
+                    cls.name, m.func.name
+                ),
+            });
+        }
+        if m.is_abstract {
+            if !cls.is_abstract {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的抽象成员函数 '{}' 只能声明在抽象类中",
+                        cls.name, m.func.name
+                    ),
+                });
+            }
+            if is_static {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的 static 成员函数 '{}' 不能声明为 abstract",
+                        cls.name, m.func.name
+                    ),
+                });
+            }
+            if m.has_body {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的抽象成员函数 '{}' 不能有实现体",
+                        cls.name, m.func.name
+                    ),
+                });
+            }
+        } else if !m.has_body {
+            if is_static {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的 static 成员函数 '{}' 必须有实现（6.1.2.4(21)）",
+                        cls.name, m.func.name
+                    ),
+                });
+            } else if !cls.is_abstract {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的成员函数 '{}' 无实现，只能声明在抽象类或接口中（6.1.2.4(8)）",
+                        cls.name, m.func.name
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 成员名去掉属性访问器前缀（`__get_p` / `__set_p` → `p`）。
+fn member_base_name(name: &str) -> &str {
+    name.strip_prefix("__get_")
+        .or_else(|| name.strip_prefix("__set_"))
+        .unwrap_or(name)
+}
+
+/// 收集父类链上的字段名（extends 无法本地解析时返回 None，保守跳过）。
+fn collect_parent_field_names<'a>(
+    cls: &ClassDef,
+    index: &ProgramIndex<'a>,
+) -> Option<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut cur = cls.extends.clone();
+    let mut seen = HashSet::new();
+    while let Some(name) = cur {
+        if !seen.insert(name.clone()) {
+            break;
+        }
+        let Some(parent) = index.classes.get(name.as_str()) else {
+            return None;
+        };
+        for f in &parent.fields {
+            if f.visibility != Visibility::Private {
+                out.insert(f.name.clone());
+            }
+        }
+        cur = parent.extends.clone();
+    }
+    Some(out)
+}
+
+/// 子类型成员不得遮蔽父类型同名成员（6.3.3(1)）：
+/// - 子类字段与父类型任意同名成员冲突；
+/// - 子类函数只有与父类型同签名且父成员可覆写（open/abstract/接口成员）时才是合法覆写；
+/// - 与父类型同名但签名不同视为遮蔽。
+fn check_member_shadowing(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<SemanticError>) {
+    let Some(parents) = collect_parent_methods(cls, index) else {
+        return;
+    };
+    let Some(parent_fields) = collect_parent_field_names(cls, index) else {
+        return;
+    };
+
+    // 子类型自身成员：字段 + 函数（函数附带签名/override/static 信息）。
+    let mut own: Vec<(String, Option<Sig>, bool, bool, bool)> = Vec::new();
+    for m in &cls.methods {
+        let sig = sig_of_class_method(m, &cls.type_params);
+        if is_synthetic_member(&sig.name) {
+            continue;
+        }
+        let is_static = m.is_static;
+        own.push((
+            member_base_name(&sig.name).to_string(),
+            Some(sig),
+            m.override_,
+            m.has_override_kw,
+            is_static,
+        ));
+    }
+    for f in &cls.fields {
+        own.push((f.name.clone(), None, false, false, false));
+    }
+
+    let mut reported: HashSet<String> = HashSet::new();
+    for (name, sig_opt, override_, has_override_kw, is_static) in own {
+        let parent_methods: Vec<&ParentMethod> = parents
+            .iter()
+            .filter(|p| !is_synthetic_member(&p.sig.name) && member_base_name(&p.sig.name) == name)
+            .filter(|p| p.sig.vis.as_ref() != Some(&Visibility::Private))
+            .collect();
+        let parent_field = parent_fields.contains(&name);
+        if parent_methods.is_empty() && !parent_field {
+            continue;
+        }
+        let mut report = |errors: &mut Vec<SemanticError>, msg: String| {
+            if reported.insert(name.clone()) {
+                errors.push(SemanticError { message: msg });
+            }
+        };
+        let Some(sig) = sig_opt else {
+            // 子类字段遮蔽父类型同名成员（字段不能与任何父成员同名）。
+            if !parent_methods.is_empty() || parent_field {
+                report(
+                    errors,
+                    format!(
+                        "类 '{}' 的字段 '{}' 遮蔽了父类型的同名成员（6.3.3(1)）",
+                        cls.name, name
+                    ),
+                );
+            }
+            continue;
+        };
+        if parent_field {
+            report(
+                errors,
+                format!(
+                    "类 '{}' 的成员 '{}' 遮蔽了父类型的同名字段（6.3.3(1)）",
+                    cls.name, sig.display
+                ),
+            );
+            continue;
+        }
+        let own_is_prop = sig.name.starts_with("__get_") || sig.name.starts_with("__set_");
+        // 不同种类（函数 vs 属性）的同名成员构成遮蔽。
+        let kind_conflict = parent_methods.iter().any(|p| {
+            let p_is_prop =
+                p.sig.name.starts_with("__get_") || p.sig.name.starts_with("__set_");
+            p_is_prop != own_is_prop
+        });
+        if kind_conflict {
+            report(
+                errors,
+                format!(
+                    "类 '{}' 的成员 '{}' 遮蔽了父类型的同名成员（6.3.3(1)）",
+                    cls.name, sig.display
+                ),
+            );
+            continue;
+        }
+        // 同种函数/属性：签名不同属于合法重载（继承的最近匹配规则），签名相同才是覆写。
+        let alt_parent_name = sig
+            .name
+            .strip_prefix("__set_")
+            .map(|rest| format!("__get_{}", rest));
+        let matching: Vec<&ParentMethod> = parent_methods
+            .iter()
+            .copied()
+            .filter(|p| p.sig.is_static == is_static)
+            .filter(|p| {
+                (p.sig.name == sig.name || alt_parent_name.as_deref() == Some(p.sig.name.as_str()))
+                    && canon_params(&sig) == canon_params(&p.sig)
+            })
+            .collect();
+        if matching.is_empty() {
+            continue;
+        }
+        // 静态函数不以实例方式继承：未写 override 的同名 static 函数视为新声明。
+        if is_static && !override_ {
+            continue;
+        }
+        // `redef`（没有显式 override）属于重定义，不要求父成员 open。
+        if override_ && !has_override_kw {
+            continue;
+        }
+        if !matching.iter().any(|p| p.open_) {
+            report(
+                errors,
+                format!(
+                    "类 '{}' 的成员函数 '{}' 覆写了父类型中不可覆写（非 open/abstract）的函数（6.1.2.4(32)）",
+                    cls.name, sig.display
+                ),
+            );
+        }
+    }
+}
+
+/// 构造函数参数顺序：普通参数必须位于所有成员变量参数之前（6.1.2.1(21)）。
+fn check_ctor_param_order(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    let mut check = |flags: &[bool], what: &str| {
+        let mut seen_member = false;
+        for (idx, is_member) in flags.iter().enumerate() {
+            if *is_member {
+                seen_member = true;
+            } else if seen_member {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的{}第 {} 个普通参数位于成员变量参数之后（6.1.2.1(21)）",
+                        cls.name,
+                        what,
+                        idx + 1
+                    ),
+                });
+                break;
+            }
+        }
+    };
+    check(&cls.primary_ctor_member_flags, "主构造函数");
+    if let Some(init) = &cls.init {
+        check(&init.member_param_flags, "构造函数");
     }
 }
 
@@ -1510,9 +1782,11 @@ struct ParentMethod {
     sig: Sig,
     /// 是否可以严格比较参数/返回类型（泛型父类型只比较参数个数）。
     strict_types: bool,
-    /// 是否为接口中的抽象方法（无默认实现）。
+    /// 是否为抽象方法（无实现体）。
     abstract_: bool,
-    /// 是否来自接口（接口方法的 static/实例修饰符不进入 AST，无法区分）。
+    /// 是否可被覆写（class 成员需 open/abstract；接口成员天然可被实现/覆写）。
+    open_: bool,
+    /// 是否来自接口。
     is_interface: bool,
     /// 声明该方法的类型名（用于识别多个接口的默认实现冲突）。
     owner: String,
@@ -1567,11 +1841,11 @@ fn collect_parent_methods<'a>(
         let strict = parent.type_params.is_empty();
         for m in &parent.methods {
             out.push(ParentMethod {
-                sig: sig_of_function(&m.func, &parent.type_params),
+                sig: sig_of_class_method(m, &parent.type_params),
                 strict_types: strict,
-                // 父类方法（无论有无函数体）都视为可用的实现来源；
-                // 抽象类未实现的方法不在此强制子类实现（保守，避免误伤）。
-                abstract_: false,
+                // 无体成员函数在抽象类中视为隐式抽象；抽象/open 方法可被子类覆写。
+                abstract_: m.is_abstract || !m.has_body,
+                open_: m.is_open || m.is_abstract || !m.has_body,
                 is_interface: false,
                 owner: name.to_string(),
             });
@@ -1582,6 +1856,7 @@ fn collect_parent_methods<'a>(
                     sig: sig_of_function(f, index.type_params_of(name)),
                     strict_types: true,
                     abstract_: false,
+                    open_: true,
                     is_interface: false,
                     owner: name.to_string(),
                 });
@@ -1621,6 +1896,7 @@ fn collect_parent_methods<'a>(
                 sig: sig_of_interface_method(m),
                 strict_types: true,
                 abstract_: m.default_body.is_none(),
+                open_: true,
                 is_interface: true,
                 owner: name.to_string(),
             });
@@ -1631,6 +1907,7 @@ fn collect_parent_methods<'a>(
                     sig: sig_of_function(f, index.type_params_of(name)),
                     strict_types: true,
                     abstract_: false,
+                    open_: true,
                     is_interface: true,
                     owner: name.to_string(),
                 });
@@ -1664,7 +1941,7 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
         if !method.override_ {
             continue;
         }
-        let sig = sig_of_function(&method.func, &cls.type_params);
+        let sig = sig_of_class_method(method, &cls.type_params);
         if is_synthetic_member(&sig.name) {
             continue;
         }
@@ -1707,6 +1984,25 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
                     cls.name, sig.display
                 ),
             });
+        } else {
+            // 只有显式 `override` 才要求父类函数为 open/abstract；
+            // `redef` 是重定义（静态成员/接口默认实现），不受 open 限制（6.1.2.4(32)/(38)）。
+            if method.has_override_kw {
+                let overridable = same_name.iter().any(|p| {
+                    let primary = p.sig.name == sig.name
+                        && signature_matches(&sig, &p.sig, p.strict_types, index);
+                    let alt = alt_getter.as_deref() == Some(p.sig.name.as_str());
+                    (primary || alt) && (p.is_interface || p.open_)
+                });
+                if !overridable {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的 '{}' 覆写了父类型中不可覆写（非 open/abstract）的函数（6.1.2.4(32)）",
+                            cls.name, sig.display
+                        ),
+                    });
+                }
+            }
         }
     }
 }
@@ -1721,7 +2017,7 @@ fn check_member_visibility_lowering(
         return;
     };
     for method in &cls.methods {
-        let sig = sig_of_function(&method.func, &cls.type_params);
+        let sig = sig_of_class_method(method, &cls.type_params);
         if is_synthetic_member(&sig.name) {
             continue;
         }
@@ -1735,11 +2031,10 @@ fn check_member_visibility_lowering(
             .map(|rest| format!("__get_{}", rest));
         let parent_rank = parents
             .iter()
-            .filter(|p| !p.is_interface)
             .filter(|p| {
                 p.sig.is_static == sig.is_static
                     && (p.sig.name == sig.name || alt_getter.as_deref() == Some(p.sig.name.as_str()))
-                    && (signature_matches(&sig, &p.sig, p.strict_types, index)
+                    && (canon_params(&sig) == canon_params(&p.sig)
                         || alt_getter.as_deref() == Some(p.sig.name.as_str()))
             })
             .filter_map(|p| p.sig.vis.as_ref().map(visibility_rank))
@@ -1750,6 +2045,51 @@ fn check_member_visibility_lowering(
                     message: format!(
                         "类 '{}' 的 '{}' 覆写/重定义时降低了访问级别（父类型更宽松）",
                         cls.name, sig.display
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 实现类型（class/struct/enum）实现接口函数时不得降低访问级别（6.3.5(3)）。
+///
+/// 接口成员未标注时默认为 public；实现函数须不窄于接口声明。
+fn check_impl_visibility(
+    owner: &str,
+    own: &[Sig],
+    parents: &[ParentMethod],
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for sig in own {
+        if is_synthetic_member(&sig.name) {
+            continue;
+        }
+        let Some(child_rank) = sig.vis.as_ref().map(visibility_rank) else {
+            continue;
+        };
+        let alt_getter = sig
+            .name
+            .strip_prefix("__set_")
+            .map(|rest| format!("__get_{}", rest));
+        let parent_rank = parents
+            .iter()
+            .filter(|p| p.is_interface)
+            .filter(|p| {
+                p.sig.is_static == sig.is_static
+                    && (p.sig.name == sig.name || alt_getter.as_deref() == Some(p.sig.name.as_str()))
+                    && (canon_params(sig) == canon_params(&p.sig)
+                        || alt_getter.as_deref() == Some(p.sig.name.as_str()))
+            })
+            .filter_map(|p| p.sig.vis.as_ref().map(visibility_rank))
+            .max();
+        if let Some(parent_rank) = parent_rank {
+            if child_rank < parent_rank {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类型 '{}' 的 '{}' 实现接口函数时降低了访问级别（6.3.5(3)）",
+                        owner, sig.display
                     ),
                 });
             }
@@ -1768,7 +2108,7 @@ fn check_inherited_static_conflicts(
         return;
     };
     for method in &cls.methods {
-        let sig = sig_of_function(&method.func, &cls.type_params);
+        let sig = sig_of_class_method(method, &cls.type_params);
         if is_synthetic_member(&sig.name) {
             continue;
         }
@@ -1902,7 +2242,7 @@ fn check_interface_implementation(
     let mut own_impls: Vec<Sig> = cls
         .methods
         .iter()
-        .map(|m| sig_of_function(&m.func, &cls.type_params))
+        .map(|m| sig_of_class_method(m, &cls.type_params))
         .collect();
     // extend 块中为当前类提供的方法
     if let Some(exts) = index.extends.get(cls.name.as_str()) {
@@ -1934,6 +2274,7 @@ fn collect_interface_methods<'a>(
                 sig: sig_of_interface_method(m),
                 strict_types: true,
                 abstract_: m.default_body.is_none(),
+                open_: true,
                 is_interface: true,
                 owner: name.to_string(),
             });
@@ -1944,6 +2285,7 @@ fn collect_interface_methods<'a>(
                     sig: sig_of_function(f, index.type_params_of(name)),
                     strict_types: true,
                     abstract_: false,
+                    open_: true,
                     is_interface: true,
                     owner: name.to_string(),
                 });
@@ -1989,6 +2331,7 @@ fn check_struct_interfaces<'a>(
             own_impls.push(sig_of_function(f, &st.type_params));
         }
     }
+    check_impl_visibility(&st.name, &own_impls, &parents, index, errors);
     if parents.iter().any(|p| p.abstract_) {
         check_abstract_methods_implemented(&st.name, own_impls.clone(), &parents, index, errors);
     }
@@ -2039,7 +2382,929 @@ fn check_enum_interfaces<'a>(
             own_impls.push(sig_of_function(f, &en.type_params));
         }
     }
+    check_impl_visibility(&en.name, &own_impls, &parents, index, errors);
     check_abstract_methods_implemented(&en.name, own_impls, &parents, index, errors);
+}
+
+// ─── AST 通用遍历辅助 ───────────────────────────────────────────────────────
+
+/// 递归访问表达式及其所有子表达式。
+fn walk_expr<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
+    f(e);
+    match e {
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(x) = p {
+                    walk_expr(x, f);
+                }
+            }
+        }
+        Expr::Unary { expr, .. } => walk_expr(expr, f),
+        Expr::Binary { left, right, .. } => {
+            walk_expr(left, f);
+            walk_expr(right, f);
+        }
+        Expr::Call { args, named_args, .. } => {
+            for a in args {
+                walk_expr(a, f);
+            }
+            for (_, a) in named_args {
+                walk_expr(a, f);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            walk_expr(object, f);
+            for a in args {
+                walk_expr(a, f);
+            }
+            for (_, a) in named_args {
+                walk_expr(a, f);
+            }
+        }
+        Expr::SuperCall { args, named_args, .. } => {
+            for a in args {
+                walk_expr(a, f);
+            }
+            for (_, a) in named_args {
+                walk_expr(a, f);
+            }
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            walk_expr(cond, f);
+            walk_expr(then_branch, f);
+            if let Some(e) = else_branch {
+                walk_expr(e, f);
+            }
+        }
+        Expr::IfLet {
+            pattern,
+            expr,
+            then_branch,
+            else_branch,
+        } => {
+            walk_pattern_exprs(pattern, f);
+            walk_expr(expr, f);
+            walk_expr(then_branch, f);
+            if let Some(e) = else_branch {
+                walk_expr(e, f);
+            }
+        }
+        Expr::Block(stmts, tail) => {
+            walk_stmts(stmts, f);
+            if let Some(t) = tail {
+                walk_expr(t, f);
+            }
+        }
+        Expr::Tuple(exprs) | Expr::Array(exprs) => {
+            for x in exprs {
+                walk_expr(x, f);
+            }
+        }
+        Expr::TupleIndex { object, .. } => walk_expr(object, f),
+        Expr::Index { array, index } => {
+            walk_expr(array, f);
+            walk_expr(index, f);
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, x) in fields {
+                walk_expr(x, f);
+            }
+        }
+        Expr::ConstructorCall {
+            args, named_args, ..
+        } => {
+            for a in args {
+                walk_expr(a, f);
+            }
+            for (_, a) in named_args {
+                walk_expr(a, f);
+            }
+        }
+        Expr::Field { object, .. } | Expr::OptionalChain { object, .. } => walk_expr(object, f),
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            walk_expr(start, f);
+            walk_expr(end, f);
+            if let Some(s) = step {
+                walk_expr(s, f);
+            }
+        }
+        Expr::VariantConst { arg, .. } => {
+            if let Some(a) = arg {
+                walk_expr(a, f);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            walk_expr(expr, f);
+            for arm in arms {
+                walk_pattern_exprs(&arm.pattern, f);
+                if let Some(g) = &arm.guard {
+                    walk_expr(g, f);
+                }
+                walk_expr(&arm.body, f);
+            }
+        }
+        Expr::Cast { expr, .. }
+        | Expr::IsType { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr) => walk_expr(expr, f),
+        Expr::Lambda { body, .. } => walk_expr(body, f),
+        Expr::NullCoalesce { option, default } => {
+            walk_expr(option, f);
+            walk_expr(default, f);
+        }
+        Expr::Return(opt) => {
+            if let Some(e) = opt {
+                walk_expr(e, f);
+            }
+        }
+        Expr::TryBlock {
+            resources,
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            for (_, e) in resources {
+                walk_expr(e, f);
+            }
+            walk_stmts(body, f);
+            walk_stmts(catch_body, f);
+            if let Some(b) = finally_body {
+                walk_stmts(b, f);
+            }
+        }
+        Expr::SliceExpr { array, start, end } => {
+            walk_expr(array, f);
+            walk_expr(start, f);
+            walk_expr(end, f);
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                walk_expr(k, f);
+                walk_expr(v, f);
+            }
+        }
+        Expr::Spawn { body } => walk_stmts(body, f),
+        Expr::Synchronized { lock, body } => {
+            walk_expr(lock, f);
+            walk_stmts(body, f);
+        }
+        Expr::TrailingClosure {
+            callee,
+            args,
+            closure,
+        } => {
+            walk_expr(callee, f);
+            for a in args {
+                walk_expr(a, f);
+            }
+            walk_expr(closure, f);
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            walk_expr(callee, f);
+            for a in args {
+                walk_expr(a, f);
+            }
+            for (_, a) in named_args {
+                walk_expr(a, f);
+            }
+        }
+        Expr::Macro { args, .. } => {
+            for a in args {
+                walk_expr(a, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_pattern_exprs<'a>(p: &'a crate::ast::Pattern, f: &mut dyn FnMut(&'a Expr)) {
+    use crate::ast::Pattern;
+    match p {
+        Pattern::Struct { fields, .. } => {
+            for (_, sub) in fields {
+                walk_pattern_exprs(sub, f);
+            }
+        }
+        Pattern::Tuple(items) | Pattern::Or(items) => {
+            for sub in items {
+                walk_pattern_exprs(sub, f);
+            }
+        }
+        Pattern::Variant { payload, .. } => {
+            if let Some(sub) = payload {
+                walk_pattern_exprs(sub, f);
+            }
+        }
+        Pattern::Guard(e) => walk_expr(e, f),
+        _ => {}
+    }
+}
+
+fn walk_stmts<'a>(stmts: &'a [Stmt], f: &mut dyn FnMut(&'a Expr)) {
+    for s in stmts {
+        walk_stmt(s, f);
+    }
+}
+
+fn walk_stmt<'a>(s: &'a Stmt, f: &mut dyn FnMut(&'a Expr)) {
+    match s {
+        Stmt::Let { pattern, value, .. } | Stmt::Var { pattern, value, .. } => {
+            walk_pattern_exprs(pattern, f);
+            walk_expr(value, f);
+        }
+        Stmt::Assign { target, value } => {
+            walk_assign_target(target, f);
+            walk_expr(value, f);
+        }
+        Stmt::Expr(e) => walk_expr(e, f),
+        Stmt::Return(opt) => {
+            if let Some(e) = opt {
+                walk_expr(e, f);
+            }
+        }
+        Stmt::While { cond, body } => {
+            walk_expr(cond, f);
+            walk_stmts(body, f);
+        }
+        Stmt::WhileLet {
+            pattern,
+            expr,
+            body,
+        } => {
+            walk_pattern_exprs(pattern, f);
+            walk_expr(expr, f);
+            walk_stmts(body, f);
+        }
+        Stmt::DoWhile { body, cond } => {
+            walk_stmts(body, f);
+            walk_expr(cond, f);
+        }
+        Stmt::For { iterable, body, .. } => {
+            walk_expr(iterable, f);
+            walk_stmts(body, f);
+        }
+        Stmt::Loop { body } | Stmt::UnsafeBlock { body } => walk_stmts(body, f),
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            walk_expr(left, f);
+            walk_expr(right, f);
+        }
+        Stmt::Const { value, .. } => walk_expr(value, f),
+        Stmt::LocalFunc(func) => {
+            for p in &func.params {
+                if let Some(d) = &p.default {
+                    walk_expr(d, f);
+                }
+            }
+            walk_stmts(&func.body, f);
+        }
+        _ => {}
+    }
+}
+
+fn walk_assign_target<'a>(target: &'a crate::ast::AssignTarget, f: &mut dyn FnMut(&'a Expr)) {
+    use crate::ast::AssignTarget;
+    match target {
+        AssignTarget::Index { index, .. }
+        | AssignTarget::IndexPath { index, .. }
+        | AssignTarget::ExprIndex { index, .. } => walk_expr(index, f),
+        AssignTarget::ExprField { object, .. } => walk_expr(object, f),
+        AssignTarget::Slice {
+            array, start, end, ..
+        } => {
+            walk_expr(array, f);
+            walk_expr(start, f);
+            walk_expr(end, f);
+        }
+        AssignTarget::Tuple(items) => {
+            for t in items {
+                walk_assign_target(t, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 收集模式中绑定的名字。
+fn collect_pattern_bindings(p: &crate::ast::Pattern, out: &mut HashSet<String>) {
+    use crate::ast::Pattern;
+    match p {
+        Pattern::Binding(name) => {
+            out.insert(name.clone());
+        }
+        Pattern::Struct { fields, .. } => {
+            for (_, sub) in fields {
+                collect_pattern_bindings(sub, out);
+            }
+        }
+        Pattern::Tuple(items) | Pattern::Or(items) => {
+            for sub in items {
+                collect_pattern_bindings(sub, out);
+            }
+        }
+        Pattern::Variant { payload, .. } => {
+            if let Some(sub) = payload {
+                collect_pattern_bindings(sub, out);
+            }
+        }
+        Pattern::TypeTest { binding, .. } => {
+            out.insert(binding.clone());
+        }
+        _ => {}
+    }
+}
+
+/// 收集语句块内所有局部绑定名（含嵌套作用域，保守取并集）。
+fn collect_bindings_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+                collect_pattern_bindings(pattern, out)
+            }
+            Stmt::WhileLet { pattern, body, .. } => {
+                collect_pattern_bindings(pattern, out);
+                collect_bindings_stmts(body, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::UnsafeBlock { body } => collect_bindings_stmts(body, out),
+            Stmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                collect_bindings_stmts(body, out);
+            }
+            Stmt::Const { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stmt::Expr(Expr::TryBlock {
+                catch_var,
+                body,
+                catch_body,
+                finally_body,
+                ..
+            }) => {
+                if let Some(v) = catch_var {
+                    out.insert(v.clone());
+                }
+                collect_bindings_stmts(body, out);
+                collect_bindings_stmts(catch_body, out);
+                if let Some(b) = finally_body {
+                    collect_bindings_stmts(b, out);
+                }
+            }
+            Stmt::LocalFunc(func) => {
+                let last = func
+                    .name
+                    .rsplit_once('.')
+                    .map(|(_, n)| n)
+                    .unwrap_or(&func.name);
+                out.insert(last.to_string());
+                for p in &func.params {
+                    out.insert(p.name.clone());
+                }
+                collect_bindings_stmts(&func.body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 收集类（含父类/接口）中所有实例成员的名字（字段、实例函数、属性基名）。
+/// 任一父类型无法本地解析时返回 None，调用方保守跳过。
+fn collect_instance_member_names<'a>(
+    cls: &'a ClassDef,
+    index: &ProgramIndex<'a>,
+) -> Option<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut add_class = |c: &ClassDef, out: &mut HashSet<String>| {
+        for f in &c.fields {
+            if !f.is_static {
+                out.insert(f.name.clone());
+            }
+        }
+        for m in &c.methods {
+            let sig = sig_of_class_method(m, &c.type_params);
+            if is_synthetic_member(&sig.name) {
+                continue;
+            }
+            if !m.is_static {
+                out.insert(member_base_name(&sig.name).to_string());
+            }
+        }
+    };
+    add_class(cls, &mut out);
+
+    let mut queue: Vec<&'a str> = Vec::new();
+    if let Some(p) = cls.extends.as_deref() {
+        queue.push(p);
+    }
+    for i in &cls.implements {
+        queue.push(i.as_str());
+    }
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut qi = 0;
+    while qi < queue.len() {
+        let name = queue[qi];
+        qi += 1;
+        if !visited.insert(name) {
+            continue;
+        }
+        if let Some(c) = index.classes.get(name) {
+            add_class(c, &mut out);
+            if let Some(p) = c.extends.as_deref() {
+                queue.push(p);
+            }
+            for i in &c.implements {
+                queue.push(i.as_str());
+            }
+        } else if let Some(iface) = index.interfaces.get(name) {
+            for m in &iface.methods {
+                if !m.is_static {
+                    out.insert(member_base_name(&m.name).to_string());
+                }
+            }
+            for p in &iface.parents {
+                queue.push(p.as_str());
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// 静态成员函数体内不得访问实例成员（6.1.2.4(17)/(41)）。
+fn check_static_member_access(
+    cls: &ClassDef,
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let Some(instance_names) = collect_instance_member_names(cls, index) else {
+        return;
+    };
+    if instance_names.is_empty() {
+        return;
+    }
+    let globals: HashSet<String> = program
+        .functions
+        .iter()
+        .filter(|f| owner_name(&f.name).is_none())
+        .map(|f| f.name.clone())
+        .chain(program.constants.iter().map(|c| c.name.clone()))
+        .chain(program.classes.iter().map(|c| c.name.clone()))
+        .collect();
+    for m in &cls.methods {
+        let sig = sig_of_class_method(m, &cls.type_params);
+        if is_synthetic_member(&sig.name) || !m.has_body {
+            continue;
+        }
+        if !m.is_static {
+            continue;
+        }
+        let mut locals: HashSet<String> = HashSet::new();
+        for p in &m.func.params {
+            locals.insert(p.name.clone());
+        }
+        collect_bindings_stmts(&m.func.body, &mut locals);
+        let mut hits: Vec<String> = Vec::new();
+        walk_stmts(&m.func.body, &mut |e| {
+            let name = match e {
+                Expr::Var(n) => n,
+                Expr::Call { name, .. } => name,
+                _ => return,
+            };
+            if name.contains('.') {
+                return;
+            }
+            if instance_names.contains(name) && !locals.contains(name) && !globals.contains(name) {
+                hits.push(name.clone());
+            }
+        });
+        hits.sort();
+        hits.dedup();
+        for name in hits {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的静态成员函数 '{}' 不能访问实例成员 '{}'（6.1.2.4(17)/(41)）",
+                    cls.name, m.func.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 子类不得访问父类的 private 成员（6.1.1.2(13)：private 成员不被继承）。
+fn collect_private_parent_members<'a>(
+    cls: &ClassDef,
+    index: &ProgramIndex<'a>,
+) -> Option<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut cur = cls.extends.clone();
+    let mut seen = HashSet::new();
+    while let Some(name) = cur {
+        if !seen.insert(name.clone()) {
+            break;
+        }
+        let Some(parent) = index.classes.get(name.as_str()) else {
+            return None;
+        };
+        for f in &parent.fields {
+            if f.visibility == Visibility::Private {
+                out.insert(f.name.clone());
+            }
+        }
+        for m in &parent.methods {
+            let sig = sig_of_class_method(m, &parent.type_params);
+            if m.func.visibility == Visibility::Private && !is_synthetic_member(&sig.name) {
+                out.insert(member_base_name(&sig.name).to_string());
+            }
+        }
+        cur = parent.extends.clone();
+    }
+    Some(out)
+}
+
+fn check_private_parent_access(
+    cls: &ClassDef,
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let Some(private_names) = collect_private_parent_members(cls, index) else {
+        return;
+    };
+    if private_names.is_empty() {
+        return;
+    }
+    // 子类自身成员会遮蔽/覆盖同名名字，不视为访问父类私有成员。
+    let mut own_names: HashSet<String> = HashSet::new();
+    for f in &cls.fields {
+        own_names.insert(f.name.clone());
+    }
+    for m in &cls.methods {
+        let sig = sig_of_class_method(m, &cls.type_params);
+        if !is_synthetic_member(&sig.name) {
+            own_names.insert(member_base_name(&sig.name).to_string());
+        }
+    }
+    let globals: HashSet<String> = program
+        .functions
+        .iter()
+        .filter(|f| owner_name(&f.name).is_none())
+        .map(|f| f.name.clone())
+        .chain(program.constants.iter().map(|c| c.name.clone()))
+        .chain(program.classes.iter().map(|c| c.name.clone()))
+        .collect();
+    for m in &cls.methods {
+        let sig = sig_of_class_method(m, &cls.type_params);
+        if is_synthetic_member(&sig.name) || !m.has_body {
+            continue;
+        }
+        let mut locals: HashSet<String> = HashSet::new();
+        for p in &m.func.params {
+            locals.insert(p.name.clone());
+        }
+        collect_bindings_stmts(&m.func.body, &mut locals);
+        let mut hits: Vec<String> = Vec::new();
+        walk_stmts(&m.func.body, &mut |e| {
+            let name = match e {
+                Expr::Var(n) => n,
+                Expr::Call { name, .. } => name,
+                Expr::SuperCall { method, .. } => method,
+                Expr::SuperFieldAccess { field } => field,
+                Expr::Field { object, field }
+                    if matches!(object.as_ref(), Expr::Var(n) if n == "this") =>
+                {
+                    field
+                }
+                Expr::MethodCall { object, method, .. }
+                    if matches!(object.as_ref(), Expr::Var(n) if n == "this") =>
+                {
+                    method
+                }
+                _ => return,
+            };
+            if name.contains('.') {
+                return;
+            }
+            if private_names.contains(name)
+                && !locals.contains(name)
+                && !own_names.contains(name)
+                && !globals.contains(name)
+            {
+                hits.push(name.clone());
+            }
+        });
+        hits.sort();
+        hits.dedup();
+        for name in hits {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的成员函数 '{}' 不能访问父类的 private 成员 '{}'（6.1.1.2(13)）",
+                    cls.name, m.func.name, name
+                ),
+            });
+        }
+    }
+}
+
+// ─── This 类型使用限制（6.1.4(1)）─────────────────────────────────────────
+fn contains_this(ty: &Type) -> bool {
+    match ty {
+        Type::This => true,
+        Type::Array(t) | Type::Option(t) | Type::Slice(t) => contains_this(t),
+        Type::Struct(_, args) | Type::Tuple(args) => args.iter().any(contains_this),
+        Type::Result(a, b) | Type::Map(a, b) => contains_this(a) || contains_this(b),
+        Type::Function { params, ret } => {
+            params.iter().any(contains_this)
+                || ret.as_ref().as_ref().map_or(false, contains_this)
+        }
+        _ => false,
+    }
+}
+
+fn for_each_pattern_type<'a>(p: &'a crate::ast::Pattern, f: &mut dyn FnMut(&'a Type)) {
+    use crate::ast::Pattern;
+    match p {
+        Pattern::Struct { fields, .. } => {
+            for (_, sub) in fields {
+                for_each_pattern_type(sub, &mut *f);
+            }
+        }
+        Pattern::Tuple(items) | Pattern::Or(items) => {
+            for sub in items {
+                for_each_pattern_type(sub, &mut *f);
+            }
+        }
+        Pattern::Variant { payload, .. } => {
+            if let Some(sub) = payload {
+                for_each_pattern_type(sub, &mut *f);
+            }
+        }
+        Pattern::TypeTest { ty, .. } => f(ty),
+        _ => {}
+    }
+}
+
+/// 访问表达式内部出现的所有类型位置（类型实参、cast/is、lambda 参数/返回、模式）。
+fn for_each_expr_type<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Type)) {
+    match e {
+        Expr::Cast { target_ty, .. } | Expr::IsType { target_ty, .. } => f(target_ty),
+        Expr::Lambda {
+            params,
+            return_type,
+            ..
+        } => {
+            for (_, ty) in params {
+                f(ty);
+            }
+            if let Some(ty) = return_type {
+                f(ty);
+            }
+        }
+        Expr::Call { type_args, .. }
+        | Expr::MethodCall { type_args, .. }
+        | Expr::StructInit { type_args, .. }
+        | Expr::ConstructorCall { type_args, .. } => {
+            if let Some(args) = type_args {
+                for ty in args {
+                    f(ty);
+                }
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for arm in arms {
+                for_each_pattern_type(&arm.pattern, &mut *f);
+            }
+        }
+        Expr::IfLet { pattern, .. } => for_each_pattern_type(pattern, &mut *f),
+        _ => {}
+    }
+}
+
+/// 访问语句块内所有声明位置与表达式位置中的类型。
+fn for_each_type_in_stmts<'a>(stmts: &'a [Stmt], f: &mut dyn FnMut(&'a Type)) {
+    for s in stmts {
+        match s {
+            Stmt::Let { ty, pattern, value } | Stmt::Var { ty, pattern, value } => {
+                if let Some(ty) = ty {
+                    f(ty);
+                }
+                for_each_pattern_type(pattern, f);
+                walk_expr(value, &mut |e| for_each_expr_type(e, &mut *f));
+            }
+            Stmt::WhileLet {
+                pattern,
+                expr,
+                body,
+            } => {
+                for_each_pattern_type(pattern, f);
+                walk_expr(expr, &mut |e| for_each_expr_type(e, &mut *f));
+                for_each_type_in_stmts(body, &mut *f);
+            }
+            Stmt::While { cond, body } => {
+                walk_expr(cond, &mut |e| for_each_expr_type(e, &mut *f));
+                for_each_type_in_stmts(body, &mut *f);
+            }
+            Stmt::DoWhile { body, cond } => {
+                for_each_type_in_stmts(body, &mut *f);
+                walk_expr(cond, &mut |e| for_each_expr_type(e, &mut *f));
+            }
+            Stmt::For {
+                iterable, body, ..
+            } => {
+                walk_expr(iterable, &mut |e| for_each_expr_type(e, &mut *f));
+                for_each_type_in_stmts(body, &mut *f);
+            }
+            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => for_each_type_in_stmts(body, &mut *f),
+            Stmt::Const { ty, value, .. } => {
+                if let Some(ty) = ty {
+                    f(ty);
+                }
+                walk_expr(value, &mut |e| for_each_expr_type(e, &mut *f));
+            }
+            Stmt::LocalFunc(func) => {
+                for p in &func.params {
+                    f(&p.ty);
+                }
+                if let Some(ty) = &func.return_type {
+                    f(ty);
+                }
+                for_each_type_in_stmts(&func.body, f);
+            }
+            _ => {
+                walk_stmt(s, &mut |e| for_each_expr_type(e, &mut *f));
+            }
+        }
+    }
+}
+
+fn check_this_type_usage(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut bad = |what: &str, errors: &mut Vec<SemanticError>| {
+        errors.push(SemanticError {
+            message: format!(
+                "This 类型只能用作类的实例成员函数的返回类型（6.1.4(1)）：{}",
+                what
+            ),
+        });
+    };
+    let check_constraints = |constraints: &[crate::ast::TypeConstraint],
+                            owner: &str,
+                            errors: &mut Vec<SemanticError>| {
+        if constraints.iter().any(|c| c.bounds.iter().any(|b| b == "This")) {
+            errors.push(SemanticError {
+                message: format!(
+                    "This 类型不能用作泛型约束（6.1.4(1)）：{}",
+                    owner
+                ),
+            });
+        }
+    };
+    // 顶层函数：This 完全不可用。
+    for f in &program.functions {
+        let mut found = f
+            .params
+            .iter()
+            .any(|p| contains_this(&p.ty))
+            || f.return_type.as_ref().map_or(false, contains_this);
+        if !found {
+            for_each_type_in_stmts(&f.body, &mut |ty| {
+                if contains_this(ty) {
+                    found = true;
+                }
+            });
+        }
+        check_constraints(&f.constraints, &f.name, errors);
+        if found {
+            bad(&format!("顶层函数 '{}' 的签名或函数体", f.name), errors);
+        }
+    }
+    for c in &program.constants {
+        if contains_this(&c.ty) {
+            bad(&format!("顶层常量 '{}' 的类型", c.name), errors);
+        }
+    }
+    for cls in &program.classes {
+        for fld in &cls.fields {
+            if contains_this(&fld.ty) {
+                bad(&format!("类 '{}' 的字段 '{}'", cls.name, fld.name), errors);
+            }
+        }
+        if let Some(init) = &cls.init {
+            for p in &init.params {
+                if contains_this(&p.ty) {
+                    bad(&format!("类 '{}' 的构造函数参数 '{}'", cls.name, p.name), errors);
+                }
+            }
+            for_each_type_in_stmts(&init.body, &mut |ty| {
+                if contains_this(ty) {
+                    bad(&format!("类 '{}' 的构造函数体", cls.name), errors);
+                }
+            });
+        }
+        for p in &cls.primary_ctor_params {
+            if contains_this(&p.ty) {
+                bad(&format!("类 '{}' 的主构造函数参数 '{}'", cls.name, p.name), errors);
+            }
+        }
+        check_constraints(&cls.constraints, &cls.name, errors);
+        for m in &cls.methods {
+            let sig = sig_of_class_method(m, &cls.type_params);
+            if is_synthetic_member(&sig.name) {
+                continue;
+            }
+            let is_static = m.is_static;
+            for p in &m.func.params {
+                if contains_this(&p.ty) {
+                    bad(
+                        &format!("类 '{}' 的方法 '{}' 的参数 '{}'", cls.name, m.func.name, p.name),
+                        errors,
+                    );
+                }
+            }
+            if is_static {
+                if m.func.return_type.as_ref().map_or(false, contains_this) {
+                    bad(
+                        &format!("类 '{}' 的静态方法 '{}' 的返回类型", cls.name, m.func.name),
+                        errors,
+                    );
+                }
+            }
+            check_constraints(&m.func.constraints, &m.func.name, errors);
+            for_each_type_in_stmts(&m.func.body, &mut |ty| {
+                if contains_this(ty) {
+                    bad(&format!("类 '{}' 的方法 '{}' 的函数体", cls.name, m.func.name), errors);
+                }
+            });
+        }
+    }
+    for st in &program.structs {
+        for fld in &st.fields {
+            if contains_this(&fld.ty) {
+                bad(&format!("结构体 '{}' 的字段 '{}'", st.name, fld.name), errors);
+            }
+        }
+        check_constraints(&st.constraints, &st.name, errors);
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if m.params.iter().any(|p| contains_this(&p.ty))
+                || m.return_type.as_ref().map_or(false, contains_this)
+            {
+                bad(
+                    &format!("接口 '{}' 的成员函数 '{}'", iface.name, m.name),
+                    errors,
+                );
+            }
+        }
+    }
+    for en in &program.enums {
+        for v in &en.variants {
+            if v.payload.as_ref().map_or(false, contains_this) {
+                bad(&format!("枚举 '{}' 的构造器 '{}'", en.name, v.name), errors);
+            }
+        }
+        check_constraints(&en.constraints, &en.name, errors);
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            let mut found = f.params.iter().any(|p| contains_this(&p.ty))
+                || f.return_type.as_ref().map_or(false, contains_this);
+            if !found {
+                for_each_type_in_stmts(&f.body, &mut |ty| {
+                    if contains_this(ty) {
+                        found = true;
+                    }
+                });
+            }
+            if found {
+                bad(&format!("extend 函数 '{}'", f.name), errors);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2545,8 +3810,14 @@ mod tests {
                 deinit: None,
                 static_init: None,
                 primary_ctor_params: vec![],
+                primary_ctor_member_flags: vec![],
                 methods: vec![ClassMethod {
                     override_: false,
+                    has_override_kw: false,
+                    is_static: false,
+                    is_open: false,
+                    is_abstract: false,
+                    has_body: true,
                     func: Function {
                         visibility: Visibility::default(),
                         name: "Foo.getVal".to_string(),
@@ -2743,7 +4014,7 @@ mod tests {
              \x20   func f(x: Int64): Int64\n\
              }\n\
              class A <: I {\n\
-             \x20   func f(x: Int64) { x }\n\
+             \x20   public func f(x: Int64) { x }\n\
              }\n\
              main() {}\n",
         );
@@ -2943,6 +4214,134 @@ mod tests {
              \x20   public func f(): Int64 { 1 }\n\
              }\n\
              main() {}\n",
+        );
+    }
+
+    // ─── 06 章：成员修饰符 / 遮蔽 / 访问控制 / This / 构造参数顺序 ────────────
+
+    #[test]
+    fn test_validate_static_member_func_requires_body() {
+        assert_invalid("class A {\n    static func f(): Int64\n}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_static_member_func_with_body_ok() {
+        assert_valid("class A {\n    static func f(): Int64 { 1 }\n}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_no_body_func_in_non_abstract_class() {
+        assert_invalid("class A {\n    public func f(): Int64\n}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_no_body_func_in_abstract_class_ok() {
+        assert_valid("abstract class A {\n    func f(): Int64\n}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_open_static_func_conflict() {
+        assert_invalid(
+            "class A {\n    public static open func f() {}\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_override_non_open_func_rejected() {
+        assert_invalid(
+            "open class A {\n    public func f() {}\n}\nclass B <: A {\n    override public func f() {}\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_override_open_func_ok() {
+        assert_valid(
+            "open class A {\n    open public func f() {}\n}\nclass B <: A {\n    override public func f() {}\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_static_redef_non_open_ok() {
+        assert_valid(
+            "open class A {\n    public static func f() {}\n}\nclass B <: A {\n    public redef static func f() {}\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_member_shadowing_kind_conflict() {
+        // 子类函数与父类字段同名 → 遮蔽。
+        assert_invalid(
+            "open class A {\n    let x = 1\n}\nclass B <: A {\n    func x() {}\n}\nmain() {}\n",
+        );
+        // 子类字段与父类字段同名 → 遮蔽。
+        assert_invalid(
+            "open class A {\n    let x = 1\n}\nclass B <: A {\n    let x = 2\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_shadowing_private_parent_field_ok() {
+        assert_valid(
+            "open class A {\n    private let x = 1\n}\nclass B <: A {\n    let x = 2\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_interface_implementation_lowers_visibility() {
+        assert_invalid(
+            "interface I {\n    func f(): Int64\n}\nclass A <: I {\n    func f(): Int64 { 1 }\n}\nmain() {}\n",
+        );
+        assert_valid(
+            "interface I {\n    func f(): Int64\n}\nclass A <: I {\n    public func f(): Int64 { 1 }\n}\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_static_func_access_instance_member() {
+        assert_invalid("class A {\n    let x = 1\n    static func f() { x }\n}\nmain() {}\n");
+        assert_invalid(
+            "class A {\n    func g() {}\n    static func f() { g() }\n}\nmain() {}\n",
+        );
+        assert_valid("class A {\n    static let x = 1\n    static func f() { x }\n}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_ctor_regular_param_after_member_param() {
+        // 命名构造函数：普通参数位于成员变量参数之后。
+        assert_invalid("class A {\n    A(x: Bool, let a: Int64, y: Bool) {}\n}\nmain() {}\n");
+        // 主构造函数：同上。
+        assert_invalid("class A(let a: Int64, x: Bool) {}\nmain() {}\n");
+        assert_valid("class A {\n    A(x: Bool, let a: Int64) {}\n}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_this_type_placement() {
+        // This 不能作参数类型。
+        assert_invalid("class A {\n    func f(x: This) {}\n}\nmain() {}\n");
+        // This 不能作静态函数返回类型。
+        assert_invalid("class A {\n    static func f(): This { A() }\n}\nmain() {}\n");
+        // This 不能作局部变量类型。
+        assert_invalid("class A {\n    func f() { let x: This = this }\n}\nmain() {}\n");
+        // This 不能作顶层函数返回类型。
+        assert_invalid("func f(): This { A() }\nclass A {}\nmain() {}\n");
+        // 类的实例成员函数返回 This 合法。
+        assert_valid("class A {\n    func f(): This { this }\n}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_validate_private_parent_member_access() {
+        assert_invalid(
+            "open class A {\n    private func f() {}\n}\nclass B <: A {\n    func g() { f() }\n}\nmain() {}\n",
+        );
+        assert_invalid(
+            "open class A {\n    private let x = 1\n}\nclass B <: A {\n    func g() { x }\n}\nmain() {}\n",
+        );
+        assert_valid(
+            "open class A {\n    public func f() {}\n}\nclass B <: A {\n    func g() { f() }\n}\nmain() {}\n",
+        );
+        // 子类同名成员是自己的成员，不视为访问父类 private 成员。
+        assert_valid(
+            "open class A {\n    private func f() {}\n}\nclass B <: A {\n    func f() {}\n    func g() { f() }\n}\nmain() {}\n",
         );
     }
 }

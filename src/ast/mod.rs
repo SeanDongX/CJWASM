@@ -449,6 +449,10 @@ pub struct FieldDef {
     /// 字段是否可变（`var` 为 true，`let`/`const` 为 false）。
     /// 仅用于语义检查（不可变字段赋值），不影响代码生成。
     pub is_mut: bool,
+    /// 是否为 static 字段（static let/var）。
+    pub is_static: bool,
+    /// 字段可见性（接口/结构体字段未标注时按 public 处理）。
+    pub visibility: Visibility,
 }
 
 /// 顶层常量定义 (let/var name: Type = expr)
@@ -555,6 +559,12 @@ pub struct InterfaceMethod {
     pub return_type: Option<Type>,
     /// 默认实现体（若有则为 Some）
     pub default_body: Option<Vec<Stmt>>,
+    /// 成员可见性（接口成员未标注时默认为 public）。
+    pub visibility: Visibility,
+    /// 是否为 static 成员函数。
+    pub is_static: bool,
+    /// 方法级泛型参数名（如 `func f<T>()` 的 ["T"]）。
+    pub type_params: Vec<String>,
 }
 
 /// 接口关联类型定义（如 type Element）
@@ -620,6 +630,9 @@ pub struct ClassDef {
     /// P6: 主构造函数参数（如 class Foo(var x: Int64, var y: Int64)），
     /// 若非空则自动生成对应 fields 和 init
     pub primary_ctor_params: Vec<Param>,
+    /// 主构造函数参数是否为成员变量参数（`var`/`let` 前缀），与
+    /// `primary_ctor_params` 一一对应；用于校验“普通参数须在成员变量参数之前”。
+    pub primary_ctor_member_flags: Vec<bool>,
 }
 
 /// 构造函数定义
@@ -627,12 +640,24 @@ pub struct ClassDef {
 pub struct InitDef {
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
+    /// 参数是否为成员变量参数（`var`/`let` 前缀），与 `params` 一一对应。
+    pub member_param_flags: Vec<bool>,
 }
 
 /// 类方法（含 override 标记）
 #[derive(Debug, Clone)]
 pub struct ClassMethod {
     pub override_: bool,
+    /// 是否显式写了 `override` 关键字（`redef` 为重定义，语义不同）。
+    pub has_override_kw: bool,
+    /// 是否为 static 成员（属性访问器也需区分 static/实例）。
+    pub is_static: bool,
+    /// 是否带 `open` 修饰符（可被覆写）。
+    pub is_open: bool,
+    /// 是否带 `abstract` 修饰符（仅抽象类中允许，且无实现体）。
+    pub is_abstract: bool,
+    /// 是否声明了函数体（`{}` 也算有体）。无体声明用于抽象方法。
+    pub has_body: bool,
     pub func: Function,
 }
 

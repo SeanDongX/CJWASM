@@ -682,7 +682,7 @@ mod tests {
     }
 
     fn make_field(name: &str, ty: Type) -> FieldDef {
-        FieldDef { name: name.into(), ty, default: None, is_mut: true }
+        FieldDef { is_static: false, visibility: crate::ast::Visibility::Public, name: name.into(), ty, default: None, is_mut: true }
     }
 
     fn make_function(name: &str, params: Vec<Param>, return_type: Option<Type>, body: Vec<Stmt>) -> Function {
@@ -1141,8 +1141,14 @@ mod tests {
             fields: vec![make_field("count", Type::Int64)],
             init: None, deinit: None, static_init: None,
             primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
             methods: vec![ClassMethod {
                 override_: false,
+                has_override_kw: false,
+                is_static: false,
+                is_open: false,
+                is_abstract: false,
+                has_body: true,
                 func: make_function("Counter.get", vec![
                     make_param("this", Type::Struct("Counter".into(), vec![])),
                 ], Some(Type::Int64), vec![]),
@@ -1166,6 +1172,7 @@ mod tests {
             fields: vec![make_field("id", Type::Int64)],
             init: None, deinit: None, static_init: None,
             primary_ctor_params: vec![], methods: vec![],
+            primary_ctor_member_flags: vec![],
         };
         let child_class = ClassDef {
             visibility: Visibility::Public, name: "Child".into(),
@@ -1175,6 +1182,7 @@ mod tests {
             fields: vec![make_field("name", Type::String)],
             init: None, deinit: None, static_init: None,
             primary_ctor_params: vec![], methods: vec![],
+            primary_ctor_member_flags: vec![],
         };
         prog.classes.push(base_class);
         prog.classes.push(child_class);

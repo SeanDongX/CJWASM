@@ -13,7 +13,11 @@ pub(crate) struct MemberModifiers {
     /// const 作为 func / init 的前缀修饰符（常量求值语义，本阶段按普通 func/init 处理）
     pub is_const: bool,
     pub is_override: bool,
+    /// 是否显式写了 `override` 关键字（`redef` 不计入）。
+    pub has_override_kw: bool,
     pub is_open: bool,
+    pub is_abstract: bool,
+    pub is_sealed: bool,
     pub is_operator: bool,
     pub is_unsafe: bool,
     pub is_mut: bool,
@@ -54,14 +58,23 @@ impl Parser {
                 Some(Token::Override) => {
                     self.advance();
                     m.is_override = true;
+                    m.has_override_kw = true;
                 }
                 Some(Token::Redef) => {
                     self.advance();
                     m.is_override = true;
                 }
-                Some(Token::Open) | Some(Token::Abstract) | Some(Token::Sealed) => {
+                Some(Token::Open) => {
                     self.advance();
                     m.is_open = true;
+                }
+                Some(Token::Abstract) => {
+                    self.advance();
+                    m.is_abstract = true;
+                }
+                Some(Token::Sealed) => {
+                    self.advance();
+                    m.is_sealed = true;
                 }
                 Some(Token::Operator) => {
                     self.advance();
@@ -901,7 +914,7 @@ impl Parser {
                     } else {
                         None
                     };
-                    fields.push(FieldDef {
+                    fields.push(FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: param_name,
                         ty,
                         default,
@@ -1138,7 +1151,7 @@ impl Parser {
                 ));
             };
 
-            fields.push(FieldDef {
+            fields.push(FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                 name: field_name,
                 ty,
                 default,
@@ -1518,6 +1531,9 @@ impl Parser {
                         params: vec![],
                         return_type: Some(prop_ty),
                         default_body: None,
+                        visibility: Visibility::Public,
+                        is_static: false,
+                        type_params: vec![],
                     });
                     continue;
                 }
@@ -1547,6 +1563,9 @@ impl Parser {
                                 params: vec![],
                                 return_type: Some(prop_ty.clone()),
                                 default_body,
+                                visibility: Visibility::Public,
+                                is_static: false,
+                                type_params: vec![],
                             });
                         } else if kw == "set" {
                             self.advance();
@@ -1588,6 +1607,9 @@ impl Parser {
                                 }],
                                 return_type: None,
                                 default_body,
+                                visibility: Visibility::Public,
+                                is_static: false,
+                                type_params: vec![],
                             });
                         } else {
                             break;
@@ -1620,8 +1642,10 @@ impl Parser {
             };
             // 泛型方法签名：func name<A, B: Bound>(...)
             let (iface_type_params, _) = self.parse_type_params_with_constraints()?;
-            let prev_type_params =
-                std::mem::replace(&mut self.current_type_params, iface_type_params);
+            let prev_type_params = std::mem::replace(
+                &mut self.current_type_params,
+                iface_type_params.clone(),
+            );
             self.expect(Token::LParen)?;
             let params = self.parse_params()?;
             self.expect(Token::RParen)?;
@@ -1671,6 +1695,9 @@ impl Parser {
                 params,
                 return_type,
                 default_body,
+                visibility: mods.visibility.unwrap_or(Visibility::Public),
+                is_static: mods.is_static,
+                type_params: iface_type_params,
             });
         }
         self.expect(Token::RBrace)?;
@@ -2080,11 +2107,13 @@ impl Parser {
         };
         // P6: Primary constructor — class Foo(var x: Int64, var y: Int64) { ... }
         let mut primary_ctor_params = Vec::new();
+        let mut primary_ctor_member_flags: Vec<bool> = Vec::new();
         if self.check(&Token::LParen) {
             self.advance();
             while !self.check(&Token::RParen) {
-                // 跳过可选的 var/let
-                if self.check(&Token::Var) || self.check(&Token::Let) {
+                // 跳过可选的 var/let，并记录是否为成员变量参数
+                let is_member = self.check(&Token::Var) || self.check(&Token::Let);
+                if is_member {
                     self.advance();
                 }
                 let pname = match self.advance_ident() {
@@ -2126,6 +2155,7 @@ impl Parser {
                     is_named: false,
                     is_inout: false,
                 });
+                primary_ctor_member_flags.push(is_member);
                 if !self.check(&Token::Comma) {
                     break;
                 }
@@ -2220,6 +2250,8 @@ impl Parser {
                     self.advance();
                 }
                 fields.push(crate::ast::FieldDef {
+                    is_static: mods.is_static,
+                    visibility: member_vis.clone(),
                     name: f_name,
                     ty,
                     default,
@@ -2247,6 +2279,11 @@ impl Parser {
                             extern_import: None,
                         },
                         override_: false,
+                        has_override_kw: false,
+                        is_static: true,
+                        is_open: false,
+                        is_abstract: false,
+                        has_body: true,
                     });
                     continue;
                 }
@@ -2280,7 +2317,11 @@ impl Parser {
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
                 self.receiver_name = None;
-                init = Some(crate::ast::InitDef { params, body });
+                init = Some(crate::ast::InitDef {
+                    params,
+                    body,
+                    member_param_flags: vec![],
+                });
             } else if self.check(&Token::Tilde) {
                 // 规范 6.1.2.5(4)(5)：finalizer 不能带参数/返回类型/泛型参数/任何修饰符，
                 // 且 open/abstract/sealed 类不能定义 finalizer。
@@ -2367,6 +2408,11 @@ impl Parser {
                             // 脱糖为 getter 方法: ClassName.__get_propName(this): Type
                             methods.push(crate::ast::ClassMethod {
                                 override_: mods.is_override,
+                                has_override_kw: mods.has_override_kw,
+                                is_static: mods.is_static,
+                                is_open: mods.is_open,
+                                is_abstract: mods.is_abstract,
+                                has_body: true,
                                 func: crate::ast::Function {
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__get_{}", name, prop_name),
@@ -2409,6 +2455,11 @@ impl Parser {
                             // 脱糖为 setter 方法: ClassName.__set_propName(this, value)
                             methods.push(crate::ast::ClassMethod {
                                 override_: mods.is_override,
+                                has_override_kw: mods.has_override_kw,
+                                is_static: mods.is_static,
+                                is_open: mods.is_open,
+                                is_abstract: mods.is_abstract,
+                                has_body: true,
                                 func: crate::ast::Function {
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__set_{}", name, prop_name),
@@ -2461,6 +2512,7 @@ impl Parser {
                 self.advance(); // 消费类名
                 self.expect(Token::LParen)?;
                 let mut params = Vec::new();
+                let mut member_param_flags: Vec<bool> = Vec::new();
                 while !self.check(&Token::RParen) {
                     // 跳过可选的可见性修饰符 (private/public/protected/internal)
                     if self.check(&Token::Private)
@@ -2470,8 +2522,9 @@ impl Parser {
                     {
                         self.advance();
                     }
-                    // 跳过可选的 let/var 前缀
-                    if self.check(&Token::Let) || self.check(&Token::Var) {
+                    // 跳过可选的 let/var 前缀，并记录是否为成员变量参数
+                    let is_member = self.check(&Token::Let) || self.check(&Token::Var);
+                    if is_member {
                         self.advance();
                     }
                     let pname = match self.advance_ident() {
@@ -2519,6 +2572,7 @@ impl Parser {
                         is_named: is_required_named, // 必需命名参数标记为 is_named
                         is_inout: false,
                     });
+                    member_param_flags.push(is_member);
                     if !self.check(&Token::Comma) {
                         break;
                     }
@@ -2531,7 +2585,11 @@ impl Parser {
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
                 self.receiver_name = None;
-                init = Some(crate::ast::InitDef { params, body });
+                init = Some(crate::ast::InitDef {
+                    params,
+                    body,
+                    member_param_flags,
+                });
             } else if self.check(&Token::At) {
                 self.skip_optional_attributes()?;
                 continue; // 跳过属性后重新循环，下一次会看到 Func 等
@@ -2633,7 +2691,7 @@ impl Parser {
                     }
                 }
                 // P2.5: 支持抽象方法（无 body，以 ; 结尾或后跟下一成员/可见性关键字）
-                let body = if self.check(&Token::Semicolon)
+                let no_body = self.check(&Token::Semicolon)
                     || self.check(&Token::RBrace)
                     || matches!(
                         self.peek(),
@@ -2643,6 +2701,7 @@ impl Parser {
                             | Some(Token::Internal)
                             | Some(Token::Override)
                             | Some(Token::Open)
+                            | Some(Token::Abstract)
                             | Some(Token::Static)
                             | Some(Token::Func)
                             | Some(Token::Init)
@@ -2650,8 +2709,8 @@ impl Parser {
                             | Some(Token::Prop)
                             | Some(Token::Mut)
                             | Some(Token::At)
-                    )
-                {
+                    );
+                let body = if no_body {
                     // 抽象方法或声明：无函数体
                     if self.check(&Token::Semicolon) {
                         self.advance();
@@ -2666,10 +2725,16 @@ impl Parser {
                     self.expect(Token::RBrace)?;
                     stmts
                 };
+                let has_body = !no_body;
                 self.receiver_name = None;
                 self.current_type_params = prev_params;
                 methods.push(crate::ast::ClassMethod {
                     override_,
+                    has_override_kw: mods.has_override_kw,
+                    is_static,
+                    is_open: mods.is_open,
+                    is_abstract: mods.is_abstract,
+                    has_body,
                     func: crate::ast::Function {
                         visibility: member_vis,
                         name: m_name,
@@ -2696,7 +2761,11 @@ impl Parser {
                     let body = self.parse_stmts()?;
                     self.expect(Token::RBrace)?;
                     self.receiver_name = None;
-                    init = Some(crate::ast::InitDef { params, body });
+                    init = Some(crate::ast::InitDef {
+                        params,
+                        body,
+                        member_param_flags: vec![],
+                    });
                 } else {
                     // const FIELD_NAME: Type = value — 类级别常量，当作字段处理
                     let f_name = match self.advance() {
@@ -2731,6 +2800,8 @@ impl Parser {
                         self.advance();
                     }
                     fields.push(crate::ast::FieldDef {
+                        is_static: mods.is_static,
+                        visibility: member_vis.clone(),
                         name: f_name,
                         ty,
                         default,
@@ -2762,11 +2833,14 @@ impl Parser {
             static_init: None, // P3.11: TODO - 从 class body 中解析 static init()
             methods,
             primary_ctor_params: primary_ctor_params.clone(),
+            primary_ctor_member_flags: primary_ctor_member_flags.clone(),
         };
         // P6: 展开主构造函数参数为字段 + init
         if !primary_ctor_params.is_empty() {
             for p in &primary_ctor_params {
                 class_def.fields.push(FieldDef {
+                    is_static: false,
+                    visibility: crate::ast::Visibility::Internal,
                     name: p.name.clone(),
                     ty: p.ty.clone(),
                     default: p.default.clone(),
@@ -2787,6 +2861,7 @@ impl Parser {
                 class_def.init = Some(InitDef {
                     params: primary_ctor_params,
                     body: init_body,
+                    member_param_flags: primary_ctor_member_flags,
                 });
             }
         }

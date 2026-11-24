@@ -770,7 +770,7 @@ mod tests {
             is_open: false,
             extends: None,
             implements: vec![],
-            fields: vec![FieldDef {
+            fields: vec![FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                 name: "n".to_string(),
                 ty: Type::Int64,
                 default: None,
@@ -781,9 +781,15 @@ mod tests {
             static_init: None,
             methods: vec![ClassMethod {
                 override_: false,
+                has_override_kw: false,
+                is_static: false,
+                is_open: false,
+                is_abstract: false,
+                has_body: true,
                 func: class_method_func,
             }],
             primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
         };
 
         let program = crate::ast::Program {

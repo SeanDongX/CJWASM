@@ -1542,6 +1542,8 @@ pub fn monomorphize_program(program: &mut Program) {
             .fields
             .iter()
             .map(|f| FieldDef {
+                is_static: f.is_static,
+                visibility: f.visibility.clone(),
                 name: f.name.clone(),
                 ty: substitute_type(&f.ty, &subst),
                 default: f
@@ -1613,6 +1615,8 @@ pub fn monomorphize_program(program: &mut Program) {
             .fields
             .iter()
             .map(|f| FieldDef {
+                is_static: f.is_static,
+                visibility: f.visibility.clone(),
                 name: f.name.clone(),
                 ty: substitute_type(&f.ty, &subst),
                 default: f
@@ -1634,6 +1638,11 @@ pub fn monomorphize_program(program: &mut Program) {
                 };
                 ClassMethod {
                     override_: m.override_,
+                    has_override_kw: m.has_override_kw,
+                    is_static: m.is_static,
+                    is_open: m.is_open,
+                    is_abstract: m.is_abstract,
+                    has_body: m.has_body,
                     func: Function {
                         visibility: m.func.visibility.clone(),
                         name: method_name,
@@ -1695,6 +1704,7 @@ pub fn monomorphize_program(program: &mut Program) {
                 .cloned()
                 .map(|s| substitute_stmt(s, &subst, &rewrites))
                 .collect(),
+            member_param_flags: i.member_param_flags.clone(),
         });
         let deinit = def.deinit.as_ref().map(|d| {
             d.iter()
@@ -1726,6 +1736,7 @@ pub fn monomorphize_program(program: &mut Program) {
             }),
             methods,
             primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
         });
     }
     program.classes.append(&mut new_classes);
@@ -2026,13 +2037,13 @@ mod tests {
                 type_params: vec!["T".to_string(), "U".to_string()],
                 constraints: vec![],
                 fields: vec![
-                    crate::ast::FieldDef {
+                    crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "first".to_string(),
                         ty: Type::TypeParam("T".to_string()),
                         default: None,
                         is_mut: true,
                     },
-                    crate::ast::FieldDef {
+                    crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "second".to_string(),
                         ty: Type::TypeParam("U".to_string()),
                         default: None,
@@ -2084,13 +2095,13 @@ mod tests {
                 type_params: vec!["A".to_string(), "B".to_string()],
                 constraints: vec![],
                 fields: vec![
-                    crate::ast::FieldDef {
+                    crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "x".to_string(),
                         ty: Type::TypeParam("A".to_string()),
                         default: None,
                         is_mut: true,
                     },
-                    crate::ast::FieldDef {
+                    crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "y".to_string(),
                         ty: Type::TypeParam("B".to_string()),
                         default: None,
@@ -2144,7 +2155,7 @@ mod tests {
                 name: "Point".to_string(),
                 type_params: vec![],
                 constraints: vec![],
-                fields: vec![crate::ast::FieldDef {
+                fields: vec![crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                     name: "x".to_string(),
                     ty: Type::Int64,
                     default: None,
@@ -2255,7 +2266,7 @@ mod tests {
                 name: "Box".to_string(),
                 type_params: vec!["T".to_string()],
                 constraints: vec![],
-                fields: vec![crate::ast::FieldDef {
+                fields: vec![crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                     name: "value".to_string(),
                     ty: Type::TypeParam("T".to_string()),
                     default: None,
@@ -2313,7 +2324,7 @@ mod tests {
                     is_open: false,
                     extends: None,
                     implements: vec![],
-                    fields: vec![crate::ast::FieldDef {
+                    fields: vec![crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "data".to_string(),
                         ty: Type::TypeParam("T".to_string()),
                         default: None,
@@ -2335,11 +2346,17 @@ mod tests {
                             },
                             value: Expr::Var("d".to_string()),
                         }],
+                        member_param_flags: vec![false],
                     }),
                     deinit: None,
                     static_init: None,
                     methods: vec![crate::ast::ClassMethod {
                         override_: false,
+                        has_override_kw: false,
+                        is_static: false,
+                        is_open: false,
+                        is_abstract: false,
+                        has_body: true,
                         func: Function {
                             visibility: Visibility::default(),
                             name: "Wrapper.get".to_string(),
@@ -2360,6 +2377,7 @@ mod tests {
                         },
                     }],
                     primary_ctor_params: vec![],
+                    primary_ctor_member_flags: vec![],
                 },
             ],
             enums: vec![],
@@ -2412,13 +2430,13 @@ mod tests {
                 type_params: vec!["A".to_string(), "B".to_string()],
                 constraints: vec![],
                 fields: vec![
-                    crate::ast::FieldDef {
+                    crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "a".to_string(),
                         ty: Type::TypeParam("A".to_string()),
                         default: None,
                         is_mut: true,
                     },
-                    crate::ast::FieldDef {
+                    crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "b".to_string(),
                         ty: Type::TypeParam("B".to_string()),
                         default: None,
@@ -2644,7 +2662,7 @@ mod tests {
                 name: "Cell".to_string(),
                 type_params: vec!["T".to_string()],
                 constraints: vec![],
-                fields: vec![crate::ast::FieldDef {
+                fields: vec![crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                     name: "v".to_string(),
                     ty: Type::TypeParam("T".to_string()),
                     default: None,
