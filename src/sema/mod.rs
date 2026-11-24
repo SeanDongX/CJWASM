@@ -6,7 +6,7 @@
 //!
 //! 设计目标：零 panic、无 I/O、纯函数，与 CodeGen 解耦。
 
-use crate::ast::{Expr, Program, Stmt, Type};
+use crate::ast::{Expr, Program, Stmt, Type, TypeConstraint};
 use std::collections::HashMap;
 
 /// 语义分析上下文：保存预分析推断出的类型信息
@@ -354,9 +354,22 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         check_ctor_param_order(cls, &mut errors);
         check_static_member_access(cls, program, &index, &mut errors);
         check_private_parent_access(cls, program, &index, &mut errors);
+        // 6.1.2.3(3)(4)：实例成员变量初始化表达式的引用限制。
+        check_instance_field_initializers(cls, &mut errors);
+        // 6.1.2.1(56)：open/abstract 类构造函数不得调用实例成员函数/属性。
+        check_open_class_ctor_member_calls(cls, &index, &mut errors);
     }
     for st in &program.structs {
         check_struct_interfaces(st, program, &index, &mut errors);
+        check_impl_generic_constraint_loosening(
+            &st.name,
+            &st.type_params,
+            &st.constraints,
+            "结构体",
+            program,
+            &index,
+            &mut errors,
+        );
     }
     for iface in &program.interfaces {
         check_interface(iface, &mut errors);
@@ -364,6 +377,15 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     for en in &program.enums {
         check_enum_variants(en, &mut errors);
         check_enum_interfaces(en, program, &index, &mut errors);
+        check_impl_generic_constraint_loosening(
+            &en.name,
+            &en.type_params,
+            &en.constraints,
+            "枚举",
+            program,
+            &index,
+            &mut errors,
+        );
     }
 
     // 声明层泛型检查：类型参数重名、约束左界必须是类型变量（9.1(4)/9.2(4)）。
@@ -723,6 +745,10 @@ fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<Semant
 
     // 父类型来源合法性：单继承、可继承性、不能继承 struct/enum
     check_class_supertypes(cls, index, errors);
+
+    // 重定义/实现父类型的泛型函数时，约束不得比父类型更严格
+    // （6.3.4.1(5)、6.2.4.1(5)）。
+    check_generic_constraint_loosening(cls, index, errors);
 }
 
 /// 可见性级别：private < internal(默认) < protected < public。
@@ -980,6 +1006,398 @@ fn check_ctor_param_order(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
     check(&cls.primary_ctor_member_flags, "主构造函数");
     if let Some(init) = &cls.init {
         check(&init.member_param_flags, "构造函数");
+    }
+}
+
+/// 6.1.2.3(3)：实例成员变量的初始化表达式只能引用在它之前声明的实例成员变量。
+/// 6.1.2.3(4)：实例成员变量初始化表达式不得用 `super` 访问父类型成员
+/// （初始化发生在父类构造函数调用之前）。
+fn check_instance_field_initializers(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    // 实例字段名 → 声明顺序（同名重复由其它规则报告，这里取首个）。
+    let mut order: HashMap<&str, usize> = HashMap::new();
+    for (i, f) in cls.fields.iter().enumerate() {
+        if f.is_static {
+            continue;
+        }
+        order.entry(f.name.as_str()).or_insert(i);
+    }
+    for (i, f) in cls.fields.iter().enumerate() {
+        if f.is_static {
+            continue;
+        }
+        let Some(expr) = &f.default else {
+            continue;
+        };
+        // 初始化表达式内引入的局部绑定（let/var/for/lambda 参数等）不是字段引用。
+        let mut locals: HashSet<String> = HashSet::new();
+        walk_expr(expr, &mut |e| match e {
+            Expr::Lambda { params, .. } => {
+                for (n, _) in params {
+                    locals.insert(n.clone());
+                }
+            }
+            Expr::Block(stmts, _) => collect_bindings_stmts(stmts, &mut locals),
+            Expr::Match { arms, .. } => {
+                for arm in arms {
+                    collect_pattern_bindings(&arm.pattern, &mut locals);
+                }
+            }
+            Expr::IfLet { pattern, .. } => {
+                collect_pattern_bindings(pattern, &mut locals);
+            }
+            _ => {}
+        });
+        let mut later: Option<String> = None;
+        let mut super_use: Option<String> = None;
+        walk_expr(expr, &mut |e| match e {
+            Expr::Var(name) => {
+                if later.is_none() && !locals.contains(name.as_str()) {
+                    if let Some(&j) = order.get(name.as_str()) {
+                        // 只有“之前”声明的实例字段可用于初始化；自身及之后均非法。
+                        if j >= i {
+                            later = Some(name.clone());
+                        }
+                    }
+                }
+            }
+            Expr::Field { object, field } if is_this_expr(object) => {
+                if later.is_none() {
+                    if let Some(&j) = order.get(field.as_str()) {
+                        if j >= i {
+                            later = Some(field.clone());
+                        }
+                    }
+                }
+            }
+            Expr::SuperFieldAccess { field } => {
+                if super_use.is_none() {
+                    super_use = Some(format!("super.{}", field));
+                }
+            }
+            Expr::SuperCall { method, .. } => {
+                if super_use.is_none() {
+                    super_use = Some(format!("super.{}", method));
+                }
+            }
+            Expr::MethodCall { object, method, .. }
+                if matches!(object.as_ref(), Expr::Var(n) if n == "super") =>
+            {
+                if super_use.is_none() {
+                    super_use = Some(format!("super.{}", method));
+                }
+            }
+            _ => {}
+        });
+        if let Some(name) = super_use {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的实例成员变量 '{}' 的初始化表达式不能通过 '{}' 访问父类型成员（6.1.2.3(4)）",
+                    cls.name, f.name, name
+                ),
+            });
+        }
+        if let Some(name) = later {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的实例成员变量 '{}' 的初始化表达式引用了尚未初始化的成员 '{}'（6.1.2.3(3)）",
+                    cls.name, f.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 是否为 `this` / `self` 接收者表达式。
+fn is_this_expr(e: &Expr) -> bool {
+    matches!(e, Expr::Var(n) if n == "this" || n == "self")
+}
+
+/// 6.1.2.1(56)：open/abstract 类的构造函数（成员尚未全部初始化）中
+/// 禁止调用实例成员函数或属性（包括经 `super.` 访问父类型成员）。
+fn check_open_class_ctor_member_calls(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if !(cls.is_open || cls.is_abstract) {
+        return;
+    }
+    let Some(init) = &cls.init else {
+        return;
+    };
+    // 属性脱糖为 `__get_p` / `__set_p`，收集本类与可解析父类型的属性名。
+    let mut props: HashSet<String> = HashSet::new();
+    for m in &cls.methods {
+        let base = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+        if let Some(p) = base
+            .strip_prefix("__get_")
+            .or_else(|| base.strip_prefix("__set_"))
+        {
+            props.insert(p.to_string());
+        }
+    }
+    if let Some(parents) = collect_parent_methods(cls, index) {
+        for p in &parents {
+            if let Some(name) = p
+                .sig
+                .name
+                .strip_prefix("__get_")
+                .or_else(|| p.sig.name.strip_prefix("__set_"))
+            {
+                props.insert(name.to_string());
+            }
+        }
+    }
+
+    let mut report: Option<String> = None;
+    for stmt in &init.body {
+        walk_stmt(stmt, &mut |e| {
+            if report.is_some() {
+                return;
+            }
+            match e {
+                Expr::MethodCall { object, method, .. } if is_this_expr(object) => {
+                    report = Some(format!("this.{}()", method));
+                }
+                Expr::Field { object, field } if is_this_expr(object) => {
+                    if props.contains(field.as_str()) {
+                        report = Some(format!("this.{}", field));
+                    }
+                }
+                Expr::SuperCall { method, .. } if method != "init" => {
+                    report = Some(format!("super.{}()", method));
+                }
+                Expr::SuperFieldAccess { field } => {
+                    if props.contains(field.as_str()) {
+                        report = Some(format!("super.{}", field));
+                    }
+                }
+                Expr::MethodCall { object, method, .. }
+                    if matches!(object.as_ref(), Expr::Var(n) if n == "super") =>
+                {
+                    report = Some(format!("super.{}()", method));
+                }
+                _ => {}
+            }
+        });
+    }
+    if let Some(what) = report {
+        errors.push(SemanticError {
+            message: format!(
+                "类 '{}' 的构造函数中不能调用实例成员函数或属性（{}）（6.1.2.1(56)）",
+                cls.name, what
+            ),
+        });
+    }
+}
+
+/// 泛型约束上界的规范形式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoundVal {
+    /// `Any` / `Object`：顶层约束（等价于不约束）。
+    Top,
+    /// 方法级类型参数（按声明顺序编号）。
+    TypeParam(usize),
+    /// 具名类型。
+    Name(String),
+}
+
+/// 把一组泛型约束规范化为 `类型参数序号 → 上界列表`。
+///
+/// 上界若引用方法级类型参数则映射为其声明序号；若引用类级类型参数，
+/// 则返回 `None`（无法安全比较，保守跳过）。
+fn canonical_constraint_bounds(
+    constraints: &[TypeConstraint],
+    type_params: &[String],
+    class_type_params: &[String],
+) -> Option<HashMap<usize, Vec<BoundVal>>> {
+    let mut map: HashMap<usize, Vec<BoundVal>> = HashMap::new();
+    for c in constraints {
+        let pi = type_params.iter().position(|n| n == &c.param)?;
+        for b in &c.bounds {
+            if class_type_params.iter().any(|n| n == b) {
+                return None;
+            }
+            let v = if b == "Any" || b == "Object" {
+                BoundVal::Top
+            } else if let Some(bi) = type_params.iter().position(|n| n == b) {
+                BoundVal::TypeParam(bi)
+            } else {
+                BoundVal::Name(b.clone())
+            };
+            map.entry(pi).or_default().push(v);
+        }
+    }
+    Some(map)
+}
+
+/// 父约束 `p` 是否蕴含子约束 `c`（即 `p` 描述的类型集合是 `c` 的子集，`p <: c`）。
+fn bound_implies(p: &BoundVal, c: &BoundVal, index: &ProgramIndex<'_>) -> bool {
+    match (p, c) {
+        (BoundVal::Top, BoundVal::Top) => true,
+        // 父类型没有任何限制时，只能由 Any/Object 放宽。
+        (BoundVal::Top, _) => false,
+        (_, BoundVal::Top) => true,
+        (BoundVal::TypeParam(i), BoundVal::TypeParam(j)) => i == j,
+        (BoundVal::Name(a), BoundVal::Name(b)) => a == b || index.is_subtype_name(a, b),
+        _ => false,
+    }
+}
+
+/// 判断子类型函数的约束是否不严于父类型（更宽松或相同）。
+///
+/// 允许：删除约束、把上界换成父类型的上界（或多个父上界之一）；
+/// 禁止：新增约束项（如 `T <: B & Object`）、把上界换成更窄的类型。
+fn constraints_not_tighter(
+    child: &HashMap<usize, Vec<BoundVal>>,
+    parent: &HashMap<usize, Vec<BoundVal>>,
+    index: &ProgramIndex<'_>,
+) -> bool {
+    for (pi, cb) in child {
+        if cb.is_empty() {
+            continue;
+        }
+        let empty: Vec<BoundVal> = Vec::new();
+        let pb = parent.get(pi).unwrap_or(&empty);
+        if pb.is_empty() {
+            // 父类型对无约束；子类型只能显式写 Any/Object。
+            if cb.iter().all(|b| matches!(b, BoundVal::Top)) {
+                continue;
+            }
+            return false;
+        }
+        // 子类型不能新增约束项（例如 `T <: B & Object`）。
+        if cb.len() > pb.len() {
+            return false;
+        }
+        for c in cb {
+            if matches!(c, BoundVal::Top) {
+                continue;
+            }
+            if !pb.iter().any(|p| bound_implies(p, c, index)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 6.3.4.1(5) / 6.2.4.1(5)：重定义父类方法或实现接口泛型函数时，
+/// 子类型函数的类型参数约束不得比父类型更严格（只能更宽松或相同）。
+fn check_generic_constraint_loosening(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let Some(parents) = collect_parent_methods(cls, index) else {
+        return;
+    };
+    for m in &cls.methods {
+        if !m.is_static || m.func.type_params.is_empty() {
+            continue;
+        }
+        let sig = sig_of_class_method(m, &cls.type_params);
+        if is_synthetic_member(&sig.name) {
+            continue;
+        }
+        let Some(child_bounds) = canonical_constraint_bounds(
+            &m.func.constraints,
+            &m.func.type_params,
+            &cls.type_params,
+        ) else {
+            continue;
+        };
+        for p in &parents {
+            if !p.sig.is_static
+                || p.sig.name != sig.name
+                || p.type_params.len() != m.func.type_params.len()
+            {
+                continue;
+            }
+            if canon_params(&sig) != canon_params(&p.sig) {
+                continue;
+            }
+            let parent_tp = index.type_params_of(&p.owner);
+            let Some(parent_bounds) =
+                canonical_constraint_bounds(&p.constraints, &p.type_params, parent_tp)
+            else {
+                continue;
+            };
+            if !constraints_not_tighter(&child_bounds, &parent_bounds, index) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 重定义/实现的泛型函数 '{}' 的类型参数约束比父类型更严格（6.3.4.1(5)/6.2.4.1(5)）",
+                        cls.name, sig.display
+                    ),
+                });
+                break;
+            }
+        }
+    }
+}
+
+/// 同上，针对实现接口的枚举/结构体：其内部方法被解析为顶层函数 `Type.method`。
+fn check_impl_generic_constraint_loosening<'a>(
+    type_name: &str,
+    type_params: &[String],
+    constraints: &[TypeConstraint],
+    kind: &str,
+    program: &'a Program,
+    index: &ProgramIndex<'a>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let bounds: Vec<&str> = constraints
+        .iter()
+        .filter(|c| c.param == type_name)
+        .flat_map(|c| c.bounds.iter().map(|b| b.as_str()))
+        .collect();
+    if bounds.is_empty() {
+        return;
+    }
+    let Some(parents) = collect_interface_methods(&bounds, index) else {
+        return;
+    };
+    let mut own: Vec<&crate::ast::Function> = program
+        .functions
+        .iter()
+        .filter(|f| owner_name(&f.name) == Some(type_name))
+        .collect();
+    if let Some(exts) = index.extends.get(type_name) {
+        own.extend(exts.iter().copied());
+    }
+    for f in own {
+        if f.type_params.is_empty() {
+            continue;
+        }
+        let sig = sig_of_function(f, type_params);
+        let Some(child_bounds) =
+            canonical_constraint_bounds(&f.constraints, &f.type_params, type_params)
+        else {
+            continue;
+        };
+        for p in &parents {
+            if p.sig.name != sig.name || p.type_params.len() != f.type_params.len() {
+                continue;
+            }
+            if canon_params(&sig) != canon_params(&p.sig) {
+                continue;
+            }
+            let parent_tp = index.type_params_of(&p.owner);
+            let Some(parent_bounds) =
+                canonical_constraint_bounds(&p.constraints, &p.type_params, parent_tp)
+            else {
+                continue;
+            };
+            if !constraints_not_tighter(&child_bounds, &parent_bounds, index) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "{} '{}' 实现的泛型函数 '{}' 的类型参数约束比接口更严格（6.2.4.1(5)）",
+                        kind, type_name, sig.display
+                    ),
+                });
+                break;
+            }
+        }
     }
 }
 
@@ -1803,7 +2221,7 @@ struct ParentMethod {
     /// 声明该方法的类型名（用于识别多个接口的默认实现冲突）。
     owner: String,
     /// 方法级类型参数（不含类级参数），用于约束宽松度比较时按位置 alpha 对齐。
-    method_tp: Vec<String>,
+    type_params: Vec<String>,
     /// 方法级泛型约束（6.2.4.1(5) / 6.3.4.1(5)）。
     constraints: Vec<crate::ast::TypeConstraint>,
 }
@@ -1864,7 +2282,7 @@ fn collect_parent_methods<'a>(
                 open_: m.is_open || m.is_abstract || !m.has_body,
                 is_interface: false,
                 owner: name.to_string(),
-                method_tp: m.func.type_params.clone(),
+                type_params: m.func.type_params.clone(),
                 constraints: m.func.constraints.clone(),
             });
         }
@@ -1877,7 +2295,7 @@ fn collect_parent_methods<'a>(
                     open_: true,
                     is_interface: false,
                     owner: name.to_string(),
-                    method_tp: f.type_params.clone(),
+                    type_params: f.type_params.clone(),
                     constraints: f.constraints.clone(),
                 });
             }
@@ -1919,7 +2337,7 @@ fn collect_parent_methods<'a>(
                 open_: true,
                 is_interface: true,
                 owner: name.to_string(),
-                method_tp: m.type_params.clone(),
+                type_params: m.type_params.clone(),
                 constraints: m.constraints.clone(),
             });
         }
@@ -1932,7 +2350,7 @@ fn collect_parent_methods<'a>(
                     open_: true,
                     is_interface: true,
                     owner: name.to_string(),
-                    method_tp: f.type_params.clone(),
+                    type_params: f.type_params.clone(),
                     constraints: f.constraints.clone(),
                 });
             }
@@ -2156,13 +2574,13 @@ fn check_constraint_looseness_for(
         if sig.generic != p.sig.generic {
             continue;
         }
-        if own_tp.len() != p.method_tp.len() {
+        if own_tp.len() != p.type_params.len() {
             continue;
         }
         if !signature_matches(sig, &p.sig, true, index) {
             continue;
         }
-        let Some(par_pairs) = normalize_constraints(&p.constraints, &p.method_tp) else {
+        let Some(par_pairs) = normalize_constraints(&p.constraints, &p.type_params) else {
             continue;
         };
         matched = true;
@@ -2693,7 +3111,7 @@ fn collect_interface_methods<'a>(
                 open_: true,
                 is_interface: true,
                 owner: name.to_string(),
-                method_tp: m.type_params.clone(),
+                type_params: m.type_params.clone(),
                 constraints: m.constraints.clone(),
             });
         }
@@ -2706,7 +3124,7 @@ fn collect_interface_methods<'a>(
                     open_: true,
                     is_interface: true,
                     owner: name.to_string(),
-                    method_tp: f.type_params.clone(),
+                    type_params: f.type_params.clone(),
                     constraints: f.constraints.clone(),
                 });
             }
