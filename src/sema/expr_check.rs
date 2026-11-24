@@ -48,12 +48,18 @@ enum Ty {
     IntLit,
     /// 浮点字面量（可适配任意浮点类型）
     FloatLit,
+    /// 用户定义类型（class/struct/interface/enum 名）：与内建具体类型互不可赋值
+    User(String),
+    /// 内建聚合类型（tuple/array/range/...）：不同类别之间互不可比较/赋值
+    Agg(&'static str),
+    /// Option<T>
+    Option(Box<Ty>),
     /// 无法确定（用户类型 / 泛型 / 调用结果未知等），不参与检查
     Unknown,
 }
 
 impl Ty {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         match self {
             Ty::Int8 => "Int8",
             Ty::Int16 => "Int16",
@@ -74,6 +80,9 @@ impl Ty {
             Ty::Unit => "Unit",
             Ty::IntLit => "整数字面量",
             Ty::FloatLit => "浮点字面量",
+            Ty::User(n) => n,
+            Ty::Agg(a) => a,
+            Ty::Option(_) => "Option",
             Ty::Unknown => "未知类型",
         }
     }
@@ -124,12 +133,40 @@ impl Ty {
                 | Ty::Rune
                 | Ty::String
                 | Ty::Unit
+                | Ty::User(_)
+                | Ty::Agg(_)
+                | Ty::Option(_)
         )
     }
 
     /// 是否足以参与一次“确定”的类型比较（具体类型或字面量）。
     fn is_definite(&self) -> bool {
         self.is_concrete() || matches!(self, Ty::IntLit | Ty::FloatLit)
+    }
+
+    /// 是否为可参与运算符类型规则的类型（用户类型/Option 保守跳过，
+    /// 以免误伤用户自定义运算符或 std 中的重载；聚合类型仍参与，
+    /// 因为 tuple/array/range 明确不是数值类型）。
+    fn is_prim(&self) -> bool {
+        self.is_definite() && !matches!(self, Ty::User(_) | Ty::Option(_))
+    }
+}
+
+/// 若表达式是一个编译期可确定的整数字面量（含一元负号），返回其值。
+///
+/// 注意：词法器把 `0xFFFF_FFFF_FFFF_FFFF` 这类超出 i64 的无符号字面量
+/// 也折叠成负的 i64，无法与真正的负字面量区分，此时返回 `None`（保守跳过）。
+fn literal_int(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Integer(n) if *n >= 0 => Some(*n),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => match &**expr {
+            Expr::Integer(n) if *n > 0 => n.checked_neg(),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -153,6 +190,10 @@ fn ty_of(ty: &Type) -> Ty {
         Type::Rune => Ty::Rune,
         Type::String => Ty::String,
         Type::Unit => Ty::Unit,
+        Type::Tuple(_) => Ty::Agg("tuple"),
+        Type::Array(_) => Ty::Agg("array"),
+        Type::Range => Ty::Agg("range"),
+        Type::Option(inner) => Ty::Option(Box::new(ty_of(inner))),
         // 少数场景下基础类型名以 Struct 形式出现（如未识别的别名），按名字兜底。
         Type::Struct(name, args) if args.is_empty() => match name.as_str() {
             "Int8" => Ty::Int8,
@@ -172,8 +213,20 @@ fn ty_of(ty: &Type) -> Ty {
             "Rune" => Ty::Rune,
             "String" => Ty::String,
             "Unit" => Ty::Unit,
+            "Array" => Ty::Agg("array"),
+            "Range" => Ty::Agg("range"),
             _ => Ty::Unknown,
         },
+        Type::Struct(name, args) if name == "Option" && args.len() == 1 => {
+            Ty::Option(Box::new(ty_of(&args[0])))
+        }
+        Type::Struct(name, _args) if name == "Range" || name == "Array" => {
+            if name == "Range" {
+                Ty::Agg("range")
+            } else {
+                Ty::Agg("array")
+            }
+        }
         _ => Ty::Unknown,
     }
 }
@@ -249,12 +302,19 @@ fn static_expr_ty(e: &Expr) -> Ty {
 fn compatible(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         (Ty::Unknown, _) | (_, Ty::Unknown) => true,
+        // Option<T> 与 Option<U> / T 之间（隐式包裹/解包比较）。
+        (Ty::Option(x), Ty::Option(y)) => compatible(x, y),
+        (Ty::Option(inner), other) | (other, Ty::Option(inner)) => compatible(inner, other),
         (Ty::IntLit, Ty::IntLit) => true,
         // 整数字面量可适配任意数值类型（含浮点）；这与无初始化变量
         // （如 `var x: Float16`）合成默认值 `0` 的语法形态一致。
         (Ty::IntLit, other) | (other, Ty::IntLit) => other.is_numeric(),
         (Ty::FloatLit, Ty::FloatLit) => true,
         (Ty::FloatLit, other) | (other, Ty::FloatLit) => other.is_float(),
+        // 用户类型之间可能存在继承/接口实现关系，不做强弱判定。
+        (Ty::User(_), Ty::User(_)) => true,
+        // 聚合类型（tuple/array/range）只有同类才可赋值/比较。
+        (Ty::Agg(x), Ty::Agg(y)) => x == y,
         _ => a == b,
     }
 }
@@ -263,6 +323,12 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
 /// 任一侧类型未知时结果视为未知（保守跳过后续检查）。
 fn merged(a: &Ty, b: &Ty) -> Ty {
     if matches!(a, Ty::Unknown) || matches!(b, Ty::Unknown) {
+        return Ty::Unknown;
+    }
+    // 用户类型/聚合/Option 的运算结果不做推断（可能来自重载），保守置为未知。
+    if matches!(a, Ty::User(_) | Ty::Agg(_) | Ty::Option(_))
+        || matches!(b, Ty::User(_) | Ty::Agg(_) | Ty::Option(_))
+    {
         return Ty::Unknown;
     }
     if a.is_concrete() {
@@ -283,6 +349,24 @@ fn is_comparison_op(op: &BinOp) -> bool {
         op,
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
     )
+}
+
+/// 关系运算符的结合性分组：`== !=` 一组，`< <= > >=` 一组（组内不可结合，
+/// 组间因优先级不同可以嵌套）。
+fn cmp_chain_level(op: &BinOp) -> Option<u8> {
+    match op {
+        BinOp::Eq | BinOp::NotEq => Some(0),
+        BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => Some(1),
+        _ => None,
+    }
+}
+
+/// 若表达式本身是比较运算，返回其结合性分组。
+fn cmp_child_level(e: &Expr) -> Option<u8> {
+    match e {
+        Expr::Binary { op, .. } => cmp_chain_level(op),
+        _ => None,
+    }
 }
 
 fn is_comparison_expr(e: &Expr) -> bool {
@@ -421,6 +505,9 @@ fn overload_name(op: &BinOp) -> &'static str {
 struct VarInfo {
     ty: Ty,
     mutable: bool,
+    /// 若绑定由整数字面量（或其负号形态）初始化且之后未被重新赋值，
+    /// 记录其编译期常量值，用于移位越界 / 字面量越界检查。
+    const_int: Option<i64>,
 }
 
 /// 单趟表达式类型检查器。
@@ -437,18 +524,52 @@ struct Checker<'a> {
     overloaded_ops: HashSet<String>,
     errors: &'a mut Vec<SemanticError>,
     scopes: Vec<HashMap<String, VarInfo>>,
+    /// 用户定义类型名（class/struct/interface/enum）
+    type_names: HashSet<String>,
+    /// enum 类型名（enum 构造值不可赋值）
+    enum_names: HashSet<String>,
+    /// class 名 → 字段名 → 是否可变
+    class_fields: HashMap<String, HashMap<String, bool>>,
+    /// 当前函数声明的返回类型（用于 `return expr` 类型检查）
+    ret_ty: Option<Ty>,
 }
 
 /// 对整个 Program 做表达式/赋值类型检查，错误追加到 `errors`。
 pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 收集用户定义类型名，用于把类型标注中的 `List` / `C` 等解析为 Ty::User。
+    let mut type_names: HashSet<String> = HashSet::new();
+    for s in &program.structs {
+        type_names.insert(s.name.clone());
+    }
+    for c in &program.classes {
+        type_names.insert(c.name.clone());
+    }
+    for i in &program.interfaces {
+        type_names.insert(i.name.clone());
+    }
+    let mut enum_names: HashSet<String> = HashSet::new();
+    for e in &program.enums {
+        type_names.insert(e.name.clone());
+        enum_names.insert(e.name.clone());
+    }
+    // class 名 → 字段名 → 是否可变（用于 `C.x = v` 静态字段赋值检查）。
+    let mut class_fields: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    for c in &program.classes {
+        class_fields.insert(
+            c.name.clone(),
+            c.fields.iter().map(|f| (f.name.clone(), f.is_mut)).collect(),
+        );
+    }
+
     let mut globals = HashMap::new();
     for c in &program.constants {
         globals.insert(
             c.name.clone(),
             VarInfo {
                 ty: global_const_ty(c),
-                // 顶层 let/var 的可变性在 AST 中未区分，不对其做可变性检查。
-                mutable: true,
+                // 顶层 `let`/`const` 不可重新赋值；`var` 可以。
+                mutable: c.is_mut,
+                const_int: literal_int(&c.init),
             },
         );
     }
@@ -462,6 +583,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     let mut overloaded_ops = HashSet::new();
     collect_operator_overloads(program, &mut overloaded_ops);
 
+    // 10.2.3(18)：对已内建支持某运算符的基础类型，用 extend 定义同签名 operator func 属于重定义。
+    check_builtin_operator_redefinitions(program, errors);
+
     let mut checker = Checker {
         globals,
         funcs,
@@ -470,6 +594,10 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         overloaded_ops,
         errors,
         scopes: Vec::new(),
+        type_names,
+        enum_names,
+        class_fields,
+        ret_ty: None,
     };
 
     for func in &program.functions {
@@ -486,12 +614,13 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                     VarInfo {
                         ty: field_ty(f),
                         mutable: true,
+                        const_int: None,
                     },
                 )
             })
             .collect();
         if let Some(init) = &cls.init {
-            checker.check_params_body_extra(&init.params, &init.body, Some(&fields));
+            checker.check_params_body_extra(&init.params, &init.body, Some(&fields), None);
         }
         if let Some(deinit) = &cls.deinit {
             checker.scopes.push(fields.clone());
@@ -509,7 +638,12 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         }
         for m in &cls.methods {
             if !m.func.body.is_empty() {
-                checker.check_params_body_extra(&m.func.params, &m.func.body, Some(&fields));
+                checker.check_params_body_extra(
+                    &m.func.params,
+                    &m.func.body,
+                    Some(&fields),
+                    m.func.return_type.as_ref().map(|t| checker.ty_of_ann(t)),
+                );
             }
         }
         // primary constructor 参数类型也记录下来，供构造函数体中复用（保守）。
@@ -519,8 +653,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 scope.insert(
                     p.name.clone(),
                     VarInfo {
-                        ty: ty_of(&p.ty),
+                        ty: checker.ty_of_ann(&p.ty),
                         mutable: true,
+                        const_int: None,
                     },
                 );
             }
@@ -531,7 +666,11 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     for iface in &program.interfaces {
         for m in &iface.methods {
             if let Some(body) = &m.default_body {
-                checker.check_params_and_body(&m.params, body);
+                checker.check_params_and_body(
+                    &m.params,
+                    body,
+                    m.return_type.as_ref().map(|t| checker.ty_of_ann(t)),
+                );
             }
         }
     }
@@ -706,6 +845,86 @@ fn collect_operator_overloads(program: &Program, out: &mut HashSet<String>) {
     }
 }
 
+fn is_builtin_int(name: &str) -> bool {
+    matches!(
+        name,
+        "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "IntNative"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "UIntNative"
+    )
+}
+
+fn is_builtin_float(name: &str) -> bool {
+    matches!(name, "Float16" | "Float32" | "Float64")
+}
+
+fn builtin_ty_by_name(name: &str) -> Ty {
+    ty_of(&Type::Struct(name.to_string(), vec![]))
+}
+
+/// 10.2.3(18)：基础类型已内建的运算符，若在 `extend T` 中以相同签名重定义，
+/// 应报重定义错误。仅覆盖内建数值/Bool 类型，用户类型不参与（避免误伤扩展）。
+fn check_builtin_operator_redefinitions(program: &Program, errors: &mut Vec<SemanticError>) {
+    for ext in &program.extends {
+        let t = ext.target_type.as_str();
+        let is_int = is_builtin_int(t);
+        let is_float = is_builtin_float(t);
+        let is_bool = t == "Bool";
+        if !is_int && !is_float && !is_bool {
+            continue;
+        }
+        let self_ty = builtin_ty_by_name(t);
+        for m in &ext.methods {
+            let name = m.name.rsplit_once('.').map(|(_, n)| n).unwrap_or(&m.name);
+            // extend 方法会插入隐式 `this` 形参，检查签名时剔除。
+            let params: Vec<&crate::ast::Param> = m
+                .params
+                .iter()
+                .filter(|p| p.name != "this" && p.name != "self")
+                .collect();
+            let supported = match params.len() {
+                // 一元运算符：`!` 对内建整数与 Bool 已存在，`-` 内建数值类型已存在。
+                0 => match name {
+                    "op_not" => is_int || is_bool,
+                    "op_sub" => is_int || is_float,
+                    _ => false,
+                },
+                // 二元运算符：签名相同（RHS 类型为 T）即重定义。
+                1 => {
+                    let pt = ty_of(&params[0].ty);
+                    match name {
+                        "op_add" | "op_sub" | "op_mul" | "op_div" | "op_lt" | "op_gt"
+                        | "op_le" | "op_ge" | "op_eq" | "op_ne" => {
+                            (is_int || is_float) && pt == self_ty
+                        }
+                        "op_mod" | "op_bitand" | "op_bitor" | "op_bitxor" => {
+                            is_int && pt == self_ty
+                        }
+                        "op_shl" | "op_shr" => is_int && pt.is_int(),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if supported {
+                errors.push(SemanticError {
+                    message: format!(
+                        "运算符 {} 在类型 {} 上已内建支持，不能通过 extend 重定义相同签名的 operator func",
+                        name, t
+                    ),
+                });
+            }
+        }
+    }
+}
+
 impl<'a> Checker<'a> {
     fn err(&mut self, message: String) {
         self.errors.push(SemanticError { message });
@@ -720,15 +939,68 @@ impl<'a> Checker<'a> {
         self.globals.get(name)
     }
 
+    /// 表达式各操作数的类型是否均可静态确定（用于比较链检查，避免解析歧义误判）。
+    fn operand_known(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Integer(_)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Bool(_)
+            | Expr::Rune(_)
+            | Expr::String(_) => true,
+            Expr::Var(name) => self
+                .lookup(name)
+                .map(|v| !matches!(v.ty, Ty::Unknown))
+                .unwrap_or(false),
+            Expr::Unary { expr, .. } => self.operand_known(expr),
+            Expr::Binary { op, left, right } if is_comparison_op(op) => {
+                self.operand_known(left) && self.operand_known(right)
+            }
+            _ => false,
+        }
+    }
+
+    /// 类型标注 → 轻量类型（识别用户定义类型名）。
+    fn ty_of_ann(&self, ty: &Type) -> Ty {
+        if let Type::Struct(name, args) = ty {
+            if args.is_empty() && self.type_names.contains(name) {
+                return Ty::User(name.clone());
+            }
+        }
+        ty_of(ty)
+    }
+
+    /// 查询变量的编译期整数值。
+    fn const_int_of(&self, e: &Expr) -> Option<i64> {
+        match e {
+            Expr::Var(name) => self.lookup(name).and_then(|v| v.const_int),
+            _ => literal_int(e),
+        }
+    }
+
+    /// 变量被重新赋值后，其编译期常量值不再可靠。
+    fn clear_const(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(info) = scope.get_mut(name) {
+                info.const_int = None;
+                return;
+            }
+        }
+        if let Some(info) = self.globals.get_mut(name) {
+            info.const_int = None;
+        }
+    }
+
     fn check_function(&mut self, func: &Function) {
         if func.body.is_empty() {
             return;
         }
-        self.check_params_and_body(&func.params, &func.body);
+        let ret = func.return_type.as_ref().map(|t| self.ty_of_ann(t));
+        self.check_params_body_extra(&func.params, &func.body, None, ret);
     }
 
-    fn check_params_and_body(&mut self, params: &[crate::ast::Param], body: &[Stmt]) {
-        self.check_params_body_extra(params, body, None);
+    fn check_params_and_body(&mut self, params: &[crate::ast::Param], body: &[Stmt], ret: Option<Ty>) {
+        self.check_params_body_extra(params, body, None, ret);
     }
 
     fn check_params_body_extra(
@@ -736,13 +1008,14 @@ impl<'a> Checker<'a> {
         params: &[crate::ast::Param],
         body: &[Stmt],
         extra: Option<&HashMap<String, VarInfo>>,
+        ret: Option<Ty>,
     ) {
         let mut scope = extra.cloned().unwrap_or_default();
         for p in params {
             let ty = if p.variadic {
                 Ty::Unknown
             } else {
-                ty_of(&p.ty)
+                self.ty_of_ann(&p.ty)
             };
             scope.insert(
                 p.name.clone(),
@@ -751,14 +1024,18 @@ impl<'a> Checker<'a> {
                     // 函数参数在仓颉中不可变；但为保守起见不在此处做可变性检查，
                     // 仅保证类型信息可用于运算符规则。
                     mutable: true,
+                    const_int: None,
                 },
             );
         }
+        let saved_ret = self.ret_ty.take();
+        self.ret_ty = ret;
         self.scopes.push(scope);
         for stmt in body {
             self.check_stmt(stmt);
         }
         self.scopes.pop();
+        self.ret_ty = saved_ret;
     }
 
     // ─── 语句 ────────────────────────────────────────────────────────────
@@ -770,35 +1047,41 @@ impl<'a> Checker<'a> {
                 // `let x: T` 无初始化式时解析器会合成类型默认值，此时属于
                 // “延迟赋值”声明，允许之后的第一次赋值。
                 let deferred = ty.as_ref().map_or(false, |t| is_default_value(t, value));
+                let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
                 if !deferred {
-                    if let Some(ann) = ty.as_ref() {
-                        self.check_assignable(&ty_of(ann), &value_ty, "变量初始化");
+                    if let Some(ann) = ann_ty.as_ref() {
+                        self.check_assignable(ann, &value_ty, "变量初始化");
+                        self.check_literal_range(ann, value);
                     }
                 }
-                let bind_ty = ty
-                    .as_ref()
-                    .map(ty_of)
-                    .unwrap_or_else(|| default_binding_ty(&value_ty));
-                self.bind_pattern(pattern, bind_ty, deferred);
+                let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
+                let cinit = if deferred { None } else { literal_int(value) };
+                self.bind_pattern_const(pattern, bind_ty, deferred, cinit);
             }
             Stmt::Var { pattern, ty, value } => {
                 let value_ty = self.check_expr(value);
-                if let Some(ann) = ty.as_ref() {
-                    self.check_assignable(&ty_of(ann), &value_ty, "变量初始化");
+                // `var x: T` 无初始化式时解析器同样合成类型默认值，需跳过可赋值性检查。
+                let deferred = ty.as_ref().map_or(false, |t| is_default_value(t, value));
+                let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                if !deferred {
+                    if let Some(ann) = ann_ty.as_ref() {
+                        self.check_assignable(ann, &value_ty, "变量初始化");
+                        self.check_literal_range(ann, value);
+                    }
                 }
-                let bind_ty = ty
-                    .as_ref()
-                    .map(ty_of)
-                    .unwrap_or_else(|| default_binding_ty(&value_ty));
-                self.bind_pattern(pattern, bind_ty, true);
+                let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
+                let cinit = if deferred { None } else { literal_int(value) };
+                self.bind_pattern_const(pattern, bind_ty, true, cinit);
             }
             Stmt::Const { name, ty, value } => {
                 let value_ty = self.check_expr(value);
-                if let Some(ann) = ty.as_ref() {
-                    self.check_assignable(&ty_of(ann), &value_ty, "常量初始化");
+                let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                if let Some(ann) = ann_ty.as_ref() {
+                    self.check_assignable(ann, &value_ty, "常量初始化");
+                    self.check_literal_range(ann, value);
                 }
-                let bind_ty = ty.as_ref().map(ty_of).unwrap_or(value_ty);
-                self.bind_name(name, bind_ty, false);
+                let bind_ty = ann_ty.unwrap_or(value_ty);
+                self.bind_name(name, bind_ty, false, literal_int(value));
             }
             Stmt::Assign { target, value } => {
                 let value_ty = self.check_expr(value);
@@ -808,7 +1091,8 @@ impl<'a> Checker<'a> {
                 self.check_expr(e);
             }
             Stmt::Return(Some(e)) => {
-                self.check_expr(e);
+                let t = self.check_expr(e);
+                self.check_return(&t);
             }
             Stmt::While { cond, body } => {
                 self.check_expr(cond);
@@ -828,7 +1112,7 @@ impl<'a> Checker<'a> {
             } => {
                 let iter_ty = self.check_expr(iterable);
                 let elem_ty = match iter_ty {
-                    Ty::Unknown => match iterable {
+                    Ty::Unknown | Ty::Agg("range") | Ty::Agg("array") => match iterable {
                         // Range 迭代变量类型无法可靠确定（字面量后缀在词法中已剥离），
                         // 保守置为 Unknown，避免把 `for (i in 2u64..)` 误判为 Int64。
                         Expr::Range { start, .. } => {
@@ -852,6 +1136,7 @@ impl<'a> Checker<'a> {
                     VarInfo {
                         ty: elem_ty,
                         mutable: true,
+                        const_int: None,
                     },
                 );
                 self.scopes.push(scope);
@@ -908,8 +1193,18 @@ impl<'a> Checker<'a> {
     }
 
     fn bind_pattern(&mut self, pattern: &Pattern, ty: Ty, mutable: bool) {
+        self.bind_pattern_const(pattern, ty, mutable, None)
+    }
+
+    fn bind_pattern_const(
+        &mut self,
+        pattern: &Pattern,
+        ty: Ty,
+        mutable: bool,
+        const_int: Option<i64>,
+    ) {
         if let Pattern::Binding(name) = pattern {
-            self.bind_name(name, ty, mutable);
+            self.bind_name(name, ty, mutable, const_int);
         } else {
             let mut tmp = HashMap::new();
             bind_pattern_unknown(pattern, &mut tmp);
@@ -921,25 +1216,106 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn bind_name(&mut self, name: &str, ty: Ty, mutable: bool) {
+    fn bind_name(&mut self, name: &str, ty: Ty, mutable: bool, const_int: Option<i64>) {
+        let info = VarInfo {
+            ty,
+            mutable,
+            const_int,
+        };
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), VarInfo { ty, mutable });
+            scope.insert(name.to_string(), info);
         } else {
-            self.globals.insert(name.to_string(), VarInfo { ty, mutable });
+            self.globals.insert(name.to_string(), info);
+        }
+    }
+
+    /// 字面量是否落在声明整数类型的取值范围内（含负数赋给无符号类型的形态）。
+    fn check_literal_range(&mut self, target: &Ty, value: &Expr) {
+        let (min, max) = match target {
+            Ty::Int8 => (-128, 127),
+            Ty::Int16 => (-32768, 32767),
+            Ty::Int32 => (i32::MIN as i64, i32::MAX as i64),
+            Ty::Int64 | Ty::IntNative => (i64::MIN, i64::MAX),
+            Ty::UInt8 => (0, 255),
+            Ty::UInt16 => (0, 65535),
+            Ty::UInt32 => (0, u32::MAX as i64),
+            // UInt64 的上界超出 i64 表示范围，保守只检查负值。
+            Ty::UInt64 | Ty::UIntNative => (0, i64::MAX),
+            _ => return,
+        };
+        if let Some(v) = self.const_int_of(value) {
+            if v < min || v > max {
+                self.err(format!(
+                    "整数字面量 {} 超出类型 {} 的取值范围",
+                    v,
+                    target.name()
+                ));
+            }
+        }
+    }
+
+    fn check_return(&mut self, value: &Ty) {
+        let ret = match &self.ret_ty {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        if ret == Ty::Unit {
+            if value.is_definite() && *value != Ty::Unit {
+                self.err(format!(
+                    "返回类型不匹配: 函数声明为 Unit，但返回了 {}",
+                    value.name()
+                ));
+            }
+            return;
+        }
+        if !ret.is_concrete() || !value.is_definite() {
+            return;
+        }
+        if !compatible(&ret, value) {
+            self.err(format!(
+                "返回类型不匹配: 函数声明返回 {}，实际返回 {}",
+                ret.name(),
+                value.name()
+            ));
         }
     }
 
     fn check_assign_target(&mut self, target: &crate::ast::AssignTarget, value_ty: &Ty) {
         use crate::ast::AssignTarget;
-        if let AssignTarget::Var(name) = target {
-            if let Some(info) = self.lookup(name).cloned() {
-                if !info.mutable {
-                    self.err(format!("不可变变量 '{}' 不能被重新赋值", name));
+        match target {
+            AssignTarget::Var(name) => {
+                if let Some(info) = self.lookup(name).cloned() {
+                    if !info.mutable {
+                        self.err(format!("不可变变量 '{}' 不能被重新赋值", name));
+                    }
+                    self.check_assignable(&info.ty, value_ty, "赋值");
                 }
-                self.check_assignable(&info.ty, value_ty, "赋值");
+                self.clear_const(name);
+            }
+            // 静态字段 / enum 构造值：`C.x = v`、`E.v = x`
+            AssignTarget::Field { object, field } => {
+                self.check_field_target(object, field);
+            }
+            AssignTarget::FieldPath { base, fields } => {
+                if fields.len() == 1 {
+                    self.check_field_target(base, &fields[0]);
+                }
+            }
+            // 数组元素 / 元组解构等目标类型无法在本地精确解析，保守跳过。
+            _ => {}
+        }
+    }
+
+    fn check_field_target(&mut self, object: &str, field: &str) {
+        if self.enum_names.contains(object) {
+            self.err(format!("enum 构造值 '{}.{}' 不可被赋值", object, field));
+        } else if let Some(fields_map) = self.class_fields.get(object) {
+            if let Some(&is_mut) = fields_map.get(field) {
+                if !is_mut {
+                    self.err(format!("不可变字段 '{}.{}' 不能被重新赋值", object, field));
+                }
             }
         }
-        // 数组元素 / 字段 / 元组解构等目标类型无法在本地精确解析，保守跳过。
     }
 
     /// 目标类型与值类型是否可赋值（无隐式跨类别/跨宽度转换）。
@@ -985,14 +1361,22 @@ impl<'a> Checker<'a> {
             Expr::Binary { op, left, right } => {
                 let lt = self.check_expr(left);
                 let rt = self.check_expr(right);
-                // 解析器把所有比较/相等运算符放在同一优先级左结合解析，
-                // 形如 `A > B == C > D`（语法正例）会被压平成
-                // `((A > B) == C) > D`。此时 AST 已不能反映语法结构，
-                // 对“操作数为比较结果”的比较表达式跳过类型检查，避免误伤。
-                if is_comparison_op(op)
-                    && (is_comparison_expr(left) || is_comparison_expr(right))
-                {
-                    return Ty::Bool;
+                // 解析器把所有比较/相等运算符放在同一优先级左结合解析。
+                // 规范 4.16(6)：同一优先级的关系运算符不可结合（`a < b < c`、
+                // `a == b == c` 非法）；但 `<` 与 `==` 属于不同优先级，
+                // `a < b == c`（即 `(a < b) == c`）合法。
+                if let Some(level) = cmp_chain_level(op) {
+                    let chained =
+                        cmp_child_level(left) == Some(level) || cmp_child_level(right) == Some(level);
+                    // 仅在操作数类型均可静态确定时才报错，避免把 `f<Box<Unit>>()`
+                    // 这类泛型调用的解析歧义误判为比较链。
+                    if chained && self.operand_known(left) && self.operand_known(right) {
+                        self.err(format!(
+                            "关系运算符 '{}' 不满足结合性，不能链式使用",
+                            bin_symbol(op)
+                        ));
+                        return Ty::Bool;
+                    }
                 }
                 // 仅对“可静态确定”的操作数形态执行类型规则（变量、字面量、
                 // 基础转换及由它们构成的算术表达式）。方法调用、lambda、
@@ -1000,7 +1384,7 @@ impl<'a> Checker<'a> {
                 if !(simple_operand(left) && simple_operand(right)) {
                     return binary_result_no_check(op, &lt, &rt);
                 }
-                self.check_binary(op, &lt, &rt)
+                self.check_binary(op, &lt, &rt, right)
             }
 
             Expr::Call {
@@ -1094,7 +1478,25 @@ impl<'a> Checker<'a> {
                 t
             }
 
-            Expr::Tuple(elems) | Expr::Array(elems) | Expr::Macro { args: elems, .. } => {
+            Expr::Tuple(elems) => {
+                for e in elems {
+                    self.check_expr(e);
+                }
+                if elems.is_empty() {
+                    Ty::Unit
+                } else {
+                    Ty::Agg("tuple")
+                }
+            }
+
+            Expr::Array(elems) => {
+                for e in elems {
+                    self.check_expr(e);
+                }
+                Ty::Agg("array")
+            }
+
+            Expr::Macro { args: elems, .. } => {
                 for e in elems {
                     self.check_expr(e);
                 }
@@ -1153,7 +1555,7 @@ impl<'a> Checker<'a> {
                 if let Some(s) = step {
                     self.check_expr(s);
                 }
-                Ty::Unknown
+                Ty::Agg("range")
             }
 
             Expr::VariantConst { arg, .. } => {
@@ -1205,11 +1607,15 @@ impl<'a> Checker<'a> {
                         VarInfo {
                             ty: pty,
                             mutable: true,
+                            const_int: None,
                         },
                     );
                 }
                 self.scopes.push(scope);
+                // lambda 内的 return 属于 lambda 自身，不使用外层函数返回类型。
+                let saved_ret = self.ret_ty.take();
                 self.check_expr(body);
+                self.ret_ty = saved_ret;
                 self.scopes.pop();
                 Ty::Unknown
             }
@@ -1222,8 +1628,27 @@ impl<'a> Checker<'a> {
             Expr::None => Ty::Unknown,
 
             Expr::NullCoalesce { option, default } => {
-                self.check_expr(option);
-                self.check_expr(default)
+                let ot = self.check_expr(option);
+                let dt = self.check_expr(default);
+                // 4.21(3)：e1 为 Option<T> 时，e2 的类型必须为 T（或 Option<T>，此时再解一层）。
+                if let Ty::Option(inner) = &ot {
+                    let dt_eff = match &dt {
+                        Ty::Option(di) => di.as_ref(),
+                        other => other,
+                    };
+                    if inner.is_prim() && dt_eff.is_definite() && !compatible(inner, dt_eff) {
+                        self.err(format!(
+                            "空值合并运算符 '??' 的右侧类型不匹配: 左侧为 Option<{}>，右侧为 {}",
+                            inner.name(),
+                            dt.name()
+                        ));
+                    }
+                }
+                if matches!(ot, Ty::Option(_)) {
+                    dt
+                } else {
+                    Ty::Unknown
+                }
             }
 
             Expr::Try(inner) => self.check_expr(inner),
@@ -1252,7 +1677,7 @@ impl<'a> Checker<'a> {
                 self.scopes.pop();
                 self.scopes.push(HashMap::new());
                 if let Some(cv) = catch_var {
-                    self.bind_name(cv, Ty::Unknown, true);
+                    self.bind_name(cv, Ty::Unknown, true, None);
                 }
                 for s in catch_body {
                     self.check_stmt(s);
@@ -1297,7 +1722,10 @@ impl<'a> Checker<'a> {
             }
 
             Expr::Spawn { body } => {
+                // spawn 的 body 是一个独立闭包，其 return 与外围函数返回类型无关。
+                let saved_ret = self.ret_ty.take();
                 self.check_nested_body(body);
+                self.ret_ty = saved_ret;
                 Ty::Unknown
             }
 
@@ -1348,26 +1776,37 @@ impl<'a> Checker<'a> {
         match op {
             UnaryOp::Neg => {
                 // Bool 参与加减通常源于解析器跨行合并（语法正例），保守跳过。
-                if t.is_definite() && !t.is_numeric() && *t != Ty::Bool {
+                // 用户类型/Option 可能由用户自定义一元运算符处理，也跳过。
+                if t.is_prim() && !t.is_numeric() && *t != Ty::Bool {
                     self.err(format!("一元运算符 '-' 不能作用于类型 {}", t.name()));
                 }
-                t.clone()
+                if t.is_prim() {
+                    t.clone()
+                } else {
+                    Ty::Unknown
+                }
             }
             UnaryOp::Not => {
-                // 规范要求 `!` 作用于 Bool；但官方语法正例中存在 `!Int64`
-                // 的写法（04_18 a05），为避免误伤正测试，非 Bool 时保留操作数
-                // 类型而不报错。
+                // 规范要求 `!` 作用于 Bool 或整数（按位取反）；但官方语法正例中
+                // 存在 `!Int64` 的写法（04_18 a05），为避免误伤正测试，
+                // 非 Bool 时保留操作数类型而不报错。
                 if *t == Ty::Bool {
                     Ty::Bool
-                } else {
+                } else if t.is_prim() {
                     t.clone()
+                } else {
+                    Ty::Unknown
                 }
             }
             UnaryOp::BitNot => {
-                if t.is_definite() && !t.is_int() {
+                if t.is_prim() && !t.is_int() {
                     self.err(format!("一元运算符 '~' 只能作用于整数类型，实际为 {}", t.name()));
                 }
-                t.clone()
+                if t.is_prim() {
+                    t.clone()
+                } else {
+                    Ty::Unknown
+                }
             }
         }
     }
@@ -1405,7 +1844,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_binary(&mut self, op: &BinOp, lt: &Ty, rt: &Ty) -> Ty {
+    fn check_binary(&mut self, op: &BinOp, lt: &Ty, rt: &Ty, right: &Expr) -> Ty {
         // 定义了该运算符重载时关闭对应规则，避免误伤合法重载。
         if self.overloaded_ops.contains(overload_name(op)) {
             return overload_result_ty(op);
@@ -1468,8 +1907,8 @@ impl<'a> Checker<'a> {
                 merged(lt, rt)
             }
             BinOp::Shl | BinOp::Shr => {
-                let bad_l = lt.is_definite() && !lt.is_int();
-                let bad_r = rt.is_definite() && !rt.is_int();
+                let bad_l = lt.is_prim() && !lt.is_int();
+                let bad_r = rt.is_prim() && !rt.is_int();
                 if bad_l || bad_r {
                     self.err(format!(
                         "移位运算符 '{}' 的操作数必须为整数类型: {} 与 {}",
@@ -1477,6 +1916,25 @@ impl<'a> Checker<'a> {
                         lt.name(),
                         rt.name()
                     ));
+                }
+                // 4.18(13)/4.18(9)：右操作数为编译期常量时检查越界与负数。
+                if let Some(width) = int_bit_width(lt) {
+                    if let Some(v) = self.const_int_of(right) {
+                        if v < 0 {
+                            self.err(format!(
+                                "移位运算符 '{}' 的右操作数不能为负数",
+                                bin_symbol(op)
+                            ));
+                        } else if v >= width {
+                            self.err(format!(
+                                "移位运算符 '{}' 的右操作数越界: {} >= {}（{} 的位宽）",
+                                bin_symbol(op),
+                                v,
+                                width,
+                                lt.name()
+                            ));
+                        }
+                    }
                 }
                 // 移位结果的类型由左操作数决定（字面量保留可适配标记）。
                 if lt.is_definite() {
@@ -1486,8 +1944,8 @@ impl<'a> Checker<'a> {
                 }
             }
             BinOp::LogicalAnd | BinOp::LogicalOr => {
-                let bad = (lt.is_definite() && *lt != Ty::Bool)
-                    || (rt.is_definite() && *rt != Ty::Bool);
+                let bad = (lt.is_prim() && *lt != Ty::Bool)
+                    || (rt.is_prim() && *rt != Ty::Bool);
                 if bad {
                     self.err(format!(
                         "逻辑运算符 '{}' 的操作数只能为 Bool 类型: {} 与 {}",
@@ -1504,7 +1962,7 @@ impl<'a> Checker<'a> {
     }
 
     fn require_same_numeric(&mut self, op: &BinOp, lt: &Ty, rt: &Ty) {
-        if !lt.is_definite() || !rt.is_definite() {
+        if !lt.is_prim() || !rt.is_prim() {
             return;
         }
         if !lt.is_numeric() || !rt.is_numeric() {
@@ -1527,7 +1985,7 @@ impl<'a> Checker<'a> {
     }
 
     fn require_same_integer(&mut self, op: &BinOp, lt: &Ty, rt: &Ty) {
-        if !lt.is_definite() || !rt.is_definite() {
+        if !lt.is_prim() || !rt.is_prim() {
             return;
         }
         if !lt.is_int() || !rt.is_int() {
@@ -1551,6 +2009,10 @@ impl<'a> Checker<'a> {
 
     /// `**`：底数 Int64 → 指数 UInt64；底数 Float64 → 指数 Int64/Float64。
     fn check_pow(&mut self, lt: &Ty, rt: &Ty) -> Ty {
+        // 用户类型 / Option 可能重载 `**`，保守跳过。
+        if matches!(lt, Ty::User(_) | Ty::Option(_)) || matches!(rt, Ty::User(_) | Ty::Option(_)) {
+            return Ty::Unknown;
+        }
         // 字面量默认类型：整数字面量按 Int64，浮点字面量按 Float64。
         let base = match lt {
             Ty::IntLit => Ty::Int64,
@@ -1588,6 +2050,17 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
         }
+    }
+}
+
+/// 整型位宽（用于移位越界检查）。`None` 表示非具体整数类型。
+fn int_bit_width(t: &Ty) -> Option<i64> {
+    match t {
+        Ty::Int8 | Ty::UInt8 => Some(8),
+        Ty::Int16 | Ty::UInt16 => Some(16),
+        Ty::Int32 | Ty::UInt32 => Some(32),
+        Ty::Int64 | Ty::UInt64 | Ty::IntNative | Ty::UIntNative => Some(64),
+        _ => None,
     }
 }
 
@@ -1672,6 +2145,7 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
                 VarInfo {
                     ty: Ty::Unknown,
                     mutable: true,
+                    const_int: None,
                 },
             );
         }
@@ -1692,6 +2166,7 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
                 VarInfo {
                     ty: Ty::Unknown,
                     mutable: true,
+                    const_int: None,
                 },
             );
         }
@@ -1950,6 +2425,131 @@ mod tests {
     #[test]
     fn test_string_concat_allowed() {
         assert_ok("main() { var s: String = \"a\"; var n: Int64 = 1; let c = s + \":\" }");
+    }
+
+    // ─── batch-04：移位常量 / 结合性 / 返回类型 ─────────────────────────
+
+    #[test]
+    fn test_shift_amount_constant_checked() {
+        assert_err(
+            "main() { let v1: Int64 = 1; let v2: UInt32 = 64; let v3 = v1 << v2 }",
+            "越界",
+        );
+        assert_err(
+            "main() { let v1: Int8 = 1; var v2: Int8 = -1; let v3 = v1 << v2 }",
+            "不能为负数",
+        );
+        assert_ok("main() { let v1: Int64 = 1; let v2: UInt32 = 63; let v3 = v1 << v2 }");
+        // 右操作数非常量时不检查。
+        assert_ok("main() { let v1: Int64 = 1; let v2 = f(); let v3 = v1 << v2 }");
+    }
+
+    #[test]
+    fn test_relational_non_associative() {
+        assert_err("main() { let a = 1 < 2 < 3 }", "结合性");
+        assert_err("main() { let a = 1 == 2 == 3 }", "结合性");
+        assert_err("main() { let a = 3 == 3 != 4 }", "结合性");
+        // 不同优先级可以嵌套：`(1 < 2) == true`。
+        assert_ok("main() { let a = 1 < 2 == true }");
+    }
+
+    #[test]
+    fn test_return_type_checked() {
+        assert_err(
+            "func f(): UInt16 { let r: Int16 = 1; return r }\nmain() {}",
+            "返回类型不匹配",
+        );
+        assert_err("func f(): Unit { return true }\nmain() {}", "返回类型不匹配");
+        assert_ok("func f(): UInt16 { let r: UInt16 = 1; return r }\nmain() {}");
+    }
+
+    // ─── batch-04：Option / 字面量范围 / 聚合类型 ───────────────────────
+
+    #[test]
+    fn test_null_coalesce_type_checked() {
+        assert_err(
+            "main() { var v1: Option<Int8> = Some(1); var v2: Int16 = 1; let v3 = v1 ?? v2 }",
+            "空值合并",
+        );
+        assert_ok("main() { var v1: Option<Int8> = Some(1); var v2: Int8 = 1; let v3 = v1 ?? v2 }");
+        assert_ok("main() { var c1: Option<Int64> = 0; var c2: Option<Int64> = 0; c2 = c1 ?? c2 }");
+    }
+
+    #[test]
+    fn test_option_comparable_with_value() {
+        assert_ok("main() { var x: Option<Int64> = 1; let b = x == 5 }");
+    }
+
+    #[test]
+    fn test_integer_literal_range_checked() {
+        assert_err("main() { let x: Int8 = 128 }", "超出");
+        assert_err("main() { let x: UInt16 = -1 }", "超出");
+        assert_ok("main() { let x: Int8 = -128 }");
+        assert_ok("main() { let x: UInt64 = 18446744073709551615 }");
+    }
+
+    #[test]
+    fn test_aggregate_type_mismatch() {
+        assert_err(
+            "main() { var v1: String = \"1\"; var v2: (Int8, Int16) = (1, 1); let v3 = v1 == v2 }",
+            "要求两侧操作数类型相同",
+        );
+        assert_err(
+            "main() { var v1: Array<Int8> = []; var v2: Int8 = 1; let v3 = v1 == v2 }",
+            "要求两侧操作数类型相同",
+        );
+        assert_ok("main() { var t: (Int64, Int64) = (1, 2) }");
+    }
+
+    #[test]
+    fn test_deferred_declarations_not_reported() {
+        assert_ok("main() { var a: Rune; a = r'x' }");
+        assert_ok("main() { var t: (Int64, Int64); t = (1, 2) }");
+        assert_ok("main() { var o: Option<Int64>; o = Some(1) }");
+    }
+
+    #[test]
+    fn test_user_type_assignment_mismatch() {
+        assert_err(
+            "interface I {}\nfunc fail(): I;\nmain() { var s: I = fail(); let t: Rune = s }",
+            "类型不匹配",
+        );
+    }
+
+    // ─── batch-04：可变性 ──────────────────────────────────────────────
+
+    #[test]
+    fn test_top_level_let_not_assignable() {
+        assert_err("let c: Int64 = 1\nmain() { let v: Int64 = 1; c = v }", "不可变变量");
+        assert_ok("var c: Int64 = 1\nmain() { let v: Int64 = 1; c = v }");
+    }
+
+    #[test]
+    fn test_static_immutable_field_not_assignable() {
+        assert_err(
+            "class C { static let x = 1 }\nmain() { let v = 1; C.x = v }",
+            "不可变字段",
+        );
+        assert_ok("class C { static var x = 1 }\nmain() { let v = 1; C.x = v }");
+    }
+
+    // ─── batch-04：内建运算符重定义 ────────────────────────────────────
+
+    #[test]
+    fn test_builtin_operator_redefinition() {
+        assert_err(
+            "extend Int64 { operator func +(x: Int64) { } }\nmain() {}",
+            "重定义",
+        );
+        assert_err(
+            "extend Int8 { operator func !() { } }\nmain() {}",
+            "重定义",
+        );
+        assert_err(
+            "extend UInt64 { operator func <<(x: UInt8) { } }\nmain() {}",
+            "重定义",
+        );
+        assert_ok("class C { operator func +(x: Int64): C { this } }\nmain() {}");
     }
 }
 

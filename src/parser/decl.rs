@@ -562,7 +562,7 @@ impl Parser {
 
     /// 解析顶层常量 (let/var/const name [: Type] = expr)
     pub(crate) fn parse_top_level_const(&mut self) -> Result<ConstDef, ParseErrorAt> {
-        self.advance(); // consume let/var/const
+        let is_mut = matches!(self.advance(), Some(Token::Var)); // consume let/var/const
         let name = match self.advance_ident() {
             Some(n) => n,
             None => {
@@ -582,7 +582,12 @@ impl Parser {
         if self.check(&Token::Semicolon) {
             self.advance();
         }
-        Ok(ConstDef { name, ty, init })
+        Ok(ConstDef {
+            name,
+            ty,
+            init,
+            is_mut,
+        })
     }
 
     /// 解析 @import("module", "name") 属性（用于 extern func 前）
@@ -758,7 +763,9 @@ impl Parser {
                     {
                         self.advance();
                     }
+                    let mut field_is_mut = true;
                     if self.check(&Token::Var) || self.check(&Token::Let) {
+                        field_is_mut = self.check(&Token::Var);
                         self.advance();
                     }
                     let param_name = match self.advance_ident() {
@@ -785,6 +792,7 @@ impl Parser {
                         name: param_name,
                         ty,
                         default,
+                        is_mut: field_is_mut,
                     });
                     if !self.check(&Token::Comma) {
                         break;
@@ -979,7 +987,9 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 continue;
             }
+            let mut field_is_mut = true;
             if self.check(&Token::Var) || self.check(&Token::Let) || self.check(&Token::Const) {
+                field_is_mut = self.check(&Token::Var);
                 self.advance();
             }
             let field_name = match self.advance() {
@@ -1019,6 +1029,7 @@ impl Parser {
                 name: field_name,
                 ty,
                 default,
+                is_mut: field_is_mut,
             });
 
             // 成员之间允许逗号或分号分隔，也容忍 `;;`/`,;` 等重复分隔符
@@ -2010,6 +2021,7 @@ impl Parser {
             let mods = self.parse_member_modifiers();
             let member_vis = mods.visibility.clone().unwrap_or_default();
             if self.check(&Token::Var) || self.check(&Token::Let) {
+                let field_is_mut = self.check(&Token::Var);
                 self.advance();
                 let f_name = match self.advance() {
                     Some(Token::Ident(n)) => n,
@@ -2058,6 +2070,7 @@ impl Parser {
                     name: f_name,
                     ty,
                     default,
+                    is_mut: field_is_mut,
                 });
             } else if self.check(&Token::Init) {
                 if mods.is_static {
@@ -2507,6 +2520,7 @@ impl Parser {
                         name: f_name,
                         ty,
                         default,
+                        is_mut: false,
                     });
                 }
             } else {
@@ -2542,6 +2556,7 @@ impl Parser {
                     name: p.name.clone(),
                     ty: p.ty.clone(),
                     default: p.default.clone(),
+                    is_mut: true,
                 });
             }
             if class_def.init.is_none() {
