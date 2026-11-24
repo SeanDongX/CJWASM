@@ -3368,8 +3368,6 @@ fn check_this_type_usage(program: &Program, errors: &mut Vec<SemanticError>) {
 
 #[cfg(test)]
 mod tests {
-
-mod tests {
     use super::*;
     use crate::ast::{
         BinOp, ClassDef, ClassMethod, Expr, Function, InterpolatePart, MatchArm, Param, Pattern,
@@ -3879,6 +3877,7 @@ mod tests {
                     is_open: false,
                     is_abstract: false,
                     has_body: true,
+                    is_const: false,
                     func: Function {
                         visibility: Visibility::default(),
                         name: "Foo.getVal".to_string(),
@@ -4405,10 +4404,9 @@ mod tests {
             "open class A {\n    private func f() {}\n}\nclass B <: A {\n    func f() {}\n    func g() { f() }\n}\nmain() {}\n",
         );
     }
-}
 
-
-        fn test_w5c_const_interface_func_requires_const_impl() {
+    #[test]
+    fn test_w5c_const_interface_func_requires_const_impl() {
         // 接口 const 函数必须由 const 函数实现
         assert_invalid(
             "interface I {\n\

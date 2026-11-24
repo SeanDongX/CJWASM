@@ -259,7 +259,8 @@ fn global_const_ty(c: &crate::ast::ConstDef) -> Ty {
         let init_ty = static_expr_ty(&c.init);
         // 无类型标注的整数常量（占位 Int64，如 `let N = 101u64`）按整数字面量处理，
         // 使其可与任意整数类型共同参与运算，避免把 UInt64*常量 误判为类型不匹配。
-        if init_ty == Ty::IntLit {
+        // 含后缀的整数字面量（IntegerSuffixed → 具体整数类型）同样按可适配处理。
+        if init_ty == Ty::IntLit || init_ty.is_int() {
             return Ty::IntLit;
         }
         if matches!(
@@ -2673,6 +2674,9 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
 
     fn parse(src: &str) -> Program {
         let tokens: Result<Vec<_>, _> = Lexer::new(src).collect();
@@ -2707,18 +2711,21 @@ mod tests {
     }
 
 
+    #[test]
     fn test_arith_same_numeric_ok() {
         assert_ok("main() { var a: Int64 = 1; var b: Int64 = 2; let c = a + b }");
         assert_ok("main() { var a: Int32 = 1; var b: Int32 = 2; let c = a * b }");
     }
 
 
+    #[test]
     fn test_arith_literal_adapts() {
         assert_ok("main() { var a: Int8 = 1; let c = a + 1 }");
         assert_ok("main() { var a: Float64 = 1.0; let c = a * 2.0 }");
     }
 
 
+    #[test]
     fn test_suffix_literal_decl_ok() {
         // 后缀类型与声明类型一致时允许。
         assert_ok("main() { let a: UInt8 = 1u8 }");
@@ -2729,6 +2736,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_suffix_narrow_decl_mismatch() {
         // 后缀类型与声明类型不一致时报错（不隐式跨宽度转换）。
         assert_err("main() { let a: Int64 = 1u8 }", "类型不匹配");
@@ -2738,6 +2746,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_mixed_suffix_arith() {
         // 混合后缀算术：两侧后缀类型不同即报错。
         assert_err("main() { let v = 1u8 + 1i64 }", "操作数类型不匹配");
@@ -2748,6 +2757,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_suffix_return_type_match() {
         assert_err(
             "func f(): Int64 { return 1u8 + 2u8 }",
@@ -2757,6 +2767,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_shift_count_overflow_suffixed() {
         // 后缀字面量携带位宽，移位计数越界可在编译期发现（含无符号）。
         assert_err("main() { let x = 1u8 << 8 }", "越界");
@@ -2765,6 +2776,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_string_repeat_mul_ok() {
         // std.core 为 String 提供 `operator func *(n: Int64): String` 重复重载
         assert_ok("main() { let s = \"f\" * 16 }");
@@ -2772,12 +2784,14 @@ mod tests {
     }
 
 
+    #[test]
     fn test_string_sub_still_rejected() {
         // 仅 `*` 是字符串重载；`-` 仍应报非数值操作数错误
         assert_err("main() { let s = \"a\" - 1 }", "必须为数值类型");
     }
 
 
+    #[test]
     fn test_arith_cross_width_rejected() {
         assert_err(
             "main() { var a: Int8 = 1; var b: Int64 = 2; let c = a + b }",
@@ -2790,6 +2804,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_arith_float_int_rejected() {
         assert_err(
             "main() { var a: Float64 = 1.0; var b: Int64 = 2; let c = a + b }",
@@ -2798,6 +2813,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_mod_only_integer() {
         assert_err(
             "main() { var a: Float64 = 1.0; var b: Float64 = 2.0; let c = a % b }",
@@ -2806,6 +2822,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_pow_valid_forms() {
         assert_ok("main() { var a: Int64 = 2; var b: UInt64 = 3; let c = a ** b }");
         assert_ok("main() { var a: Float64 = 2.0; var b: Int64 = 3; let c = a ** b }");
@@ -2814,6 +2831,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_pow_bad_base_rejected() {
         assert_err(
             "main() { var a: Int16 = 2; var b: UInt16 = 3; let c = a ** b }",
@@ -2826,6 +2844,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_pow_bad_exponent_rejected() {
         assert_err(
             "main() { var a: Int64 = 2; var b: Int64 = 3; let c = a ** b }",
@@ -2838,6 +2857,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_comparison_same_type_ok() {
         assert_ok("main() { var a: Int64 = 1; var b: Int64 = 2; let c = a < b }");
         assert_ok("main() { var a: String = \"a\"; var b: String = \"b\"; let c = a == b }");
@@ -2845,6 +2865,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_comparison_cross_type_rejected() {
         assert_err(
             "main() { var a: Float64 = 1.0; var b: UInt64 = 2; let c = a >= b }",
@@ -2857,12 +2878,14 @@ mod tests {
     }
 
 
+    #[test]
     fn test_comparison_literal_adapts() {
         assert_ok("main() { var a: Int8 = 1; let c = a == 1 }");
         assert_ok("main() { var a: Float32 = 1.0; let c = a < 2.0 }");
     }
 
 
+    #[test]
     fn test_bitwise_same_integer_ok_and_cross_rejected() {
         assert_ok("main() { var a: Int64 = 1; var b: Int64 = 2; let c = a & b }");
         assert_err(
@@ -2872,6 +2895,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_shift_mixed_integer_ok() {
         assert_ok("main() { var a: UInt16 = 1; var b: Int64 = 2; let c = a << b }");
         assert_err(
@@ -2881,6 +2905,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_logical_requires_bool() {
         assert_ok("main() { var a: Bool = true; var b: Bool = false; let c = a && b }");
         assert_err(
@@ -2895,6 +2920,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_unary_neg_non_numeric_rejected() {
         assert_err("main() { var s: String = \"x\"; let c = -s }", "一元运算符 '-'");
         assert_err("main() { var r: Rune = 'x'; let c = -r }", "一元运算符 '-'");
@@ -2902,6 +2928,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_init_type_mismatch_rejected() {
         assert_err(
             "main() { var a: Int64 = 1; var b: Float64 = a }",
@@ -2914,11 +2941,13 @@ mod tests {
     }
 
 
+    #[test]
     fn test_init_literal_adapts() {
         assert_ok("main() { var a: Int16 = 1; var b: Float32 = 1.0 }");
     }
 
 
+    #[test]
     fn test_assign_type_mismatch_rejected() {
         assert_err(
             "main() { var a: Int64 = 1; var b: Bool = true; b = a == 1; a = b }",
@@ -2927,18 +2956,21 @@ mod tests {
     }
 
 
+    #[test]
     fn test_let_reassignment_rejected() {
         assert_err("main() { let a: Int64 = 1; a = 2 }", "不可变变量");
         assert_ok("main() { var a: Int64 = 1; a = 2 }");
     }
 
 
+    #[test]
     fn test_deferred_let_assignment_allowed() {
         assert_ok("main() { let a: Int64; a = 2 }");
         assert_ok("main() { let s: String; s = \"x\" }");
     }
 
 
+    #[test]
     fn test_compound_assign_type_checked() {
         assert_err(
             "main() { var a: Int16 = 2; var b: UInt16 = 3; a **= b }",
@@ -2948,6 +2980,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_class_field_shadows_global() {
         assert_ok(
             "var flag = \"g\"\nclass C {\n  var flag: Bool = false\n  func set() { flag = true }\n}",
@@ -2955,6 +2988,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_operator_overload_disables_check() {
         assert_ok(
             "class C {\n  var v: Int64 = 0\n  operator func +(x: Int64): C { this }\n}\nmain() { var c = C(); let d = c + 1 }",
@@ -2962,16 +2996,19 @@ mod tests {
     }
 
 
+    #[test]
     fn test_unknown_operands_are_not_reported() {
         assert_ok("main() { let a = unknownFn(); let b = a + 1 }");
     }
 
 
+    #[test]
     fn test_string_concat_allowed() {
         assert_ok("main() { var s: String = \"a\"; var n: Int64 = 1; let c = s + \":\" }");
     }
 
 
+    #[test]
     fn test_shift_amount_constant_checked() {
         assert_err(
             "main() { let v1: Int64 = 1; let v2: UInt32 = 64; let v3 = v1 << v2 }",
@@ -2987,6 +3024,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_relational_non_associative() {
         assert_err("main() { let a = 1 < 2 < 3 }", "结合性");
         assert_err("main() { let a = 1 == 2 == 3 }", "结合性");
@@ -2996,6 +3034,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_return_type_checked() {
         assert_err(
             "func f(): UInt16 { let r: Int16 = 1; return r }\nmain() {}",
@@ -3006,6 +3045,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_null_coalesce_type_checked() {
         assert_err(
             "main() { var v1: Option<Int8> = Some(1); var v2: Int16 = 1; let v3 = v1 ?? v2 }",
@@ -3016,11 +3056,13 @@ mod tests {
     }
 
 
+    #[test]
     fn test_option_comparable_with_value() {
         assert_ok("main() { var x: Option<Int64> = 1; let b = x == 5 }");
     }
 
 
+    #[test]
     fn test_integer_literal_range_checked() {
         assert_err("main() { let x: Int8 = 128 }", "超出");
         assert_err("main() { let x: UInt16 = -1 }", "超出");
@@ -3029,6 +3071,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_aggregate_type_mismatch() {
         assert_err(
             "main() { var v1: String = \"1\"; var v2: (Int8, Int16) = (1, 1); let v3 = v1 == v2 }",
@@ -3042,6 +3085,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_deferred_declarations_not_reported() {
         assert_ok("main() { var a: Rune; a = r'x' }");
         assert_ok("main() { var t: (Int64, Int64); t = (1, 2) }");
@@ -3049,6 +3093,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_user_type_assignment_mismatch() {
         assert_err(
             "interface I {}\nfunc fail(): I;\nmain() { var s: I = fail(); let t: Rune = s }",
@@ -3057,12 +3102,14 @@ mod tests {
     }
 
 
+    #[test]
     fn test_top_level_let_not_assignable() {
         assert_err("let c: Int64 = 1\nmain() { let v: Int64 = 1; c = v }", "不可变变量");
         assert_ok("var c: Int64 = 1\nmain() { let v: Int64 = 1; c = v }");
     }
 
 
+    #[test]
     fn test_static_immutable_field_not_assignable() {
         assert_err(
             "class C { static let x = 1 }\nmain() { let v = 1; C.x = v }",
@@ -3072,6 +3119,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_builtin_operator_redefinition() {
         assert_err(
             "extend Int64 { operator func +(x: Int64) { } }\nmain() {}",
@@ -3089,6 +3137,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_w5c_untyped_int_global_const_adapts() {
         // 无类型标注的 u64 常量按整数字面量参与运算
         assert_ok("let N = 101u64\nmain() { var x: UInt64 = 1; let y = x * N }");
@@ -3096,12 +3145,14 @@ mod tests {
     }
 
 
+    #[test]
     fn test_w5c_shift_negative_constant_from_intlit_var() {
         // 整数字面量型变量作左操作数时仍按 Int64 位宽检查负移位
         assert_err("main() { let x = 3; let y = x << -2 }", "不能为负数");
     }
 
 
+    #[test]
     fn test_w5c_var_multi_variant_pattern_rejected() {
         assert_err(
             "enum E { A(Int64) | B(Int64) }\nmain() { var A(x) = A(1) }",
@@ -3111,6 +3162,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_w5c_const_init_non_const_ctor_arg_rejected() {
         // 常量初始化中调用函数，其对象构造成员必须有 init（const 构造）
         assert_err(
@@ -3122,6 +3174,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_compound_op_return_same_type_ok() {
         assert_ok(
             "class C { operator func +(x: Int64): C { this } }\nmain() { var a = C(); a += 0 }",
@@ -3132,6 +3185,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_compound_op_return_subtype_ok() {
         // 返回类型为左操作数类型的子类 → 合法。
         assert_ok(
@@ -3149,6 +3203,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_compound_op_return_unrelated_type_rejected() {
         assert_err(
             "open class A { operator func -(x: Int64): B { B() } }\n\
@@ -3159,6 +3214,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_compound_op_return_wrong_supertype_rejected() {
         // 返回父类（非子类）应被拒绝：要求返回类型是左操作数的同类型或子类型。
         assert_err(
@@ -3177,6 +3233,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_compound_op_return_builtin_extend() {
         // 基础类型 extend 的运算符：返回类型与左操作数不一致 → 拒绝。
         assert_err(
@@ -3192,6 +3249,7 @@ mod tests {
     }
 
 
+    #[test]
     fn test_compound_op_return_non_numeric_builtin_skipped() {
         // String/Bool/Rune/Unit 等非数值内建类型的扩展运算符形态复杂
         // （官方套件中存在返回类型不同却被标记为合法的用例），保守跳过。

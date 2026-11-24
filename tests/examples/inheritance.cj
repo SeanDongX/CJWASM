@@ -25,7 +25,7 @@ open class Animal {
         this.age = age
     }
 
-    func speak(): Int64 {
+    open func speak(): Int64 {
         return 0
     }
 

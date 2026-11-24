@@ -37,7 +37,7 @@ func testStatic(): Int64 {
 // P2.5: 抽象方法（无 body 的 func 声明）
 // =============================================================
 
-open class Shape {
+abstract open class Shape {
     func area(): Int64;   // 抽象方法（无 body，以 ; 结尾）
 }
 
