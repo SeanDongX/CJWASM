@@ -4427,4 +4427,64 @@ mod tests {
              main() {}\n",
         );
     }
+
+    #[test]
+    fn test_validate_abstract_property_accessors_overridable() {
+        // 抽象类中的无体属性脱糖出的访问器是抽象成员，子类实现/覆写不应被误判为
+        // “覆写了父类型中不可覆写（非 open/abstract）的函数”。（对应 07_property 下正测试。）
+        // 隐式实现抽象属性（无需 override 关键字）。
+        assert_valid(
+            "abstract class I {\n\
+             \x20   protected prop i1: Int64\n\
+             \x20   protected mut prop i2: Int64\n\
+             }\n\
+             class C <: I {\n\
+             \x20   protected prop i1: Int64 { get() { 0 } }\n\
+             \x20   protected mut prop i2: Int64 { get() { 0 } set(v) {} }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 抽象属性存在带默认实现的兄弟属性。
+        assert_valid(
+            "abstract class A {\n\
+             \x20   protected prop a1: Int64\n\
+             \x20   protected mut prop a2: Int64 { get() { 5 } set(v) {} }\n\
+             }\n\
+             class C <: A {\n\
+             \x20   protected prop a1: Int64 { get() { 6 } }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 显式 override 抽象不可变属性。
+        assert_valid(
+            "abstract class A {\n\
+             \x20   public prop aaa: Int32\n\
+             }\n\
+             class B <: A {\n\
+             \x20   override public prop aaa: Int32 { get() { 0 } }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 显式 override 抽象可变属性。
+        assert_valid(
+            "abstract class A {\n\
+             \x20   public mut prop aaa: Int32\n\
+             }\n\
+             class B <: A {\n\
+             \x20   override public mut prop aaa: Int32 { get() { 0 } set(v) {} }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_validate_no_body_property_requires_abstract_class() {
+        // 非抽象类不能声明无体属性（其访问器没有实现）。
+        assert_invalid(
+            "class C {\n\
+             \x20   prop x: Int64\n\
+             }\n\
+             main() {}\n",
+        );
+    }
 }
