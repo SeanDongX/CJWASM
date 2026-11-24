@@ -8142,6 +8142,8 @@ mod tests {
             interfaces: vec![InterfaceDef {
                 visibility: Visibility::default(),
                 name: "Drawable".to_string(),
+                type_params: vec![],
+                constraints: vec![],
                 parents: vec![],
                 methods: vec![InterfaceMethod {
                     name: "draw".to_string(),
@@ -8151,6 +8153,7 @@ mod tests {
                     visibility: Visibility::Public,
                     is_static: false,
                     type_params: vec![],
+                    constraints: vec![],
                     is_const: false,
                 }],
                 assoc_types: vec![],
@@ -8205,6 +8208,8 @@ mod tests {
             interfaces: vec![InterfaceDef {
                 visibility: Visibility::default(),
                 name: "Printable".to_string(),
+                type_params: vec![],
+                constraints: vec![],
                 parents: vec![],
                 methods: vec![InterfaceMethod {
                     name: "print".to_string(),
@@ -8214,6 +8219,7 @@ mod tests {
                     visibility: Visibility::Public,
                     is_static: false,
                     type_params: vec![],
+                    constraints: vec![],
                     is_const: false,
                 }],
                 assoc_types: vec![],

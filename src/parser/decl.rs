@@ -1478,8 +1478,9 @@ impl Parser {
             Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string())),
             None => return self.bail(ParseError::UnexpectedEof),
         };
-        // 解析泛型类型参数 <T, U: Bound, ...>（InterfaceDef 暂不存储类型参数）
-        let _ = self.parse_type_params_with_constraints()?;
+        // 解析泛型类型参数 <T, U: Bound, ...>
+        let (iface_own_type_params, mut iface_own_constraints) =
+            self.parse_type_params_with_constraints()?;
         // 解析接口继承 <: Parent1 & Parent2 或 : Parent1, Parent2 (cjc)
         // 语法顺序: interface Name<T> [<: Parents] [where T <: Bound] { ... }
         // 兼容 where 在 <: 之前出现的写法。
@@ -1513,10 +1514,10 @@ impl Parser {
             Ok(())
         };
         parse_parents(self, &mut parents)?;
-        let _ = self.parse_where_clause()?;
+        iface_own_constraints.extend(self.parse_where_clause()?);
         // 兼容 where 之后仍跟 <: 的写法
         parse_parents(self, &mut parents)?;
-        let _ = self.parse_where_clause()?;
+        iface_own_constraints.extend(self.parse_where_clause()?);
         self.expect(Token::LBrace)?;
         let mut methods = Vec::new();
         let mut assoc_types = Vec::new();
@@ -1562,6 +1563,7 @@ impl Parser {
                         visibility: Visibility::Public,
                         is_static: false,
                         type_params: vec![],
+                        constraints: vec![],
                         is_const: false,
                     });
                     continue;
@@ -1595,6 +1597,7 @@ impl Parser {
                                 visibility: Visibility::Public,
                                 is_static: false,
                                 type_params: vec![],
+                                constraints: vec![],
                                 is_const: false,
                             });
                         } else if kw == "set" {
@@ -1640,6 +1643,7 @@ impl Parser {
                                 visibility: Visibility::Public,
                                 is_static: false,
                                 type_params: vec![],
+                                constraints: vec![],
                                 is_const: false,
                             });
                         } else {
@@ -1672,7 +1676,8 @@ impl Parser {
                 }
             };
             // 泛型方法签名：func name<A, B: Bound>(...)
-            let (iface_type_params, _) = self.parse_type_params_with_constraints()?;
+            let (iface_type_params, mut method_constraints) =
+                self.parse_type_params_with_constraints()?;
             let prev_type_params = std::mem::replace(
                 &mut self.current_type_params,
                 iface_type_params.clone(),
@@ -1686,7 +1691,7 @@ impl Parser {
             } else {
                 None
             };
-            let _ = self.parse_where_clause()?;
+            method_constraints.extend(self.parse_where_clause()?);
             if self.check(&Token::Lt) {
                 self.advance();
                 loop {
@@ -1729,6 +1734,7 @@ impl Parser {
                 visibility: mods.visibility.unwrap_or(Visibility::Public),
                 is_static: mods.is_static,
                 type_params: iface_type_params,
+                constraints: method_constraints,
                 is_const: mods.is_const,
             });
         }
@@ -1736,6 +1742,8 @@ impl Parser {
         Ok(crate::ast::InterfaceDef {
             visibility,
             name,
+            type_params: iface_own_type_params,
+            constraints: iface_own_constraints,
             parents,
             methods,
             assoc_types,

@@ -20,7 +20,9 @@
 //! 规则整体关闭，避免误伤合法重载。
 
 use super::SemanticError;
-use crate::ast::{BinOp, Expr, Function, IntSuffix, Pattern, Program, Stmt, Type, UnaryOp};
+use crate::ast::{
+    BinOp, Expr, Function, IntSuffix, Pattern, Program, Stmt, Type, TypeConstraint, UnaryOp,
+};
 use std::collections::{HashMap, HashSet};
 
 /// 轻量类型表示：只区分规范中参与运算符规则的基础类型，
@@ -570,6 +572,19 @@ struct Checker<'a> {
     multi_variant_names: HashSet<String>,
     /// class 名 → 是否定义显式 init（常量构造要求目标类型有 const init）。
     class_has_init: HashMap<String, bool>,
+    /// 用户泛型类型/函数定义：类型参数与约束（用于显式实例化的约束检查）。
+    generic_defs: HashMap<String, GenericDef>,
+    /// 类型别名（`type T = Base`），用于解析实例化实参的实际类型。
+    alias_types: HashMap<String, Type>,
+    /// 用户类型名 → 直接父类型名（含 extend 实现的接口），用于约束满足判定。
+    constraint_parents: HashMap<String, Vec<String>>,
+}
+
+/// 泛型定义的类型参数与约束（实例化约束检查用）。
+#[derive(Clone)]
+struct GenericDef {
+    type_params: Vec<String>,
+    constraints: Vec<TypeConstraint>,
 }
 
 /// 对整个 Program 做表达式/赋值类型检查，错误追加到 `errors`。
@@ -639,6 +654,52 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     let operator_returns = collect_operator_returns(program, &type_names);
     let static_method_returns = collect_static_method_returns(program, &type_names);
 
+    // 显式泛型实例化（`C<T>()` / `f<T>(..)`）的约束满足检查所需的定义表。
+    let mut generic_defs: HashMap<String, GenericDef> = HashMap::new();
+    let mut generic_dup_names: HashSet<String> = HashSet::new();
+    {
+        let mut add = |name: &str,
+                       tp: &[String],
+                       cons: &[TypeConstraint],
+                       generic_defs: &mut HashMap<String, GenericDef>,
+                       dup: &mut HashSet<String>| {
+            if tp.is_empty() || cons.is_empty() {
+                return;
+            }
+            if generic_defs.contains_key(name) || dup.contains(name) {
+                // 同名重载/重定义：无法确定唯一实例化目标，保守跳过。
+                generic_defs.remove(name);
+                dup.insert(name.to_string());
+                return;
+            }
+            generic_defs.insert(
+                name.to_string(),
+                GenericDef {
+                    type_params: tp.to_vec(),
+                    constraints: cons.to_vec(),
+                },
+            );
+        };
+        for c in &program.classes {
+            add(&c.name, &c.type_params, &c.constraints, &mut generic_defs, &mut generic_dup_names);
+        }
+        for s in &program.structs {
+            add(&s.name, &s.type_params, &s.constraints, &mut generic_defs, &mut generic_dup_names);
+        }
+        for e in &program.enums {
+            add(&e.name, &e.type_params, &e.constraints, &mut generic_defs, &mut generic_dup_names);
+        }
+        for f in &program.functions {
+            add(&f.name, &f.type_params, &f.constraints, &mut generic_defs, &mut generic_dup_names);
+        }
+    }
+    let alias_types: HashMap<String, Type> = program
+        .type_aliases
+        .iter()
+        .map(|(n, t)| (n.clone(), t.clone()))
+        .collect();
+    let constraint_parents = collect_constraint_parents(program);
+
     let mut checker = Checker {
         globals,
         funcs,
@@ -657,6 +718,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         ret_ty: None,
         multi_variant_names,
         class_has_init,
+        generic_defs,
+        alias_types,
+        constraint_parents,
     };
 
     for func in &program.functions {
@@ -1108,6 +1172,50 @@ fn is_same_or_subtype_name(
         }
     }
     false
+}
+
+/// 构建用于约束满足判定的继承图（含 extend 实现的接口、enum 的父接口约束）。
+fn collect_constraint_parents(program: &Program) -> HashMap<String, Vec<String>> {
+    let mut m: HashMap<String, Vec<String>> = HashMap::new();
+    for cls in &program.classes {
+        let mut ps: Vec<String> = Vec::new();
+        if let Some(p) = &cls.extends {
+            ps.push(p.clone());
+        }
+        ps.extend(cls.implements.iter().cloned());
+        m.insert(cls.name.clone(), ps);
+    }
+    for st in &program.structs {
+        m.insert(st.name.clone(), Vec::new());
+    }
+    for e in &program.enums {
+        let ps: Vec<String> = e
+            .constraints
+            .iter()
+            .filter(|c| c.param == e.name)
+            .flat_map(|c| c.bounds.iter().cloned())
+            .collect();
+        m.insert(e.name.clone(), ps);
+    }
+    for i in &program.interfaces {
+        m.insert(i.name.clone(), i.parents.clone());
+    }
+    for ext in &program.extends {
+        if let Some(iface) = &ext.interface {
+            m.entry(ext.target_type.clone())
+                .or_default()
+                .push(iface.clone());
+        }
+    }
+    m
+}
+
+/// 仅接受无类型实参的具名类型，返回其类型名（含实参的泛型形态无法与约束名直接比较）。
+fn plain_type_head(t: &Type) -> Option<String> {
+    match t {
+        Type::Struct(n, args) if args.is_empty() => Some(n.clone()),
+        _ => None,
+    }
 }
 
 fn is_builtin_int(name: &str) -> bool {
@@ -1683,9 +1791,83 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 解析类型别名到实际类型（递归，带环保护）。
+    fn resolve_alias_type(&self, ty: &Type) -> Type {
+        let mut cur = ty.clone();
+        let mut seen: HashSet<String> = HashSet::new();
+        loop {
+            let Type::Struct(name, args) = &cur else {
+                break;
+            };
+            if !args.is_empty() || !seen.insert(name.clone()) {
+                break;
+            }
+            match self.alias_types.get(name) {
+                Some(next) => cur = next.clone(),
+                None => break,
+            }
+        }
+        cur
+    }
+
+    /// 显式泛型实例化 `name<args>` 的类型实参是否满足定义的约束（9.2(1)/9.2(2)）。
+    ///
+    /// 仅在“能证明违反”时报告：实参与被约束上界都必须是本文件可见的用户类型，
+    /// 内建类型、含类型实参的泛型形态、未声明的上界一律保守跳过。
+    fn check_type_instantiation(&mut self, name: &str, type_args: Option<&[Type]>) {
+        let Some(args) = type_args else {
+            return;
+        };
+        let Some(def) = self.generic_defs.get(name).cloned() else {
+            return;
+        };
+        if def.type_params.len() != args.len() {
+            return;
+        }
+        let subst: HashMap<String, Type> = def
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        for c in &def.constraints {
+            let Some(arg) = subst.get(&c.param) else {
+                continue;
+            };
+            let arg_resolved = self.resolve_alias_type(arg);
+            let Some(arg_head) = plain_type_head(&arg_resolved) else {
+                continue;
+            };
+            if !self.constraint_parents.contains_key(&arg_head) {
+                continue;
+            }
+            for b in &c.bounds {
+                let bound_ty = match subst.get(b) {
+                    Some(t) => t.clone(),
+                    None => Type::Struct(b.clone(), Vec::new()),
+                };
+                let bound_resolved = self.resolve_alias_type(&bound_ty);
+                let Some(bound_head) = plain_type_head(&bound_resolved) else {
+                    continue;
+                };
+                if bound_head == "Object" || bound_head == "Any" {
+                    continue;
+                }
+                if !self.constraint_parents.contains_key(&bound_head) {
+                    continue;
+                }
+                if !is_same_or_subtype_name(&arg_head, &bound_head, &self.constraint_parents) {
+                    self.err(format!(
+                        "类型 '{}' 不满足泛型 '{}' 的类型参数 '{}' 的约束 '<: {}'（9.2(1)/9.2(2)）",
+                        arg_head, name, c.param, bound_head
+                    ));
+                }
+            }
+        }
+    }
+
     /// 目标类型与值类型是否可赋值（无隐式跨类别/跨宽度转换）。
-    fn check_assignable(&mut self, target: &Ty, value: &Ty, ctx: &str) {
-        // Unit 类型语义特殊（允许 `var u: Unit` 等语法形态），不参与检查。
+    fn check_assignable(&mut self, target: &Ty, value: &Ty, ctx: &str) {        // Unit 类型语义特殊（允许 `var u: Unit` 等语法形态），不参与检查。
         if *target == Ty::Unit {
             return;
         }
@@ -1866,6 +2048,7 @@ impl<'a> Checker<'a> {
                 for (_, a) in named_args {
                     self.check_expr(a);
                 }
+                self.check_type_instantiation(name, type_args.as_deref());
                 self.call_return_ty(name, type_args.as_deref())
             }
 
@@ -2004,18 +2187,23 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
 
-            Expr::StructInit { fields, .. } => {
+            Expr::StructInit {
+                name,
+                type_args,
+                fields,
+            } => {
                 for (_, e) in fields {
                     self.check_expr(e);
                 }
+                self.check_type_instantiation(name, type_args.as_deref());
                 Ty::Unknown
             }
 
             Expr::ConstructorCall {
                 name,
+                type_args,
                 args,
                 named_args,
-                ..
             } => {
                 for a in args {
                     self.check_expr(a);
@@ -2023,6 +2211,7 @@ impl<'a> Checker<'a> {
                 for (_, a) in named_args {
                     self.check_expr(a);
                 }
+                self.check_type_instantiation(name, type_args.as_deref());
                 // 用户类型构造调用 `T()`：结果类型即该类型，便于后续复合赋值
                 // 运算符返回类型校验确定左操作数类型。
                 if self.ctor_types.contains(name) {
@@ -3256,6 +3445,66 @@ mod tests {
         assert_ok(
             "extend String { operator func |(x: Unit) { '1' } }\n\
              main() { var a = \"1\"; a |= () }",
+        );
+    }
+
+    // ── w6a: 泛型实参约束满足（9.2(1)/9.2(2)/9.2(7)）───────────────────────
+
+    #[test]
+    fn test_w6a_generic_instantiation_constraint_violation() {
+        // 显式实例化实参不满足类型参数上界 → 拒绝。
+        assert_err(
+            "open class Animal {}\n\
+             class Dog <: Animal {}\n\
+             class Car {}\n\
+             class GenericClass<T> where T <: Animal {\n\
+             \x20   var x: T\n\
+             }\n\
+             main() { var c = Car(); var g = GenericClass<Car>(c) }",
+            "不满足泛型",
+        );
+        // 类型别名解析后仍不满足 → 拒绝。
+        assert_err(
+            "open class Animal {}\n\
+             class Base {}\n\
+             class GenericClass<T> where T <: Animal {\n\
+             \x20   var x: T\n\
+             }\n\
+             type T = Base\n\
+             main() { var b = Base(); var g = GenericClass<T>(b) }",
+            "不满足泛型",
+        );
+        // 多个上界之一不满足 → 拒绝。
+        assert_err(
+            "interface Printable {}\n\
+             open class Animal {}\n\
+             class Dog <: Animal {}\n\
+             class GenericClass<T> where T <: Animal & Printable {\n\
+             \x20   var x: T\n\
+             }\n\
+             main() { var g = GenericClass<Dog>() }",
+            "不满足泛型",
+        );
+    }
+
+    #[test]
+    fn test_w6a_generic_instantiation_constraint_ok() {
+        // 满足上界 → 合法。
+        assert_ok(
+            "open class Animal {}\n\
+             class Dog <: Animal {}\n\
+             class GenericClass<T> where T <: Animal {\n\
+             \x20   var x: T\n\
+             }\n\
+             main() { var g = GenericClass<Dog>() }",
+        );
+        // 上界为不可解析的内建/外部类型时保守跳过，不误伤。
+        assert_ok(
+            "class C {}\n\
+             class GenericClass<T> where T <: ToString {\n\
+             \x20   var x: T\n\
+             }\n\
+             main() { var g = GenericClass<C>() }",
         );
     }
 

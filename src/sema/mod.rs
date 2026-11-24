@@ -366,6 +366,12 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         check_enum_interfaces(en, program, &index, &mut errors);
     }
 
+    // 声明层泛型检查：类型参数重名、约束左界必须是类型变量（9.1(4)/9.2(4)）。
+    check_generic_declarations(program, &mut errors);
+
+    // 实现/覆写函数的泛型约束宽松度（6.2.4.1(5)/6.3.4.1(5)）。
+    check_generic_constraint_looseness(program, &index, &mut errors);
+
     // `This` 类型只能作为类的实例成员函数返回类型（6.1.4(1)）。
     check_this_type_usage(program, &mut errors);
 
@@ -1796,6 +1802,10 @@ struct ParentMethod {
     is_interface: bool,
     /// 声明该方法的类型名（用于识别多个接口的默认实现冲突）。
     owner: String,
+    /// 方法级类型参数（不含类级参数），用于约束宽松度比较时按位置 alpha 对齐。
+    method_tp: Vec<String>,
+    /// 方法级泛型约束（6.2.4.1(5) / 6.3.4.1(5)）。
+    constraints: Vec<crate::ast::TypeConstraint>,
 }
 
 /// 收集一个 class 的所有本地父类型（父类 + 接口，含传递）的方法。
@@ -1854,6 +1864,8 @@ fn collect_parent_methods<'a>(
                 open_: m.is_open || m.is_abstract || !m.has_body,
                 is_interface: false,
                 owner: name.to_string(),
+                method_tp: m.func.type_params.clone(),
+                constraints: m.func.constraints.clone(),
             });
         }
         if let Some(exts) = index.extends.get(name) {
@@ -1865,6 +1877,8 @@ fn collect_parent_methods<'a>(
                     open_: true,
                     is_interface: false,
                     owner: name.to_string(),
+                    method_tp: f.type_params.clone(),
+                    constraints: f.constraints.clone(),
                 });
             }
         }
@@ -1905,6 +1919,8 @@ fn collect_parent_methods<'a>(
                 open_: true,
                 is_interface: true,
                 owner: name.to_string(),
+                method_tp: m.type_params.clone(),
+                constraints: m.constraints.clone(),
             });
         }
         if let Some(exts) = index.extends.get(name) {
@@ -1916,6 +1932,8 @@ fn collect_parent_methods<'a>(
                     open_: true,
                     is_interface: true,
                     owner: name.to_string(),
+                    method_tp: f.type_params.clone(),
+                    constraints: f.constraints.clone(),
                 });
             }
         }
@@ -2009,6 +2027,345 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
                     });
                 }
             }
+        }
+    }
+}
+
+/// 泛型约束规范化目标：类型参数按声明位置编号，或具体类型名。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ConsTarget {
+    Param(usize),
+    Named(String),
+}
+
+/// 把一组约束规范化到方法级类型参数空间；存在无法归位的约束参数时返回 None
+/// （保守跳过比较，避免误伤）。
+fn normalize_constraints(
+    constraints: &[crate::ast::TypeConstraint],
+    tp: &[String],
+) -> Option<Vec<(usize, ConsTarget)>> {
+    let mut out = Vec::new();
+    for c in constraints {
+        let pi = tp.iter().position(|n| n == &c.param)?;
+        for b in &c.bounds {
+            let target = match tp.iter().position(|n| n == b) {
+                Some(bi) => ConsTarget::Param(bi),
+                None => ConsTarget::Named(b.clone()),
+            };
+            out.push((pi, target));
+        }
+    }
+    Some(out)
+}
+
+/// 上界放宽判定：父约束 `T <: parent_bound` 是否已蕴含实现约束 `T <: own_bound`。
+fn bound_looser_or_eq(parent_bound: &str, own_bound: &str, index: &ProgramIndex<'_>) -> bool {
+    if own_bound == "Any" || parent_bound == own_bound {
+        return true;
+    }
+    if parent_bound == "Nothing" {
+        return true;
+    }
+    // Object 是类层级的顶层类型：仅当父上界本身是类（或 Object）时才被蕴含；
+    // 对无上界 / 仅参数间约束的情形，`T <: Object` 会排除结构体等类型，属于更严格。
+    if own_bound == "Object" {
+        return parent_bound == "Object" || index.classes.contains_key(parent_bound);
+    }
+    index.is_subtype_name(parent_bound, own_bound)
+}
+
+/// 在约束关系集合 `pairs` 下，`(a, b)` 是否被蕴含（含参数间的传递闭包）。
+///
+/// 具名上界允许“放宽”：父约束 `T <: B_par` 可满足更宽松的实现约束 `T <: B_own`
+/// （只要 `B_par <: B_own`）。`Any` 是顶层类型，`T <: Any` 恒真，不构成更严格约束。
+fn constraint_implied(
+    pairs: &[(usize, ConsTarget)],
+    a: usize,
+    b: &ConsTarget,
+    index: &ProgramIndex<'_>,
+) -> bool {
+    if matches!(b, ConsTarget::Named(n) if n == "Any") {
+        return true;
+    }
+    let mut params_seen: HashSet<usize> = HashSet::new();
+    let mut named_seen: HashSet<String> = HashSet::new();
+    let mut stack = vec![a];
+    while let Some(x) = stack.pop() {
+        if !params_seen.insert(x) {
+            continue;
+        }
+        for (pa, pb) in pairs {
+            if *pa != x {
+                continue;
+            }
+            match pb {
+                ConsTarget::Param(y) => stack.push(*y),
+                ConsTarget::Named(n) => {
+                    named_seen.insert(n.clone());
+                }
+            }
+        }
+    }
+    match b {
+        ConsTarget::Param(y) => params_seen.contains(y),
+        ConsTarget::Named(n) => named_seen
+            .iter()
+            .any(|pn| bound_looser_or_eq(pn, n, index)),
+    }
+}
+
+/// 单个实现/覆写函数的约束宽松度比较（6.2.4.1(5) / 6.3.4.1(5)）。
+///
+/// 实现方的约束必须是父类型声明约束的子集（即更宽松或相同）；额外添加约束或
+/// 反转上下界都视为更严格。仅在签名可严格比对、类型参数个数一致且约束都能归位
+/// 到方法级类型参数时才判定，避免误伤。
+fn check_constraint_looseness_for(
+    owner: &str,
+    sig: &Sig,
+    own_tp: &[String],
+    own_cons: &[crate::ast::TypeConstraint],
+    parents: &[ParentMethod],
+    ignore_static: bool,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if is_synthetic_member(&sig.name) {
+        return;
+    }
+    let Some(own_pairs) = normalize_constraints(own_cons, own_tp) else {
+        return;
+    };
+    if own_pairs.is_empty() {
+        return;
+    }
+    let mut parent_sets: Vec<Vec<(usize, ConsTarget)>> = Vec::new();
+    let mut matched = false;
+    for p in parents {
+        if p.sig.name != sig.name {
+            continue;
+        }
+        // struct/enum 的成员函数在解析器中被合成为带 `this` 接收者的顶层函数，
+        // static 信息丢失，比较时忽略该属性。
+        if !ignore_static && p.sig.is_static != sig.is_static {
+            continue;
+        }
+        // 泛型父类只做参数个数比较，约束比较不可靠。
+        if !p.strict_types {
+            continue;
+        }
+        if sig.generic != p.sig.generic {
+            continue;
+        }
+        if own_tp.len() != p.method_tp.len() {
+            continue;
+        }
+        if !signature_matches(sig, &p.sig, true, index) {
+            continue;
+        }
+        let Some(par_pairs) = normalize_constraints(&p.constraints, &p.method_tp) else {
+            continue;
+        };
+        matched = true;
+        parent_sets.push(par_pairs);
+    }
+    if !matched {
+        return;
+    }
+    // 任一已匹配父函数能蕴含该约束即放行（实现需同时满足多个父类型时取并集放宽）。
+    let stricter = own_pairs
+        .iter()
+        .any(|(a, b)| !parent_sets.iter().any(|ps| constraint_implied(ps, *a, b, index)));
+    if stricter {
+        errors.push(SemanticError {
+            message: format!(
+                "类型 '{}' 的 '{}' 的泛型约束比父类型中的对应函数更严格（要求更宽松或相同，6.2.4.1(5)/6.3.4.1(5)）",
+                owner, sig.display
+            ),
+        });
+    }
+}
+
+/// 检查所有类型的实现/覆写函数是否在使用更严格泛型约束（6.2.4.1(5) / 6.3.4.1(5)）。
+fn check_generic_constraint_looseness<'a>(
+    program: &'a Program,
+    index: &ProgramIndex<'a>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for cls in &program.classes {
+        let Some(parents) = collect_parent_methods(cls, index) else {
+            continue;
+        };
+        for m in &cls.methods {
+            let sig = sig_of_class_method(m, &cls.type_params);
+            check_constraint_looseness_for(
+                &cls.name,
+                &sig,
+                &m.func.type_params,
+                &m.func.constraints,
+                &parents,
+                false,
+                index,
+                errors,
+            );
+        }
+    }
+
+    // struct / enum 通过 `<: Interface` 约束或 extend 提供实现函数（顶层函数名带所属类型前缀）。
+    for (owner, type_params, constraints) in program
+        .structs
+        .iter()
+        .map(|s| (s.name.as_str(), &s.type_params, &s.constraints))
+        .chain(
+            program
+                .enums
+                .iter()
+                .map(|e| (e.name.as_str(), &e.type_params, &e.constraints)),
+        )
+    {
+        let bounds: Vec<&'a str> = constraints
+            .iter()
+            .filter(|c| c.param == owner)
+            .flat_map(|c| c.bounds.iter().map(|b| b.as_str()))
+            .collect();
+        if bounds.is_empty() {
+            continue;
+        }
+        let Some(parents) = collect_interface_methods(&bounds, index) else {
+            continue;
+        };
+        for f in &program.functions {
+            if owner_name(&f.name) != Some(owner) {
+                continue;
+            }
+            let sig = sig_of_function(f, type_params);
+            check_constraint_looseness_for(
+                owner,
+                &sig,
+                &f.type_params,
+                &f.constraints,
+                &parents,
+                true,
+                index,
+                errors,
+            );
+        }
+        if let Some(exts) = index.extends.get(owner) {
+            for f in exts {
+                let sig = sig_of_function(f, type_params);
+                check_constraint_looseness_for(
+                    owner,
+                    &sig,
+                    &f.type_params,
+                    &f.constraints,
+                    &parents,
+                    true,
+                    index,
+                    errors,
+                );
+            }
+        }
+    }
+}
+
+/// 声明层泛型检查：类型参数不得重名（9.1(4)）；约束左界必须是已声明的类型变量
+/// （9.2(4)）。`struct S <: I` / `enum E <: I` 会把自身类型名作为约束左界，
+/// 属于语法层面的父类型编码，需放行。
+fn check_generic_declarations(program: &Program, errors: &mut Vec<SemanticError>) {
+    fn check_dup(owner: &str, tps: &[String], errors: &mut Vec<SemanticError>) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for t in tps {
+            if !seen.insert(t.as_str()) {
+                errors.push(SemanticError {
+                    message: format!("类型参数重名（9.1(4)）：{} 中重复声明了 '{}'", owner, t),
+                });
+            }
+        }
+    }
+
+    fn check_cons(
+        owner: &str,
+        declared: &[String],
+        self_name: Option<&str>,
+        constraints: &[crate::ast::TypeConstraint],
+        errors: &mut Vec<SemanticError>,
+    ) {
+        for c in constraints {
+            // 父类型编码（`struct S <: I` 的 param == "S"）不是真正的类型变量约束。
+            if self_name == Some(c.param.as_str()) {
+                continue;
+            }
+            if !declared.iter().any(|t| t == &c.param) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "泛型约束的左界必须是类型变量（9.2(4)）：{} 中的 '{}'",
+                        owner, c.param
+                    ),
+                });
+            }
+        }
+    }
+
+    // 类型名 → 类型参数（用于带类型前缀的成员函数解析外层类型参数）。
+    let mut owner_params: HashMap<&str, &[String]> = HashMap::new();
+    for c in &program.classes {
+        owner_params.insert(c.name.as_str(), c.type_params.as_slice());
+    }
+    for s in &program.structs {
+        owner_params.insert(s.name.as_str(), s.type_params.as_slice());
+    }
+    for e in &program.enums {
+        owner_params.insert(e.name.as_str(), e.type_params.as_slice());
+    }
+    for i in &program.interfaces {
+        owner_params.insert(i.name.as_str(), i.type_params.as_slice());
+    }
+
+    for f in &program.functions {
+        check_dup(&f.name, &f.type_params, errors);
+        let mut declared = f.type_params.clone();
+        let self_name = owner_name(&f.name);
+        if let Some(owner) = self_name {
+            match owner_params.get(owner) {
+                Some(tps) => declared.extend(tps.iter().cloned()),
+                // 所属类型不可解析（如 extend 泛型参数已被丢弃）：保守跳过。
+                None => continue,
+            }
+        }
+        check_cons(&f.name, &declared, None, &f.constraints, errors);
+    }
+
+    for cls in &program.classes {
+        check_dup(&cls.name, &cls.type_params, errors);
+        check_cons(&cls.name, &cls.type_params, Some(&cls.name), &cls.constraints, errors);
+        for m in &cls.methods {
+            check_dup(&m.func.name, &m.func.type_params, errors);
+            let mut declared = m.func.type_params.clone();
+            declared.extend(cls.type_params.iter().cloned());
+            check_cons(&m.func.name, &declared, None, &m.func.constraints, errors);
+        }
+    }
+    for st in &program.structs {
+        check_dup(&st.name, &st.type_params, errors);
+        check_cons(&st.name, &st.type_params, Some(&st.name), &st.constraints, errors);
+    }
+    for en in &program.enums {
+        check_dup(&en.name, &en.type_params, errors);
+        check_cons(&en.name, &en.type_params, Some(&en.name), &en.constraints, errors);
+    }
+    for iface in &program.interfaces {
+        check_dup(&iface.name, &iface.type_params, errors);
+        check_cons(
+            &iface.name,
+            &iface.type_params,
+            Some(&iface.name),
+            &iface.constraints,
+            errors,
+        );
+        for m in &iface.methods {
+            check_dup(&m.name, &m.type_params, errors);
+            let mut declared = m.type_params.clone();
+            declared.extend(iface.type_params.iter().cloned());
+            check_cons(&m.name, &declared, None, &m.constraints, errors);
         }
     }
 }
@@ -2336,6 +2693,8 @@ fn collect_interface_methods<'a>(
                 open_: true,
                 is_interface: true,
                 owner: name.to_string(),
+                method_tp: m.type_params.clone(),
+                constraints: m.constraints.clone(),
             });
         }
         if let Some(exts) = index.extends.get(name) {
@@ -2347,6 +2706,8 @@ fn collect_interface_methods<'a>(
                     open_: true,
                     is_interface: true,
                     owner: name.to_string(),
+                    method_tp: f.type_params.clone(),
+                    constraints: f.constraints.clone(),
                 });
             }
         }
@@ -4423,6 +4784,118 @@ mod tests {
              }\n\
              class C <: I {\n\
              \x20   public const static func f() { 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    // ── w6a: 泛型约束/型变（09 章 + 6.2.4.1(5)/6.3.4.1(5)）─────────────────
+
+    #[test]
+    fn test_w6a_duplicate_type_param_name() {
+        // 9.1(4)：类型参数不得重名。
+        assert_invalid("class GenericClass<T1, T1> {\n}\nmain() {}\n");
+        assert_invalid("func f<T, T>() {}\nmain() {}\n");
+        let errs = assert_invalid("interface I {\n    func f<T, T>(): Unit\n}\nmain() {}\n");
+        assert!(errs.iter().any(|e| e.message.contains("类型参数重名")));
+        assert_valid("class GenericClass<T1, T2> {\n}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_w6a_constraint_lhs_must_be_type_variable() {
+        // 9.2(4)：约束左界只能是类型变量；接口 where 子句中的具体类型名非法。
+        let errs = assert_invalid(
+            "open class Animal {}\n\
+             class Dog <: Animal {}\n\
+             interface GenericInterface<T> where Dog <: Animal {\n\
+             \x20   func isAnimal(x: T) { true }\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("泛型约束的左界")));
+        // 合法的 where 约束不应误伤。
+        assert_valid(
+            "open class Animal {}\n\
+             class GenericClass<T> where T <: Animal {\n\
+             \x20   var x: T\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w6a_impl_may_not_strengthen_generic_constraints() {
+        // 6.2.4.1(5)：实现接口泛型函数时不得添加约束。
+        assert_invalid(
+            "interface I {\n\
+             \x20   static func f<T1, T2, T3, T4>(): Unit where T1 <: T2\n\
+             }\n\
+             class A <: I {\n\
+             \x20   public static func f<T1, T2, T3, T4>() where T1 <: T2, T3 <: T4 {}\n\
+             }\n\
+             main() {}\n",
+        );
+        // 反转上下界同样是更严格约束。
+        assert_invalid(
+            "interface I {\n\
+             \x20   static func f<T1, T2>(): Unit where T1 <: T2\n\
+             }\n\
+             class A <: I {\n\
+             \x20   public static func f<T1, T2>() where T2 <: T1 {}\n\
+             }\n\
+             main() {}\n",
+        );
+        // 相同约束合法。
+        assert_valid(
+            "interface I {\n\
+             \x20   static func f<T1, T2, T3, T4>(): Unit where T1 <: T2\n\
+             }\n\
+             class A <: I {\n\
+             \x20   public static func f<T1, T2, T3, T4>(): Unit where T1 <: T2 {}\n\
+             }\n\
+             main() {}\n",
+        );
+        // 放宽为 `Any` / 更宽松的类上界合法。
+        assert_valid(
+            "interface I {\n\
+             \x20   static func f<T>(): Unit\n\
+             }\n\
+             class A <: I {\n\
+             \x20   public static func f<T>() where T <: Any {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "open class A1 {}\n\
+             open class A2 <: A1 {}\n\
+             interface I {\n\
+             \x20   func f<T>(): Int64 where T <: A2\n\
+             }\n\
+             class C <: I {\n\
+             \x20   public func f<T>(): Int64 where T <: A1 { 0 }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w6a_override_may_not_strengthen_generic_constraints() {
+        // 6.3.4.1(5)：类重定义父类泛型函数时不得添加约束。
+        assert_invalid(
+            "open class I {\n\
+             \x20   static func f<T1, T2, T3, T4>() where T1 <: T2 {}\n\
+             }\n\
+             class A <: I {\n\
+             \x20   public static func f<T1, T2, T3, T4>() where T1 <: T2, T3 <: T4 {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "open class I {\n\
+             \x20   static func f<T1, T2, T3, T4>() where T1 <: T2 {}\n\
+             }\n\
+             class A <: I {\n\
+             \x20   public static func f<T1, T2, T3, T4>() where T1 <: T2 {}\n\
              }\n\
              main() {}\n",
         );
