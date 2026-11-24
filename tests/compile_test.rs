@@ -687,8 +687,6 @@ fn test_compile_class_inheritance_super_deinit() {
                 this.age = age
             }
 
-            ~init { }
-
             func speak(self: Animal) : Int64 {
                 return self.kind
             }
@@ -696,6 +694,13 @@ fn test_compile_class_inheritance_super_deinit() {
             func getAge(self: Animal) : Int64 {
                 return self.age
             }
+        }
+
+        // 规范 6.1.2.5(5)：open 类不能定义 finalizer；finalizer 只能出现在非 open 类中
+        class Finalizable {
+            init() { }
+
+            ~init { }
         }
 
         class Dog <: Animal {

@@ -4033,6 +4033,10 @@ impl CodeGen {
                         self.compile_expr(value, locals, func, loop_ctx);
                         for t in targets.iter().rev() {
                             match t {
+                                AssignTarget::Var(name) if name == "_" => {
+                                    // 元组解构中的通配符 _：丢弃该元素值
+                                    func.instruction(&Instruction::Drop);
+                                }
                                 AssignTarget::Var(name) => {
                                     let idx = locals.get(name).expect("元组赋值目标变量未找到");
                                     func.instruction(&Instruction::LocalSet(idx));

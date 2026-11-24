@@ -103,62 +103,20 @@ fn strip_quote_contents(source: &str) -> String {
     out
 }
 
-/// 计算 bytes[start..end] 中未匹配的 " 数量（跳过 \" 转义）
-fn count_unmatched_quotes(bytes: &[u8], start: usize, end: usize) -> usize {
-    let mut count = 0usize;
-    let mut i = start;
-    while i < end {
-        if bytes[i] == b'\\' && i + 1 < end {
-            i += 2;
-        } else if bytes[i] == b'"' {
-            count += 1;
-            i += 1;
-        } else {
-            i += 1;
-        }
-    }
-    count
-}
-
 /// 找到块注释的关闭位置（返回 */ 之后的位置），支持嵌套块注释（规范 1.5(2)）
 ///
-/// 处理两种特殊情况：
-/// 1. `/*  "synchronized */`：`"` 未闭合，但 `*/` 是真正的注释关闭符
-/// 2. `/*  e.g. "/*xx*/" */`：`*/` 出现在字符串字面量内，外层 `*/` 才是注释关闭符
-///
-/// 嵌套的 `/*` 提高深度，`*/` 降低深度；深度归零即注释结束。引号内的注释
-/// 定界符仍按原有启发式处理（不影响嵌套计数）。
+/// 仓颉规范 A.1.1(1)：`DelimitedComment : '/*' ( DelimitedComment | . )*? '*/'`，
+/// 注释内容中引号不具特殊含义，只有 `/*` / `*/` 参与嵌套计数。
 fn find_comment_close(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     let mut depth = 1usize;
     while i + 1 < bytes.len() {
         if bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            // 引号内（奇数个未匹配引号）的 /* 视作注释文本，不嵌套
-            if count_unmatched_quotes(bytes, start, i) % 2 == 0 {
-                depth += 1;
-            }
+            depth += 1;
             i += 2;
             continue;
         }
         if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-            let q = count_unmatched_quotes(bytes, start, i);
-            if q % 2 == 0 {
-                // 偶数个引号：不在字符串内，关闭当前层注释
-                depth -= 1;
-                i += 2;
-                if depth == 0 {
-                    return i;
-                }
-                continue;
-            }
-            // 奇数个引号：可能在字符串内
-            let after = i + 2;
-            if after < bytes.len() && bytes[after] == b'"' {
-                // */ 后紧跟 "，说明此 */ 在字符串内（如 "/*xx*/"），跳过
-                i += 2;
-                continue;
-            }
-            // */ 后不是 "，说明 " 只是注释内容（如 "synchronized），关闭当前层
             depth -= 1;
             i += 2;
             if depth == 0 {
@@ -174,28 +132,147 @@ fn find_comment_close(bytes: &[u8], start: usize) -> usize {
 /// 移除源码中的块注释 /* ... */，便于解析含版权头的 vendor 文件
 /// 通过引号计数正确处理注释内含 */ 的字符串（如 /* e.g. "/*xx*/" */）
 fn strip_block_comments(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0;
     let bytes = source.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
     while i < bytes.len() {
+        // 行注释：`//` 到行尾整体保留（词法器会跳过），避免把 `//*/` 中的 `/*` 误判为块注释
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // 多行字符串 """..."""：整体保留
+        if i + 2 < bytes.len() && bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"'
+        {
+            out.extend_from_slice(b"\"\"\"");
+            i += 3;
+            while i < bytes.len() {
+                if i + 2 < bytes.len()
+                    && bytes[i] == b'"'
+                    && bytes[i + 1] == b'"'
+                    && bytes[i + 2] == b'"'
+                {
+                    out.extend_from_slice(b"\"\"\"");
+                    i += 3;
+                    break;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // 普通字符串：整体保留，避免字符串内的 /* */ 被误判
+        if bytes[i] == b'"' {
+            out.push(bytes[i]);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i]);
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    out.push(bytes[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
             i += 2;
             let close = find_comment_close(bytes, i);
             i = close;
-            out.push(' ');
+            out.push(b' ');
             continue;
         }
-        let ch = source[i..].chars().next().unwrap_or(' ');
-        out.push(ch);
-        i += ch.len_utf8();
+        out.push(bytes[i]);
+        i += 1;
     }
-    out
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// 十六进制字面量紧邻范围运算符（如 `0x1..5`）时，logos 的十六进制浮点模式会误吞 `.`。
+/// 在十六进制整数与 `..` 之间插入一个空格（不改变语义），避免词法错误。
+fn separate_hex_range(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // 跳过字符串（普通/多行），保持原样
+        if i + 2 < bytes.len() && bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"'
+        {
+            out.extend_from_slice(b"\"\"\"");
+            i += 3;
+            while i < bytes.len() {
+                if i + 2 < bytes.len()
+                    && bytes[i] == b'"'
+                    && bytes[i + 1] == b'"'
+                    && bytes[i + 2] == b'"'
+                {
+                    out.extend_from_slice(b"\"\"\"");
+                    i += 3;
+                    break;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'"' {
+            out.push(bytes[i]);
+            i += 1;
+            while i < bytes.len() {
+                out.push(bytes[i]);
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    out.push(bytes[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // 十六进制整数 0x... 后紧跟 `..`
+        if i + 1 < bytes.len()
+            && bytes[i] == b'0'
+            && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+        {
+            let mut j = i + 2;
+            while j < bytes.len()
+                && ((bytes[j] as char).is_ascii_hexdigit() || bytes[j] == b'_')
+            {
+                j += 1;
+            }
+            if j + 1 < bytes.len() && bytes[j] == b'.' && bytes[j + 1] == b'.' {
+                out.extend_from_slice(&bytes[i..j]);
+                out.push(b' ');
+                i = j;
+                continue;
+            }
+            out.extend_from_slice(&bytes[i..j]);
+            i = j;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// 解析源代码字符串为 Program AST
 pub fn parse_source(source: &str) -> Result<Program, String> {
     let source = strip_block_comments(source);
     let source = strip_quote_contents(&source);
+    let source = separate_hex_range(&source);
     let lexer = Lexer::new(&source);
     let tokens: Result<Vec<_>, _> = lexer.collect();
     let tokens = tokens.map_err(|e| format!("词法错误: {}", e))?;
@@ -912,5 +989,45 @@ extend<T> Array<T> <: SortByExtension<T> {
         let end = find_comment_close(src, 2);
         assert_eq!(end, src.len() - 1);
         assert_eq!(&src[end..], b"x");
+    }
+}
+
+#[cfg(test)]
+mod batch04_tests {
+    use super::*;
+
+    #[test]
+    fn test_line_comment_containing_block_open() {
+        // `//*/` 是行注释，不能把其中的 `/*` 当作块注释起始
+        let src = "//*/. tail words\nmain() { }\n";
+        let out = strip_block_comments(src);
+        assert!(out.contains("//*/. tail words"), "line comment preserved: {:?}", out);
+        assert!(out.contains("main()"), "code preserved: {:?}", out);
+    }
+
+    #[test]
+    fn test_block_comment_with_quotes_and_nesting() {
+        // 注释内的引号不参与嵌套计数，`/* /* */` 仍按嵌套处理
+        let src = "/* a \" /* b */ still */ main() { }\n";
+        assert!(!strip_block_comments(src).contains("still"));
+    }
+
+    #[test]
+    fn test_separate_hex_range() {
+        let out = separate_hex_range("let a = 0x1..5\nlet b = 0x1.8p3\n");
+        assert!(out.contains("0x1 ..5"), "hex range separated: {:?}", out);
+        assert!(out.contains("0x1.8p3"), "hex float untouched: {:?}", out);
+    }
+
+    #[test]
+    fn test_hex_range_parses() {
+        assert!(parse_source("main() { let a = 0x1..5 }").is_ok());
+    }
+
+    #[test]
+    fn test_string_with_block_comment_text_preserved() {
+        let src = "main() { let s = \"/* not a comment */\" }\n";
+        let out = strip_block_comments(src);
+        assert!(out.contains("/* not a comment */"), "string content preserved: {:?}", out);
     }
 }

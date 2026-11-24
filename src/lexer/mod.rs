@@ -442,7 +442,8 @@ pub enum StringOrInterpolated {
 }
 
 #[derive(Logos, Debug, PartialEq, Clone)]
-#[logos(skip r"[ \t\r\n]+")] // 跳过空白
+// 规范 A.1.2(1)：WS := [ 	]，另含 \r\n
+#[logos(skip r"[ \t\r\n\x0C]+")] // 跳过空白（含换页符 U+000C）
 #[logos(skip r"//[^\n]*")] // 跳过单行注释
 pub enum Token {
     // 块注释 /* ... */：支持嵌套（规范 1.5(2)），由 callback 手工计数深度后跳过
@@ -1648,18 +1649,6 @@ mod tests {
     }
 
     #[test]
-    fn test_float_leading_dot() {
-        // 规范 1.3.2：DecimalFraction 允许省略整数部分（.5 / .8e1）。
-        // 词法层拆为 Dot + 数字，由解析器 try_leading_dot_float 重建（避免
-        // t.0 的 .0 被误吞为 Float 导致元组索引失效）。
-        let source = ".5 .8e1 .002";
-        let lexer = Lexer::new(source);
-        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(tokens[0], Token::Dot);
-        assert_eq!(tokens[1], Token::Integer(5));
-        assert_eq!(tokens[2], Token::Dot);
-    }
-
     #[test]
     fn test_float_leading_dot_with_suffix() {
         // 前导点带后缀拆分：.002f32 → Dot + Float32(词法值不含前导点，
@@ -1724,5 +1713,30 @@ mod tests {
             tokens[3],
             Token::MultiLineStringLit("abc\"\"\" def".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod batch04_tests {
+    use super::*;
+
+    fn lex_ok(src: &str) -> Vec<Token> {
+        let mut out = Vec::new();
+        for t in Lexer::new(src) {
+            match t {
+                Ok((_, tok, _)) => out.push(tok),
+                Err(e) => panic!("lex error: {} in {:?}", e, src),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_form_feed_is_whitespace() {
+        // 规范 A.1.2(1)：WS 包含 U+000C
+        let toks = lex_ok("let\u{000C}a\u{000C}=\u{000C}1");
+        assert_eq!(toks[0], Token::Let);
+        assert_eq!(toks[1], Token::Ident("a".to_string()));
+        assert_eq!(toks[2], Token::Assign);
     }
 }

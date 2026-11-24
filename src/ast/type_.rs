@@ -75,7 +75,8 @@ impl Type {
             Type::Float64 => ValType::F64,
             Type::Rune => ValType::I32,
             Type::Bool => ValType::I32,
-            Type::Nothing => panic!("Nothing 类型不能转换为 WASM 值类型"),
+            // Nothing 无值；在 cast / Option<Nothing> 等泛化上下文中以 i32 占位（与对象引用一致）
+            Type::Nothing => ValType::I32,
             // Unit 作为字段/参数存储时以 i32 占位（与 () 的运行时表示一致）
             Type::Unit => ValType::I32,
             Type::String => ValType::I32,
@@ -147,9 +148,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Nothing 类型不能转换为 WASM")]
-    fn test_to_wasm_nothing_panic() {
-        Type::Nothing.to_wasm();
+    fn test_to_wasm_nothing_as_i32() {
+        // Nothing 在 cast / Option<Nothing> 等泛化上下文以 i32 占位（与对象引用一致）
+        assert_eq!(Type::Nothing.to_wasm(), ValType::I32);
     }
 
     #[test]

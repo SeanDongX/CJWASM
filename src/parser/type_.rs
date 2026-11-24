@@ -341,6 +341,13 @@ impl Parser {
             Some(Token::TypeUnit) => Ok(Type::Unit),
             Some(Token::TypeString) => Ok(Type::String),
             Some(Token::TypeArray) => {
+                // 裸 Array（无泛型实参）可用于类型别名场景：type Array = Array<Int64>
+                if !self.check(&Token::Lt) {
+                    if let Some(alias_ty) = self.type_aliases.get("Array").cloned() {
+                        return Ok(alias_ty);
+                    }
+                    return Ok(Type::Struct("Array".to_string(), vec![]));
+                }
                 self.expect(Token::Lt)?;
                 let elem_type = self.parse_type()?;
                 self.expect(Token::Gt)?;
@@ -366,6 +373,13 @@ impl Parser {
                 Ok(Type::Array(Box::new(elem_type)))
             }
             Some(Token::TypeTuple) => {
+                // 裸 Tuple 用于类型别名场景：type Tuple = (Int64, Int64)
+                if !self.check(&Token::Lt) {
+                    if let Some(alias_ty) = self.type_aliases.get("Tuple").cloned() {
+                        return Ok(alias_ty);
+                    }
+                    return Ok(Type::Struct("Tuple".to_string(), vec![]));
+                }
                 self.expect(Token::Lt)?;
                 let mut types = Vec::new();
                 loop {

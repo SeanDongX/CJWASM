@@ -115,7 +115,7 @@ impl Parser {
                         value,
                     });
                 }
-                let pattern = if self.check(&Token::LParen) {
+                let pattern = if self.check(&Token::LParen) || self.looks_like_variant_pattern() {
                     self.parse_pattern()?
                 } else {
                     let first = match self.advance_binding_ident() {
@@ -198,6 +198,7 @@ impl Parser {
             }
             Some(Token::Var) => {
                 self.advance();
+                // var 声明只允许元组解构；构造器模式（如 var Workday(x) = ...）非法
                 let pattern = if self.check(&Token::LParen) {
                     self.parse_pattern()?
                 } else {
@@ -249,7 +250,36 @@ impl Parser {
                 if self.check(&Token::RBrace) || self.check(&Token::Semicolon) {
                     Ok(Stmt::Return(None))
                 } else {
-                    Ok(Stmt::Return(Some(self.parse_expr()?)))
+                    let expr = self.parse_expr()?;
+                    // `return lhs = rhs`：赋值表达式返回 Unit，脱糖为块内赋值
+                    let bin_op = match self.peek() {
+                        Some(Token::Assign) => Some(None),
+                        Some(Token::PlusEq) => Some(Some(BinOp::Add)),
+                        Some(Token::MinusEq) => Some(Some(BinOp::Sub)),
+                        Some(Token::StarEq) => Some(Some(BinOp::Mul)),
+                        Some(Token::SlashEq) => Some(Some(BinOp::Div)),
+                        Some(Token::PercentEq) => Some(Some(BinOp::Mod)),
+                        _ => None,
+                    };
+                    if let Some(op) = bin_op {
+                        self.advance();
+                        let rhs = self.parse_expr()?;
+                        let target = self.expr_to_assign_target(expr)?;
+                        let value = match op {
+                            None => rhs,
+                            Some(bin) => Expr::Binary {
+                                op: bin,
+                                left: Box::new(self.assign_target_to_expr(&target)),
+                                right: Box::new(rhs),
+                            },
+                        };
+                        Ok(Stmt::Return(Some(Expr::Block(
+                            vec![Stmt::Assign { target, value }],
+                            None,
+                        ))))
+                    } else {
+                        Ok(Stmt::Return(Some(expr)))
+                    }
                 }
             }
             Some(Token::While) => {
@@ -313,17 +343,10 @@ impl Parser {
                 }
                 let (var, tuple_vars, binding_pattern) = if self.check(&Token::LParen) {
                     self.advance();
-                    let mut names = Vec::new();
+                    let mut patterns = Vec::new();
                     loop {
-                        let n = match self.advance() {
-                            Some(Token::Ident(n)) => n,
-                            Some(Token::Underscore) => "_".to_string(),
-                            Some(tok) => {
-                                return self.bail(ParseError::UnexpectedToken(tok, "元组元素名".to_string()))
-                            }
-                            None => return self.bail(ParseError::UnexpectedEof),
-                        };
-                        names.push(n);
+                        // 元组元素可为简单名、_ 或嵌套模式（如 (Foo(x), _)）
+                        patterns.push(self.parse_pattern()?);
                         if self.check(&Token::RParen) {
                             self.advance();
                             break;
@@ -336,7 +359,25 @@ impl Parser {
                         }
                         self.advance();
                     }
-                    ("__for_tuple_destr".to_string(), names, None)
+                    let all_simple = patterns
+                        .iter()
+                        .all(|p| matches!(p, Pattern::Binding(_) | Pattern::Wildcard));
+                    if all_simple {
+                        let names = patterns
+                            .into_iter()
+                            .map(|p| match p {
+                                Pattern::Binding(n) => n,
+                                _ => "_".to_string(),
+                            })
+                            .collect();
+                        ("__for_tuple_destr".to_string(), names, None)
+                    } else {
+                        (
+                            "__for_pat".to_string(),
+                            Vec::new(),
+                            Some(Pattern::Tuple(patterns)),
+                        )
+                    }
                 } else if matches!(
                     self.peek(),
                     Some(Token::Ident(_))
@@ -839,5 +880,102 @@ impl Parser {
             Type::Rune => Expr::Rune('\0'),
             _ => Expr::Integer(0), // 其他类型默认为0
         }
+    }
+}
+
+#[cfg(test)]
+mod stmt_tests {
+    use crate::pipeline::parse_source;
+
+    fn ok(src: &str) {
+        if let Err(e) = parse_source(src) {
+            panic!("parse failed: {}\nsource:\n{}", e, src);
+        }
+    }
+
+    #[test]
+    fn test_tuple_destructuring_assignment() {
+        ok(r#"
+class C {
+    var x = 0
+}
+main() {
+    var x = 0
+    var y = 0
+    var b = true
+    var c = C()
+    (x, c.x) = (3, 4)
+    (x, b,) = (5, true,)
+    (_, x) = (1, 2)
+    (x, (b, y)) = (3, (true, 4))
+}
+"#);
+    }
+
+    #[test]
+    fn test_tuple_let_patterns() {
+        ok(r#"
+enum Color {
+    Red(Int64)
+}
+main() {
+    let (x, y) = ("S", 1.0)
+    let Red(a) = Red(22)
+}
+"#);
+    }
+
+    #[test]
+    fn test_for_nested_variant_pattern() {
+        ok(r#"
+enum E { Foo(Int64) }
+main() {
+    var count = 0
+    for ((Foo(x), _) in [(Foo(1), 'a')]) {
+        count += x
+    }
+}
+"#);
+    }
+
+    #[test]
+    fn test_return_assignment_expression() {
+        ok(r#"
+class C {
+    static func f() {
+        var x = 1
+        return x = 2
+    }
+}
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_while_condition_call_with_empty_block() {
+        // `while (cond()) {}` 中的 `{}` 是循环体，不能被当作尾随空闭包
+        ok(r#"
+class Q {
+    func remove(): Option<Int64> { None }
+}
+main() {
+    let q = Q()
+    while (q.remove().isNone()) {}
+}
+"#);
+    }
+
+    #[test]
+    fn test_newline_tuple_assignment_after_identifier() {
+        // 上一行以标识符结尾时，下一行的元组赋值不能被吞成调用参数
+        ok(r#"
+func add5(x: Int64): Int64 { x + 5 }
+main() {
+    var x = 0
+    var b = true
+    var f = add5
+    (x, b) = (1, true)
+}
+"#);
     }
 }

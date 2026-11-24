@@ -432,6 +432,11 @@ impl Parser {
                     break;
                 }
                 Some(Token::LBracket) => {
+                    // 跨行的 `[` 视为新语句（数组字面量），而不是上一行表达式的索引，
+                    // 例如连续两行数组字面量 `[1, 2]\n[3, 4]`。
+                    if self.newline_before_current() {
+                        break;
+                    }
                     self.advance();
                     // 支持 arr[..end] 语法（从开头到 end）
                     if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
@@ -480,10 +485,24 @@ impl Parser {
                                 end: Box::new(end),
                             };
                         } else {
+                            // 多索引支持：c[i, j]（索引运算符重载可接受多个参数）
+                            let index = if self.check(&Token::Comma) {
+                                let mut elts = vec![first];
+                                while self.check(&Token::Comma) {
+                                    self.advance();
+                                    if self.check(&Token::RBracket) {
+                                        break;
+                                    }
+                                    elts.push(self.parse_expr()?);
+                                }
+                                Expr::Tuple(elts)
+                            } else {
+                                first
+                            };
                             self.expect(Token::RBracket)?;
                             expr = Expr::Index {
                                 array: Box::new(expr),
-                                index: Box::new(first),
+                                index: Box::new(index),
                             };
                         }
                     }
@@ -512,6 +531,26 @@ impl Parser {
                             named_args,
                             type_args: None,
                         };
+                    } else if self.check(&Token::Lt) {
+                        // obj?.method<T> — 可选链方法带显式类型实参
+                        let type_args = self.parse_opt_type_args()?;
+                        if self.check(&Token::LParen) {
+                            self.advance();
+                            let (args, named_args) = self.parse_args()?;
+                            self.expect(Token::RParen)?;
+                            expr = Expr::MethodCall {
+                                object: Box::new(expr),
+                                method: field,
+                                args,
+                                named_args,
+                                type_args,
+                            };
+                        } else {
+                            expr = Expr::OptionalChain {
+                                object: Box::new(expr),
+                                field,
+                            };
+                        }
                     } else {
                         expr = Expr::OptionalChain {
                             object: Box::new(expr),
@@ -635,9 +674,20 @@ impl Parser {
                     expr = Expr::PostfixDecr(Box::new(expr));
                 }
                 Some(Token::Question) => {
-                    // ? 运算符：expr? 提前返回 Err/None
+                    // ? 运算符：expr? 提前返回 Err/None；
+                    // 也支持可选调用尾随块：s?.f?{} / s?.f?{ ... }
                     self.advance();
-                    expr = Expr::Try(Box::new(expr));
+                    let inner = Expr::Try(Box::new(expr));
+                    if self.check(&Token::LBrace) {
+                        let closure = self.parse_primary()?;
+                        expr = Expr::Invoke {
+                            callee: Box::new(inner),
+                            args: vec![closure],
+                            named_args: vec![],
+                        };
+                    } else {
+                        expr = inner;
+                    }
                 }
                 // P6: Trailing closure — f(args) { params => body } 或 expr.method { params => body }
                 // 支持 Call、MethodCall、Field（如 .any { x => ... }），以及 Var（如 map { x => f(x) }）
@@ -650,10 +700,15 @@ impl Parser {
                             | Expr::Field { .. }
                             | Expr::Var(_)
                             | Expr::ConstructorCall { .. }
+                            | Expr::OptionalChain { .. }
                     ) =>
                 {
                     // Peek ahead to check if this looks like a lambda: { ident => ... } or { => ... }
                     let looks_like_lambda = matches!(self.peek_next(), Some(Token::FatArrow))
+                        // 空块尾随闭包仅限可选链 `s?.f{}`：普通调用后的 `{}` 是语句块，
+                        // 不能吞进调用（如 `while (cond()) {}`）。
+                        || (matches!(self.peek_next(), Some(Token::RBrace))
+                            && matches!(&expr, Expr::OptionalChain { .. }))
                         || (matches!(self.peek_next(), Some(Token::Ident(_)))
                             && matches!(
                                 self.peek_at(2),
@@ -662,7 +717,15 @@ impl Parser {
                     if looks_like_lambda {
                         // Consume { and parse the lambda body
                         self.advance(); // consume {
-                        let closure = if self.check(&Token::FatArrow) {
+                        let closure = if self.check(&Token::RBrace) {
+                            // {} — 空 lambda（无可执行体）
+                            self.advance();
+                            Expr::Lambda {
+                                params: vec![],
+                                return_type: None,
+                                body: Box::new(Expr::Block(vec![], None)),
+                            }
+                        } else if self.check(&Token::FatArrow) {
                             // { => body } — 无参 lambda；body 可为语句块
                             self.advance();
                             let body = self.parse_lambda_body()?;
@@ -755,6 +818,13 @@ impl Parser {
                             } => Expr::MethodCall {
                                 object: obj,
                                 method: method_name,
+                                args: vec![closure],
+                                named_args: vec![],
+                                type_args: None,
+                            },
+                            Expr::OptionalChain { object, field } => Expr::MethodCall {
+                                object,
+                                method: field,
                                 args: vec![closure],
                                 named_args: vec![],
                                 type_args: None,
@@ -941,13 +1011,13 @@ impl Parser {
                         // 2.. 后面是 ] 或 ) 或 , 说明是开放式范围
                         Box::new(Expr::Integer(i64::MAX))
                     } else {
-                        // 结束值允许一元负号：`-10..-11`、`0..-1`
-                        Box::new(self.parse_unary()?)
+                        // 结束值：范围运算符优先级最低，按完整表达式解析（如 1..3 + 3）
+                        Box::new(self.parse_pipeline()?)
                     };
                     // P2.6: 可选步长 `: step`（支持负步长 -1）
                     let step = if self.check(&Token::Colon) {
                         self.advance();
-                        Some(Box::new(self.parse_unary()?))
+                        Some(Box::new(self.parse_pipeline()?))
                     } else {
                         None
                     };
@@ -970,6 +1040,16 @@ impl Parser {
                 ),
             },
             Some(Token::Super) => {
+                // 规范 6.1.2.4(17)：静态成员函数不能引用 super
+                if self.in_static_method {
+                    return self.bail_at(
+                        ParseError::UnexpectedToken(
+                            Token::Super,
+                            "静态方法不能使用 super".to_string(),
+                        ),
+                        self.at_prev(),
+                    );
+                }
                 if self.check(&Token::LParen) {
                     self.advance();
                     let (args, named_args) = self.parse_args()?;
@@ -992,6 +1072,10 @@ impl Parser {
                         None => return self.bail(ParseError::UnexpectedEof),
                     };
                     // 检查是否为方法调用 super.method(...) 或字段访问 super.field
+                    // 也支持泛型方法调用 super.method<T>(...)
+                    if self.check(&Token::Lt) {
+                        let _ = self.parse_opt_type_args()?;
+                    }
                     if self.check(&Token::LParen) {
                         self.advance();
                         let (args, named_args) = self.parse_args()?;
@@ -1007,6 +1091,9 @@ impl Parser {
                             field: field_or_method,
                         })
                     }
+                } else if self.check(&Token::LBracket) {
+                    // super[i] — 由外层后缀解析继续处理索引
+                    Ok(Expr::Var("super".to_string()))
                 } else {
                     self.bail(ParseError::UnexpectedToken(
                         self.peek().cloned().unwrap_or(Token::Dot),
@@ -1227,8 +1314,9 @@ impl Parser {
                     // 检查是否是 try (let/var name = expr) 或 try (name = expr) 形式
                     let has_let_var = matches!(self.peek(), Some(Token::Let) | Some(Token::Var));
                     // 或者 name = expr（不带 let/var 的资源绑定）
+                    // 或者 name: Type = expr（带类型注解的资源绑定）
                     let has_bare_assign = matches!(self.peek(), Some(Token::Ident(_)))
-                        && matches!(self.peek_at(1), Some(Token::Assign));
+                        && matches!(self.peek_at(1), Some(Token::Assign) | Some(Token::Colon));
                     if has_let_var || has_bare_assign {
                         let mut res = Vec::new();
                         loop {
@@ -1241,6 +1329,11 @@ impl Parser {
                                 byte_start: self.at().0,
                                 byte_end: self.at().1,
                             })?;
+                            // 可选的类型注解 name: Type
+                            if self.check(&Token::Colon) {
+                                self.advance();
+                                let _ = self.parse_type()?;
+                            }
                             self.expect(Token::Assign)?;
                             let expr = self.parse_expr()?;
                             res.push((name, expr));
@@ -1435,8 +1528,10 @@ impl Parser {
                     None
                 };
                 // 检查是否是函数调用、构造函数调用或结构体初始化
+                // 跨行的 `(` 视为新语句/元组起点，而不是上一行标识符的调用，避免
+                // `var f = g\n(x, y) = ...` 把元组赋值吞成调用参数。
                 match self.peek() {
-                    Some(Token::LParen) => {
+                    Some(Token::LParen) if !self.newline_before_current() => {
                         self.advance();
                         let (args, named_args) = self.parse_args()?;
                         self.expect(Token::RParen)?;
@@ -1516,19 +1611,37 @@ impl Parser {
                     self.expect(Token::RParen)?;
                     return self.parse_lambda_rest(params);
                 }
-                // 解析第一个表达式
-                let first = self.parse_expr()?;
+                // 解析第一个表达式（括号内允许 `_` 通配符，用于元组解构赋值 (_, a) = ...）
+                let prev_wildcard = self.allow_wildcard_expr;
+                self.allow_wildcard_expr = true;
+                let first_result = self.parse_expr();
+                let first = match first_result {
+                    Ok(e) => e,
+                    Err(e) => {
+                        self.allow_wildcard_expr = prev_wildcard;
+                        return Err(e);
+                    }
+                };
+                self.allow_wildcard_expr = prev_wildcard;
                 if self.check(&Token::Comma) {
                     // 这是元组字面量 (a, b, ...)
                     self.advance();
                     let mut elements = vec![first];
                     if !self.check(&Token::RParen) {
                         loop {
-                            elements.push(self.parse_expr()?);
+                            let prev_wildcard = self.allow_wildcard_expr;
+                            self.allow_wildcard_expr = true;
+                            let elem = self.parse_expr();
+                            self.allow_wildcard_expr = prev_wildcard;
+                            elements.push(elem?);
                             if !self.check(&Token::Comma) {
                                 break;
                             }
                             self.advance();
+                            // 允许尾随逗号：(a, b,)
+                            if self.check(&Token::RParen) {
+                                break;
+                            }
                         }
                     }
                     self.expect(Token::RParen)?;
@@ -1985,6 +2098,9 @@ impl Parser {
                     // match { case ... } 无主体，视为 match (()) { ... }
                     // 但 match {} 不是有效的无主体语法（空块应该是主体）
                     Box::new(Expr::Block(vec![], None))
+                } else if has_paren {
+                    // match (完整表达式) { ... }：括号内是普通表达式（可含运算符）
+                    Box::new(self.parse_expr()?)
                 } else {
                     Box::new(self.parse_match_subject()?)
                 };
@@ -2568,7 +2684,22 @@ impl Parser {
                 byte_end: self.at_prev().1,
             });
         }
-        parser.parse_expr()
+        // `${ var a = 1; var b = 2; a + b }`：插值内允许语句序列，块的值取最后一条表达式
+        let mut stmts = parser.parse_stmts()?;
+        if stmts.len() == 1 {
+            if let Some(Stmt::Expr(e)) = stmts.pop() {
+                return Ok(e);
+            }
+        }
+        let result = if matches!(stmts.last(), Some(Stmt::Expr(_))) {
+            match stmts.pop() {
+                Some(Stmt::Expr(e)) => Some(Box::new(e)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Ok(Expr::Block(stmts, result))
     }
 
     /// 检查 < 后面是否看起来像泛型方法调用
@@ -2659,5 +2790,119 @@ impl Parser {
             return matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod expr_tests {
+    use crate::pipeline::parse_source;
+
+    fn ok(src: &str) {
+        if let Err(e) = parse_source(src) {
+            panic!("parse failed: {}\nsource:\n{}", e, src);
+        }
+    }
+
+    #[test]
+    fn test_match_parenthesized_expression_subject() {
+        ok(r#"
+main() {
+    var i = 0
+    match (i + 10) {
+        case 10 => 1
+        case _ => 0
+    }
+}
+"#);
+    }
+
+    #[test]
+    fn test_consecutive_array_literal_statements() {
+        ok(r#"
+func foo() { 321 }
+main() {
+    [1, 2, 3]
+    ['a', 'b', 'c']
+    [0x23.2p1, 1.2, 3.21e5]
+    [1..3, 2..4, 3..=6]
+    [[1, 2], [3, 4]]
+    [foo, { => 42 }]
+    return 0
+}
+"#);
+    }
+
+    #[test]
+    fn test_optional_chain_forms() {
+        ok(r#"
+class S {
+    var id = 1
+    func f() {}
+    func vf() {}
+}
+main() {
+    let s: ?S = S()
+    s?.f?{}
+    s?.vf{}
+    s?.id<Int64>
+    s?.a
+}
+"#);
+    }
+
+    #[test]
+    fn test_multi_index_expression() {
+        ok(r#"
+class C {
+    operator func [](i: Int64, j: Int64): Int64 { i + j }
+}
+main() {
+    let c = C()
+    let v = c[0, 1]
+}
+"#);
+    }
+
+    #[test]
+    fn test_interpolation_with_statements() {
+        ok(r#"
+main() {
+    let a = "Bla ${ var x = 1; var y = 2; x + y } bla"
+    let b = "${ 1 + 1 }"
+    return 0
+}
+"#);
+    }
+
+    #[test]
+    fn test_hex_literal_range() {
+        ok(r#"
+main() {
+    let a = 0x1..5
+    let b = -0x83c91..=0o3470601:5
+}
+"#);
+    }
+
+    #[test]
+    fn test_range_with_step_precedence() {
+        ok(r#"
+main() {
+    let a = 0 * 1 .. 3 + 3:1 + 1
+}
+"#);
+    }
+
+    #[test]
+    fn test_super_index_assignment() {
+        ok(r#"
+open class A {}
+class B <: A {
+    func g() {
+        super[0] = 1
+    }
+}
+main() {}
+"#);
     }
 }

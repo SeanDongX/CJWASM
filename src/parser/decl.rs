@@ -1,6 +1,6 @@
 //! 声明解析：parse_program、parse_struct、parse_class、parse_enum、parse_function 等。
 
-use super::{ParseError, ParseErrorAt, Parser};
+use super::{is_valid_raw_ident_text, ParseError, ParseErrorAt, Parser};
 use crate::ast::*;
 use crate::lexer::{StringOrInterpolated, Token};
 
@@ -333,22 +333,45 @@ impl Parser {
                     | Some(Token::Abstract)
                     | Some(Token::Sealed)
                     | Some(Token::Open) => {
-                        classes.push(self.parse_class_with_visibility(visibility)?)
+                        // 类/接口修饰符（abstract/sealed/open 及可见性）可交错出现，
+                        // 如 `abstract public class`、`public sealed interface`。
+                        // 先收集修饰符，再按后续关键字分派到 class 或 interface。
+                        let mut vis = visibility;
+                        let (is_abstract, is_sealed, is_open) = self.parse_type_modifiers(&mut vis);
+                        if self.check(&Token::Interface) {
+                            // 接口只允许 public/sealed 修饰；abstract/open 仅用于 class
+                            if is_abstract || is_open {
+                                let tok = self.advance().unwrap_or(Token::Interface);
+                                return self.bail(ParseError::UnexpectedToken(
+                                    tok,
+                                    "Class".to_string(),
+                                ));
+                            }
+                            interfaces.push(self.parse_interface_with_visibility(vis)?)
+                        } else {
+                            classes.push(self.parse_class_body(
+                                vis,
+                                is_abstract,
+                                is_sealed,
+                                is_open,
+                            )?)
+                        }
                     }
                     Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
                     Some(Token::Extend) => extends.push(self.parse_extend()?),
                     // P2.2: type Name = Type  /  type Name<T, U> = Type<T, U>
                     Some(Token::TypeAlias) => {
                         self.advance();
-                        let alias_name = match self.advance() {
-                            Some(Token::Ident(n)) => n,
-                            Some(tok) => {
+                        // 别名可使用库类型名（type Tuple = ...、type Array = ...）
+                        let alias_name = match self.advance_alias_name() {
+                            Some(n) => n,
+                            None => {
+                                let tok = self.advance().unwrap_or(Token::Semicolon);
                                 return self.bail(ParseError::UnexpectedToken(
                                     tok,
                                     "类型别名名称".to_string(),
-                                ))
+                                ));
                             }
-                            None => return self.bail(ParseError::UnexpectedEof),
                         };
                         // 类型别名可带泛型参数（如 type Arr<T> = Array<Int8>），
                         // 目标类型中的 T 按类型参数解析。
@@ -432,7 +455,7 @@ impl Parser {
                     }
                     // cjc: 顶层常量 let/var/const name: Type = expr
                     Some(Token::Let) | Some(Token::Var) | Some(Token::Const) => {
-                        constants.push(self.parse_top_level_const()?);
+                        constants.extend(self.parse_top_level_const()?);
                     }
                     // cjc: public import ... — 带可见性的导入语句
                     Some(Token::Import) => {
@@ -467,6 +490,52 @@ impl Parser {
     /// 解析 import 语句 (cjc: import path.to.Item 或 import path.to.*)
     pub(crate) fn parse_import(&mut self) -> Result<Import, ParseErrorAt> {
         self.expect(Token::Import)?;
+
+        // cjc 也允许完全分组写法：import {a.b.*, c.d.E}
+        // （本编译器不做真实导入解析，保留第一条路径即可保证语法通过）
+        if self.check(&Token::LBrace) {
+            self.advance();
+            let mut first_path: Vec<String> = Vec::new();
+            loop {
+                if self.check(&Token::RBrace) {
+                    break;
+                }
+                let part = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(Token::Star) => "*".to_string(),
+                    Some(tok) => {
+                        return self
+                            .bail(ParseError::UnexpectedToken(tok, "导入项名称".to_string()))
+                    }
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                if first_path.is_empty() {
+                    first_path.push(part);
+                }
+                if self.check(&Token::Dot) {
+                    self.advance();
+                    continue;
+                }
+                // 该项结束，跳过后续项
+                while !self.check(&Token::Comma) && !self.check(&Token::RBrace) {
+                    if self.advance().is_none() {
+                        break;
+                    }
+                }
+                if self.check(&Token::Comma) {
+                    self.advance();
+                }
+            }
+            self.expect(Token::RBrace)?;
+            if self.check(&Token::Semicolon) {
+                self.advance();
+            }
+            return Ok(Import {
+                module_path: first_path,
+                items: None,
+                alias: None,
+            });
+        }
 
         // cjc 风格: import path.to.Item 或 import path.to.* 或 import path.to.Item as alias
         // 或 import path.to.{Item1, Item2, ...}
@@ -561,8 +630,48 @@ impl Parser {
     }
 
     /// 解析顶层常量 (let/var/const name [: Type] = expr)
-    pub(crate) fn parse_top_level_const(&mut self) -> Result<ConstDef, ParseErrorAt> {
+    /// 支持元组解构：public let (a, b): (T1, T2) = expr
+    pub(crate) fn parse_top_level_const(&mut self) -> Result<Vec<ConstDef>, ParseErrorAt> {
         self.advance(); // consume let/var/const
+        // 元组解构声明：展开为多个常量（每个绑定取 TupleIndex）
+        if self.check(&Token::LParen) {
+            let pattern = self.parse_pattern()?;
+            if self.check(&Token::Bang) {
+                self.advance();
+            }
+            if self.check(&Token::Colon) {
+                self.advance();
+                let _ = self.parse_type()?;
+            }
+            self.expect(Token::Assign)?;
+            let init = self.parse_expr()?;
+            if self.check(&Token::Semicolon) {
+                self.advance();
+            }
+            let bindings: Vec<String> = match pattern {
+                Pattern::Tuple(ps) => ps
+                    .into_iter()
+                    .filter_map(|p| match p {
+                        Pattern::Binding(n) => Some(n),
+                        _ => None,
+                    })
+                    .collect(),
+                Pattern::Binding(n) => vec![n],
+                _ => vec![],
+            };
+            return Ok(bindings
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| ConstDef {
+                    name,
+                    ty: Type::Int64,
+                    init: Expr::TupleIndex {
+                        object: Box::new(init.clone()),
+                        index: i as u32,
+                    },
+                })
+                .collect());
+        }
         let name = match self.advance_ident() {
             Some(n) => n,
             None => {
@@ -582,7 +691,7 @@ impl Parser {
         if self.check(&Token::Semicolon) {
             self.advance();
         }
-        Ok(ConstDef { name, ty, init })
+        Ok(vec![ConstDef { name, ty, init }])
     }
 
     /// 解析 @import("module", "name") 属性（用于 extern func 前）
@@ -1549,27 +1658,13 @@ impl Parser {
         if self.check(&Token::Lt) {
             let _ = self.parse_type_params()?;
         }
-        let target_type = match self.advance() {
-            Some(Token::Ident(n)) => n,
-            Some(Token::TypeRune) => "Rune".to_string(),
-            Some(Token::TypeInt64) => "Int64".to_string(),
-            Some(Token::TypeInt32) => "Int32".to_string(),
-            Some(Token::TypeInt16) => "Int16".to_string(),
-            Some(Token::TypeInt8) => "Int8".to_string(),
-            Some(Token::TypeUInt64) => "UInt64".to_string(),
-            Some(Token::TypeUInt32) => "UInt32".to_string(),
-            Some(Token::TypeUInt16) => "UInt16".to_string(),
-            Some(Token::TypeUInt8) => "UInt8".to_string(),
-            Some(Token::TypeIntNative) => "IntNative".to_string(),
-            Some(Token::TypeUIntNative) => "UIntNative".to_string(),
-            Some(Token::TypeString) => "String".to_string(),
-            Some(Token::TypeBool) => "Bool".to_string(),
-            Some(Token::TypeArray) => "Array".to_string(),
-            Some(Token::TypeFloat64) => "Float64".to_string(),
-            Some(Token::TypeFloat32) => "Float32".to_string(),
-            Some(Token::TypeFloat16) => "Float16".to_string(),
-            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类型名".to_string())),
-            None => return self.bail(ParseError::UnexpectedEof),
+        // 扩展目标可为普通类型名或类型关键字（extend Unit / Nothing / Tuple / Array<T> ...）
+        let target_type = match self.advance_type_name() {
+            Some(n) => n,
+            None => {
+                let tok = self.advance().unwrap_or(Token::Semicolon);
+                return self.bail(ParseError::UnexpectedToken(tok, "类型名".to_string()));
+            }
         };
         // 目标类型的泛型实参 Array<T>
         let _ = self.parse_opt_type_args()?;
@@ -1588,12 +1683,12 @@ impl Parser {
             } else {
                 self.advance();
             }
-            let name = match self.advance() {
-                Some(Token::Ident(n)) => n,
-                Some(tok) => {
-                    return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string()))
+            let name = match self.advance_ident() {
+                Some(n) => n,
+                None => {
+                    let tok = self.advance().unwrap_or(Token::Semicolon);
+                    return self.bail(ParseError::UnexpectedToken(tok, "接口名".to_string()));
                 }
-                None => return self.bail(ParseError::UnexpectedEof),
             };
             // 消费接口的类型实参，如 SortByExtension<T> 中的 <T>（此处确定是泛型，直接解析）
             if self.check(&Token::Lt) {
@@ -1617,13 +1712,13 @@ impl Parser {
             // cjc: extend Type <: A & B { ... } — 跳过后续 & Bound / & Bound<T>
             while self.check(&Token::And) {
                 self.advance();
-                let _ = match self.advance() {
-                    Some(Token::Ident(_)) => (),
-                    Some(tok) => {
+                let _ = match self.advance_ident() {
+                    Some(_) => (),
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
                         return self
-                            .bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string()))
+                            .bail(ParseError::UnexpectedToken(tok, "约束接口名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 if self.check(&Token::Lt) {
                     self.advance();
@@ -1851,11 +1946,12 @@ impl Parser {
     }
 
     /// 解析类定义
-    pub(crate) fn parse_class_with_visibility(
+    /// 收集类型声明前缀修饰符：abstract / sealed / open 以及可交错的可见性修饰符
+    /// （如 `abstract public class`、`open private class`）。返回三个标志位。
+    pub(crate) fn parse_type_modifiers(
         &mut self,
-        visibility: Visibility,
-    ) -> Result<crate::ast::ClassDef, ParseErrorAt> {
-        // 解析可选修饰符: abstract / sealed / open（任意顺序，如 sealed abstract class）
+        visibility: &mut Visibility,
+    ) -> (bool, bool, bool) {
         let mut is_abstract = false;
         let mut is_sealed = false;
         let mut is_open = false;
@@ -1869,15 +1965,49 @@ impl Parser {
             } else if self.check(&Token::Open) {
                 self.advance();
                 is_open = true;
+            } else if self.check(&Token::Public) {
+                self.advance();
+                *visibility = Visibility::Public;
+            } else if self.check(&Token::Private) {
+                self.advance();
+                *visibility = Visibility::Private;
+            } else if self.check(&Token::Protected) {
+                self.advance();
+                *visibility = Visibility::Protected;
+            } else if self.check(&Token::Internal) {
+                self.advance();
+                *visibility = Visibility::Internal;
             } else {
                 break;
             }
         }
+        (is_abstract, is_sealed, is_open)
+    }
+
+    pub(crate) fn parse_class_with_visibility(
+        &mut self,
+        mut visibility: Visibility,
+    ) -> Result<crate::ast::ClassDef, ParseErrorAt> {
+        // 解析可选修饰符: abstract / sealed / open（任意顺序，如 sealed abstract class）
+        let (is_abstract, is_sealed, is_open) = self.parse_type_modifiers(&mut visibility);
+        self.parse_class_body(visibility, is_abstract, is_sealed, is_open)
+    }
+
+    /// 解析类定义主体（修饰符已由调用方消费）。
+    fn parse_class_body(
+        &mut self,
+        visibility: Visibility,
+        is_abstract: bool,
+        is_sealed: bool,
+        is_open: bool,
+    ) -> Result<crate::ast::ClassDef, ParseErrorAt> {
         self.expect(Token::Class)?;
-        let name = match self.advance() {
-            Some(Token::Ident(n)) => n,
-            Some(tok) => return self.bail(ParseError::UnexpectedToken(tok, "类名".to_string())),
-            None => return self.bail(ParseError::UnexpectedEof),
+        let name = match self.advance_decl_name() {
+            Some(n) => n,
+            None => {
+                let tok = self.advance().unwrap_or(Token::Semicolon);
+                return self.bail(ParseError::UnexpectedToken(tok, "类名".to_string()));
+            }
         };
         // 解析可选的泛型类型参数 <T, U: Bound, ...>
         let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
@@ -2011,12 +2141,13 @@ impl Parser {
             let member_vis = mods.visibility.clone().unwrap_or_default();
             if self.check(&Token::Var) || self.check(&Token::Let) {
                 self.advance();
-                let f_name = match self.advance() {
-                    Some(Token::Ident(n)) => n,
-                    Some(tok) => {
-                        return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()))
+                // 上下文关键字可作字段名，但 main/where/type 等保留关键字不可
+                let f_name = match self.advance_binding_ident() {
+                    Some(n) => n,
+                    None => {
+                        let tok = self.advance().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(tok, "字段名".to_string()));
                     }
-                    None => return self.bail(ParseError::UnexpectedEof),
                 };
                 // cjc: 字段确定赋值声明 name!: Type（`!` 仅作语法修饰）
                 if self.check(&Token::Bang) {
@@ -2116,9 +2247,53 @@ impl Parser {
                 self.receiver_name = None;
                 init = Some(crate::ast::InitDef { params, body });
             } else if self.check(&Token::Tilde) {
-                // cjc: ~init 析构函数
+                // 规范 6.1.2.5(4)(5)：finalizer 不能带参数/返回类型/泛型参数/任何修饰符，
+                // 且 open/abstract/sealed 类不能定义 finalizer。
+                if is_open || is_abstract || is_sealed {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Tilde,
+                        "open/abstract/sealed 类不能定义 finalizer".to_string(),
+                    ));
+                }
+                if mods.visibility.is_some()
+                    || mods.is_static
+                    || mods.is_const
+                    || mods.is_override
+                    || mods.is_open
+                    || mods.is_operator
+                    || mods.is_unsafe
+                    || mods.is_mut
+                {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Tilde,
+                        "finalizer 不能带修饰符".to_string(),
+                    ));
+                }
+                // cjc: ~init 析构函数，规范写作 `~init()`（可带空参数括号）
                 self.advance(); // consume ~
                 self.expect(Token::Init)?; // consume init
+                if self.check(&Token::Lt) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Lt,
+                        "finalizer 不能带泛型参数".to_string(),
+                    ));
+                }
+                if self.check(&Token::LParen) {
+                    self.advance();
+                    if !self.check(&Token::RParen) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::RParen),
+                            "finalizer 不能带参数".to_string(),
+                        ));
+                    }
+                    self.expect(Token::RParen)?;
+                }
+                if self.check(&Token::Colon) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Colon,
+                        "finalizer 不能有返回类型".to_string(),
+                    ));
+                }
                 self.expect(Token::LBrace)?;
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
@@ -2349,6 +2524,10 @@ impl Parser {
                 let prev_params =
                     std::mem::replace(&mut self.current_type_params, merged_type_params);
                 self.expect(Token::LParen)?;
+                // 成员函数参数默认值中允许使用 this（如 func f(x!: A = this)）
+                if self.receiver_name.is_none() && !is_static {
+                    self.receiver_name = Some("this".to_string());
+                }
                 let mut params = self.parse_params()?;
                 self.expect(Token::RParen)?;
                 // cjc 兼容: 无 self/this 时添加隐式 this 参数（P2.4: static 方法除外）
@@ -2372,12 +2551,17 @@ impl Parser {
                         },
                     );
                 }
-                self.receiver_name = Some(
-                    params
-                        .first()
-                        .map(|p| p.name.clone())
-                        .unwrap_or_else(|| "this".to_string()),
-                );
+                self.receiver_name = if is_static {
+                    // 静态方法体内不允许 this/super
+                    None
+                } else {
+                    Some(
+                        params
+                            .first()
+                            .map(|p| p.name.clone())
+                            .unwrap_or_else(|| "this".to_string()),
+                    )
+                };
                 let return_type = if self.check(&Token::Colon) {
                     self.advance();
                     Some(self.parse_type()?)
@@ -2435,7 +2619,10 @@ impl Parser {
                     vec![] // 空 body
                 } else {
                     self.expect(Token::LBrace)?;
+                    let prev_static = self.in_static_method;
+                    self.in_static_method = is_static;
                     let stmts = self.parse_stmts()?;
+                    self.in_static_method = prev_static;
                     self.expect(Token::RBrace)?;
                     stmts
                 };
@@ -2769,6 +2956,26 @@ impl Parser {
         }
 
         loop {
+            // cjc: foreign func f(a: T, ...) — 末尾无名的变长参数占位
+            if self.check(&Token::DotDotDot) {
+                self.advance();
+                params.push(Param {
+                    name: "__va_args".to_string(),
+                    ty: Type::TypeParam("_".to_string()),
+                    default: None,
+                    variadic: true,
+                    is_named: false,
+                    is_inout: false,
+                });
+                if self.check(&Token::Comma) {
+                    self.advance();
+                    if self.check(&Token::RParen) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
             // P6: inout 参数
             let is_inout = if self.check(&Token::Inout) {
                 self.advance();
@@ -2780,6 +2987,11 @@ impl Parser {
                 Some(Token::Ident(name)) => name,
                 Some(Token::This) => "this".to_string(),
                 Some(Token::Underscore) => "_".to_string(),
+                Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name)))
+                    if is_valid_raw_ident_text(&name) =>
+                {
+                    name
+                }
                 Some(tok) => {
                     return self.bail(ParseError::UnexpectedToken(tok, "参数名".to_string()))
                 }
@@ -2831,8 +3043,195 @@ impl Parser {
                 break;
             }
             self.advance();
+            // 允许末尾多余逗号：f(a: Int64, b: Bool,)
+            if self.check(&Token::RParen) {
+                break;
+            }
         }
 
         Ok(params)
+    }
+}
+
+#[cfg(test)]
+mod decl_tests {
+    use crate::pipeline::parse_source;
+
+    fn ok(src: &str) {
+        if let Err(e) = parse_source(src) {
+            panic!("parse failed: {}\nsource:\n{}", e, src);
+        }
+    }
+
+    #[test]
+    fn test_class_interface_modifier_any_order() {
+        // 修饰符可任意交错：abstract public / open public / sealed interface
+        ok(r#"
+abstract class A {}
+public abstract class B {}
+abstract public class C {}
+open public class D {}
+public open class E {}
+abstract public open class F {}
+sealed interface I1 {}
+public sealed interface I2 {}
+sealed interface I3<T> {}
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_finalizer_with_empty_parens() {
+        ok(r#"
+class C {
+    let id = 1
+    init() {}
+    ~init() {}
+}
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_extend_keyword_target_types() {
+        ok(r#"
+extend Unit { func f() {} }
+extend Nothing { func g() {} }
+extend Rune { func h() {} }
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_type_alias_type_keyword_names() {
+        ok(r#"
+type Tuple = (Int64, Int64)
+type Array = Array<Int64>
+type Range = Range<Int64>
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_contextual_keyword_field_names() {
+        // 规范 3.3.1(24)：上下文关键字可不加反引号作字段名
+        ok(r#"
+class MyClass {
+    static public let abstract = false
+    public let open: UInt16 = 127
+    static private let override = 1
+    private let protected: Float32 = 1.0
+    static let redef = "A"
+}
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_backtick_ident_as_class_and_binding() {
+        ok(r#"
+class `__` {}
+main() {
+    let `_5` = 1
+    var `open` = 2
+}
+"#);
+    }
+
+    #[test]
+    fn test_trailing_param_comma_and_foreign_varargs() {
+        ok(r#"
+foreign func printf(fmt: CString, ...): Int32
+class C {
+    init(a: String, b: Bool, c!: Int64,) {}
+}
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_grouped_import() {
+        ok(r#"
+import {utils.macros.*, utils.assert.Assert}
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_try_with_typed_resources() {
+        ok(r#"
+class R {
+    init() {}
+}
+main() {
+    try (r: R = R(), s = R()) {
+        let x = 1
+    }
+}
+"#);
+    }
+
+    #[test]
+    fn test_super_generic_method_call() {
+        ok(r#"
+open class A {
+    func f2<T>(x: T): Int64 { 1 }
+}
+class B <: A {
+    func g() {
+        let a = super.f2<Int64>(1)
+    }
+}
+main() {}
+"#);
+    }
+
+    #[test]
+    fn test_extend_multiple_interfaces() {
+        ok(r#"
+interface I1 {}
+interface I2<T> {}
+extend Int64 <: I1 & I2<Int64> {}
+extend Unit <: I1 & I2<Rune> {}
+main() {}
+"#);
+    }
+
+    fn err(src: &str) {
+        assert!(parse_source(src).is_err(), "expected parse error, got ok:\n{}", src);
+    }
+
+    #[test]
+    fn test_open_class_cannot_have_finalizer() {
+        err("open class C { ~init() {} }\nmain() {}");
+        err("public open class C { ~init() {} }\nmain() {}");
+        // 非 open 类允许 finalizer
+        ok("class C { ~init() {} }\nmain() {}");
+    }
+
+    #[test]
+    fn test_reserved_keyword_rejected_as_field_name() {
+        err("class C { let main = 1 }\nmain() {}");
+        err("class C { let where = 1 }\nmain() {}");
+        err("class C { let type = 1 }\nmain() {}");
+        err("class C { let _ = 1 }\nmain() {}");
+    }
+
+    #[test]
+    fn test_keywords_rejected_as_alias_and_class_names() {
+        err("type Unit = Int64\nmain() {}");
+        err("type Float64 = Int64\nmain() {}");
+        err("type Nothing = Int64\nmain() {}");
+        err("class main {}\nmain() {}");
+        err("class _ {}\nmain() {}");
+        err("main() { let ` ` = 1 }");
+    }
+
+    #[test]
+    fn test_top_level_tuple_const() {
+        ok(r#"
+public let (x, y): (Int8, Float16) = (12, 1.0)
+main() {}
+"#);
     }
 }
