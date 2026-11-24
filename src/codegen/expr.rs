@@ -3944,8 +3944,11 @@ impl CodeGen {
                             memory_index: 0,
                         }));
                     }
-                    AssignTarget::ExprField { object, field } => {
+                    AssignTarget::ExprField { object, field }
+                    | AssignTarget::OptionalField { object, field } => {
                         // expr.field = value（expr 为方法调用/索引等复杂表达式）
+                        // 可选链字段赋值 a?.b = v 的运行时语义与普通字段赋值一致
+                        // （编译期语义由 sema 校验 4.23(15)）。
                         self.compile_expr(object, locals, func, loop_ctx);
                         if self.infer_type_with_locals(object, locals) == ValType::I64 {
                             func.instruction(&Instruction::I32WrapI64);

@@ -801,6 +801,10 @@ impl Parser {
                 object: object.clone(),
                 field: field.clone(),
             },
+            AssignTarget::OptionalField { object, field } => Expr::OptionalChain {
+                object: object.clone(),
+                field: field.clone(),
+            },
             AssignTarget::Slice { array, start, end } => Expr::SliceExpr {
                 array: array.clone(),
                 start: start.clone(),
@@ -966,8 +970,9 @@ impl Parser {
                 end,
             }),
             Expr::OptionalChain { object, field } => {
-                // 可选链赋值 a?.b = v（语法接受；运行时语义由 codegen 处理）
-                Ok(AssignTarget::ExprField { object, field })
+                // 可选链赋值 a?.b = v：保留可选链形态，交由语义检查
+                // 4.23(15)/4.13.4 判定（目标字段可变且基础为引用类型时才合法）。
+                Ok(AssignTarget::OptionalField { object, field })
             }
             Expr::SuperFieldAccess { field } => {
                 // super.field = value
