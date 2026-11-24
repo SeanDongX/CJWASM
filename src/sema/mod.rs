@@ -321,6 +321,8 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
 use crate::ast::{ClassDef, EnumDef, Function, InterfaceDef, InterfaceMethod, StructDef};
 use std::collections::HashSet;
 
+mod expr_check;
+
 /// 一条语义校验错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticError {
@@ -354,6 +356,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     for en in &program.enums {
         check_enum_variants(en, &mut errors);
     }
+
+    // 表达式/赋值类型检查：运算符操作数类型、可赋值性、不可变绑定等。
+    expr_check::check_program(program, &mut errors);
 
     if errors.is_empty() {
         Ok(())
