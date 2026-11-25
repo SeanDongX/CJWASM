@@ -383,6 +383,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         check_this_ctor_call_outside_init(cls, &mut errors);
         // 6.1.2.1(54)：super 成员访问时机 / 静态上下文禁用 super。
         check_super_access_rules(cls, &mut errors);
+        // 6.1.2.1(23)/(24)：显式 super(...) / this(...) 调用必须是构造函数体的首条语句。
+        check_explicit_ctor_call_first(cls, &mut errors);
         // 6.1.2.1(58)/(26)：全部成员初始化完成前的受限使用。
         check_use_before_init(cls, &index, &mut errors);
         // 6.1.2.1(57)：open/abstract 类构造函数中 this 不得逃逸。
@@ -3939,6 +3941,11 @@ fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<Semant
     // 接口实现完整性
     check_interface_implementation(cls, index, errors);
 
+    // 6.2.4.1(9)：抽象类也不能依赖多个父接口的默认实现（无体声明不算实现）。
+    if cls.is_abstract {
+        check_abstract_class_default_conflicts(cls, index, errors);
+    }
+
     // 接口 const 函数必须由 const 函数实现
     check_const_interface_impls(cls, index, errors);
 
@@ -4816,6 +4823,43 @@ fn check_super_access_rules(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
             }
             if stmt_has_explicit_ctor_call(s) {
                 called = true;
+            }
+        }
+    }
+}
+
+/// 6.1.2.1(23)/(24)：若构造函数体显式调用父类构造函数 `super(...)` 或本类构造函数
+/// `this(...)`，该调用必须是构造函数体的第一条语句（不能出现在变量声明、函数定义
+/// 或其它表达式之后）。
+fn check_explicit_ctor_call_first(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    fn is_ctor_call_stmt(s: &Stmt) -> bool {
+        match s {
+            Stmt::Expr(e) => match e {
+                Expr::SuperCall { method, .. } => method == "init",
+                Expr::Call { name, .. } => name == "this",
+                // `this(...)` 通常解析为 Invoke（callee 为 `this`/`self`）。
+                Expr::Invoke { callee, .. } => {
+                    matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self")
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    let inits: Vec<&InitDef> = if cls.inits.is_empty() {
+        cls.init.iter().collect()
+    } else {
+        cls.inits.iter().collect()
+    };
+    for init in &inits {
+        if let Some(pos) = init.body.iter().position(is_ctor_call_stmt) {
+            if pos > 0 {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的构造函数中显式 super(...)/this(...) 调用必须是构造函数体的第一条语句（6.1.2.1(23)/(24)）",
+                        cls.name
+                    ),
+                });
             }
         }
     }
@@ -6670,6 +6714,57 @@ fn check_interface(
     check_interface_inherited_static_conflicts(iface, index, errors);
     // 接口继承：子接口成员不得遮蔽父接口同名成员（6.3.3(1)）。
     check_interface_inherited_kind_shadowing(iface, index, errors);
+    // 接口继承的默认实现规则（6.2.3.1(3)/(6)）。
+    check_interface_default_inheritance(iface, index, errors);
+}
+
+/// 子接口继承默认实现的规则：
+/// - 6.2.3.1(3)：子接口不得仅声明而无默认实现地覆盖父接口已有的默认实现；
+/// - 6.2.3.1(6)：多个父接口为同一签名提供默认实现时，子接口必须提供自己的默认实现。
+fn check_interface_default_inheritance(
+    iface: &InterfaceDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if iface.parents.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = iface.parents.iter().map(|s| s.as_str()).collect();
+    let Some(parents) = collect_interface_methods(&names, index) else {
+        return;
+    };
+    // 6.2.3.1(3)：子接口仅给出声明（无默认实现体）覆盖父接口默认实现。
+    let mut reported: HashSet<(String, String, bool)> = HashSet::new();
+    for m in &iface.methods {
+        if m.default_body.is_some() || is_synthetic_member(&m.name) {
+            continue;
+        }
+        let sig = sig_of_interface_method(m);
+        let hit = parents.iter().any(|p| {
+            p.is_interface
+                && !p.abstract_
+                && !is_synthetic_member(&p.sig.name)
+                && p.sig.name == sig.name
+                && p.sig.is_static == sig.is_static
+                && canon_params(&p.sig) == canon_params(&sig)
+        });
+        if hit && reported.insert((sig.name.clone(), canon_params(&sig), sig.is_static)) {
+            errors.push(SemanticError {
+                message: format!(
+                    "接口 '{}' 的成员 '{}' 不能只声明而无默认实现地覆盖父接口的默认实现（6.2.3.1(3)）",
+                    iface.name, sig.display
+                ),
+            });
+        }
+    }
+    // 6.2.3.1(6)：只有子接口自身提供了默认实现体才算“自行实现”。
+    let own_defaults: Vec<Sig> = iface
+        .methods
+        .iter()
+        .filter(|m| m.default_body.is_some() && !is_synthetic_member(&m.name))
+        .map(sig_of_interface_method)
+        .collect();
+    check_multiple_default_conflicts(&iface.name, &own_defaults, &parents, index, errors, "接口");
 }
 
 /// 6.2.3(4)/(5)：同一接口不得被以相同泛型实参直接继承多次
@@ -7968,17 +8063,35 @@ fn check_abstract_methods_implemented(
         }
     }
 
-    // 多个接口为同名同签名的函数提供默认实现时，实现类型不能依赖继承默认实现（6.2.4.1(9)）。
-    let mut defaults: HashMap<(String, String), (HashSet<String>, Sig)> = HashMap::new();
+    // 多个接口为同名同签名的成员提供默认实现时，实现类型不能依赖继承默认实现
+    // （6.2.4.1(9)）。
+    check_multiple_default_conflicts(owner, &real_impls, parents, index, errors, "类型");
+}
+
+/// 多个父接口为同名同签名成员提供默认实现时，实现类型（class/struct/enum）或
+/// 子接口必须提供自己的实现，不能依赖继承默认实现（6.2.4.1(9)、6.2.3.1(6)）。
+///
+/// `own_impls` 必须是“真正的实现”：对 class/struct/enum 是带函数体的成员，
+/// 对子接口是带默认实现体的成员。仅声明而无实现体的成员不计入。
+fn check_multiple_default_conflicts(
+    owner: &str,
+    own_impls: &[Sig],
+    parents: &[ParentMethod],
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+    kind: &str,
+) {
+    let mut defaults: HashMap<(String, String, bool), (HashSet<String>, Sig)> = HashMap::new();
     for p in parents {
         if p.is_interface && !p.abstract_ && !is_synthetic_member(&p.sig.name) {
             let entry = defaults
-                .entry((p.sig.name.clone(), canon_params(&p.sig)))
+                .entry((p.sig.name.clone(), canon_params(&p.sig), p.sig.is_static))
                 .or_insert_with(|| (HashSet::new(), p.sig.clone()));
             entry.0.insert(p.owner.clone());
         }
     }
-    for ((name, _params), (owners, sample)) in defaults {
+    let mut reported: HashSet<(String, String, bool)> = HashSet::new();
+    for (key, (owners, sample)) in defaults {
         if owners.len() < 2 {
             continue;
         }
@@ -7996,18 +8109,48 @@ fn check_abstract_methods_implemented(
         if maximal.len() < 2 {
             continue;
         }
-        let real = real_impls
-            .iter()
-            .any(|s| s.name == name && signature_matches(s, &sample, true, index));
-        if !real {
+        // 注意：struct/enum 的成员函数签名由 `sig_of_function` 推断静态性，
+        // 静态属性访问器可能被误判为实例方法，故此处只比较名字与参数/返回类型。
+        let real = own_impls.iter().any(|s| {
+            s.name == sample.name
+                && canon_params(s) == canon_params(&sample)
+                && signature_matches(s, &sample, true, index)
+        });
+        if !real && reported.insert(key) {
             errors.push(SemanticError {
                 message: format!(
-                    "类型 '{}' 的函数 '{}' 在多个接口中存在默认实现，必须显式实现（不能依赖继承）",
-                    owner, sample.display
+                    "{} '{}' 的成员 '{}' 在多个父接口中存在默认实现，必须自行实现（不能依赖继承）（6.2.4.1(9)/6.2.3.1(6)）",
+                    kind, owner, sample.display
                 ),
             });
         }
     }
+}
+
+/// 6.2.4.1(9)：抽象类也不能依赖多个父接口的默认实现；无实现体的声明不算实现。
+fn check_abstract_class_default_conflicts(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let Some(parents) = collect_parent_methods(cls, index) else {
+        return;
+    };
+    if !parents.iter().any(|p| p.is_interface && !p.abstract_) {
+        return;
+    }
+    let mut own: Vec<Sig> = cls
+        .methods
+        .iter()
+        .filter(|m| m.has_body)
+        .map(|m| sig_of_class_method(m, &cls.type_params))
+        .collect();
+    if let Some(exts) = index.extends.get(cls.name.as_str()) {
+        for f in exts {
+            own.push(sig_of_function(f, &cls.type_params));
+        }
+    }
+    check_multiple_default_conflicts(&cls.name, &own, &parents, index, errors, "类型");
 }
 
 /// 非抽象类必须实现其（本地）接口的抽象方法。
@@ -8182,6 +8325,9 @@ fn check_struct_interfaces<'a>(
     check_impl_visibility(&st.name, &own_impls, &parents, index, errors);
     if parents.iter().any(|p| p.abstract_) {
         check_abstract_methods_implemented(&st.name, own_impls.clone(), &parents, index, errors);
+    } else {
+        // 6.2.4.1(9)：结构体实现了多个带默认实现的父接口时，必须自行实现冲突成员。
+        check_multiple_default_conflicts(&st.name, &own_impls, &parents, index, errors, "类型");
     }
     check_interface_property_types(&st.name, &own_impls, &parents, index, errors);
     check_interface_property_mut(&st.name, &own_impls, &parents, errors);
@@ -8255,6 +8401,11 @@ fn check_enum_interfaces<'a>(
     // 枚举实现的接口属性：类型（6.2.4.1(7)）与 mut 修饰符（6.2.4.1(6)）必须一致。
     check_interface_property_types(&en.name, &own_impls, &parents, index, errors);
     check_interface_property_mut(&en.name, &own_impls, &parents, errors);
+    // 6.2.4.1(9)：枚举实现多个带默认实现的父接口时，必须自行实现冲突成员。
+    // 必须在剔除属性脱糖成员之前检查，属性默认实现冲突同样适用。
+    if !has_abstract {
+        check_multiple_default_conflicts(&en.name, &own_impls, &parents, index, errors, "类型");
+    }
     parents.retain(|p| !is_property_method_name(&p.sig.name));
     // 访问级别不得低于接口声明（6.3.5(3)）；即使接口成员带默认实现也同样适用。
     check_impl_visibility(&en.name, &own_impls, &parents, index, errors);
@@ -14892,6 +15043,95 @@ main() {}"#,
         assert_valid("class C1 {}\nfunc foo() { C1() }\nmain() {}");
         // 存在 import 时保守跳过。
         assert_valid("import utils.assert.Assert\nclass C1 {}\npublic func foo() { C1() }\nmain() {}");
+    }
+
+    // ─── w13a-class8：06 章第七轮 — 接口默认实现继承 / 构造器 super 位置 ─────
+
+    #[test]
+    fn test_w13a_class8_interface_default_inheritance() {
+        // 6.2.3.1(3)：子接口不能只声明而无默认实现地覆盖父接口的默认实现。
+        assert_invalid(
+            "interface I { func f() {} }\ninterface J <: I { func f(): Unit }\nmain() {}",
+        );
+        assert_invalid(
+            "interface I { static prop p: Int64 { get() { 1 } } }\ninterface J <: I { static prop p: Int64 }\nmain() {}",
+        );
+        // 6.2.3.1(6)：多个父接口的默认实现冲突，子接口必须提供自己的默认实现。
+        assert_invalid(
+            "interface I1 { func f() {} }\ninterface I2 { func f() {} }\ninterface J <: I1 & I2 {}\nmain() {}",
+        );
+        assert_invalid(
+            "interface I1 { mut prop p: Int64 { get() { 1 } set(v) {} } }\ninterface I2 { mut prop p: Int64 { get() { 2 } set(v) {} } }\ninterface J <: I1 & I2 {}\nmain() {}",
+        );
+        // 正例：子接口未重新声明，直接继承单个父接口的默认实现。
+        assert_valid("interface I { func f() {} }\ninterface J <: I {}\nmain() {}");
+        // 正例：子接口提供了自己的默认实现，冲突消除。
+        assert_valid(
+            "interface I1 { func f() {} }\ninterface I2 { func f() {} }\ninterface J <: I1 & I2 { func f() {} }\nmain() {}",
+        );
+        // 正例：一个父接口是另一个的父接口，只保留最派生的默认实现。
+        assert_valid(
+            "interface I { func f() {} }\ninterface J1 <: I { func f() {} }\ninterface J2 <: J1 & I {}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w13a_class8_multiple_default_impls_all_types() {
+        let two = "interface I1 { func f() {} }\ninterface I2 { func f() {} }\n";
+        // 6.2.4.1(9)：抽象类不能省略/只声明而不实现冲突默认成员。
+        assert_invalid(&format!("{}abstract class A <: I1 & I2 {{}}\nmain() {{}}", two));
+        assert_invalid(&format!(
+            "{}abstract class A <: I1 & I2 {{ public func f(): Unit }}\nmain() {{}}",
+            two
+        ));
+        // 6.2.4.1(9)：结构体、枚举同样不能省略实现。
+        assert_invalid(&format!("{}struct A <: I1 & I2 {{}}\nmain() {{}}", two));
+        assert_invalid(&format!("{}enum A <: I1 & I2 {{ E }}\nmain() {{}}", two));
+        // 枚举的属性默认实现冲突同样适用（属性脱糖成员参与判定）。
+        assert_invalid(
+            "interface I1 { mut prop p: Int64 { get() { 1 } set(v) {} } }\ninterface I2 { mut prop p: Int64 { get() { 2 } set(v) {} } }\nenum A <: I1 & I2 { E }\nmain() {}",
+        );
+        // 属性默认实现冲突同样适用于抽象类。
+        assert_invalid(
+            "interface I1 { mut prop p: Int64 { get() { 1 } set(v) {} } }\ninterface I2 { mut prop p: Int64 { get() { 2 } set(v) {} } }\nabstract class A <: I1 & I2 {}\nmain() {}",
+        );
+        // 正例：提供了真正的实现（有函数体）。
+        assert_valid(&format!(
+            "{}abstract class A <: I1 & I2 {{ public func f() {{}} }}\nmain() {{}}",
+            two
+        ));
+        assert_valid(&format!(
+            "{}struct A <: I1 & I2 {{ public func f() {{}} }}\nmain() {{}}",
+            two
+        ));
+        assert_valid(&format!(
+            "{}enum A <: I1 & I2 {{ E; public func f() {{}} }}\nmain() {{}}",
+            two
+        ));
+        // 正例：单个父接口的默认实现可以直接继承。
+        assert_valid("interface I { func f() {} }\nclass A <: I {}\nstruct B <: I {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w13a_class8_super_call_must_be_first() {
+        // 6.1.2.1(23)：显式 super(...) 必须是构造函数体的第一条语句。
+        assert_invalid(
+            "open class A { init(x: Int64, y: Int64) {} }\nclass B <: A { B() { var x = 1\n super(1, 2) } }\nmain() {}",
+        );
+        assert_invalid(
+            "open class A { init(x: Int64, y: Int64) {} }\nclass B <: A { B() { foo()\n super(1, 2) }\n func foo() {} }\nmain() {}",
+        );
+        // 正例：super(...) 位于构造函数体首条语句。
+        assert_valid(
+            "open class A { init(x: Int64) {} }\nclass B <: A { B() { super(1) } }\nmain() {}",
+        );
+        // 正例：构造体内没有显式 super 调用。
+        assert_valid("open class A { init() {} }\nclass B <: A { B() { var x = 1 } }\nmain() {}");
+        // 6.1.2.1(24)：显式 this(...) 调用同样必须是构造函数体的第一条语句。
+        assert_invalid(
+            "class A { init(x: Int64) {}\n init() { 1 + 2\n this(1) } }\nmain() {}",
+        );
+        assert_valid("class A { init(x: Int64) {}\n init() { this(1) } }\nmain() {}");
     }
 
 }

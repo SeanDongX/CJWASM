@@ -737,6 +737,9 @@ struct Checker<'a> {
     /// 用户的 interface 含有非用户父接口（prelude）的传递闭包：成员可能来自 prelude，
     /// 成员存在性检查对这些接口保守跳过。
     interface_open_parents: HashSet<String>,
+    /// 用户 interface 名 → 传递可见的静态成员函数（名, 参数个数, 是否有默认实现体）。
+    /// 用于 6.2.2.1(8)：无函数体的静态函数不能通过接口类型直接调用。
+    iface_static_methods: HashMap<String, Vec<IfaceStaticMethod>>,
     /// 当前正在检查的类（类方法/构造/静态初始化体），用于私有成员访问判定。
     cur_class: Option<String>,
     /// 当前正在检查的 interface（默认函数体），用于成员存在性判定。
@@ -860,6 +863,14 @@ struct MemberInfo {
     is_static: bool,
     visibility: Visibility,
     owner: String,
+}
+
+/// 接口静态成员函数信息（6.2.2.1(8)）。
+#[derive(Clone)]
+struct IfaceStaticMethod {
+    name: String,
+    arity: usize,
+    has_body: bool,
 }
 
 /// prelude 常见类型的类别。`Object` 是 class 根（`Any` 是顶层类型），
@@ -1556,6 +1567,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         interface_members,
         interface_instance_members,
         interface_open_parents,
+        iface_static_methods: collect_iface_static_methods(program),
         cur_class: None,
         cur_interface: None,
         cur_iface_static: false,
@@ -2961,6 +2973,31 @@ fn collect_class_members(program: &Program) -> HashMap<String, HashMap<String, M
             }
             members.insert(name, info);
         }
+        // 主构造函数 / 命名构造函数的 `var`/`let` 成员参数隐式生成实例字段
+        // （6.1.2.1(15)：这些字段不能通过类型名访问）。
+        let mut add_ctor_member = |p: &crate::ast::Param| {
+            members.entry(p.name.clone()).or_insert_with(|| MemberInfo {
+                is_static: false,
+                visibility: Visibility::Internal,
+                owner: cls.name.clone(),
+            });
+        };
+        for (p, flag) in cls
+            .primary_ctor_params
+            .iter()
+            .zip(cls.primary_ctor_member_flags.iter())
+        {
+            if *flag {
+                add_ctor_member(p);
+            }
+        }
+        for init in &cls.inits {
+            for (p, flag) in init.params.iter().zip(init.member_param_flags.iter()) {
+                if *flag {
+                    add_ctor_member(p);
+                }
+            }
+        }
         out.insert(cls.name.clone(), members);
     }
     out
@@ -3043,6 +3080,57 @@ fn collect_interface_members(
         }
     }
     (all, inst, open_parents)
+}
+
+/// 收集每个用户接口传递可见的静态成员函数（名、参数个数、是否有默认实现体）。
+/// 用于 6.2.2.1(8)：无函数体的静态函数不能通过接口类型直接调用。
+fn collect_iface_static_methods(program: &Program) -> HashMap<String, Vec<IfaceStaticMethod>> {
+    let user: HashSet<&str> = program
+        .interfaces
+        .iter()
+        .map(|i| i.name.as_str())
+        .collect();
+    let by_name: HashMap<&str, &crate::ast::InterfaceDef> = program
+        .interfaces
+        .iter()
+        .map(|i| (i.name.as_str(), i))
+        .collect();
+    let mut out: HashMap<String, Vec<IfaceStaticMethod>> = HashMap::new();
+    for iface in &program.interfaces {
+        let mut list: Vec<IfaceStaticMethod> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = vec![iface.name.as_str()];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            let Some(def) = by_name.get(n) else {
+                continue;
+            };
+            for m in &def.methods {
+                if !m.is_static {
+                    continue;
+                }
+                let skip_receiver = m
+                    .params
+                    .first()
+                    .map_or(false, |p| p.name == "this" || p.name == "self");
+                let arity = m.params.len() - usize::from(skip_receiver);
+                list.push(IfaceStaticMethod {
+                    name: m.name.clone(),
+                    arity,
+                    has_body: m.default_body.is_some(),
+                });
+            }
+            for p in &def.parents {
+                if user.contains(p.as_str()) {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        out.insert(iface.name.clone(), list);
+    }
+    out
 }
 
 /// 仅接受无类型实参的具名类型，返回其类型名（含实参的泛型形态无法与约束名直接比较）。
@@ -4959,6 +5047,39 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 6.2.2.1(8)：无函数体的静态接口函数不能通过接口类型直接调用。
+    fn check_interface_static_call(&mut self, type_name: &str, member: &str, argc: usize) {
+        if self.type_kinds.get(type_name) != Some(&TypeKind::Interface) {
+            return;
+        }
+        // 局部变量可遮蔽同名类型，保守跳过。
+        if self.lookup(type_name).is_some() {
+            return;
+        }
+        let all_bodyless = {
+            let Some(list) = self.iface_static_methods.get(type_name) else {
+                return;
+            };
+            let mut any = false;
+            let mut any_body = false;
+            for m in list {
+                if m.name == member && m.arity == argc {
+                    any = true;
+                    if m.has_body {
+                        any_body = true;
+                    }
+                }
+            }
+            any && !any_body
+        };
+        if all_bodyless {
+            self.err(format!(
+                "接口 '{}' 的静态函数 '{}' 没有函数体，不能通过接口类型直接调用（6.2.2.1(8)）",
+                type_name, member
+            ));
+        }
+    }
+
     /// 在 interface 默认函数体（6.2.2(1)）：经接口类型访问的成员必须在
     /// 该接口（含父接口）中声明，实现类的成员不会经接口类型暴露。
     fn check_interface_member_exists(&mut self, recv_ty: &str, member: &str) {
@@ -5394,6 +5515,14 @@ impl<'a> Checker<'a> {
                 self.check_static_iface_member_ref(name);
                 // 6.2.2(1)：interface 默认函数体不能裸名引用其它接口成员。
                 self.check_iface_foreign_member_ref(name);
+                // 6.2.2.1(8)：无函数体的静态接口函数不能经接口类型调用。
+                if let Some((prefix, member)) = name.rsplit_once('.') {
+                    self.check_interface_static_call(
+                        prefix,
+                        member,
+                        args.len() + named_args.len(),
+                    );
+                }
                 // 2.1.10.2(3)：`A.A()` 形态（经类型名调用构造函数）非法；若该类型确有
                 // 同名成员函数则视为普通限定调用，放行。
                 if let Some((prefix, method)) = name.rsplit_once('.') {
@@ -5432,6 +5561,14 @@ impl<'a> Checker<'a> {
                 }
                 for (_, a) in named_args {
                     self.check_expr(a);
+                }
+                // 6.2.2.1(8)：无函数体的静态接口函数不能经接口类型调用（`I.f()`）。
+                if let Expr::Var(type_name) = &**object {
+                    self.check_interface_static_call(
+                        type_name,
+                        method,
+                        args.len() + named_args.len(),
+                    );
                 }
                 // 类型限定的泛型静态调用 `T.m<...>(...)`：显式类型实参元数与
                 // 合法性检查（6.1.2.4(24)）。
@@ -9249,6 +9386,65 @@ mod tests {
         // 抛出异常变量或构造调用仍合法。
         assert_ok("main() { let e = Exception()\n throw e }");
         assert_ok("main() { throw Error() }");
+    }
+
+
+    // ─── w13a-class8：06 章第七轮 — 接口静态函数调用 / 构造参数成员字段 ─────
+
+    #[test]
+    fn test_w13a_class8_iface_static_call_without_body() {
+        // 6.2.2.1(8)：无函数体的静态接口函数不能通过接口类型调用。
+        assert_err(
+            "interface I { static func f(): Unit }\nmain() { I.f() }",
+            "6.2.2.1(8)",
+        );
+        assert_err(
+            "interface I { static func f(x: Int64): Unit }\nmain() { I.f(1) }",
+            "6.2.2.1(8)",
+        );
+        assert_err(
+            "interface I { static func f<T>(): Unit }\nmain() { I.f<Int64>() }",
+            "6.2.2.1(8)",
+        );
+        // 在接口函数体内经接口类型调用同样非法。
+        assert_err(
+            "interface I { static func f(): Unit\n static func g() { I.f() } }\nmain() {}",
+            "6.2.2.1(8)",
+        );
+        // 不同参数个数的已实现重载不能使无体版本变得可调用。
+        assert_err(
+            "interface I { static func f(x: Int64): Unit\n static func f() {} }\nmain() { I.f(1) }",
+            "6.2.2.1(8)",
+        );
+        // 经父接口类型调用无体函数，即使子接口已实现。
+        assert_err(
+            "interface S { static func f(): Unit }\ninterface I <: S { static func f() {} }\nmain() { S.f() }",
+            "6.2.2.1(8)",
+        );
+        // 正例：静态接口函数有默认实现体，可以经类型调用。
+        assert_ok("interface I { static func f() {} }\nmain() { I.f() }");
+        assert_ok(
+            "interface I { static func f(x: Int64): Unit\n static func f() {} }\nmain() { I.f() }",
+        );
+        assert_ok(
+            "interface S { static func f(): Unit }\ninterface I <: S { static func f() {} }\nmain() { I.f() }",
+        );
+    }
+
+    #[test]
+    fn test_w13a_class8_ctor_member_param_not_via_type() {
+        // 6.1.2.1(15)：主/命名构造函数成员参数生成的实例字段不能经类名访问。
+        assert_err(
+            "class Test { Test(var p: Int64) {}\n func check() { let x = Test.p } }\nmain() {}",
+            "不能通过类型名",
+        );
+        assert_err(
+            "class Test(var p: Int64) { func check() { let x = Test.p } }\nmain() {}",
+            "不能通过类型名",
+        );
+        // 正例：经实例访问成员参数生成的字段。
+        assert_ok("class Test { Test(var p: Int64) {}\n func check() { let x = this.p } }\nmain() {}");
+        assert_ok("class Test(var p: Int64) { func check() { let x = p } }\nmain() {}");
     }
 
 }
