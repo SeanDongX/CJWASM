@@ -243,6 +243,11 @@ fn ty_of(ty: &Type) -> Ty {
         Type::Option(inner) => Ty::Option(Box::new(ty_of(inner))),
         // 少数场景下基础类型名以 Struct 形式出现（如未识别的别名），按名字兜底。
         Type::Struct(name, args) if args.is_empty() => match name.as_str() {
+            // 2.1.1(19)：Byte/Int/UInt 是内建类型别名（Byte≡UInt8、Int≡Int64、
+            // UInt≡UInt64），需按底层类型参与范围与可赋值性检查。
+            "Byte" => Ty::UInt8,
+            "Int" => Ty::Int64,
+            "UInt" => Ty::UInt64,
             "Int8" => Ty::Int8,
             "Int16" => Ty::Int16,
             "Int32" => Ty::Int32,
@@ -1555,6 +1560,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     // 结构体类型细则（2.1.10）：仅凭声明即可判定的规则。
     check_struct_type_rules(program, &type_names, errors);
 
+    // enum 成员同名细则（2.1.11.4(3)）：构造器/成员函数/属性不可同名。
+    check_enum_member_names(program, errors);
+
     // 字段静态类型表与零参成员方法返回类型（4.13.4 可选链推导 / 4.23(15) 复杂左值）。
     let field_types = collect_field_types(program, &type_names);
     let method_returns = collect_method_returns(program, &type_names, &field_types);
@@ -2073,6 +2081,44 @@ fn check_struct_type_rules(
                     s.name
                 ),
             });
+        }
+    }
+}
+
+/// 2.1.11.4(3)：enum 的构造器、静态/实例成员函数与成员属性之间不能同名。
+/// 仅凭声明即可判定：一个名字若同时用作“构造器/属性”与另一类别（构造器、
+/// 属性、成员函数）即非法；成员函数之间的重载（含运算符函数）仍然允许。
+/// 脱糖访问器 `__get_`/`__set_` 不计入成员函数。
+fn check_enum_member_names(program: &Program, errors: &mut Vec<SemanticError>) {
+    for e in &program.enums {
+        // 按类别记录每个名字：构造器=1、属性=2、成员函数=4。
+        // 规则只禁止“构造器/属性”与其它类别同名；成员函数之间的重载（含同名若干次、
+        // 运算符函数）是允许的，故同一类别无论出现多少次都只置一位。
+        let mut cats: HashMap<String, u8> = HashMap::new();
+        for v in &e.variants {
+            *cats.entry(v.name.clone()).or_insert(0) |= 1;
+        }
+        for p in &e.props {
+            *cats.entry(p.name.clone()).or_insert(0) |= 2;
+        }
+        let prefix = format!("{}.", e.name);
+        for f in &program.functions {
+            if let Some(member) = f.name.strip_prefix(&prefix) {
+                if member.starts_with("__get_") || member.starts_with("__set_") {
+                    continue;
+                }
+                *cats.entry(member.to_string()).or_insert(0) |= 4;
+            }
+        }
+        for (name, bits) in cats {
+            if bits.count_ones() >= 2 {
+                errors.push(SemanticError {
+                    message: format!(
+                        "enum '{}' 的成员 '{}' 同时用作构造器/属性/成员函数，enum 构造器与属性不能与其它成员同名（2.1.11.4(3)）",
+                        e.name, name
+                    ),
+                });
+            }
         }
     }
 }
@@ -6353,9 +6399,36 @@ impl<'a> Checker<'a> {
             }
 
             Expr::Match { expr, arms } => {
-                self.check_expr(expr);
+                let sel_ty = self.check_expr(expr);
+                // 仅当选择子是已确定类型的**局部**变量且为标量（非元组/聚合/数组/
+                // 用户/Option/函数）时判定：顶层无标注变量的 Int64 是占位类型，
+                // 可能掩盖真实的元组类型，故不参与判定。
+                let scalar_selector = match &**expr {
+                    Expr::Var(n) if self.scopes.iter().any(|s| s.contains_key(n)) => {
+                        sel_ty.is_definite()
+                            && !matches!(
+                                &sel_ty,
+                                Ty::Tuple(_)
+                                    | Ty::Agg(_)
+                                    | Ty::Array(_)
+                                    | Ty::User(_)
+                                    | Ty::Option(_)
+                                    | Ty::Func { .. }
+                            )
+                    }
+                    _ => false,
+                };
                 let mut result = Ty::Unknown;
                 for arm in arms {
+                    // 空元组模式 `()` 表示 Unit 常量模式，单元素无元组模式；
+                    // 只有 ≥2 元素的元组模式才要求选择子为元组类型。
+                    if scalar_selector
+                        && matches!(&arm.pattern, Pattern::Tuple(ps) if ps.len() >= 2)
+                    {
+                        self.err(
+                            "元组模式只能用于匹配元组类型的选择子（4.4.1.4(1)）".to_string(),
+                        );
+                    }
                     let mut scope = HashMap::new();
                     // 4.4.1.3(4)：绑定模式引入的变量不可变。
                     bind_pattern_unknown_mut(&arm.pattern, &mut scope, false);
@@ -6659,6 +6732,11 @@ impl<'a> Checker<'a> {
                     t.clone()
                 } else if t.is_prim() {
                     t.clone()
+                } else if matches!(t, Ty::User(_)) {
+                    // 用户类型可能通过 extend 重载 `!`，此处保守不报错（既有正例依赖）；
+                    // 但将结果类型保留为自身，使外层逻辑运算符据 4.20(2) 判定
+                    // “非 Bool 操作数” 非法（如 `!v || true`，v 为用户类型）。
+                    t.clone()
                 } else {
                     Ty::Unknown
                 }
@@ -6827,7 +6905,35 @@ impl<'a> Checker<'a> {
             | Expr::Cast { .. } => {
                 self.err("自增/自减运算符只能作用于整数变量".to_string());
             }
-            // 字段/索引等左值保守跳过。
+            // 4.14(7)：`++`/`--` 的操作数必须是可赋值的左值。字段访问与索引访问
+            // 仅在底层成员/元素可变时才是左值，否则（如 `let` 字段、不可变元组元素）非法。
+            Expr::Field { object, field } => {
+                if let Ty::User(tn) = self.target_base_ty(object) {
+                    if let Some(is_mut) = self.field_mutability(&tn, field) {
+                        if !is_mut {
+                            self.err(format!(
+                                "不可变成员 '{}.{}' 不能被自增/自减（4.14(7)）",
+                                tn, field
+                            ));
+                        }
+                    }
+                }
+            }
+            Expr::Index { array, .. } => {
+                // 元组元素恒为不可变左值；仅当基变量确为不可变 tuple 时判定，避免
+                // 误伤可变数组元素的合法自增/自减。
+                if let Expr::Var(n) = &**array {
+                    if let Some(info) = self.lookup(n).cloned() {
+                        if !info.mutable && matches!(info.ty, Ty::Tuple(_)) {
+                            self.err(format!(
+                                "不可变元组元素 '{}[...]' 不能被自增/自减（4.14(7)）",
+                                n
+                            ));
+                        }
+                    }
+                }
+            }
+            // 其它左值形态保守跳过。
             _ => {}
         }
     }
@@ -7042,8 +7148,12 @@ impl<'a> Checker<'a> {
                 merged(lt, rt)
             }
             BinOp::Shl | BinOp::Shr => {
-                let bad_l = lt.is_prim() && !lt.is_int();
-                let bad_r = rt.is_prim() && !rt.is_int();
+                // 4.18(7)：移位操作数必须为整数类型。此前只用 `is_prim()` 判定，
+                // 对用户类型（class/struct/enum）恒放行，导致 `C() >> 1` 被接受。
+                // 若本程序中存在 `<<`/`>>` 重载则已在函数开头整体跳过；否则用户
+                // 类型不可能具备该运算，可安全判定为非法。Option 保守跳过。
+                let bad_l = lt.is_definite() && !matches!(lt, Ty::Option(_)) && !lt.is_int();
+                let bad_r = rt.is_definite() && !matches!(rt, Ty::Option(_)) && !rt.is_int();
                 if bad_l || bad_r {
                     self.err(format!(
                         "移位运算符 '{}' 的操作数必须为整数类型: {} 与 {}",
@@ -7079,8 +7189,11 @@ impl<'a> Checker<'a> {
                 }
             }
             BinOp::LogicalAnd | BinOp::LogicalOr => {
-                let bad = (lt.is_prim() && *lt != Ty::Bool)
-                    || (rt.is_prim() && *rt != Ty::Bool);
+                // 4.20(2)：逻辑运算符的操作数只能为 Bool。此前用 `is_prim()` 判定，
+                // 对用户类型放行；存在 `&&`/`||` 重载时已在函数开头整体跳过，故此处
+                // 可将确定的用户类型一并判为非法。Option 保守跳过。
+                let bad = (lt.is_definite() && !matches!(lt, Ty::Option(_)) && *lt != Ty::Bool)
+                    || (rt.is_definite() && !matches!(rt, Ty::Option(_)) && *rt != Ty::Bool);
                 if bad {
                     self.err(format!(
                         "逻辑运算符 '{}' 的操作数只能为 Bool 类型: {} 与 {}",
@@ -9855,6 +9968,98 @@ mod tests {
         assert_ok("main() { var v: CType = () }");
         assert_ok("main() { var v: CType = 1.5 }");
         assert_ok("@C\nstruct S { var x: Int32 = 0 }\nmain() { var v: CType = S() }");
+    }
+
+    // ---- batch-14 w14c-mid-f：04/02 章中章推进 ----
+
+    #[test]
+    fn test_w14c_shift_operand_must_be_integer() {
+        // 4.18(7)：移位操作数必须为整数，用户类型（无重载）同样非法。
+        assert_err(
+            "class C {}\nmain() { var v1: C = C()\n var v2: Int16 = 1\n let v3 = v1 >> v2 }",
+            "移位运算符",
+        );
+        assert_err(
+            "class C {}\nmain() { var v1: Int32 = 1\n var v2: C = C()\n let v3 = v1 << v2 }",
+            "移位运算符",
+        );
+        assert_ok("main() { var a: Int64 = 1\n var b: Int64 = 2\n let c = a << b }");
+    }
+
+    #[test]
+    fn test_w14c_logical_operand_must_be_bool() {
+        // 4.20(2)：逻辑运算符操作数必须为 Bool。
+        assert_err(
+            "class C {}\nmain() { var v1: Bool = true\n var v2: C = C()\n let v3 = v1 && v2 }",
+            "逻辑运算符",
+        );
+        assert_err(
+            "class C {}\nmain() { var v1: Bool = true\n var v2: C = C()\n let v3 = v1 || v2 }",
+            "逻辑运算符",
+        );
+        // `!用户类型`（无重载，保留其类型）作为逻辑操作数时按非 Bool 处理。
+        assert_err("class C {}\nmain() { var v: C = C()\n !v || true }", "逻辑运算符");
+        assert_ok("main() { let a = true && false\n let b = true || false }");
+    }
+
+    #[test]
+    fn test_w14c_numeric_type_aliases() {
+        // 2.1.1(19)：Byte≡UInt8、Int≡Int64、UInt≡UInt64。
+        assert_err("main() { let byteVar: Byte = 256 }", "超出");
+        assert_err("main() { let byteVar: Byte = -1 }", "超出");
+        assert_err("main() { let uintVar: UInt = -1 }", "超出");
+        assert_err(
+            "main() { let u: UInt32 = 1\n let b: Byte = u }",
+            "类型不匹配",
+        );
+        assert_ok("main() { let b: Byte = 200\n let i: Int = 5\n let u: UInt = 5 }");
+    }
+
+    #[test]
+    fn test_w14c_enum_member_name_collision() {
+        // 2.1.11.4(3)：enum 的构造器/成员函数/属性不得同名。
+        assert_err(
+            "enum E { F | F1(Bool)\n static func F() {} }\nmain() {}",
+            "同名",
+        );
+        assert_err(
+            "enum E { A | B\n prop A: Int64 { get() { 1 } } }\nmain() {}",
+            "同名",
+        );
+        assert_ok("enum E { A | B\n func foo() {} }\nmain() {}");
+        // 同名构造器按参数个数重载是合法的（2.1.11.1(10)）。
+        assert_ok("enum E { A\n A(Int8) }\nmain() {}");
+    }
+
+    #[test]
+    fn test_w14c_tuple_pattern_requires_tuple_selector() {
+        // 4.4.1.4(1)：元组模式只能匹配元组类型选择子。
+        assert_err(
+            "main() { var v1: Bool = true\n match(v1) { case (true, true) => true case _ => false } }",
+            "元组模式",
+        );
+        assert_err(
+            "main() { var v1: Int64 = 1\n match(v1) { case (1, 1) => true case _ => false } }",
+            "元组模式",
+        );
+        assert_ok(
+            "main() { var v: (Int64, Int64) = (1, 2)\n match(v) { case (a, b) => a case _ => 0 } }",
+        );
+    }
+
+    #[test]
+    fn test_w14c_incr_decr_requires_mutable_lvalue() {
+        // 4.14(7)：`++`/`--` 只能作用于可变左值。
+        assert_err(
+            "class C { let x: Int64 = 0 }\nmain() { var c = C()\n c.x++\n return }",
+            "自增/自减",
+        );
+        assert_err(
+            "main() { let t = (1, 2, 3)\n t[1]--\n return }",
+            "自增/自减",
+        );
+        assert_ok("class C { var x: Int64 = 0 }\nmain() { var c = C()\n c.x++\n return }");
+        assert_ok("main() { var arr = [1, 2, 3]\n arr[0]++\n return }");
     }
 
 }
