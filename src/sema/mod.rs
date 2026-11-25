@@ -359,6 +359,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_public_internal_exposure(program, &mut errors);
     // 3.1(3)：同一作用域内局部变量重复声明。
     check_duplicate_local_bindings(program, &mut errors);
+    // 3.2.3.1(4)：顶层变量须先定义后使用（初始化式不得引用其后声明的顶层变量）。
+    check_top_level_const_ordering(program, &mut errors);
     // 3.2.3.2(3)/(6)：局部变量 / 局部函数先使用后声明。
     check_use_before_declaration(program, &mut errors);
     // 3.2.3.3(1)：类型的成员名仅在类型内部可见；顶层自由函数不能无资格引用
@@ -461,6 +463,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
 
     // 声明层泛型检查：类型参数重名、约束左界必须是类型变量（9.1(4)/9.2(4)）。
     check_generic_declarations(program, &mut errors);
+
+    // 2.4.1(11)/(12)：类型别名之间不允许直接或间接的循环引用。
+    check_type_alias_cycles(program, &mut errors);
 
     // 实现/覆写函数的泛型约束宽松度（6.2.4.1(5)/6.3.4.1(5)）。
     check_generic_constraint_looseness(program, &index, &mut errors);
@@ -1643,6 +1648,40 @@ fn type_display(ty: &Type) -> String {
 }
 
 // ─── 3.1(3)：顶层名称共享同一命名空间的重复 / 冲突 ────────────────────────
+
+/// 3.2.3.1(4)：顶层变量须先定义后使用。
+///
+/// `Program.constants` 保留顶层 `let/var/const` 的源码顺序。若某个顶层变量的
+/// 初始化式引用了在它**之后**才声明的顶层变量，即为“使用前未定义”。
+/// 仅比较“同属 `constants` 的名字”，函数/类型/导入名不参与，避免误报。
+fn check_top_level_const_ordering(program: &Program, errors: &mut Vec<SemanticError>) {
+    if program.constants.len() < 2 {
+        return;
+    }
+    let position: HashMap<&str, usize> = program
+        .constants
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name.as_str(), i))
+        .collect();
+    let mut reported: HashSet<(usize, String)> = HashSet::new();
+    for (i, c) in program.constants.iter().enumerate() {
+        let mut refs: Vec<String> = Vec::new();
+        collect_expr_direct_refs(&c.init, &mut refs);
+        for r in refs {
+            if let Some(&j) = position.get(r.as_str()) {
+                if j > i && reported.insert((i, r.clone())) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "顶层变量 '{}' 的初始化引用了其后才声明的顶层变量 '{}'（3.2.3.1(4)）",
+                            c.name, r
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
 
 /// 3.1(3)：变量、函数、类型别名与类型声明在顶层共享同一命名空间，跨类别同名即冲突。
 ///
@@ -7649,6 +7688,123 @@ fn check_generic_constraint_looseness<'a>(
                     errors,
                 );
             }
+        }
+    }
+}
+
+/// 2.4.1(11)/(12)：类型别名之间不允许直接或间接的循环引用。
+///
+/// 仅在同一文件的 `type Alias = ...` 定义之间建立引用图并检测环；别名指向的
+/// 具体类型本身可以合法地包含泛型实参/元组/函数类型等，这里递归收集其中出现
+/// 的别名名（`Type::Struct(name, ..)` 且 name 是本地别名）。
+fn check_type_alias_cycles(program: &Program, errors: &mut Vec<SemanticError>) {
+    let aliases: HashMap<&str, &Type> = program
+        .type_aliases
+        .iter()
+        .map(|(n, t)| (n.as_str(), t))
+        .collect();
+    if aliases.is_empty() {
+        return;
+    }
+
+    // 递归收集一个类型表达式直接引用到的本地别名名。
+    fn collect(ty: &Type, aliases: &HashMap<&str, &Type>, out: &mut Vec<String>) {
+        match ty {
+            Type::Struct(name, args) => {
+                // 预声明类型名在别名右侧应解析为内建类型（如 `type Array = Array<Int64>`），
+                // 而非自引用；跳过这些名字以避免误报循环。
+                let predeclared = is_builtin_type_name(name)
+                    || matches!(
+                        name.as_str(),
+                        "Range"
+                            | "Option"
+                            | "Result"
+                            | "Tuple"
+                            | "Map"
+                            | "Slice"
+                            | "Any"
+                            | "Object"
+                            | "Unit"
+                            | "Nothing"
+                            | "Iterable"
+                            | "Collection"
+                            | "Iterator"
+                            | "ToString"
+                            | "Equatable"
+                            | "Comparable"
+                            | "Hashable"
+                    );
+                if !predeclared && aliases.contains_key(name.as_str()) {
+                    out.push(name.clone());
+                }
+                for a in args {
+                    collect(a, aliases, out);
+                }
+            }
+            Type::Array(t) | Type::Option(t) | Type::Slice(t) => collect(t, aliases, out),
+            Type::Result(a, b) | Type::Map(a, b) => {
+                collect(a, aliases, out);
+                collect(b, aliases, out);
+            }
+            Type::Tuple(ts) => {
+                for t in ts {
+                    collect(t, aliases, out);
+                }
+            }
+            Type::Function { params, ret } => {
+                for p in params {
+                    collect(p, aliases, out);
+                }
+                if let Some(r) = ret.as_ref() {
+                    collect(r, aliases, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut adj: HashMap<&str, Vec<String>> = HashMap::new();
+    for (name, ty) in &program.type_aliases {
+        let mut refs = Vec::new();
+        collect(ty, &aliases, &mut refs);
+        adj.insert(name.as_str(), refs);
+    }
+
+    // 从 cur 出发能否回到 start（存在长度 >= 1 的路径）。
+    fn reaches(
+        start: &str,
+        cur: &str,
+        adj: &HashMap<&str, Vec<String>>,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        if let Some(nexts) = adj.get(cur) {
+            for n in nexts {
+                if n == start {
+                    return true;
+                }
+                if visited.insert(n.clone()) && reaches(start, n, adj, visited) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    let mut reported: HashSet<&str> = HashSet::new();
+    for (name, _) in &program.type_aliases {
+        if reported.contains(name.as_str()) {
+            continue;
+        }
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(name.clone());
+        if reaches(name.as_str(), name.as_str(), &adj, &mut visited) {
+            reported.insert(name.as_str());
+            errors.push(SemanticError {
+                message: format!(
+                    "类型别名 '{}' 存在（直接或间接的）循环引用（2.4.1(11)/(12)）",
+                    name
+                ),
+            });
         }
     }
 }
@@ -14892,6 +15048,36 @@ main() {}"#,
         assert_valid("class C1 {}\nfunc foo() { C1() }\nmain() {}");
         // 存在 import 时保守跳过。
         assert_valid("import utils.assert.Assert\nclass C1 {}\npublic func foo() { C1() }\nmain() {}");
+    }
+
+    // ─── w13b：类型别名循环引用（2.4.1(11)/(12)） ───────────────────────────
+
+    #[test]
+    fn test_w13b_type_alias_cycle_rejected() {
+        // 直接自引用。
+        assert_invalid("type A = A\nmain() {}");
+        // 间接循环。
+        assert_invalid("type A = B\ntype B = A\nmain() {}");
+        // 嵌套在泛型实参中的自引用。
+        assert_invalid("class G<K, V> {}\ntype V = G<Int64, V>\nmain() {}");
+        // 元组中的自引用。
+        assert_invalid("type T2 = (Int64, T2)\nmain() {}");
+        // 正例：链式别名无环。
+        assert_valid("type A = Int64\ntype B = A\ntype C = B\nmain() {}");
+        assert_valid("class G<K, V> {}\ntype V = G<Int64, Int64>\nmain() {}");
+    }
+
+    // ─── w13b：顶层变量先定义后使用（3.2.3.1(4)） ───────────────────────────
+
+    #[test]
+    fn test_w13b_top_level_const_order_rejected() {
+        // 初始化式引用其后的顶层变量。
+        assert_invalid("let a = b\nlet b = 1\nmain() {}");
+        assert_invalid("var a: Int64 = b\nvar b: Int64 = 0\nmain() {}");
+        // 正例：引用之前声明的变量。
+        assert_valid("let b = 1\nlet a = b\nmain() {}");
+        // 正例：引用函数/类型名不受影响。
+        assert_valid("func f() { 1 }\nlet a = f()\nmain() {}");
     }
 
 }
