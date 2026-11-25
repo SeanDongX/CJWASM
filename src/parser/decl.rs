@@ -1177,19 +1177,21 @@ impl Parser {
                     self.parsing_operator_func = true;
                 }
                 let mut func = self.parse_function_with_visibility(
-                    mods.visibility.clone().unwrap_or(Visibility::Public),
+                    // 成员默认可见性为 internal（可访问性级别低于 public 接口成员
+                    // 时由语义检查拒绝，如 6.3.5(3)）。
+                    mods.visibility.clone().unwrap_or(Visibility::Internal),
                 )?;
                 self.receiver_name = prev_receiver;
                 // 重命名为 StructName.methodName
                 if !func.name.contains('.') {
                     func.name = format!("{}.{}", name, func.name);
                 }
-                // 添加隐式 self 参数（如果没有）
+                // 添加隐式 self 参数（静态成员函数没有接收者）
                 let has_self = func
                     .params
                     .iter()
                     .any(|p| p.name == "self" || p.name == "this");
-                if !has_self {
+                if !has_self && !mods.is_static {
                     func.params.insert(
                         0,
                         crate::ast::Param {
@@ -1552,7 +1554,8 @@ impl Parser {
                     self.parsing_operator_func = true;
                 }
                 let mut func = self.parse_function_with_visibility(
-                    mods.visibility.clone().unwrap_or(Visibility::Public),
+                    // 成员默认可见性为 internal。
+                    mods.visibility.clone().unwrap_or(Visibility::Internal),
                 )?;
                 self.receiver_name = prev_receiver;
                 if !func.name.contains('.') {
@@ -1562,7 +1565,7 @@ impl Parser {
                     .params
                     .iter()
                     .any(|p| p.name == "self" || p.name == "this");
-                if !has_self {
+                if !has_self && !mods.is_static {
                     func.params.insert(
                         0,
                         crate::ast::Param {

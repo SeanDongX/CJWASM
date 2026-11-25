@@ -364,6 +364,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         check_ctor_definite_assignment(cls, &mut errors);
         // 6.1.2.1(22)/(8)/(9)：构造参数命名顺序、形参不可重新赋值。
         check_ctor_param_rules(cls, &mut errors);
+        // 6.1.2.1(49)：构造函数参数默认值不得引用实例成员。
+        check_ctor_param_default_member_refs(cls, program, &index, &mut errors);
+        // 6.1.2.1(59)：构造函数调用 this(...) 只允许出现在构造函数体内。
+        check_this_ctor_call_outside_init(cls, &mut errors);
         // 6.1.2.1(54)：super 成员访问时机 / 静态上下文禁用 super。
         check_super_access_rules(cls, &mut errors);
         // 6.1.2.1(58)/(26)：全部成员初始化完成前的受限使用。
@@ -379,6 +383,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     }
     for st in &program.structs {
         check_struct_interfaces(st, program, &index, &mut errors);
+        // 6.3.3(1)：struct 成员不得遮蔽父接口同名成员。
+        check_struct_member_shadowing(st, program, &index, &mut errors);
         // 2.1.10.2 结构体构造器规则（参数顺序/默认值/确定赋值/this 使用等）。
         check_struct_ctor_rules(st, program, &mut errors);
         check_impl_generic_constraint_loosening(
@@ -394,11 +400,13 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 2.1.10.2(41)：跨结构体构造函数的无条件互相调用形成循环。
     check_struct_mutual_ctor_cycles(program, &mut errors);
     for iface in &program.interfaces {
-        check_interface(iface, &mut errors);
+        check_interface(iface, &index, &mut errors);
     }
     for en in &program.enums {
         check_enum_variants(en, &mut errors);
         check_enum_interfaces(en, program, &index, &mut errors);
+        // 6.3.3(1)：enum 成员不得遮蔽父接口同名成员。
+        check_enum_member_shadowing(en, program, &index, &mut errors);
         check_impl_generic_constraint_loosening(
             &en.name,
             &en.type_params,
@@ -1729,6 +1737,9 @@ fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<Semant
     // 与父类同名函数的 static/实例冲突
     check_inherited_static_conflicts(cls, index, errors);
 
+    // 父类与接口（或多个父类型）之间同名函数的 static/实例冲突（6.3.2(1)）。
+    check_cross_parent_static_conflicts(cls, index, errors);
+
     // 接口实现完整性
     check_interface_implementation(cls, index, errors);
 
@@ -1838,6 +1849,11 @@ fn collect_parent_field_names<'a>(
             break;
         }
         let Some(parent) = index.classes.get(name.as_str()) else {
+            // `<:` 后面也可能是接口实现（如 `class C <: I`）：接口没有字段，
+            // 不构成字段遮蔽来源，但也不应中止整个检查。
+            if index.interfaces.contains_key(name.as_str()) {
+                break;
+            }
             return None;
         };
         for f in &parent.fields {
@@ -2353,6 +2369,148 @@ fn check_ctor_param_rules(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
                 message: format!(
                     "类 '{}' 的构造函数形参 '{}' 不能被重新赋值（6.1.2.1(8)/(9)）",
                     cls.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 6.1.2.1(49)：构造函数参数默认值不得引用实例成员
+/// （`this.x` / `super.x`，或与成员变量同名的裸标识符）。
+fn check_ctor_param_default_member_refs(
+    cls: &ClassDef,
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut instance_fields: HashSet<String> = HashSet::new();
+    for f in &cls.fields {
+        if !f.is_static {
+            instance_fields.insert(f.name.clone());
+        }
+    }
+    let mut cur = cls.extends.clone();
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(name) = cur {
+        if !seen.insert(name.clone()) {
+            break;
+        }
+        let Some(parent) = index.classes.get(name.as_str()) else {
+            break;
+        };
+        for f in &parent.fields {
+            if !f.is_static {
+                instance_fields.insert(f.name.clone());
+            }
+        }
+        cur = parent.extends.clone();
+    }
+    if instance_fields.is_empty() {
+        return;
+    }
+    let globals: HashSet<&str> = program.constants.iter().map(|c| c.name.as_str()).collect();
+    let top_funcs: HashSet<&str> = program
+        .functions
+        .iter()
+        .filter(|f| !f.name.contains('.'))
+        .map(|f| f.name.as_str())
+        .collect();
+    let mut ctors: Vec<&[Param]> = vec![&cls.primary_ctor_params];
+    if cls.inits.is_empty() {
+        if let Some(i) = &cls.init {
+            ctors.push(&i.params);
+        }
+    } else {
+        for i in &cls.inits {
+            ctors.push(&i.params);
+        }
+    }
+    let mut reported: HashSet<(String, String)> = HashSet::new();
+    for params in ctors {
+        let param_names: HashSet<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        for p in params {
+            let Some(def) = &p.default else { continue };
+            let mut hit: Option<String> = None;
+            walk_expr(def, &mut |e| {
+                if hit.is_some() {
+                    return;
+                }
+                match e {
+                    Expr::Field { object, field } => {
+                        if matches!(object.as_ref(), Expr::Var(n) if n == "this" || n == "self") {
+                            hit = Some(format!("this.{}", field));
+                        }
+                    }
+                    Expr::SuperFieldAccess { field } => {
+                        hit = Some(format!("super.{}", field));
+                    }
+                    Expr::Var(n) => {
+                        if instance_fields.contains(n)
+                            && !param_names.contains(n.as_str())
+                            && !globals.contains(n.as_str())
+                            && !top_funcs.contains(n.as_str())
+                        {
+                            hit = Some(n.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            });
+            if let Some(name) = hit {
+                if reported.insert((p.name.clone(), name.clone())) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的构造函数参数 '{}' 的默认值不能引用实例成员 '{}'（6.1.2.1(49)）",
+                            cls.name, p.name, name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 6.1.2.1(59)：构造函数调用 `this(...)`/`self(...)` 只允许出现在构造函数体内。
+fn check_this_ctor_call_outside_init(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    for m in &cls.methods {
+        if stmts_contain_this_ctor_call(&m.func.body) {
+            let base = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的成员 '{}' 中不能调用本类构造函数 this(...)（6.1.2.1(59)）",
+                    cls.name, base
+                ),
+            });
+        }
+    }
+    for f in &cls.fields {
+        if let Some(d) = &f.default {
+            if expr_contains_this_ctor_call(d) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的成员变量 '{}' 的初始值不能调用本类构造函数 this(...)（6.1.2.1(59)）",
+                        cls.name, f.name
+                    ),
+                });
+            }
+        }
+    }
+    if let Some(si) = &cls.static_init {
+        if stmts_contain_this_ctor_call(si) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的 static init 块中不能调用本类构造函数 this(...)（6.1.2.1(59)）",
+                    cls.name
+                ),
+            });
+        }
+    }
+    if let Some(d) = &cls.deinit {
+        if stmts_contain_this_ctor_call(d) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的 deinit 中不能调用本类构造函数 this(...)（6.1.2.1(59)）",
+                    cls.name
                 ),
             });
         }
@@ -4173,7 +4331,11 @@ fn check_duplicate_fields<'a, I: Iterator<Item = &'a str>>(
     }
 }
 
-fn check_interface(iface: &InterfaceDef, errors: &mut Vec<SemanticError>) {
+fn check_interface(
+    iface: &InterfaceDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
     let mut by_name: HashMap<String, Vec<Sig>> = HashMap::new();
     for method in &iface.methods {
         let sig = sig_of_interface_method(method);
@@ -4183,7 +4345,84 @@ fn check_interface(iface: &InterfaceDef, errors: &mut Vec<SemanticError>) {
         by_name.entry(sig.name.clone()).or_default().push(sig);
     }
     for group in by_name.values() {
-        check_signature_group(&iface.name, group, false, errors);
+        // 接口内部同样不允许 static 与实例成员函数同名互为重载（6.3.2(1)）。
+        check_signature_group(&iface.name, group, true, errors);
+    }
+    // 接口继承：子接口成员不得与父接口同名成员构成 static/实例重载冲突（6.3.2(1)）。
+    check_interface_inherited_static_conflicts(iface, index, errors);
+    // 接口继承：子接口成员不得遮蔽父接口同名成员（6.3.3(1)）。
+    check_interface_inherited_kind_shadowing(iface, index, errors);
+}
+
+/// 接口继承中 static 与实例成员函数同名冲突（6.3.2(1)）。
+fn check_interface_inherited_static_conflicts(
+    iface: &InterfaceDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if iface.parents.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = iface.parents.iter().map(|s| s.as_str()).collect();
+    let Some(parents) = collect_interface_methods(&names, index) else {
+        return;
+    };
+    for method in &iface.methods {
+        let sig = sig_of_interface_method(method);
+        if is_synthetic_member(&sig.name) || is_property_method_name(&sig.name) {
+            continue;
+        }
+        let conflict = parents.iter().any(|p| {
+            !is_synthetic_member(&p.sig.name)
+                && !is_property_method_name(&p.sig.name)
+                && p.sig.name == sig.name
+                && p.sig.is_static != sig.is_static
+        });
+        if conflict {
+            errors.push(SemanticError {
+                message: format!(
+                    "接口 '{}' 的成员函数 '{}' 与父接口同名函数在 static/实例属性上冲突，不允许互为重载（6.3.2(1)）",
+                    iface.name, sig.display
+                ),
+            });
+        }
+    }
+}
+
+/// 接口继承中不同种类（函数 / 属性）的同名成员构成遮蔽（6.3.3(1)）。
+fn check_interface_inherited_kind_shadowing(
+    iface: &InterfaceDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if iface.parents.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = iface.parents.iter().map(|s| s.as_str()).collect();
+    let Some(parents) = collect_interface_methods(&names, index) else {
+        return;
+    };
+    let mut reported: HashSet<String> = HashSet::new();
+    for method in &iface.methods {
+        let sig = sig_of_interface_method(method);
+        if is_synthetic_member(&sig.name) {
+            continue;
+        }
+        let base = member_base_name(&sig.name).to_string();
+        let own_is_prop = is_property_method_name(&sig.name);
+        let conflict = parents.iter().any(|p| {
+            !is_synthetic_member(&p.sig.name)
+                && member_base_name(&p.sig.name) == base
+                && is_property_method_name(&p.sig.name) != own_is_prop
+        });
+        if conflict && reported.insert(base.clone()) {
+            errors.push(SemanticError {
+                message: format!(
+                    "接口 '{}' 的成员 '{}' 遮蔽了父接口的同名成员（6.3.3(1)）",
+                    iface.name, base
+                ),
+            });
+        }
     }
 }
 
@@ -5119,20 +5358,58 @@ fn check_inherited_static_conflicts(
     };
     for method in &cls.methods {
         let sig = sig_of_class_method(method, &cls.type_params);
-        if is_synthetic_member(&sig.name) {
+        if is_synthetic_member(&sig.name) || is_property_method_name(&sig.name) {
             continue;
         }
         let conflict = parents.iter().any(|p| {
-            !p.is_interface
-                && p.sig.name == sig.name
+            p.sig.name == sig.name
                 && p.sig.is_static != sig.is_static
                 && !is_synthetic_member(&p.sig.name)
+                && !is_property_method_name(&p.sig.name)
         });
         if conflict {
             errors.push(SemanticError {
                 message: format!(
-                    "类 '{}' 的成员函数 '{}' 与父类同名函数在 static/实例属性上冲突，不允许互为重载",
+                    "类 '{}' 的成员函数 '{}' 与父类型同名函数在 static/实例属性上冲突，不允许互为重载（6.3.2(1)）",
                     cls.name, sig.display
+                ),
+            });
+        }
+    }
+}
+
+/// 多个父类型（父类 + 接口）之间的同名成员函数 static/实例冲突（6.3.2(1)）。
+///
+/// 例如类继承 static `f`（父类）同时实现声明 instance `f`（接口），
+/// 即使子类自身没有定义 `f`，同名函数的 static/实例重载同样非法。
+fn check_cross_parent_static_conflicts(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let Some(parents) = collect_parent_methods(cls, index) else {
+        return;
+    };
+    let mut kinds: HashMap<String, (bool, bool)> = HashMap::new(); // name → (static, instance)
+    let mut owners: HashMap<String, String> = HashMap::new();
+    for p in &parents {
+        if is_synthetic_member(&p.sig.name) || is_property_method_name(&p.sig.name) {
+            continue;
+        }
+        let entry = kinds.entry(p.sig.name.clone()).or_insert((false, false));
+        if p.sig.is_static {
+            entry.0 = true;
+        } else {
+            entry.1 = true;
+        }
+        owners.entry(p.sig.name.clone()).or_insert_with(|| p.owner.clone());
+    }
+    for (name, (has_static, has_instance)) in kinds {
+        if has_static && has_instance {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 从父类型继承的成员函数 '{}'（来源 '{}'）在 static/实例属性上冲突，不允许互为重载（6.3.2(1)）",
+                    cls.name, name, owners.get(&name).cloned().unwrap_or_default()
                 ),
             });
         }
@@ -5435,9 +5712,7 @@ fn check_enum_interfaces<'a>(
         .into_iter()
         .filter(|p| !is_property_method_name(&p.sig.name))
         .collect();
-    if !parents.iter().any(|p| p.abstract_) {
-        return;
-    }
+    let has_abstract = parents.iter().any(|p| p.abstract_);
     let mut own_impls: Vec<Sig> = program
         .functions
         .iter()
@@ -5449,8 +5724,128 @@ fn check_enum_interfaces<'a>(
             own_impls.push(sig_of_function(f, &en.type_params));
         }
     }
+    // 访问级别不得低于接口声明（6.3.5(3)）；即使接口成员带默认实现也同样适用。
     check_impl_visibility(&en.name, &own_impls, &parents, index, errors);
-    check_abstract_methods_implemented(&en.name, own_impls, &parents, index, errors);
+    if has_abstract {
+        check_abstract_methods_implemented(&en.name, own_impls, &parents, index, errors);
+    }
+}
+
+/// 子类型成员与父接口同名成员种类不同（函数 / 属性 / 字段）即构成遮蔽（6.3.3(1)）。
+///
+/// `own` 为 (成员基名, 种类) 列表，种类取 `"func"` / `"prop"` / `"field"`。
+fn check_member_kind_shadowing_vs_interfaces(
+    owner: &str,
+    own: &[(String, &'static str)],
+    parents: &[ParentMethod],
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut reported: HashSet<String> = HashSet::new();
+    for (name, kind) in own {
+        let parent_kinds: Vec<&str> = parents
+            .iter()
+            .filter(|p| !is_synthetic_member(&p.sig.name))
+            .filter(|p| member_base_name(&p.sig.name) == name.as_str())
+            .map(|p| {
+                if is_property_method_name(&p.sig.name) {
+                    "prop"
+                } else {
+                    "func"
+                }
+            })
+            .collect();
+        if parent_kinds.iter().any(|k| k != kind) && reported.insert(name.clone()) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类型 '{}' 的成员 '{}' 遮蔽了父接口的同名成员（6.3.3(1)）",
+                    owner, name
+                ),
+            });
+        }
+    }
+}
+
+/// 收集 struct/enum 自身成员（字段固定由 struct 提供）用于遮蔽检查。
+fn collect_own_member_kinds<'a>(
+    owner: &str,
+    struct_fields: Option<&'a [crate::ast::FieldDef]>,
+    program: &'a Program,
+    index: &ProgramIndex<'a>,
+) -> Vec<(String, &'static str)> {
+    let mut own: Vec<(String, &'static str)> = Vec::new();
+    if let Some(fields) = struct_fields {
+        for f in fields {
+            own.push((f.name.clone(), "field"));
+        }
+    }
+    for f in &program.functions {
+        if owner_name(&f.name) != Some(owner) {
+            continue;
+        }
+        let base = f.name.rsplit('.').next().unwrap_or(&f.name);
+        if is_property_method_name(base) {
+            own.push((member_base_name(base).to_string(), "prop"));
+        } else {
+            own.push((base.to_string(), "func"));
+        }
+    }
+    if let Some(exts) = index.extends.get(owner) {
+        for f in exts {
+            let base = f.name.rsplit('.').next().unwrap_or(&f.name);
+            if is_property_method_name(base) {
+                own.push((member_base_name(base).to_string(), "prop"));
+            } else {
+                own.push((base.to_string(), "func"));
+            }
+        }
+    }
+    own
+}
+
+/// struct 实现接口时成员不得遮蔽接口同名成员（6.3.3(1)）。
+fn check_struct_member_shadowing<'a>(
+    st: &'a StructDef,
+    program: &'a Program,
+    index: &ProgramIndex<'a>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let bounds: Vec<&'a str> = st
+        .constraints
+        .iter()
+        .filter(|c| c.param == st.name)
+        .flat_map(|c| c.bounds.iter().map(|b| b.as_str()))
+        .collect();
+    if bounds.is_empty() {
+        return;
+    }
+    let Some(parents) = collect_interface_methods(&bounds, index) else {
+        return;
+    };
+    let own = collect_own_member_kinds(&st.name, Some(&st.fields), program, index);
+    check_member_kind_shadowing_vs_interfaces(&st.name, &own, &parents, errors);
+}
+
+/// enum 实现接口时成员不得遮蔽接口同名成员（6.3.3(1)）。
+fn check_enum_member_shadowing<'a>(
+    en: &'a EnumDef,
+    program: &'a Program,
+    index: &ProgramIndex<'a>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let bounds: Vec<&'a str> = en
+        .constraints
+        .iter()
+        .filter(|c| c.param == en.name)
+        .flat_map(|c| c.bounds.iter().map(|b| b.as_str()))
+        .collect();
+    if bounds.is_empty() {
+        return;
+    }
+    let Some(parents) = collect_interface_methods(&bounds, index) else {
+        return;
+    };
+    let own = collect_own_member_kinds(&en.name, None, program, index);
+    check_member_kind_shadowing_vs_interfaces(&en.name, &own, &parents, errors);
 }
 
 // ─── AST 通用遍历辅助 ───────────────────────────────────────────────────────
@@ -9888,6 +10283,289 @@ main() {}"#,
         assert_invalid("class C {}\nextend C <: CType {}\nmain() {}");
         // 泛型约束 `where T <: CType` 合法，不应被误判。
         assert_valid("class D<T> where T <: CType {}\nmain() {}");
+    }
+
+    // ── w9a-class4: 06 章第三轮规则 ──────────────────────────────────────
+
+    #[test]
+    fn test_w9a_ctor_default_refs_instance_member_rejected() {
+        // 6.1.2.1(49)：构造参数默认值不得引用裸成员名 / super.x。
+        // （`this.x` 由解析器在方法体之外直接拒绝。）
+        let errs = assert_invalid(
+            "class A {\n\
+             \x20   var x: Int64\n\
+             \x20   init(p!: Int64 = x) {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("6.1.2.1(49)")));
+        assert_invalid(
+            "open class B {\n\
+             \x20   var x: Int64 = 1\n\
+             }\n\
+             class A <: B {\n\
+             \x20   init(p!: Int64 = super.x) {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w9a_ctor_default_refs_param_or_global_ok() {
+        assert_valid(
+            "class A {\n\
+             \x20   init(q!: Int64 = 1, p!: Int64 = q) {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "let g = 1\n\
+             class A {\n\
+             \x20   init(p!: Int64 = g) {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w9a_this_ctor_call_outside_init_rejected() {
+        // 6.1.2.1(59)：构造函数 this(...) 只能在构造函数体内调用。
+        let errs = assert_invalid(
+            "class A {\n\
+             \x20   init() {}\n\
+             \x20   func f() { this() }\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("6.1.2.1(59)")));
+        assert_invalid(
+            "class A {\n\
+             \x20   init() {}\n\
+             \x20   let x = this()\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_invalid(
+            "class A {\n\
+             \x20   init() {}\n\
+             \x20   prop p: Int64 {\n\
+             \x20       get() { this() }\n\
+             \x20   }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w9a_this_ctor_call_inside_init_ok() {
+        assert_valid(
+            "class A {\n\
+             \x20   init() {}\n\
+             \x20   init(x: Int64) { this() }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w9a_static_instance_overload_rejected() {
+        // 6.3.2(1)：接口内部 / 接口继承 / 实现类型 / 多父类型之间的 static 与实例同名。
+        assert_invalid(
+            "interface I {\n\
+             \x20   func f() {}\n\
+             \x20   static func f<T>() {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_invalid(
+            "interface I1 {\n\
+             \x20   static func f() {}\n\
+             }\n\
+             interface I2 <: I1 {\n\
+             \x20   func f() {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_invalid(
+            "interface I {\n\
+             \x20   static func f() {}\n\
+             }\n\
+             class A <: I {\n\
+             \x20   public func f(x: Int64) {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_invalid(
+            "interface I {\n\
+             \x20   static func f() {}\n\
+             }\n\
+             open class A {\n\
+             \x20   func f(x: Int64) {}\n\
+             }\n\
+             class B <: A & I {}\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w9a_static_instance_overload_same_kind_ok() {
+        assert_valid(
+            "interface I {\n\
+             \x20   func f() {}\n\
+             \x20   func f(x: Int64) {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "interface I {\n\
+             \x20   static func f() {}\n\
+             }\n\
+             class A <: I {\n\
+             \x20   public static func f() {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w9a_member_kind_shadowing_rejected() {
+        // 6.3.3(1)：不同种类（函数/属性/字段）的同名成员构成遮蔽。
+        // 类实现接口（此前 collect_parent_field_names 在接口父类型上提前返回而漏检）。
+        assert_invalid(
+            "interface I {\n\
+             \x20   prop x: Int64 {\n\
+             \x20       get() { 1 }\n\
+             \x20   }\n\
+             }\n\
+             class C <: I {\n\
+             \x20   func x() {}\n\
+             }\n\
+             main() {}\n",
+        );
+        // struct 字段遮蔽接口函数。
+        assert_invalid(
+            "interface I {\n\
+             \x20   func x() {}\n\
+             }\n\
+             struct C <: I {\n\
+             \x20   let x = 1\n\
+             }\n\
+             main() {}\n",
+        );
+        // enum 函数遮蔽接口属性。
+        assert_invalid(
+            "interface I {\n\
+             \x20   static prop x: Int64 {\n\
+             \x20       get() { 1 }\n\
+             \x20   }\n\
+             }\n\
+             enum E <: I {\n\
+             \x20   D\n\
+             \x20   static func x() {}\n\
+             }\n\
+             main() {}\n",
+        );
+        // 接口继承中的种类遮蔽。
+        assert_invalid(
+            "interface I1 {\n\
+             \x20   static func x() {}\n\
+             }\n\
+             interface I2 <: I1 {\n\
+             \x20   prop x: Int64 {\n\
+             \x20       get() { 1 }\n\
+             \x20   }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w9a_member_same_kind_not_shadowing() {
+        assert_valid(
+            "interface I {\n\
+             \x20   func x() {}\n\
+             }\n\
+             struct C <: I {\n\
+             \x20   public func x() {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "interface I {\n\
+             \x20   func x() {}\n\
+             }\n\
+             enum E <: I {\n\
+             \x20   D\n\
+             \x20   public func x() {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w9a_impl_access_lowered_struct_enum_rejected() {
+        // 6.3.5(3)：struct/enum 实现接口函数的访问级别不得低于接口。
+        assert_invalid(
+            "interface I {\n\
+             \x20   func f(): Unit\n\
+             }\n\
+             struct A <: I {\n\
+             \x20   func f() {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_invalid(
+            "interface I {\n\
+             \x20   static func f<T>() {}\n\
+             }\n\
+             struct A <: I {\n\
+             \x20   private static func f<T>() {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_invalid(
+            "interface I {\n\
+             \x20   func f(): Unit\n\
+             }\n\
+             enum A <: I {\n\
+             \x20   E\n\
+             \x20   private func f() {}\n\
+             }\n\
+             main() {}\n",
+        );
+        // 接口成员带默认实现时同样适用。
+        assert_invalid(
+            "interface I {\n\
+             \x20   func f() {}\n\
+             }\n\
+             enum A <: I {\n\
+             \x20   E\n\
+             \x20   func f() {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w9a_impl_access_public_ok() {
+        assert_valid(
+            "interface I {\n\
+             \x20   func f(): Unit\n\
+             }\n\
+             struct A <: I {\n\
+             \x20   public func f() {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "interface I {\n\
+             \x20   static func f<T>() {}\n\
+             }\n\
+             struct A <: I {\n\
+             \x20   public static func f<T>() {}\n\
+             }\n\
+             main() {}\n",
+        );
     }
 
 }

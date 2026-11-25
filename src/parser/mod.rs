@@ -3744,6 +3744,49 @@ mod tests {
         assert_eq!(f.type_params, vec!["A".to_string()]);
         assert!(f.params.iter().any(|p| p.name == "this"));
     }
+
+    #[test]
+    fn test_w9a_static_struct_enum_method_has_no_implicit_this() {
+        // static 成员函数没有接收者；实例方法仍插入隐式 this。
+        let program = parse_ok(
+            r#"
+            struct S {
+                static func sf(x: Int64) {}
+                func mf() {}
+            }
+            enum E {
+                V
+                static func sf2() {}
+                func mf2() {}
+            }
+        "#,
+        );
+        let sf = program
+            .functions
+            .iter()
+            .find(|f| f.name == "S.sf")
+            .expect("struct static method");
+        assert!(!sf.params.iter().any(|p| p.name == "this"));
+        assert_eq!(sf.params.len(), 1);
+        let mf = program
+            .functions
+            .iter()
+            .find(|f| f.name == "S.mf")
+            .expect("struct instance method");
+        assert!(mf.params.iter().any(|p| p.name == "this"));
+        let esf = program
+            .functions
+            .iter()
+            .find(|f| f.name == "E.sf2")
+            .expect("enum static method");
+        assert!(!esf.params.iter().any(|p| p.name == "this"));
+        let emf = program
+            .functions
+            .iter()
+            .find(|f| f.name == "E.mf2")
+            .expect("enum instance method");
+        assert!(emf.params.iter().any(|p| p.name == "this"));
+    }
     #[test]
     fn test_parse_varray_type_position() {
         // VArray<T, N> 类型位置：降级为 Array<T>
