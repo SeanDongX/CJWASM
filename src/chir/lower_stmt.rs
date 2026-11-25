@@ -755,8 +755,10 @@ impl<'a> LoweringContext<'a> {
                 })
             }
 
-            AssignTarget::ExprField { object, field } => {
-                // 复杂表达式字段赋值，如 obj.method().field、arr[i].field
+            AssignTarget::ExprField { object, field }
+            | AssignTarget::OptionalField { object, field } => {
+                // 复杂表达式字段赋值，如 obj.method().field、arr[i].field；
+                // 可选链字段赋值 a?.b = v 沿用同一 lowering。
                 let obj_chir = self.lower_expr(object)?;
                 let obj_ty = self.type_ctx.infer_expr(object)?;
                 let offset = self.get_field_offset(&obj_ty, field)?;

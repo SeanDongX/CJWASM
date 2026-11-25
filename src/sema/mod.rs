@@ -2881,6 +2881,7 @@ impl<'a, 'i> InstantiationScan<'a, 'i> {
                 self.scan_expr(index);
             }
             AssignTarget::ExprField { object, .. } => self.scan_expr(object),
+            AssignTarget::OptionalField { object, .. } => self.scan_expr(object),
             AssignTarget::Slice { array, start, end } => {
                 self.scan_expr(array);
                 self.scan_expr(start);
@@ -4719,6 +4720,7 @@ fn walk_assign_target<'a>(target: &'a crate::ast::AssignTarget, f: &mut dyn FnMu
         | AssignTarget::IndexPath { index, .. }
         | AssignTarget::ExprIndex { index, .. } => walk_expr(index, f),
         AssignTarget::ExprField { object, .. } => walk_expr(object, f),
+        AssignTarget::OptionalField { object, .. } => walk_expr(object, f),
         AssignTarget::Slice {
             array, start, end, ..
         } => {

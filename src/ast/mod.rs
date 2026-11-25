@@ -432,6 +432,8 @@ pub enum AssignTarget {
     ExprIndex { expr: Box<Expr>, index: Box<Expr> },
     /// 复杂表达式的字段 expr.field（如 obj.method().field、arr[i].field）
     ExprField { object: Box<Expr>, field: String },
+    /// 可选链字段赋值 a?.b = v（保留可选链形态供语义检查 4.23(15)/4.13.4）
+    OptionalField { object: Box<Expr>, field: String },
     /// 切片赋值 arr[start..end] = value
     Slice {
         array: Box<Expr>,
