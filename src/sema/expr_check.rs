@@ -307,6 +307,11 @@ fn global_const_ty(c: &crate::ast::ConstDef) -> Ty {
         ) {
             return default_literal(&init_ty);
         }
+        // Option 值 / 用户类型值：不能退化为占位的 Int64（否则 `let c = Some(c)`
+        // 会把 c 误判为 Int64，进而误伤可选链 `c?.field`）。
+        if matches!(init_ty, Ty::Option(_) | Ty::User(_)) {
+            return init_ty;
+        }
     }
     declared
 }
@@ -321,6 +326,38 @@ fn static_expr_ty(e: &Expr) -> Ty {
         Expr::Bool(_) => Ty::Bool,
         Expr::Rune(_) => Ty::Rune,
         Expr::String(_) | Expr::Interpolate(_) => Ty::String,
+        // `Some(x)`：Option<x 的类型>（顶层 `let c1 = Some(c)` 的可选链来源）。
+        Expr::Some(inner) => match &**inner {
+            Expr::ConstructorCall { name, .. } => {
+                Ty::Option(Box::new(Ty::User(name.clone())))
+            }
+            other => Ty::Option(Box::new(static_expr_ty(other))),
+        },
+        // `Option<T>.Some(x)` / `Option<T>.None`（类型实参在表达式中已丢失，
+        // None 记为 Option<Unknown>，足以让其参与“是 Option”判定）。
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } if matches!(&**object, Expr::Var(n) if n == "Option") => match method.as_str() {
+            "Some" if args.len() == 1 => match &args[0] {
+                Expr::ConstructorCall { name, .. } => {
+                    Ty::Option(Box::new(Ty::User(name.clone())))
+                }
+                other => Ty::Option(Box::new(static_expr_ty(other))),
+            },
+            "None" => Ty::Option(Box::new(Ty::Unknown)),
+            _ => Ty::Unknown,
+        },
+        // `Option<T>.None`（无调用括号，解析为字段访问，类型实参已丢失）。
+        Expr::Field { object, field } if field == "None" => {
+            if matches!(&**object, Expr::Var(n) if n == "Option") {
+                Ty::Option(Box::new(Ty::Unknown))
+            } else {
+                Ty::Unknown
+            }
+        }
         Expr::Cast { target_ty, .. } => ty_of(target_ty),
         Expr::Unary { op, expr } => match op {
             UnaryOp::Neg => static_expr_ty(expr),
@@ -751,6 +788,15 @@ struct Checker<'a> {
     generic_type_arity: HashMap<String, (usize, bool)>,
     /// struct 名 → 字段名 → 是否可变。
     struct_fields: HashMap<String, HashMap<String, bool>>,
+    /// 用户类型名 → 字段名 → 静态类型（4.13.4 可选链推导 / 复杂左值成员检查）。
+    /// 仅登记可静态确定类型的字段；无法推断的字段不出现（保守跳过）。
+    field_types: HashMap<String, HashMap<String, Ty>>,
+    /// (类名, 无参成员方法名) → 推断的返回类型。用于 `obj.method().field` 这类
+    /// 复杂赋值目标的成员可变性检查（4.23(15)）。
+    method_returns: HashMap<(String, String), Ty>,
+    /// 当前 `if` 表达式所处的期望类型上下文（如带类型标注的初始化）。
+    /// 存在时按上下文逐分支检查可赋值性，而非套用 4.3(15) 的最小公共超类型。
+    expected_ty: Option<Ty>,
     /// 全部 enum 变体名（`E1 = E1` 这类构造值不可赋值，4.23(15)）。
     enum_variants: HashSet<String>,
     /// 以 `Type.method` 形式记录的所有成员函数名（class/struct/extend）。
@@ -1486,6 +1532,10 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     // 结构体类型细则（2.1.10）：仅凭声明即可判定的规则。
     check_struct_type_rules(program, &type_names, errors);
 
+    // 字段静态类型表与零参成员方法返回类型（4.13.4 可选链推导 / 4.23(15) 复杂左值）。
+    let field_types = collect_field_types(program, &type_names);
+    let method_returns = collect_method_returns(program, &type_names, &field_types);
+
     let mut checker = Checker {
         globals,
         funcs,
@@ -1519,6 +1569,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         class_ctors,
         struct_names,
         struct_fields,
+        field_types,
+        method_returns,
+        expected_ty: None,
         struct_private_fields,
         struct_private_ctor,
         struct_private_methods,
@@ -2142,6 +2195,223 @@ fn field_ty(f: &crate::ast::FieldDef) -> Ty {
         }
     }
     declared
+}
+
+/// 去掉一层 `Option<T>` → `T`；非 Option 原样返回。
+fn strip_option_ty(ty: Ty) -> Ty {
+    match ty {
+        Ty::Option(inner) => *inner,
+        other => other,
+    }
+}
+
+/// 把一个 AST 类型解析为轻量类型，识别用户类型名、`?T`/`Option<T>`、元组/数组。
+/// 与 `Checker::ty_of_ann` 等价，但不需要 `&self`（用于在构造 Checker 前
+/// 预计算字段类型表）。
+fn resolve_ann_ty(ty: &Type, type_names: &HashSet<String>) -> Ty {
+    match ty {
+        Type::Struct(name, args) if args.is_empty() && type_names.contains(name) => {
+            Ty::User(name.clone())
+        }
+        Type::Option(inner) => Ty::Option(Box::new(resolve_ann_ty(inner, type_names))),
+        Type::Struct(name, args) if name == "Option" && args.len() == 1 => {
+            Ty::Option(Box::new(resolve_ann_ty(&args[0], type_names)))
+        }
+        Type::Tuple(ts) if ts.is_empty() => Ty::Unit,
+        Type::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| resolve_ann_ty(t, type_names)).collect()),
+        Type::Array(inner) => Ty::Array(Box::new(resolve_ann_ty(inner, type_names))),
+        _ => ty_of(ty),
+    }
+}
+
+/// 从字段默认值保守推断字段静态类型（无显式标注时使用）。
+/// 只识别确定形态：字面量、构造调用、`Option<T>.Some/None`、数组字面量；
+/// 其余返回 `Unknown`。
+fn infer_default_ty(e: &Expr, type_names: &HashSet<String>) -> Ty {
+    match e {
+        Expr::Integer(_) => Ty::Int64,
+        Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
+        Expr::Float(_) | Expr::Float32(_) => Ty::Float64,
+        Expr::Bool(_) => Ty::Bool,
+        Expr::String(_) | Expr::Interpolate(_) => Ty::String,
+        Expr::Rune(_) => Ty::Rune,
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => infer_default_ty(expr, type_names),
+        Expr::ConstructorCall { name, .. } if type_names.contains(name) => {
+            Ty::User(name.clone())
+        }
+        Expr::Some(inner) => Ty::Option(Box::new(infer_default_ty(inner, type_names))),
+        // `Option<T>.Some(value)` 被解析为 MethodCall{object: Var("Option"), ...}。
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } if method == "Some" && args.len() == 1 => {
+            if matches!(&**object, Expr::Var(n) if n == "Option") {
+                Ty::Option(Box::new(infer_default_ty(&args[0], type_names)))
+            } else {
+                Ty::Unknown
+            }
+        }
+        Expr::Array(elems) => Ty::Array(Box::new(
+            elems
+                .first()
+                .map(|e| infer_default_ty(e, type_names))
+                .unwrap_or(Ty::Unknown),
+        )),
+        // `Option<T>.None`
+        Expr::Field { object, field } if field == "None" => {
+            if let Expr::Call {
+                name,
+                type_args: Some(tas),
+                args,
+                ..
+            } = &**object
+            {
+                if name == "Option" && tas.len() == 1 && args.is_empty() {
+                    return Ty::Option(Box::new(resolve_ann_ty(&tas[0], type_names)));
+                }
+            }
+            if matches!(&**object, Expr::Var(n) if n == "Option") {
+                return Ty::Option(Box::new(Ty::Unknown));
+            }
+            Ty::Unknown
+        }
+        // `Option<T>.Some(value)`
+        Expr::Invoke {
+            callee,
+            args,
+            named_args: _,
+        } if args.len() == 1 => {
+            if let Expr::Field { object, field } = &**callee {
+                if field == "Some" {
+                    if let Expr::Call {
+                        name,
+                        type_args: Some(tas),
+                        args: cargs,
+                        ..
+                    } = &**object
+                    {
+                        if name == "Option" && tas.len() == 1 && cargs.is_empty() {
+                            return Ty::Option(Box::new(resolve_ann_ty(
+                                &tas[0], type_names,
+                            )));
+                        }
+                    }
+                }
+            }
+            Ty::Unknown
+        }
+        _ => Ty::Unknown,
+    }
+}
+
+/// 字段声明的静态类型：有显式标注用标注，否则从默认值推断。
+fn field_decl_ty(f: &crate::ast::FieldDef, type_names: &HashSet<String>) -> Ty {
+    let declared = resolve_ann_ty(&f.ty, type_names);
+    if declared == Ty::Unknown {
+        if let Some(d) = &f.default {
+            return infer_default_ty(d, type_names);
+        }
+    }
+    declared
+}
+
+/// 收集用户类型（class/struct）的非静态字段类型表。
+fn collect_field_types(
+    program: &Program,
+    type_names: &HashSet<String>,
+) -> HashMap<String, HashMap<String, Ty>> {
+    let mut out: HashMap<String, HashMap<String, Ty>> = HashMap::new();
+    let mut add = |owner: &str, fields: &[crate::ast::FieldDef]| {
+        let mut m: HashMap<String, Ty> = HashMap::new();
+        for f in fields {
+            if f.is_static {
+                continue;
+            }
+            m.insert(f.name.clone(), field_decl_ty(f, type_names));
+        }
+        out.insert(owner.to_string(), m);
+    };
+    for c in &program.classes {
+        add(&c.name, &c.fields);
+    }
+    for s in &program.structs {
+        add(&s.name, &s.fields);
+    }
+    out
+}
+
+/// 收集零参成员方法的返回类型（显式标注优先，否则从方法体尾表达式保守推断）。
+/// 供 `obj.method().field` 这类复杂左值目标的成员可变性检查使用。
+fn collect_method_returns(
+    program: &Program,
+    type_names: &HashSet<String>,
+    field_types: &HashMap<String, HashMap<String, Ty>>,
+) -> HashMap<(String, String), Ty> {
+    let mut out: HashMap<(String, String), Ty> = HashMap::new();
+    let mut add = |owner: &str, f: &Function| {
+        let other_params = f
+            .params
+            .iter()
+            .filter(|p| p.name != "this" && p.name != "self")
+            .count();
+        if other_params != 0 || f.body.is_empty() {
+            return;
+        }
+        let bare = member_name(&f.name).to_string();
+        let ty = match &f.return_type {
+            Some(rt) => resolve_ann_ty(rt, type_names),
+            None => {
+                let tail = match f.body.last() {
+                    Some(Stmt::Expr(e)) => Some(e),
+                    Some(Stmt::Return(Some(e))) => Some(e),
+                    _ => None,
+                };
+                match tail {
+                    // 返回某字段：`func getC() { c }` → 字段 c 的类型。
+                    Some(Expr::Var(n)) => field_types
+                        .get(owner)
+                        .and_then(|m| m.get(n))
+                        .cloned()
+                        .unwrap_or(Ty::Unknown),
+                    Some(e) => infer_default_ty(e, type_names),
+                    None => Ty::Unknown,
+                }
+            }
+        };
+        if ty == Ty::Unknown {
+            return;
+        }
+        let key = (owner.to_string(), bare);
+        match out.get(&key) {
+            Some(prev) if *prev != ty => {
+                // 重载返回类型不一致：无法确定，移除以免误判。
+                out.remove(&key);
+            }
+            None => {
+                out.insert(key, ty);
+            }
+            _ => {}
+        }
+    };
+    for c in &program.classes {
+        for m in &c.methods {
+            add(&c.name, &m.func);
+        }
+    }
+    // struct 方法被脱糖为 `StructName.method` 顶层函数。
+    for f in &program.functions {
+        if let Some((owner, _)) = f.name.rsplit_once('.') {
+            if field_types.contains_key(owner) {
+                add(owner, f);
+            }
+        }
+    }
+    out
 }
 
 const KNOWN_OPERATOR_METHODS: &[&str] = &[
@@ -3057,11 +3327,28 @@ impl<'a> Checker<'a> {
     fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let { pattern, ty, value } => {
-                let value_ty = self.check_expr(value);
+                let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                // 带类型标注的 `if` 初始化：按上下文逐分支检查（4.3(16)）。
+                let value_ty = match ann_ty.as_ref() {
+                    Some(ann)
+                        if matches!(
+                            value,
+                            Expr::If {
+                                else_branch: Some(_),
+                                ..
+                            }
+                        ) =>
+                    {
+                        self.check_expr_in_expected(value, ann.clone())
+                    }
+                    _ => self.check_expr(value),
+                };
                 // `let x: T` 无初始化式时解析器会合成类型默认值，此时属于
                 // “延迟赋值”声明，允许之后的第一次赋值。
                 let deferred = ty.as_ref().map_or(false, |t| is_default_value(t, value));
-                let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                if ann_ty.is_none() && !deferred {
+                    self.check_if_supertype_in_value(value);
+                }
                 if !deferred {
                     if let Some(ann) = ann_ty.as_ref() {
                         self.check_assignable(ann, &value_ty, "变量初始化");
@@ -3078,10 +3365,26 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::Var { pattern, ty, value } => {
-                let value_ty = self.check_expr(value);
+                let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                let value_ty = match ann_ty.as_ref() {
+                    Some(ann)
+                        if matches!(
+                            value,
+                            Expr::If {
+                                else_branch: Some(_),
+                                ..
+                            }
+                        ) =>
+                    {
+                        self.check_expr_in_expected(value, ann.clone())
+                    }
+                    _ => self.check_expr(value),
+                };
                 // `var x: T` 无初始化式时解析器同样合成类型默认值，需跳过可赋值性检查。
                 let deferred = ty.as_ref().map_or(false, |t| is_default_value(t, value));
-                let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                if ann_ty.is_none() && !deferred {
+                    self.check_if_supertype_in_value(value);
+                }
                 if !deferred {
                     if let Some(ann) = ann_ty.as_ref() {
                         self.check_assignable(ann, &value_ty, "变量初始化");
@@ -3218,7 +3521,30 @@ impl<'a> Checker<'a> {
             Expr::String(_) | Expr::Interpolate(_) => Ty::String,
             Expr::Cast { target_ty, .. } => ty_of(target_ty),
             Expr::Var(name) => self.lookup(name).map(|v| v.ty.clone()).unwrap_or(Ty::Unknown),
+            // 用户类型构造调用：结果即该类型（供 if 分支上下文可赋值性检查）。
+            Expr::ConstructorCall { name, .. } if self.ctor_types.contains(name) => {
+                Ty::User(name.clone())
+            }
+            // 基础类型转换 `Int32(x)` 等：结果类型即目标基础类型。
+            Expr::Call { name, .. } => primitive_ctor_ty(name).unwrap_or(Ty::Unknown),
             _ => Ty::Unknown,
+        }
+    }
+
+    /// 探测 `if` 分支的有效类型：空块（或仅语句、无尾表达式）视为 Unit，
+    /// 尾表达式块递归探测其尾表达式，其余走 `check_expr_ty_peek`。
+    fn branch_peek_ty(&self, e: &Expr) -> Ty {
+        match e {
+            Expr::Block(stmts, trailing) => {
+                if let Some(t) = trailing {
+                    return self.branch_peek_ty(t);
+                }
+                match stmts.last() {
+                    Some(Stmt::Expr(t)) => self.branch_peek_ty(t),
+                    _ => Ty::Unit,
+                }
+            }
+            _ => self.check_expr_ty_peek(e),
         }
     }
 
@@ -3743,17 +4069,24 @@ impl<'a> Checker<'a> {
             AssignTarget::ExprIndex { expr, .. } => {
                 if let crate::ast::Expr::Try(inner) = &**expr {
                     self.check_optional_index_target(inner);
+                } else {
+                    // 对 Option 类型直接索引赋值而缺少 '?' 非法。
+                    self.check_missing_question(expr, "[]");
                 }
             }
             // `a?.b = v`：可选链字段赋值，仅在引用类型且字段可变时合法。
             AssignTarget::OptionalField { object, field } => {
                 self.check_optional_field_target(object, field);
             }
-            // `obj.f().x` / 复杂基础对象的字段目标：基础是类型名时仍查
-            // `Type.method = ...`（4.23(15)），其余保守跳过。
+            // `obj.f().x` / 复杂基础对象的字段目标：解析基础对象的静态类型后，
+            // 检查目标字段可变性 / 是否为方法（4.23(15)）。
             AssignTarget::ExprField { object, field } => {
                 if let crate::ast::Expr::Var(name) = &**object {
                     self.check_field_target(name, field);
+                } else {
+                    // `a?.b.c?.d = v` 这类目标：基础对象本身是可选链字段访问，
+                    // 其静态类型按去 ? 规则解析后再检查末端字段。
+                    self.check_complex_field_target(object, field);
                 }
             }
             // 多元赋值 `(a, b) = expr`：逐元素检查左值合法性（4.23(30)）。
@@ -3794,6 +4127,284 @@ impl<'a> Checker<'a> {
                 .unwrap_or(Ty::Unknown),
             _ => Ty::Unknown,
         }
+    }
+
+    /// 在用户类型（含父类型）中查找字段的静态类型。
+    fn user_field_ty(&self, recv: &Ty, field: &str) -> Option<Ty> {
+        let Ty::User(name) = recv else {
+            return None;
+        };
+        let mut stack: Vec<&str> = vec![name.as_str()];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if let Some(m) = self.field_types.get(t) {
+                if let Some(ty) = m.get(field) {
+                    return Some(ty.clone());
+                }
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        None
+    }
+
+    /// 在用户类型（含父类型）中查找零参成员方法的返回类型。
+    fn user_method_ty(&self, recv: &Ty, method: &str) -> Option<Ty> {
+        let Ty::User(name) = recv else {
+            return None;
+        };
+        let mut stack: Vec<&str> = vec![name.as_str()];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if let Some(ty) = self
+                .method_returns
+                .get(&(t.to_string(), method.to_string()))
+            {
+                return Some(ty.clone());
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        None
+    }
+
+    /// 用户类型（含父类型）某字段的可变性；字段不存在时返回 `None`。
+    fn field_mutability(&self, name: &str, field: &str) -> Option<bool> {
+        let mut stack: Vec<&str> = vec![name];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if let Some(m) = self.class_fields.get(t) {
+                if let Some(&is_mut) = m.get(field) {
+                    return Some(is_mut);
+                }
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        None
+    }
+
+    /// 用户类型（含父类型）是否以成员函数形态定义了某名字。
+    fn has_method_member(&self, name: &str, member: &str) -> bool {
+        let mut stack: Vec<&str> = vec![name];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if self.qualified_methods.contains(&format!("{}.{}", t, member)) {
+                return true;
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        false
+    }
+
+    /// 结构体是否拥有实例字段/方法/属性 `member`（4.13.4(9) 成员存在性）。
+    fn struct_has_member(&self, name: &str, member: &str) -> bool {
+        if self
+            .field_types
+            .get(name)
+            .map_or(false, |m| m.contains_key(member))
+        {
+            return true;
+        }
+        if self.has_method_member(name, member) {
+            return true;
+        }
+        // 属性访问器脱糖为 `S.__get_p` / `S.__set_p`。
+        let getter = format!("__get_{}", member);
+        let setter = format!("__set_{}", member);
+        self.qualified_methods
+            .contains(&format!("{}.{}", name, getter))
+            || self
+                .qualified_methods
+                .contains(&format!("{}.{}", name, setter))
+    }
+
+    /// “去掉可选链 `?`”后的静态类型（4.13.4(6) 的 e1）。
+    ///
+    /// 对 `x?.f` 返回 f 的（解一层 Option 后的）类型；对变量返回其声明类型
+    /// （本身可能已是 Option）。无法确定时返回 `Unknown`。
+    fn deq_ty(&self, e: &crate::ast::Expr) -> Ty {
+        match e {
+            crate::ast::Expr::Var(name) => self
+                .lookup(name)
+                .map(|v| v.ty.clone())
+                .unwrap_or(Ty::Unknown),
+            crate::ast::Expr::OptionalChain { object, field }
+            | crate::ast::Expr::Field { object, field } => {
+                let recv = strip_option_ty(self.deq_ty(object));
+                self.user_field_ty(&recv, field).unwrap_or(Ty::Unknown)
+            }
+            crate::ast::Expr::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } if args.is_empty() => {
+                let recv = strip_option_ty(self.deq_ty(object));
+                self.user_method_ty(&recv, method).unwrap_or(Ty::Unknown)
+            }
+            crate::ast::Expr::Try(inner) => self.deq_ty(inner),
+            crate::ast::Expr::Invoke { callee, .. } => self.deq_ty(callee),
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// 是否为参与 `if` 分支公共超类型判定的标量类型（数值/Bool/Rune/String/Unit 及字面量）。
+    fn is_scalar_branch_ty(t: &Ty) -> bool {
+        matches!(
+            t,
+            Ty::Int8
+                | Ty::Int16
+                | Ty::Int32
+                | Ty::Int64
+                | Ty::IntNative
+                | Ty::UInt8
+                | Ty::UInt16
+                | Ty::UInt32
+                | Ty::UInt64
+                | Ty::UIntNative
+                | Ty::Float16
+                | Ty::Float32
+                | Ty::Float64
+                | Ty::Bool
+                | Ty::Rune
+                | Ty::String
+                | Ty::Unit
+                | Ty::IntLit
+                | Ty::FloatLit
+        )
+    }
+
+    /// 值上下文（无类型标注的绑定初始化）中对 `if` 表达式套用 4.3(15)：
+    /// 两分支类型须存在最小公共超类型。
+    fn check_if_supertype_in_value(&mut self, value: &Expr) {
+        if let Expr::If {
+            then_branch,
+            else_branch: Some(eb),
+            ..
+        } = value
+        {
+            let t = self.branch_peek_ty(then_branch);
+            let e = self.branch_peek_ty(eb);
+            if Self::if_no_common_supertype(&t, &e) {
+                self.err(format!(
+                    "if 表达式两个分支没有公共超类型：{} 与 {}（4.3(15)）",
+                    t.name(),
+                    e.name()
+                ));
+            }
+        }
+    }
+
+    /// 4.3(15)：上下文无关时若无公共超类型则报错。仅对可确定的标量类型判定，
+    /// 用户类型/容器类型一律跳过（避免误伤合法子类型关系）。
+    fn if_no_common_supertype(a: &Ty, b: &Ty) -> bool {
+        if !Self::is_scalar_branch_ty(a) || !Self::is_scalar_branch_ty(b) {
+            return false;
+        }
+        let a = default_literal(a);
+        let b = default_literal(b);
+        if a == b {
+            return false;
+        }
+        !compatible(&a, &b) && !compatible(&b, &a)
+    }
+
+    /// 在期望类型上下文中检查表达式（用于带类型标注的 `if` 初始化）。
+    fn check_expr_in_expected(&mut self, value: &Expr, expected: Ty) -> Ty {
+        let saved = self.expected_ty.replace(expected);
+        let t = self.check_expr(value);
+        self.expected_ty = saved;
+        t
+    }
+
+    /// 非可选后缀操作（`.`/`()`/`[]`/`{}`）的接收者若是 Option 类型，
+    /// 说明缺少 `?`（4.13.4(6)）。仅在接收者形态为可选链/变量时判定。
+    fn check_missing_question(&mut self, receiver: &crate::ast::Expr, op: &str) {
+        let applicable = matches!(
+            receiver,
+            crate::ast::Expr::OptionalChain { .. }
+                | crate::ast::Expr::Var(_)
+                | crate::ast::Expr::Field { .. }
+        );
+        if !applicable {
+            return;
+        }
+        if let Ty::Option(_) = self.deq_ty(receiver) {
+            self.err(format!(
+                "对 Option 类型使用 '{}' 需要可选链 '?'（4.13.4(6)）",
+                op
+            ));
+        }
+    }
+
+    /// 用户类型是否（含父类型）定义了 `operator func()`（脱糖为 `Type.op_call`）。
+    fn type_has_call_op(&self, name: &str) -> bool {
+        let mut stack: Vec<&str> = vec![name];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if self.qualified_methods.contains(&format!("{}.op_call", t)) {
+                return true;
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        false
+    }
+
+    fn type_has_index_op(&self, name: &str, set: bool) -> bool {
+        let ops = if set {
+            &self.index_set_types
+        } else {
+            &self.index_op_types
+        };
+        let mut stack: Vec<&str> = vec![name];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if ops.contains(t) {
+                return true;
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        false
     }
 
     /// 2.2.1.2(1)：数组下标必须是 Int64；编译期可确定的负下标非法。
@@ -3846,14 +4457,20 @@ impl<'a> Checker<'a> {
     /// （23_assignment_expressions/a15_174 判负、13_postfix_expressions/a21_03 判正），
     /// 为守住“正测试 100%”红线，这里对 struct 保守放行，仅拒绝确定可判定的形态。
     fn check_optional_index_target(&mut self, base: &crate::ast::Expr) {
-        let ty = self.target_base_ty(base);
+        let ty = self.deq_ty(base);
         match ty {
             Ty::Option(inner) => match *inner {
                 Ty::Agg("array") | Ty::Array(_) => {}
+                // 4.13.4(21)/4.23(15)：元组元素不可赋值，`t?[i] = v` 非法。
+                Ty::Agg("tuple") | Ty::Tuple(_) => {
+                    self.err(
+                        "元组的可选链索引不能被赋值（元组不可变，4.23(15)）".to_string(),
+                    );
+                }
                 Ty::User(name) => {
+                    // struct（值类型）可选索引存在官方矛盾用例，保守跳过。
                     if !self.struct_names.contains(&name)
-                        && self.index_op_types.contains(&name)
-                        && !self.index_set_types.contains(&name)
+                        && !self.type_has_index_op(&name, true)
                     {
                         self.err(format!(
                             "类型 '{}' 未定义 set 形态的 [] 运算符，可选链索引不能被赋值（4.23(15)）",
@@ -3876,11 +4493,25 @@ impl<'a> Checker<'a> {
 
     /// `a?.b = v`：仅当 `a` 为 `Option<引用类型>` 且字段 `b` 可变时合法。
     fn check_optional_field_target(&mut self, object: &crate::ast::Expr, field: &str) {
-        let ty = self.target_base_ty(object);
-        let Ty::Option(inner) = ty else {
-            return;
+        // 用“去 ?”后的静态类型判定基础表达式：`a?.b.c?.d` 的接收者经
+        // 字段 c 解析为 Option<C>，再解一层得到 C。
+        let ty = self.deq_ty(object);
+        let receiver = match ty {
+            Ty::Option(inner) => *inner,
+            // 对确定非 Option 的基础表达式使用 `?.` 非法（class/interface 实例
+            // 兼容项目方言放行，见表达式检查处说明）。
+            other if other.is_definite()
+                && !matches!(&other, Ty::User(n) if !self.struct_names.contains(n)) =>
+            {
+                self.err(format!(
+                    "可选链 '?.' 要求基础表达式为 Option 类型，当前为 '{}'（4.13.4(9)）",
+                    other.name()
+                ));
+                return;
+            }
+            _ => return,
         };
-        let Ty::User(name) = *inner else {
+        let Ty::User(name) = receiver else {
             return;
         };
         if self.struct_names.contains(&name) {
@@ -3895,6 +4526,29 @@ impl<'a> Checker<'a> {
                     name, field
                 ));
             }
+        }
+    }
+
+    /// 复杂基础对象的字段赋值目标（`obj.method().x = v`）：解析基础类型后检查
+    /// 末端成员是否为可写字段（4.23(15)）。
+    fn check_complex_field_target(&mut self, object: &crate::ast::Expr, field: &str) {
+        let recv = strip_option_ty(self.deq_ty(object));
+        let Ty::User(name) = recv else {
+            return;
+        };
+        let has_field = self.field_mutability(&name, field).is_some();
+        if !has_field && self.has_method_member(&name, field) {
+            self.err(format!(
+                "方法 '{}.{}' 不能被赋值（4.23(15)）",
+                name, field
+            ));
+            return;
+        }
+        if let Some(false) = self.field_mutability(&name, field) {
+            self.err(format!(
+                "不可变字段 '{}.{}' 不能被重新赋值（4.23(15)）",
+                name, field
+            ));
         }
     }
 
@@ -4739,6 +5393,9 @@ impl<'a> Checker<'a> {
                 type_args,
             } => {
                 self.check_expr(object);
+                // 注意：`obj?.method()` 被解析器折叠为 MethodCall（与 `obj.method()`
+                // 形态相同），无法在此区分是否带 '?'，故不对 MethodCall 套用
+                // “Option 接收者缺 ?”规则，避免误伤合法的可选链方法调用。
                 for a in args {
                     self.check_expr(a);
                 }
@@ -4832,6 +5489,17 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                // `Option<T>.Some(value)` 被解析为 MethodCall{object: Var("Option")}：
+                // 以实参类型作为 Option 内层类型（用于可选链来源推断）。
+                if matches!(&**object, Expr::Var(n) if n == "Option")
+                    && method == "Some"
+                    && args.len() == 1
+                {
+                    let inner = self.check_expr_ty_peek(&args[0]);
+                    if inner != Ty::Unknown {
+                        return Ty::Option(Box::new(inner));
+                    }
+                }
                 Ty::Unknown
             }
 
@@ -4858,6 +5526,17 @@ impl<'a> Checker<'a> {
                     let e = self.check_expr(eb);
                     if t == Ty::Unknown {
                         return e;
+                    }
+                    // 上下文要求具体类型时（4.3(16)）：逐分支检查是否可赋给期望类型。
+                    // 无上下文的 4.3(15) 公共超类型判定仅在值上下文（绑定初始化）
+                    // 由 `check_if_supertype_in_value` 执行，避免误伤 if 语句。
+                    if let Some(expected) = self.expected_ty.take() {
+                        for br in [then_branch.as_ref(), eb.as_ref()] {
+                            let bty = self.branch_peek_ty(br);
+                            if bty.is_definite() {
+                                self.check_assignable(&expected, &bty, "if 分支");
+                            }
+                        }
                     }
                     t
                 } else {
@@ -4929,14 +5608,54 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
 
-            Expr::TupleIndex { object, .. }
-            | Expr::OptionalChain { object, .. } => {
+            Expr::TupleIndex { object, .. } => {
                 self.check_expr(object);
+                Ty::Unknown
+            }
+
+            Expr::OptionalChain { object, field } => {
+                self.check_expr(object);
+                // 4.13.4(9)：`a?.b` 要求 a 为某个 Option<T>；对确定非 Option 的
+                // 基础表达式使用 `?.` 非法。
+                // 兼容项目既有方言：引用类型（class/interface）实例上的 `?.`
+                // （如 p6_new_features.cj 的 `b?.value`）按直接访问放行；仅对
+                // 值类型/聚合等确定非 Option 的基础报错（与官方负例 a02_02/a09_02 一致）。
+                let base = self.deq_ty(object);
+                let class_base = matches!(&base, Ty::User(n) if !self.struct_names.contains(n));
+                if base.is_definite() && !matches!(base, Ty::Option(_)) && !class_base {
+                    self.err(format!(
+                        "可选链 '?.' 要求基础表达式为 Option 类型，当前为 '{}'（4.13.4(9)）",
+                        base.name()
+                    ));
+                    return Ty::Unknown;
+                }
+                // 结果类型：Option<字段类型>（字段本身已是 Option 时保持 Option）。
+                if let Ty::Option(inner) = &base {
+                    let recv = strip_option_ty(base.clone());
+                    // 4.13.4(9)：Option<struct> 的可选链成员须存在（struct 无继承，
+                    // 成员表完整，可安全判定缺失；class/接口保守跳过）。
+                    if let Ty::User(name) = inner.as_ref() {
+                        if self.struct_names.contains(name) && !self.struct_has_member(name, field) {
+                            self.err(format!(
+                                "结构体 '{}' 没有实例成员 '{}'（4.13.4(9)）",
+                                name, field
+                            ));
+                        }
+                    }
+                    if let Some(fty) = self.user_field_ty(&recv, field) {
+                        return match fty {
+                            Ty::Option(_) => fty,
+                            other => Ty::Option(Box::new(other)),
+                        };
+                    }
+                }
                 Ty::Unknown
             }
 
             Expr::Field { object, field } => {
                 self.check_expr(object);
+                // 4.13.4(6)：对 Option 类型使用 '.' 而缺少 '?' 是非法的。
+                self.check_missing_question(object, ".");
                 // 类成员访问方向/可见性（6.1.2(4)、6.1.2.4(14)、6.1.2.4(28)）
                 // 与接口成员存在性（6.2.2(1)）。
                 if let Some((recv_ty, via_type)) = self.receiver_user(object) {
@@ -5010,10 +5729,63 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                // `Option<T>.None` 的结果类型为 Option<T>。
+                if field == "None" {
+                    if matches!(&**object, Expr::Var(n) if n == "Option") {
+                        return Ty::Option(Box::new(Ty::Unknown));
+                    }
+                    if let Expr::Call {
+                        name,
+                        type_args: Some(tas),
+                        args,
+                        ..
+                    } = &**object
+                    {
+                        if name == "Option" && tas.len() == 1 && args.is_empty() {
+                            return Ty::Option(Box::new(self.ty_of_ann(&tas[0])));
+                        }
+                    }
+                }
                 Ty::Unknown
             }
 
             Expr::Invoke { callee, args, named_args } => {
+                // 4.13.4 可选调用：`x?(...)` 要求 x 为 Option<函数类型>，
+                // 且 T 可调用（函数类型或定义了 operator func()）。非可选调用
+                // 则要求被调用者不是 Option。
+                if let Expr::Try(inner) = &**callee {
+                    let deq = self.deq_ty(inner);
+                    let mut bad: Option<String> = None;
+                    match &deq {
+                        Ty::Option(inner_ty) => match inner_ty.as_ref() {
+                            Ty::User(n) => {
+                                if !self.type_has_call_op(n) {
+                                    bad = Some(format!("类型 '{}' 不可调用", n));
+                                }
+                            }
+                            Ty::Func { .. } | Ty::Unknown | Ty::Agg(_) => {}
+                            other => bad = Some(format!("类型 '{}' 不可调用", other.name())),
+                        },
+                        other if other.is_definite() => {
+                            bad = Some(format!("'{}' 不是 Option 类型", other.name()))
+                        }
+                        _ => {
+                            if let Expr::Var(n) = &**inner {
+                                if self.known_funcs.contains(n) {
+                                    bad = Some(format!("'{}' 是普通函数而非 Option", n));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(reason) = bad {
+                        self.err(format!(
+                            "可选调用 '?()' 要求被调用者为 Option<函数类型>：{}（4.13.4(9)）",
+                            reason
+                        ));
+                    }
+                } else {
+                    self.check_missing_question(callee, "()");
+                }
                 self.check_expr(callee);
                 for a in args {
                     self.check_expr(a);
@@ -5056,10 +5828,48 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                // `Option<T>.Some(x)` 的结果类型为 Option<T>（4.13.4 可选链来源）。
+                if let Expr::Field { object, field } = &**callee {
+                    if field == "Some" || field == "None" {
+                        if let Expr::Call {
+                            name,
+                            type_args: Some(tas),
+                            args: cargs,
+                            ..
+                        } = &**object
+                        {
+                            if name == "Option" && tas.len() == 1 && cargs.is_empty() {
+                                return Ty::Option(Box::new(self.ty_of_ann(&tas[0])));
+                            }
+                        }
+                    }
+                }
                 Ty::Unknown
             }
 
             Expr::Index { array, index } => {
+                // 4.13.4 可选链索引：`x?[i]` 要求 x 为 Option<T> 且 T 支持下标；
+                // 对非 Option 使用 `?[]`、或对 Option 直接 `[]` 均非法。
+                if let Expr::Try(inner) = &**array {
+                    let deq = self.deq_ty(inner);
+                    if deq.is_definite() && !matches!(deq, Ty::Option(_)) {
+                        self.err(format!(
+                            "可选链索引 '?[]' 要求基础表达式为 Option 类型，当前为 '{}'（4.13.4(9)）",
+                            deq.name()
+                        ));
+                    } else if let Ty::Option(inner_ty) = &deq {
+                        if let Ty::User(name) = inner_ty.as_ref() {
+                            if !self.type_has_index_op(name, false) {
+                                self.err(format!(
+                                    "类型 '{}' 未定义 [] 运算符，可选链索引非法（4.13.4(9)）",
+                                    name
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    self.check_missing_question(array, "[]");
+                }
                 let base_ty = self.check_expr(array);
                 let idx_ty = self.check_expr(index);
                 match &base_ty {
@@ -5383,6 +6193,8 @@ impl<'a> Checker<'a> {
                 args,
                 closure,
             } => {
+                // 4.13.4(6)：尾随闭包调用对 Option 类型同样需要 '?'。
+                self.check_missing_question(callee, "{}");
                 self.check_expr(callee);
                 for a in args {
                     self.check_expr(a);
@@ -8071,6 +8883,175 @@ mod tests {
         assert_ok("main() { var v: UInt8 = 1; let x = -v }");
         // 有符号整数取负正常通过。
         assert_ok("main() { var v: Int64 = 1; let x = -v }");
+    }
+
+    // ── w12b-expr5: 4.13.4 可选链 / 4.3(15) if 公共超类型 / 4.23(15) 复杂左值 ──
+
+    #[test]
+    fn test_w12b_optional_chain_base_must_be_option() {
+        // 非 Option 的值类型基础：拒绝。
+        assert_err(
+            "struct S { var x = 3 } main() { let s = S(); s?.x }",
+            "可选链",
+        );
+        // ?S 基础：允许。
+        assert_ok("struct S { var x = 3 } main() { let s: ?S = S(); s?.x }");
+        // 项目方言：引用类型实例上的 ?. 放行（p6_new_features.cj 形态）。
+        assert_ok("class B { var v = 1 } main() { let b = B(); let x = b?.v }");
+    }
+
+    #[test]
+    fn test_w12b_optional_chain_missing_member() {
+        // Option<struct> 上访问不存在的成员：拒绝。
+        assert_err(
+            "struct S { var x = 6 } main() { let s: ?S = S(); s?.y }",
+            "没有实例成员",
+        );
+    }
+
+    #[test]
+    fn test_w12b_optional_chain_missing_question() {
+        // 对 Option 字段用 '.' 而缺 '?'：拒绝。
+        assert_err(
+            "struct F { var z = 1 }\n\
+             struct S { var f: ?F = F() }\n\
+             main() { let s: ?S = S(); let r = s?.f.z }",
+            "需要可选链",
+        );
+        // 对 Option 数组用 '[]' 而缺 '?'：拒绝。
+        assert_err(
+            "struct S { var a: ?Array<Int64> = [1, 2, 3] }\n\
+             main() { let s: ?S = S(); let r = s?.a[2] }",
+            "需要可选链",
+        );
+        // 正确使用 ?. 链：允许。
+        assert_ok(
+            "struct F { var z = 1 }\n\
+             struct S { var f: ?F = F() }\n\
+             main() { let s: ?S = S(); let r = s?.f?.z }",
+        );
+    }
+
+    #[test]
+    fn test_w12b_optional_index_assignment() {
+        // 元组可选索引不可赋值。
+        assert_err(
+            "main() { var t: ?(Int64, Int64) = (1, 2); t?[0] = 3 }",
+            "元组",
+        );
+        // 未定义 set 形态 [] 的类：可选索引不可赋值。
+        assert_err(
+            "class C { var x = 0 } main() { var c: ?C = C(); c?[0] = 9 }",
+            "set 形态的 []",
+        );
+        // 结构体可选索引存在官方矛盾用例：保守放行（正测试红线优先）。
+        assert_ok(
+            "struct S {\n\
+             \x20   S(var x!: Int64) {}\n\
+             \x20   operator func[](i: Int64, value!: Int64) {}\n\
+             }\n\
+             main() { var s: ?S = S(x: 1); s?[0] = 9 }",
+        );
+    }
+
+    #[test]
+    fn test_w12b_optional_field_assignment_mutability() {
+        // 嵌套可选链末端的不可变字段：拒绝。
+        assert_err(
+            "class C { let d = 1 }\n\
+             class B { var c: ?C = C() }\n\
+             class A { var b = B() }\n\
+             main() { var a = Option<A>.Some(A()); a?.b.c?.d = 1 }",
+            "不可变字段",
+        );
+        // 可变字段：允许。
+        assert_ok(
+            "class C { var d = 1 }\n\
+             class B { var c: ?C = C() }\n\
+             class A { var b = B() }\n\
+             main() { var a = Option<A>.Some(A()); a?.b.c?.d = 1 }",
+        );
+    }
+
+    #[test]
+    fn test_w12b_complex_field_target() {
+        // obj.method().immutableField：拒绝。
+        assert_err(
+            "class C { let x = 1 }\n\
+             class D { func getC() { c }\n\x20   var c = C() }\n\
+             main() { var d = D(); d.getC().x = 2 }",
+            "不可变字段",
+        );
+        // obj.method().method：方法不是左值。
+        assert_err(
+            "class C { func foo() {} }\n\
+             class D { func getC() { c }\n\x20   var c = C() }\n\
+             main() { var d = D(); d.getC().foo = d.c.foo }",
+            "不能被赋值",
+        );
+        // 可变字段：允许。
+        assert_ok(
+            "class C { var x = 1 }\n\
+             class D { func getC() { c }\n\x20   var c = C() }\n\
+             main() { var d = D(); d.getC().x = 2 }",
+        );
+    }
+
+    #[test]
+    fn test_w12b_if_branch_common_supertype() {
+        // 无上下文：数值/字符串等标量分支无公共超类型 → 拒绝。
+        assert_err(
+            "var x = 0\nmain() { var v = if (x == 0) { 1 } else { 3.14 } }",
+            "公共超类型",
+        );
+        assert_err(
+            "var x = 0\nmain() { var v = if (x == 0) { 0 } else { Int32(1) } }",
+            "公共超类型",
+        );
+        assert_err(
+            "var x = 0\nmain() { var v = if (x == 0) { \"Hello\" } else { r'w' } }",
+            "公共超类型",
+        );
+        // 同类型分支：允许。
+        assert_ok("var x = 0\nmain() { var v = if (x == 0) { 1 } else { 2 } }");
+        // 用户类型之间保守跳过（官方矛盾用例 a15_23）。
+        assert_ok(
+            "interface I {}\nclass A <: I {}\nclass B <: I {}\n\
+             var x = 0\nmain() { var v = if (x == 0) { A() } else { B() } }",
+        );
+    }
+
+    #[test]
+    fn test_w12b_if_context_assignability() {
+        // 上下文要求 Int64，else 分支为 Int32：拒绝。
+        assert_err(
+            "var x = 0\n\
+             main() { var res: Int64 = if (x == 0) { 0 } else { 1_i32 } }",
+            "if 分支",
+        );
+        // 上下文要求 S1，else 分支为 S2：拒绝。
+        assert_err(
+            "var x = 0\nstruct S1 {}\nstruct S2 {}\n\
+             main() { var res: S1 = if (x == 0) { S1() } else { S2() } }",
+            "if 分支",
+        );
+        // 分支均可赋给上下文：允许。
+        assert_ok(
+            "var x = 0\n\
+             main() { var res: Int64 = if (x == 0) { 0 } else { 1 } }",
+        );
+    }
+
+    #[test]
+    fn test_w12b_option_source_inference() {
+        // Some(c) / Option<C>.None 的全局绑定保留 Option 类型，不误伤可选链。
+        assert_ok(
+            "class C { var item = 100 }\n\
+             let c = C()\n\
+             let c1 = Some(c)\n\
+             let c2 = Option<C>.None\n\
+             main() { let r1 = c1?.item; let r2 = c2?.item }",
+        );
     }
 
 }
