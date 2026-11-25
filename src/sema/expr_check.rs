@@ -3764,6 +3764,12 @@ impl<'a> Checker<'a> {
                 step,
                 ..
             } => {
+                // 1.4(23)：范围表达式不可嵌套，`a..b..c`（解析为 `(a..b)..c`）非法。
+                if matches!(&**start, Expr::Range { .. })
+                    || matches!(&**end, Expr::Range { .. })
+                {
+                    self.err("范围表达式不能嵌套（形如 `a..b..c` 非法）".to_string());
+                }
                 self.check_expr(start);
                 self.check_expr(end);
                 if let Some(s) = step {
@@ -6117,6 +6123,19 @@ mod tests {
         // 2.1.10.4(6)：结构体私有成员不可在定义体外访问。
         assert_err("struct S { private let v = 1 }\nmain() { S().v }", "私有成员");
         assert_err("struct S { private func f() {} }\nmain() { S().f() }", "私有成员函数");
+    }
+
+
+    #[test]
+    fn test_w11b_nested_range_rejected() {
+        // 1.4(23)：范围表达式不可嵌套，`a..b..c` 被解析为 `(a..b)..c`（非法）。
+        assert_err("main() { let r = 0..10..1 }", "范围表达式不能嵌套");
+        assert_err("main() { let r = 0..=10..1 }", "范围表达式不能嵌套");
+        assert_err("main() { let r = 1..2..=3 }", "范围表达式不能嵌套");
+        // 正常范围仍合法。
+        assert_ok("main() { let r = 0..10 }");
+        assert_ok("main() { let r = 0..=10 }");
+        assert_ok("main() { for (i in 0..10) { println(i) } }");
     }
 
 }
