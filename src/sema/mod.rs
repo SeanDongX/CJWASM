@@ -387,6 +387,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         check_super_access_rules(cls, &mut errors);
         // 6.1.2.1(23)/(24)：显式 super(...) / this(...) 调用必须是构造函数体的首条语句。
         check_explicit_ctor_call_first(cls, &mut errors);
+        // 6.1.2.1(34)/(50)：构造函数体至多只能有一条 super(...)/this(...) 调用。
+        check_ctor_call_multiplicity(cls, &mut errors);
+        // 6.1.2.1(16)：主构造函数中定义的成员变量不得与构造函数外的成员同名。
+        check_ctor_member_param_conflicts(cls, &mut errors);
         // 6.1.2.1(58)/(26)：全部成员初始化完成前的受限使用。
         check_use_before_init(cls, &index, &mut errors);
         // 6.1.2.1(57)：open/abstract 类构造函数中 this 不得逃逸。
@@ -4323,6 +4327,19 @@ fn check_ctor_definite_assignment(cls: &ClassDef, errors: &mut Vec<SemanticError
             auto.insert(f.name.clone());
         }
     }
+    // 6.1.2.1(11)：以主构造函数成员变量参数（如类名形式的 `Foo(var x: Int64)`）
+    // 隐式定义的实例成员变量同样要求在所有构造函数中初始化。这类字段未进入
+    // `cls.fields`，需从各构造函数的 member_param_flags 补入。
+    for init in &inits {
+        for (p, flag) in init.params.iter().zip(init.member_param_flags.iter()) {
+            if *flag {
+                fields.insert(p.name.clone());
+                if p.default.is_some() {
+                    auto.insert(p.name.clone());
+                }
+            }
+        }
+    }
     if fields.is_empty() {
         return;
     }
@@ -4640,6 +4657,57 @@ fn check_ctor_param_rules(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
             });
         }
     }
+    // 6.1.2.1(19)：初始值表达式可引用其前已定义的参数，但不得修改这些参数的值。
+    // 默认值表达式中的赋值被解析为 `Expr::Block([Assign])`（如 `(a = 10)`）。
+    let mut default_assign_viol: Vec<String> = Vec::new();
+    {
+        let primary_names: HashSet<&str> = cls
+            .primary_ctor_params
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        if !primary_names.is_empty() {
+            for p in &cls.primary_ctor_params {
+                if let Some(def) = &p.default {
+                    collect_default_param_assigns(def, &primary_names, &mut default_assign_viol);
+                }
+            }
+        }
+    }
+    for init in &inits {
+        let names: HashSet<&str> = init.params.iter().map(|p| p.name.as_str()).collect();
+        if names.is_empty() {
+            continue;
+        }
+        for p in &init.params {
+            if let Some(def) = &p.default {
+                collect_default_param_assigns(def, &names, &mut default_assign_viol);
+            }
+        }
+    }
+    default_assign_viol.sort();
+    default_assign_viol.dedup();
+    for name in default_assign_viol {
+        errors.push(SemanticError {
+            message: format!(
+                "类 '{}' 的构造函数参数默认值表达式不能修改参数 '{}'（6.1.2.1(19)）",
+                cls.name, name
+            ),
+        });
+    }
+}
+
+/// 6.1.2.1(19)：扫描构造函数参数默认值表达式，收集其中对被引用参数的赋值。
+fn collect_default_param_assigns(e: &Expr, names: &HashSet<&str>, out: &mut Vec<String>) {
+    let mut found: Vec<String> = Vec::new();
+    walk_expr(e, &mut |sub| {
+        if let Expr::Block(stmts, _) = sub {
+            for s in stmts {
+                collect_param_assigns_stmt(s, names, &mut found);
+            }
+        }
+    });
+    out.extend(found);
 }
 
 /// 6.1.2.1(49)：构造函数参数默认值不得引用实例成员
@@ -4907,6 +4975,93 @@ fn check_explicit_ctor_call_first(cls: &ClassDef, errors: &mut Vec<SemanticError
                     message: format!(
                         "类 '{}' 的构造函数中显式 super(...)/this(...) 调用必须是构造函数体的第一条语句（6.1.2.1(23)/(24)）",
                         cls.name
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 6.1.2.1(34)/(50)：一个构造函数体内至多只能出现一条显式 super(...)/this(...)
+/// 调用（无论二者是否相同、参数是否相同）。
+fn check_ctor_call_multiplicity(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    fn classify(s: &Stmt) -> Option<u8> {
+        match s {
+            Stmt::Expr(e) => match e {
+                Expr::SuperCall { method, .. } if method == "init" => Some(0),
+                Expr::Call { name, .. } if name == "this" => Some(1),
+                Expr::Invoke { callee, .. } => {
+                    if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self") {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let inits: Vec<&InitDef> = if cls.inits.is_empty() {
+        cls.init.iter().collect()
+    } else {
+        cls.inits.iter().collect()
+    };
+    for init in &inits {
+        let mut supers = 0usize;
+        let mut thises = 0usize;
+        for s in &init.body {
+            match classify(s) {
+                Some(0) => supers += 1,
+                Some(1) => thises += 1,
+                _ => {}
+            }
+        }
+        if supers + thises > 1 {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的构造函数体中至多只能有一条 super(...)/this(...) 调用，不能同时或重复调用（6.1.2.1(34)/(50)）",
+                    cls.name
+                ),
+            });
+        }
+    }
+}
+
+/// 6.1.2.1(16)：主构造函数中定义的成员变量参数不得与构造函数外声明的成员同名。
+fn check_ctor_member_param_conflicts(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    // `class Foo(...)` 形式的主构造函数参数会被 parser 展开为同名字段；这些自动
+    // 生成的字段不代表“构造函数外声明的成员”，故从比较集合中排除。
+    let primary: HashSet<&str> = cls
+        .primary_ctor_params
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    let outside: HashSet<&str> = cls
+        .fields
+        .iter()
+        .filter(|f| !primary.contains(f.name.as_str()))
+        .map(|f| f.name.as_str())
+        .collect();
+    if outside.is_empty() {
+        return;
+    }
+    let inits: Vec<&InitDef> = if cls.inits.is_empty() {
+        cls.init.iter().collect()
+    } else {
+        cls.inits.iter().collect()
+    };
+    let mut reported: HashSet<String> = HashSet::new();
+    for (i, init) in inits.iter().enumerate() {
+        for (p, flag) in init.params.iter().zip(init.member_param_flags.iter()) {
+            if !*flag {
+                continue;
+            }
+            if outside.contains(p.name.as_str()) && reported.insert(format!("{}#{}", i, p.name)) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的成员变量参数 '{}' 与构造函数外声明的成员同名（6.1.2.1(16)）",
+                        cls.name, p.name
                     ),
                 });
             }
@@ -16296,4 +16451,70 @@ main() {}"#,
         );
     }
 
+    // ─── w14a：构造函数系（6.1.2.1(34)/(50)/(16)/(11)/(19)） ─────────────────
+
+    #[test]
+    fn test_w14a_ctor_multiple_super_rejected() {
+        // 6.1.2.1(34)/(50)：构造函数体至多一条 super(...)/this(...) 调用。
+        let errs = assert_invalid(
+            "open class P {}\nclass A <: P {\n init() {\n  super()\n  super()\n }\n}\nmain() {}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("6.1.2.1(34)/(50)")));
+        assert_invalid(
+            "open class P {}\nclass A <: P {\n init() {\n  super()\n  this(1)\n }\n}\nmain() {}",
+        );
+        assert_invalid(
+            "class A {\n init() {\n  this(1)\n  this(1)\n }\n A(x: Int64) {}\n}\nmain() {}",
+        );
+        // 正例：单条 super 或 this 调用合法。
+        assert_valid("open class P {}\nclass A <: P {\n init() {\n  super()\n }\n}\nmain() {}");
+        assert_valid("class A {\n init() {\n  this(1)\n }\n A(x: Int64) {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w14a_ctor_member_param_name_conflict() {
+        // 6.1.2.1(16)：主构造成员变量参数不得与构造函数外成员同名。
+        let errs = assert_invalid(
+            "class A {\n A(public var a: Int64) {}\n var a = 1\n}\nmain() {}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("6.1.2.1(16)")));
+        assert_invalid("class A {\n A(let a!: Int64) {}\n var a = 1\n}\nmain() {}");
+        // 正例：成员变量参数与外部成员不同名。
+        assert_valid(
+            "class A {\n A(public var a: Int64) {}\n var b = 1\n}\nmain() {}",
+        );
+        // 正例：`class A(var x)` 形式由 parser 自动生成的同名成员不算冲突。
+        assert_valid("class A(var x: Int64) {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w14a_ctor_member_param_definite_assignment() {
+        // 6.1.2.1(11)/(55)：主构造成员变量参数生成的实例成员须在所有构造函数中初始化。
+        let errs = assert_invalid(
+            "class A {\n A(var a: Int64) {}\n init() {}\n}\nmain() {}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("6.1.2.1(55)")));
+        // 正例：次构造函数显式初始化该成员。
+        assert_valid(
+            "class A {\n A(var a: Int64) {}\n init() { a = 0 }\n}\nmain() {}",
+        );
+        // 正例：成员变量参数带默认值。
+        assert_valid("class A {\n A(var a!: Int64 = 0) {}\n init() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w14a_ctor_default_value_param_assign_rejected() {
+        // 6.1.2.1(19)：初始值表达式不得修改其引用的参数。
+        let errs = assert_invalid(
+            "class A {\n A(a: Int64, let x!: Unit = (a = 10)) {}\n}\nmain() {}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("6.1.2.1(19)")));
+        assert_invalid(
+            "class A {\n A(var a: Int64, let x!: Unit = (a = 10)) {}\n}\nmain() {}",
+        );
+        // 正例：默认值只读取参数、不修改。
+        assert_valid(
+            "class A {\n A(a: Int64, let b!: Int64 = a) {}\n}\nmain() {}",
+        );
+    }
 }

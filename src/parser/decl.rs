@@ -2983,6 +2983,25 @@ impl Parser {
                     decl_kw: true,
                 });
             } else if self.check(&Token::Init) {
+                if !mods.is_static {
+                    // 6.1.2.1(34)：init 构造函数只允许至多一个可访问性修饰符；
+                    // open/abstract/redef/override/sealed/operator/unsafe/mut 均非法。
+                    // （`static init` 是静态初始化块，另行处理。）
+                    if mods.is_open
+                        || mods.is_abstract
+                        || mods.is_override
+                        || mods.is_sealed
+                        || mods.is_operator
+                        || mods.is_unsafe
+                        || mods.is_mut
+                        || mods.visibility_count > 1
+                    {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Init,
+                            "非法的 init 构造函数修饰符".to_string(),
+                        ));
+                    }
+                }
                 if mods.is_static {
                     // static init() { ... } — 静态初始化块，编译为 ClassName.__static_init
                     self.advance(); // consume init
@@ -3017,6 +3036,13 @@ impl Parser {
                 self.advance();
                 self.expect(Token::LParen)?;
                 let params = self.parse_params()?;
+                // 6.1.2.1(34)：init 构造函数不支持变长参数列表。
+                if params.iter().any(|p| p.variadic) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::DotDotDot,
+                        "init 构造函数不支持变长参数".to_string(),
+                    ));
+                }
                 self.expect(Token::RParen)?;
                 // init(output: T) where T <: Bound { ... }
                 let _ = self.parse_where_clause()?;
@@ -3319,23 +3345,51 @@ impl Parser {
                     ));
                 }
                 primary_seen = true;
+                // 6.1.2.1(2)：主构造函数只允许至多一个可访问性修饰符；
+                // static/open/abstract/redef/override/sealed/operator/unsafe/mut 非法。
+                if mods.is_static
+                    || mods.is_open
+                    || mods.is_abstract
+                    || mods.is_override
+                    || mods.is_sealed
+                    || mods.is_operator
+                    || mods.is_unsafe
+                    || mods.is_mut
+                    || mods.visibility_count > 1
+                {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::LParen,
+                        "非法的主构造函数修饰符".to_string(),
+                    ));
+                }
                 self.advance(); // 消费类名
                 self.expect(Token::LParen)?;
                 let mut params = Vec::new();
                 let mut member_param_flags: Vec<bool> = Vec::new();
                 while !self.check(&Token::RParen) {
                     // 跳过可选的可见性修饰符 (private/public/protected/internal)
-                    if self.check(&Token::Private)
+                    let has_vis = if self.check(&Token::Private)
                         || self.check(&Token::Public)
                         || self.check(&Token::Protected)
                         || self.check(&Token::Internal)
                     {
                         self.advance();
-                    }
+                        true
+                    } else {
+                        false
+                    };
                     // 跳过可选的 let/var 前缀，并记录是否为成员变量参数
                     let is_member = self.check(&Token::Let) || self.check(&Token::Var);
                     if is_member {
                         self.advance();
+                    }
+                    // 6.1.2.1(2)：可访问性修饰符只能修饰成员变量参数（需 var/let）。
+                    if has_vis && !is_member {
+                        let tok = self.peek().cloned().unwrap_or(Token::RParen);
+                        return self.bail(ParseError::UnexpectedToken(
+                            tok,
+                            "主构造函数参数带可访问性修饰符时必须使用 var/let".to_string(),
+                        ));
                     }
                     let pname = match self.advance_ident() {
                         Some(n) => n,
@@ -3374,6 +3428,14 @@ impl Parser {
                             "构造函数参数: 期望 : 类型 或 = 默认值".to_string(),
                         ));
                     };
+                    // 6.1.2.1(2)：`()` 是 Unit 字面量而非合法类型写法，不能用作参数类型
+                    // （Unit 类型应写作 `Unit`）。
+                    if matches!(&pty, Type::Tuple(v) if v.is_empty()) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::LParen,
+                            "主构造函数参数类型不能是 () 字面量".to_string(),
+                        ));
+                    }
                     params.push(Param {
                         name: pname,
                         ty: pty,

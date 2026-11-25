@@ -4382,4 +4382,81 @@ mod tests {
         let mut parser = Parser::new(tokens);
         assert!(parser.parse_program().is_err());
     }
+
+    fn try_parse_ok(src: &str) -> bool {
+        let lexer = Lexer::new(src);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        Parser::new(tokens).parse_program().is_ok()
+    }
+
+    // ─── 6.1.2.1(34)：init 构造函数修饰符 ────────────────────────────────────
+
+    #[test]
+    fn test_w14a_init_open_modifier_rejected() {
+        // 6.1.2.1(34)：init 构造函数不能带 open 修饰符。
+        assert!(!try_parse_ok("open class A {\n  public open init() {}\n}\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w14a_init_override_modifier_rejected() {
+        // 6.1.2.1(34)：init 构造函数不能带 override/redef 修饰符。
+        assert!(!try_parse_ok("open class P {}\nclass A <: P {\n  override init() {}\n}\nmain() {}"));
+        assert!(!try_parse_ok("open class P {}\nclass A <: P {\n  redef init() {}\n}\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w14a_init_duplicate_visibility_rejected() {
+        // 6.1.2.1(34)：init 构造函数只允许一个可访问性修饰符。
+        assert!(!try_parse_ok("class A {\n  private public init() {}\n}\nmain() {}"));
+        assert!(!try_parse_ok("class A {\n  protected private init() {}\n}\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w14a_init_variadic_rejected() {
+        // 6.1.2.1(34)：init 构造函数不支持变长参数。
+        assert!(!try_parse_ok("class A {\n  init(a: Int64, b: Int64, ...) {}\n}\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w14a_init_valid_modifiers_accepted() {
+        // 正例：单个可访问性修饰符与 static 初始化块均应被接受。
+        assert!(try_parse_ok("class A {\n  private init() {}\n}\nmain() {}"));
+        assert!(try_parse_ok("class A {\n  public init(x: Int64) {}\n}\nmain() {}"));
+        assert!(try_parse_ok("class A {\n  static init() {}\n}\nmain() {}"));
+    }
+
+    // ─── 6.1.2.1(2)：主构造函数修饰符与参数类型 ────────────────────────────────
+
+    #[test]
+    fn test_w14a_primary_ctor_static_rejected() {
+        // 6.1.2.1(2)：主构造函数不能带 static 修饰符。
+        assert!(!try_parse_ok("class A {\n  static A() {}\n}\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w14a_primary_ctor_duplicate_visibility_rejected() {
+        // 6.1.2.1(2)：主构造函数只允许一个可访问性修饰符。
+        assert!(!try_parse_ok("class A {\n  private public A() {}\n}\nmain() {}"));
+        assert!(!try_parse_ok("class A {\n  public public public A() {}\n}\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w14a_primary_ctor_modifier_without_var_let_rejected() {
+        // 6.1.2.1(2)：可访问性修饰符只能修饰成员变量参数（需 var/let）。
+        assert!(!try_parse_ok("class A {\n  A(public a: Int64) {}\n}\nmain() {}"));
+        assert!(!try_parse_ok("class A {\n  A(public a!: Int64) {}\n}\nmain() {}"));
+        // 正例：带 var/let 的成员变量参数合法。
+        assert!(try_parse_ok("class A {\n  A(public let a: Int64) {}\n}\nmain() {}"));
+        // 正例：无修饰符的普通参数合法。
+        assert!(try_parse_ok("class A {\n  A(a: Int64) {}\n}\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w14a_primary_ctor_unit_literal_type_rejected() {
+        // 6.1.2.1(2)：`()` 是 Unit 字面量而非类型写法，不能用作参数类型。
+        assert!(!try_parse_ok("class A {\n  A(public let a: ()) {}\n}\nmain() {}"));
+        assert!(!try_parse_ok("class A {\n  A(public let a!: ()) {}\n}\nmain() {}"));
+        // 正例：`Unit` 类型名合法。
+        assert!(try_parse_ok("class A {\n  A(public let a: Unit) {}\n}\nmain() {}"));
+    }
 }
