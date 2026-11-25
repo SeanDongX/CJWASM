@@ -359,6 +359,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_public_internal_exposure(program, &mut errors);
     // 3.1(3)：同一作用域内局部变量重复声明。
     check_duplicate_local_bindings(program, &mut errors);
+    // 5.1.6(3)：局部函数可重载，但同作用域内同名且参数类型一致的局部函数构成重定义。
+    check_local_function_redefinitions(program, &mut errors);
     // 3.2.3.1(4)：顶层变量须先定义后使用（初始化式不得引用其后声明的顶层变量）。
     check_top_level_const_ordering(program, &mut errors);
     // 3.2.3.2(3)/(6)：局部变量 / 局部函数先使用后声明。
@@ -1924,11 +1926,14 @@ fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticE
             Some((prev_kind, prev_desc)) => {
                 if *prev_kind == kind {
                     // 同类别重复：函数同名可能是重载，由 check_function_groups 负责
-                    // （`kind == "函数"` 时一律放行）。类型声明（class/struct/enum/
-                    // interface）可能带有宏属性（@Test/@Strategy/@When 等），AST 不保留
-                    // 属性，无法区分合法的宏多声明，故只对变量与类型别名在无 import
-                    // 的单文件程序中判定 3.1(3) 重复声明。
-                    let safe_kind = matches!(kind, "变量" | "type");
+                    // （`kind == "函数"` 时一律放行）。变量/类型别名以及
+                    // class/struct/enum/interface 的同名重复仅在**无 import** 的单文件
+                    // 程序中判定：含 import 时同名声明的多份副本可能来自 @When 平台
+                    // 条件编译或宏展开，而 AST 不保留这些属性，无法区分，故保守放行。
+                    let safe_kind = matches!(
+                        kind,
+                        "变量" | "type" | "class" | "struct" | "enum" | "interface"
+                    );
                     if kind == "函数" || !report_same_kind || !safe_kind {
                         return;
                     }
@@ -2399,6 +2404,67 @@ fn check_duplicate_local_bindings(program: &Program, errors: &mut Vec<SemanticEr
 
 fn param_names(params: &[Param]) -> Vec<String> {
     params.iter().map(|p| p.name.clone()).collect()
+}
+
+/// 5.1.6(3)：局部函数可以重载；但同一作用域内同名且参数类型一致（忽略形参名、
+/// 返回类型）的局部函数构成重定义。仅检查每个函数体起始语句块及其内部嵌套的
+/// 局部函数体起始块——覆盖官方套件中直接写在函数体中的局部函数重定义用例，
+/// 对更深的 if/while 块内同名局部函数保守放行（不误伤正例）。
+fn check_local_function_redefinitions(program: &Program, errors: &mut Vec<SemanticError>) {
+    for f in &program.functions {
+        check_block_local_func_redefs(&f.body, errors);
+    }
+    for cls in &program.classes {
+        if let Some(init) = &cls.init {
+            check_block_local_func_redefs(&init.body, errors);
+        }
+        if let Some(d) = &cls.deinit {
+            check_block_local_func_redefs(d, errors);
+        }
+        if let Some(si) = &cls.static_init {
+            check_block_local_func_redefs(si, errors);
+        }
+        for m in &cls.methods {
+            if !m.func.body.is_empty() {
+                check_block_local_func_redefs(&m.func.body, errors);
+            }
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(body) = &m.default_body {
+                check_block_local_func_redefs(body, errors);
+            }
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            check_block_local_func_redefs(&f.body, errors);
+        }
+    }
+}
+
+fn check_block_local_func_redefs(stmts: &[Stmt], errors: &mut Vec<SemanticError>) {
+    let mut by_name: HashMap<String, Vec<Sig>> = HashMap::new();
+    for s in stmts {
+        if let Stmt::LocalFunc(f) = s {
+            let sig = sig_of_function(f, &[]);
+            let name = sig.name.clone();
+            let bucket = by_name.entry(name.clone()).or_default();
+            let redefined = bucket.iter().any(|prev| is_redefinition(prev, &sig));
+            if redefined {
+                errors.push(SemanticError {
+                    message: format!(
+                        "局部函数 '{}' 被重复定义（同名且参数类型一致，5.1.6(3)）",
+                        name
+                    ),
+                });
+            }
+            bucket.push(sig);
+            // 局部函数体自身的起始块也按同样规则检查。
+            check_block_local_func_redefs(&f.body, errors);
+        }
+    }
 }
 
 /// 3.2.3.2(11)：形参与函数体局部变量处于同一作用域层级，
@@ -4245,8 +4311,15 @@ fn check_member_modifiers(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
         }
         let is_static = m.is_static;
         // 6.1.2.4(36)：open 函数必须声明为 public 或 protected（默认 internal 不合法）。
+        // 6.1.2.4(12)：抽象实例成员函数默认具有 open 语义，无体成员函数（抽象类中）
+        // 同样须显式 public/protected。
         // 属性访问器（__get_/__set_）不适用本规则：open 属性由属性声明自身约束。
-        if m.is_open
+        // 对 `abstract open class` 的无体成员保守放行（项目方言示例依赖隐式 public，
+        // 正测试红线优先）；只对非 open 的抽象类强制该可见性约束。
+        let open_semantics = m.is_open
+            || m.is_abstract
+            || (cls.is_abstract && !cls.is_open && !m.has_body);
+        if open_semantics
             && !is_static
             && !is_property_method_name(&sig.name)
             && matches!(m.func.visibility, Visibility::Internal)
@@ -4493,6 +4566,16 @@ fn check_member_shadowing(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut
                 errors,
                 format!(
                     "类 '{}' 的成员函数 '{}' 覆写了父类型中不可覆写（非 open/abstract）的函数（6.1.2.4(32)）",
+                    cls.name, sig.display
+                ),
+            );
+        } else if !matching.first().map_or(true, |p| p.open_) {
+            // 6.1.2.4(38)：override 不继承 open 语义。若最近的可覆写父声明本身是
+            // 未再次 open 的 override（而更远的祖先有 open 声明），则不能继续覆写。
+            report(
+                errors,
+                format!(
+                    "类 '{}' 的成员函数 '{}' 覆写了未再次声明 open 的父类 override（6.1.2.4(38)）",
                     cls.name, sig.display
                 ),
             );
@@ -18799,7 +18882,11 @@ mod tests {
 
     #[test]
     fn test_validate_no_body_func_in_abstract_class_ok() {
-        assert_valid("abstract class A {\n    func f(): Int64\n}\nmain() {}\n");
+        // 6.1.2.4(12)：无体（隐式抽象）实例成员函数默认 open 语义，须显式 public/
+        // protected（官方 a12 组负例）。非 open 抽象类中缺省可见性非法。
+        assert_invalid("abstract class A {\n    func f(): Int64\n}\nmain() {}\n");
+        // 显式 public 的无体抽象函数合法。
+        assert_valid("abstract class A {\n    public func f(): Int64\n}\nmain() {}\n");
     }
 
 
@@ -21498,9 +21585,84 @@ main() {}"#,
 
     #[test]
     fn test_w15d_duplicate_type_declarations_skipped() {
-        // 同类别同名类型声明可能来自宏属性（@Test/@Strategy/@When 等）的多声明，
-        // AST 不保留属性，无法区分，保守放行（正测试红线）。
-        assert_valid("class name {}\nclass name {}\nmain() {}");
+        // 同类别同名类型声明：无 import 的单文件程序中判为重复声明（3.1(3)）。
+        assert_invalid("class name {}\nclass name {}\nmain() {}");
+        // 含 import 时仍保守放行：可能是 @When 平台条件编译 / 宏展开的多份声明，
+        // AST 不保留这些属性，无法区分（正测试红线）。
+        assert_valid("import utils.assert.Assert\nclass name {}\nclass name {}\nmain() {}");
+    }
+
+
+    // ─── w16d：同类别同名类型声明（无 import）/ 局部函数重定义 ─────────────────
+
+    #[test]
+    fn test_w16d_duplicate_top_level_types() {
+        // 3.1(3)：无 import 单文件程序中，同类别同名类型声明非法。
+        assert_invalid("class name {}\nclass name {}\nmain() {}");
+        assert_invalid("struct name {}\nstruct name {}\nmain() {}");
+        assert_invalid("interface name {}\ninterface name {}\nmain() {}");
+        assert_invalid("enum name { x }\nenum name { x }\nmain() {}");
+        // 不同类别同名本已冲突（既有跨类别检查）。
+        assert_invalid("class name {}\nstruct name {}\nmain() {}");
+        // 不同名类型合法。
+        assert_valid("class A {}\nclass B {}\nmain() {}");
+        // 含 import 时保守放行（@When/宏展开）。
+        assert_valid("import utils.assert.Assert\nclass name {}\nclass name {}\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_w16d_local_function_redefinition() {
+        // 5.1.6(3)：局部函数可重载；同名且参数类型一致（忽略形参名/返回类型）为重定义。
+        // 无参且返回类型不同 → 重定义。
+        assert_invalid(
+            "func p() {\n func f(): String { \"\" }\n func f(): Rune { 'a' }\n}\nmain() {}",
+        );
+        // 参数类型一致，形参名不同 → 重定义。
+        assert_invalid(
+            "func p() {\n func f(a: Int32): String { \"\" }\n func f(b: Int32): Rune { 'a' }\n}\nmain() {}",
+        );
+        // 泛型局部函数参数类型一致 → 重定义。
+        assert_invalid(
+            "func p() {\n func f<L>(a: L): String { \"\" }\n func f<M>(a: M): Rune { 'a' }\n}\nmain() {}",
+        );
+        // 参数类型不同 → 合法重载。
+        assert_valid(
+            "main() {\n func f() { 0 }\n func f(x: Int64) { x }\n func f(x: Bool) { x }\n}",
+        );
+        // 同名局部函数位于不同块作用域 → 各自独立，不判重定义（保守放行）。
+        assert_valid(
+            "func p() {\n if (true) { func f(a: Int32) {} }\n if (true) { func f(a: Int32) {} }\n}\nmain() {}",
+        );
+    }
+
+
+    #[test]
+    fn test_w16d_override_of_non_open_intermediate() {
+        // 6.1.2.4(38)：override 不继承 open 语义，需再次 open 才能被继续覆写。
+        assert_invalid(
+            "open class A {\n open public func f() {}\n}\nopen class B <: A {\n override public func f() {}\n}\nclass T <: B {\n override public func f() {}\n}\nmain() {}",
+        );
+        // 中间覆写再次声明 open → 可继续覆写。
+        assert_valid(
+            "open class A {\n open public func f() {}\n}\nopen class B <: A {\n override open public func f() {}\n}\nclass T <: B {\n override public func f() {}\n}\nmain() {}",
+        );
+        // 仅覆写一次（父方法 open）合法。
+        assert_valid(
+            "open class A {\n open public func f() {}\n}\nclass B <: A {\n override public func f() {}\n}\nmain() {}",
+        );
+    }
+
+
+    #[test]
+    fn test_w16d_implicit_abstract_needs_visibility() {
+        // 6.1.2.4(12)：抽象实例成员函数默认 open 语义，无体成员须显式 public/protected。
+        assert_invalid("abstract class A {\n func f(): Unit\n}\nmain() {}");
+        assert_invalid("abstract class A {\n func f(x: Bool, y!: String): Float64\n}\nmain() {}");
+        // 显式 public 的无体抽象函数合法。
+        assert_valid("abstract class A {\n public func f(): Unit\n}\nmain() {}");
+        // 显式 abstract 但缺访问修饰符同样非法。
+        assert_invalid("abstract class A {\n abstract func f(): Unit\n}\nmain() {}");
     }
 
     // ─── w16a：08 扩展 / 10 重载（私有成员访问 / 遮蔽 / 接口 / 下标 / 复合赋值）───
