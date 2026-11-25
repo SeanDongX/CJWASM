@@ -776,7 +776,7 @@ mod tests {
             extends: None,
             implements: vec![],
             supertype_args: vec![],
-            fields: vec![FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
+            fields: vec![FieldDef { is_const: false, is_static: false, visibility: crate::ast::Visibility::Public,
                 name: "n".to_string(),
                 ty: Type::Int64,
                 default: None,

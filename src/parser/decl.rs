@@ -575,8 +575,25 @@ impl Parser {
                     Some(Token::Let) | Some(Token::Var) | Some(Token::Const) => {
                         constants.extend(self.parse_top_level_const()?);
                     }
-                    // cjc: public import ... — 带可见性的导入语句
+                    // cjc: public/internal import ... — 带可见性的导入语句。
                     Some(Token::Import) => {
+                        // A.2.2(1)：import（preamble）必须位于所有顶层声明之前。带可见性
+                        // 前缀的 import 只能出现在 preamble 区（尚无任何顶层声明）。
+                        // SEPARATE-FILE 单文件多包片段忽略顺序约束（各段独立 preamble）。
+                        let preamble_done = !self.source.contains("SEPARATE-FILE")
+                            && !(structs.is_empty()
+                                && classes.is_empty()
+                                && functions.is_empty()
+                                && enums.is_empty()
+                                && extends.is_empty()
+                                && type_aliases.is_empty()
+                                && constants.is_empty());
+                        if preamble_done {
+                            return self.bail(ParseError::UnexpectedToken(
+                                Token::Import,
+                                "import 必须位于所有顶层声明之前（preamble）".to_string(),
+                            ));
+                        }
                         imports.push(self.parse_import()?);
                     }
                     // 单文件多 package 分段规格（harness 的 SEPARATE-FILE 用例）：
@@ -1315,7 +1332,7 @@ impl Parser {
                             "非命名参数不能有默认值".to_string(),
                         ));
                     }
-                    fields.push(FieldDef { is_static: false, visibility: param_vis,
+                    fields.push(FieldDef { is_const: false, is_static: false, visibility: param_vis,
                         name: param_name,
                         ty,
                         default,
@@ -1466,6 +1483,13 @@ impl Parser {
 
             // cjc 兼容: struct 内部方法 → 转为外部方法 func StructName.method(self, ...)
             if self.check(&Token::Func) {
+                // 16.4(14)：struct 的 const 实例成员函数不能同时声明为 mut。
+                if mods.is_mut && mods.is_const {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Mut,
+                        "const 实例成员函数不能声明为 mut（16.4(14)）".to_string(),
+                    ));
+                }
                 // 5.8.1(2)：mut 只能修饰实例成员函数，不能作用于 static 成员函数。
                 if mods.is_mut && mods.is_static {
                     return self.bail(ParseError::UnexpectedToken(
@@ -1662,10 +1686,16 @@ impl Parser {
             let has_decl_kw = self.check(&Token::Var)
                 || self.check(&Token::Let)
                 || self.check(&Token::Const);
+            // `const` 通常已被 parse_member_modifiers 收进 mods.is_const；
+            // 无修饰符路径下也可能残留 Const token，两者皆算 const 字段。
+            let field_is_const = mods.is_const || self.check(&Token::Const);
             let mut field_is_mut = true;
             if has_decl_kw {
                 field_is_mut = self.check(&Token::Var);
                 self.advance();
+            }
+            if field_is_const {
+                field_is_mut = false;
             }
             let field_name = match self.advance() {
                 Some(Token::Ident(name)) => name,
@@ -1707,7 +1737,14 @@ impl Parser {
                 ));
             };
 
-            fields.push(FieldDef { is_static: mods.is_static,
+            // 16.1(2)：const 字段必须在定义处初始化。
+            if field_is_const && default.is_none() {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Ident(field_name.clone()),
+                    "const 字段必须在定义处初始化（16.1(2)）".to_string(),
+                ));
+            }
+            fields.push(FieldDef { is_const: field_is_const, is_static: mods.is_static,
                 visibility: mods.visibility.clone().unwrap_or(crate::ast::Visibility::Public),
                 name: field_name,
                 ty,
@@ -3123,7 +3160,7 @@ impl Parser {
                 while self.check(&Token::Semicolon) || self.check(&Token::Comma) {
                     self.advance();
                 }
-                fields.push(crate::ast::FieldDef {
+                fields.push(crate::ast::FieldDef { is_const: false,
                     is_static: mods.is_static,
                     visibility: member_vis.clone(),
                     name: f_name,
@@ -3937,7 +3974,14 @@ impl Parser {
                 while self.check(&Token::Semicolon) || self.check(&Token::Comma) {
                     self.advance();
                 }
-                fields.push(crate::ast::FieldDef {
+                // 16.1(2)：const 成员变量必须在定义处初始化（不能延迟到 init/static init）。
+                if default.is_none() {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Ident(f_name.clone()),
+                        "const 成员变量必须在定义处初始化（16.1(2)）".to_string(),
+                    ));
+                }
+                fields.push(crate::ast::FieldDef { is_const: true,
                     name: f_name,
                     ty,
                     default,
@@ -4002,7 +4046,14 @@ impl Parser {
                     if self.check(&Token::Semicolon) {
                         self.advance();
                     }
-                    fields.push(crate::ast::FieldDef {
+                    // 16.1(2)：const 成员变量必须在定义处初始化。
+                    if default.is_none() {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Ident(f_name.clone()),
+                            "const 成员变量必须在定义处初始化（16.1(2)）".to_string(),
+                        ));
+                    }
+                    fields.push(crate::ast::FieldDef { is_const: true,
                         is_static: mods.is_static,
                         visibility: member_vis.clone(),
                         name: f_name,
@@ -4044,7 +4095,7 @@ impl Parser {
         // P6: 展开主构造函数参数为字段 + init
         if !primary_ctor_params.is_empty() {
             for p in &primary_ctor_params {
-                class_def.fields.push(FieldDef {
+                class_def.fields.push(FieldDef { is_const: false,
                     is_static: false,
                     visibility: crate::ast::Visibility::Internal,
                     name: p.name.clone(),
