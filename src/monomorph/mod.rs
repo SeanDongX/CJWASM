@@ -1566,6 +1566,7 @@ pub fn monomorphize_program(program: &mut Program) {
             primary_ctor_member_flags: def.primary_ctor_member_flags.clone(),
             has_primary_ctor: def.has_primary_ctor,
             primary_ctor_visibility: def.primary_ctor_visibility.clone(),
+            is_c: def.is_c,
         });
     }
     program.structs.append(&mut new_structs);
@@ -2090,6 +2091,7 @@ mod tests {
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 }],
             interfaces: vec![],
             classes: vec![],
@@ -2159,6 +2161,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 }],
             interfaces: vec![],
             classes: vec![],
@@ -2222,6 +2225,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 }],
             interfaces: vec![],
             classes: vec![],
@@ -2345,6 +2349,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 }],
             interfaces: vec![],
             classes: vec![],
@@ -2535,6 +2540,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 }],
             interfaces: vec![],
             classes: vec![],
@@ -2776,6 +2782,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 }],
             interfaces: vec![],
             classes: vec![],

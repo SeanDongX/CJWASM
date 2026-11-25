@@ -7059,6 +7059,7 @@ mod tests {
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 }],
             interfaces: vec![],
             classes: vec![],
@@ -7137,6 +7138,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 }],
             interfaces: vec![],
             classes: vec![],
@@ -8274,6 +8276,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 }],
             interfaces: vec![InterfaceDef {
                 visibility: Visibility::default(),
