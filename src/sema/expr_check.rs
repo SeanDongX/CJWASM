@@ -56,6 +56,10 @@ enum Ty {
     Agg(&'static str),
     /// Option<T>
     Option(Box<Ty>),
+    /// 显式标注的函数类型 `(P1, P2, ...) -> R`（4.22.1(2) 管道形参检查用）。
+    /// 注意：`agg`/`concrete` 判定均返回 false，从而不参与其它运算符规则；
+    /// 仅管道分支显式识别它来比较 `e1 |> e2` 中 e2 的形参类型。
+    Func { params: Vec<Ty>, ret: Box<Ty> },
     /// 无法确定（用户类型 / 泛型 / 调用结果未知等），不参与检查
     Unknown,
 }
@@ -85,6 +89,7 @@ impl Ty {
             Ty::User(n) => n,
             Ty::Agg(a) => a,
             Ty::Option(_) => "Option",
+            Ty::Func { .. } => "函数类型",
             Ty::Unknown => "未知类型",
         }
     }
@@ -138,6 +143,7 @@ impl Ty {
                 | Ty::User(_)
                 | Ty::Agg(_)
                 | Ty::Option(_)
+                | Ty::Func { .. }
         )
     }
 
@@ -217,7 +223,12 @@ fn ty_of(ty: &Type) -> Ty {
         Type::Range => Ty::Agg("range"),
         // 函数类型：与元组/数组等聚合类型互不可赋值；lambda 实参推断为 Unknown，
         // 因此不会误伤把 lambda 传给函数形参的合法调用。
-        Type::Function { .. } => Ty::Agg("function"),
+        // 函数类型：记录形参与返回类型，供管道 `|>` 形参匹配（4.22.1(2)）使用；
+        // 该变体不参与其它运算符的 definite/concrete 判定，因此不会误伤合法用法。
+        Type::Function { params, ret } => Ty::Func {
+            params: params.iter().map(ty_of).collect(),
+            ret: Box::new(ret.as_ref().as_ref().map(ty_of).unwrap_or(Ty::Unknown)),
+        },
         Type::Option(inner) => Ty::Option(Box::new(ty_of(inner))),
         // 少数场景下基础类型名以 Struct 形式出现（如未识别的别名），按名字兜底。
         Type::Struct(name, args) if args.is_empty() => match name.as_str() {
@@ -3989,7 +4000,8 @@ impl<'a> Checker<'a> {
                 // 4.22.1(2)：`e1 |> e2` 等价于 `e2(e1)`，要求 e2 为函数类型。
                 // 仅拒绝“可确定且明确不可调用”的右操作数类型：
                 // - 用户类型可能定义 `operator func ()`（合法，见官方正例）；
-                // - 函数类型为 `Agg("function")`，本支暂不校验形参类型；
+                // - 函数类型不再折叠为 `Agg("function")`，而是 `Ty::Func`，
+                //   此处的“必须可调用”判定对它不生效（见下方形参匹配分支）；
                 // - Option 可能与解包/调用语法混用，保守跳过；
                 // - 顶层无类型标注绑定的类型由 Int64 占位推断（如 `let obj = A()`），
                 //   类型不可靠，指向全局变量的右操作数保守跳过。
@@ -4002,12 +4014,50 @@ impl<'a> Checker<'a> {
                 };
                 if !rhs_is_global
                     && rt.is_definite()
-                    && !matches!(rt, Ty::User(_) | Ty::Option(_) | Ty::Agg("function"))
+                    && !matches!(rt, Ty::User(_) | Ty::Option(_) | Ty::Func { .. })
                 {
                     self.err(format!(
                         "管道运算符 '|>' 的右操作数必须为函数类型，实际为 {}",
                         rt.name()
                     ));
+                }
+                // 4.22.1(3)：管道右操作数不支持 init / 主构造函数及 this/super。
+                // `this` 在 AST 中落为 `Expr::Var("this")`；类名 `C` 作为值出现时
+                // 也落为 `Expr::Var("C")`（绑定为空且是已知类型名）。
+                match right {
+                    Expr::Var(n) if n == "this" || n == "self" => {
+                        self.err(
+                            "管道运算符 '|>' 的右操作数不能是 this/super 构造函数".to_string(),
+                        );
+                    }
+                    Expr::Var(n)
+                        if self.lookup(n).is_none()
+                            && !self.funcs.contains_key(n)
+                            && self.type_names.contains(n) =>
+                    {
+                        self.err(format!(
+                            "管道运算符 '|>' 的右操作数不能是构造函数/类型 '{}'",
+                            n
+                        ));
+                    }
+                    _ => {}
+                }
+                // 4.22.1(2)：`e1 |> e2` 等价于 `e2(e1)`，要求 e1 的类型与 e2 的
+                // （唯一）形参类型匹配。仅当右侧为“显式标注的函数类型变量/值”
+                // （`Ty::Func`）且两侧类型均可静态确定时检查；函数名引用、
+                // lambda、方法引用、用户类型 operator () 等均为 Unknown/User，
+                // 保守放行，避免误伤 std 的高阶函数用法。
+                if let Ty::Func { params, .. } = &rt {
+                    if params.len() == 1 {
+                        let pt = &params[0];
+                        if lt.is_definite() && pt.is_definite() && !compatible(&lt, pt) {
+                            self.err(format!(
+                                "管道运算符 '|>' 左侧类型 {} 与右侧函数的形参类型 {} 不匹配",
+                                lt.name(),
+                                pt.name()
+                            ));
+                        }
+                    }
                 }
                 Ty::Unknown
             }
@@ -5528,6 +5578,80 @@ mod tests {
         // 顶层 const 初始化式同样须为常量表达式（16.1(2)）。
         assert_err("func f() { 1 }\nconst a = f()\nmain() {}", "不是常量表达式");
         assert_ok("const func f() { 1 }\nconst a = f()\nmain() {}");
+    }
+
+
+    // ─── w10b 04 章：管道 `|>` 右侧函数形参与左操作数匹配（4.22.1(2)(3)）───
+
+    #[test]
+    fn test_w10b_pipeline_param_match_positive() {
+        // 形参类型与左操作数一致：合法。
+        assert_ok(
+            "main() { var v1: Int8 = 1\n var v2: (Int8) -> Int8 = { x: Int8 => x }\n let v3 = v1 |> v2 }",
+        );
+        assert_ok(
+            "main() { var v1: Int64 = 1\n var v2: (Int64) -> Int64 = { x: Int64 => x }\n let v3 = v1 |> v2 }",
+        );
+        // 整数字面量左操作数可适配任意数值形参。
+        assert_ok(
+            "main() { var f: (Int64) -> Int64 = { x: Int64 => x }\n let r = 1 |> f }",
+        );
+        assert_ok(
+            "main() { var f: (Float64) -> Float64 = { x: Float64 => x }\n let r = 1.0 |> f }",
+        );
+        // 函数名引用（类型未知）保守放行。
+        assert_ok(
+            "func double(x: Int64): Int64 { x * 2 }\nmain() { let r = 1 |> double }",
+        );
+        // 右侧为用户类型（可定义 operator ()）时放行。
+        assert_ok(
+            "class F { operator func ()(x: Int64) { x } }\nmain() { var v1: Int64 = 1\n var v2 = F()\n let v3 = v1 |> v2 }",
+        );
+        // 形参个数不为 1 时保守跳过（本支只处理唯一形参的形态）。
+        assert_ok(
+            "main() { var f: (Int64, Int64) -> Int64 = { a: Int64, b: Int64 => a + b }\n let r = 1 |> f }",
+        );
+    }
+
+
+    #[test]
+    fn test_w10b_pipeline_param_mismatch_rejected() {
+        // 左侧类型与右侧函数形参类型不一致：拒绝。
+        assert_err(
+            "main() { var v1: Int64 = 1\n var v2: (Unit) -> Rune = { x: Unit => '1' }\n let v3 = v1 |> v2 }",
+            "不匹配",
+        );
+        assert_err(
+            "main() { var v1: Unit = ()\n var v2: (Int8) -> Bool = { x: Int8 => true }\n let v3 = v1 |> v2 }",
+            "不匹配",
+        );
+        assert_err(
+            "main() { var v1: (Int8, Int8) = (1, 1)\n var v2: (IntNative) -> IntNative = { x: IntNative => 1 }\n let v3 = v1 |> v2 }",
+            "不匹配",
+        );
+        assert_err(
+            "main() { var v1: UInt64 = 1\n var v2: (Int64) -> Int16 = { x: Int64 => 1 }\n let v3 = v1 |> v2 }",
+            "不匹配",
+        );
+        assert_err(
+            "main() { var v1: String = \"s\"\n var v2: (Rune) -> Float16 = { x: Rune => 1.0 }\n let v3 = v1 |> v2 }",
+            "不匹配",
+        );
+    }
+
+
+    #[test]
+    fn test_w10b_pipeline_ctor_and_this_rejected() {
+        // 4.22.1(3)：右侧不能是构造函数/类型名。
+        assert_err(
+            "class C { var x = 0\n C(y: Int64) { x = y } }\nmain() { let obj = 1 |> C }",
+            "构造函数",
+        );
+        // 4.22.1(3)：右侧不能是 this。
+        assert_err(
+            "class C { init() { let x = 1 |> this } }\nmain() {}",
+            "this",
+        );
     }
 
 }
