@@ -4350,4 +4350,36 @@ mod tests {
             crate::ast::Visibility::Private
         ));
     }
+
+    // ─── w13d：6.1.1.4(7) 类只能有一个主构造函数（类名形式） ────────────────
+
+    #[test]
+    fn test_w13d_single_primary_ctor_ok() {
+        // 一个类名形式主构造函数 + 多个 init 次构造函数（合法）。
+        let src = "class A {\n A() {}\n init(x: Int64) { this() }\n init(y: Bool) { this() }\n}\nmain() {}";
+        let lexer = Lexer::new(src);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse_program().is_ok());
+    }
+
+    #[test]
+    fn test_w13d_two_primary_ctors_rejected() {
+        // 两个类名形式主构造函数（不同签名）非法。
+        let src = "class A {\n A() {}\n A(x: Int64) {}\n}\nmain() {}";
+        let lexer = Lexer::new(src);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse_program().is_err());
+    }
+
+    #[test]
+    fn test_w13d_paren_primary_plus_named_rejected() {
+        // `class A(...)` 主构造 + 类名形式 `A()` 主构造 => 两个主构造函数。
+        let src = "class A(x: Int64) {\n A() {}\n}\nmain() {}";
+        let lexer = Lexer::new(src);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse_program().is_err());
+    }
 }

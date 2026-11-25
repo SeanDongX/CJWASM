@@ -392,6 +392,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         // 6.1.2.1(57)：open/abstract 类构造函数中 this 不得逃逸。
         check_this_escape_open(cls, &mut errors);
         check_static_member_access(cls, program, &index, &mut errors);
+        // 6.1.4(7)：覆写返回 This 的父函数时返回类型必须保持 This。
+        check_this_override_return(cls, &index, &mut errors);
         check_private_parent_access(cls, program, &index, &mut errors);
         // 6.1.2.3(3)(4)：实例成员变量初始化表达式的引用限制。
         check_instance_field_initializers(cls, &mut errors);
@@ -474,6 +476,14 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
 
     // `This` 类型只能作为类的实例成员函数返回类型（6.1.4(1)）。
     check_this_type_usage(program, &mut errors);
+    // 6.1.4(2)：返回 This 的函数体只能返回 This 表达式。
+    check_this_return_bodies(program, &mut errors);
+    // 6.2.2.1(8)/(10)：无 body 的接口 static 函数不可被调用。
+    check_interface_abstract_static_calls(program, &index, &mut errors);
+    // 6.2.3.1(6)/6.2.4.1(9)：多父接口同名默认实现冲突须由子类型自行实现。
+    check_interface_default_conflicts(program, &index, &mut errors);
+    // 6.2.2.2(7)：接口默认实现不能通过 super 访问。
+    check_super_interface_default(program, &index, &mut errors);
 
     // 13 章：C 语言互操作的单文件类型约束（foreign func / CFunc）。
     check_c_interop(program, &index, &mut errors);
@@ -9948,6 +9958,819 @@ fn check_this_type_usage(program: &Program, errors: &mut Vec<SemanticError>) {
     }
 }
 
+// ─── 6.1.4(2)/(7)：This 返回类型的函数体与覆写规则 ────────────────────────
+
+/// 6.1.4(7)：覆写父类型中返回类型为 `This` 的函数时，返回类型必须保持为 `This`。
+///
+/// 即使子类未显式书写 `override`（旧语法容许），只要同名同参数列表覆写了返回
+/// `This` 的父函数，将返回类型改为具体类型即非法。
+fn check_this_override_return(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let Some(parents) = collect_parent_methods(cls, index) else {
+        return;
+    };
+    for method in &cls.methods {
+        if method.is_static {
+            continue;
+        }
+        let sig = sig_of_class_method(method, &cls.type_params);
+        if is_synthetic_member(&sig.name) {
+            continue;
+        }
+        let parent_returns_this = parents.iter().any(|p| {
+            p.sig.name == sig.name
+                && p.sig.ret == Some(Type::This)
+                && (!p.strict_types || p.sig.params == sig.params)
+        });
+        if parent_returns_this && sig.ret != Some(Type::This) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的 '{}' 覆写了返回 This 的父类型函数，返回类型必须保持为 This（6.1.4(7)）",
+                    cls.name, sig.display
+                ),
+            });
+        }
+    }
+}
+
+/// 6.1.4(2)：返回类型为 `This` 的函数，其（隐式/显式）返回值必须是 This 表达式：
+/// `this` 或对返回 This 的成员函数的调用。其余（字面量、普通调用、lambda、
+/// if/match、类实例构造等）均非法。
+fn check_this_return_bodies(program: &Program, errors: &mut Vec<SemanticError>) {
+    for cls in &program.classes {
+        // 返回 This 的成员函数基名集合（显式 This + 6.1.4(6) 推断为 This）。
+        let mut this_methods: HashSet<String> = cls
+            .methods
+            .iter()
+            .filter(|m| m.func.return_type == Some(Type::This))
+            .filter_map(|m| m.func.name.rsplit('.').next().map(|s| s.to_string()))
+            .collect();
+        // 6.1.4(6)：无显式返回类型、函数体为 This 表达式的实例函数，推断返回 This。
+        loop {
+            let mut changed = false;
+            for m in &cls.methods {
+                if m.func.return_type.is_some() || !m.has_body || m.is_static {
+                    continue;
+                }
+                let Some(base) = m.func.name.rsplit('.').next() else {
+                    continue;
+                };
+                if this_methods.contains(base) {
+                    continue;
+                }
+                let tail = match m.func.body.last() {
+                    Some(Stmt::Expr(e)) => Some(e),
+                    Some(Stmt::Return(Some(e))) => Some(e),
+                    _ => None,
+                };
+                if let Some(e) = tail {
+                    if is_this_value(e, &this_methods) {
+                        this_methods.insert(base.to_string());
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for m in &cls.methods {
+            if m.func.return_type != Some(Type::This) || !m.has_body {
+                continue;
+            }
+            let base = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+            if is_synthetic_member(base) {
+                continue;
+            }
+            let body = &m.func.body;
+            let bad = |errors: &mut Vec<SemanticError>| {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的 '{}' 返回类型为 This，只能返回 this 或返回 This 的函数调用（6.1.4(2)）",
+                        cls.name, m.func.name
+                    ),
+                });
+            };
+            if body.is_empty() {
+                bad(errors);
+                continue;
+            }
+            match body.last() {
+                Some(Stmt::Expr(e)) => {
+                    if !is_this_value(e, &this_methods) {
+                        bad(errors);
+                    }
+                }
+                Some(Stmt::Return(Some(e))) => {
+                    if !is_this_value(e, &this_methods) {
+                        bad(errors);
+                    }
+                }
+                Some(Stmt::Return(None)) => bad(errors),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 判断表达式是否为「This 表达式」：`this`/`super`、返回 This 的成员函数调用，
+/// 以及返回 This 的运算符调用（`this + rhs`、`-this` 等）。
+fn is_this_value(e: &Expr, this_methods: &HashSet<String>) -> bool {
+    match e {
+        Expr::Var(n) if n == "this" || n == "super" => true,
+        Expr::Block(_, Some(t)) => is_this_value(t, this_methods),
+        Expr::Call { name, .. } => {
+            let base = name.rsplit('.').next().unwrap_or(name);
+            this_methods.contains(base)
+        }
+        Expr::MethodCall { method, .. } => this_methods.contains(method),
+        // 运算符调用：仅当该类声明了返回 This 的对应运算符重载。
+        Expr::Binary { op, .. } => this_methods.contains(binop_op_name(op)),
+        Expr::Unary { op, .. } => this_methods.contains(unary_op_name(op)),
+        _ => false,
+    }
+}
+
+fn unary_op_name(op: &crate::ast::UnaryOp) -> &'static str {
+    use crate::ast::UnaryOp::*;
+    match op {
+        Not => "op_not",
+        Neg => "op_sub",
+        BitNot => "op_bitnot",
+    }
+}
+
+fn binop_op_name(op: &crate::ast::BinOp) -> &'static str {
+    use crate::ast::BinOp::*;
+    match op {
+        Add => "op_add",
+        Sub => "op_sub",
+        Mul => "op_mul",
+        Div => "op_div",
+        Mod => "op_mod",
+        Eq => "op_eq",
+        NotEq => "op_ne",
+        Lt => "op_lt",
+        Gt => "op_gt",
+        LtEq => "op_le",
+        GtEq => "op_ge",
+        LogicalAnd => "op_and",
+        LogicalOr => "op_or",
+        Pow => "op_pow",
+        BitAnd => "op_bitand",
+        BitOr => "op_bitor",
+        BitXor => "op_bitxor",
+        Shl => "op_shl",
+        Shr => "op_shr",
+        NotIn => "op_notin",
+        Pipeline => "op_pipeline",
+    }
+}
+
+// ─── 6.2.2.1(8)/(10)：接口中无 body 的 static 函数不可被调用 ──────────────
+
+/// 接口 `iface` 对静态成员 `method`（已去掉类型前缀）是否解析为「无 body 的
+/// 抽象 static 函数」：
+/// - 本接口存在同名带 body 的 static 函数 → 已具体化，可调用；
+/// - 本接口存在同名无 body 的 static 函数 → 抽象，不可调用；
+/// - 否则沿父接口查找。
+/// 在接口 `iface`（含父接口）中查找名为 `name`、参数个数为 `argc` 的 static 函数。
+/// 返回 `(是否抽象（无 body）, 实现体)`；找不到返回 None。
+fn find_iface_static<'a>(
+    iface: &'a InterfaceDef,
+    name: &str,
+    argc: usize,
+    index: &ProgramIndex<'a>,
+    seen: &mut HashSet<String>,
+) -> Option<(bool, Option<&'a Vec<Stmt>>)> {
+    if !seen.insert(iface.name.clone()) {
+        return None;
+    }
+    let mut abstract_here = false;
+    for m in &iface.methods {
+        let mbase = m.name.rsplit('.').next().unwrap_or(&m.name);
+        if !m.is_static || mbase != name || m.params.len() != argc {
+            continue;
+        }
+        match &m.default_body {
+            Some(b) => return Some((false, Some(b))),
+            None => abstract_here = true,
+        }
+    }
+    if abstract_here {
+        return Some((true, None));
+    }
+    for p in &iface.parents {
+        if let Some(pi) = index.interfaces.get(p.as_str()) {
+            if let Some(r) = find_iface_static(pi, name, argc, index, seen) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
+/// 6.2.2.1(8)/(10)：无 body 的接口 static 函数不可被调用。
+///
+/// - (8)：任何位置通过接口类型名直接调用 `I.f()`（含接口方法体内的直接调用）非法。
+/// - (10)：通过接口类型名调用一个已实现 static 函数时，若其（传递地）调用了
+///   该接口层次中未实现的 static 函数，同样非法；但若调用经由子接口（其实现了
+///   这些函数）则合法（按静态分派类型解析）。
+fn check_interface_abstract_static_calls(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    use std::collections::HashSet as Set;
+    let report = |iface: &str, method: &str, errors: &mut Vec<SemanticError>| {
+        errors.push(SemanticError {
+            message: format!(
+                "接口 '{}' 的静态函数 '{}' 没有实现体，不能被调用（6.2.2.1(8)/(10)）",
+                iface, method
+            ),
+        });
+    };
+
+    // 汇总所有待扫描的函数体（自由函数、类方法、构造函数、extend、接口默认体）。
+    let mut bodies: Vec<&[Stmt]> = Vec::new();
+    for f in &program.functions {
+        bodies.push(&f.body);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            bodies.push(&m.func.body);
+        }
+        for init in &cls.inits {
+            bodies.push(&init.body);
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            bodies.push(&f.body);
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(b) = &m.default_body {
+                bodies.push(b);
+            }
+        }
+    }
+
+    // 直接调用抽象 static：任意函数体中的 `I.f(...)`。
+    // 同时收集「通过接口类型名调用已实现 static」作为间接检查根。
+    let mut roots: Vec<(String, String, usize)> = Vec::new();
+    let mut direct_hits: Vec<(String, String)> = Vec::new();
+    for body in &bodies {
+        walk_stmts(body, &mut |e| {
+            let (ty, method, argc) = match e {
+                Expr::MethodCall {
+                    object,
+                    method,
+                    args,
+                    ..
+                } => match object.as_ref() {
+                    Expr::Var(n) => (n.clone(), method.clone(), args.len()),
+                    _ => return,
+                },
+                Expr::Call { name, args, .. } => match name.rsplit_once('.') {
+                    Some((ty, m)) => (ty.to_string(), m.to_string(), args.len()),
+                    None => return,
+                },
+                _ => return,
+            };
+            let Some(iface) = index.interfaces.get(ty.as_str()) else {
+                return;
+            };
+            match find_iface_static(iface, &method, argc, index, &mut Set::new()) {
+                Some((true, _)) => direct_hits.push((ty, method)),
+                Some((false, Some(_))) => roots.push((ty, method, argc)),
+                _ => {}
+            }
+        });
+    }
+    direct_hits.sort();
+    direct_hits.dedup();
+    for (ty, m) in direct_hits {
+        report(&ty, &m, errors);
+    }
+
+    // 间接调用：从每个根出发，沿静态分派类型传递地检查无资格调用。
+    let mut visited: Set<(String, String, usize)> = Set::new();
+    while let Some((tname, mname, argc)) = roots.pop() {
+        if !visited.insert((tname.clone(), mname.clone(), argc)) {
+            continue;
+        }
+        let Some(iface) = index.interfaces.get(tname.as_str()) else {
+            continue;
+        };
+        let Some((abstract_, body)) =
+            find_iface_static(iface, &mname, argc, index, &mut Set::new())
+        else {
+            continue;
+        };
+        if abstract_ {
+            report(&tname, &mname, errors);
+            continue;
+        }
+        let Some(body) = body else { continue };
+        let mut calls: Vec<(String, usize)> = Vec::new();
+        walk_stmts(body, &mut |e| {
+            if let Expr::Call { name, args, .. } = e {
+                if !name.contains('.') {
+                    calls.push((name.clone(), args.len()));
+                }
+            }
+        });
+        for (n, a) in calls {
+            roots.push((tname.clone(), n, a));
+        }
+    }
+}
+
+// ─── 6.2.3.1(6) / 6.2.4.1(9)：多父接口同名默认实现的冲突 ─────────────────
+
+/// 成员键：去掉所属类型前缀后的成员名（属性访问器保留 `__get_`/`__set_`），
+/// 加上 static 标记与「有效参数类型列表」（不含接收者），用于区分重载。
+type MemberKey = (String, bool, Vec<Type>);
+
+fn effective_param_types(params: &[crate::ast::Param]) -> Vec<Type> {
+    let start = if params
+        .first()
+        .map_or(false, |p| p.name == "this" || p.name == "self")
+    {
+        1
+    } else {
+        0
+    };
+    params[start..].iter().map(|p| p.ty.clone()).collect()
+}
+
+fn member_key(name: &str, is_static: bool, params: &[crate::ast::Param]) -> MemberKey {
+    let base = name.rsplit('.').next().unwrap_or(name);
+    (base.to_string(), is_static, effective_param_types(params))
+}
+
+/// 收集接口（含传递父接口，不含自身）中带默认实现的成员。
+/// 计算接口 `name` 的「成员键 → 默认实现提供者」映射（就近声明遮蔽父接口，
+/// 即本接口的声明优先于父接口同名声明；无 body 的声明记为 None，同样遮蔽）。
+fn iface_default_map<'a>(
+    name: &str,
+    index: &ProgramIndex<'a>,
+    seen: &mut HashSet<String>,
+) -> HashMap<MemberKey, Option<String>> {
+    let mut map: HashMap<MemberKey, Option<String>> = HashMap::new();
+    if !seen.insert(name.to_string()) {
+        return map;
+    }
+    let Some(iface) = index.interfaces.get(name) else {
+        return map;
+    };
+    for m in &iface.methods {
+        let key = member_key(&m.name, m.is_static, &m.params);
+        let val = if m.default_body.is_some() {
+            Some(iface.name.clone())
+        } else {
+            None
+        };
+        map.entry(key).or_insert(val);
+    }
+    for p in &iface.parents {
+        for (k, v) in iface_default_map(p, index, seen) {
+            map.entry(k).or_insert(v);
+        }
+    }
+    map
+}
+
+/// 接口 `name` 的传递父接口集合。
+fn iface_ancestors(name: &str, index: &ProgramIndex<'_>) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = index
+        .interfaces
+        .get(name)
+        .map(|i| i.parents.clone())
+        .unwrap_or_default();
+    while let Some(p) = stack.pop() {
+        if out.insert(p.clone()) {
+            if let Some(pi) = index.interfaces.get(p.as_str()) {
+                stack.extend(pi.parents.iter().cloned());
+            }
+        }
+    }
+    out
+}
+
+/// 给定一组「直接」接口，计算其中存在多个**互不包含**的默认实现提供者、
+/// 因而必须由子类型自行实现的成员键。
+fn conflicting_default_keys(
+    direct: &[String],
+    index: &ProgramIndex<'_>,
+) -> Vec<MemberKey> {
+    let mut owners: HashMap<MemberKey, HashSet<String>> = HashMap::new();
+    for d in direct {
+        let mut seen = HashSet::new();
+        for (k, v) in iface_default_map(d, index, &mut seen) {
+            if let Some(owner) = v {
+                owners.entry(k).or_default().insert(owner);
+            }
+        }
+    }
+    let mut result: Vec<MemberKey> = Vec::new();
+    for (k, os) in owners.into_iter() {
+        if os.len() < 2 {
+            continue;
+        }
+        let providers: Vec<String> = os.into_iter().collect();
+        // 去掉「是另一个提供者的祖先」的提供者（被更派生的接口遮蔽）。
+        let kept = providers
+            .iter()
+            .filter(|o| {
+                !providers
+                    .iter()
+                    .any(|other| other != *o && iface_ancestors(other, index).contains(*o))
+            })
+            .count();
+        if kept >= 2 {
+            result.push(k);
+        }
+    }
+    result.sort_by(|a, b| (a.0.as_str(), a.1).cmp(&(b.0.as_str(), b.1)));
+    result
+}
+
+/// 6.2.3.1(6)：子接口从多个父接口继承同名同签名的默认实现，但自身未提供
+/// 新的默认实现（省略或仅声明无体）时报错。
+/// 6.2.4.1(9)：class/struct/enum 同理，必须自身实现这些成员，否则报错。
+fn check_interface_default_conflicts(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let report = |what: &str, key: &MemberKey, errors: &mut Vec<SemanticError>| {
+        let kind = if key.1 { "静态" } else { "" };
+        let base = &key.0;
+        let shown = base
+            .strip_prefix("__get_")
+            .or_else(|| base.strip_prefix("__set_"))
+            .unwrap_or(base);
+        errors.push(SemanticError {
+            message: format!(
+                "{}继承了多个父接口中同名同签名的默认实现 '{}'（{}），必须自行实现（6.2.3.1(6)/6.2.4.1(9)）",
+                what, shown, kind
+            ),
+        });
+    };
+
+    // 接口层：父接口（含传递）默认实现冲突。
+    for iface in &program.interfaces {
+        let keys = conflicting_default_keys(&iface.parents, index);
+        if keys.is_empty() {
+            continue;
+        }
+        let own: HashSet<MemberKey> = iface
+            .methods
+            .iter()
+            .filter(|m| m.default_body.is_some())
+            .map(|m| member_key(&m.name, m.is_static, &m.params))
+            .collect();
+        for k in keys {
+            if !own.contains(&k) {
+                report(&format!("接口 '{}' ", iface.name), &k, errors);
+            }
+        }
+    }
+
+    // 类型层：class/struct/enum 必须自行实现冲突成员。
+    let report_type = |owner: &str,
+                       impls: &HashSet<MemberKey>,
+                       keys: &[MemberKey],
+                       errors: &mut Vec<SemanticError>| {
+        for k in keys {
+            if !impls.contains(k) {
+                report(&format!("类型 '{}' ", owner), k, errors);
+            }
+        }
+    };
+
+    for cls in &program.classes {
+        let mut direct: Vec<String> = Vec::new();
+        // `<: I1 & I2` 中第一个父类型被解析为 extends（若为接口亦计入）。
+        if let Some(p) = cls.extends.as_deref() {
+            if index.interfaces.contains_key(p) {
+                direct.push(p.to_string());
+            }
+        }
+        direct.extend(cls.implements.iter().cloned());
+        if direct.is_empty() {
+            continue;
+        }
+        let keys = conflicting_default_keys(&direct, index);
+        if keys.is_empty() {
+            continue;
+        }
+        let mut impls: HashSet<MemberKey> = cls
+            .methods
+            .iter()
+            .filter(|m| m.has_body)
+            .map(|m| member_key(&m.func.name, m.is_static, &m.func.params))
+            .collect();
+        // 6.2.4.1(10)：父类已提供的同名实现同样满足接口冲突的消解要求。
+        let mut cur = cls.extends.clone();
+        let mut seen_cls: HashSet<String> = HashSet::new();
+        while let Some(pname) = cur {
+            if !seen_cls.insert(pname.clone()) {
+                break;
+            }
+            let Some(parent) = index.classes.get(pname.as_str()) else {
+                break;
+            };
+            for m in &parent.methods {
+                if m.has_body {
+                    impls.insert(member_key(&m.func.name, m.is_static, &m.func.params));
+                }
+            }
+            cur = parent.extends.clone();
+        }
+        report_type(&cls.name, &impls, &keys, errors);
+    }
+
+    for st in &program.structs {
+        let bounds: Vec<String> = st
+            .constraints
+            .iter()
+            .filter(|c| c.param == st.name)
+            .flat_map(|c| c.bounds.iter().cloned())
+            .collect();
+        if bounds.is_empty() {
+            continue;
+        }
+        let keys = conflicting_default_keys(&bounds, index);
+        if keys.is_empty() {
+            continue;
+        }
+        // struct 方法不保留 static 标记（属性访问器恒带 this 首参），
+        // 因此对同一成员名同时登记 static/实例两种键，避免误判。
+        let mut impls: HashSet<MemberKey> = HashSet::new();
+        for f in program
+            .functions
+            .iter()
+            .filter(|f| owner_name(&f.name) == Some(st.name.as_str()))
+        {
+            let b = f.name.rsplit('.').next().unwrap_or(&f.name).to_string();
+            let p = effective_param_types(&f.params);
+            impls.insert((b.clone(), false, p.clone()));
+            impls.insert((b, true, p));
+        }
+        report_type(&st.name, &impls, &keys, errors);
+    }
+
+    for en in &program.enums {
+        let bounds: Vec<String> = en
+            .constraints
+            .iter()
+            .filter(|c| c.param == en.name)
+            .flat_map(|c| c.bounds.iter().cloned())
+            .collect();
+        if bounds.is_empty() {
+            continue;
+        }
+        let keys = conflicting_default_keys(&bounds, index);
+        if keys.is_empty() {
+            continue;
+        }
+        let mut impls: HashSet<MemberKey> = HashSet::new();
+        for f in program
+            .functions
+            .iter()
+            .filter(|f| owner_name(&f.name) == Some(en.name.as_str()))
+        {
+            let b = f.name.rsplit('.').next().unwrap_or(&f.name).to_string();
+            let p = effective_param_types(&f.params);
+            impls.insert((b.clone(), false, p.clone()));
+            impls.insert((b, true, p));
+        }
+        for prop in &en.props {
+            if prop.getter.is_some() {
+                let b = format!("__get_{}", prop.name);
+                impls.insert((b.clone(), false, vec![]));
+                impls.insert((b, true, vec![]));
+            }
+            if prop.setter.is_some() {
+                let b = format!("__set_{}", prop.name);
+                impls.insert((b.clone(), false, vec![prop.ty.clone()]));
+                impls.insert((b, true, vec![prop.ty.clone()]));
+            }
+        }
+        report_type(&en.name, &impls, &keys, errors);
+    }
+}
+
+// ─── 6.2.2.2(7)：不得通过 super 访问接口默认实现 ─────────────────────────
+
+/// 收集一组接口（含传递父接口）中带默认实现的成员显示名集合
+/// （属性访问器还原为属性名）。
+fn collect_iface_default_display_names<'a>(
+    names: &[String],
+    index: &ProgramIndex<'a>,
+    out: &mut HashSet<String>,
+    seen: &mut HashSet<String>,
+) {
+    for n in names {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        let Some(iface) = index.interfaces.get(n.as_str()) else {
+            continue;
+        };
+        for m in &iface.methods {
+            if m.default_body.is_none() {
+                continue;
+            }
+            let base = m.name.rsplit('.').next().unwrap_or(&m.name);
+            let shown = base
+                .strip_prefix("__get_")
+                .or_else(|| base.strip_prefix("__set_"))
+                .unwrap_or(base);
+            out.insert(shown.to_string());
+        }
+        collect_iface_default_display_names(&iface.parents, index, out, seen);
+    }
+}
+
+/// 6.2.2.2(7)：接口默认实现不属于继承结构，不能用 `super.f()` / `super.p`
+/// 访问。仅当类型没有父类（class 的 extends 不是类，或为 struct/enum）时，
+/// 只要被访问的成员由某父接口的默认实现提供即报错。
+fn check_super_interface_default(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let report = |owner: &str, member: &str, errors: &mut Vec<SemanticError>| {
+        errors.push(SemanticError {
+            message: format!(
+                "类型 '{}' 不能通过 'super.{}' 访问接口默认实现（6.2.2.2(7)）",
+                owner, member
+            ),
+        });
+    };
+
+    for cls in &program.classes {
+        // 存在父类时 super 解析到父类，保守跳过。
+        if cls
+            .extends
+            .as_deref()
+            .map_or(false, |e| index.classes.contains_key(e))
+        {
+            continue;
+        }
+        let mut iface_names: Vec<String> = Vec::new();
+        if let Some(e) = cls.extends.as_deref() {
+            if index.interfaces.contains_key(e) {
+                iface_names.push(e.to_string());
+            }
+        }
+        iface_names.extend(cls.implements.iter().cloned());
+        let mut names: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        collect_iface_default_display_names(&iface_names, index, &mut names, &mut seen);
+        if names.is_empty() {
+            continue;
+        }
+        let mut hits: Vec<String> = Vec::new();
+        let mut collect = |stmts: &[Stmt]| {
+            walk_stmts(stmts, &mut |e| match e {
+                Expr::SuperCall { method, .. } if method != "init" => {
+                    let base = method.rsplit('.').next().unwrap_or(method);
+                    if names.contains(base) {
+                        hits.push(base.to_string());
+                    }
+                }
+                Expr::SuperFieldAccess { field } => {
+                    if names.contains(field.as_str()) {
+                        hits.push(field.clone());
+                    }
+                }
+                _ => {}
+            });
+        };
+        for m in &cls.methods {
+            collect(&m.func.body);
+        }
+        for init in &cls.inits {
+            collect(&init.body);
+        }
+        hits.sort();
+        hits.dedup();
+        for h in hits {
+            report(&cls.name, &h, errors);
+        }
+    }
+
+    // 子接口 override/redef 中通过 super 访问父接口默认实现。
+    for iface in &program.interfaces {
+        let mut names: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        collect_iface_default_display_names(&iface.parents, index, &mut names, &mut seen);
+        if names.is_empty() {
+            continue;
+        }
+        let mut hits: Vec<String> = Vec::new();
+        for m in &iface.methods {
+            if let Some(body) = &m.default_body {
+                walk_stmts(body, &mut |e| match e {
+                    Expr::SuperCall { method, .. } if method != "init" => {
+                        let base = method.rsplit('.').next().unwrap_or(method);
+                        if names.contains(base) {
+                            hits.push(base.to_string());
+                        }
+                    }
+                    Expr::SuperFieldAccess { field } => {
+                        if names.contains(field.as_str()) {
+                            hits.push(field.clone());
+                        }
+                    }
+                    _ => {}
+                });
+            }
+        }
+        hits.sort();
+        hits.dedup();
+        for h in hits {
+            report(&iface.name, &h, errors);
+        }
+    }
+
+    for (owner, iface_names, bodies) in super_scan_targets(program) {
+        let mut names: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        collect_iface_default_display_names(&iface_names, index, &mut names, &mut seen);
+        if names.is_empty() {
+            continue;
+        }
+        let mut hits: Vec<String> = Vec::new();
+        for body in bodies {
+            walk_stmts(body, &mut |e| match e {
+                Expr::SuperCall { method, .. } if method != "init" => {
+                    let base = method.rsplit('.').next().unwrap_or(method);
+                    if names.contains(base) {
+                        hits.push(base.to_string());
+                    }
+                }
+                Expr::SuperFieldAccess { field } => {
+                    if names.contains(field.as_str()) {
+                        hits.push(field.clone());
+                    }
+                }
+                _ => {}
+            });
+        }
+        hits.sort();
+        hits.dedup();
+        for h in hits {
+            report(&owner, &h, errors);
+        }
+    }
+}
+
+/// 收集 struct/enum 的 (类型名, 父接口名列表, 函数体列表)。
+fn super_scan_targets<'a>(program: &'a Program) -> Vec<(String, Vec<String>, Vec<&'a [Stmt]>)> {
+    let mut out = Vec::new();
+    let mut push = |name: &str, bounds: Vec<String>| {
+        let bodies: Vec<&[Stmt]> = program
+            .functions
+            .iter()
+            .filter(|f| owner_name(&f.name) == Some(name))
+            .map(|f| f.body.as_slice())
+            .collect();
+        if !bodies.is_empty() {
+            out.push((name.to_string(), bounds, bodies));
+        }
+    };
+    for st in &program.structs {
+        let bounds: Vec<String> = st
+            .constraints
+            .iter()
+            .filter(|c| c.param == st.name)
+            .flat_map(|c| c.bounds.iter().cloned())
+            .collect();
+        push(&st.name, bounds);
+    }
+    for en in &program.enums {
+        let bounds: Vec<String> = en
+            .constraints
+            .iter()
+            .filter(|c| c.param == en.name)
+            .flat_map(|c| c.bounds.iter().cloned())
+            .collect();
+        push(&en.name, bounds);
+    }
+    out
+}
+
 // ── 2.1.10.2 结构体构造器语义规则 ────────────────────────────────────────
 //
 // 结构体主构造函数（`StructName(...) { ... }`）与 `init` 构造函数的文法/语义
@@ -14256,8 +15079,9 @@ main() {}"#,
         assert_valid("foreign func f(cb: CFunc<(Int32)->Int32>): Unit\nmain() {}");
         // 无显式返回类型（隐式 Unit）应保持兼容（既有代码依赖）。
         assert_valid("foreign func f(x: Int32)\nmain() {}");
-        // @C struct 与本地无法判定的具名类型（struct）保守放行。
-        assert_valid("struct S { let x: Int32 }\nforeign func f(p: S): S\nmain() {}");
+        // @C struct 可作 foreign 签名类型；非 @C 本地 struct 按规范 13.1.3.1 拒绝（w13c 收敛）。
+        assert_valid("@C struct S { let x: Int32 }\nforeign func f(p: S): S\nmain() {}");
+        assert_invalid("struct S { let x: Int32 }\nforeign func f(p: S): S\nmain() {}");
         // VArray 在解析阶段降级为 Array，须放行以免误伤合法形参。
         assert_valid("foreign func f(a: VArray<Int32, $3>): Unit\nmain() {}");
     }
@@ -15379,6 +16203,97 @@ main() {}"#,
         assert_invalid("interface ABC <: CType {}\nmain() {}");
         // 泛型约束 `where T <: CType` 仍合法。
         assert_valid("class D<T> where T <: CType {}\nmain() {}");
+    }
+
+
+    // ─── w13d：This 返回类型函数体与覆写规则（6.1.4(2)/(7)） ─────────────
+
+    #[test]
+    fn test_w13d_this_return_body() {
+        // 只能返回 this 或返回 This 的函数调用。
+        assert_valid("class A {\n func f(): This { this }\n}\nmain() {}");
+        assert_valid("class A {\n func f(): This { return this }\n}\nmain() {}");
+        assert_valid("class A {\n func g(): This { this }\n func f(): This { g() }\n}\nmain() {}");
+        // 空体 / 字面量 / 普通构造 非法。
+        assert_invalid("class A {\n func f(): This { }\n}\nmain() {}");
+        assert_invalid("class A {\n func f(): This { 1 }\n}\nmain() {}");
+        assert_invalid("class A {\n func f(): This { A() }\n}\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_w13d_this_override_return() {
+        // 覆写返回 This 的父函数时返回类型必须保持 This。
+        assert_invalid(
+            "open class A {\n open func f(): This { this }\n}\nclass B <: A {\n func f(): A { this }\n}\nmain() {}",
+        );
+        assert_valid(
+            "open class A {\n open func f(): This { this }\n}\nclass B <: A {\n override func f(): This { this }\n}\nmain() {}",
+        );
+    }
+
+
+    // ─── w13d：无 body 的接口 static 函数不可调用（6.2.2.1(8)/(10)） ─────
+
+    #[test]
+    fn test_w13d_abstract_static_iface_call() {
+        // 直接通过接口名调用抽象 static：非法。
+        assert_invalid(
+            "interface I {\n static func f(): Unit\n static func g() { I.f() }\n}\nmain() {}",
+        );
+        // 间接：I.g() 在 main 中调用，g 内无资格调用抽象 f：非法。
+        assert_invalid(
+            "interface I {\n static func f(): Unit\n static func g() { f() }\n}\nmain() { I.g() }",
+        );
+        // 有实现体则合法。
+        assert_valid(
+            "interface I {\n static func f() {}\n static func g() { f() }\n}\nmain() { I.g() }",
+        );
+    }
+
+
+    // ─── w13d：多父接口同名默认实现冲突（6.2.3.1(6)/6.2.4.1(9)） ─────────
+
+    #[test]
+    fn test_w13d_iface_default_conflict() {
+        // 子接口未提供新的默认实现：非法。
+        assert_invalid(
+            "interface I1 {\n func f() {}\n}\ninterface I2 {\n func f() {}\n}\ninterface J <: I1 & I2 {}\nmain() {}",
+        );
+        // 子接口提供默认实现：合法。
+        assert_valid(
+            "interface I1 {\n func f() {}\n}\ninterface I2 {\n func f() {}\n}\ninterface J <: I1 & I2 {\n func f() {}\n}\nmain() {}",
+        );
+        // 参数列表不同不构成冲突。
+        assert_valid(
+            "interface I1 {\n func f() {}\n}\ninterface I2 {\n func f(a: Int32) {}\n}\ninterface J <: I1 & I2 {}\nmain() {}",
+        );
+    }
+
+
+    #[test]
+    fn test_w13d_type_default_conflict() {
+        // 类型未自行实现两个父接口的同一默认成员：非法。
+        assert_invalid(
+            "interface I1 {\n func f() {}\n}\ninterface I2 {\n func f() {}\n}\nclass A <: I1 & I2 {}\nmain() {}",
+        );
+        // 自行实现：合法。
+        assert_valid(
+            "interface I1 {\n func f() {}\n}\ninterface I2 {\n func f() {}\n}\nclass A <: I1 & I2 {\n public func f() {}\n}\nmain() {}",
+        );
+    }
+
+
+    // ─── w13d：不得通过 super 访问接口默认实现（6.2.2.2(7)） ─────────────
+
+    #[test]
+    fn test_w13d_super_iface_default() {
+        assert_invalid(
+            "interface I {\n func f() { 1 }\n}\ninterface J <: I {\n override func f() { super.f() }\n}\nmain() {}",
+        );
+        assert_valid(
+            "interface I {\n func f() { 1 }\n}\ninterface J <: I {\n override func f() { 1 }\n}\nmain() {}",
+        );
     }
 
 }
