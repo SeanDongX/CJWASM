@@ -1559,6 +1559,11 @@ pub fn monomorphize_program(program: &mut Program) {
             type_params: vec![],
             constraints: vec![],
             fields,
+            inits: def.inits.clone(),
+            primary_ctor_params: def.primary_ctor_params.clone(),
+            primary_ctor_member_flags: def.primary_ctor_member_flags.clone(),
+            has_primary_ctor: def.has_primary_ctor,
+            primary_ctor_visibility: def.primary_ctor_visibility.clone(),
         });
     }
     program.structs.append(&mut new_structs);
@@ -2052,7 +2057,15 @@ mod tests {
                         is_mut: true,
                     },
                 ],
-            }],
+            
+            inits: vec![],
+            primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+}],
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
@@ -2110,7 +2123,15 @@ mod tests {
                         is_mut: true,
                     },
                 ],
-            }],
+            
+            inits: vec![],
+            primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+}],
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
@@ -2163,7 +2184,15 @@ mod tests {
                     default: None,
                     is_mut: true,
                 }],
-            }],
+            
+            inits: vec![],
+            primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+}],
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
@@ -2274,7 +2303,15 @@ mod tests {
                     default: None,
                     is_mut: true,
                 }],
-            }],
+            
+            inits: vec![],
+            primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+}],
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
@@ -2447,7 +2484,15 @@ mod tests {
                         is_mut: true,
                     },
                 ],
-            }],
+            
+            inits: vec![],
+            primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+}],
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
@@ -2672,7 +2717,15 @@ mod tests {
                     default: None,
                     is_mut: true,
                 }],
-            }],
+            
+            inits: vec![],
+            primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+}],
             interfaces: vec![],
             classes: vec![],
             enums: vec![],

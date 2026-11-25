@@ -482,6 +482,18 @@ pub struct StructDef {
     /// 类型约束
     pub constraints: Vec<TypeConstraint>,
     pub fields: Vec<FieldDef>,
+    /// 全部构造函数（按声明顺序；主构造函数展开为首项）。
+    /// 语义校验（2.1.10.2 结构体构造器规则）遍历 `inits`。
+    pub inits: Vec<InitDef>,
+    /// 主构造函数参数（含普通参数与成员变量参数），按声明顺序。
+    pub primary_ctor_params: Vec<Param>,
+    /// 主构造函数参数是否为成员变量参数（`let`/`var` 前缀，或带可见性前缀），
+    /// 与 `primary_ctor_params` 一一对应。
+    pub primary_ctor_member_flags: Vec<bool>,
+    /// 是否定义了主构造函数（`StructName(...) { ... }`）。
+    pub has_primary_ctor: bool,
+    /// 主构造函数的可访问性修饰符（无修饰符时为 internal）。
+    pub primary_ctor_visibility: Visibility,
 }
 
 impl StructDef {
