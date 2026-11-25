@@ -870,6 +870,13 @@ struct Checker<'a> {
     /// 延迟赋值 `let` 的初值赋值状态：0=尚未赋值，1=可能已赋值（条件分支内），
     /// 2=确定已赋值（直线代码）。再次的直线赋值视为非法重赋值。
     deferred_state: HashMap<String, u8>,
+    /// 当前嵌套的字符串插值深度（>0 表示正在检查 `${...}` 内的表达式）。
+    ///
+    /// 插值内容由 lexer 抽出的表达式文本独立解析，不存在“解析器跨行合并语句”
+    /// 造成的 AST 歧义，因此可在此上下文收紧二元运算的类型规则：
+    /// Bool 参与算术、String 与非 String/Rune 的 `+`、以及返回类型可静态确定的
+    /// 函数调用操作数，都可安全参与判定。非插值上下文保持原有保守行为不变。
+    interp_depth: usize,
 }
 
 /// 泛型定义的类型参数与约束（实例化约束检查用）。
@@ -1681,6 +1688,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         known_funcs,
         cond_depth: 0,
         deferred_state: HashMap::new(),
+        interp_depth: 0,
     };
 
     // 结构体方法被脱糖为 `StructName.method` 顶层函数：为其注入实例字段作用域，
@@ -3564,6 +3572,85 @@ impl<'a> Checker<'a> {
             Expr::Binary { op, left, right } if is_comparison_op(op) => {
                 self.operand_known(left) && self.operand_known(right)
             }
+            _ => false,
+        }
+    }
+
+    /// 插值上下文：登记块内局部函数的返回类型，供 `call_return_ty` 解析。
+    ///
+    /// 返回 `(函数名, 旧返回值)` 列表，供 [`Self::restore_interp_local_funcs`] 还原。
+    /// 仅当 `interp_depth > 0` 时登记；非插值块不修改 `self.funcs`。
+    ///
+    /// 返回类型来源：
+    /// - 显式标注 `: T`；
+    /// - 无标注但函数体是单一 `return <形参名>` 时，取该形参的声明类型
+    ///   （覆盖 `func getU8(p:UInt8) { return p; }` 这类插值内定义）。
+    /// 其余情形不登记，调用结果保持未知（保守放行）。
+    fn register_interp_local_funcs(&mut self, stmts: &[Stmt]) -> Vec<(String, Option<Ty>)> {
+        let mut saved: Vec<(String, Option<Ty>)> = Vec::new();
+        if self.interp_depth == 0 {
+            return saved;
+        }
+        // 先收集（不可变借用），再写入（可变借用），避免借用冲突。
+        let mut entries: Vec<(String, Ty)> = Vec::new();
+        for s in stmts {
+            if let Stmt::LocalFunc(f) = s {
+                if let Some(rt) = &f.return_type {
+                    entries.push((f.name.clone(), self.ty_of_ann(rt)));
+                    continue;
+                }
+                // 无标注：`func f(p: T) { return p; }` → T
+                if let [Stmt::Return(Some(Expr::Var(ret_name)))] = f.body.as_slice() {
+                    if let Some(p) = f.params.iter().find(|p| &p.name == ret_name) {
+                        entries.push((f.name.clone(), self.ty_of_ann(&p.ty)));
+                    }
+                }
+            }
+        }
+        for (name, ty) in entries {
+            let old = self.funcs.insert(name.clone(), ty);
+            saved.push((name, old));
+        }
+        saved
+    }
+
+    /// 还原 [`Self::register_interp_local_funcs`] 对 `self.funcs` 的临时修改。
+    fn restore_interp_local_funcs(&mut self, saved: Vec<(String, Option<Ty>)>) {
+        for (name, old) in saved.into_iter().rev() {
+            match old {
+                Some(t) => {
+                    self.funcs.insert(name, t);
+                }
+                None => {
+                    self.funcs.remove(&name);
+                }
+            }
+        }
+    }
+
+    /// 插值上下文专用的“可信操作数”判定（比 `definite_operand` 多接受返回类型
+    /// 可静态确定的内建函数调用）。
+    ///
+    /// 只在 `interp_depth > 0` 时用于放宽二元运算的操作数门槛。所有形态都要求
+    /// 类型可静态确定且为内建基础类型（`is_prim`），用户类型/泛型/未知类型一律
+    /// 视为不可信，从而不会引入非建类型规则之外的误判。
+    fn interp_trusted_operand(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Integer(_)
+            | Expr::IntegerSuffixed(_, _)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Bool(_)
+            | Expr::Rune(_)
+            | Expr::String(_) => true,
+            Expr::Var(name) => self.lookup(name).map(|v| v.ty.is_prim()).unwrap_or(false),
+            Expr::Unary { expr, .. } => self.interp_trusted_operand(expr),
+            Expr::Binary { left, right, .. } => {
+                self.interp_trusted_operand(left) && self.interp_trusted_operand(right)
+            }
+            Expr::Call { name, type_args, .. } => self
+                .call_return_ty(name, type_args.as_deref())
+                .is_prim(),
             _ => false,
         }
     }
@@ -5897,11 +5984,17 @@ impl<'a> Checker<'a> {
             // 检查（1.3.6(4)/(9)：插值内容为表达式）。此前直接返回 String 而
             // 不递归，导致插值内的类型/溢出错误被放行。
             Expr::Interpolate(parts) => {
+                // 字符串插值 `${expr}` 内的表达式按同一套类型规则检查（1.3.6(4)/(9)）。
+                // 插值内容是独立解析出来的表达式文本，不存在“解析器跨行合并语句”
+                // 的歧义，故可适度收紧：`interp_depth` 用于让二元运算在此上下文
+                // 跳过 Bool 保守回避、并对 String 拼接与已知返回类型的调用应用规则。
+                self.interp_depth += 1;
                 for p in parts {
                     if let crate::ast::InterpolatePart::Expr(e) = p {
                         self.check_expr(e);
                     }
                 }
+                self.interp_depth -= 1;
                 Ty::String
             }
             Expr::String(_) => Ty::String,
@@ -6004,6 +6097,15 @@ impl<'a> Checker<'a> {
                 } else {
                     simple_operand(left) && simple_operand(right)
                 };
+                // 字符串插值内（`${...}`）：表达式由 lexer 抽出的文本独立解析，
+                // 不存在跨行合并歧义，可放宽操作数形态门槛——把“函数调用且返回
+                // 类型可静态确定”的形态也纳入检查，从而覆盖官方 1.3.6(4) 中
+                // `getChar(..) + getBool(..)` 这类不同类型调用拼接的负例。
+                // 仅在原本门槛不通过、且处于插值时启用，非插值行为完全不变。
+                let gate_ok = gate_ok
+                    || (self.interp_depth > 0
+                        && self.interp_trusted_operand(left)
+                        && self.interp_trusted_operand(right));
                 if !gate_ok {
                     return binary_result_no_check(op, &lt, &rt);
                 }
@@ -6274,6 +6376,10 @@ impl<'a> Checker<'a> {
 
             Expr::Block(stmts, trailing) => {
                 self.scopes.push(HashMap::new());
+                // 插值内的块（`${ func f():T {...}; ...; expr }`）可能声明局部函数，
+                // 其返回类型可用于推断后续表达式中的调用结果。仅插值上下文登记，
+                // 非插值处的局部函数登记会改变其它章节的行为，故不启用。
+                let saved_local_funcs = self.register_interp_local_funcs(stmts);
                 for s in stmts {
                     self.check_stmt(s);
                 }
@@ -6281,6 +6387,7 @@ impl<'a> Checker<'a> {
                     Some(e) => self.check_expr(e),
                     None => Ty::Unknown,
                 };
+                self.restore_interp_local_funcs(saved_local_funcs);
                 self.scopes.pop();
                 t
             }
@@ -7482,7 +7589,10 @@ impl<'a> Checker<'a> {
             op,
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
         ) && (*lt == Ty::Bool || *rt == Ty::Bool);
-        if bool_in_numeric_op {
+        // 非插值上下文：Bool 参与算术通常源于解析器跨行合并（语法正例），保守跳过。
+        // 插值上下文：表达式独立解析，无此歧义，继续走下方规则报出非法类型
+        // （如 `boolVar + uint16Var`、`charVar + boolVar`）。
+        if bool_in_numeric_op && self.interp_depth == 0 {
             return Ty::Unknown;
         }
 
@@ -7491,6 +7601,12 @@ impl<'a> Checker<'a> {
                 // 只要任一侧为 String 即按字符串拼接处理（仓颉允许
                 // String 与其它可显示类型的拼接），不再限制另一侧类型。
                 if *op == BinOp::Add && (*lt == Ty::String || *rt == Ty::String) {
+                    // 插值上下文：`String + x` 仅接受 String / Rune，其余内建类型
+                    // 拼接非法（官方 1.3.6(4) 负例：String 与 Int32/Bool/UInt64/
+                    // Float 等拼接）。非内建类型（用户类型/泛型/未知）保守放行。
+                    if self.interp_depth > 0 {
+                        self.check_interp_string_concat(lt, rt);
+                    }
                     return Ty::String;
                 }
                 // 仓颉 std.core 为 String 提供了 `operator func *(n: Int64): String`
@@ -7715,6 +7831,24 @@ impl<'a> Checker<'a> {
                 bin_symbol(op),
                 rv,
                 lt.name()
+            ));
+        }
+    }
+
+    /// 插值上下文：`String` 与另一操作数的 `+` 拼接仅接受 `String` / `Rune`。
+    ///
+    /// 仓颉 std.core 的 String 只定义了 `operator func +(String)` 与
+    /// `operator func +(Rune)`，因此 `String + Int32/Bool/UInt64/Float..` 非法
+    /// （官方 01_03_06 a04 负例）。保守约束：仅在另一侧为可静态确定的**内建**
+    /// 类型时才报错；用户类型/泛型/未知类型维持放行，避免误伤依赖 ToString
+    /// 或用户重载的写法。
+    fn check_interp_string_concat(&mut self, lt: &Ty, rt: &Ty) {
+        let other = if *lt == Ty::String { rt } else { lt };
+        if other.is_prim() && *other != Ty::String && *other != Ty::Rune {
+            self.err(format!(
+                "字符串拼接运算符 '+' 的操作数类型不匹配: {} 与 {}（String 仅能与 String 或 Rune 拼接）",
+                lt.name(),
+                rt.name()
             ));
         }
     }
@@ -10544,5 +10678,109 @@ mod tests {
         // 单范围切片仍合法。
         assert_ok("main() { var arr = [1,2,3]\n let s = arr[0..2]\n return }");
         assert_ok("main() { var arr = [1,2,3]\n let s = arr[..2]\n return }");
+    }
+
+    // ─── w16c：字符串插值内的类型检查（1.3.6(4)/(9)） ────────────────
+    //
+    // 插值 `${expr}` 的内容独立解析，无跨行合并歧义，故可在此上下文收紧：
+    // String 拼接仅接受 String/Rune，Bool 参与算术非法，返回类型可静态确定的
+    // 内建函数调用/插值内局部函数也纳入二元运算判定。非插值上下文行为不变。
+
+    #[test]
+    fn test_w16c_interp_string_concat_rejected() {
+        // String 与内建非 String/Rune 类型的 `+` 非法。
+        assert_err(
+            "main() { let sv = \"x\"\n let bv = true\n let r = \"${sv + bv}\" }",
+            "字符串拼接",
+        );
+        assert_err(
+            "main() { let sv = \"x\"\n let iv: Int32 = 1\n let r = \"${sv + iv}\" }",
+            "字符串拼接",
+        );
+        assert_err(
+            "main() { let sv = \"x\"\n let uv: UInt64 = 10\n let r = \"${sv + uv}\" }",
+            "字符串拼接",
+        );
+        assert_err(
+            "main() { let sv = \"x\"\n let fv: Float32 = 1.5\n let r = \"${sv + fv}\" }",
+            "字符串拼接",
+        );
+    }
+
+    #[test]
+    fn test_w16c_interp_string_concat_ok() {
+        // String 与 String / Rune 拼接合法。
+        assert_ok("main() { let a = \"x\"\n let b = \"y\"\n let r = \"${a + b}\" }");
+        assert_ok("main() { let a = \"x\"\n let c: Rune = r'a'\n let r = \"${a + c}\" }");
+        // 非插值上下文的 String 拼接行为保持不变（不新引入拒绝）。
+        assert_ok("main() { let a = \"x\"\n let b = \"y\"\n let r = a + b }");
+    }
+
+    #[test]
+    fn test_w16c_interp_bool_arith_rejected() {
+        // Bool 参与算术/幂运算非法（插值内不再保守跳过）。
+        assert_err(
+            "main() { let bv = true\n let uv: UInt16 = 5\n let r = \"${bv + uv}\" }",
+            "数值类型",
+        );
+        assert_err(
+            "main() { let cv: Rune = r'a'\n let bv = true\n let r = \"${cv + bv}\" }",
+            "数值类型",
+        );
+        assert_err(
+            "main() { let bv = false\n let iv: Int32 = 101\n let r = \"${bv * iv}\" }",
+            "数值类型",
+        );
+    }
+
+    #[test]
+    fn test_w16c_interp_mixed_int_rejected() {
+        // 插值内不同宽度/符号的整型混合运算非法。
+        assert_err(
+            "main() { let i: Int8 = 1\n let u: UInt8 = 2\n let r = \"${i - u}\" }",
+            "操作数类型不匹配",
+        );
+        assert_err(
+            "main() { let i: Int16 = 1\n let u: UInt16 = 2\n let r = \"${i + u}\" }",
+            "操作数类型不匹配",
+        );
+        // 同类型仍通过。
+        assert_ok("main() { let i: Int8 = 1\n let j: Int8 = 2\n let r = \"${i + j}\" }");
+    }
+
+    #[test]
+    fn test_w16c_interp_call_return_types() {
+        // 顶层函数调用（返回类型可静态确定）在插值内参与二元运算判定。
+        let src = "func getString(p: String): String { return p }\n\
+                   func getBool(p: Bool): Bool { return p }\n\
+                   main() { let sv = \"x\"\n let bv = true\n let r = \"${getString(sv) + getBool(bv)}\" }";
+        assert_err(src, "字符串拼接");
+        // 返回值同类型可拼接。
+        let ok = "func getStr(p: String): String { return p }\n\
+                  main() { let sv = \"x\"\n let r = \"${getStr(sv) + getStr(sv)}\" }";
+        assert_ok(ok);
+    }
+
+    #[test]
+    fn test_w16c_interp_local_func_return_types() {
+        // 插值内局部函数：显式标注返回类型。
+        assert_err(
+            "main() { let r = \"${func gi(p: Int8): Int8 { return p }; func gu(p: UInt8): UInt8 { return p }; gi(1) - gu(2)}\" }",
+            "操作数类型不匹配",
+        );
+        // 无标注但体为 `return <形参>`：按形参类型推断。
+        assert_err(
+            "main() { let r = \"${func gi(p: Int8) { return p }; func gu(p: UInt8) { return p }; gi(1) - gu(2)}\" }",
+            "操作数类型不匹配",
+        );
+        // 局部函数返回 Bool 与 String 拼接。
+        assert_err(
+            "main() { let sv = \"x\"\n let bv = true\n let r = \"${func gb(p: Bool): Bool { return p }; sv + gb(bv)}\" }",
+            "字符串拼接",
+        );
+        // 同类型局部函数相加合法。
+        assert_ok(
+            "main() { let r = \"${func gi(p: Int8) { return p }; gi(1) + gi(2)}\" }",
+        );
     }
 }
