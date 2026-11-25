@@ -34,6 +34,12 @@ pub struct Parser {
     no_trailing_lambda: bool,
     /// 当前是否在静态方法体内（静态方法不能使用 super）
     in_static_method: bool,
+    /// 上一次 `skip_optional_attributes` 是否跳过了 `@C` 属性（13.1.2.1(3)）。
+    last_attr_c: bool,
+    /// 顶层声明是否带 `@C`（由属性跳过逻辑置位，供声明分派消费）。
+    pending_c_decl: bool,
+    /// 本文件中带 `@C` 的结构体名（用于字段 CType 约束校验）。
+    c_structs: std::collections::HashSet<String>,
 }
 
 impl Parser {
@@ -51,6 +57,9 @@ impl Parser {
             allow_wildcard_expr: false,
             no_trailing_lambda: false,
             in_static_method: false,
+            last_attr_c: false,
+            pending_c_decl: false,
+            c_structs: std::collections::HashSet::new(),
         }
     }
 
@@ -126,6 +135,54 @@ impl Parser {
 
     fn peek_at(&self, offset: usize) -> Option<&Token> {
         self.tokens.get(self.pos + offset).map(|(_, t, _)| t)
+    }
+
+    /// `@C` 顶层声明合法形态检查（13.1.2.1(3)）。
+    ///
+    /// `@C` 只能修饰：foreign 函数、非泛型顶层函数、非泛型顶层结构体。
+    /// 返回违规目标的描述（供错误信息），合法或无法判定时返回 `None`。
+    fn c_attr_decl_violation(&self) -> Option<&'static str> {
+        let mut i = 0usize;
+        while matches!(
+            self.peek_at(i),
+            Some(Token::Public)
+                | Some(Token::Private)
+                | Some(Token::Protected)
+                | Some(Token::Internal)
+                | Some(Token::Open)
+                | Some(Token::Abstract)
+                | Some(Token::Sealed)
+                | Some(Token::Static)
+                | Some(Token::Unsafe)
+        ) {
+            i += 1;
+        }
+        match self.peek_at(i)? {
+            Token::Foreign => None,
+            Token::Func | Token::Struct => {
+                let mut j = i + 1;
+                if matches!(self.peek_at(j), Some(Token::Ident(_))) {
+                    j += 1;
+                }
+                if matches!(self.peek_at(j), Some(Token::Lt)) {
+                    if matches!(self.peek_at(i), Some(Token::Func)) {
+                        Some("泛型函数")
+                    } else {
+                        Some("泛型结构体")
+                    }
+                } else {
+                    None
+                }
+            }
+            Token::Macro => Some("macro 定义"),
+            Token::Class => Some("class 定义"),
+            Token::Interface => Some("interface 定义"),
+            Token::Enum => Some("enum 定义"),
+            Token::Extend => Some("extend 定义"),
+            Token::TypeAlias => Some("类型别名"),
+            Token::Var | Token::Let | Token::Const => Some("变量定义"),
+            _ => None,
+        }
     }
 
     /// 将当前 token 作为标识符消费（允许部分关键字在标识符位置出现）
@@ -460,12 +517,17 @@ impl Parser {
     fn skip_optional_attributes(&mut self) -> Result<bool, ParseErrorAt> {
         use crate::lexer::StringOrInterpolated;
         let mut should_skip_next = false;
+        self.last_attr_c = false;
         while self.check(&Token::At) {
             self.advance(); // @
             let attr_name = match self.advance_ident() {
                 Some(n) => n,
                 None => return self.bail_at(ParseError::UnexpectedEof, self.at_prev()),
             };
+            // 记录 `@C`：其合法目标有限（13.1.2.1(3)），由各声明上下文校验。
+            if attr_name == "C" || attr_name == "c" {
+                self.last_attr_c = true;
+            }
             if self.check(&Token::LBracket) {
                 self.advance();
                 // For @When[...], collect tokens to evaluate the condition
@@ -2229,9 +2291,11 @@ mod tests {
 
     #[test]
     fn test_p_extend_prop_getter_setter() {
+        // 7.1(4)：内建数值类型不允许 mut 属性，故改用本地类验证 getter/setter 解析。
         let source = r#"
-            extend Int64 {
-                prop doubled: Int64 { get() { this * 2 } set(_) { } }
+            class C {}
+            extend C {
+                mut prop doubled: Int64 { get() { 0 } set(_) { } }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3267,6 +3331,8 @@ mod tests {
 
     #[test]
     fn test_pf_extend_override_static() {
+        // 8.2：扩展成员不支持 open/override/redef 修饰符。此用例历史上被宽松
+        // 放行以接纳示例代码，现按规范拒绝（见 decl 中扩展成员修饰符校验）。
         let source = r#"
             struct T { x: Int64 }
             extend T {
@@ -3276,8 +3342,7 @@ mod tests {
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
-        let program = parser.parse_program().unwrap();
-        assert!(!program.extends.is_empty());
+        assert!(parser.parse_program().is_err());
     }
 
     #[test]
