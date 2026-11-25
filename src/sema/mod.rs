@@ -360,6 +360,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 3.2.3.3(1)：类型的成员名仅在类型内部可见；顶层自由函数不能无资格引用
     // 其它类型的字段/方法（保守版，只检查自由函数体的直接引用）。
     check_unqualified_member_refs_in_free_fns(program, &mut errors);
+    // 3.2.3.2：自由函数体中引用本文件任何作用域都无法解析的裸变量名。
+    // 仅在无 import 的单文件程序上启用（导入依赖无法静态确定），确保 std 零回归。
+    check_undefined_identifiers(program, &mut errors);
     // 5.1.2 / 5.3.4：形参声明顺序、默认值必须是命名参数、默认值静态作用域、
     // 变长形参位置，以及接口/open/abstract/运算符函数不能有可选参数。
     check_function_param_rules(program, &mut errors);
@@ -2276,6 +2279,298 @@ fn check_unqualified_member_refs_in_free_fns(
                 }
             }
         }
+    }
+}
+
+/// 3.2.3.2：自由函数体中引用了文件中**任何作用域都无法解析**的裸变量名。
+///
+/// 本编译器不做真实导入解析（vendor/import 依赖无法静态确定），因此仅在
+/// **完全没有 import** 的单文件程序上启用，且只检查“裸变量引用”
+/// （`Expr::Var`），不检查函数调用名、类型名、成员名——后者由导入/成员规则
+/// 或其它检查负责。命名集合采用“整函数体声明名 + 形参 + 顶层名”的过近似，
+/// 只用于避免误报，确保 std / 正测试零误伤。
+///
+/// 首字母大写的名字按约定视为类型/隐式导入符号（如 unittest 的 `Configuration`、
+/// `KeyOpt`、`Thread`、`TestSuite`），一律放行；本检查只针对变量形态（小写或
+/// 下划线开头）的裸引用，进一步收敛误报面。
+fn check_undefined_identifiers(program: &Program, errors: &mut Vec<SemanticError>) {
+    if !program.imports.is_empty() {
+        return;
+    }
+    let globals = collect_global_identifiers(program);
+    let members = collect_file_member_names(program);
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") || f.body.is_empty() {
+            continue;
+        }
+        let mut declared: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        declared.extend(globals.iter().cloned());
+        collect_block_local_names(&f.body, &mut declared);
+        let mut reported: HashSet<String> = HashSet::new();
+        for s in &f.body {
+            let mut refs = Vec::new();
+            collect_bare_var_refs_stmt(s, &mut refs);
+            for r in refs {
+                if declared.contains(&r) || members.contains(&r) || is_prelude_identifier(&r) {
+                    continue;
+                }
+                // 首字母大写：约定为类型 / 隐式导入符号，保守放行；但大小写变体的
+                // 布尔字面量（`True`/`False`）仍属未定义标识符。
+                if r.chars().next().map_or(false, |c| c.is_uppercase())
+                    && !matches!(r.to_lowercase().as_str(), "true" | "false")
+                {
+                    continue;
+                }
+                if reported.insert(r.clone()) {
+                    errors.push(SemanticError {
+                        message: format!("未定义的标识符 '{}'（3.2.3.2）", r),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 预置（prelude）标识符：语言核心类型与常用内建函数名。这些名字无需 import
+/// 即可使用，未定义检查必须放行。
+fn is_prelude_identifier(name: &str) -> bool {
+    matches!(
+        name,
+        // 基本类型 / 核心类型名
+        "Bool" | "Rune"
+            | "String"
+            | "Unit"
+            | "Nothing"
+            | "Any"
+            | "Object"
+            | "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "IntNative"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "UIntNative"
+            | "Float16"
+            | "Float32"
+            | "Float64"
+            | "Array"
+            | "Option"
+            | "Ordering"
+            | "Range"
+            | "Iterator"
+            | "Iterable"
+            | "Collection"
+            | "ToString"
+            | "Hashable"
+            | "Equatable"
+            | "Comparable"
+            | "Less"
+            | "Greater"
+            | "Equal"
+            | "Exception"
+            | "Error"
+            | "ArithmeticException"
+            | "IllegalArgumentException"
+            | "IndexOutOfBoundsException"
+            | "NoneValueException"
+            | "OverflowException"
+            | "ClassCastException"
+            | "IllegalStateException"
+            | "NegativeArraySizeException"
+            | "OutOfMemoryError"
+            | "StackOverflowError"
+            | "CPointer"
+            | "CString"
+            | "CStr"
+            | "CFunc"
+            | "Duration"
+            // 常用内建函数 / 伪变量
+            | "print"
+            | "println"
+            | "eprint"
+            | "eprintln"
+            | "panic"
+            | "assert"
+            | "this"
+            | "super"
+            | "None"
+            | "Some"
+            | "Ok"
+            | "Err"
+            | "min"
+            | "max"
+            | "abs"
+            | "sqrt"
+            | "floor"
+            | "ceil"
+            | "trunc"
+            | "nearest"
+            | "pow"
+            | "fmin"
+            | "fmax"
+    )
+}
+
+/// 收集语句中的“裸变量引用”（`Expr::Var` / 赋值目标变量），不含函数调用名。
+fn collect_bare_var_refs_stmt(stmt: &Stmt, out: &mut Vec<String>) {
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Const { value, .. } => {
+            collect_bare_var_refs_expr(value, out)
+        }
+        Stmt::Assign { target, value } => {
+            collect_bare_var_refs_expr(value, out);
+            if let AssignTarget::Var(name) = target {
+                out.push(name.clone());
+            }
+        }
+        Stmt::Expr(e) => collect_bare_var_refs_expr(e, out),
+        Stmt::Return(Some(e)) => collect_bare_var_refs_expr(e, out),
+        Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } => {
+            collect_bare_var_refs_expr(cond, out)
+        }
+        Stmt::For { iterable, .. } => collect_bare_var_refs_expr(iterable, out),
+        Stmt::WhileLet { expr, .. } => collect_bare_var_refs_expr(expr, out),
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            collect_bare_var_refs_expr(left, out);
+            collect_bare_var_refs_expr(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// 见 [`collect_bare_var_refs_stmt`]。子作用域（块 / lambda 体 / match 分支 /
+/// if 分支）中的引用不在当前位置收集，交由外层过近似声明集合兜底。
+fn collect_bare_var_refs_expr(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Var(name) => out.push(name.clone()),
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::IsType { expr, .. }
+        | Expr::Field { object: expr, .. }
+        | Expr::TupleIndex { object: expr, .. }
+        | Expr::OptionalChain { object: expr, .. } => collect_bare_var_refs_expr(expr, out),
+        Expr::Binary { left, right, .. }
+        | Expr::NullCoalesce {
+            option: left,
+            default: right,
+        } => {
+            collect_bare_var_refs_expr(left, out);
+            collect_bare_var_refs_expr(right, out);
+        }
+        Expr::Return(Some(e)) => collect_bare_var_refs_expr(e, out),
+        Expr::Index { array, index } => {
+            collect_bare_var_refs_expr(array, out);
+            collect_bare_var_refs_expr(index, out);
+        }
+        Expr::Tuple(elems) | Expr::Array(elems) => {
+            for e in elems {
+                collect_bare_var_refs_expr(e, out);
+            }
+        }
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            collect_bare_var_refs_expr(start, out);
+            collect_bare_var_refs_expr(end, out);
+            if let Some(s) = step {
+                collect_bare_var_refs_expr(s, out);
+            }
+        }
+        Expr::Call {
+            args, named_args, ..
+        }
+        | Expr::ConstructorCall {
+            args, named_args, ..
+        }
+        | Expr::SuperCall {
+            args, named_args, ..
+        } => {
+            for a in args {
+                collect_bare_var_refs_expr(a, out);
+            }
+            for (_, a) in named_args {
+                collect_bare_var_refs_expr(a, out);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            collect_bare_var_refs_expr(object, out);
+            for a in args {
+                collect_bare_var_refs_expr(a, out);
+            }
+            for (_, a) in named_args {
+                collect_bare_var_refs_expr(a, out);
+            }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields {
+                collect_bare_var_refs_expr(e, out);
+            }
+        }
+        Expr::Match { expr, .. } | Expr::IfLet { expr, .. } => {
+            collect_bare_var_refs_expr(expr, out)
+        }
+        Expr::If { cond, .. } => collect_bare_var_refs_expr(cond, out),
+        Expr::VariantConst { arg: Some(a), .. } => collect_bare_var_refs_expr(a, out),
+        Expr::SliceExpr { array, start, end } => {
+            collect_bare_var_refs_expr(array, out);
+            collect_bare_var_refs_expr(start, out);
+            collect_bare_var_refs_expr(end, out);
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                collect_bare_var_refs_expr(k, out);
+                collect_bare_var_refs_expr(v, out);
+            }
+        }
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(e) = p {
+                    collect_bare_var_refs_expr(e, out);
+                }
+            }
+        }
+        Expr::TrailingClosure { callee, args, .. } => {
+            collect_bare_var_refs_expr(callee, out);
+            for a in args {
+                collect_bare_var_refs_expr(a, out);
+            }
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            collect_bare_var_refs_expr(callee, out);
+            for a in args {
+                collect_bare_var_refs_expr(a, out);
+            }
+            for (_, a) in named_args {
+                collect_bare_var_refs_expr(a, out);
+            }
+        }
+        Expr::TryBlock { resources, .. } => {
+            for (_, e) in resources {
+                collect_bare_var_refs_expr(e, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -13205,6 +13500,51 @@ main() {}"#,
         // 10.2.4(12)：函数/元组类型不允许被 extend。
         assert_invalid("type F = (Int64) -> Int64\nextend F { func g() {} }\nmain() {}");
         assert_invalid("type T = (Int64, Int64)\nextend T { func g() {} }\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_w11b_undefined_variable_rejected() {
+        // 3.2.3.2：无法解析的裸变量引用（涉及整数字面量/后缀形近词）。
+        assert_invalid("main() {\n let a: Int8 = _0\n}");
+        assert_invalid("main() {\n let a: Int8 = i8\n}");
+        assert_invalid("main() {\n let a: Int32 = i32\n}");
+        assert_invalid("main() {\n let a: Int8 = 0-x1\n}");
+        assert_invalid("main() {\n let a: UInt64 = u64\n}");
+        // 字符串 / 字符 / 布尔字面量的错误写法（大小写变体）。
+        assert_invalid("main() {\n let s: String = incorrect_string_literal\n}");
+        assert_invalid("main() {\n let b: Bool = True\n}");
+        assert_invalid("main() {\n let b: Bool = False\n}");
+        assert_invalid("main() {\n let b = true_\n}");
+        assert_invalid("main() {\n `q`\n}");
+        // 裸变量出现在元组下标对象位置（f16.0 / e.0 / _1.0）。
+        assert_invalid("main() {\n let a: Float16 = f16.0\n}");
+        assert_invalid("main() {\n let a: Float16 = e.0\n}");
+        assert_invalid("main() {\n let a: Float16 = _1.0\n}");
+        // 二进制运算操作数。
+        assert_invalid("main() {\n x1 - 1\n}");
+    }
+
+
+    #[test]
+    fn test_w11b_undefined_scope_forms_not_rejected() {
+        // 形参、局部变量、局部函数、for 变量、顶层函数均视为已声明。
+        assert_valid("main(ina: Array<String>) {\n let z = ina.size\n}");
+        assert_valid("main() {\n let x = 1\n let y = x + 1\n}");
+        assert_valid("func f(a: Int64): Int64 { a + 1 }\nmain() {\n let r = f(2)\n}");
+        assert_valid("main() {\n func g() { 1 }\n let x = g()\n}");
+        assert_valid("main() {\n for (i in 0..10) {\n println(i)\n }\n}");
+        // 核心类型 / 内建函数是预置名。
+        assert_valid("main() {\n let a: Int64 = 1\n println(a)\n}");
+    }
+
+
+    #[test]
+    fn test_w11b_undefined_check_skipped_with_imports() {
+        // 存在 import 时不判定未定义（导入依赖无法静态确定），避免 std/正测试误伤。
+        assert_valid("import std.math.*\nmain() {\n let x = PI\n}");
+        // 首字母大写的裸名按类型/隐式导入符号放行。
+        assert_valid("main() {\n let v = KeyOpt\n}");
     }
 
 }

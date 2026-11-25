@@ -4311,6 +4311,12 @@ impl<'a> Checker<'a> {
                 step,
                 ..
             } => {
+                // 1.4(23)：范围表达式不可嵌套，`a..b..c`（解析为 `(a..b)..c`）非法。
+                if matches!(&**start, Expr::Range { .. })
+                    || matches!(&**end, Expr::Range { .. })
+                {
+                    self.err("范围表达式不能嵌套（形如 `a..b..c` 非法）".to_string());
+                }
                 self.check_expr(start);
                 self.check_expr(end);
                 if let Some(s) = step {
@@ -6666,6 +6672,7 @@ mod tests {
         assert_err("struct S { private func f() {} }\nmain() { S().f() }", "私有成员函数");
     }
 
+
     // ─── w11a-class6：06 章第五轮规则 ─────────────────────────────────────────
 
     #[test]
@@ -6686,6 +6693,7 @@ mod tests {
         assert_ok("class T { func f() {} }\nmain() { let t = T(); t.f() }");
     }
 
+
     #[test]
     fn test_w11a_instance_member_via_type_rejected() {
         // 6.1.2(4)：实例成员不能经类型名访问。
@@ -6694,6 +6702,7 @@ mod tests {
         assert_ok("class A { var a = 1 }\nmain() { let x = A(); let y = x.a }");
         assert_ok("class A { func f() {} }\nmain() { A().f() }");
     }
+
 
     #[test]
     fn test_w11a_private_member_outside_class_rejected() {
@@ -6716,6 +6725,7 @@ mod tests {
         );
         assert_ok("class A { private static func f() {} func g() { A.f() } }\nmain() {}");
     }
+
 
     #[test]
     fn test_w11a_object_constraint_prelude() {
@@ -6744,6 +6754,7 @@ mod tests {
         assert_ok("class G<T> where T <: Object {}\nmain() { let a = G<Object>() }");
     }
 
+
     #[test]
     fn test_w11a_static_generic_constraint_satisfaction() {
         // 6.1.2.4(24)：静态泛型函数显式类型实参须满足约束（含类型参数间约束）。
@@ -6759,6 +6770,7 @@ mod tests {
             "open class A {}\nclass B <: A {}\nclass Test { static func f<T1, T2>() where T1 <: T2 {} }\nmain() { Test.f<B, A>() }",
         );
     }
+
 
     #[test]
     fn test_w11a_interface_member_existence() {
@@ -6787,6 +6799,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_w11a_static_iface_instance_member_ref() {
         // 6.2.2.2(5)：interface 的 static 成员体不能直接引用实例成员。
@@ -6804,6 +6817,19 @@ mod tests {
         assert_ok(
             "interface I { static func f(): Unit\n static func g(): Unit\n static func h() { f() } }\nmain() {}",
         );
+    }
+
+
+    #[test]
+    fn test_w11b_nested_range_rejected() {
+        // 1.4(23)：范围表达式不可嵌套，`a..b..c` 被解析为 `(a..b)..c`（非法）。
+        assert_err("main() { let r = 0..10..1 }", "范围表达式不能嵌套");
+        assert_err("main() { let r = 0..=10..1 }", "范围表达式不能嵌套");
+        assert_err("main() { let r = 1..2..=3 }", "范围表达式不能嵌套");
+        // 正常范围仍合法。
+        assert_ok("main() { let r = 0..10 }");
+        assert_ok("main() { let r = 0..=10 }");
+        assert_ok("main() { for (i in 0..10) { println(i) } }");
     }
 
 }
