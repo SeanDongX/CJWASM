@@ -199,10 +199,30 @@ impl Parser {
         Ok(left)
     }
 
+    /// 最近一个已消费 token 是否为右括号。用于区分 `(x as T) is U`（合法，括号
+    /// 改变结合性）与 `x as T is U`（4.17(2) 非法）。
+    fn prev_token_is_rparen(&self) -> bool {
+        self.pos > 0
+            && matches!(
+                self.tokens.get(self.pos - 1).map(|t| &t.1),
+                Some(Token::RParen)
+            )
+    }
+
     /// 解析 `is` 类型检查（优先级高于 ==/!=，低于位运算）
     pub(crate) fn parse_is_expr(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_bitwise_or()?;
         while self.check(&Token::Is) {
+            // 4.17(2)/4.28(25)：`is` 不满足结合性，`x is T is U` / `x as T is U` 非法；
+            // 但括号可改变结合，`(x as T) is U`、`(x is T) is Bool` 合法。
+            if matches!(left, Expr::Cast { .. } | Expr::IsType { .. })
+                && !self.prev_token_is_rparen()
+            {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Is,
+                    "'is' / 'as' 不满足结合性，不能链式使用".to_string(),
+                ));
+            }
             self.advance();
             let target_ty = self.parse_type()?;
             left = Expr::IsType {
@@ -673,6 +693,17 @@ impl Parser {
                     }
                 }
                 Some(Token::As) => {
+                    // 4.17(2)/4.28(25)/(26)：`as` / `is` 不满足结合性，
+                    // `x as T as U`、`x as T is U` 非法；但括号可改变结合，
+                    // `(x as T) is U` 合法——此时左操作数紧随右括号。
+                    if matches!(expr, Expr::Cast { .. } | Expr::IsType { .. })
+                        && !self.prev_token_is_rparen()
+                    {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::As,
+                            "'as' / 'is' 不满足结合性，不能链式使用".to_string(),
+                        ));
+                    }
                     self.advance();
                     let target_ty = self.parse_type()?;
                     expr = Expr::Cast {
@@ -681,10 +712,24 @@ impl Parser {
                     };
                 }
                 Some(Token::Incr) => {
+                    // 4.28(8)/4.14(4)：`++` 不满足结合性，`x++ ++` 非法。
+                    if matches!(expr, Expr::PostfixIncr(_)) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Incr,
+                            "'++' 不满足结合性，不能连续使用".to_string(),
+                        ));
+                    }
                     self.advance();
                     expr = Expr::PostfixIncr(Box::new(expr));
                 }
                 Some(Token::Decr) => {
+                    // 4.28(9)/4.14(4)：`--` 不满足结合性，`x-- --` 非法。
+                    if matches!(expr, Expr::PostfixDecr(_)) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Decr,
+                            "'--' 不满足结合性，不能连续使用".to_string(),
+                        ));
+                    }
                     self.advance();
                     expr = Expr::PostfixDecr(Box::new(expr));
                 }
@@ -1037,6 +1082,15 @@ impl Parser {
             } else {
                 None
             };
+            // 4.28(32)/(33)：范围运算符不满足结合性。步长中再次出现范围
+            // （如 `0..=2:1..=3:1`）非法；结束值的嵌套由语义检查统一判定
+            // （见 1.4(23) "范围表达式不能嵌套"），以保持既有诊断形态。
+            if matches!(step.as_deref(), Some(Expr::Range { .. })) {
+                return self.bail(ParseError::UnexpectedToken(
+                    self.peek().cloned().unwrap_or(Token::DotDot),
+                    "范围运算符 '..' / '..=' 不满足结合性，不能连续使用".to_string(),
+                ));
+            }
             return Ok(Expr::Range {
                 start: Box::new(lit),
                 end,
@@ -3283,5 +3337,35 @@ main() { Test.f<Array<Int64>>(1) }
         parse_ok_only("main() { try {} finally {} }");
         // try-with-resources 允许既无 catch 也无 finally。
         parse_ok_only("main() { try (r = 1) {} }");
+    }
+
+    #[test]
+    fn test_w15c_range_non_associative() {
+        // 4.28(32)/(33)：范围运算符不满足结合性。结束值的嵌套在语义阶段判定
+        // （1.4(23)），解析器只负责“步长中再次出现范围”的形态。
+        parse_err_only("main() { var arr = [1,2,3]\n arr[0..=2:1..=3:1]\n return }");
+        // 单个范围（含步长）仍合法。
+        parse_ok_only("main() { var arr = [1,2,3]\n arr[0..2]\n return }");
+        parse_ok_only("main() { var arr = [1,2,3]\n arr[0..=2:1]\n return }");
+        parse_ok_only("main() { var arr = [1,2,3]\n arr[..2]\n return }");
+    }
+
+    #[test]
+    fn test_w15c_incr_decr_non_associative() {
+        // 4.28(8)/(9)、4.14(4)：`++`/`--` 不满足结合性。
+        parse_err_only("main() { var p = 0\n p ++ ++\n return }");
+        parse_err_only("main() { var p = 0\n p -- --\n return }");
+        parse_ok_only("main() { var p = 0\n p++\n return }");
+    }
+
+    #[test]
+    fn test_w15c_as_is_non_associative_but_parens_ok() {
+        // 4.17(2)/(25)/(26)：`as`/`is` 不满足结合性；括号可改变结合。
+        parse_err_only("main() { let x = 1 as Int64 as Int32 }");
+        parse_err_only("main() { let x = 1 as Int64 is Int32 }");
+        parse_err_only("main() { let x = 1 is Int64 is Int32 }");
+        parse_ok_only("main() { let x = (1 as Int64) as Int32 }");
+        parse_ok_only("main() { let x = (1 is Int64) is Bool }");
+        parse_ok_only("main() { let x = (1 as Int64) is Int32 }");
     }
 }

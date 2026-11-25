@@ -607,6 +607,32 @@ fn simple_operand(e: &Expr) -> bool {
     }
 }
 
+/// 操作数是否具有“可静态确定的类型”，用于算术/移位/位/幂/逻辑运算的操作数
+/// 合法性检查。在 `simple_operand` 之外，额外承认两类结果类型恒定的表达式：
+/// 比较/相等（`e1 < e2` 等结果为 Bool）与 `is` 类型测试（结果为 Bool），
+/// 以及空元组 `()`（Unit）。它们只可能在数值/整数/布尔运算中作为非法操作数
+/// 出现（4.28(19)/(20)、4.23(27)），故可安全参与判定。
+fn definite_operand(e: &Expr) -> bool {
+    match e {
+        Expr::Binary { op, left, right }
+            if matches!(
+                op,
+                BinOp::Eq
+                    | BinOp::NotEq
+                    | BinOp::Lt
+                    | BinOp::Gt
+                    | BinOp::LtEq
+                    | BinOp::GtEq
+            ) =>
+        {
+            simple_operand(left) && simple_operand(right)
+        }
+        Expr::IsType { .. } => true,
+        Expr::Tuple(elems) if elems.is_empty() => true,
+        _ => simple_operand(e),
+    }
+}
+
 /// 跳过类型检查时二元表达式的结果类型（保守推断）。
 fn binary_result_no_check(op: &BinOp, lt: &Ty, rt: &Ty) -> Ty {
     match op {
@@ -709,6 +735,9 @@ struct VarInfo {
     /// 比较表达式并入上一条 `let` 的初始化式，使被绑定变量错误地呈现
     /// 为 Bool；仅对显式 Bool 标注/布尔字面量实参做转换合法性检查。
     explicit_bool: bool,
+    /// 是否为“延迟赋值的 `let`”（`let x: T` 无初始化式）且尚未完成唯一一次
+    /// 初值赋值。首次赋值后置 false；再次赋值按不可变变量处理（4.2(5)）。
+    uninit_let: bool,
 }
 
 /// 单趟表达式类型检查器。
@@ -829,6 +858,13 @@ struct Checker<'a> {
     in_const_ctx: bool,
     /// 程序中声明过的全部函数名（顶层裸名与 `Type.method` 限定名）。
     known_funcs: HashSet<String>,
+    /// 当前处于第几层“条件分支”（if 分支 / catch 体 / 循环体等）。用于
+    /// 延迟赋值 `let` 的“唯一一次初值赋值”近似判定（4.2(5)）：在条件分支内的
+    /// 赋值只记为“可能已赋值”，不在该处报错，避免误伤 if/else 逐分支初始化。
+    cond_depth: usize,
+    /// 延迟赋值 `let` 的初值赋值状态：0=尚未赋值，1=可能已赋值（条件分支内），
+    /// 2=确定已赋值（直线代码）。再次的直线赋值视为非法重赋值。
+    deferred_state: HashMap<String, u8>,
 }
 
 /// 泛型定义的类型参数与约束（实例化约束检查用）。
@@ -1077,6 +1113,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 mutable: c.is_mut,
                 const_int: literal_int(&c.init),
                 explicit_bool: matches!(c.ty, Type::Bool),
+                uninit_let: false,
             },
         );
     }
@@ -1560,6 +1597,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     // 结构体类型细则（2.1.10）：仅凭声明即可判定的规则。
     check_struct_type_rules(program, &type_names, errors);
 
+    // class 成员变量默认值类型（2.1.6(1)/2.1.10.1(1) 对应规则）。
+    check_class_field_defaults(program, &type_names, errors);
+
     // enum 成员同名细则（2.1.11.4(3)）：构造器/成员函数/属性不可同名。
     check_enum_member_names(program, errors);
 
@@ -1623,6 +1663,8 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         const_init_types,
         in_const_ctx: false,
         known_funcs,
+        cond_depth: 0,
+        deferred_state: HashMap::new(),
     };
 
     // 结构体方法被脱糖为 `StructName.method` 顶层函数：为其注入实例字段作用域，
@@ -1649,6 +1691,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         mutable: f.is_mut,
                         const_int: None,
                         explicit_bool: false,
+                        uninit_let: false,
                     },
                 )
             })
@@ -1694,6 +1737,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         mutable: f.is_mut,
                         const_int: None,
                         explicit_bool: false,
+                        uninit_let: false,
                     },
                 )
             })
@@ -1713,6 +1757,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         mutable: f.is_mut || deferred_let,
                         const_int: None,
                         explicit_bool: false,
+                        uninit_let: false,
                     },
                 )
             })
@@ -1733,6 +1778,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         mutable: f.is_mut || deferred_static_let,
                         const_int: None,
                     explicit_bool: false,
+                    uninit_let: false,
                     },
                 )
             })
@@ -1790,6 +1836,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         mutable: true,
                         const_int: None,
                     explicit_bool: false,
+                    uninit_let: false,
                     },
                 );
             }
@@ -2089,6 +2136,53 @@ fn check_struct_type_rules(
 /// 仅凭声明即可判定：一个名字若同时用作“构造器/属性”与另一类别（构造器、
 /// 属性、成员函数）即非法；成员函数之间的重载（含运算符函数）仍然允许。
 /// 脱糖访问器 `__get_`/`__set_` 不计入成员函数。
+/// class 成员变量默认值的类型须与声明类型一致（2.1.6(1) / 2.1.10.1(1)）。
+///
+/// 仅当声明类型可静态确定（内建基础/聚合类型）且默认值是类型确定的字面量/范围
+/// 表达式时报错；用户类型、泛型、构造调用结果类型未知时一律保守放行。
+fn check_class_field_defaults(
+    program: &Program,
+    type_names: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for cls in &program.classes {
+        for f in &cls.fields {
+            let Some(d) = &f.default else {
+                continue;
+            };
+            let target = resolve_ann_ty(&f.ty, type_names);
+            if !target.is_concrete() || !target.is_prim() {
+                continue;
+            }
+            if matches!(d, Expr::Range { .. }) {
+                if !matches!(target, Ty::Agg("range")) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的成员变量 '{}' 不能用范围表达式初始化（2.1.6(1)）：声明类型 {}",
+                            cls.name,
+                            f.name,
+                            target.name()
+                        ),
+                    });
+                }
+                continue;
+            }
+            let value = static_expr_ty(d);
+            if value.is_definite() && value.is_prim() && !compatible(&target, &value) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的成员变量 '{}' 初始化表达式类型与声明类型不匹配（2.1.6(1)）：{} 与 {}",
+                        cls.name,
+                        f.name,
+                        target.name(),
+                        value.name()
+                    ),
+                });
+            }
+        }
+    }
+}
+
 fn check_enum_member_names(program: &Program, errors: &mut Vec<SemanticError>) {
     for e in &program.enums {
         // 按类别记录每个名字：构造器=1、属性=2、成员函数=4。
@@ -3461,6 +3555,7 @@ impl<'a> Checker<'a> {
                     mutable,
                     const_int: None,
                     explicit_bool: false,
+                    uninit_let: false,
                 },
             );
         }
@@ -3508,10 +3603,22 @@ impl<'a> Checker<'a> {
                         self.check_literal_annotation(ann, value);
                     }
                 }
+                // 4.2(5)：`let x: T` 无初始化式（延迟赋值声明）允许在**之后恰好赋一次值**
+                // （官方正例 04/a01/test_a01_01：`let l2: Float64` 后 `l2 = 3.2345`），
+                // 但再次赋值非法（负例 a05_12/16/…）。故 mutable 取 deferred，
+                // 同时 uninit_let 记录“尚待唯一一次初值赋值”。
                 let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
                 let cinit = if deferred { None } else { literal_int(value) };
                 self.check_irrefutable_pattern(pattern);
-                self.bind_pattern_const(pattern, bind_ty, deferred, cinit, false);
+                // 记录延迟赋值 `let` 的初值赋值状态（4.2(5)），并处理同名遮蔽。
+                if let Pattern::Binding(name) = pattern {
+                    if deferred {
+                        self.deferred_state.insert(name.clone(), 0);
+                    } else {
+                        self.deferred_state.remove(name);
+                    }
+                }
+                self.bind_pattern_const(pattern, bind_ty, deferred, cinit, false, deferred);
                 if matches!(ty.as_ref(), Some(Type::Bool)) {
                     self.mark_explicit_bool(pattern);
                 }
@@ -3547,7 +3654,10 @@ impl<'a> Checker<'a> {
                 let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
                 let cinit = if deferred { None } else { literal_int(value) };
                 self.check_irrefutable_pattern(pattern);
-                self.bind_pattern_const(pattern, bind_ty, true, cinit, false);
+                if let Pattern::Binding(name) = pattern {
+                    self.deferred_state.remove(name);
+                }
+                self.bind_pattern_const(pattern, bind_ty, true, cinit, false, false);
                 if matches!(ty.as_ref(), Some(Type::Bool)) {
                     self.mark_explicit_bool(pattern);
                 }
@@ -3564,7 +3674,7 @@ impl<'a> Checker<'a> {
                     self.check_literal_annotation(ann, value);
                 }
                 let bind_ty = ann_ty.unwrap_or(value_ty);
-                self.bind_name(name, bind_ty, false, literal_int(value), true);
+                self.bind_name(name, bind_ty, false, literal_int(value), true, false);
             }
             Stmt::Assign { target, value } => {
                 let value_ty = self.check_expr(value);
@@ -3582,14 +3692,17 @@ impl<'a> Checker<'a> {
                 self.check_expr(cond);
                 // 3.2.3.2(22)/(23)/(25)：循环条件与循环体同级，不能引用体内局部名。
                 self.check_loop_cond_body_scope(cond, body);
-                self.check_nested_body(body);
+                self.check_conditional_body(body);
             }
             Stmt::DoWhile { body, cond } => {
-                self.check_nested_body(body);
+                self.check_conditional_body(body);
                 self.check_loop_cond_body_scope(cond, body);
                 self.check_expr(cond);
             }
-            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+            Stmt::Loop { body } => {
+                self.check_conditional_body(body);
+            }
+            Stmt::UnsafeBlock { body } => {
                 self.check_nested_body(body);
             }
             Stmt::For {
@@ -3638,12 +3751,15 @@ impl<'a> Checker<'a> {
                         mutable: true,
                         const_int: None,
                     explicit_bool: false,
+                    uninit_let: false,
                     },
                 );
                 self.scopes.push(scope);
+                self.cond_depth += 1;
                 for s in body {
                     self.check_stmt(s);
                 }
+                self.cond_depth -= 1;
                 self.scopes.pop();
             }
             Stmt::WhileLet {
@@ -3655,9 +3771,11 @@ impl<'a> Checker<'a> {
                 let mut scope = HashMap::new();
                 bind_pattern_unknown(pattern, &mut scope);
                 self.scopes.push(scope);
+                self.cond_depth += 1;
                 for s in body {
                     self.check_stmt(s);
                 }
+                self.cond_depth -= 1;
                 self.scopes.pop();
             }
             Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
@@ -3719,6 +3837,14 @@ impl<'a> Checker<'a> {
         self.scopes.pop();
     }
 
+    /// 以“条件分支”语义检查一段 body（循环体/if 分支/catch 体）：其中的
+    /// 延迟 `let` 赋值只记为“可能已赋值”，避免把逐分支初始化误判为重赋值。
+    fn check_conditional_body(&mut self, body: &[Stmt]) {
+        self.cond_depth += 1;
+        self.check_nested_body(body);
+        self.cond_depth -= 1;
+    }
+
     /// 3.2.3.2(22)/(23)/(25)：循环条件中不能引用仅在循环体内引入的变量。
     ///
     /// 条件与循环体处于不同的作用域；若条件中的裸名在条件处无法解析（不在
@@ -3760,7 +3886,7 @@ impl<'a> Checker<'a> {
     }
 
     fn bind_pattern(&mut self, pattern: &Pattern, ty: Ty, mutable: bool) {
-        self.bind_pattern_const(pattern, ty, mutable, None, false)
+        self.bind_pattern_const(pattern, ty, mutable, None, false, false)
     }
 
     /// 将刚绑定的简单变量标记为“显式 `: Bool` 标注”（仅用于区分解析器
@@ -4097,9 +4223,10 @@ impl<'a> Checker<'a> {
         mutable: bool,
         const_int: Option<i64>,
         is_const: bool,
+        uninit_let: bool,
     ) {
         if let Pattern::Binding(name) = pattern {
-            self.bind_name(name, ty, mutable, const_int, is_const);
+            self.bind_name(name, ty, mutable, const_int, is_const, uninit_let);
         } else {
             let mut tmp = HashMap::new();
             // 3.3.1(11)：`let` 解构/枚举模式的绑定变量同样不可变。
@@ -4112,13 +4239,22 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn bind_name(&mut self, name: &str, ty: Ty, mutable: bool, const_int: Option<i64>, is_const: bool) {
+    fn bind_name(
+        &mut self,
+        name: &str,
+        ty: Ty,
+        mutable: bool,
+        const_int: Option<i64>,
+        is_const: bool,
+        uninit_let: bool,
+    ) {
         let info = VarInfo {
             is_const,
             ty,
             mutable,
             const_int,
             explicit_bool: false,
+            uninit_let,
         };
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.to_string(), info);
@@ -4236,6 +4372,23 @@ impl<'a> Checker<'a> {
                 "变量初始化类型不匹配: {} 不能用布尔字面量初始化（3.3.1(1)）",
                 ann.name()
             ));
+        } else if explicit_ann && matches!(v, Expr::Range { .. }) && !matches!(ann, Ty::Agg("range"))
+        {
+            // 2.1.6(1)：范围表达式只能初始化范围类型。
+            self.err(format!(
+                "变量初始化类型不匹配: {} 不能用范围表达式初始化（3.3.1(1)）",
+                ann.name()
+            ));
+        } else if explicit_ann && ann.is_prim() {
+            // 兜底：其它字面量类别（如整数字面量初始化 String）与标注类型不兼容。
+            let vt = static_expr_ty(v);
+            if vt.is_definite() && vt.is_prim() && !compatible(&ann, &vt) {
+                self.err(format!(
+                    "变量初始化类型不匹配: {} 不能用 {} 初始化（3.3.1(1)）",
+                    ann.name(),
+                    vt.name()
+                ));
+            }
         }
     }
 
@@ -4287,7 +4440,21 @@ impl<'a> Checker<'a> {
         match target {
             AssignTarget::Var(name) => {
                 if let Some(info) = self.lookup(name).cloned() {
-                    if !info.mutable {
+                    if info.uninit_let {
+                        // 4.2(5)：延迟赋值 `let` 允许且仅允许一次初值赋值。
+                        // 条件分支（if/catch/循环体）内的赋值只记为“可能已赋值”，
+                        // 便于 if/else 逐分支初始化；直线代码中的再次赋值才报错。
+                        let state = self.deferred_state.get(name).copied().unwrap_or(0);
+                        if self.cond_depth > 0 {
+                            if state == 0 {
+                                self.deferred_state.insert(name.clone(), 1);
+                            }
+                        } else if state >= 1 {
+                            self.err(format!("不可变变量 '{}' 不能被重新赋值", name));
+                        } else {
+                            self.deferred_state.insert(name.clone(), 2);
+                        }
+                    } else if !info.mutable {
                         self.err(format!("不可变变量 '{}' 不能被重新赋值", name));
                     }
                     self.check_assignable(&info.ty, value_ty, "赋值");
@@ -5664,7 +5831,33 @@ impl<'a> Checker<'a> {
                 // 仅对“可静态确定”的操作数形态执行类型规则（变量、字面量、
                 // 基础转换及由它们构成的算术表达式）。方法调用、lambda、
                 // `is` 等语法正例中的复杂形态不参与，避免误伤。
-                if !(simple_operand(left) && simple_operand(right)) {
+                //
+                // 对算术/移位/位/幂/逻辑运算，额外接受“结果类型可静态确定”的
+                // 操作数（比较/相等/is 结果为 Bool，`()` 为 Unit）。这些类型
+                // 一定不是整数/数值，因此可安全判定 4.28(19)/(20)、4.23(27) 中
+                // `(a < b) << c`、`x >>= ()` 这类非法形态；比较/相等运算自身的
+                // 操作数仍用更严的 simple_operand 过滤（解析器跨行合并时不可靠）。
+                let gate_ok = if matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Mod
+                        | BinOp::Pow
+                        | BinOp::Shl
+                        | BinOp::Shr
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::LogicalAnd
+                        | BinOp::LogicalOr
+                ) {
+                    definite_operand(left) && definite_operand(right)
+                } else {
+                    simple_operand(left) && simple_operand(right)
+                };
+                if !gate_ok {
                     return binary_result_no_check(op, &lt, &rt);
                 }
                 self.check_binary(op, left, &lt, &rt, right)
@@ -5879,9 +6072,14 @@ impl<'a> Checker<'a> {
                 else_branch,
             } => {
                 self.check_expr(cond);
+                // if 分支属于“条件执行”，其内的延迟 let 赋值记为可能赋值。
+                self.cond_depth += 1;
                 let t = self.check_expr(then_branch);
+                self.cond_depth -= 1;
                 if let Some(eb) = else_branch {
+                    self.cond_depth += 1;
                     let e = self.check_expr(eb);
+                    self.cond_depth -= 1;
                     if t == Ty::Unknown {
                         return e;
                     }
@@ -5913,10 +6111,14 @@ impl<'a> Checker<'a> {
                 let mut scope = HashMap::new();
                 bind_pattern_unknown(pattern, &mut scope);
                 self.scopes.push(scope);
+                self.cond_depth += 1;
                 self.check_expr(then_branch);
+                self.cond_depth -= 1;
                 self.scopes.pop();
                 if let Some(eb) = else_branch {
+                    self.cond_depth += 1;
                     self.check_expr(eb);
+                    self.cond_depth -= 1;
                 }
                 Ty::Unknown
             }
@@ -6508,6 +6710,7 @@ impl<'a> Checker<'a> {
                             mutable: true,
                             const_int: None,
                     explicit_bool: false,
+                    uninit_let: false,
                         },
                     );
                 }
@@ -6622,17 +6825,20 @@ impl<'a> Checker<'a> {
                 for (_, e) in resources {
                     self.check_expr(e);
                 }
+                // try/catch 体可能因异常而不执行，按条件分支记录延迟 let 赋值。
+                self.cond_depth += 1;
                 for s in body {
                     self.check_stmt(s);
                 }
                 self.scopes.pop();
                 self.scopes.push(HashMap::new());
                 if let Some(cv) = catch_var {
-                    self.bind_name(cv, Ty::Unknown, true, None, false);
+                    self.bind_name(cv, Ty::Unknown, true, None, false, false);
                 }
                 for s in catch_body {
                     self.check_stmt(s);
                 }
+                self.cond_depth -= 1;
                 self.scopes.pop();
                 if let Some(fb) = finally_body {
                     self.check_nested_body(fb);
@@ -6641,6 +6847,12 @@ impl<'a> Checker<'a> {
             }
 
             Expr::SliceExpr { array, start, end } => {
+                // 4.28(32)/(33)：范围运算符不满足结合性。切片语法 `a[b..c]` 已由
+                // 解析器把范围拆成 start/end，若其中任一又是范围（如
+                // `arr[0..2..3]`、`arr[..2..3]`）即为双重范围，非法。
+                if matches!(&**start, Expr::Range { .. }) || matches!(&**end, Expr::Range { .. }) {
+                    self.err("范围表达式不能嵌套（形如 `a..b..c` 非法）".to_string());
+                }
                 self.check_expr(array);
                 self.check_expr(start);
                 self.check_expr(end);
@@ -7784,6 +7996,7 @@ fn bind_pattern_unknown_mut(
                     mutable,
                     const_int: None,
                     explicit_bool: false,
+                    uninit_let: false,
                 },
             );
         }
@@ -7809,6 +8022,7 @@ fn bind_pattern_unknown_mut(
                     mutable,
                     const_int: None,
                     explicit_bool: false,
+                    uninit_let: false,
                 },
             );
         }
@@ -10113,4 +10327,73 @@ mod tests {
         assert_ok("var flag = true\nmain() {}");
     }
 
+    // ─── w15c：延迟 let 唯一一次初值赋值（4.2(5)） ─────────────────────
+
+    #[test]
+    fn test_w15c_deferred_let_single_init_ok_double_err() {
+        // 官方正例 04/a01/test_a01_01：无初始化 let 可被赋初值一次。
+        assert_ok("main() { let l: Float64\n l = 3.2345\n return }");
+        // 负例 a05_12/16：再次赋值非法。
+        assert_err(
+            "main() { let x: Int64\n x = 1\n x = 2\n return }",
+            "不可变变量",
+        );
+        assert_err(
+            "main() { let x: Int64\n if (true) { x = 1 }\n x = 2\n return }",
+            "不可变变量",
+        );
+    }
+
+    // ─── w15c：移位/算术操作数为 Bool/Unit 等非整数（4.28(19)/(20)、4.23(27)） ─
+
+    #[test]
+    fn test_w15c_shift_bool_operand_rejected() {
+        assert_err("main() { let b = (5 < 1) << 4 }", "移位运算符");
+        assert_err("main() { let b = 1 << (4 is Int64) }", "移位运算符");
+        assert_err("main() { let b = (5 < 1) >> 4 }", "移位运算符");
+        // 合法移位仍通过。
+        assert_ok("main() { let a = 5\n let b = a << 2 }");
+        assert_ok("main() { let b = (5 < 1) == true }");
+    }
+
+    #[test]
+    fn test_w15c_unit_operand_rejected() {
+        assert_err("main() { var a = 1.0f16\n a += () }", "操作数");
+        assert_err("main() { var a = 1.0\n let b = a + () }", "操作数");
+        // Unit 上的 == / != 合法。
+        assert_ok("main() { let u = ()\n let b = u == () }");
+    }
+
+    // ─── w15c：顶层/成员初始化类型不匹配（2.1.6(1)） ────────────────
+
+    #[test]
+    fn test_w15c_string_init_from_int_literal() {
+        assert_err("public let t: String = 1124\nmain() {}", "不能用");
+        assert_ok("public let t: String = \"hi\"\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15c_class_field_default_type_mismatch() {
+        assert_err(
+            "class C {\n static public let x: String = r'b'\n C(){}\n}\nmain() {}",
+            "初始化表达式类型",
+        );
+        assert_err(
+            "class C {\n private let y: String = 1..10:2\n C(){}\n}\nmain() {}",
+            "范围表达式",
+        );
+        // 一致的情形不得误报。
+        assert_ok("class C {\n static public let x: String = \"s\"\n C(){}\n}\nmain() {}");
+        assert_ok("class C {\n let n: Int64 = 1\n C(){}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15c_slice_nested_range_rejected() {
+        // 4.28(32)/(33)：切片下标中再次出现范围（双重范围）非法。
+        assert_err("main() { var arr = [1,2,3]\n arr[0..2..3]\n return }", "范围表达式不能嵌套");
+        assert_err("main() { var arr = [1,2,3]\n arr[..2..3]\n return }", "范围表达式不能嵌套");
+        // 单范围切片仍合法。
+        assert_ok("main() { var arr = [1,2,3]\n let s = arr[0..2]\n return }");
+        assert_ok("main() { var arr = [1,2,3]\n let s = arr[..2]\n return }");
+    }
 }
