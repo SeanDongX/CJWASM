@@ -536,8 +536,30 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 下标运算符重载；函数/元组类型亦不允许被 extend。
     check_index_operator_extensions(program, &mut errors);
 
+    // 10.2.4(3)/(7)：[] 下标个数须与 op_index 重载的非命名形参个数一致。
+    check_index_operator_arity(program, &index, &mut errors);
+    // 10.2.4(7)：[] 字面量下标类型须与 op_index 形参类型兼容。
+    check_index_operator_arg_types(program, &index, &mut errors);
+    // 10.2.3(15)：浮点运算符返回非浮点类型时，复合赋值类型不兼容。
+    check_compound_assign_operator_return(program, &index, &mut errors);
+
     // 8.4(9)：同一类型的多个扩展之间不得定义同名同签名的成员。
     check_extension_member_shadowing(program, &mut errors);
+
+    // 8.4(5)/8(9)/8(14)：扩展不得访问被扩展类型 private 成员。
+    check_extension_private_member_access(program, &index, &mut errors);
+    // 8.4(7)/(8)：扩展不得遮蔽被扩展类型自身同名同签名成员。
+    check_extension_member_shadowing_type_members(program, &index, &mut errors);
+    // 8.1.2：接口扩展只能实现接口、且不得重复实现已实现的接口。
+    check_extension_interface_rules(program, &index, &mut errors);
+    // 8.2.1.1(2)/8.4(12)：扩展 private 成员不能被其它扩展直接引用。
+    check_extension_private_member_cross_reference(program, &index, &mut errors);
+    // 8.2.1.1(2)/8.2.2.1(2)：扩展 private 成员在扩展之外不可见。
+    check_extension_private_member_outside_access(program, &index, &mut errors);
+    // 8(1)：接口类型不能被 extend。
+    check_extension_target_not_interface(program, &index, &mut errors);
+    // 8.5(3)：子类不得覆写/重定义父类扩展新增的成员。
+    check_extension_member_redefined_in_subclass(program, &index, &mut errors);
 
     // 6.3.5(3)/6.4.2(1)：extend 实现接口泛型函数时必须为 public。
     check_extension_generic_impl_visibility(program, &index, &mut errors);
@@ -561,6 +583,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 10.2.3(4)-(14)：运算符重载函数的参数个数须与运算符元数一致；
     // `&&` / `||` 不支持重载。
     check_operator_function_signatures(program, &mut errors);
+
+    // 10.2.3(19)/(21)：this(...)/super(...) 只解析为构造函数，不能调用 () 运算符。
+    check_this_super_ctor_call_resolution(program, &index, &mut errors);
 
     if errors.is_empty() {
         Ok(())
@@ -11102,6 +11127,762 @@ fn check_extension_member_shadowing(program: &Program, errors: &mut Vec<Semantic
     }
 }
 
+// ─── 08 章：扩展成员访问 / 遮蔽 / 接口实现（w16a 批） ────────────────────────
+
+/// 判断表达式是否为 `this` 接收者。
+fn is_this_receiver_expr(e: &Expr) -> bool {
+    matches!(e, Expr::Var(n) if n == "this")
+}
+
+/// 收集模式中绑定的变量名（解构 / 变体 / 类型测试等）。
+fn collect_pattern_bound_names(p: &Pattern, out: &mut HashSet<String>) {
+    match p {
+        Pattern::Binding(n) => {
+            out.insert(n.clone());
+        }
+        Pattern::Struct { fields, .. } => {
+            for (_, sub) in fields {
+                collect_pattern_bound_names(sub, out);
+            }
+        }
+        Pattern::Tuple(items) | Pattern::Or(items) => {
+            for sub in items {
+                collect_pattern_bound_names(sub, out);
+            }
+        }
+        Pattern::Variant { payload, .. } => {
+            if let Some(sub) = payload {
+                collect_pattern_bound_names(sub, out);
+            }
+        }
+        Pattern::TypeTest { binding, .. } => {
+            out.insert(binding.clone());
+        }
+        Pattern::Field { object, .. } => {
+            out.insert(object.clone());
+        }
+        _ => {}
+    }
+}
+
+fn collect_stmt_bound_names(s: &Stmt, out: &mut HashSet<String>) {
+    match s {
+        Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+            collect_pattern_bound_names(pattern, out);
+        }
+        Stmt::Const { name, .. } => {
+            out.insert(name.clone());
+        }
+        Stmt::For { var, body, .. } => {
+            out.insert(var.clone());
+            for b in body {
+                collect_stmt_bound_names(b, out);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::UnsafeBlock { body } => {
+            for b in body {
+                collect_stmt_bound_names(b, out);
+            }
+        }
+        Stmt::WhileLet { pattern, body, .. } => {
+            collect_pattern_bound_names(pattern, out);
+            for b in body {
+                collect_stmt_bound_names(b, out);
+            }
+        }
+        Stmt::DoWhile { body, .. } => {
+            for b in body {
+                collect_stmt_bound_names(b, out);
+            }
+        }
+        Stmt::LocalFunc(f) => {
+            out.insert(last_name_segment(&f.name));
+            for p in &f.params {
+                out.insert(p.name.clone());
+            }
+            for b in &f.body {
+                collect_stmt_bound_names(b, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 收集函数体内全部局部绑定名（形参、let/var/const、for 变量、局部函数、
+/// lambda 形参、match / if-let 模式绑定）。成员访问检查用它保守排除被局部
+/// 绑定遮蔽的标识符，避免把同名的局部变量误判成私有成员访问。
+fn collect_function_bound_names(func: &Function) -> HashSet<String> {
+    let mut names: HashSet<String> = HashSet::new();
+    for p in &func.params {
+        names.insert(p.name.clone());
+    }
+    for s in &func.body {
+        collect_stmt_bound_names(s, &mut names);
+    }
+    walk_stmts(&func.body, &mut |e| match e {
+        Expr::Lambda { params, .. } => {
+            for (n, _) in params {
+                names.insert(n.clone());
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for arm in arms {
+                collect_pattern_bound_names(&arm.pattern, &mut names);
+            }
+        }
+        Expr::IfLet { pattern, .. } => {
+            collect_pattern_bound_names(pattern, &mut names);
+        }
+        _ => {}
+    });
+    names
+}
+
+/// 收集被扩展类型（class / struct / enum）显式 `private` 成员的基础名。
+///
+/// 属性访问器脱糖出的 `__get_p` / `__set_p` 归一为其属性名 `p`。
+/// 返回 `None` 表示目标类型无法本地解析（保守跳过整个检查）。
+fn collect_private_member_names(
+    base: &str,
+    program: &Program,
+    index: &ProgramIndex<'_>,
+) -> Option<HashSet<String>> {
+    let mut out: HashSet<String> = HashSet::new();
+    let mut resolved = false;
+    if let Some(cls) = index.classes.get(base) {
+        resolved = true;
+        for f in &cls.fields {
+            if matches!(f.visibility, Visibility::Private) {
+                out.insert(f.name.clone());
+            }
+        }
+        for m in &cls.methods {
+            if matches!(m.func.visibility, Visibility::Private) {
+                let seg = last_name_segment(&m.func.name);
+                if seg.starts_with("__get_") || seg.starts_with("__set_") {
+                    out.insert(member_base_name(&seg).to_string());
+                } else if !seg.starts_with("__") {
+                    out.insert(seg);
+                }
+            }
+        }
+    }
+    if index.structs.contains(base) {
+        resolved = true;
+        if let Some(st) = program.structs.iter().find(|s| s.name == base) {
+            for f in &st.fields {
+                if matches!(f.visibility, Visibility::Private) {
+                    out.insert(f.name.clone());
+                }
+            }
+        }
+    }
+    if index.enums.contains(base) {
+        resolved = true;
+        if let Some(en) = program.enums.iter().find(|e| e.name == base) {
+            for p in &en.props {
+                if matches!(p.visibility, Visibility::Private) {
+                    out.insert(p.name.clone());
+                }
+            }
+        }
+    }
+    if index.structs.contains(base) || index.enums.contains(base) {
+        for f in &program.functions {
+            if owner_name(&f.name) == Some(base) && matches!(f.visibility, Visibility::Private) {
+                let seg = last_name_segment(&f.name);
+                if seg.starts_with("__get_") || seg.starts_with("__set_") {
+                    out.insert(member_base_name(&seg).to_string());
+                } else if !seg.starts_with("__") {
+                    out.insert(seg);
+                }
+            }
+        }
+    }
+    if resolved {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 8.4(5) / 8(9) / 8(14)：扩展成员不得访问被扩展类型的 private 成员。
+///
+/// 保守实现：仅当被扩展类型可本地解析、且被访问名确实是该类型的显式 private
+/// 成员、又未被局部绑定或同名顶层符号遮蔽时才报错。
+fn check_extension_private_member_access(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 与顶层常量 / 自由函数同名的标识符不视为成员访问（保守）。
+    let mut top_names: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        top_names.insert(c.name.clone());
+    }
+    for f in &program.functions {
+        if owner_name(&f.name).is_none() {
+            top_names.insert(f.name.clone());
+        }
+    }
+    let mut reported: HashSet<(String, String, String)> = HashSet::new();
+    for ext in &program.extends {
+        let target = ext.target_type.trim();
+        let base = target.split('<').next().unwrap_or(target).trim();
+        let Some(private_members) = collect_private_member_names(base, program, index) else {
+            continue;
+        };
+        if private_members.is_empty() {
+            continue;
+        }
+        for m in &ext.methods {
+            let locals = collect_function_bound_names(m);
+            let mut hits: HashSet<String> = HashSet::new();
+            walk_stmts(&m.body, &mut |e| match e {
+                Expr::Var(name) => {
+                    if name != "this"
+                        && private_members.contains(name.as_str())
+                        && !locals.contains(name)
+                        && !top_names.contains(name)
+                    {
+                        hits.insert(name.clone());
+                    }
+                }
+                Expr::Call { name, .. } => {
+                    let b = last_name_segment(name);
+                    if private_members.contains(b.as_str())
+                        && !locals.contains(&b)
+                        && !top_names.contains(&b)
+                    {
+                        hits.insert(b);
+                    }
+                }
+                Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+                    if is_this_receiver_expr(object) && private_members.contains(field.as_str()) {
+                        hits.insert(field.clone());
+                    }
+                }
+                Expr::MethodCall { object, method, .. } => {
+                    if is_this_receiver_expr(object) && private_members.contains(method.as_str()) {
+                        hits.insert(method.clone());
+                    }
+                }
+                _ => {}
+            });
+            let mut sorted: Vec<String> = hits.into_iter().collect();
+            sorted.sort();
+            for name in sorted {
+                if reported.insert((base.to_string(), m.name.clone(), name.clone())) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "扩展 '{}' 的成员 '{}' 访问了被扩展类型的 private 成员 '{}'（8.4(5)/8(9)/8(14)）",
+                            base, m.name, name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 8.4(7) / 8.4(8)：扩展成员不得遮蔽被扩展类型自身的同名同签名成员。
+///
+/// 仅比较“成员名 + 运算数形参类型列表”（剥离接收者）。同名但参数不同的重载
+/// 视为合法，保守放行；属性访问器（`__get_/__set_`）不参与比较。
+fn check_extension_member_shadowing_type_members(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for ext in &program.extends {
+        let target = ext.target_type.trim();
+        let base = target.split('<').next().unwrap_or(target).trim();
+        let mut members: Vec<(String, Vec<Type>)> = Vec::new();
+        if let Some(cls) = index.classes.get(base) {
+            for m in &cls.methods {
+                let seg = last_name_segment(&m.func.name);
+                if seg.starts_with("__") {
+                    continue;
+                }
+                let (ps, _, _) = split_receiver(&m.func.params);
+                members.push((seg, ps));
+            }
+        }
+        for f in &program.functions {
+            if owner_name(&f.name) == Some(base) {
+                let seg = last_name_segment(&f.name);
+                if seg.starts_with("__") {
+                    continue;
+                }
+                let (ps, _, _) = split_receiver(&f.params);
+                members.push((seg, ps));
+            }
+        }
+        if members.is_empty() {
+            continue;
+        }
+        for m in &ext.methods {
+            let seg = last_name_segment(&m.name);
+            if seg.starts_with("__") {
+                continue;
+            }
+            let (ps, _, _) = split_receiver(&m.params);
+            if members
+                .iter()
+                .any(|(name, pts)| *name == seg && *pts == ps)
+            {
+                errors.push(SemanticError {
+                    message: format!(
+                        "扩展 '{}' 的成员 '{}' 与类型自身的成员同名同签名，构成遮蔽（8.4(7)）",
+                        base, seg
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 8.1.2：接口扩展的合法性。
+///
+/// - (2) 实现的接口必须是接口（若是本地 class/struct/enum 则非法；单文件无 import
+///   且非 prelude 名字时视为未声明）。
+/// - (8)-(12) 类型已直接实现（或已通过其它扩展实现）的非泛型接口，不得再次通过
+///   扩展实现。泛型接口实参在 AST 中丢失，保守跳过。
+fn check_extension_interface_rules(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for (i, ext) in program.extends.iter().enumerate() {
+        let Some(iface_full) = ext.interface.as_deref() else {
+            continue;
+        };
+        let iface_base = iface_full
+            .split('<')
+            .next()
+            .unwrap_or(iface_full)
+            .trim();
+        // (2) 实现的必须是接口：若解析为本地 class/struct/enum 则非法。
+        // 注意：无法从单文件 AST 判断接口是否在“同包其它文件”中声明，故不检查
+        // “未声明”情形（避免 std 等同包多文件被误判）。
+        if !index.interfaces.contains_key(iface_base) {
+            if index.classes.contains_key(iface_base)
+                || index.structs.contains(iface_base)
+                || index.enums.contains(iface_base)
+            {
+                errors.push(SemanticError {
+                    message: format!(
+                        "扩展实现的 '{}' 不是接口，接口扩展只能实现接口（8.1.2(2)）",
+                        iface_base
+                    ),
+                });
+            }
+            continue;
+        }
+        // 泛型接口的实参无法从 AST 还原，保守跳过重复实现检查。
+        let iface_generic = index
+            .interfaces
+            .get(iface_base)
+            .map_or(true, |idef| !idef.type_params.is_empty());
+        if iface_generic {
+            continue;
+        }
+        let target_base = ext
+            .target_type
+            .split('<')
+            .next()
+            .unwrap_or(&ext.target_type)
+            .trim()
+            .to_string();
+        // 类型自身已直接实现该接口。
+        let type_already = index.classes.get(target_base.as_str()).map_or(false, |cls| {
+            cls.implements.iter().any(|i| i.split('<').next().unwrap_or(i).trim() == iface_base)
+                || cls.extends.as_deref() == Some(iface_base)
+        });
+        if type_already {
+            errors.push(SemanticError {
+                message: format!(
+                    "类型 '{}' 已实现接口 '{}'，不能通过扩展重复实现（8.1.2(8)-(12)）",
+                    target_base, iface_base
+                ),
+            });
+            continue;
+        }
+        // 其它扩展已为同一类型实现该接口。
+        let other_ext = program.extends.iter().enumerate().any(|(j, e2)| {
+            j != i
+                && e2.target_type.split('<').next().unwrap_or(&e2.target_type).trim()
+                    == target_base.as_str()
+                && e2.interface.as_deref().map_or(false, |i2| {
+                    i2.split('<').next().unwrap_or(i2).trim() == iface_base
+                })
+        });
+        if other_ext {
+            errors.push(SemanticError {
+                message: format!(
+                    "类型 '{}' 已通过其它扩展实现接口 '{}'，不能重复实现（8.1.2(9)）",
+                    target_base, iface_base
+                ),
+            });
+        }
+    }
+}
+
+/// 收集某类型（class/struct/enum）全部成员的基础名（任意可见性）。
+/// 用于在“扩展私有成员跨扩展引用”检查中排除会被该类型自身成员解析的名字。
+fn collect_type_member_basenames(
+    base: &str,
+    program: &Program,
+    index: &ProgramIndex<'_>,
+) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    if let Some(cls) = index.classes.get(base) {
+        for f in &cls.fields {
+            out.insert(f.name.clone());
+        }
+        for m in &cls.methods {
+            let seg = last_name_segment(&m.func.name);
+            out.insert(member_base_name(&seg).to_string());
+        }
+    }
+    for st in &program.structs {
+        if st.name == base {
+            for f in &st.fields {
+                out.insert(f.name.clone());
+            }
+        }
+    }
+    for en in &program.enums {
+        if en.name == base {
+            for p in &en.props {
+                out.insert(p.name.clone());
+            }
+        }
+    }
+    for f in &program.functions {
+        if owner_name(&f.name) == Some(base) {
+            let seg = last_name_segment(&f.name);
+            out.insert(member_base_name(&seg).to_string());
+        }
+    }
+    out
+}
+
+/// 8.2.1.1(2) / 8.2.2.1(2) / 8.4(12)/(13)：扩展中 `private` 修饰的成员只能在
+/// 其所在扩展内部使用，不能被同一类型的其它扩展直接引用。
+///
+/// 保守实现：仅当同一被扩展类型存在多个扩展、名字确实是某扩展的 private 成员、
+/// 且未被任何扩展声明为非 private、也不是被扩展类型自身成员 / 顶层名字 / 局部绑定
+/// 时才报错。
+fn check_extension_private_member_cross_reference(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut top_names: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        top_names.insert(c.name.clone());
+    }
+    for f in &program.functions {
+        if owner_name(&f.name).is_none() {
+            top_names.insert(f.name.clone());
+        }
+    }
+    // 目标基础名 → 扩展下标列表。
+    let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, ext) in program.extends.iter().enumerate() {
+        let base = ext
+            .target_type
+            .split('<')
+            .next()
+            .unwrap_or(&ext.target_type)
+            .trim()
+            .to_string();
+        by_base.entry(base).or_default().push(i);
+    }
+    let mut reported: HashSet<(usize, String)> = HashSet::new();
+    for (base, idxs) in &by_base {
+        if idxs.len() < 2 {
+            continue;
+        }
+        let type_members = collect_type_member_basenames(base, program, index);
+        let mut priv_def: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut nonpriv: HashSet<String> = HashSet::new();
+        for &i in idxs {
+            for m in &program.extends[i].methods {
+                let seg = last_name_segment(&m.name);
+                let b = member_base_name(&seg).to_string();
+                if matches!(m.visibility, Visibility::Private) {
+                    priv_def.entry(b).or_default().push(i);
+                } else {
+                    nonpriv.insert(b);
+                }
+            }
+        }
+        for &i in idxs {
+            // 本扩展可见的“外部扩展私有成员”名字集合。
+            let flagged: HashSet<String> = priv_def
+                .iter()
+                .filter(|(name, owners)| {
+                    !owners.contains(&i)
+                        && !nonpriv.contains(*name)
+                        && !type_members.contains(*name)
+                        && !top_names.contains(*name)
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            if flagged.is_empty() {
+                continue;
+            }
+            for m in &program.extends[i].methods {
+                let locals = collect_function_bound_names(m);
+                let mut hits: HashSet<String> = HashSet::new();
+                walk_stmts(&m.body, &mut |e| match e {
+                    Expr::Call { name, .. } => {
+                        let b = last_name_segment(name);
+                        if flagged.contains(&b) && !locals.contains(&b) {
+                            hits.insert(b);
+                        }
+                    }
+                    Expr::Var(name) => {
+                        if name != "this"
+                            && flagged.contains(name.as_str())
+                            && !locals.contains(name)
+                        {
+                            hits.insert(name.clone());
+                        }
+                    }
+                    Expr::MethodCall { object, method, .. } => {
+                        if is_this_receiver_expr(object)
+                            && flagged.contains(method.as_str())
+                            && !locals.contains(method)
+                        {
+                            hits.insert(method.clone());
+                        }
+                    }
+                    Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+                        if is_this_receiver_expr(object)
+                            && flagged.contains(field.as_str())
+                            && !locals.contains(field)
+                        {
+                            hits.insert(field.clone());
+                        }
+                    }
+                    _ => {}
+                });
+                let mut sorted: Vec<String> = hits.into_iter().collect();
+                sorted.sort();
+                for name in sorted {
+                    if reported.insert((i, name.clone())) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "扩展成员 '{}' 为 private，不能在类型 '{}' 的其它扩展中直接引用（8.2.1.1(2)/8.4(12)）",
+                                name, base
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 8.2.1.1(2) / 8.2.2.1(2)：扩展中的 private 成员在扩展之外不可见。
+///
+/// 保守实现：仅在局部变量能被简单推断为 `T(...)`、且被访问名确定为 T 的
+/// private 扩展成员（未被任何扩展声明为非 private，也不是 T 自身成员）时，
+/// 对 `obj.name` / `obj.name(...)` 报错。只扫描自由函数与类型方法，不扫描扩展
+/// 方法（扩展内部访问由跨扩展检查负责，避免误伤同扩展内合法访问）。
+fn check_extension_private_member_outside_access(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 目标基础名 → private 扩展成员名集合。
+    let mut priv_map: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, ext) in program.extends.iter().enumerate() {
+        let base = ext
+            .target_type
+            .split('<')
+            .next()
+            .unwrap_or(&ext.target_type)
+            .trim()
+            .to_string();
+        by_base.entry(base).or_default().push(i);
+    }
+    for (base, idxs) in &by_base {
+        let type_members = collect_type_member_basenames(base, program, index);
+        let mut priv_def: HashSet<String> = HashSet::new();
+        let mut nonpriv: HashSet<String> = HashSet::new();
+        for &i in idxs {
+            for m in &program.extends[i].methods {
+                let seg = last_name_segment(&m.name);
+                let b = member_base_name(&seg).to_string();
+                if matches!(m.visibility, Visibility::Private) {
+                    priv_def.insert(b);
+                } else {
+                    nonpriv.insert(b);
+                }
+            }
+        }
+        let flagged: HashSet<String> = priv_def
+            .into_iter()
+            .filter(|n| !nonpriv.contains(n) && !type_members.contains(n))
+            .collect();
+        if !flagged.is_empty() {
+            priv_map.insert(base.clone(), flagged);
+        }
+    }
+    if priv_map.is_empty() {
+        return;
+    }
+    // 待扫描函数：自由函数 + 类方法（program.functions 已含 struct/enum 方法）。
+    let mut funcs: Vec<&Function> = Vec::new();
+    for f in &program.functions {
+        funcs.push(f);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            funcs.push(&m.func);
+        }
+    }
+    let mut reported: HashSet<String> = HashSet::new();
+    for f in funcs {
+        let var_types = local_var_type_map(&f.body);
+        if var_types.is_empty() {
+            continue;
+        }
+        let mut hits: Vec<(String, String)> = Vec::new();
+        walk_stmts(&f.body, &mut |e| match e {
+            Expr::MethodCall { object, method, .. } => {
+                if let Expr::Var(v) = object.as_ref() {
+                    if let Some(t) = var_types.get(v) {
+                        if priv_map.get(t).map_or(false, |s| s.contains(method.as_str())) {
+                            hits.push((t.clone(), method.clone()));
+                        }
+                    }
+                }
+            }
+            Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+                let ty = match object.as_ref() {
+                    Expr::Var(v) => var_types.get(v).cloned(),
+                    Expr::VariantConst { enum_name, .. } => Some(enum_name.clone()),
+                    _ => None,
+                };
+                if let Some(t) = ty {
+                    if priv_map.get(&t).map_or(false, |s| s.contains(field.as_str())) {
+                        hits.push((t, field.clone()));
+                    }
+                }
+            }
+            _ => {}
+        });
+        for (t, name) in hits {
+            let key = format!("{}.{}", t, name);
+            if reported.insert(key) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "扩展成员 '{}.{}' 为 private，只能在声明它的扩展内部使用（8.2.1.1(2)/8.2.2.1(2)）",
+                        t, name
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 8.5(3)：父类扩展中新增的成员被继承后，子类不得再定义同名同签名的成员
+/// （既不能 override，也不能按同签名重定义）。
+///
+/// 仅比较“成员名 + 运算数形参类型列表”，只对照祖先类型的扩展成员。
+fn check_extension_member_redefined_in_subclass(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for cls in &program.classes {
+        // 祖先类名链（本地可解析的部分）。
+        let mut ancestors: Vec<&str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = cls
+            .extends
+            .as_deref()
+            .map(|p| p.split('<').next().unwrap_or(p).trim());
+        while let Some(name) = cur {
+            if !seen.insert(name) {
+                break;
+            }
+            ancestors.push(name);
+            cur = index
+                .classes
+                .get(name)
+                .and_then(|pc| pc.extends.as_deref())
+                .map(|p| p.split('<').next().unwrap_or(p).trim());
+        }
+        if ancestors.is_empty() {
+            continue;
+        }
+        let mut parent_members: Vec<(String, Vec<Type>)> = Vec::new();
+        for ext in &program.extends {
+            let tb = ext
+                .target_type
+                .split('<')
+                .next()
+                .unwrap_or(&ext.target_type)
+                .trim();
+            if !ancestors.iter().any(|a| *a == tb) {
+                continue;
+            }
+            for m in &ext.methods {
+                let seg = last_name_segment(&m.name);
+                if seg.starts_with("__") {
+                    continue;
+                }
+                let (ps, _, _) = split_receiver(&m.params);
+                parent_members.push((seg, ps));
+            }
+        }
+        if parent_members.is_empty() {
+            continue;
+        }
+        for m in &cls.methods {
+            let seg = last_name_segment(&m.func.name);
+            if seg.starts_with("__") {
+                continue;
+            }
+            let (ps, _, _) = split_receiver(&m.func.params);
+            if parent_members.iter().any(|(n, pts)| *n == seg && *pts == ps) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的成员 '{}' 与父类扩展新增的成员同名同签名，不能覆写或重定义（8.5(3)）",
+                        cls.name, seg
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 8(1)：接口类型不允许被 extend（只能通过 `extend T <: I` 实现）。
+fn check_extension_target_not_interface(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for ext in &program.extends {
+        let target = ext.target_type.trim();
+        let base = target.split('<').next().unwrap_or(target).trim();
+        if index.interfaces.contains_key(base) {
+            errors.push(SemanticError {
+                message: format!("接口类型 '{}' 不能被 extend（8(1)）", base),
+            });
+        }
+    }
+}
+
 /// 6.3.5(3)/6.4.2(1)：extend 实现接口的泛型成员函数时，实现函数必须为 public
 /// （接口成员对外可见性等同 public，实现方的可见性不得降低）。
 fn check_extension_generic_impl_visibility(
@@ -14313,7 +15094,705 @@ fn scan_ct_expr(
     }
 }
 
+/// 下标实参的字面量类别。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexLitKind {
+    Int,
+    Float,
+    Str,
+    Bool,
+    Rune,
+}
+
+fn index_literal_kind(e: &Expr) -> Option<IndexLitKind> {
+    match e {
+        Expr::Integer(_) | Expr::IntegerSuffixed(..) => Some(IndexLitKind::Int),
+        Expr::Float(_) | Expr::Float32(_) => Some(IndexLitKind::Float),
+        Expr::String(_) => Some(IndexLitKind::Str),
+        Expr::Bool(_) => Some(IndexLitKind::Bool),
+        Expr::Rune(_) => Some(IndexLitKind::Rune),
+        _ => None,
+    }
+}
+
+fn is_int_type(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::IntNative
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::UIntNative
+    )
+}
+
+fn is_float_type(t: &Type) -> bool {
+    matches!(t, Type::Float16 | Type::Float32 | Type::Float64)
+}
+
+fn is_primitive_scalar_type(t: &Type) -> bool {
+    is_int_type(t)
+        || is_float_type(t)
+        || matches!(
+            t,
+            Type::Bool | Type::String | Type::Rune | Type::Unit | Type::Nothing
+        )
+}
+
+/// 字面量下标与运算符形参类型是否兼容（保守：非原始标量类型一律放行）。
+fn index_lit_compatible(kind: IndexLitKind, t: &Type) -> bool {
+    let family_ok = match kind {
+        IndexLitKind::Int => is_int_type(t),
+        // 浮点字面量（含 f16/f32/f64 后缀）对任意浮点类型放行。
+        IndexLitKind::Float => is_float_type(t),
+        IndexLitKind::Str => matches!(t, Type::String),
+        IndexLitKind::Bool => matches!(t, Type::Bool),
+        IndexLitKind::Rune => matches!(t, Type::Rune),
+    };
+    if family_ok {
+        return true;
+    }
+    // 若形参是确定的其它原始标量类型 → 不兼容；非原始类型（泛型/自定义）→ 放行。
+    !is_primitive_scalar_type(t)
+}
+
+fn as_index_arg_kinds(e: &Expr) -> Vec<Option<IndexLitKind>> {
+    match e {
+        Expr::Tuple(items) => items.iter().map(index_literal_kind).collect(),
+        _ => vec![index_literal_kind(e)],
+    }
+}
+
+fn collect_set_index_use_kinds(
+    stmts: &[Stmt],
+    var_types: &HashMap<String, String>,
+    out: &mut Vec<(String, Vec<Option<IndexLitKind>>, bool)>,
+) {
+    fn handle(
+        t: &AssignTarget,
+        var_types: &HashMap<String, String>,
+        out: &mut Vec<(String, Vec<Option<IndexLitKind>>, bool)>,
+    ) {
+        let (base, index) = match t {
+            AssignTarget::Index { array, index } => (array.as_str(), index.as_ref()),
+            AssignTarget::IndexPath { base, index, .. } => (base.as_str(), index.as_ref()),
+            AssignTarget::ExprIndex { expr, index } => match expr.as_ref() {
+                Expr::Var(v) => (v.as_str(), index.as_ref()),
+                _ => return,
+            },
+            _ => return,
+        };
+        if let Some(ty) = var_types.get(base) {
+            out.push((ty.clone(), as_index_arg_kinds(index), true));
+        }
+    }
+    for s in stmts {
+        match s {
+            Stmt::Assign { target, .. } => handle(target, var_types, out),
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => collect_set_index_use_kinds(body, var_types, out),
+            Stmt::For { body, .. } => collect_set_index_use_kinds(body, var_types, out),
+            Stmt::DoWhile { body, .. } => collect_set_index_use_kinds(body, var_types, out),
+            Stmt::WhileLet { body, .. } => collect_set_index_use_kinds(body, var_types, out),
+            _ => {}
+        }
+    }
+}
+
+/// 10.2.4(7)：`[]` 中字面量下标的类型须与下标运算符非命名形参类型兼容。
+///
+/// 保守实现：仅当接收者可简单推断、存在参数个数匹配的 `op_index` 重载、
+/// 且下标实参为可判定类别的字面量时才检查；泛型/自定义形参类型放行。
+fn check_index_operator_arg_types(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut funcs: Vec<&Function> = Vec::new();
+    for f in &program.functions {
+        funcs.push(f);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            funcs.push(&m.func);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            funcs.push(m);
+        }
+    }
+    for f in funcs {
+        let var_types = local_var_type_map(&f.body);
+        if var_types.is_empty() {
+            continue;
+        }
+        let mut uses: Vec<(String, Vec<Option<IndexLitKind>>, bool)> = Vec::new();
+        walk_stmts(&f.body, &mut |e| {
+            if let Expr::Index { array, index } = e {
+                if let Expr::Var(v) = array.as_ref() {
+                    if let Some(t) = var_types.get(v) {
+                        uses.push((t.clone(), as_index_arg_kinds(index), false));
+                    }
+                }
+            }
+        });
+        collect_set_index_use_kinds(&f.body, &var_types, &mut uses);
+        for (tbase, kinds, is_set) in uses {
+            let sigs = collect_index_op_sigs(&tbase, program, index);
+            let relevant: Vec<&IndexOpSig> = sigs
+                .iter()
+                .filter(|s| s.is_set == is_set && s.index_types.len() == kinds.len())
+                .collect();
+            if relevant.is_empty() {
+                continue;
+            }
+            // 至少有一个下标实参可确定类别，且没有任何匹配重载能兼容全部实参 → 报错。
+            if kinds.iter().all(|k| k.is_none()) {
+                continue;
+            }
+            let any_ok = relevant.iter().any(|s| {
+                kinds.iter().zip(s.index_types.iter()).all(|(k, t)| {
+                    k.map_or(true, |kk| index_lit_compatible(kk, t))
+                })
+            });
+            if !any_ok {
+                errors.push(SemanticError {
+                    message: format!(
+                        "对类型 '{}' 的下标运算符传入了类型不匹配的下标实参（10.2.4(7)）",
+                        tbase
+                    ),
+                });
+            }
+        }
+    }
+}
+
+// ─── 10.2.3(15)：复合赋值运算符返回值类型 ──────────────────────────────────
+
+/// 推断运算符函数的返回类型（优先显式标注，否则取末条表达式的简单类型）。
+fn infer_operator_return_type(f: &Function) -> Option<Type> {
+    if let Some(t) = &f.return_type {
+        return Some(t.clone());
+    }
+    let empty: HashMap<String, Type> = HashMap::new();
+    match f.body.last() {
+        Some(Stmt::Expr(e)) => infer_expr(e, &empty),
+        Some(Stmt::Return(Some(e))) => infer_expr(e, &empty),
+        _ => None,
+    }
+}
+
+fn collect_float_literal_vars(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let {
+                pattern: Pattern::Binding(n),
+                value,
+                ..
+            }
+            | Stmt::Var {
+                pattern: Pattern::Binding(n),
+                value,
+                ..
+            } => {
+                if matches!(value, Expr::Float(_) | Expr::Float32(_)) {
+                    out.insert(n.clone());
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => collect_float_literal_vars(body, out),
+            Stmt::For { body, .. } => collect_float_literal_vars(body, out),
+            Stmt::DoWhile { body, .. } => collect_float_literal_vars(body, out),
+            Stmt::WhileLet { body, .. } => collect_float_literal_vars(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn scan_compound_assign_nonfloat(
+    stmts: &[Stmt],
+    float_vars: &HashSet<String>,
+    overloads: &HashMap<String, Vec<Option<Type>>>,
+    hits: &mut Vec<String>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::Assign {
+                target: AssignTarget::Var(v),
+                value,
+            } => {
+                if float_vars.contains(v) {
+                    if let Expr::Binary { op, left, .. } = value {
+                        if matches!(left.as_ref(), Expr::Var(l) if l == v) {
+                            let opname = binop_op_name(op);
+                            if let Some(rets) = overloads.get(opname) {
+                                // 仅当所有浮点类型上的该运算符重载都返回已知的非浮点类型时报错。
+                                if !rets.is_empty()
+                                    && rets
+                                        .iter()
+                                        .all(|r| matches!(r, Some(t) if !is_float_type(t)))
+                                {
+                                    hits.push(opname.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => {
+                scan_compound_assign_nonfloat(body, float_vars, overloads, hits)
+            }
+            Stmt::For { body, .. } => scan_compound_assign_nonfloat(body, float_vars, overloads, hits),
+            Stmt::DoWhile { body, .. } => {
+                scan_compound_assign_nonfloat(body, float_vars, overloads, hits)
+            }
+            Stmt::WhileLet { body, .. } => {
+                scan_compound_assign_nonfloat(body, float_vars, overloads, hits)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 10.2.3(15)：若浮点类型上重载的二元运算符返回值不是浮点类型，则对应的
+/// 复合赋值（`a op= b`）会因返回类型与左操作数不兼容而非法。
+///
+/// 保守实现：仅针对由浮点字面量初始化的局部变量，且该运算符在浮点类型上的
+/// 全部重载返回类型都已知且均非浮点类型时才报错。
+fn check_compound_assign_operator_return(
+    program: &Program,
+    _index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 收集浮点类型扩展上的运算符重载返回类型。
+    let mut float_overloads: HashMap<String, Vec<Option<Type>>> = HashMap::new();
+    for ext in &program.extends {
+        let tb = ext
+            .target_type
+            .split('<')
+            .next()
+            .unwrap_or(&ext.target_type)
+            .trim();
+        if !matches!(tb, "Float16" | "Float32" | "Float64") {
+            continue;
+        }
+        for m in &ext.methods {
+            let seg = last_name_segment(&m.name);
+            if !seg.starts_with("op_") {
+                continue;
+            }
+            float_overloads
+                .entry(seg)
+                .or_default()
+                .push(infer_operator_return_type(m));
+        }
+    }
+    if float_overloads.is_empty() {
+        return;
+    }
+    let mut funcs: Vec<&Function> = Vec::new();
+    for f in &program.functions {
+        funcs.push(f);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            funcs.push(&m.func);
+        }
+    }
+    let mut reported: HashSet<String> = HashSet::new();
+    for f in funcs {
+        let mut float_vars: HashSet<String> = HashSet::new();
+        collect_float_literal_vars(&f.body, &mut float_vars);
+        if float_vars.is_empty() {
+            continue;
+        }
+        let mut hits: Vec<String> = Vec::new();
+        scan_compound_assign_nonfloat(&f.body, &float_vars, &float_overloads, &mut hits);
+        for op in hits {
+            if reported.insert(op.clone()) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "浮点类型上重载的运算符 '{}' 返回非浮点类型，其复合赋值形式类型不兼容（10.2.3(15)）",
+                        op
+                    ),
+                });
+            }
+        }
+    }
+}
+
 // ─── 10.2.3(4)-(14)：运算符重载函数的元数（参数个数）校验 ───────────────────
+
+// ─── 10.2.4：下标运算符参数个数与类型（w16a 批） ────────────────────────────
+
+struct IndexOpSig {
+    /// 非命名（下标）形参的类型列表。
+    index_types: Vec<Type>,
+    /// 是否为 set 形态（含命名参数 `value!`）。
+    is_set: bool,
+}
+
+fn collect_index_op_sigs(
+    base: &str,
+    program: &Program,
+    index: &ProgramIndex<'_>,
+) -> Vec<IndexOpSig> {
+    let mut out: Vec<IndexOpSig> = Vec::new();
+    fn push_sig(f: &Function, out: &mut Vec<IndexOpSig>) {
+        if last_name_segment(&f.name) != "op_index" {
+            return;
+        }
+        let (ps, named, _) = split_receiver(&f.params);
+        let is_set = named.iter().any(|b| *b);
+        let index_types: Vec<Type> = ps
+            .iter()
+            .zip(named.iter())
+            .filter(|(_, n)| !**n)
+            .map(|(t, _)| t.clone())
+            .collect();
+        out.push(IndexOpSig { index_types, is_set });
+    }
+    if let Some(cls) = index.classes.get(base) {
+        for m in &cls.methods {
+            push_sig(&m.func, &mut out);
+        }
+    }
+    for f in &program.functions {
+        if owner_name(&f.name) == Some(base) {
+            push_sig(f, &mut out);
+        }
+    }
+    for ext in &program.extends {
+        let tb = ext
+            .target_type
+            .split('<')
+            .next()
+            .unwrap_or(&ext.target_type)
+            .trim();
+        if tb == base {
+            for m in &ext.methods {
+                push_sig(m, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// 从构造调用 / 结构体字面量推断表达式的类型名（保守，仅简单形态）。
+fn expr_ctor_type_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::ConstructorCall { name, .. } | Expr::StructInit { name, .. } => {
+            Some(name.split('<').next().unwrap_or(name).trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+/// 下标表达式中的下标个数（`a[i]` 为 1，`a[i, j]` 为 2）。
+fn index_arg_count(e: &Expr) -> usize {
+    match e {
+        Expr::Tuple(items) => items.len().max(1),
+        _ => 1,
+    }
+}
+
+/// 函数体内局部变量的“简单类型名”映射（仅 `let/var x = Type(...)` 形态）。
+/// 同名映射到不同类型时移除（歧义，保守跳过）。
+fn local_var_type_map(stmts: &[Stmt]) -> HashMap<String, String> {
+    fn add(
+        map: &mut HashMap<String, String>,
+        conflicts: &mut HashSet<String>,
+        name: &str,
+        ty: &str,
+    ) {
+        if let Some(existing) = map.get(name) {
+            if existing != ty {
+                conflicts.insert(name.to_string());
+            }
+        } else {
+            map.insert(name.to_string(), ty.to_string());
+        }
+    }
+    fn walk(
+        stmts: &[Stmt],
+        map: &mut HashMap<String, String>,
+        conflicts: &mut HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Let {
+                    pattern: Pattern::Binding(n),
+                    ty,
+                    value,
+                    ..
+                }
+                | Stmt::Var {
+                    pattern: Pattern::Binding(n),
+                    ty,
+                    value,
+                    ..
+                } => {
+                    if let Some(Type::Struct(tn, _)) = ty {
+                        add(map, conflicts, n, tn.split('<').next().unwrap_or(tn).trim());
+                    } else if let Some(tn) = expr_ctor_type_name(value) {
+                        add(map, conflicts, n, &tn);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body } => walk(body, map, conflicts),
+                Stmt::For { body, .. } => walk(body, map, conflicts),
+                Stmt::DoWhile { body, .. } => walk(body, map, conflicts),
+                Stmt::WhileLet { body, .. } => walk(body, map, conflicts),
+                _ => {}
+            }
+        }
+    }
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut conflicts: HashSet<String> = HashSet::new();
+    walk(stmts, &mut map, &mut conflicts);
+    for c in conflicts {
+        map.remove(&c);
+    }
+    map
+}
+
+fn collect_set_index_uses(
+    stmts: &[Stmt],
+    var_types: &HashMap<String, String>,
+    out: &mut Vec<(String, usize, bool)>,
+) {
+    fn handle(
+        t: &AssignTarget,
+        var_types: &HashMap<String, String>,
+        out: &mut Vec<(String, usize, bool)>,
+    ) {
+        let (base, index) = match t {
+            AssignTarget::Index { array, index } => (array.as_str(), index.as_ref()),
+            AssignTarget::IndexPath { base, index, .. } => (base.as_str(), index.as_ref()),
+            AssignTarget::ExprIndex { expr, index } => match expr.as_ref() {
+                Expr::Var(v) => (v.as_str(), index.as_ref()),
+                _ => return,
+            },
+            _ => return,
+        };
+        if let Some(ty) = var_types.get(base) {
+            out.push((ty.clone(), index_arg_count(index), true));
+        }
+    }
+    for s in stmts {
+        match s {
+            Stmt::Assign { target, .. } => handle(target, var_types, out),
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => collect_set_index_uses(body, var_types, out),
+            Stmt::For { body, .. } => collect_set_index_uses(body, var_types, out),
+            Stmt::DoWhile { body, .. } => collect_set_index_uses(body, var_types, out),
+            Stmt::WhileLet { body, .. } => collect_set_index_uses(body, var_types, out),
+            _ => {}
+        }
+    }
+}
+
+/// 10.2.4(3)/(7)：`[]` 中的下标个数须与下标运算符重载的非命名形参个数一致。
+///
+/// 保守实现：仅当接收者可被简单推断为本地类型、且该类型存在 `op_index` 重载时
+/// 才检查；get/set 形态分别匹配。
+fn check_index_operator_arity(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut funcs: Vec<&Function> = Vec::new();
+    for f in &program.functions {
+        funcs.push(f);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            funcs.push(&m.func);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            funcs.push(m);
+        }
+    }
+    for f in funcs {
+        let var_types = local_var_type_map(&f.body);
+        if var_types.is_empty() {
+            continue;
+        }
+        let mut uses: Vec<(String, usize, bool)> = Vec::new();
+        walk_stmts(&f.body, &mut |e| {
+            if let Expr::Index { array, index } = e {
+                if let Expr::Var(v) = array.as_ref() {
+                    if let Some(t) = var_types.get(v) {
+                        uses.push((t.clone(), index_arg_count(index), false));
+                    }
+                }
+            }
+        });
+        collect_set_index_uses(&f.body, &var_types, &mut uses);
+        for (tbase, count, is_set) in uses {
+            let sigs = collect_index_op_sigs(&tbase, program, index);
+            if sigs.is_empty() {
+                continue;
+            }
+            let relevant: Vec<&IndexOpSig> = sigs.iter().filter(|s| s.is_set == is_set).collect();
+            if relevant.is_empty() {
+                continue;
+            }
+            if !relevant.iter().any(|s| s.index_types.len() == count) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "对类型 '{}' 的 {} 形态下标运算符提供了 {} 个下标参数，与重载不匹配（10.2.4(3)/(7)）",
+                        tbase,
+                        if is_set { "set" } else { "get" },
+                        count
+                    ),
+                });
+            }
+        }
+    }
+}
+
+// ─── 10.2.3(19)/(21)：this(...)/super(...) 只解析为构造函数 ──────────────────
+
+/// 构造函数能否按位置接受 `argc` 个实参（保守宽松：默认值/命名参数尽量放行）。
+fn ctor_accepts_params(params: &[Param], argc: usize) -> bool {
+    fn direct(params: &[Param], argc: usize) -> bool {
+        let variadic = params.iter().any(|p| p.variadic);
+        if argc > params.len() && !variadic {
+            return false;
+        }
+        let min_required = params
+            .iter()
+            .filter(|p| p.default.is_none() && !p.variadic && !p.is_named)
+            .count();
+        argc >= min_required
+    }
+    if direct(params, argc) {
+        return true;
+    }
+    // `this(...){...}` / `super(...){...}` 的尾随闭包可能填充最后一个函数类型形参，
+    // 按 argc+1 再匹配一次（仅放宽，不会误判为错误）。
+    if params
+        .last()
+        .map_or(false, |p| matches!(p.ty, Type::Function { .. }))
+    {
+        return direct(params, argc + 1);
+    }
+    false
+}
+
+/// 收集类的全部构造函数的形参列表。
+fn class_ctor_param_lists<'a>(cls: &'a ClassDef) -> Vec<&'a [Param]> {
+    if !cls.inits.is_empty() {
+        cls.inits.iter().map(|i| i.params.as_slice()).collect()
+    } else if let Some(init) = &cls.init {
+        vec![init.params.as_slice()]
+    } else if !cls.primary_ctor_params.is_empty() {
+        vec![cls.primary_ctor_params.as_slice()]
+    } else {
+        vec![&[] as &[Param]]
+    }
+}
+
+/// 10.2.3(19)/(21)：`this(...)` / `super(...)` 构造函数调用只解析为构造函数，
+/// 绝不能调用 `()` 运算符重载。若给定实参个数不匹配任何可解析的构造函数，
+/// 则报错（保守：父类无法本地解析时跳过 super 检查）。
+fn check_this_super_ctor_call_resolution(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for cls in &program.classes {
+        let own_ctors = class_ctor_param_lists(cls);
+        let parent_ctors = cls
+            .extends
+            .as_deref()
+            .map(|p| p.split('<').next().unwrap_or(p).trim())
+            .and_then(|base| index.classes.get(base))
+            .map(|pc| class_ctor_param_lists(pc));
+        // 待扫描函数体：(语句体, 是否为构造函数体)。
+        let mut bodies: Vec<(&[Stmt], bool)> = Vec::new();
+        if !cls.inits.is_empty() {
+            for i in &cls.inits {
+                bodies.push((i.body.as_slice(), true));
+            }
+        } else if let Some(init) = &cls.init {
+            bodies.push((init.body.as_slice(), true));
+        }
+        for m in &cls.methods {
+            bodies.push((m.func.body.as_slice(), false));
+        }
+        for (body, is_ctor) in bodies {
+            walk_stmts(body, &mut |e| match e {
+                Expr::Call {
+                    name, args, named_args, ..
+                } if name == "this" => {
+                    let argc = args.len() + named_args.len();
+                    if !own_ctors.iter().any(|p| ctor_accepts_params(p, argc)) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "类 '{}' 的 this(...) 只能调用构造函数，参数个数 {} 不匹配任何构造函数（10.2.3(19)）",
+                                cls.name, argc
+                            ),
+                        });
+                    }
+                }
+                Expr::Invoke {
+                    callee,
+                    args,
+                    named_args,
+                } if matches!(callee.as_ref(), Expr::Var(n) if n == "this") => {
+                    let argc = args.len() + named_args.len();
+                    if !own_ctors.iter().any(|p| ctor_accepts_params(p, argc)) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "类 '{}' 的 this(...) 只能调用构造函数，参数个数 {} 不匹配任何构造函数（10.2.3(19)）",
+                                cls.name, argc
+                            ),
+                        });
+                    }
+                }
+                Expr::SuperCall {
+                    method, args, named_args, ..
+                } if method == "init" => {
+                    if !is_ctor {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "类 '{}' 的 super(...) 构造函数调用只能出现在构造函数体内（6.1.2.1）",
+                                cls.name
+                            ),
+                        });
+                    } else if let Some(pcs) = &parent_ctors {
+                        let argc = args.len() + named_args.len();
+                        if !pcs.iter().any(|p| ctor_accepts_params(p, argc)) {
+                            errors.push(SemanticError {
+                                message: format!(
+                                    "类 '{}' 的 super(...) 只能调用父类构造函数，参数个数 {} 不匹配任何父类构造函数（10.2.3(21)）",
+                                    cls.name, argc
+                                ),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            });
+        }
+    }
+}
 
 fn check_operator_function_signatures(program: &Program, errors: &mut Vec<SemanticError>) {
     fn check_one(
@@ -19836,6 +21315,138 @@ main() {}"#,
         // 同类别同名类型声明可能来自宏属性（@Test/@Strategy/@When 等）的多声明，
         // AST 不保留属性，无法区分，保守放行（正测试红线）。
         assert_valid("class name {}\nclass name {}\nmain() {}");
+    }
+
+    // ─── w16a：08 扩展 / 10 重载（私有成员访问 / 遮蔽 / 接口 / 下标 / 复合赋值）───
+
+    #[test]
+    fn test_w16a_extension_private_member_access() {
+        // 扩展访问被扩展类型的 private 方法 → 非法。
+        let errs = assert_invalid(
+            "class P {\n    private func secret(): Int64 { 1 }\n}\nextend P {\n    func use(): Int64 { secret() }\n}\nmain() {}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("private")));
+        // private 成员在被扩展类型内部访问 → 合法。
+        assert_valid(
+            "class P {\n    private func secret(): Int64 { 1 }\n    func use(): Int64 { secret() }\n}\nmain() {}",
+        );
+        // 扩展访问 public 成员 → 合法。
+        assert_valid(
+            "class P2 {\n    func reveal(): Int64 { 1 }\n}\nextend P2 {\n    func use(): Int64 { reveal() }\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w16a_extension_shadowing_type_member() {
+        // 扩展定义与被扩展类型同名同签名成员 → 非法（8.4(7)）。
+        let errs = assert_invalid(
+            "class S { func f(x: Int64) {} }\nextend S { func f(x: Int64) {} }\nmain() {}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("遮蔽")));
+        // 同名不同参数（重载）→ 合法。
+        assert_valid(
+            "class S2 { func f(x: Int64) {} }\nextend S2 { func f(x: Bool) {} }\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w16a_extension_interface_rules() {
+        // 已实现接口的类型再次通过扩展实现 → 非法（8.1.2(8)）。
+        let errs = assert_invalid(
+            "interface I { func f(): Unit }\nclass F <: I { public func f(): Unit {} }\nextend F <: I {}\nmain() {}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("接口")));
+        // 通过两个扩展重复实现同一接口 → 非法（8.1.2(9)）。
+        assert_invalid(
+            "interface J { func f(): Unit }\nclass G {}\nextend G <: J { func f(): Unit {} }\nextend G <: J {}\nmain() {}",
+        );
+        // 扩展实现的是类而非接口 → 非法（8.1.2(2)）。
+        assert_invalid(
+            "open class K {}\nextend Bool <: K { public func z(): Unit {} }\nmain() {}",
+        );
+        // extend 接口类型本身 → 非法（8(1)）。
+        assert_invalid("interface M { func a(): Unit }\nextend M { func b(): Unit {} }\nmain() {}");
+        // 未实现接口的类型唯一一次实现 → 合法。
+        assert_valid(
+            "interface N { func f(): Unit }\nclass H {}\nextend H <: N { func f(): Unit {} }\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w16a_extension_private_cross_reference() {
+        // 同一类型的另一个扩展引用 private 扩展成员 → 非法（8.4(12)）。
+        let errs = assert_invalid(
+            "class A {}\nextend A { private func p(): Int64 { 1 } }\nextend A { func q(): Int64 { p() } }\nmain() {}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("private")));
+        // 同一扩展内部引用自己的 private 成员 → 合法。
+        assert_valid(
+            "class A2 {}\nextend A2 { private func p(): Int64 { 1 } func q(): Int64 { p() } }\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w16a_extension_private_outside_access() {
+        // 扩展外通过对象访问 private 扩展成员 → 非法（8.2.1.1(2)）。
+        let errs = assert_invalid(
+            "class B {}\nextend B { private func p(): Int64 { 1 } }\nmain() { let b = B(); b.p() }",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("private")));
+        // 访问 public 扩展成员 → 合法。
+        assert_valid(
+            "class B2 {}\nextend B2 { public func p(): Int64 { 1 } }\nmain() { let b = B2(); b.p() }",
+        );
+    }
+
+    #[test]
+    fn test_w16a_index_operator_arity_and_type() {
+        // get 形态下标个数与 op_index 非命名形参个数不符 → 非法（10.2.4(3)）。
+        let errs = assert_invalid(
+            "class C { operator func[](i1: Int64, i2: Int64) { return 42 } }\nmain() { var c = C(); c[0] }",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("下标")));
+        // 字面量下标类型与形参类型不兼容 → 非法（10.2.4(7)）。
+        assert_invalid(
+            "class D { operator func[](index: String) { return 0 } }\nmain() { var d = D(); d[1] }",
+        );
+        // 个数与类型均匹配 → 合法。
+        assert_valid(
+            "class E2 { operator func[](index: Int64) { return 0 } }\nmain() { var e = E2(); e[1] }",
+        );
+        // 字符串字面量下标匹配 String 形参 → 合法。
+        assert_valid(
+            "class F3 { operator func[](index: String) { return 0 } }\nmain() { var f = F3(); f[\"k\"] }",
+        );
+    }
+
+    #[test]
+    fn test_w16a_this_super_ctor_call_resolution() {
+        // this() 不匹配任何构造函数（不能落到 () 运算符）→ 非法（10.2.3(19)）。
+        let errs = assert_invalid(
+            "open class A {\n    init(x: Int64) {\n        this()\n    }\n    operator func ()(): Unit {}\n}\nmain() {}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("构造函数")));
+        // super() 不匹配父类任何构造函数 → 非法（10.2.3(21)）。
+        assert_invalid(
+            "open class B0 {\n    init(x: Int64) {}\n    operator func ()(): Unit {}\n}\nclass B <: B0 {\n    init() {\n        super()\n    }\n}\nmain() {}",
+        );
+        // 构造函数调用匹配 → 合法。
+        assert_valid(
+            "class C0 {\n    init(x: Int64) {}\n    init() {\n        this(1)\n    }\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w16a_compound_assign_operator_return() {
+        // 浮点运算符返回非浮点类型，其复合赋值形式类型不兼容 → 非法（10.2.3(15)）。
+        let errs = assert_invalid(
+            "extend Float16 { public operator func &(x: Unit) { 1u64 } }\nmain() { var a = 1.0f16; a &= () }",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("复合赋值")));
+        // 浮点运算符返回浮点类型 → 复合赋值合法。
+        assert_valid(
+            "extend Float16 { public operator func &(x: Unit) { 1.0f16 } }\nmain() { var a = 1.0f16; a &= () }",
+        );
     }
 
 }
