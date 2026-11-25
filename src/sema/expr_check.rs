@@ -2265,6 +2265,12 @@ impl<'a> Checker<'a> {
                     self.check_field_target(name, field);
                 }
             }
+            // 多元赋值 `(a, b) = expr`：逐元素检查左值合法性（4.23(30)）。
+            AssignTarget::Tuple(targets) => {
+                for t in targets {
+                    self.check_assign_target(t, &Ty::Unknown);
+                }
+            }
             // 其余目标（切片 / 解构 / super）保守跳过。
             _ => {}
         }
@@ -2559,7 +2565,7 @@ impl<'a> Checker<'a> {
     /// 的同类型或子类型；否则报类型不匹配。
     fn check_compound_operator_return(&mut self, target: &crate::ast::AssignTarget, value: &Expr) {
         use crate::ast::AssignTarget;
-        let Expr::Binary { op, left, .. } = value else {
+        let Expr::Binary { op, left, right } = value else {
             return;
         };
         // 仅处理脱糖出的复合赋值形态：右值为 `target op expr` 且左操作数即赋值目标本身。
@@ -2584,6 +2590,28 @@ impl<'a> Checker<'a> {
         // → Float64（`var a = 1` / `var a = 1.0` 的静态类型即为默认类型），
         // 否则 FloatLit/IntLit 无法在扩展运算符表中定位接收者而被跳过。
         let target_ty = default_literal(&target_ty);
+        // 4.23(24)：复合赋值 `a op= b` 要求两侧操作数同类型。该形态由解析器
+        // 脱糖为 `a = a op b` 的 Binary，这里对可静态确定的基础类型操作数做
+        // 保守判定；用户重载、String 拼接/重复、未知类型（调用结果等）跳过。
+        if !self.overloaded_ops.contains(overload_name(op))
+            && target_ty.is_prim()
+            && !matches!(target_ty, Ty::String)
+            // `**` 的指数类型与底数类型本就可以不同（4.15 幂运算规则），不适用同类型要求。
+            && !matches!(op, BinOp::Pow)
+        {
+            let rhs_ty = self.check_expr_ty_peek(right);
+            if rhs_ty.is_prim()
+                && !matches!(rhs_ty, Ty::String)
+                && !compatible(&target_ty, &rhs_ty)
+            {
+                self.err(format!(
+                    "复合赋值运算符 '{}=' 要求两侧操作数类型相同: {} 与 {}（4.23(24)）",
+                    bin_symbol(op),
+                    target_ty.name(),
+                    rhs_ty.name()
+                ));
+            }
+        }
         let Some(ret_ty) = self.operator_return_for(&target_ty, op) else {
             return;
         };
@@ -2725,7 +2753,7 @@ impl<'a> Checker<'a> {
                 if !(simple_operand(left) && simple_operand(right)) {
                     return binary_result_no_check(op, &lt, &rt);
                 }
-                self.check_binary(op, &lt, &rt, right)
+                self.check_binary(op, left, &lt, &rt, right)
             }
 
             Expr::Call {
@@ -3263,11 +3291,22 @@ impl<'a> Checker<'a> {
                 }
             }
             UnaryOp::Not => {
-                // 规范要求 `!` 作用于 Bool 或整数（按位取反）；但官方语法正例中
-                // 存在 `!Int64` 的写法（04_18 a05），为避免误伤正测试，
-                // 非 Bool 时保留操作数类型而不报错。
+                // 规范要求 `!` 作用于 Bool（逻辑非）或整数（按位取反，4.18(2)）；
+                // 官方语法正例中存在 `!Int64` 的写法（04_18 a05），故整数放行。
+                // 用户类型可能通过 `extend T { operator func !() }` 重载，存在
+                // op_not/op_bitnot 重载时整体保守跳过。
+                let over = self.overloaded_ops.contains("op_not")
+                    || self.overloaded_ops.contains("op_bitnot");
                 if *t == Ty::Bool {
                     Ty::Bool
+                } else if over {
+                    t.clone()
+                } else if t.is_prim() && !t.is_int() {
+                    self.err(format!(
+                        "一元运算符 '!' 只能作用于 Bool 或整数类型，实际为 {}（4.18(2)）",
+                        t.name()
+                    ));
+                    t.clone()
                 } else if t.is_prim() {
                     t.clone()
                 } else {
@@ -3440,28 +3479,23 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_binary(&mut self, op: &BinOp, lt: &Ty, rt: &Ty, right: &Expr) -> Ty {
+    fn check_binary(&mut self, op: &BinOp, left: &Expr, lt: &Ty, rt: &Ty, right: &Expr) -> Ty {
         // 定义了该运算符重载时关闭对应规则，避免误伤合法重载。
         if self.overloaded_ops.contains(overload_name(op)) {
             return overload_result_ty(op);
         }
 
-        // Bool 极少是算术/位运算/幂运算的合法操作数；出现 Bool 通常意味着
+        // 4.15(62)/(65)：两个操作数均为编译期可确定的整型字面量时，
+        // 在编译期检测算术溢出（默认策略与 @OverflowThrowing 一致）。
+        self.check_const_arith_overflow(op, left, right);
+
+        // Bool 极少是算术/幂运算的合法操作数；出现 Bool 通常意味着
         // 解析器把换行后的语句并入了上一表达式（官方语法正例中存在此形态），
-        // 此时 AST 已不可靠，保守跳过。
+        // 此时 AST 已不可靠，保守跳过。位运算/移位仍按 4.18(2)/(7) 判定
+        //（Bool 不是整数类型，不能参与位运算/移位）。
         let bool_in_numeric_op = matches!(
             op,
-            BinOp::Add
-                | BinOp::Sub
-                | BinOp::Mul
-                | BinOp::Div
-                | BinOp::Mod
-                | BinOp::Pow
-                | BinOp::BitAnd
-                | BinOp::BitOr
-                | BinOp::BitXor
-                | BinOp::Shl
-                | BinOp::Shr
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
         ) && (*lt == Ty::Bool || *rt == Ty::Bool);
         if bool_in_numeric_op {
             return Ty::Unknown;
@@ -3570,7 +3604,87 @@ impl<'a> Checker<'a> {
                 Ty::Bool
             }
             BinOp::NotIn => Ty::Bool,
-            BinOp::Pipeline => Ty::Unknown,
+            BinOp::Pipeline => {
+                // 4.22.1(2)：`e1 |> e2` 等价于 `e2(e1)`，要求 e2 为函数类型。
+                // 仅拒绝“可确定且明确不可调用”的右操作数类型：
+                // - 用户类型可能定义 `operator func ()`（合法，见官方正例）；
+                // - 函数类型为 `Agg("function")`，本支暂不校验形参类型；
+                // - Option 可能与解包/调用语法混用，保守跳过；
+                // - 顶层无类型标注绑定的类型由 Int64 占位推断（如 `let obj = A()`），
+                //   类型不可靠，指向全局变量的右操作数保守跳过。
+                let rhs_is_global = match right {
+                    Expr::Var(n) => {
+                        !self.scopes.iter().any(|s| s.contains_key(n))
+                            && self.globals.contains_key(n)
+                    }
+                    _ => false,
+                };
+                if !rhs_is_global
+                    && rt.is_definite()
+                    && !matches!(rt, Ty::User(_) | Ty::Option(_) | Ty::Agg("function"))
+                {
+                    self.err(format!(
+                        "管道运算符 '|>' 的右操作数必须为函数类型，实际为 {}",
+                        rt.name()
+                    ));
+                }
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// 4.15(62)/(65)：常量算术表达式在编译期溢出时报告错误。
+    ///
+    /// 仅处理“两侧均为同一后缀类型的整型字面量（允许一元负号）”这一可精确
+    /// 判定的形态；变量、常量名、混合类型一律跳过（可能来自运行时或重载）。
+    /// 无符号后缀的字面量在词法阶段被按位折叠为 i64，这里通过 `as u64`
+    /// 还原其真实数值。
+    fn check_const_arith_overflow(&mut self, op: &BinOp, left: &Expr, right: &Expr) {
+        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+            return;
+        }
+        let Some((lv, lt)) = const_int_value(left) else {
+            return;
+        };
+        let Some((rv, rt)) = const_int_value(right) else {
+            return;
+        };
+        if lt != rt {
+            return;
+        }
+        let Some((lo, hi)) = int_ty_range(&lt) else {
+            return;
+        };
+        let over = match op {
+            BinOp::Add => {
+                let r = lv + rv;
+                r < lo || r > hi
+            }
+            BinOp::Sub => {
+                let r = lv - rv;
+                r < lo || r > hi
+            }
+            BinOp::Mul => {
+                if lv >= 0 && rv >= 0 {
+                    // 两个无符号 64 位值的乘积可超过 i128，用 u128 计算。
+                    (lv as u128) * (rv as u128) > hi as u128
+                } else {
+                    match lv.checked_mul(rv) {
+                        Some(r) => r < lo || r > hi,
+                        None => true,
+                    }
+                }
+            }
+            _ => false,
+        };
+        if over {
+            self.err(format!(
+                "常量算术表达式溢出：{} {} {} 的结果超出类型 {} 的取值范围（4.15(62)/(65)）",
+                lv,
+                bin_symbol(op),
+                rv,
+                lt.name()
+            ));
         }
     }
 
@@ -3682,6 +3796,72 @@ fn int_bit_width(t: &Ty) -> Option<i64> {
 /// 重载运算符调用的结果类型未知（由重载定义决定，交由其他阶段处理）。
 fn overload_result_ty(_op: &BinOp) -> Ty {
     Ty::Unknown
+}
+
+/// 编译期可确定的整型字面量 → (真实数值, 具体类型)。
+///
+/// 仅识别带类型后缀的字面量及其一元负号形态。无符号后缀在词法阶段被
+/// 按位折叠为 i64（如 `18446744073709551615u64` → -1），这里用 `as u64`
+/// 还原真实数值。带符号后缀出现负的原始值时无法区分“真正的负数”与
+/// “超 i64 折叠”，除 `-9223372036854775808i64`（i64::MIN）外一律跳过。
+fn const_int_value(e: &Expr) -> Option<(i128, Ty)> {
+    fn raw_lit(v: i64, s: IntSuffix) -> Option<i128> {
+        match s {
+            IntSuffix::U8 | IntSuffix::U16 | IntSuffix::U32 | IntSuffix::U64 => {
+                Some((v as u64) as i128)
+            }
+            _ => {
+                if v < 0 {
+                    None
+                } else {
+                    Some(v as i128)
+                }
+            }
+        }
+    }
+    match e {
+        Expr::IntegerSuffixed(v, s) => Some((raw_lit(*v, *s)?, suffix_ty(*s))),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => match &**expr {
+            Expr::IntegerSuffixed(v, s) => {
+                if matches!(
+                    s,
+                    IntSuffix::U8 | IntSuffix::U16 | IntSuffix::U32 | IntSuffix::U64
+                ) {
+                    return None;
+                }
+                let mag: i128 = if *v >= 0 {
+                    *v as i128
+                } else if (*v as u64) == (1u64 << 63) {
+                    // `-9223372036854775808i64`：内层字面量超出 i64 上界，
+                    // 词法阶段折叠为 i64::MIN；其真实幅度为 2^63。
+                    1i128 << 63
+                } else {
+                    return None;
+                };
+                Some((-mag, suffix_ty(*s)))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 具体整型的取值范围（i128 表示）。
+fn int_ty_range(t: &Ty) -> Option<(i128, i128)> {
+    Some(match t {
+        Ty::Int8 => (-(1i128 << 7), (1i128 << 7) - 1),
+        Ty::Int16 => (-(1i128 << 15), (1i128 << 15) - 1),
+        Ty::Int32 => (-(1i128 << 31), (1i128 << 31) - 1),
+        Ty::Int64 | Ty::IntNative => (-(1i128 << 63), (1i128 << 63) - 1),
+        Ty::UInt8 => (0, (1i128 << 8) - 1),
+        Ty::UInt16 => (0, (1i128 << 16) - 1),
+        Ty::UInt32 => (0, (1i128 << 32) - 1),
+        Ty::UInt64 | Ty::UIntNative => (0, u64::MAX as i128),
+        _ => return None,
+    })
 }
 
 /// 基础类型转换构造函数名 → 类型。
@@ -4801,6 +4981,95 @@ mod tests {
         assert_ok(
             "class C {\n var x: Int64 = 1\n C() {}\n}\nmain() {\n let o = C()\n o.x = 2\n}",
         );
+    }
+
+    #[test]
+    fn test_const_arith_overflow_literals() {
+        // 4.15(62)/(65)：同类型后缀字面量的常量算术溢出在编译期报错。
+        assert_err("main() { let x = 32767i16 + 32767i16 }", "溢出");
+        assert_err("main() { let x = 255u8 * 255u8 }", "溢出");
+        assert_err("main() { let x = 0u8 - 1u8 }", "溢出");
+        assert_err("main() { let x = 2147483647i32 * 2147483647i32 }", "溢出");
+        assert_err(
+            "main() { let x = 18446744073709551615u64 * 18446744073709551615u64 }",
+            "溢出",
+        );
+        // 不溢出的常量运算应通过。
+        assert_ok("main() { let x = 32766i16 + 1i16 }");
+        assert_ok("main() { let x = 127i8 * 1i8 }");
+        assert_ok("main() { let x = 255u8 * 1u8 }");
+        // 变量参与的运行时运算不能在编译期判定，应通过。
+        assert_ok("main() { var a: Int16 = 32767\n var b: Int16 = 1\n let x = a + b }");
+    }
+
+    #[test]
+    fn test_compound_assign_same_type() {
+        // 4.23(24)：复合赋值两侧操作数类型必须相同。
+        assert_err(
+            "main() { var a: UInt16 = 1\n var b: UInt32 = 2\n a <<= b }",
+            "复合赋值",
+        );
+        assert_err(
+            "main() { var a: Int32 = 1\n var b: UInt32 = 2\n a >>= b }",
+            "复合赋值",
+        );
+        // 字面量可适配目标类型。
+        assert_ok("main() { var a: UInt16 = 1\n a <<= 1 }");
+        assert_ok("main() { var a: Int64 = 1\n a += 2 }");
+        // `**` 的指数类型可以与底数不同。
+        assert_ok("main() { var a: Int64 = 2\n a **= 2u64 }");
+    }
+
+    #[test]
+    fn test_multi_assign_targets() {
+        // 4.23(30)：多元赋值左侧逐元素检查左值合法性。
+        assert_err("main() { let v = 1\n (v, _) = (1, 1) }", "不可变");
+        assert_err(
+            "enum E { E1 }\nmain() { (E1, _) = (E1, 1) }",
+            "enum 构造值",
+        );
+        assert_err("main() { var t = (1, 1)\n (t[0], _) = (1, 1) }", "元组");
+        assert_ok("main() { var a = 1\n var b = 2\n (a, b) = (1, 2) }");
+    }
+
+    #[test]
+    fn test_pipeline_rhs_must_be_callable() {
+        // 4.22.1(2)：管道右操作数必须为函数类型（或定义了 operator () 的用户类型）。
+        assert_err(
+            "main() { var v1: Int64 = 1\n var v2: String = \"x\"\n let v3 = v1 |> v2 }",
+            "管道",
+        );
+        assert_err(
+            "main() { var v1: UInt8 = 1\n var v2: Float32 = 1.0\n let v3 = v1 |> v2 }",
+            "管道",
+        );
+        // 函数类型变量合法。
+        assert_ok(
+            "main() { var v1: Int8 = 1\n var v2: (Int8) -> Int8 = { x: Int8 => x }\n let v3 = v1 |> v2 }",
+        );
+        // 用户类型可能定义 operator ()，保守放行。
+        assert_ok("class F {}\nmain() { var v1: Int64 = 1\n var v2 = F()\n let v3 = v1 |> v2 }");
+    }
+
+    #[test]
+    fn test_bitwise_bool_and_unary_not() {
+        // 4.18(7)：移位操作数必须为整数类型（Bool 非法）。
+        assert_err(
+            "main() { var v1: Bool = true\n var v2: UInt8 = 1\n let v3 = v1 << v2 }",
+            "移位",
+        );
+        // 4.18(2)：位运算操作数必须为整数类型。
+        assert_err(
+            "main() { var v1: Bool = true\n var v2: Bool = true\n let v3 = v1 | v2 }",
+            "整数类型",
+        );
+        // `!` 只能用于 Bool 或整数。
+        assert_err("main() { var v: String = \"s\"\n let x = !v }", "只能作用于");
+        // Bool 与整数的 `!` 合法。
+        assert_ok("main() { let b = !true }");
+        assert_ok("main() { var x: Int64 = 1\n let y = !x }");
+        // 用户类型可能重载 `!`，保守放行。
+        assert_ok("class C {}\nmain() { var v: C = C()\n let x = !v }");
     }
 
 }
