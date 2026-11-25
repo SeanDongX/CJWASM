@@ -357,6 +357,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_duplicate_local_bindings(program, &mut errors);
     // 3.2.3.2(3)/(6)：局部变量 / 局部函数先使用后声明。
     check_use_before_declaration(program, &mut errors);
+    // 3.2.3.3(1)：类型的成员名仅在类型内部可见；顶层自由函数不能无资格引用
+    // 其它类型的字段/方法（保守版，只检查自由函数体的直接引用）。
+    check_unqualified_member_refs_in_free_fns(program, &mut errors);
     // 5.1.2 / 5.3.4：形参声明顺序、默认值必须是命名参数、默认值静态作用域、
     // 变长形参位置，以及接口/open/abstract/运算符函数不能有可选参数。
     check_function_param_rules(program, &mut errors);
@@ -1586,7 +1589,8 @@ fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticE
             }
             Some((prev_kind, prev_desc)) => {
                 if *prev_kind == kind {
-                    // 同类别重复：由专门检查或宏展开负责，保守跳过。
+                    // 同类别重复：可能来自重载、宏展开或 @When 平台条件编译，
+                    // 由专门检查负责，保守跳过。
                     return;
                 }
                 errors.push(SemanticError {
@@ -1600,6 +1604,8 @@ fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticE
     }
 
     let mut seen: HashMap<String, (&'static str, String)> = HashMap::new();
+    // 顶层同名 let/var 可能来自 @When[os/backend] 平台条件编译（官方 std 大量使用），
+    // 预处理前的 AST 会同时保留各平台分支，故同类别重复必须保守跳过。
     for c in &program.constants {
         record(&mut seen, &c.name, "变量", "变量", errors);
     }
@@ -1608,8 +1614,11 @@ fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticE
         if f.name.contains('.') || f.name.contains("::") {
             continue;
         }
+        // 同名顶层函数可能是重载，由 check_function_groups 判定，不在此处按类别重复处理。
         record(&mut seen, &f.name, "函数", "函数", errors);
     }
+    // 用户定义类型：跨类别冲突由 record 判定；同类别重复可能来自 @When
+    // 平台条件编译，按上面同样的理由保守跳过。
     for c in &program.classes {
         record(&mut seen, &c.name, "class", "class", errors);
     }
@@ -1635,41 +1644,61 @@ fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticE
 /// 子块、分支、匹配分支、lambda 体各自开启新作用域，因此合法遮蔽不会被误判。
 fn check_duplicate_local_bindings(program: &Program, errors: &mut Vec<SemanticError>) {
     for f in &program.functions {
-        walk_body_for_dups(&f.body, errors);
+        let params = param_names(&f.params);
+        walk_body_for_dups(&f.body, &params, errors);
     }
     for cls in &program.classes {
         if let Some(init) = &cls.init {
-            walk_body_for_dups(&init.body, errors);
+            let params = param_names(&init.params);
+            walk_body_for_dups(&init.body, &params, errors);
         }
         if let Some(d) = &cls.deinit {
-            walk_body_for_dups(d, errors);
+            walk_body_for_dups(d, &[], errors);
         }
         if let Some(si) = &cls.static_init {
-            walk_body_for_dups(si, errors);
+            walk_body_for_dups(si, &[], errors);
         }
         for m in &cls.methods {
             if !m.func.body.is_empty() {
-                walk_body_for_dups(&m.func.body, errors);
+                let params = param_names(&m.func.params);
+                walk_body_for_dups(&m.func.body, &params, errors);
             }
         }
     }
     for iface in &program.interfaces {
         for m in &iface.methods {
             if let Some(body) = &m.default_body {
-                walk_body_for_dups(body, errors);
+                let params = param_names(&m.params);
+                walk_body_for_dups(body, &params, errors);
             }
         }
     }
     for ext in &program.extends {
         for f in &ext.methods {
-            walk_body_for_dups(&f.body, errors);
+            let params = param_names(&f.params);
+            walk_body_for_dups(&f.body, &params, errors);
         }
     }
 }
 
-fn walk_body_for_dups(stmts: &[Stmt], errors: &mut Vec<SemanticError>) {
+fn param_names(params: &[Param]) -> Vec<String> {
+    params.iter().map(|p| p.name.clone()).collect()
+}
+
+/// 3.2.3.2(11)：形参与函数体局部变量处于同一作用域层级，
+/// 因此函数体最外层不能再声明同名变量（3.1(3) 同作用域重复声明）。
+/// 参数名预置到最外层作用域；嵌套块仍可合法遮蔽。
+fn walk_body_for_dups(
+    stmts: &[Stmt],
+    params: &[String],
+    errors: &mut Vec<SemanticError>,
+) {
     let mut scopes: Vec<HashSet<String>> = Vec::new();
-    walk_block_for_dups(stmts, &mut scopes, errors);
+    scopes.push(params.iter().cloned().collect());
+    for s in stmts {
+        walk_stmt_for_dups(s, &mut scopes, errors);
+    }
+    scopes.pop();
 }
 
 fn pattern_binding_names(p: &Pattern, out: &mut Vec<String>) {
@@ -1687,6 +1716,29 @@ fn pattern_binding_names(p: &Pattern, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// 3.3.1(9)/(10)：判断模式中是否**明显**包含可反驳的子模式。
+///
+/// 只把字面量、范围、类型测试、守卫识别为可反驳；枚举变体本身不判定
+/// （是否可反驳取决于枚举构造器数量，单文件无法可靠得知），
+/// 元组 / 结构体解构只递归检查其字段子模式。
+/// 因此 `let (x, y)`、`let (_, z)`、`let Red(a)`、`for (i in ...)` 等合法
+/// 写法不会被误判——这正是 w9c 回退的教训。
+fn pattern_clearly_refutable(p: &Pattern) -> bool {
+    match p {
+        Pattern::Literal(_) | Pattern::Range { .. } | Pattern::TypeTest { .. } | Pattern::Guard(_) => {
+            true
+        }
+        Pattern::Tuple(ps) | Pattern::Or(ps) => ps.iter().any(pattern_clearly_refutable),
+        Pattern::Struct { fields, .. } => {
+            fields.iter().any(|(_, q)| pattern_clearly_refutable(q))
+        }
+        Pattern::Variant { payload, .. } => {
+            payload.as_deref().map_or(false, pattern_clearly_refutable)
+        }
+        Pattern::Wildcard | Pattern::Binding(_) | Pattern::Field { .. } => false,
     }
 }
 
@@ -1735,7 +1787,30 @@ fn walk_stmt_for_dups(
             walk_expr_for_dups(value, scopes, errors);
             let mut names = Vec::new();
             pattern_binding_names(pattern, &mut names);
+            // 形参自引用式遮蔽（如 std 中常见的 `var low = low`）：最外层作用域内
+            // 新声明与形参同名，且初始化表达式直接引用该同名形参时视为合法。
+            // 这保留了 a10_02 类（`var x = 1` 遮蔽形参）的拒绝，同时不误伤 std。
+            if scopes.len() == 1 {
+                let mut value_refs = Vec::new();
+                collect_expr_direct_refs(value, &mut value_refs);
+                for name in &names {
+                    if value_refs.contains(name) {
+                        if let Some(scope) = scopes.first_mut() {
+                            scope.remove(name);
+                        }
+                    }
+                }
+            }
             declare_local_names(&names, scopes, errors);
+            // 3.3.1(9)/(10)：let/var 后的模式必须（或可能）不可反驳。
+            // 保守版：只拒绝模式中显式出现字面量 / 范围 / 类型测试等明显可反驳
+            // 子模式的情形；纯绑定、通配符、元组解构、结构体解构、枚举变体模式
+            // 一律放行，避免误伤 for-in / 解构等合法写法。
+            if pattern_clearly_refutable(pattern) {
+                errors.push(SemanticError {
+                    message: "let/var 后的模式必须是不可反驳模式（3.3.1(9)/(10)）".to_string(),
+                });
+            }
         }
         Stmt::Const { name, value, .. } => {
             walk_expr_for_dups(value, scopes, errors);
@@ -1784,7 +1859,10 @@ fn walk_stmt_for_dups(
             walk_block_for_dups(body, scopes, errors);
             scopes.pop();
         }
-        Stmt::LocalFunc(f) => walk_body_for_dups(&f.body, errors),
+        Stmt::LocalFunc(f) => {
+            let params = param_names(&f.params);
+            walk_body_for_dups(&f.body, &params, errors)
+        }
         Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
             walk_expr_for_dups(left, scopes, errors);
             walk_expr_for_dups(right, scopes, errors);
@@ -2034,7 +2112,13 @@ fn check_use_before_declaration(program: &Program, errors: &mut Vec<SemanticErro
     }
 
     for cls in &program.classes {
-        let base: HashSet<String> = cls.fields.iter().map(|f| f.name.clone()).collect();
+        let mut base: HashSet<String> = cls.fields.iter().map(|f| f.name.clone()).collect();
+        // 同一类型内的成员方法可在方法体中无资格引用。
+        base.extend(
+            cls.methods
+                .iter()
+                .map(|m| last_name_segment(&m.func.name)),
+        );
         if let Some(init) = &cls.init {
             let mut outer = base.clone();
             outer.extend(init.params.iter().map(|p| p.name.clone()));
@@ -2057,29 +2141,131 @@ fn check_use_before_declaration(program: &Program, errors: &mut Vec<SemanticErro
     }
 
     for iface in &program.interfaces {
+        let iface_methods: HashSet<String> = iface
+            .methods
+            .iter()
+            .map(|m| last_name_segment(&m.name))
+            .collect();
         for m in &iface.methods {
             if let Some(body) = &m.default_body {
-                let outer: HashSet<String> =
-                    m.params.iter().map(|p| p.name.clone()).collect();
+                let mut outer = iface_methods.clone();
+                outer.extend(m.params.iter().map(|p| p.name.clone()));
                 order_body(body, &outer, &globals, errors);
             }
         }
     }
     for ext in &program.extends {
+        let mut type_members = HashSet::new();
+        add_type_field_names(program, &ext.target_type, &mut type_members);
         for f in &ext.methods {
-            let outer: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+            let mut outer = type_members.clone();
+            outer.extend(f.params.iter().map(|p| p.name.clone()));
             order_body(&f.body, &outer, &globals, errors);
         }
     }
 }
 
-/// 收集某用户类型的字段名到 `out`（供成员方法体引用）。
+/// 取限定名的最后一段（`C.m` / `C::m` → `m`）。
+fn last_name_segment(name: &str) -> String {
+    name.rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .rsplit(':')
+        .next()
+        .unwrap_or(name)
+        .to_string()
+}
+
+/// 所有类型成员（字段/方法）的名字集合，用于判定“无资格引用不在作用域内的成员名”。
+fn collect_file_member_names(program: &Program) -> HashSet<String> {
+    let mut m: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        m.extend(c.fields.iter().map(|f| f.name.clone()));
+        m.extend(c.methods.iter().map(|x| last_name_segment(&x.func.name)));
+    }
+    for s in &program.structs {
+        m.extend(s.fields.iter().map(|f| f.name.clone()));
+    }
+    for i in &program.interfaces {
+        m.extend(i.methods.iter().map(|x| last_name_segment(&x.name)));
+    }
+    // struct / enum 等方法以 `Type.method` 形式存放。
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") {
+            m.insert(last_name_segment(&f.name));
+        }
+    }
+    m
+}
+
+/// 3.2.3.3(1)：顶层自由函数体中无资格引用某类型的成员名（字段/方法）即为未解析标识符。
+///
+/// 仅检查自由函数体**最外层**语句的直接引用，且把函数内任意位置声明的局部名、
+/// 形参、顶层名、导入名都视为可见，避免与使用前声明规则叠加产生误报。
+/// 成员方法体 / 构造函数 / 扩展方法体内允许无资格访问自身成员，故不在此检查。
+fn check_unqualified_member_refs_in_free_fns(
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    let members = collect_file_member_names(program);
+    if members.is_empty() {
+        return;
+    }
+    let globals = collect_global_identifiers(program);
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") || f.body.is_empty() {
+            continue;
+        }
+        let mut declared: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        declared.extend(globals.iter().cloned());
+        for s in &f.body {
+            for n in block_decl_names(s) {
+                declared.insert(n);
+            }
+        }
+        collect_block_local_names(&f.body, &mut declared);
+        let mut reported: HashSet<String> = HashSet::new();
+        for s in &f.body {
+            let mut refs = Vec::new();
+            collect_stmt_direct_refs(s, &mut refs);
+            for r in refs {
+                if declared.contains(&r) || !members.contains(&r) {
+                    continue;
+                }
+                if reported.insert(r.clone()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "标识符 '{}' 是类型成员，不能在自由函数中无资格引用（3.2.3.3(1)）",
+                            r
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 收集某用户类型的字段名与方法名到 `out`（供成员方法体无资格引用）。
 fn add_type_field_names(program: &Program, type_name: &str, out: &mut HashSet<String>) {
     if let Some(c) = program.classes.iter().find(|c| c.name == type_name) {
         out.extend(c.fields.iter().map(|f| f.name.clone()));
+        out.extend(
+            c.methods
+                .iter()
+                .map(|m| last_name_segment(&m.func.name)),
+        );
     }
     if let Some(s) = program.structs.iter().find(|s| s.name == type_name) {
         out.extend(s.fields.iter().map(|f| f.name.clone()));
+    }
+    // 结构体 / 枚举等类型的方法以 `Type.method` / `Type::method` 形式存放在
+    // program.functions。
+    let prefix_dot = format!("{}.", type_name);
+    let prefix_colon = format!("{}::", type_name);
+    for f in &program.functions {
+        if f.name.starts_with(&prefix_dot) || f.name.starts_with(&prefix_colon) {
+            out.insert(last_name_segment(&f.name));
+        }
     }
 }
 
@@ -2153,6 +2339,21 @@ fn order_body(
     globals: &HashSet<String>,
     errors: &mut Vec<SemanticError>,
 ) {
+    let closed: HashSet<String> = HashSet::new();
+    order_body_closed(stmts, outer, globals, &closed, errors);
+}
+
+/// 带“已离开作用域名字集合”的块顺序检查。
+///
+/// `closed` 记录在**前序兄弟语句的嵌套块**中声明、但在当前块层面已不可见的
+/// 局部变量名（3.2.3.2(1)/(2)/(3)）。当前语句若引用这类名字即属越界访问。
+fn order_body_closed(
+    stmts: &[Stmt],
+    outer: &HashSet<String>,
+    globals: &HashSet<String>,
+    closed_in: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
     // 预扫描：本块内每个名字首次声明所在的语句下标。
     let mut first: HashMap<String, usize> = HashMap::new();
     for (i, s) in stmts.iter().enumerate() {
@@ -2162,6 +2363,7 @@ fn order_body(
     }
 
     let mut visible: HashSet<String> = outer.clone();
+    let mut closed: HashSet<String> = closed_in.clone();
     for (i, s) in stmts.iter().enumerate() {
         let mut refs = Vec::new();
         collect_stmt_direct_refs(s, &mut refs);
@@ -2181,6 +2383,14 @@ fn order_body(
                         ),
                     });
                 }
+            } else if closed.contains(r) {
+                // 名字曾在（本块内先前的）嵌套块中声明，但该块已结束。
+                errors.push(SemanticError {
+                    message: format!(
+                        "局部变量 '{}' 已离开作用域，不能在当前块中引用（3.2.3.2(1)/(2)/(3)）",
+                        r
+                    ),
+                });
             }
         }
 
@@ -2189,8 +2399,10 @@ fn order_body(
         for n in block_decl_names(s) {
             child_outer.insert(n);
         }
-        recurse_child_blocks(s, &child_outer, globals, errors);
+        recurse_child_blocks(s, &child_outer, globals, &closed, errors);
 
+        // 本语句嵌套块中声明的局部变量在语句结束即离开作用域。
+        collect_stmt_nested_local_names(s, &mut closed);
         for n in block_decl_names(s) {
             visible.insert(n);
         }
@@ -2201,34 +2413,44 @@ fn recurse_child_blocks(
     stmt: &Stmt,
     outer: &HashSet<String>,
     globals: &HashSet<String>,
+    closed: &HashSet<String>,
     errors: &mut Vec<SemanticError>,
 ) {
     match stmt {
         Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
         | Stmt::Loop { body }
-        | Stmt::UnsafeBlock { body } => order_body(body, outer, globals, errors),
+        | Stmt::UnsafeBlock { body } => order_body_closed(body, outer, globals, closed, errors),
         Stmt::For { var, body, .. } => {
             let mut child = outer.clone();
             child.insert(var.clone());
-            order_body(body, &child, globals, errors);
+            order_body_closed(body, &child, globals, closed, errors);
         }
         Stmt::WhileLet { pattern, body, .. } => {
             let mut child = outer.clone();
             let mut names = Vec::new();
             pattern_binding_names(pattern, &mut names);
             child.extend(names);
-            order_body(body, &child, globals, errors);
+            order_body_closed(body, &child, globals, closed, errors);
         }
-        Stmt::Expr(e) | Stmt::Return(Some(e)) => recurse_expr_blocks(e, outer, globals, errors),
+        Stmt::LocalFunc(f) => {
+            // 局部函数体可见自身（递归调用）与形参，以及声明位置之前可见的名字。
+            let mut child = outer.clone();
+            child.insert(f.name.clone());
+            child.extend(f.params.iter().map(|p| p.name.clone()));
+            order_body_closed(&f.body, &child, globals, closed, errors);
+        }
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => {
+            recurse_expr_blocks(e, outer, globals, closed, errors)
+        }
         Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
-            recurse_expr_blocks(value, outer, globals, errors)
+            recurse_expr_blocks(value, outer, globals, closed, errors)
         }
-        Stmt::Const { value, .. } => recurse_expr_blocks(value, outer, globals, errors),
-        Stmt::Assign { value, .. } => recurse_expr_blocks(value, outer, globals, errors),
+        Stmt::Const { value, .. } => recurse_expr_blocks(value, outer, globals, closed, errors),
+        Stmt::Assign { value, .. } => recurse_expr_blocks(value, outer, globals, closed, errors),
         Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
-            recurse_expr_blocks(left, outer, globals, errors);
-            recurse_expr_blocks(right, outer, globals, errors);
+            recurse_expr_blocks(left, outer, globals, closed, errors);
+            recurse_expr_blocks(right, outer, globals, closed, errors);
         }
         _ => {}
     }
@@ -2238,13 +2460,14 @@ fn recurse_expr_blocks(
     expr: &Expr,
     outer: &HashSet<String>,
     globals: &HashSet<String>,
+    closed: &HashSet<String>,
     errors: &mut Vec<SemanticError>,
 ) {
     match expr {
         Expr::Block(stmts, trailing) => {
-            order_body(stmts, outer, globals, errors);
+            order_body_closed(stmts, outer, globals, closed, errors);
             if let Some(t) = trailing {
-                recurse_expr_blocks(t, outer, globals, errors);
+                recurse_expr_blocks(t, outer, globals, closed, errors);
             }
         }
         Expr::If {
@@ -2252,26 +2475,460 @@ fn recurse_expr_blocks(
             else_branch,
             ..
         } => {
-            recurse_expr_blocks(then_branch, outer, globals, errors);
+            recurse_expr_blocks(then_branch, outer, globals, closed, errors);
             if let Some(eb) = else_branch {
-                recurse_expr_blocks(eb, outer, globals, errors);
+                recurse_expr_blocks(eb, outer, globals, closed, errors);
             }
         }
-        Expr::Binary { left, right, .. } | Expr::NullCoalesce { option: left, default: right } => {
-            recurse_expr_blocks(left, outer, globals, errors);
-            recurse_expr_blocks(right, outer, globals, errors);
+        Expr::IfLet {
+            pattern,
+            expr,
+            then_branch,
+            else_branch,
+        } => {
+            recurse_expr_blocks(expr, outer, globals, closed, errors);
+            let mut child = outer.clone();
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, &mut names);
+            child.extend(names);
+            recurse_expr_blocks(then_branch, &child, globals, closed, errors);
+            if let Some(eb) = else_branch {
+                recurse_expr_blocks(eb, outer, globals, closed, errors);
+            }
         }
-        Expr::Call { args, .. } | Expr::ConstructorCall { args, .. } | Expr::SuperCall { args, .. } => {
+        Expr::Match { expr, arms } => {
+            recurse_expr_blocks(expr, outer, globals, closed, errors);
+            let mut arm_closed = closed.clone();
+            for arm in arms {
+                let mut child = outer.clone();
+                let mut names = Vec::new();
+                pattern_binding_names(&arm.pattern, &mut names);
+                child.extend(names.clone());
+                if let Some(g) = &arm.guard {
+                    recurse_expr_blocks(g, &child, globals, &arm_closed, errors);
+                }
+                recurse_expr_blocks(&arm.body, &child, globals, &arm_closed, errors);
+                // 同一 match 的其它分支不可见本分支绑定名。
+                arm_closed.extend(names);
+            }
+        }
+        Expr::Lambda { params, body, .. } => {
+            let mut child = outer.clone();
+            child.extend(params.iter().map(|(n, _)| n.clone()));
+            recurse_expr_blocks(body, &child, globals, closed, errors);
+        }
+        Expr::TryBlock {
+            resources,
+            body,
+            catch_var,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            let mut body_scope = outer.clone();
+            for (n, e) in resources {
+                recurse_expr_blocks(e, outer, globals, closed, errors);
+                body_scope.insert(n.clone());
+            }
+            order_body_closed(body, &body_scope, globals, closed, errors);
+            let mut catch_scope = outer.clone();
+            if let Some(cv) = catch_var {
+                catch_scope.insert(cv.clone());
+            }
+            order_body_closed(catch_body, &catch_scope, globals, closed, errors);
+            if let Some(fb) = finally_body {
+                order_body_closed(fb, outer, globals, closed, errors);
+            }
+        }
+        Expr::Spawn { body } | Expr::Synchronized { body, .. } => {
+            order_body_closed(body, outer, globals, closed, errors)
+        }
+        Expr::Binary { left, right, .. }
+        | Expr::NullCoalesce {
+            option: left,
+            default: right,
+        } => {
+            recurse_expr_blocks(left, outer, globals, closed, errors);
+            recurse_expr_blocks(right, outer, globals, closed, errors);
+        }
+        Expr::Call {
+            args,
+            named_args,
+            ..
+        }
+        | Expr::ConstructorCall {
+            args,
+            named_args,
+            ..
+        }
+        | Expr::SuperCall {
+            args,
+            named_args,
+            ..
+        } => {
             for a in args {
-                recurse_expr_blocks(a, outer, globals, errors);
+                recurse_expr_blocks(a, outer, globals, closed, errors);
+            }
+            for (_, a) in named_args {
+                recurse_expr_blocks(a, outer, globals, closed, errors);
             }
         }
-        Expr::MethodCall { object, args, .. } => {
-            recurse_expr_blocks(object, outer, globals, errors);
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            recurse_expr_blocks(object, outer, globals, closed, errors);
             for a in args {
-                recurse_expr_blocks(a, outer, globals, errors);
+                recurse_expr_blocks(a, outer, globals, closed, errors);
+            }
+            for (_, a) in named_args {
+                recurse_expr_blocks(a, outer, globals, closed, errors);
             }
         }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::IsType { expr, .. }
+        | Expr::OptionalChain { object: expr, .. }
+        | Expr::Field { object: expr, .. }
+        | Expr::TupleIndex { object: expr, .. } => {
+            recurse_expr_blocks(expr, outer, globals, closed, errors)
+        }
+        Expr::Index { array, index } => {
+            recurse_expr_blocks(array, outer, globals, closed, errors);
+            recurse_expr_blocks(index, outer, globals, closed, errors);
+        }
+        Expr::Tuple(elems) | Expr::Array(elems) => {
+            for e in elems {
+                recurse_expr_blocks(e, outer, globals, closed, errors);
+            }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields {
+                recurse_expr_blocks(e, outer, globals, closed, errors);
+            }
+        }
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            recurse_expr_blocks(start, outer, globals, closed, errors);
+            recurse_expr_blocks(end, outer, globals, closed, errors);
+            if let Some(s) = step {
+                recurse_expr_blocks(s, outer, globals, closed, errors);
+            }
+        }
+        Expr::VariantConst { arg: Some(a), .. } => {
+            recurse_expr_blocks(a, outer, globals, closed, errors)
+        }
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(e) = p {
+                    recurse_expr_blocks(e, outer, globals, closed, errors);
+                }
+            }
+        }
+        Expr::SliceExpr { array, start, end } => {
+            recurse_expr_blocks(array, outer, globals, closed, errors);
+            recurse_expr_blocks(start, outer, globals, closed, errors);
+            recurse_expr_blocks(end, outer, globals, closed, errors);
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                recurse_expr_blocks(k, outer, globals, closed, errors);
+                recurse_expr_blocks(v, outer, globals, closed, errors);
+            }
+        }
+        Expr::TrailingClosure {
+            callee,
+            args,
+            closure,
+        } => {
+            recurse_expr_blocks(callee, outer, globals, closed, errors);
+            for a in args {
+                recurse_expr_blocks(a, outer, globals, closed, errors);
+            }
+            recurse_expr_blocks(closure, outer, globals, closed, errors);
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            recurse_expr_blocks(callee, outer, globals, closed, errors);
+            for a in args {
+                recurse_expr_blocks(a, outer, globals, closed, errors);
+            }
+            for (_, a) in named_args {
+                recurse_expr_blocks(a, outer, globals, closed, errors);
+            }
+        }
+        Expr::Return(Some(e)) => recurse_expr_blocks(e, outer, globals, closed, errors),
+        _ => {}
+    }
+}
+
+/// 收集某语句**嵌套块**中声明的局部变量名（不含该语句自身的直接声明）。
+/// 这些名字在语句结束即离开作用域，供后续语句的越界引用判定。
+fn collect_stmt_nested_local_names(stmt: &Stmt, out: &mut HashSet<String>) {
+    match stmt {
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::UnsafeBlock { body } => collect_block_local_names(body, out),
+        Stmt::For { var, body, .. } => {
+            out.insert(var.clone());
+            collect_block_local_names(body, out);
+        }
+        Stmt::WhileLet { pattern, body, .. } => {
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, &mut names);
+            out.extend(names);
+            collect_block_local_names(body, out);
+        }
+        Stmt::LocalFunc(f) => collect_block_local_names(&f.body, out),
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => collect_expr_nested_local_names(e, out),
+        Stmt::Let { value, .. }
+        | Stmt::Var { value, .. }
+        | Stmt::Const { value, .. }
+        | Stmt::Assign { value, .. } => collect_expr_nested_local_names(value, out),
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            collect_expr_nested_local_names(left, out);
+            collect_expr_nested_local_names(right, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_block_local_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+                let mut names = Vec::new();
+                pattern_binding_names(pattern, &mut names);
+                out.extend(names);
+            }
+            Stmt::Const { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stmt::LocalFunc(f) => {
+                // 局部函数同样只在所声明的块内可见（3.2.3.2(6)）。
+                out.insert(f.name.clone());
+            }
+            _ => {}
+        }
+        collect_stmt_nested_local_names(s, out);
+    }
+}
+
+fn collect_expr_nested_local_names(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Block(stmts, trailing) => {
+            collect_block_local_names(stmts, out);
+            if let Some(t) = trailing {
+                collect_expr_nested_local_names(t, out);
+            }
+        }
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expr_nested_local_names(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_expr_nested_local_names(eb, out);
+            }
+        }
+        Expr::IfLet {
+            pattern,
+            expr,
+            then_branch,
+            else_branch,
+        } => {
+            collect_expr_nested_local_names(expr, out);
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, &mut names);
+            out.extend(names);
+            collect_expr_nested_local_names(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_expr_nested_local_names(eb, out);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            collect_expr_nested_local_names(expr, out);
+            for arm in arms {
+                let mut names = Vec::new();
+                pattern_binding_names(&arm.pattern, &mut names);
+                out.extend(names);
+                if let Some(g) = &arm.guard {
+                    collect_expr_nested_local_names(g, out);
+                }
+                collect_expr_nested_local_names(&arm.body, out);
+            }
+        }
+        Expr::Lambda { params, body, .. } => {
+            out.extend(params.iter().map(|(n, _)| n.clone()));
+            collect_expr_nested_local_names(body, out);
+        }
+        Expr::TryBlock {
+            resources,
+            body,
+            catch_var,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            for (n, e) in resources {
+                out.insert(n.clone());
+                collect_expr_nested_local_names(e, out);
+            }
+            collect_block_local_names(body, out);
+            if let Some(cv) = catch_var {
+                out.insert(cv.clone());
+            }
+            collect_block_local_names(catch_body, out);
+            if let Some(fb) = finally_body {
+                collect_block_local_names(fb, out);
+            }
+        }
+        Expr::Spawn { body } | Expr::Synchronized { body, .. } => {
+            collect_block_local_names(body, out)
+        }
+        Expr::Binary { left, right, .. }
+        | Expr::NullCoalesce {
+            option: left,
+            default: right,
+        } => {
+            collect_expr_nested_local_names(left, out);
+            collect_expr_nested_local_names(right, out);
+        }
+        Expr::Call {
+            args,
+            named_args,
+            ..
+        }
+        | Expr::ConstructorCall {
+            args,
+            named_args,
+            ..
+        }
+        | Expr::SuperCall {
+            args,
+            named_args,
+            ..
+        } => {
+            for a in args {
+                collect_expr_nested_local_names(a, out);
+            }
+            for (_, a) in named_args {
+                collect_expr_nested_local_names(a, out);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            collect_expr_nested_local_names(object, out);
+            for a in args {
+                collect_expr_nested_local_names(a, out);
+            }
+            for (_, a) in named_args {
+                collect_expr_nested_local_names(a, out);
+            }
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::IsType { expr, .. }
+        | Expr::OptionalChain { object: expr, .. }
+        | Expr::Field { object: expr, .. }
+        | Expr::TupleIndex { object: expr, .. } => collect_expr_nested_local_names(expr, out),
+        Expr::Index { array, index } => {
+            collect_expr_nested_local_names(array, out);
+            collect_expr_nested_local_names(index, out);
+        }
+        Expr::Tuple(elems) | Expr::Array(elems) => {
+            for e in elems {
+                collect_expr_nested_local_names(e, out);
+            }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields {
+                collect_expr_nested_local_names(e, out);
+            }
+        }
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            collect_expr_nested_local_names(start, out);
+            collect_expr_nested_local_names(end, out);
+            if let Some(s) = step {
+                collect_expr_nested_local_names(s, out);
+            }
+        }
+        Expr::VariantConst { arg: Some(a), .. } => collect_expr_nested_local_names(a, out),
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(e) = p {
+                    collect_expr_nested_local_names(e, out);
+                }
+            }
+        }
+        Expr::SliceExpr { array, start, end } => {
+            collect_expr_nested_local_names(array, out);
+            collect_expr_nested_local_names(start, out);
+            collect_expr_nested_local_names(end, out);
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                collect_expr_nested_local_names(k, out);
+                collect_expr_nested_local_names(v, out);
+            }
+        }
+        Expr::TrailingClosure {
+            callee,
+            args,
+            closure,
+        } => {
+            collect_expr_nested_local_names(callee, out);
+            for a in args {
+                collect_expr_nested_local_names(a, out);
+            }
+            collect_expr_nested_local_names(closure, out);
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            collect_expr_nested_local_names(callee, out);
+            for a in args {
+                collect_expr_nested_local_names(a, out);
+            }
+            for (_, a) in named_args {
+                collect_expr_nested_local_names(a, out);
+            }
+        }
+        Expr::Return(Some(e)) => collect_expr_nested_local_names(e, out),
         _ => {}
     }
 }
@@ -2375,7 +3032,61 @@ fn collect_expr_direct_refs(expr: &Expr, out: &mut Vec<String>) {
                 collect_expr_direct_refs(e, out);
             }
         }
-        // 嵌套块 / lambda / match 分支属于其它作用域，不在此处收集。
+        // match / if-let 的**被匹配表达式**在当前位置求值，属于直接引用；
+        // 其分支体属于子作用域，由 recurse_expr_blocks 处理。
+        Expr::Match { expr, .. } | Expr::IfLet { expr, .. } => {
+            collect_expr_direct_refs(expr, out)
+        }
+        // if 表达式的条件在当前位置求值；分支体属于子作用域。
+        Expr::If { cond, .. } => collect_expr_direct_refs(cond, out),
+        Expr::VariantConst { arg: Some(a), .. } => collect_expr_direct_refs(a, out),
+        Expr::SliceExpr { array, start, end } => {
+            collect_expr_direct_refs(array, out);
+            collect_expr_direct_refs(start, out);
+            collect_expr_direct_refs(end, out);
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                collect_expr_direct_refs(k, out);
+                collect_expr_direct_refs(v, out);
+            }
+        }
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(e) = p {
+                    collect_expr_direct_refs(e, out);
+                }
+            }
+        }
+        Expr::TrailingClosure {
+            callee,
+            args,
+            closure: _,
+        } => {
+            collect_expr_direct_refs(callee, out);
+            for a in args {
+                collect_expr_direct_refs(a, out);
+            }
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            collect_expr_direct_refs(callee, out);
+            for a in args {
+                collect_expr_direct_refs(a, out);
+            }
+            for (_, a) in named_args {
+                collect_expr_direct_refs(a, out);
+            }
+        }
+        Expr::TryBlock { resources, .. } => {
+            for (_, e) in resources {
+                collect_expr_direct_refs(e, out);
+            }
+        }
+        // 嵌套块 / lambda 体属于其它作用域，不在此处收集。
         _ => {}
     }
 }
@@ -2397,6 +3108,19 @@ fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<Semant
     check_duplicate_fields(
         &cls.name,
         cls.fields.iter().map(|f| f.name.as_str()),
+        errors,
+    );
+
+    // 字段与成员函数同名（3.1(3)）
+    let method_names: Vec<String> = cls
+        .methods
+        .iter()
+        .map(|m| last_name_segment(&m.func.name))
+        .collect();
+    check_field_method_conflicts(
+        &cls.name,
+        cls.fields.iter().map(|f| f.name.as_str()),
+        method_names.iter().map(|s| s.as_str()),
         errors,
     );
 
@@ -5018,6 +5742,31 @@ fn check_duplicate_fields<'a, I: Iterator<Item = &'a str>>(
                 message: format!("类型 '{}' 中字段 '{}' 被重复定义", owner, name),
             });
         }
+    }
+}
+
+/// 3.1(3)：同一类型内字段名与成员函数名不能相同（共享成员命名空间）。
+fn check_field_method_conflicts<'a, 'b, I, J>(
+    owner: &str,
+    fields: I,
+    methods: J,
+    errors: &mut Vec<SemanticError>,
+) where
+    I: Iterator<Item = &'a str>,
+    J: Iterator<Item = &'b str>,
+{
+    let field_set: HashSet<&str> = fields.collect();
+    let mut reported: HashSet<&str> = HashSet::new();
+    for m in methods {
+        if is_synthetic_member(m) || !field_set.contains(m) || !reported.insert(m) {
+            continue;
+        }
+        errors.push(SemanticError {
+            message: format!(
+                "类型 '{}' 中字段 '{}' 与成员函数同名（3.1(3)）",
+                owner, m
+            ),
+        });
     }
 }
 
@@ -11991,6 +12740,82 @@ main() {}"#,
         assert_invalid("struct S {\n const init() {\n var x = 0\n }\n}\nmain() {}");
         // 合法的 const init：对实例字段赋值。
         assert_valid("class C {\n let v: Int64\n const init() {\n v = 1\n }\n}\nmain() {}");
+    }
+
+    // ── w10c: 03 章块级作用域（保守重做） ───────────────────────────────────
+
+    #[test]
+    fn test_w10c_let_var_irrefutable_literal_rejected() {
+        // 3.3.1(9)/(10)：含字面量的可反驳模式被拒绝。
+        assert_invalid("main() {\n let (x, 13, z) = (1, 2, 3)\n}");
+        assert_invalid("main() {\n var (1, x) = (2, 3)\n}");
+    }
+
+    #[test]
+    fn test_w10c_let_var_irrefutable_binding_patterns_accepted() {
+        // 纯绑定 / 通配符 / 元组解构 / 枚举变体模式一律放行（w9c 回退教训）。
+        assert_valid("main() {\n let (x, y) = (1, 2)\n}");
+        assert_valid("main() {\n let (_, z) = (1, 2)\n}");
+        assert_valid("main() {\n var _ = 1\n}");
+        assert_valid("enum Color {\n Red(Int64)\n}\nmain() {\n let Red(a) = Red(1)\n}");
+        assert_valid("main() {\n for (i in 1..3) { let v = i }\n}");
+    }
+
+    #[test]
+    fn test_w10c_param_shadowing_rejected() {
+        // 3.2.3.2(11)：函数体最外层不能声明与形参同名变量。
+        assert_invalid("func f(x: Int64) {\n var x = 1\n}\nmain() {}");
+        // 嵌套块内遮蔽形参合法。
+        assert_valid("func f(x: Int64) {\n if (true) { let x = 1 }\n}\nmain() {}");
+        // 自引用式遮蔽（var x = x）合法（std 常见写法）。
+        assert_valid("func f(x: Int64) {\n var x = x\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w10c_block_local_out_of_scope_rejected() {
+        // 3.2.3.2(1)/(2)/(3)：块内局部变量离开块后不可见。
+        assert_invalid("main() {\n for (i in 1..3) { var j = 1 }\n j = 0\n}");
+        assert_invalid("main() {\n if (true) { let a = 1 }\n print(\"${a}\")\n}");
+        assert_invalid("main() {\n try { let e = 1 } catch (_) {}\n print(\"${e}\")\n}");
+    }
+
+    #[test]
+    fn test_w10c_block_local_shadowing_accepted() {
+        // 内层块用同名局部变量遮蔽外层合法。
+        assert_valid(
+            "main() {\n let a = 1\n if (true) { let a = 2; print(\"${a}\") }\n print(\"${a}\")\n}",
+        );
+    }
+
+    #[test]
+    fn test_w10c_use_before_decl_in_condition_rejected() {
+        // 3.2.3.2(4)：if / match 条件中引用后声明的变量。
+        assert_invalid("main() {\n if (tmp == 0) {}\n let tmp = 0\n}");
+        assert_invalid("main() {\n let ss = match (tmp) { case _ => 0 }\n var tmp = 0\n}");
+        assert_valid("main() {\n let tmp = 0\n if (tmp == 0) {}\n}");
+    }
+
+    #[test]
+    fn test_w10c_local_func_out_of_scope_rejected() {
+        // 3.2.3.2(6)：局部函数只在声明块内可见。
+        assert_invalid("main() {\n if (true) { func foo() {}\n }\n foo()\n}");
+        assert_valid("main() {\n if (true) { func foo() {}; foo() }\n}");
+    }
+
+    #[test]
+    fn test_w10c_free_fn_unqualified_member_rejected() {
+        // 3.2.3.3(1)：自由函数不能无资格引用其它类型成员。
+        assert_invalid("class C {\n func f() {}\n}\nmain() {\n f()\n}");
+        assert_invalid("class C {\n var v: Int64 = 0\n}\nmain() {\n let x = v\n}");
+        // 类型内部无资格访问自身成员合法。
+        assert_valid("class C {\n func f() { f() }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w10c_class_field_method_same_name_rejected() {
+        // 3.1(3)：同一 class 内字段名与成员函数名不能相同。
+        assert_invalid("class C {\n let a = 0\n func a() {}\n}\nmain() {}");
+        assert_valid("class C {\n let a = 0\n func b() {}\n}\nmain() {}");
     }
 
 }
