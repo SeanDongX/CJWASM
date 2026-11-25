@@ -782,9 +782,11 @@ struct Checker<'a> {
     cur_interface: Option<String>,
     /// 当前 interface 默认函数体是否为 static 成员（6.2.2.2(5)）。
     cur_iface_static: bool,
-    /// 顶层函数 / 接口函数名 → 各签名的“参数是否命名参数”列表。
+    /// 顶层函数 / 接口函数名 → 各签名的 (参数是否命名参数, 参数是否 Array 类型) 列表。
     /// 用于 6.2.2.1(3)：命名参数必须以 `名字:` 形式传入。
-    named_call_sigs: HashMap<String, Vec<Vec<bool>>>,
+    /// Array 形参可经变长实参糖吸收多余的位置实参（5.3.4），其后的命名参数
+    /// 位不会被位置实参占用，故此类签名在位置走查中豁免。
+    named_call_sigs: HashMap<String, Vec<Vec<(bool, bool)>>>,
     /// 用户类型名 → 直接父类型名（类继承 + 接口实现 + 接口继承）。
     /// 用于判断运算符返回类型是否为左操作数类型的子类型。
     user_parents: HashMap<String, Vec<String>>,
@@ -3251,14 +3253,14 @@ fn collect_interface_members(
 /// 收集顶层函数与接口函数的签名（仅记录每个形参是否为命名参数）。
 ///
 /// 用于 6.2.2.1(3)：命名参数必须以 `名字:` 形式传入，不能按位置传入。
-fn collect_named_call_sigs(program: &Program) -> HashMap<String, Vec<Vec<bool>>> {
-    let mut map: HashMap<String, Vec<Vec<bool>>> = HashMap::new();
+fn collect_named_call_sigs(program: &Program) -> HashMap<String, Vec<Vec<(bool, bool)>>> {
+    let mut map: HashMap<String, Vec<Vec<(bool, bool)>>> = HashMap::new();
     {
         let mut add = |full: &str, params: &[crate::ast::Param]| {
-            let sig: Vec<bool> = params
+            let sig: Vec<(bool, bool)> = params
                 .iter()
                 .filter(|p| p.name != "this" && p.name != "self")
-                .map(|p| p.is_named)
+                .map(|p| (p.is_named, matches!(p.ty, Type::Array(_))))
                 .collect();
             let bare = full.rsplit('.').next().unwrap_or(full).to_string();
             map.entry(bare).or_default().push(sig);
@@ -3515,9 +3517,27 @@ impl<'a> Checker<'a> {
         if !sigs.iter().any(|s| positional <= s.len()) {
             return;
         }
-        let ok = sigs
-            .iter()
-            .any(|sig| positional <= sig.len() && sig[..positional].iter().all(|n| !*n));
+        // 前缀走查：位置实参逐参消耗；非命名 Array 形参可吸收剩余全部位置实参
+        // （变长实参糖，5.3.4），因此它之后的位置实参不会落到命名参数位。
+        let ok = sigs.iter().any(|sig| {
+            let mut i = 0usize;
+            let mut excused = true;
+            for &(is_named, is_array) in sig.iter() {
+                if i >= positional {
+                    break;
+                }
+                if is_named {
+                    excused = false;
+                    break;
+                }
+                if is_array {
+                    i = positional;
+                    break;
+                }
+                i += 1;
+            }
+            excused && i >= positional
+        });
         if !ok {
             self.err(format!(
                 "命名参数必须以 `名字:` 形式传入（函数 '{}'，6.2.2.1(3)）",
@@ -3667,6 +3687,7 @@ impl<'a> Checker<'a> {
                     mutable: false,
                     const_int: None,
                     explicit_bool: false,
+                    uninit_let: false,
                 });
             }
         }
