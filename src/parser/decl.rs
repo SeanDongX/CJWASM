@@ -2719,6 +2719,9 @@ impl Parser {
         // P6: Primary constructor — class Foo(var x: Int64, var y: Int64) { ... }
         let mut primary_ctor_params = Vec::new();
         let mut primary_ctor_member_flags: Vec<bool> = Vec::new();
+        // 6.1.1.4(7)：类只能定义至多一个主构造函数（`class Foo(...)` 形式或类名形式
+        // `Foo(...) {}` 均计入；`init(...)` 为次构造函数，可多次定义）。
+        let mut primary_seen = self.check(&Token::LParen);
         if self.check(&Token::LParen) {
             self.advance();
             while !self.check(&Token::RParen) {
@@ -3202,6 +3205,14 @@ impl Parser {
                 };
                 is_named_ctor && matches!(self.peek_next(), Some(Token::LParen))
             } {
+                // 6.1.1.4(7)：类名形式的构造函数即主构造函数，至多一个。
+                if primary_seen {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::LParen,
+                        "类只能定义一个主构造函数（6.1.1.4(7)）".to_string(),
+                    ));
+                }
+                primary_seen = true;
                 self.advance(); // 消费类名
                 self.expect(Token::LParen)?;
                 let mut params = Vec::new();
