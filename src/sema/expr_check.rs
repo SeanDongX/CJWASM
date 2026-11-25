@@ -758,6 +758,8 @@ struct Checker<'a> {
     ret_ty: Option<Ty>,
     /// 属于多构造器枚举的变体名集合：不可反驳绑定（let/var）不可使用这些变体模式。
     multi_variant_names: HashSet<String>,
+    /// 变体数大于 1 的枚举类型名集合：`let Enum.Variant(x)` 形态的可反驳判定。
+    multi_variant_enums: HashSet<String>,
     /// class 名 → 是否定义显式 init（常量构造要求目标类型有 const init）。
     class_has_init: HashMap<String, bool>,
     /// 用户泛型类型/函数定义：类型参数与约束（用于显式实例化的约束检查）。
@@ -1018,10 +1020,12 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     }
     let mut enum_names: HashSet<String> = HashSet::new();
     let mut multi_variant_names: HashSet<String> = HashSet::new();
+    let mut multi_variant_enums: HashSet<String> = HashSet::new();
     for e in &program.enums {
         type_names.insert(e.name.clone());
         enum_names.insert(e.name.clone());
         if e.variants.len() > 1 {
+            multi_variant_enums.insert(e.name.clone());
             for v in &e.variants {
                 multi_variant_names.insert(v.name.clone());
             }
@@ -1562,6 +1566,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         static_method_generics: collect_static_method_generics(program),
         ret_ty: None,
         multi_variant_names,
+        multi_variant_enums,
         class_has_init,
         generic_defs,
         alias_types,
@@ -3575,23 +3580,48 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// 不可反驳绑定（let/var）的 pattern 不能使用多构造器枚举的变体模式。
+    /// 3.3.1(9)/(10)：不可反驳绑定（let/var）后的模式必须是（或可能）不可反驳的。
+    ///
+    /// 只拒绝**确定可反驳**的子模式：字面量、范围、类型测试、守卫，以及变体数
+    /// 大于 1 的枚举变体模式；纯绑定 / 通配符 / 元组 / 结构体解构只递归检查字段。
+    /// 单构造器枚举的变体模式合法（irrefutable），不误伤。
     fn check_irrefutable_pattern(&mut self, pattern: &Pattern) {
         match pattern {
+            Pattern::Literal(_)
+            | Pattern::Range { .. }
+            | Pattern::TypeTest { .. }
+            | Pattern::Guard(_) => {
+                self.err(
+                    "let/var 后的模式必须是不可反驳模式（3.3.1(9)/(10)）".to_string(),
+                );
+            }
             Pattern::Variant {
                 enum_name,
                 variant_name,
-                ..
+                payload,
             } => {
-                if enum_name.is_empty() && self.multi_variant_names.contains(variant_name) {
+                let refutable = if enum_name.is_empty() {
+                    self.multi_variant_names.contains(variant_name)
+                } else {
+                    self.multi_variant_enums.contains(enum_name)
+                };
+                if refutable {
                     self.err(format!(
                         "不可反驳绑定不能使用多构造器枚举的变体模式 '{}'",
                         variant_name
                     ));
                 }
+                if let Some(p) = payload {
+                    self.check_irrefutable_pattern(p);
+                }
             }
-            Pattern::Tuple(ps) => {
+            Pattern::Tuple(ps) | Pattern::Or(ps) => {
                 for p in ps {
+                    self.check_irrefutable_pattern(p);
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                for (_, p) in fields {
                     self.check_irrefutable_pattern(p);
                 }
             }
@@ -3874,7 +3904,8 @@ impl<'a> Checker<'a> {
             self.bind_name(name, ty, mutable, const_int, is_const);
         } else {
             let mut tmp = HashMap::new();
-            bind_pattern_unknown(pattern, &mut tmp);
+            // 3.3.1(11)：`let` 解构/枚举模式的绑定变量同样不可变。
+            bind_pattern_unknown_mut(pattern, &mut tmp, mutable);
             if let Some(scope) = self.scopes.last_mut() {
                 scope.extend(tmp);
             } else {
@@ -5972,6 +6003,48 @@ impl<'a> Checker<'a> {
                 {
                     self.err("范围表达式不能嵌套（形如 `a..b..c` 非法）".to_string());
                 }
+                // 2.1.7：步长不能为常量 0。
+                if let Some(s) = step {
+                    if self.const_int_of(s) == Some(0) {
+                        self.err("范围表达式的步长不能为 0（2.1.7）".to_string());
+                    }
+                    // 步长类型须为 Int64（无后缀整数字面量默认 Int64）。
+                    if let Ty::Int8
+                    | Ty::Int16
+                    | Ty::Int32
+                    | Ty::IntNative
+                    | Ty::UInt8
+                    | Ty::UInt16
+                    | Ty::UInt32
+                    | Ty::UInt64
+                    | Ty::UIntNative = self.check_expr_ty_peek(s)
+                    {
+                        self.err("范围表达式的步长类型必须为 Int64（2.1.7）".to_string());
+                    }
+                }
+                // 2.1.7：起止值类型必须一致（仅在两者都带明确整型后缀时可判定）。
+                {
+                    let st = self.check_expr_ty_peek(start);
+                    let en = self.check_expr_ty_peek(end);
+                    let definite = |t: &Ty| {
+                        matches!(
+                            t,
+                            Ty::Int8
+                                | Ty::Int16
+                                | Ty::Int32
+                                | Ty::Int64
+                                | Ty::IntNative
+                                | Ty::UInt8
+                                | Ty::UInt16
+                                | Ty::UInt32
+                                | Ty::UInt64
+                                | Ty::UIntNative
+                        )
+                    };
+                    if definite(&st) && definite(&en) && st != en {
+                        self.err("范围表达式起止值类型必须一致（2.1.7）".to_string());
+                    }
+                }
                 self.check_expr(start);
                 self.check_expr(end);
                 if let Some(s) = step {
@@ -6407,6 +6480,9 @@ impl<'a> Checker<'a> {
                     if !info.mutable {
                         self.err(format!("不可变变量 '{}' 不能被自增/自减", name));
                     }
+                } else if self.enum_variants.contains(name) {
+                    // enum 构造值不是左值（`C++`）。
+                    self.err(format!("enum 构造值 '{}' 不可被自增/自减", name));
                 }
                 if t.is_definite() && !t.is_int() {
                     self.err(format!(
@@ -7091,8 +7167,19 @@ fn is_default_value(ty: &Type, value: &Expr) -> bool {
     }
 }
 
-/// 将 pattern 中的绑定名以 Unknown 类型写入作用域。
+/// 将 pattern 中的绑定名以 Unknown 类型写入作用域（默认可变，供 for-in /
+/// match 等绑定场景使用）。
 fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>) {
+    bind_pattern_unknown_mut(pattern, scope, true);
+}
+
+/// 同 [`bind_pattern_unknown`]，但显式指定绑定变量的可变性。
+/// `let` 解构得到的变量必须不可变（3.3.1(11)），不能一律按可变登记。
+fn bind_pattern_unknown_mut(
+    pattern: &Pattern,
+    scope: &mut HashMap<String, VarInfo>,
+    mutable: bool,
+) {
     match pattern {
         Pattern::Binding(name) => {
             scope.insert(
@@ -7100,7 +7187,7 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
                 VarInfo {
                     is_const: false,
                     ty: Ty::Unknown,
-                    mutable: true,
+                    mutable,
                     const_int: None,
                     explicit_bool: false,
                 },
@@ -7108,13 +7195,15 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
         }
         Pattern::Tuple(pats) | Pattern::Or(pats) => {
             for p in pats {
-                bind_pattern_unknown(p, scope);
+                bind_pattern_unknown_mut(p, scope, mutable);
             }
         }
-        Pattern::Variant { payload: Some(p), .. } => bind_pattern_unknown(p, scope),
+        Pattern::Variant { payload: Some(p), .. } => {
+            bind_pattern_unknown_mut(p, scope, mutable)
+        }
         Pattern::Struct { fields, .. } => {
             for (_, p) in fields {
-                bind_pattern_unknown(p, scope);
+                bind_pattern_unknown_mut(p, scope, mutable);
             }
         }
         Pattern::TypeTest { binding, .. } => {
@@ -7123,7 +7212,7 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
                 VarInfo {
                     is_const: false,
                     ty: Ty::Unknown,
-                    mutable: true,
+                    mutable,
                     const_int: None,
                     explicit_bool: false,
                 },
@@ -8885,6 +8974,7 @@ mod tests {
         assert_ok("main() { var v: Int64 = 1; let x = -v }");
     }
 
+
     // ── w12b-expr5: 4.13.4 可选链 / 4.3(15) if 公共超类型 / 4.23(15) 复杂左值 ──
 
     #[test]
@@ -8900,6 +8990,7 @@ mod tests {
         assert_ok("class B { var v = 1 } main() { let b = B(); let x = b?.v }");
     }
 
+
     #[test]
     fn test_w12b_optional_chain_missing_member() {
         // Option<struct> 上访问不存在的成员：拒绝。
@@ -8908,6 +8999,7 @@ mod tests {
             "没有实例成员",
         );
     }
+
 
     #[test]
     fn test_w12b_optional_chain_missing_question() {
@@ -8932,6 +9024,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_w12b_optional_index_assignment() {
         // 元组可选索引不可赋值。
@@ -8954,6 +9047,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_w12b_optional_field_assignment_mutability() {
         // 嵌套可选链末端的不可变字段：拒绝。
@@ -8972,6 +9066,7 @@ mod tests {
              main() { var a = Option<A>.Some(A()); a?.b.c?.d = 1 }",
         );
     }
+
 
     #[test]
     fn test_w12b_complex_field_target() {
@@ -8997,6 +9092,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_w12b_if_branch_common_supertype() {
         // 无上下文：数值/字符串等标量分支无公共超类型 → 拒绝。
@@ -9021,6 +9117,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_w12b_if_context_assignability() {
         // 上下文要求 Int64，else 分支为 Int32：拒绝。
@@ -9042,6 +9139,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_w12b_option_source_inference() {
         // Some(c) / Option<C>.None 的全局绑定保留 Option 类型，不误伤可选链。
@@ -9052,6 +9150,61 @@ mod tests {
              let c2 = Option<C>.None\n\
              main() { let r1 = c1?.item; let r2 = c2?.item }",
         );
+    }
+
+
+    // ─── w12c：03 章 let 模式绑定不可变 / 枚举构造值不可自增 / 不可反驳 ──────
+
+    #[test]
+    fn test_w12c_let_pattern_bindings_immutable() {
+        // 3.3.1(11)：`let` 元组/枚举模式引入的变量不可重新赋值。
+        assert_err("main() { let (a, b) = (1, 2); b = 3 }", "不可变变量");
+        assert_err("enum E { C(Int64) }\nmain() { let C(x) = C(1); x = 2 }", "不可变变量");
+        // 正例：`var` 模式绑定可赋值。
+        assert_ok("main() { var (a, b) = (1, 2); b = 3 }");
+        // 正例：`let` 模式绑定只读使用。
+        assert_ok("main() { let (a, b) = (1, 2); let c = a + b }");
+    }
+
+
+    #[test]
+    fn test_w12c_enum_constructor_incr_decr_rejected() {
+        // 4.23(15)：enum 构造值不是左值，不能自增/自减。
+        assert_err("enum MyEnum { C(Int64) }\nmain() { let C(x) = C(16); C++ }", "enum 构造值");
+        // 正例：普通整数变量可自增。
+        assert_ok("main() { var n = 0; n++ }");
+    }
+
+
+    #[test]
+    fn test_w12c_irrefutable_pattern_extension() {
+        // 正例：单构造器枚举变体模式是不可反驳的，可用于 let。
+        assert_ok("enum E { C(Int64) }\nmain() { let C(x) = C(1) }");
+        // 正例：元组解构（纯绑定）合法。
+        assert_ok("main() { let (a, b) = (1, 2) }");
+        // 正例：通配符/纯绑定模式合法。
+        assert_ok("main() { let _ = 1 }");
+        assert_ok("main() { let y = 2 }");
+    }
+
+
+    // ─── w12c：02 章范围类型细则 ───────────────────────────────────────────
+
+    #[test]
+    fn test_w12c_range_expression_rules() {
+        // 2.1.7：步长不能为常量 0。
+        assert_err("main() { let r = -1..-10:0 }", "步长不能为 0");
+        assert_err("main() { let r = 0..=10: 0 }", "步长不能为 0");
+        assert_err("main() { let r = 0..10: 0 }", "步长不能为 0");
+        // 2.1.7：起止值类型必须一致（均带明确后缀时可判定）。
+        assert_err("main() { let a = 0i8..5u8 }", "起止值类型必须一致");
+        // 2.1.7：步长类型必须为 Int64（无后缀整数字面量默认 Int64）。
+        assert_err("main() { let a = 0i32..=10i32:2i32 }", "步长类型必须为 Int64");
+        // 正例：无后缀/Int64 步长与同类型起止值。
+        assert_ok("main() { let r = 0..10 }");
+        assert_ok("main() { let r = 0..=10:2 }");
+        assert_ok("main() { let r = 1..10:1i64 }");
+        assert_ok("main() { let r = 35u8..13u8:-7 }");
     }
 
 }
