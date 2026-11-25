@@ -3289,7 +3289,7 @@ impl Parser {
                     ty,
                     default,
                     is_mut: false,
-                    is_static: false,
+                    is_static: mods.is_static,
                     visibility: member_vis.clone(),
                 });
             } else if self.check(&Token::Const) {
@@ -3961,5 +3961,22 @@ main() {}
         let iface = program.interfaces.iter().find(|i| i.name == "I").expect("iface I");
         let getter = iface.methods.iter().find(|m| m.name == "__get_p").expect("getter");
         assert!(getter.is_static, "getter should be static");
+    }
+
+    #[test]
+    fn test_class_static_const_field_is_static() {
+        // 类内 `static const` 字段的 static 修饰符不应在解析时丢失
+        // （6.1.2(4)：实例成员不可经类型名访问，反之静态常量必须可按 `C.d` 访问）。
+        let program = parse_source(
+            r#"
+class C { static const d = (1, 2) }
+main() {}
+"#,
+        )
+        .expect("parse ok");
+        let cls = program.classes.iter().find(|c| c.name == "C").expect("class C");
+        let f = cls.fields.iter().find(|f| f.name == "d").expect("field d");
+        assert!(f.is_static, "static const field should be static");
+        assert!(!f.is_mut, "const field should be immutable");
     }
 }

@@ -22,6 +22,7 @@
 use super::SemanticError;
 use crate::ast::{
     BinOp, Expr, Function, IntSuffix, Pattern, Program, Stmt, Type, TypeConstraint, UnaryOp,
+    Visibility,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -655,6 +656,23 @@ struct Checker<'a> {
     enum_names: HashSet<String>,
     /// class 名 → 字段名 → 是否可变
     class_fields: HashMap<String, HashMap<String, bool>>,
+    /// class 名 → 成员名 → 静态性/可见性/定义类（6.1.2(4)、6.1.2.4(14)、6.1.2.4(28)）。
+    class_members: HashMap<String, HashMap<String, MemberInfo>>,
+    /// 用户类型名 → 类别（class/struct/enum/interface），用于 prelude 子类型关系。
+    type_kinds: HashMap<String, TypeKind>,
+    /// 用户 interface 名 → 全部成员名（含属性脱糖名与属性短名，传递可见）。
+    interface_members: HashMap<String, HashSet<String>>,
+    /// 用户 interface 名 → 实例成员名（用于静态上下文引用检查）。
+    interface_instance_members: HashMap<String, HashSet<String>>,
+    /// 用户的 interface 含有非用户父接口（prelude）的传递闭包：成员可能来自 prelude，
+    /// 成员存在性检查对这些接口保守跳过。
+    interface_open_parents: HashSet<String>,
+    /// 当前正在检查的类（类方法/构造/静态初始化体），用于私有成员访问判定。
+    cur_class: Option<String>,
+    /// 当前正在检查的 interface（默认函数体），用于成员存在性判定。
+    cur_interface: Option<String>,
+    /// 当前 interface 默认函数体是否为 static 成员（6.2.2.2(5)）。
+    cur_iface_static: bool,
     /// 用户类型名 → 直接父类型名（类继承 + 接口实现 + 接口继承）。
     /// 用于判断运算符返回类型是否为左操作数类型的子类型。
     user_parents: HashMap<String, Vec<String>>,
@@ -736,6 +754,150 @@ struct CtorParam {
 #[derive(Clone)]
 struct CtorSig {
     params: Vec<CtorParam>,
+}
+
+/// 用户类型类别（用于 prelude 子类型关系与成员访问规则判定）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypeKind {
+    Class,
+    Struct,
+    Enum,
+    Interface,
+}
+
+/// 类成员信息：静态性 + 可见性 + 定义该成员的类名。
+#[derive(Clone)]
+struct MemberInfo {
+    is_static: bool,
+    visibility: Visibility,
+    owner: String,
+}
+
+/// prelude 常见类型的类别。`Object` 是 class 根（`Any` 是顶层类型），
+/// 结构体/枚举/接口都不是 `Object` 的子类型（6.1.3(1)）。
+fn prelude_kind(name: &str) -> Option<TypeKind> {
+    match name {
+        "Object" | "Exception" | "Error" => Some(TypeKind::Class),
+        "Int8" | "Int16" | "Int32" | "Int64" | "IntNative" | "UInt8" | "UInt16" | "UInt32"
+        | "UInt64" | "UIntNative" | "Float16" | "Float32" | "Float64" | "Bool" | "Rune"
+        | "String" | "Unit" | "Array" | "Tuple" | "Range" | "Slice" | "Map" => {
+            Some(TypeKind::Struct)
+        }
+        "Any" | "ToString" | "Equatable" | "Comparable" | "Hashable" | "Iterable"
+        | "Iterator" | "Collection" | "Resource" | "CType" | "Countable" | "Equal"
+        | "LessThan" | "GreaterThan" | "NotEqual" | "Zero" | "ComparableCollection" => {
+            Some(TypeKind::Interface)
+        }
+        _ => None,
+    }
+}
+
+/// 取类型声明的头名（忽略泛型实参），用于 prelude 类别判定。
+fn type_head_name(t: &Type) -> Option<String> {
+    match t {
+        Type::Int8 => Some("Int8".to_string()),
+        Type::Int16 => Some("Int16".to_string()),
+        Type::Int32 => Some("Int32".to_string()),
+        Type::Int64 => Some("Int64".to_string()),
+        Type::IntNative => Some("IntNative".to_string()),
+        Type::UInt8 => Some("UInt8".to_string()),
+        Type::UInt16 => Some("UInt16".to_string()),
+        Type::UInt32 => Some("UInt32".to_string()),
+        Type::UInt64 => Some("UInt64".to_string()),
+        Type::UIntNative => Some("UIntNative".to_string()),
+        Type::Float16 => Some("Float16".to_string()),
+        Type::Float32 => Some("Float32".to_string()),
+        Type::Float64 => Some("Float64".to_string()),
+        Type::Bool => Some("Bool".to_string()),
+        Type::Rune => Some("Rune".to_string()),
+        Type::String => Some("String".to_string()),
+        Type::Unit => Some("Unit".to_string()),
+        Type::Nothing => Some("Nothing".to_string()),
+        Type::Array(_) => Some("Array".to_string()),
+        Type::Tuple(_) => Some("Tuple".to_string()),
+        Type::Range => Some("Range".to_string()),
+        Type::Slice(_) => Some("Slice".to_string()),
+        Type::Map(_, _) => Some("Map".to_string()),
+        Type::Struct(n, _) => Some(n.clone()),
+        Type::TypeParam(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+/// 判断 `arg <: bound`，仅在能确定时返回 `Some`（保守用于约束满足检查）。
+///
+/// `kinds` 为用户类型（class/struct/enum/interface）类别表，`parents` 为
+/// 已有约束满足检查使用的用户继承图。
+fn subtype_relation(
+    arg: &str,
+    bound: &str,
+    kinds: &HashMap<String, TypeKind>,
+    parents: &HashMap<String, Vec<String>>,
+) -> Option<bool> {
+    if arg == bound {
+        return Some(true);
+    }
+    // Nothing 是所有类型的子类型。
+    if arg == "Nothing" {
+        return Some(true);
+    }
+    // Any 是所有类型的父类型。
+    if bound == "Any" {
+        return Some(true);
+    }
+    // Any 自身不是其它任何类型的子类型（包括 Object 与各接口）。
+    if arg == "Any" {
+        return Some(false);
+    }
+    let ak = kinds.get(arg).copied().or_else(|| prelude_kind(arg));
+    let bk = kinds.get(bound).copied().or_else(|| prelude_kind(bound));
+    // 实参与上界都是本文件用户类型：按用户继承图直接判定。
+    if kinds.contains_key(arg) && kinds.contains_key(bound) && bound != "Object" {
+        return Some(is_same_or_subtype_name(arg, bound, parents));
+    }
+    // 用户继承图能直接证明时优先（含用户 class/struct 实现的接口）。
+    if bound != "Object"
+        && is_same_or_subtype_name(arg, bound, parents)
+        && parents.contains_key(arg)
+    {
+        return Some(true);
+    }
+    match bk {
+        Some(TypeKind::Class) => {
+            if bound == "Object" {
+                // Object 只接纳 class 类型（用户 class 或 prelude class）；
+                // 实参类别未知（如外部导入的类型）时保守跳过。
+                return match ak {
+                    Some(TypeKind::Class) => Some(true),
+                    Some(_) => Some(false),
+                    None => None,
+                };
+            }
+            match ak {
+                Some(TypeKind::Struct) | Some(TypeKind::Enum) | Some(TypeKind::Interface) => {
+                    Some(false)
+                }
+                _ => None,
+            }
+        }
+        Some(TypeKind::Struct) => match ak {
+            Some(_) => Some(false),
+            None => None,
+        },
+        Some(TypeKind::Enum) => Some(false),
+        Some(TypeKind::Interface) => {
+            // 所有 prelude 结构体自动实现 ToString。
+            if bound == "ToString" && matches!(ak, Some(TypeKind::Struct)) {
+                return Some(true);
+            }
+            // Object 与 Any 不实现任何 prelude 接口。
+            if arg == "Object" {
+                return Some(false);
+            }
+            None
+        }
+        None => None,
+    }
 }
 
 /// 对整个 Program 做表达式/赋值类型检查，错误追加到 `errors`。
@@ -858,6 +1020,10 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         .map(|(n, t)| (n.clone(), t.clone()))
         .collect();
     let constraint_parents = collect_constraint_parents(program);
+    let type_kinds = collect_type_kinds(program);
+    let class_members = collect_class_members(program);
+    let (interface_members, interface_instance_members, interface_open_parents) =
+        collect_interface_members(program);
 
     // 各类的全部构造函数签名（含主构造函数展开），用于构造调用实参匹配。
     let mut class_ctors: HashMap<String, Vec<CtorSig>> = HashMap::new();
@@ -1139,6 +1305,14 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         type_names,
         enum_names,
         class_fields,
+        class_members,
+        type_kinds,
+        interface_members,
+        interface_instance_members,
+        interface_open_parents,
+        cur_class: None,
+        cur_interface: None,
+        cur_iface_static: false,
         user_parents,
         ctor_types,
         operator_returns,
@@ -1222,6 +1396,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         }
     }
     for cls in &program.classes {
+        let prev_class = checker.cur_class.replace(cls.name.clone());
         // 类字段先入作用域，避免方法体内同名字段被解析成同名全局变量。
         // 字段可变性来自声明（`var` 可写，`let`/`const` 不可写）。
         let fields: HashMap<String, VarInfo> = cls
@@ -1338,9 +1513,13 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             checker.scopes.push(scope);
             checker.scopes.pop();
         }
+        checker.cur_class = prev_class;
     }
     for iface in &program.interfaces {
+        let prev_iface = checker.cur_interface.replace(iface.name.clone());
         for m in &iface.methods {
+            let prev_static = checker.cur_iface_static;
+            checker.cur_iface_static = m.is_static;
             if let Some(body) = &m.default_body {
                 let prev_c = checker.in_const_ctx;
                 checker.in_const_ctx = m.is_const;
@@ -1351,7 +1530,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 );
                 checker.in_const_ctx = prev_c;
             }
+            checker.cur_iface_static = prev_static;
         }
+        checker.cur_interface = prev_iface;
     }
     for ext in &program.extends {
         for func in &ext.methods {
@@ -1945,6 +2126,146 @@ fn collect_constraint_parents(program: &Program) -> HashMap<String, Vec<String>>
         }
     }
     m
+}
+
+/// 用户类型名 → 类别（class/struct/enum/interface）。
+fn collect_type_kinds(program: &Program) -> HashMap<String, TypeKind> {
+    let mut m = HashMap::new();
+    for c in &program.classes {
+        m.insert(c.name.clone(), TypeKind::Class);
+    }
+    for s in &program.structs {
+        m.insert(s.name.clone(), TypeKind::Struct);
+    }
+    for e in &program.enums {
+        m.insert(e.name.clone(), TypeKind::Enum);
+    }
+    for i in &program.interfaces {
+        m.insert(i.name.clone(), TypeKind::Interface);
+    }
+    m
+}
+
+/// 收集 class 成员（字段 + 方法 + 属性脱糖名）的静态性与可见性。
+fn collect_class_members(program: &Program) -> HashMap<String, HashMap<String, MemberInfo>> {
+    let mut out: HashMap<String, HashMap<String, MemberInfo>> = HashMap::new();
+    for cls in &program.classes {
+        let mut members: HashMap<String, MemberInfo> = HashMap::new();
+        for f in &cls.fields {
+            members.insert(
+                f.name.clone(),
+                MemberInfo {
+                    is_static: f.is_static,
+                    visibility: f.visibility.clone(),
+                    owner: cls.name.clone(),
+                },
+            );
+        }
+        let prefix = format!("{}.", cls.name);
+        for m in &cls.methods {
+            let name = m
+                .func
+                .name
+                .strip_prefix(prefix.as_str())
+                .unwrap_or(&m.func.name)
+                .to_string();
+            if name == "__static_init" {
+                continue;
+            }
+            let info = MemberInfo {
+                is_static: m.is_static,
+                visibility: m.func.visibility.clone(),
+                owner: cls.name.clone(),
+            };
+            // 属性 getter/setter 同时登记属性短名。
+            if let Some(prop) = name.strip_prefix("__get_").or_else(|| name.strip_prefix("__set_"))
+            {
+                members.insert(prop.to_string(), info.clone());
+            }
+            members.insert(name, info);
+        }
+        out.insert(cls.name.clone(), members);
+    }
+    out
+}
+
+/// 收集用户 interface 的成员名（含属性短名），并标记带有 prelude 父接口者。
+/// 返回（全部成员, 实例成员, 含 prelude 父接口者）。
+fn collect_interface_members(
+    program: &Program,
+) -> (
+    HashMap<String, HashSet<String>>,
+    HashMap<String, HashSet<String>>,
+    HashSet<String>,
+) {
+    let user_ifaces: HashSet<&str> = program.interfaces.iter().map(|i| i.name.as_str()).collect();
+    let mut all: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut inst: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut open_parents: HashSet<String> = HashSet::new();
+    for i in &program.interfaces {
+        let mut names: HashSet<String> = HashSet::new();
+        let mut inst_names: HashSet<String> = HashSet::new();
+        for m in &i.methods {
+            names.insert(m.name.clone());
+            if !m.is_static {
+                inst_names.insert(m.name.clone());
+            }
+            if let Some(prop) = m
+                .name
+                .strip_prefix("__get_")
+                .or_else(|| m.name.strip_prefix("__set_"))
+            {
+                names.insert(prop.to_string());
+                if !m.is_static {
+                    inst_names.insert(prop.to_string());
+                }
+            }
+        }
+        all.insert(i.name.clone(), names);
+        inst.insert(i.name.clone(), inst_names);
+        if i.parents.iter().any(|p| !user_ifaces.contains(p.as_str())) {
+            open_parents.insert(i.name.clone());
+        }
+    }
+    // 传递合并父接口成员（固定点迭代）。
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in &program.interfaces {
+            let mut add: Vec<String> = Vec::new();
+            let mut add_inst: Vec<String> = Vec::new();
+            let mut open = false;
+            for p in &i.parents {
+                if let Some(ps) = all.get(p) {
+                    add.extend(ps.iter().cloned());
+                } else {
+                    open = true;
+                }
+                if let Some(ps) = inst.get(p) {
+                    add_inst.extend(ps.iter().cloned());
+                }
+                if open_parents.contains(p) {
+                    open = true;
+                }
+            }
+            let entry = all.entry(i.name.clone()).or_default();
+            for a in add {
+                if entry.insert(a) {
+                    changed = true;
+                }
+            }
+            let ientry = inst.entry(i.name.clone()).or_default();
+            for a in add_inst {
+                if ientry.insert(a) {
+                    changed = true;
+                }
+            }
+            if open && open_parents.insert(i.name.clone()) {
+                changed = true;
+            }
+        }
+    }
+    (all, inst, open_parents)
 }
 
 /// 仅接受无类型实参的具名类型，返回其类型名（含实参的泛型形态无法与约束名直接比较）。
@@ -3061,32 +3382,34 @@ impl<'a> Checker<'a> {
                 continue;
             };
             let arg_resolved = self.resolve_alias_type(arg);
-            let Some(arg_head) = plain_type_head(&arg_resolved) else {
+            let Some(arg_head) = type_head_name(&arg_resolved) else {
                 continue;
             };
-            if !self.constraint_parents.contains_key(&arg_head) {
-                continue;
-            }
             for b in &c.bounds {
                 let bound_ty = match subst.get(b) {
                     Some(t) => t.clone(),
                     None => Type::Struct(b.clone(), Vec::new()),
                 };
                 let bound_resolved = self.resolve_alias_type(&bound_ty);
-                let Some(bound_head) = plain_type_head(&bound_resolved) else {
+                let Some(bound_head) = type_head_name(&bound_resolved) else {
                     continue;
                 };
-                if bound_head == "Object" || bound_head == "Any" {
+                // 上界若是尚未替换的泛型参数名，无法判定，保守跳过。
+                if def.type_params.iter().any(|p| p == &bound_head) {
                     continue;
                 }
-                if !self.constraint_parents.contains_key(&bound_head) {
-                    continue;
-                }
-                if !is_same_or_subtype_name(&arg_head, &bound_head, &self.constraint_parents) {
-                    self.err(format!(
-                        "类型 '{}' 不满足泛型 '{}' 的类型参数 '{}' 的约束 '<: {}'（9.2(1)/9.2(2)）",
-                        arg_head, name, c.param, bound_head
-                    ));
+                if let Some(ok) = subtype_relation(
+                    &arg_head,
+                    &bound_head,
+                    &self.type_kinds,
+                    &self.constraint_parents,
+                ) {
+                    if !ok {
+                        self.err(format!(
+                            "类型 '{}' 不满足泛型 '{}' 的类型参数 '{}' 的约束 '<: {}'（9.2(1)/9.2(2)）",
+                            arg_head, name, c.param, bound_head
+                        ));
+                    }
                 }
             }
         }
@@ -3119,6 +3442,49 @@ impl<'a> Checker<'a> {
                 def.type_params.len(),
                 type_args.len()
             ));
+            return;
+        }
+        // 类型实参须满足静态泛型函数的约束（6.1.2.4(24)、9.2(1)/9.2(2)）。
+        let subst: HashMap<String, Type> = def
+            .type_params
+            .iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect();
+        for c in &def.constraints {
+            let Some(arg) = subst.get(&c.param) else {
+                continue;
+            };
+            let arg_resolved = self.resolve_alias_type(arg);
+            let Some(arg_head) = type_head_name(&arg_resolved) else {
+                continue;
+            };
+            for b in &c.bounds {
+                let bound_ty = match subst.get(b) {
+                    Some(t) => t.clone(),
+                    None => Type::Struct(b.clone(), Vec::new()),
+                };
+                let bound_resolved = self.resolve_alias_type(&bound_ty);
+                let Some(bound_head) = type_head_name(&bound_resolved) else {
+                    continue;
+                };
+                if def.type_params.iter().any(|p| p == &bound_head) {
+                    continue;
+                }
+                if let Some(ok) = subtype_relation(
+                    &arg_head,
+                    &bound_head,
+                    &self.type_kinds,
+                    &self.constraint_parents,
+                ) {
+                    if !ok {
+                        self.err(format!(
+                            "类型 '{}' 不满足静态泛型函数 '{}.{}' 的类型参数 '{}' 的约束 '<: {}'（6.1.2.4(24)）",
+                            arg_head, type_name, method, c.param, bound_head
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -3143,6 +3509,166 @@ impl<'a> Checker<'a> {
         } else {
             None
         }
+    }
+
+    /// 解析成员访问接收者：返回 (静态类型名, 是否经类型名限定)。
+    /// 仅当能确定接收者为用户 class 实例或类型名时返回。
+    fn receiver_user(&self, e: &Expr) -> Option<(String, bool)> {
+        match e {
+            Expr::Var(n) => {
+                if let Some(v) = self.lookup(n) {
+                    if let Ty::User(t) = &v.ty {
+                        return Some((t.clone(), false));
+                    }
+                    return None;
+                }
+                if self.type_names.contains(n) {
+                    return Some((n.clone(), true));
+                }
+                None
+            }
+            Expr::ConstructorCall { name, .. } if self.type_names.contains(name) => {
+                Some((name.clone(), false))
+            }
+            _ => None,
+        }
+    }
+
+    /// 在类成员表（含父类/接口继承）中查找成员信息。
+    fn lookup_class_member(&self, ty: &str, member: &str) -> Option<MemberInfo> {
+        let mut stack: Vec<&str> = vec![ty];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if let Some(m) = self.class_members.get(t) {
+                if let Some(info) = m.get(member) {
+                    return Some(info.clone());
+                }
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        None
+    }
+
+    /// 校验类成员访问方向（静态/实例）与私有可见性。
+    /// 对应 6.1.2(4)（实例成员不可经类型名访问）、6.1.2.4(14)（静态成员不可经实例
+    /// 访问）、6.1.2.4(28)（私有成员仅在定义类内可见）。
+    fn check_class_member_access(&mut self, recv_ty: &str, via_type: bool, member: &str) {
+        let Some(info) = self.lookup_class_member(recv_ty, member) else {
+            return;
+        };
+        if via_type && !info.is_static {
+            self.err(format!(
+                "实例成员 '{}' 不能通过类型名 '{}' 访问（6.1.2(4)）",
+                member, recv_ty
+            ));
+            return;
+        }
+        if !via_type && info.is_static {
+            self.err(format!(
+                "静态成员 '{}' 不能通过实例访问（6.1.2.4(14)）",
+                member
+            ));
+            return;
+        }
+        if info.visibility == Visibility::Private
+            && self.cur_class.as_deref() != Some(info.owner.as_str())
+        {
+            self.err(format!(
+                "不能访问类 '{}' 的私有成员 '{}'（6.1.2.4(28)）",
+                info.owner, member
+            ));
+        }
+    }
+
+    /// 在 interface 默认函数体（6.2.2(1)）：经接口类型访问的成员必须在
+    /// 该接口（含父接口）中声明，实现类的成员不会经接口类型暴露。
+    fn check_interface_member_exists(&mut self, recv_ty: &str, member: &str) {
+        if self.cur_interface.is_none() {
+            return;
+        }
+        if self.type_kinds.get(recv_ty) != Some(&TypeKind::Interface) {
+            return;
+        }
+        let Some(names) = self.interface_members.get(recv_ty) else {
+            return;
+        };
+        if self.interface_open_parents.contains(recv_ty) {
+            return;
+        }
+        if !names.contains(member) {
+            self.err(format!(
+                "接口 '{}' 中不存在成员 '{}'（6.2.2(1)）",
+                recv_ty, member
+            ));
+        }
+    }
+
+    /// 6.2.2.2(5)：interface 的 static 成员体中不能直接引用该接口的实例成员。
+    fn check_static_iface_member_ref(&mut self, name: &str) {
+        if !self.cur_iface_static {
+            return;
+        }
+        let Some(iface) = self.cur_interface.clone() else {
+            return;
+        };
+        // 局部变量/参数会遮蔽成员，保守跳过。
+        if self.lookup(name).is_some() {
+            return;
+        }
+        if self
+            .interface_instance_members
+            .get(&iface)
+            .map_or(false, |s| s.contains(name))
+        {
+            self.err(format!(
+                "静态上下文不能引用接口 '{}' 的实例成员 '{}'（6.2.2.2(5)）",
+                iface, name
+            ));
+        }
+    }
+
+    /// 6.2.2(1)：interface 默认函数体中不能以裸名引用其它接口的成员
+    /// （父接口体看不到子接口成员，接口实现类的成员也不会经接口暴露）。
+    fn check_iface_foreign_member_ref(&mut self, name: &str) {
+        let Some(cur) = self.cur_interface.clone() else {
+            return;
+        };
+        if self.lookup(name).is_some() {
+            return;
+        }
+        // 继承关系不完整（含 prelude 父接口）时保守跳过。
+        if self.interface_open_parents.contains(&cur) {
+            return;
+        }
+        if self
+            .interface_members
+            .get(&cur)
+            .map_or(false, |s| s.contains(name))
+        {
+            return;
+        }
+        // 名称为其它用户接口的成员，且不是全局函数/常量。
+        let in_other = self
+            .interface_members
+            .iter()
+            .any(|(i, s)| i != &cur && s.contains(name));
+        if !in_other {
+            return;
+        }
+        if self.known_funcs.contains(name) || self.globals.contains_key(name) {
+            return;
+        }
+        self.err(format!(
+            "接口 '{}' 的默认函数体不能引用其它接口的成员 '{}'（6.2.2(1)）",
+            cur, name
+        ));
     }
 
     fn check_assignable(&mut self, target: &Ty, value: &Ty, ctx: &str) {
@@ -3403,10 +3929,15 @@ impl<'a> Checker<'a> {
             }
             Expr::String(_) => Ty::String,
 
-            Expr::Var(name) => self
-                .lookup(name)
-                .map(|v| v.ty.clone())
-                .unwrap_or(Ty::Unknown),
+            Expr::Var(name) => {
+                // 6.2.2.2(5)：interface static 成员体不能直接引用实例成员。
+                self.check_static_iface_member_ref(name);
+                // 6.2.2(1)：interface 默认函数体不能裸名引用其它接口成员。
+                self.check_iface_foreign_member_ref(name);
+                self.lookup(name)
+                    .map(|v| v.ty.clone())
+                    .unwrap_or(Ty::Unknown)
+            }
 
             Expr::Unary { op, expr } => {
                 if is_ctrl_transfer_expr(expr) {
@@ -3479,6 +4010,10 @@ impl<'a> Checker<'a> {
                 // 2.1.3(4)/2.3.1(1)：基础类型转换的合法性（Bool↔数值、Rune↔数值）。
                 self.check_builtin_conversion(name, args, &arg_tys);
                 self.check_type_instantiation(name, type_args.as_deref());
+                // 6.2.2.2(5)：interface static 成员体不能直接引用实例成员。
+                self.check_static_iface_member_ref(name);
+                // 6.2.2(1)：interface 默认函数体不能裸名引用其它接口成员。
+                self.check_iface_foreign_member_ref(name);
                 // 2.1.10.2(3)：`A.A()` 形态（经类型名调用构造函数）非法；若该类型确有
                 // 同名成员函数则视为普通限定调用，放行。
                 if let Some((prefix, method)) = name.rsplit_once('.') {
@@ -3521,6 +4056,12 @@ impl<'a> Checker<'a> {
                     if self.type_names.contains(type_name) {
                         self.check_static_type_args(type_name, method, tas);
                     }
+                }
+                // 类成员访问方向/可见性（6.1.2(4)、6.1.2.4(14)、6.1.2.4(28)）
+                // 与接口成员存在性（6.2.2(1)）。
+                if let Some((recv_ty, via_type)) = self.receiver_user(object) {
+                    self.check_class_member_access(&recv_ty, via_type, method);
+                    self.check_interface_member_exists(&recv_ty, method);
                 }
                 // 2.1.10.4(6)：结构体私有成员函数仅可在定义体内调用。
                 if let Some(ty_name) = self.receiver_struct_ty(object) {
@@ -3661,6 +4202,12 @@ impl<'a> Checker<'a> {
 
             Expr::Field { object, field } => {
                 self.check_expr(object);
+                // 类成员访问方向/可见性（6.1.2(4)、6.1.2.4(14)、6.1.2.4(28)）
+                // 与接口成员存在性（6.2.2(1)）。
+                if let Some((recv_ty, via_type)) = self.receiver_user(object) {
+                    self.check_class_member_access(&recv_ty, via_type, field);
+                    self.check_interface_member_exists(&recv_ty, field);
+                }
                 // 2.1.10.4(6)：私有实例成员仅可在结构体定义体内访问。
                 if let Some(ty_name) = self.receiver_struct_ty(object) {
                     if self.cur_struct.as_deref() != Some(ty_name.as_str())
@@ -6117,6 +6664,146 @@ mod tests {
         // 2.1.10.4(6)：结构体私有成员不可在定义体外访问。
         assert_err("struct S { private let v = 1 }\nmain() { S().v }", "私有成员");
         assert_err("struct S { private func f() {} }\nmain() { S().f() }", "私有成员函数");
+    }
+
+    // ─── w11a-class6：06 章第五轮规则 ─────────────────────────────────────────
+
+    #[test]
+    fn test_w11a_static_member_via_instance_rejected() {
+        // 6.1.2.4(14)：静态成员不能经实例访问。
+        assert_err(
+            "class T { static func f() {} }\nmain() { let t = T(); t.f() }",
+            "静态成员",
+        );
+        assert_err(
+            "class T { static let x = 1 }\nmain() { let t = T(); let y = t.x }",
+            "静态成员",
+        );
+        // 经类型名访问静态成员合法。
+        assert_ok("class T { static func f() {} }\nmain() { T.f() }");
+        assert_ok("class T { static let x = 1 }\nmain() { let y = T.x }");
+        // 实例成员经实例访问合法。
+        assert_ok("class T { func f() {} }\nmain() { let t = T(); t.f() }");
+    }
+
+    #[test]
+    fn test_w11a_instance_member_via_type_rejected() {
+        // 6.1.2(4)：实例成员不能经类型名访问。
+        assert_err("class A { var a = 1 }\nmain() { A.a }", "实例成员");
+        assert_err("class A { func f() {} }\nmain() { A.f() }", "实例成员");
+        assert_ok("class A { var a = 1 }\nmain() { let x = A(); let y = x.a }");
+        assert_ok("class A { func f() {} }\nmain() { A().f() }");
+    }
+
+    #[test]
+    fn test_w11a_private_member_outside_class_rejected() {
+        // 6.1.2.4(28)：私有成员仅在定义类内可见。
+        assert_err(
+            "class A { private func f() {} }\nmain() { A().f() }",
+            "私有成员",
+        );
+        assert_err(
+            "class A { private static func f() {} }\nmain() { A.f() }",
+            "私有成员",
+        );
+        assert_err(
+            "class A { private let v = 1 }\nmain() { let a = A(); let w = a.v }",
+            "私有成员",
+        );
+        // 类内通过同类型实例访问私有成员合法。
+        assert_ok(
+            "class A { private func f() {} func g(o: A) { o.f() } }\nmain() {}",
+        );
+        assert_ok("class A { private static func f() {} func g() { A.f() } }\nmain() {}");
+    }
+
+    #[test]
+    fn test_w11a_object_constraint_prelude() {
+        // 6.1.3(1)：Object 只接纳 class 类型；struct/enum/interface/Any 都不是子类型。
+        assert_err(
+            "class G<T> where T <: Object {}\nmain() { let a = G<String>() }",
+            "不满足泛型",
+        );
+        assert_err(
+            "class G<T> where T <: Object {}\ninterface I {}\nmain() { let a = G<I>() }",
+            "不满足泛型",
+        );
+        assert_err(
+            "class G<T> where T <: Object {}\nenum E { X }\nmain() { let a = G<E>() }",
+            "不满足泛型",
+        );
+        // 用户 class 是 Object 的子类型。
+        assert_ok("class G<T> where T <: Object {}\nclass C {}\nmain() { let a = G<C>() }");
+        // 预定义结构体自动实现 ToString；Object 不实现 ToString。
+        assert_ok("class G<T> where T <: ToString {}\nmain() { let a = G<Int64>() }");
+        assert_err(
+            "class G<T> where T <: ToString {}\nmain() { let a = G<Object>() }",
+            "不满足泛型",
+        );
+        // 同类型满足自身约束。
+        assert_ok("class G<T> where T <: Object {}\nmain() { let a = G<Object>() }");
+    }
+
+    #[test]
+    fn test_w11a_static_generic_constraint_satisfaction() {
+        // 6.1.2.4(24)：静态泛型函数显式类型实参须满足约束（含类型参数间约束）。
+        assert_err(
+            "class Test { static func f<T1, T2>() where T1 <: T2 {} }\nmain() { Test.f<Int64, String>() }",
+            "不满足",
+        );
+        assert_err(
+            "class Test { static func f<T>(a: String) where T <: ToString {} }\nmain() { Test.f<Object>(\"\") }",
+            "不满足",
+        );
+        assert_ok(
+            "open class A {}\nclass B <: A {}\nclass Test { static func f<T1, T2>() where T1 <: T2 {} }\nmain() { Test.f<B, A>() }",
+        );
+    }
+
+    #[test]
+    fn test_w11a_interface_member_existence() {
+        // 6.2.2(1)：实现类的成员不经接口类型暴露。
+        assert_err(
+            "interface I1 { func f(x: I1) { x.f1() } }\nclass A <: I1 { func f1() {} }\nmain() {}",
+            "不存在成员",
+        );
+        assert_err(
+            "interface I1 { func f() { I1.x } }\nstruct A <: I1 { static let x = 1 }\nmain() {}",
+            "不存在成员",
+        );
+        // 接口自身声明的成员可经接口类型访问。
+        assert_ok(
+            "interface I1 { func f1(): Unit\n func f(x: I1) { x.f1() } }\nmain() {}",
+        );
+        // 父接口默认函数体看不到子接口成员（裸名引用）。
+        assert_err(
+            "interface I1 { func f() { f1() } }\ninterface I2 <: I1 { static func f1(): Int64 }\nmain() {}",
+            "其它接口的成员",
+        );
+        // 父接口默认函数体看不到子接口静态属性。
+        assert_err(
+            "interface I1 { func f() { p } }\ninterface I2 <: I1 { static prop p: Int64 { get() { 1 } } }\nmain() {}",
+            "其它接口的成员",
+        );
+    }
+
+    #[test]
+    fn test_w11a_static_iface_instance_member_ref() {
+        // 6.2.2.2(5)：interface 的 static 成员体不能直接引用实例成员。
+        assert_err(
+            "interface I { func f(): Unit\n static func g() { f() } }\nmain() {}",
+            "实例成员",
+        );
+        assert_err(
+            "interface I { prop p: Int64 { get() { 1 } }\n static func g() { p } }\nmain() {}",
+            "实例成员",
+        );
+        // 实例默认函数体内引用实例成员合法。
+        assert_ok("interface I { func f() {}\n func g() { f() } }\nmain() {}");
+        // static 成员体引用 static 成员合法。
+        assert_ok(
+            "interface I { static func f(): Unit\n static func g(): Unit\n static func h() { f() } }\nmain() {}",
+        );
     }
 
 }
