@@ -3521,10 +3521,13 @@ impl<'a> Checker<'a> {
             }
             Stmt::While { cond, body } => {
                 self.check_expr(cond);
+                // 3.2.3.2(22)/(23)/(25)：循环条件与循环体同级，不能引用体内局部名。
+                self.check_loop_cond_body_scope(cond, body);
                 self.check_nested_body(body);
             }
             Stmt::DoWhile { body, cond } => {
                 self.check_nested_body(body);
+                self.check_loop_cond_body_scope(cond, body);
                 self.check_expr(cond);
             }
             Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
@@ -3559,6 +3562,14 @@ impl<'a> Checker<'a> {
                     Ty::String => Ty::UInt8,
                     other => other,
                 };
+                // 3.2.3.2(22)/(23)：for-in 循环变量不能再由循环体内（同层）的
+                // let/var/const 声明遮蔽（嵌套 for-in 复用同一变量名是合法的）。
+                if body_binding_declares_name(body, var.as_str()) {
+                    self.err(format!(
+                        "for-in 循环变量 '{}' 不能在循环体中被重新声明（3.2.3.2(22)/(23)）",
+                        var
+                    ));
+                }
                 let mut scope = HashMap::new();
                 scope.insert(
                     var.clone(),
@@ -3647,6 +3658,46 @@ impl<'a> Checker<'a> {
             self.check_stmt(s);
         }
         self.scopes.pop();
+    }
+
+    /// 3.2.3.2(22)/(23)/(25)：循环条件中不能引用仅在循环体内引入的变量。
+    ///
+    /// 条件与循环体处于不同的作用域；若条件中的裸名在条件处无法解析（不在
+    /// 外层作用域/全局），而该名字出现在循环体的局部声明中，即为引用了体局部名。
+    /// 若外层已存在同名变量（合法遮蔽/引用），`lookup` 命中，不会误报。
+    fn check_loop_cond_body_scope(&mut self, cond: &Expr, body: &[Stmt]) {
+        let mut decls: HashSet<String> = HashSet::new();
+        collect_body_decl_names(body, &mut decls);
+        if decls.is_empty() {
+            return;
+        }
+        let mut vars: Vec<String> = Vec::new();
+        let mut calls: Vec<String> = Vec::new();
+        collect_default_uses(cond, &mut vars, &mut calls);
+        let mut reported: HashSet<String> = HashSet::new();
+        for r in vars {
+            if decls.contains(&r)
+                && self.lookup(&r).is_none()
+                && reported.insert(r.clone())
+            {
+                self.err(format!(
+                    "循环条件不能引用仅在循环体内声明的变量 '{}'（3.2.3.2(22)/(23)/(25)）",
+                    r
+                ));
+            }
+        }
+        // 循环体内声明的局部函数也不能在条件中被调用（3.2.3.2(22)/(23)/(25)）。
+        for c in calls {
+            if decls.contains(&c)
+                && !self.known_funcs.contains(&c)
+                && reported.insert(c.clone())
+            {
+                self.err(format!(
+                    "循环条件不能引用仅在循环体内声明的局部函数 '{}'（3.2.3.2(22)/(23)/(25)）",
+                    c
+                ));
+            }
+        }
     }
 
     fn bind_pattern(&mut self, pattern: &Pattern, ty: Ty, mutable: bool) {
@@ -5523,6 +5574,10 @@ impl<'a> Checker<'a> {
                         args.len() + named_args.len(),
                     );
                 }
+                // 2.1.4(2)：Unit 类型未定义 () 调用运算符。
+                if self.lookup(name).map_or(false, |v| v.ty == Ty::Unit) {
+                    self.err("Unit 类型未定义 () 调用运算符（2.1.4(2)）".to_string());
+                }
                 // 2.1.10.2(3)：`A.A()` 形态（经类型名调用构造函数）非法；若该类型确有
                 // 同名成员函数则视为普通限定调用，放行。
                 if let Some((prefix, method)) = name.rsplit_once('.') {
@@ -5553,6 +5608,16 @@ impl<'a> Checker<'a> {
                 type_args,
             } => {
                 self.check_expr(object);
+                // 2.1.4(2)：Unit 类型未定义成员访问运算符 '.'。
+                // `(e as T)` 结果为 Option<T>（4.17.2），排除 Cast 形态。
+                if !matches!(&**object, Expr::Cast { .. })
+                    && !is_universal_method(method)
+                    && self.check_expr_ty_peek(object) == Ty::Unit
+                {
+                    self.err(
+                        "Unit 类型未定义成员访问运算符 '.'（2.1.4(2)）".to_string(),
+                    );
+                }
                 // 注意：`obj?.method()` 被解析器折叠为 MethodCall（与 `obj.method()`
                 // 形态相同），无法在此区分是否带 '?'，故不对 MethodCall 套用
                 // “Option 接收者缺 ?”规则，避免误伤合法的可选链方法调用。
@@ -5822,6 +5887,17 @@ impl<'a> Checker<'a> {
 
             Expr::Field { object, field } => {
                 self.check_expr(object);
+                // 2.1.4(2)：Unit 类型未定义成员访问运算符 '.'。
+                // `(e as T)` 的结果为 Option<T>（4.17.2），其 peek 类型为 T，
+                // 若 T=Unit 不能据此判定接收者为 Unit，故排除 Cast 形态。
+                if !matches!(&**object, Expr::Cast { .. })
+                    && !is_universal_method(field)
+                    && self.check_expr_ty_peek(object) == Ty::Unit
+                {
+                    self.err(
+                        "Unit 类型未定义成员访问运算符 '.'（2.1.4(2)）".to_string(),
+                    );
+                }
                 // 4.13.4(6)：对 Option 类型使用 '.' 而缺少 '?' 是非法的。
                 self.check_missing_question(object, ".");
                 // 类成员访问方向/可见性（6.1.2(4)、6.1.2.4(14)、6.1.2.4(28)）
@@ -6040,6 +6116,12 @@ impl<'a> Checker<'a> {
                 }
                 let base_ty = self.check_expr(array);
                 let idx_ty = self.check_expr(index);
+                // 2.1.4(2)：Unit 类型未定义下标运算符 []。
+                if base_ty == Ty::Unit {
+                    self.err(
+                        "Unit 类型未定义下标运算符 []（2.1.4(2)）".to_string(),
+                    );
+                }
                 match &base_ty {
                     // 2.1.7.3(1)：元组下标只能是 Int64 整数字面量；元素类型按字面量定位。
                     Ty::Tuple(elems) => {
@@ -6140,6 +6222,14 @@ impl<'a> Checker<'a> {
                 {
                     self.err("范围表达式不能嵌套（形如 `a..b..c` 非法）".to_string());
                 }
+                // 2.1.4(2)：Unit 类型未定义范围运算符 '..'。
+                if self.check_expr_ty_peek(start) == Ty::Unit
+                    || self.check_expr_ty_peek(end) == Ty::Unit
+                {
+                    self.err(
+                        "Unit 类型未定义范围运算符 '..'（2.1.4(2)）".to_string(),
+                    );
+                }
                 // 2.1.7：步长不能为常量 0。
                 if let Some(s) = step {
                     if self.const_int_of(s) == Some(0) {
@@ -6218,7 +6308,15 @@ impl<'a> Checker<'a> {
                 let mut result = Ty::Unknown;
                 for arm in arms {
                     let mut scope = HashMap::new();
-                    bind_pattern_unknown(&arm.pattern, &mut scope);
+                    // 4.4.1.3(4)：绑定模式引入的变量不可变。
+                    bind_pattern_unknown_mut(&arm.pattern, &mut scope, false);
+                    // 4.4.1.3(7)/(8)：绑定模式不得出现在 `|` 连接的子模式中。
+                    if or_pattern_has_binding(&arm.pattern, &self.enum_variants) {
+                        self.err(
+                            "绑定模式不能出现在由 '|' 连接的子模式中（4.4.1.3(7)/(8)）"
+                                .to_string(),
+                        );
+                    }
                     self.scopes.push(scope);
                     if let Some(g) = &arm.guard {
                         self.check_expr(g);
@@ -6313,13 +6411,26 @@ impl<'a> Checker<'a> {
             Expr::NullCoalesce { option, default } => {
                 let ot = self.check_expr(option);
                 let dt = self.check_expr(default);
+                // 2.1.4(2)：Unit 只定义了 =、==、!=，未定义 ??。
+                // 仅当左操作数本身为 Unit 时非法；`Option<Unit> ?? ()` 是合法的
+                // （左操作数为 Option<Unit>，右操作数为 Unit）。
+                if ot == Ty::Unit {
+                    self.err(
+                        "运算符 '??' 未对 Unit 类型定义（Unit 仅支持 =、==、!=）（2.1.4(2)）"
+                            .to_string(),
+                    );
+                }
                 // 4.21(3)：e1 为 Option<T> 时，e2 的类型必须为 T（或 Option<T>，此时再解一层）。
                 if let Ty::Option(inner) = &ot {
                     let dt_eff = match &dt {
                         Ty::Option(di) => di.as_ref(),
                         other => other,
                     };
-                    if inner.is_prim() && dt_eff.is_definite() && !compatible(inner, dt_eff) {
+                    // 4.21(3)：e2 的类型须为 T（或可赋给 T）。此前仅对基础类型判定，
+                    // 导致 `Option<C> ?? Int8/String/Array<...>`（C 为用户类型）被放行。
+                    // 用户类型之间保持宽松（可能为继承/接口关系），仅拒绝与内建
+                    // 具体类型/聚合类型确定不兼容的组合。
+                    if inner.is_definite() && dt_eff.is_definite() && !compatible(inner, dt_eff) {
                         self.err(format!(
                             "空值合并运算符 '??' 的右侧类型不匹配: 左侧为 Option<{}>，右侧为 {}",
                             inner.name(),
@@ -7328,6 +7439,134 @@ fn is_default_value(ty: &Type, value: &Expr) -> bool {
         // 结构体/类/数组等其它类型：解析器统一合成 Integer(0)。
         _ => matches!(value, Expr::Integer(0)),
     }
+}
+
+/// Any/Object 上对所有类型（含 Unit）可用的通用成员方法。
+///
+/// 2.1.4(2) 只限制 Unit 上的运算符；`toString`/`hashCode`/`equals` 等来自
+/// Object 的成员对 Unit 仍可用（如 std 中的 `p.toString()`）。
+fn is_universal_method(name: &str) -> bool {
+    matches!(name, "toString" | "hashCode" | "equals")
+}
+
+/// 收集语句块中（含嵌套块）由 let/var/const/循环变量/局部函数引入的名字。
+fn collect_body_decl_names(body: &[Stmt], out: &mut HashSet<String>) {
+    for s in body {
+        match s {
+            Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+                pattern_binding_names(pattern, out)
+            }
+            Stmt::Const { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stmt::LocalFunc(f) => {
+                out.insert(crate::sema::last_name_segment(&f.name));
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => collect_body_decl_names(body, out),
+            Stmt::DoWhile { body, .. } => collect_body_decl_names(body, out),
+            Stmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                collect_body_decl_names(body, out);
+            }
+            Stmt::WhileLet { pattern, body, .. } => {
+                pattern_binding_names(pattern, out);
+                collect_body_decl_names(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 收集模式中绑定的变量名。
+fn pattern_binding_names(pattern: &Pattern, out: &mut HashSet<String>) {
+    match pattern {
+        Pattern::Binding(n) => {
+            out.insert(n.clone());
+        }
+        Pattern::Tuple(ps) | Pattern::Or(ps) => {
+            for p in ps {
+                pattern_binding_names(p, out);
+            }
+        }
+        Pattern::Variant {
+            payload: Some(inner),
+            ..
+        } => pattern_binding_names(inner, out),
+        Pattern::Struct { fields, .. } => {
+            for (_, p) in fields {
+                pattern_binding_names(p, out);
+            }
+        }
+        Pattern::TypeTest { binding, .. } => {
+            out.insert(binding.clone());
+        }
+        _ => {}
+    }
+}
+
+/// 4.4.1.3(7)/(8)：`|` 连接的子模式中不得引入绑定变量（含类型测试式绑定）。
+///
+/// 裸名子模式若为已知枚举变体（如 `case A | B =>` 中的 A/B）则是常量模式，
+/// 不是绑定变量，不计入。
+fn or_pattern_has_binding(pattern: &Pattern, variants: &HashSet<String>) -> bool {
+    fn binds_any(p: &Pattern, variants: &HashSet<String>) -> bool {
+        match p {
+            Pattern::Binding(n) => !variants.contains(n),
+            Pattern::TypeTest { .. } => true,
+            Pattern::Or(ps) | Pattern::Tuple(ps) => {
+                ps.iter().any(|q| binds_any(q, variants))
+            }
+            Pattern::Variant {
+                payload: Some(inner),
+                ..
+            } => binds_any(inner, variants),
+            Pattern::Struct { fields, .. } => {
+                fields.iter().any(|(_, q)| binds_any(q, variants))
+            }
+            _ => false,
+        }
+    }
+    match pattern {
+        Pattern::Or(ps) => ps.iter().any(|q| binds_any(q, variants)),
+        Pattern::Tuple(ps) => ps.iter().any(|q| or_pattern_has_binding(q, variants)),
+        Pattern::Variant {
+            payload: Some(inner),
+            ..
+        } => or_pattern_has_binding(inner, variants),
+        Pattern::Struct { fields, .. } => {
+            fields.iter().any(|(_, p)| or_pattern_has_binding(p, variants))
+        }
+        _ => false,
+    }
+}
+
+/// 模式（含嵌套）是否绑定了指定名字（用于循环变量遮蔽判定）。
+fn pattern_binds_name(pattern: &Pattern, name: &str) -> bool {
+    match pattern {
+        Pattern::Binding(n) => n == name,
+        Pattern::Tuple(ps) | Pattern::Or(ps) => ps.iter().any(|p| pattern_binds_name(p, name)),
+        Pattern::Variant {
+            payload: Some(inner),
+            ..
+        } => pattern_binds_name(inner, name),
+        Pattern::Struct { fields, .. } => {
+            fields.iter().any(|(_, p)| pattern_binds_name(p, name))
+        }
+        _ => false,
+    }
+}
+
+/// 循环体（仅直接层）是否以 let/var/const 声明了指定名字。
+fn body_binding_declares_name(body: &[Stmt], name: &str) -> bool {
+    body.iter().any(|s| match s {
+        Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+            pattern_binds_name(pattern, name)
+        }
+        Stmt::Const { name: n, .. } => n == name,
+        _ => false,
+    })
 }
 
 /// 将 pattern 中的绑定名以 Unknown 类型写入作用域（默认可变，供 for-in /
@@ -9431,6 +9670,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_w13a_class8_ctor_member_param_not_via_type() {
         // 6.1.2.1(15)：主/命名构造函数成员参数生成的实例字段不能经类名访问。
@@ -9445,6 +9685,100 @@ mod tests {
         // 正例：经实例访问成员参数生成的字段。
         assert_ok("class Test { Test(var p: Int64) {}\n func check() { let x = this.p } }\nmain() {}");
         assert_ok("class Test(var p: Int64) { func check() { let x = p } }\nmain() {}");
+    }
+
+
+    // ─── w13b：04/21(3) ?? 右侧类型须为 T（含用户类型） ────────────────────
+
+    #[test]
+    fn test_w13b_null_coalesce_user_option_mismatch() {
+        assert_err(
+            "class C {}\nmain() { var v: Option<C> = None; var n: Int8 = 1; let r = v ?? n }",
+            "??",
+        );
+        assert_err(
+            "class C {}\nmain() { var v: Option<C> = None; var s: String = \"\"; let r = v ?? s }",
+            "??",
+        );
+        // 正例：右侧为同类型用户类型。
+        assert_ok("class C {}\nmain() { var v: Option<C> = None; let r = v ?? C() }");
+        // 正例：Option<Unit> ?? ()。
+        assert_ok("main() { let r = Option<Unit>.Some(()) ?? () }");
+    }
+
+
+    // ─── w13b：04/04/01(3/7/8) 绑定模式不可变 / 禁止出现在 | 中 ─────────────
+
+    #[test]
+    fn test_w13b_match_binding_immutable_and_or_rejected() {
+        assert_err(
+            "main() { var v = 1; match (v) { case foo => foo = 2 } }",
+            "不可变变量",
+        );
+        assert_err(
+            "main() { let v = 1; match (v) { case 1 | foo => 1 } }",
+            "绑定模式不能出现在",
+        );
+        assert_err(
+            "main() { let v = 1; match (v) { case foo | foo => 1 } }",
+            "绑定模式不能出现在",
+        );
+        // 正例：普通绑定读取。
+        assert_ok("main() { let v = 1; match (v) { case foo => let x = foo } }");
+        // 正例：无绑定变量的 | 模式。
+        assert_ok("main() { let v = 1; match (v) { case 1 | 2 => 0 case _ => 1 } }");
+    }
+
+
+    // ─── w13b：02/01/04(2) Unit 类型运算符限制 ──────────────────────────────
+
+    #[test]
+    fn test_w13b_unit_operator_restrictions() {
+        assert_err(
+            "func f(): Unit { }\nmain() { let u: Unit = f(); let v: Unit = f(); u ?? v }",
+            "Unit",
+        );
+        assert_err("func f(): Unit { }\nmain() { let u: Unit = f(); u() }", "Unit");
+        assert_err(
+            "func f(): Unit { }\nmain() { let u: Unit = f(); let x = u.foo }",
+            "Unit",
+        );
+        assert_err(
+            "func f(): Unit { }\nmain() { let u: Unit = f(); let x = u[0] }",
+            "Unit",
+        );
+        assert_err("func f(): Unit { }\nmain() { let u: Unit = f(); let r = u..u }", "Unit");
+        // 正例：正常类型的运算符。
+        assert_ok("main() { let a: Int64 = 1; let b: Int64 = 2; let c = a + b }");
+    }
+
+
+    // ─── w13b：03/02/03/02(22)/(23)/(25) 循环条件与循环体作用域 ─────────────
+
+    #[test]
+    fn test_w13b_loop_condition_body_scope() {
+        assert_err(
+            "main() { while (num > 0) { let num = 0 } }",
+            "循环条件",
+        );
+        assert_err(
+            "main() { while (num > 0) { var num = 0 } }",
+            "循环条件",
+        );
+        assert_err(
+            "main() { do { let x = 1 } while (x == 1) }",
+            "循环条件",
+        );
+        assert_err(
+            "main() { do { func g() { false } } while (g()) }",
+            "循环条件",
+        );
+        assert_err(
+            "main() { let arr: Array<Int32> = []; for (num in arr) { let num: Int32 = 0 } }",
+            "for-in 循环变量",
+        );
+        // 正例：条件引用外层变量。
+        assert_ok("main() { var num = 1; while (num > 0) { num = num - 1 } }");
     }
 
 }
