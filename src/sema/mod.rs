@@ -357,6 +357,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_duplicate_local_bindings(program, &mut errors);
     // 3.2.3.2(3)/(6)：局部变量 / 局部函数先使用后声明。
     check_use_before_declaration(program, &mut errors);
+    // 5.1.2 / 5.3.4：形参声明顺序、默认值必须是命名参数、默认值静态作用域、
+    // 变长形参位置，以及接口/open/abstract/运算符函数不能有可选参数。
+    check_function_param_rules(program, &mut errors);
     for cls in &program.classes {
         check_class(cls, &index, &mut errors);
         check_ctor_param_order(cls, &mut errors);
@@ -7892,6 +7895,546 @@ fn check_struct_mutual_ctor_cycles(program: &Program, errors: &mut Vec<SemanticE
     }
 }
 
+// ─── 5.1.2 / 5.3.4 函数形参声明与默认值规则 ─────────────────────────────────
+
+/// 收集顶层静态作用域内可见的名字（用于默认值“静态作用域”判定，5.1.2.2(8)）。
+fn collect_top_level_names(program: &Program) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for c in &program.constants {
+        out.insert(c.name.clone());
+    }
+    for f in &program.functions {
+        out.insert(f.name.clone());
+    }
+    for c in &program.classes {
+        out.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        out.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        out.insert(e.name.clone());
+    }
+    for i in &program.interfaces {
+        out.insert(i.name.clone());
+    }
+    for (n, _) in &program.type_aliases {
+        out.insert(n.clone());
+    }
+    out
+}
+
+/// 函数名是否对应运算符重载。解析器把运算符映射为 `op_add` / `op_eq` 等标识符名，
+/// 旧路径也可能保留原始符号；两者都识别。
+fn is_operator_func_name(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name);
+    matches!(
+        last,
+        "op_add"
+            | "op_sub"
+            | "op_mul"
+            | "op_pow"
+            | "op_div"
+            | "op_mod"
+            | "op_eq"
+            | "op_ne"
+            | "op_lt"
+            | "op_gt"
+            | "op_le"
+            | "op_ge"
+            | "op_shl"
+            | "op_shr"
+            | "op_not"
+            | "op_bitand"
+            | "op_bitor"
+            | "op_bitxor"
+            | "op_and"
+            | "op_or"
+            | "op_bitnot"
+            | "op_index"
+            | "op_call"
+    ) || (!last.is_empty()
+        && !last
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_alphabetic() || c == '_'))
+}
+
+/// 收集表达式中的变量引用（`Expr::Var`），不进入嵌套块 / lambda / match 等其它作用域，
+/// 也不把调用名当作变量引用。用于默认值静态作用域检查。
+fn collect_default_var_refs(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Var(name) => out.push(name.clone()),
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::IsType { expr, .. }
+        | Expr::Field { object: expr, .. }
+        | Expr::TupleIndex { object: expr, .. }
+        | Expr::OptionalChain { object: expr, .. } => collect_default_var_refs(expr, out),
+        Expr::Binary { left, right, .. }
+        | Expr::NullCoalesce {
+            option: left,
+            default: right,
+        } => {
+            collect_default_var_refs(left, out);
+            collect_default_var_refs(right, out);
+        }
+        Expr::Return(Some(e)) => collect_default_var_refs(e, out),
+        Expr::Index { array, index } => {
+            collect_default_var_refs(array, out);
+            collect_default_var_refs(index, out);
+        }
+        Expr::Tuple(elems) | Expr::Array(elems) => {
+            for e in elems {
+                collect_default_var_refs(e, out);
+            }
+        }
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            collect_default_var_refs(start, out);
+            collect_default_var_refs(end, out);
+            if let Some(s) = step {
+                collect_default_var_refs(s, out);
+            }
+        }
+        Expr::Call {
+            args, named_args, ..
+        } => {
+            for a in args {
+                collect_default_var_refs(a, out);
+            }
+            for (_, a) in named_args {
+                collect_default_var_refs(a, out);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            collect_default_var_refs(object, out);
+            for a in args {
+                collect_default_var_refs(a, out);
+            }
+            for (_, a) in named_args {
+                collect_default_var_refs(a, out);
+            }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields {
+                collect_default_var_refs(e, out);
+            }
+        }
+        // 嵌套块 / lambda / match 属于其它作用域，不在此处收集。
+        _ => {}
+    }
+}
+
+/// 校验一段形参列表的声明规则：
+/// - 5.1.2.1(2)：非命名形参必须位于所有命名形参之前；
+/// - 5.1.2.2(3)：带默认值的形参必须是命名形参（`name!`）；
+/// - 5.3.4(4)/(5)：变长形参必须是最后一个形参，且不能为命名形参；
+/// - 5.1.2.2(8)/(12)/(13)：默认值不能引用自身或之后声明的形参。
+fn check_param_list(
+    params: &[Param],
+    label: &str,
+    globals: &HashSet<String>,
+    check_order: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    if check_order {
+        if let Some(idx) = first_unnamed_after_named(params) {
+            errors.push(SemanticError {
+                message: format!(
+                    "{}的第 {} 个非命名形参位于命名形参之后（5.1.2.1(2)）",
+                    label,
+                    idx + 1
+                ),
+            });
+        }
+    }
+    let last_pos = params.len().saturating_sub(1);
+    for (i, p) in params.iter().enumerate() {
+        // 5.1.2.1：命名通配符形参 `_!` 非法（通配符不能作为命名参数）。
+        if p.name == "_" && p.is_named {
+            errors.push(SemanticError {
+                message: format!("{}的命名形参不能使用通配符 `_!`（5.1.2.1）", label),
+            });
+        }
+        // 5.1.2.1：形参必须带类型标注（`name: Type`）；`name = expr` 缺类型非法。
+        if !p.variadic && matches!(&p.ty, Type::TypeParam(t) if t == "_") {
+            errors.push(SemanticError {
+                message: format!("{}的形参 '{}' 缺少类型标注（5.1.2.1）", label, p.name),
+            });
+        }
+        // 5.1.2.2(3)：默认值参数（可选参数）必须是命名参数。
+        if p.default.is_some() && !p.is_named && !p.variadic {
+            errors.push(SemanticError {
+                message: format!(
+                    "{}的形参 '{}' 带默认值但不是命名形参（缺少 `!`）（5.1.2.2(3)）",
+                    label, p.name
+                ),
+            });
+        }
+        // 5.3.4(4)/(5)：变长形参位置与命名冲突。
+        if p.variadic {
+            if i != last_pos {
+                errors.push(SemanticError {
+                    message: format!(
+                        "{}的变长形参 '{}' 必须是最后一个形参（5.3.4(4)）",
+                        label, p.name
+                    ),
+                });
+            }
+            if p.is_named {
+                errors.push(SemanticError {
+                    message: format!(
+                        "{}的变长形参 '{}' 不能声明为命名形参（5.3.4(5)）",
+                        label, p.name
+                    ),
+                });
+            }
+        }
+    }
+    // 5.1.2.2(8)/(12)/(13)：默认值的静态作用域——只能引用在它之前声明的形参。
+    for (i, p) in params.iter().enumerate() {
+        let Some(def) = &p.default else { continue };
+        let mut refs = Vec::new();
+        collect_default_var_refs(def, &mut refs);
+        refs.sort();
+        refs.dedup();
+        for name in refs {
+            if let Some(j) = params.iter().position(|q| q.name == name) {
+                // j >= i：引用自身（j == i）或之后声明的形参（j > i）。
+                // 若同名名字在顶层静态作用域已存在，则按静态作用域解析，不算引用形参。
+                if j >= i && !globals.contains(&name) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "{}的形参 '{}' 的默认值不能引用自身或之后声明的形参 '{}'（5.1.2.2(8)/(12)/(13)）",
+                            label, p.name, name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 5.1.2.2(1)/(5)/(6)：可选（默认值）参数在若干上下文中非法。
+fn check_optional_param_contexts(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 接口成员函数（抽象或默认实现）不能有可选参数。
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(p) = m.params.iter().find(|p| p.default.is_some()) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "接口 '{}' 的成员函数 '{}' 不能有可选参数 '{}'（5.1.2.2(5)）",
+                        iface.name, m.name, p.name
+                    ),
+                });
+            }
+        }
+    }
+    // 类中 open / abstract 成员函数不能有可选参数。
+    for cls in &program.classes {
+        for m in &cls.methods {
+            if is_synthetic_member(&m.func.name) {
+                continue;
+            }
+            if m.is_open || m.is_abstract {
+                if let Some(p) = m.func.params.iter().find(|p| p.default.is_some()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的 open/abstract 成员函数 '{}' 不能有可选参数 '{}'（5.1.2.2(5)）",
+                            cls.name, m.func.name, p.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    // 运算符函数不能有可选参数。
+    for f in &program.functions {
+        if is_operator_func_name(&f.name) {
+            if let Some(p) = f.params.iter().find(|p| p.default.is_some()) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "运算符函数 '{}' 不能有可选参数 '{}'（5.1.2.2(6)）",
+                        f.name, p.name
+                    ),
+                });
+            }
+        }
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            if is_operator_func_name(&m.func.name) {
+                if let Some(p) = m.func.params.iter().find(|p| p.default.is_some()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "运算符函数 '{}' 不能有可选参数 '{}'（5.1.2.2(6)）",
+                            m.func.name, p.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            if is_operator_func_name(&m.name) {
+                if let Some(p) = m.params.iter().find(|p| p.default.is_some()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "运算符函数 '{}' 不能有可选参数 '{}'（5.1.2.2(6)）",
+                            m.name, p.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 5.3.1：函数调用处命名实参 / 位置实参数量的静态检查。
+///
+/// 只对“在文件内唯一定义的顶层函数”的裸名调用做检查；变长参数函数、重载函数、
+/// 与成员方法/常量同名的裸调用一并保守跳过，避免误伤合法代码。
+fn check_call_arguments(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 裸名 → 顶层函数（仅唯一者参与检查）。
+    let mut funcs: HashMap<&str, Vec<&Function>> = HashMap::new();
+    for f in &program.functions {
+        if f.name.contains('.') {
+            continue;
+        }
+        funcs.entry(f.name.as_str()).or_default().push(f);
+    }
+    // 与成员方法末段名 / 顶层常量同名的裸调用可能解析到别处，保守跳过。
+    let mut blocked: HashSet<&str> = HashSet::new();
+    for c in &program.constants {
+        blocked.insert(c.name.as_str());
+    }
+    for f in &program.functions {
+        if f.name.contains('.') {
+            if let Some(last) = f.name.rsplit('.').next() {
+                blocked.insert(last);
+            }
+        }
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            blocked.insert(m.func.name.rsplit('.').next().unwrap_or(&m.func.name));
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            blocked.insert(m.name.as_str());
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            blocked.insert(m.name.rsplit('.').next().unwrap_or(&m.name));
+        }
+    }
+
+    let mut check_stmts = |stmts: &[Stmt], errors: &mut Vec<SemanticError>| {
+        // 宏实参由宏自行解释（如 @PowerAssert），其中的调用不做普通语义检查。
+        // 先收集宏实参子树内表达式的地址，检查时跳过。
+        let mut macro_roots: Vec<&Expr> = Vec::new();
+        walk_stmts(stmts, &mut |e| {
+            if let Expr::Macro { args, .. } = e {
+                for a in args {
+                    macro_roots.push(a);
+                }
+            }
+        });
+        let mut in_macro: HashSet<usize> = HashSet::new();
+        for root in macro_roots {
+            walk_expr(root, &mut |x| {
+                in_macro.insert(x as *const Expr as usize);
+            });
+        }
+        walk_stmts(stmts, &mut |e| {
+            if in_macro.contains(&(e as *const Expr as usize)) {
+                return;
+            }
+            let Expr::Call {
+                name,
+                args,
+                named_args,
+                ..
+            } = e
+            else {
+                return;
+            };
+            let Some(cands) = funcs.get(name.as_str()) else {
+                return;
+            };
+            if cands.len() != 1 || blocked.contains(name.as_str()) {
+                return;
+            }
+            let f = cands[0];
+            // 变长参数无法精确匹配实参数量，保守跳过。
+            if f.params.iter().any(|p| p.variadic) {
+                return;
+            }
+            let positional: Vec<&Param> = f.params.iter().filter(|p| !p.is_named).collect();
+            let named_params: Vec<&Param> = f.params.iter().filter(|p| p.is_named).collect();
+            // 5.3.4(1)：末个非命名形参为 Array 类型时允许变长实参语法糖，
+            // 此时位置实参数量可与形参数量不同，跳过数量检查。
+            let last_is_array = positional
+                .last()
+                .map_or(false, |p| matches!(&p.ty, Type::Array(_) | Type::Slice(_)));
+            // 5.3.1(2)/(4)：位置实参过多——命名形参必须以 `名字:` 形式传入。
+            if !last_is_array && args.len() > positional.len() {
+                errors.push(SemanticError {
+                    message: format!(
+                        "调用函数 '{}' 的位置实参过多（{} 个），命名形参须以 `名字:` 形式传入（5.3.1(4)）",
+                        name,
+                        args.len()
+                    ),
+                });
+            }
+            // 5.3.1(1)/(3)：命名实参必须对应且仅对应命名形参。
+            for (n, _) in named_args {
+                if named_params.iter().any(|p| &p.name == n) {
+                    continue;
+                }
+                if positional.iter().any(|p| &p.name == n) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "调用函数 '{}'：形参 '{}' 不是命名参数，不能以 `名字:` 形式传入（5.3.1(3)）",
+                            name, n
+                        ),
+                    });
+                } else {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "调用函数 '{}'：不存在名为 '{}' 的命名形参（5.3.1(1)）",
+                            name, n
+                        ),
+                    });
+                }
+            }
+        });
+    };
+
+    for f in &program.functions {
+        check_stmts(&f.body, errors);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            check_stmts(&m.func.body, errors);
+        }
+        for init in &cls.inits {
+            check_stmts(&init.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            check_stmts(&init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            check_stmts(&m.body, errors);
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(b) = &m.default_body {
+                check_stmts(b, errors);
+            }
+        }
+    }
+}
+
+/// 5.1.2 / 5.3.4：遍历全部函数式声明，检查形参声明与默认值规则。
+fn check_function_param_rules(program: &Program, errors: &mut Vec<SemanticError>) {
+    let globals = collect_top_level_names(program);
+    for f in &program.functions {
+        check_param_list(
+            &f.params,
+            &format!("函数 '{}'", f.name),
+            &globals,
+            true,
+            errors,
+        );
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            if is_synthetic_member(&m.func.name) {
+                continue;
+            }
+            check_param_list(
+                &m.func.params,
+                &format!("类 '{}' 的成员函数 '{}'", cls.name, m.func.name),
+                &globals,
+                true,
+                errors,
+            );
+        }
+        // 构造函数：普通/命名顺序已由 check_ctor_param_rules 检查，这里只查
+        // 默认值必须命名与变长形参位置，避免重复报错。
+        for init in &cls.inits {
+            check_param_list(
+                &init.params,
+                &format!("类 '{}' 的构造函数", cls.name),
+                &globals,
+                false,
+                errors,
+            );
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            check_param_list(
+                &init.params,
+                &format!("结构体 '{}' 的构造函数", s.name),
+                &globals,
+                false,
+                errors,
+            );
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            check_param_list(
+                &m.params,
+                &format!("接口 '{}' 的成员函数 '{}'", iface.name, m.name),
+                &globals,
+                true,
+                errors,
+            );
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            check_param_list(
+                &m.params,
+                &format!("扩展函数 '{}'", m.name),
+                &globals,
+                true,
+                errors,
+            );
+        }
+    }
+    check_optional_param_contexts(program, errors);
+    // 5.3.1：调用处命名实参 / 位置实参检查。
+    check_call_arguments(program, errors);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9888,6 +10431,131 @@ main() {}"#,
         assert_invalid("class C {}\nextend C <: CType {}\nmain() {}");
         // 泛型约束 `where T <: CType` 合法，不应被误判。
         assert_valid("class D<T> where T <: CType {}\nmain() {}");
+    }
+
+    // ─── 5.1.2 / 5.3 形参声明与调用规则 ─────────────────────────────────────
+
+    #[test]
+    fn test_named_param_after_unnamed_accepted() {
+        // 5.1.2.1(2)：非命名形参位于命名形参之前合法。
+        assert_valid("func f(a: Int32, b!: Int32) {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_unnamed_param_after_named_rejected() {
+        // 5.1.2.1(2)：命名形参之后不能再出现非命名形参。
+        assert_invalid("func f(a!: Int32, b: Int32) {}\nmain() {}");
+        assert_invalid(
+            "class C {\n\
+             \x20   func m(a: Int32, b!: Int32, c: Bool) {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_default_param_must_be_named() {
+        // 5.1.2.2(3)：带默认值的形参必须是命名形参。
+        assert_valid("func f(a!: Int32 = 1) {}\nmain() {}");
+        assert_invalid("func f(a: Int32 = 1) {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_variadic_param_position() {
+        // 5.3.4(4)：变长形参必须是最后一个形参。
+        assert_valid("func f(a: Int32, b: Int32...) {}\nmain() {}");
+        assert_invalid("func f(a: Int32..., b: Int32) {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_param_missing_type_annotation_rejected() {
+        // 5.1.2.1：形参必须带类型标注，`name = expr` 缺类型非法。
+        assert_invalid("func f(a! = 1) {}\nmain() {}");
+        assert_valid("func f(a!: Int32 = 1) {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_named_wildcard_param_rejected() {
+        // 5.1.2.1：命名通配符形参 `_!` 非法；普通通配符形参合法。
+        assert_invalid("func f(_!: Int32) {}\nmain() {}");
+        assert_valid("func f(_: Int32) {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_default_value_static_scope() {
+        // 5.1.2.2(8)/(12)/(13)：默认值只能引用在其之前声明的形参。
+        assert_valid("func f(a: Int32, b!: Int32 = a) {}\nmain() {}");
+        assert_invalid("func f(a!: Int32 = b, b!: Int32) {}\nmain() {}");
+        // 自身引用同样非法。
+        assert_invalid("func f(a!: Int32 = a) {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_optional_param_forbidden_in_open_contexts() {
+        // 5.1.2.2(5)：接口函数（抽象或默认实现）与 open/abstract 类方法不能有可选参数。
+        assert_invalid("interface I { func f(a!: Int32 = 1): Int32 }\nmain() {}");
+        assert_invalid(
+            "interface I { func f(a!: Int32 = 1): Int32 { a } }\nmain() {}",
+        );
+        assert_invalid(
+            "open class C {\n\
+             \x20   open public func f(a!: Int32 = 1): Int32 { a }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 普通（非 open）类方法可以带可选参数。
+        assert_valid(
+            "class C {\n\
+             \x20   func f(a!: Int32 = 1): Int32 { a }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_optional_param_forbidden_in_operator_func() {
+        // 5.1.2.2(6)：运算符函数不能有可选参数。
+        assert_invalid(
+            "class C {\n\
+             \x20   operator func ==(a!: Int32 = 1) {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "class C {\n\
+             \x20   operator func ==(a!: Int32) {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_call_positional_overflow_rejected() {
+        // 5.3.1(4)：命名形参必须以 `名字:` 传入，多余位置实参非法。
+        assert_valid("func f(a: Int32, b!: Int32) {}\nmain() { f(1, b: 2) }");
+        assert_invalid("func f(a: Int32, b!: Int32) {}\nmain() { f(1, 2) }");
+    }
+
+    #[test]
+    fn test_call_named_argument_matching() {
+        // 5.3.1(1)/(3)：命名实参必须对应命名形参。
+        assert_valid("func f(a!: Int32) {}\nmain() { f(a: 1) }");
+        // 命名实参对应到非命名形参 → 非法。
+        assert_invalid("func f(a: Int32) {}\nmain() { f(a: 1) }");
+        // 不存在的形参名 → 非法。
+        assert_invalid("func f(a!: Int32) {}\nmain() { f(b: 1) }");
+        // 省略带默认值的命名实参合法。
+        assert_valid("func f(a!: Int32 = 1) {}\nmain() { f() }");
+    }
+
+    #[test]
+    fn test_call_in_macro_argument_not_semantically_checked() {
+        // 宏实参由宏自行解释（如 @PowerAssert），其中的调用不按普通调用检查。
+        assert_valid(
+            "func f(x: Unit) {}\n\
+             func g() { @PowerAssert(f(b = 2)) }\n\
+             main() {}\n",
+        );
     }
 
 }
