@@ -683,7 +683,7 @@ mod tests {
     }
 
     fn make_field(name: &str, ty: Type) -> FieldDef {
-        FieldDef { is_static: false, visibility: crate::ast::Visibility::Public, name: name.into(), ty, default: None, is_mut: true, decl_kw: true }
+        FieldDef { is_const: false, is_static: false, visibility: crate::ast::Visibility::Public, name: name.into(), ty, default: None, is_mut: true, decl_kw: true }
     }
 
     fn make_function(name: &str, params: Vec<Param>, return_type: Option<Type>, body: Vec<Stmt>) -> Function {

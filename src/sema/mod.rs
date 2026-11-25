@@ -511,6 +511,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
 
     // 声明层泛型检查：类型参数重名、约束左界必须是类型变量（9.1(4)/9.2(4)）。
     check_generic_declarations(program, &mut errors);
+    // 9.5.1.1(12)/(13)：值类型/枚举上界的递归约束非法（T <: S<T>）。
+    check_recursive_value_constraints(program, &mut errors);
 
     // 2.4.1(11)/(12)：类型别名之间不允许直接或间接的循环引用。
     check_type_alias_cycles(program, &mut errors);
@@ -610,6 +612,29 @@ struct ConstDeclCtx {
     const_globals: HashSet<String>,
     /// 顶层 let/var 变量名（不是常量表达式）。
     nonconst_globals: HashSet<String>,
+    /// 用户类型名 → 该类型的非 const 静态成员名集合（16.4(4)/(5)：const 函数/
+    /// const init 只能访问 const 的外部 static 成员）。
+    nonconst_static_members: HashMap<String, HashSet<String>>,
+}
+
+/// 收集“非 const 静态成员”：`static let`/`static var`（is_static 且非 is_const）。
+fn collect_nonconst_static_members(program: &Program) -> HashMap<String, HashSet<String>> {
+    let mut m: HashMap<String, HashSet<String>> = HashMap::new();
+    for c in &program.classes {
+        for f in &c.fields {
+            if f.is_static && !f.is_const {
+                m.entry(c.name.clone()).or_default().insert(f.name.clone());
+            }
+        }
+    }
+    for s in &program.structs {
+        for f in &s.fields {
+            if f.is_static && !f.is_const {
+                m.entry(s.name.clone()).or_default().insert(f.name.clone());
+            }
+        }
+    }
+    m
 }
 
 impl ConstDeclCtx {
@@ -666,6 +691,69 @@ impl ConstDeclCtx {
             Expr::Throw(_) | Expr::Return(_) | Expr::Break | Expr::Continue => false,
             // 其余形态保守放行（无法确定是非常量）。
             _ => true,
+        }
+    }
+}
+
+/// 16.5：子类定义 const init 时，其在用户程序内定义的父类也必须定义 const init。
+/// 父类未知（prelude/跨文件）时保守放行。
+fn check_const_init_parent_requirement(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut has_const_init: HashMap<&str, bool> = HashMap::new();
+    for c in &program.classes {
+        has_const_init.insert(
+            c.name.as_str(),
+            c.inits.iter().chain(c.init.iter()).any(|i| i.is_const),
+        );
+    }
+    for c in &program.classes {
+        let child_const = c.inits.iter().chain(c.init.iter()).any(|i| i.is_const);
+        if !child_const {
+            continue;
+        }
+        if let Some(parent) = &c.extends {
+            if let Some(&pconst) = has_const_init.get(parent.as_str()) {
+                if !pconst {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 定义了 const init，但其父类 '{}' 未定义 const init（16.5）",
+                            c.name, parent
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 16.1(2)/16.2：检查 class/struct 的 const 成员变量的初始值是否为常量表达式。
+fn check_const_field_initializers(
+    program: &Program,
+    ctx: &ConstDeclCtx,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut check = |owner: &str, f: &crate::ast::FieldDef| {
+        if !f.is_const {
+            return;
+        }
+        if let Some(def) = &f.default {
+            if !ctx.is_const(def) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "const 成员变量 '{}.{}' 的初始值必须是常量表达式（16.1(2)/16.2）",
+                        owner, f.name
+                    ),
+                });
+            }
+        }
+    };
+    for c in &program.classes {
+        for f in &c.fields {
+            check(&c.name, f);
+        }
+    }
+    for s in &program.structs {
+        for f in &s.fields {
+            check(&s.name, f);
         }
     }
 }
@@ -740,7 +828,13 @@ fn check_const_declarations(program: &Program, errors: &mut Vec<SemanticError>) 
         const_init_types,
         const_globals,
         nonconst_globals,
+        nonconst_static_members: collect_nonconst_static_members(program),
     };
+
+    // 16.1(2)/16.2：const 成员变量的初始值必须是常量表达式（非 const 函数调用等非法）。
+    check_const_field_initializers(program, &ctx, errors);
+    // 16.5：若子类定义 const init，则其（用户程序内定义的）父类也必须定义 const init。
+    check_const_init_parent_requirement(program, errors);
 
     for cls in &program.classes {
         let has_const_init = cls.inits.iter().chain(cls.init.iter()).any(|i| i.is_const);
@@ -904,9 +998,25 @@ fn const_fn_expr_ok(e: &Expr, locals: &HashSet<String>, ctx: &ConstDeclCtx) -> b
                 && named_args.iter().all(|(_, a)| const_fn_expr_ok(a, locals, ctx))
         }
         Expr::Range { .. } => false,
+        // 16.4(4)/(5)：const 函数/const init 只能访问 const 的外部 static 成员，
+        // 访问 `Type.staticLetOrVar` 非法。
+        Expr::Field { object, field } => {
+            if let Expr::Var(tn) = object.as_ref() {
+                if !locals.contains(tn)
+                    && !ctx.const_globals.contains(tn)
+                    && !ctx.nonconst_globals.contains(tn)
+                {
+                    if let Some(set) = ctx.nonconst_static_members.get(tn) {
+                        if set.contains(field) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            const_fn_expr_ok(object, locals, ctx)
+        }
         Expr::Unary { expr, .. }
         | Expr::TupleIndex { object: expr, .. }
-        | Expr::Field { object: expr, .. }
         | Expr::OptionalChain { object: expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::Some(expr)
@@ -1053,6 +1163,14 @@ fn const_init_body_ok(
                     crate::ast::AssignTarget::Field { object, field } => {
                         object != "this" && static_fields.contains(field)
                     }
+                    // 16.5：元组解构赋值左值含 static 成员亦非法，如 (v1, v2) = (1, 2)。
+                    crate::ast::AssignTarget::Tuple(targets) => targets.iter().any(|t| match t {
+                        crate::ast::AssignTarget::Var(n) => static_fields.contains(n),
+                        crate::ast::AssignTarget::Field { object, field } => {
+                            object != "this" && static_fields.contains(field)
+                        }
+                        _ => false,
+                    }),
                     _ => false,
                 };
                 if hits_static {
@@ -1186,6 +1304,7 @@ fn check_const_function_bodies(program: &Program, errors: &mut Vec<SemanticError
         const_init_types,
         const_globals,
         nonconst_globals,
+        nonconst_static_members: collect_nonconst_static_members(program),
     };
 
     // 16.5：const init 体限制（不允许 var、循环、非 const 表达式与 static 成员赋值）。
@@ -9129,6 +9248,73 @@ fn check_type_alias_cycles(program: &Program, errors: &mut Vec<SemanticError>) {
 /// 声明层泛型检查：类型参数不得重名（9.1(4)）；约束左界必须是已声明的类型变量
 /// （9.2(4)）。`struct S <: I` / `enum E <: I` 会把自身类型名作为约束左界，
 /// 属于语法层面的父类型编码，需放行。
+/// 类型 `t` 是否直接或间接引用类型参数 `p`。
+fn type_mentions_param(t: &Type, p: &str) -> bool {
+    match t {
+        Type::TypeParam(n) => n == p,
+        Type::Array(inner) | Type::Option(inner) | Type::Slice(inner) => {
+            type_mentions_param(inner, p)
+        }
+        Type::Struct(_, args) => args.iter().any(|a| type_mentions_param(a, p)),
+        Type::Tuple(ts) => ts.iter().any(|a| type_mentions_param(a, p)),
+        Type::Map(k, v) => type_mentions_param(k, p) || type_mentions_param(v, p),
+        Type::Result(a, b) => type_mentions_param(a, p) || type_mentions_param(b, p),
+        Type::Function { params, ret } => {
+            params.iter().any(|a| type_mentions_param(a, p))
+                || ret.as_ref().as_ref().map_or(false, |r| type_mentions_param(r, p))
+        }
+        _ => false,
+    }
+}
+
+/// 9.5.1.1(12)/(13)：当类型变量的上界是值类型（struct/enum，含 Option/Result）时，
+/// 不允许递归约束（上界实参直接/间接依赖该类型变量本身），如 `T <: S<T>`。
+/// 接口/类上界保守放行（是否递归依赖继承关系，无法据此判定）。
+fn check_recursive_value_constraints(program: &Program, errors: &mut Vec<SemanticError>) {
+    let struct_names: HashSet<&str> = program.structs.iter().map(|s| s.name.as_str()).collect();
+    let enum_names: HashSet<&str> = program.enums.iter().map(|e| e.name.as_str()).collect();
+    let is_value_bound = |b: &str| {
+        struct_names.contains(b)
+            || enum_names.contains(b)
+            || b == "Option"
+            || b == "Result"
+    };
+    let mut check = |owner: &str, constraints: &[TypeConstraint]| {
+        for c in constraints {
+            for (i, b) in c.bounds.iter().enumerate() {
+                if !is_value_bound(b) {
+                    continue;
+                }
+                if let Some(args) = c.bound_args.get(i) {
+                    if args.iter().any(|t| type_mentions_param(t, &c.param)) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "泛型约束左侧类型变量 '{}' 出现在其上界 '{}' 的类型实参中，构成递归约束（9.5.1.1(12)）：{}",
+                                c.param, b, owner
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    };
+    for cls in &program.classes {
+        check(&cls.name, &cls.constraints);
+        for m in &cls.methods {
+            check(&m.func.name, &m.func.constraints);
+        }
+    }
+    for st in &program.structs {
+        check(&st.name, &st.constraints);
+    }
+    for en in &program.enums {
+        check(&en.name, &en.constraints);
+    }
+    for f in &program.functions {
+        check(&f.name, &f.constraints);
+    }
+}
+
 fn check_generic_declarations(program: &Program, errors: &mut Vec<SemanticError>) {
     fn check_dup(owner: &str, tps: &[String], errors: &mut Vec<SemanticError>) {
         let mut seen: HashSet<&str> = HashSet::new();
@@ -21447,6 +21633,66 @@ main() {}"#,
         assert_valid(
             "extend Float16 { public operator func &(x: Unit) { 1.0f16 } }\nmain() { var a = 1.0f16; a &= () }",
         );
+    }
+
+    // ─── w16b: 16 章常量求值（成员 const / const 函数 / const init） ──────────
+
+    #[test]
+    fn test_w16b_const_field_nonconst_initializer_rejected() {
+        // 16.1(2)：const 成员变量用非 const 函数调用初始化非法。
+        assert_invalid("func f() { 1 }\nclass C { static const a = f() }\nmain() {}");
+        assert_invalid("func f() { 1 }\nstruct S { const a = f()\n const init() { } }\nmain() {}");
+        // 常量字面量初始化合法。
+        assert_valid("class C { static const a = 1 }\nmain() {}");
+        assert_valid("struct S { const a = 2\n const init() { } }\nmain() {}");
+    }
+
+    #[test]
+    fn test_w16b_const_fn_access_nonconst_static_member_rejected() {
+        // 16.4(4)/(5)：const 函数/const init 只能访问 const 的外部 static 成员。
+        assert_invalid("class Aux { static let x = 0 }\nconst func f() { Aux.x }\nmain() {}");
+        assert_invalid("class Aux { static var x = 0 }\nconst func f() { Aux.x }\nmain() {}");
+        assert_invalid(
+            "class Aux { static let x = 0 }\nstruct S { const init() { Aux.x } }\nmain() {}",
+        );
+        // 访问 const 静态成员合法。
+        assert_valid("class Aux { static const x = 0 }\nconst func f() { Aux.x }\nmain() {}");
+    }
+
+    #[test]
+    fn test_w16b_const_init_parent_requirement() {
+        // 16.5：子类有 const init 时父类也须有 const init。
+        assert_invalid("open class A { }\nclass B <: A { const init() { } }\nmain() {}");
+        assert_valid(
+            "open class A { const init() { } }\nclass B <: A { const init() { } }\nmain() {}",
+        );
+        // 父类未知（prelude）保守放行。
+        assert_valid("class B <: Object { const init() { } }\nmain() {}");
+    }
+
+    #[test]
+    fn test_w16b_const_init_tuple_static_assign_rejected() {
+        // 16.5：const init 中元组解构赋值左值含 static 成员非法。
+        assert_invalid(
+            "struct S {\n static var v1 = 0\n static var v2 = 0\n const init() { (v1, v2) = (1, 2) }\n}\nmain() {}",
+        );
+    }
+
+    // ─── w16b: 09 章泛型递归约束 ─────────────────────────────────────────────
+
+    #[test]
+    fn test_w16b_recursive_value_constraint() {
+        // 9.5.1.1(12)/(13)：值类型/枚举上界的递归约束非法。
+        assert_invalid(
+            "struct S<T> { S(var x!: T) { }\n}\nclass G<T> where T <: S<T> {}\nmain() {}",
+        );
+        assert_invalid("class G<T> where T <: Option<T> {}\nmain() {}");
+        // 非递归实参合法。
+        assert_valid(
+            "struct S<T> { S(var x!: T) { }\n}\nclass G<T> where T <: S<Int64> {}\nmain() {}",
+        );
+        // 接口上界保守放行（不据此判定递归）。
+        assert_valid("interface I<T> {}\nclass G<T> where T <: I<T> {}\nmain() {}");
     }
 
 }

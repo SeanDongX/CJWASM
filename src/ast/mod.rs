@@ -462,6 +462,9 @@ pub struct FieldDef {
     /// 本方言兼容 `struct S { x: Int64 }` 这种无关键字的字面量构造形态，
     /// 此类字段不参与“隐式构造函数要求初始值”（2.1.10.2(44)）检查。
     pub decl_kw: bool,
+    /// 是否为 `const` 成员（16.1(2)/16.2）：须在定义处用常量表达式初始化，
+    /// 且不可作为赋值左值；const 函数/const init 只能访问 const 的外部 static 成员。
+    pub is_const: bool,
     /// 字段可见性（接口/结构体字段未标注时按 public 处理）。
     pub visibility: Visibility,
 }

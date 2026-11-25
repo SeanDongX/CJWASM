@@ -4157,8 +4157,10 @@ impl<'a> Checker<'a> {
                 }
                 match self.lookup(name) {
                     Some(v) => v.is_const,
-                    // 未知标识符（枚举变体/类型名/内建值）保守放行。
-                    None => true,
+                    // 16.2(6)/16.4(3)：引用一个已知的非 const 用户函数（函数名本身
+                    // 作为值）不是常量表达式。
+                    None => !(self.known_funcs.contains(name)
+                        && !self.const_funcs.contains(name)),
                 }
             }
             Expr::Unary { expr, .. } => self.is_const_expr(expr),
@@ -4333,11 +4335,13 @@ impl<'a> Checker<'a> {
     }
 
     /// 语句块是否只由常量声明/常量表达式组成（用于 const lambda / try 块，16.2）。
-    /// 局部 `let`/`var` 声明属于“声明”，按 a07 正例可出现在 const 函数/lambda 中。
+    /// 局部 `let`/`const` 声明按 a07 正例可出现在 const 函数/lambda 中；但 `var`
+    /// 声明不是常量表达式（16.4(7)），且 try 块内的 var 亦使其失去常量性。
     fn const_stmts_ok(&self, stmts: &[Stmt]) -> bool {
         stmts.iter().all(|s| match s {
             Stmt::Const { value, .. } => self.is_const_expr(value),
-            Stmt::Let { .. } | Stmt::Var { .. } | Stmt::LocalFunc(_) => true,
+            Stmt::Let { .. } | Stmt::LocalFunc(_) => true,
+            Stmt::Var { .. } => false,
             Stmt::Expr(e) => self.is_const_expr(e),
             Stmt::Return(Some(e)) => self.is_const_expr(e),
             Stmt::Return(None) => true,
@@ -10544,5 +10548,36 @@ mod tests {
         // 单范围切片仍合法。
         assert_ok("main() { var arr = [1,2,3]\n let s = arr[0..2]\n return }");
         assert_ok("main() { var arr = [1,2,3]\n let s = arr[..2]\n return }");
+    }
+
+    // ─── w16b: 16.1(2)/16.2 const 表达式判定 ─────────────────────────────────
+
+    #[test]
+    fn test_w16b_nonconst_function_reference_not_const_expr() {
+        // 16.2(6)/16.4(3)：引用非 const 函数名不是常量表达式。
+        assert_err("func f() { }\nmain() { const c = f\n return }", "常量表达式");
+        // 引用 const 函数名合法。
+        assert_ok("const func g() { }\nmain() { const c = g\n return }");
+    }
+
+    #[test]
+    fn test_w16b_var_in_const_lambda_rejected() {
+        // 16.4(7)：const lambda 内不能声明 var。
+        assert_err("main() { const f = { => var x = 0 }\n return }", "常量表达式");
+        // let/const 声明合法。
+        assert_ok("main() { const f = { => let x = 0 }\n return }");
+        assert_ok("main() { const f = { => const x = 0 }\n return }");
+    }
+
+    #[test]
+    fn test_w16b_var_in_const_try_block_rejected() {
+        // 16.2(11)：try 体内的 var 声明使其失去常量性。
+        assert_err(
+            "class E <: Exception { }\nmain() { const x = try { var a = 1 } catch (e: E) { }\n return }",
+            "常量表达式",
+        );
+        assert_ok(
+            "class E <: Exception { }\nmain() { const x = try { let a = 1 } catch (e: E) { }\n return }",
+        );
     }
 }

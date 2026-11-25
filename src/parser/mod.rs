@@ -4609,4 +4609,36 @@ mod tests {
         ));
     }
 
+    // ─── w16b: 16 章常量求值 / translationUnit 顺序 ──────────────────────────
+
+    #[test]
+    fn test_w16b_mut_const_func_rejected() {
+        assert!(parse_or_err(
+            "struct S {\n mut const func f() { }\n const init() { }\n}\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "struct S {\n const func f() { }\n const init() { }\n}\nmain() {}"
+        ));
+    }
+
+    #[test]
+    fn test_w16b_const_field_requires_initializer() {
+        assert!(parse_or_err("class C {\n static const a: Int64\n}\nmain() {}"));
+        assert!(parse_or_err("class C {\n const a: Int64\n}\nmain() {}"));
+        assert!(parse_or_err(
+            "struct S {\n const a: Int64\n const init() { }\n}\nmain() {}"
+        ));
+        assert!(!parse_or_err("class C {\n static const a: Int64 = 0\n}\nmain() {}"));
+        assert!(!parse_or_err(
+            "struct S {\n const a: Int64 = 0\n const init() { }\n}\nmain() {}"
+        ));
+    }
+
+    #[test]
+    fn test_w16b_import_must_precede_decls() {
+        assert!(parse_or_err("func foo() {}\nimport std.core.*\nmain() {}"));
+        assert!(parse_or_err("main() { }\nimport std.core.*"));
+        assert!(!parse_or_err("import std.core.*\nfunc foo() {}\nmain() {}"));
+    }
+
 }
