@@ -374,6 +374,13 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_function_param_rules(program, &mut errors);
     for cls in &program.classes {
         check_class(cls, &index, &mut errors);
+        // 6.1.1(4)：父类/接口必须是绑定到类型的有效引用。
+        check_supertype_declaration_kinds(cls, program, &index, &mut errors);
+        // 6.1.1.2(13)：子类不能通过 super.父类名() 访问父类主构造函数。
+        check_super_primary_ctor_access(cls, &index, &mut errors);
+        // 6.1.2.1(46)/(53)：父类没有可访问的无参构造函数时，子类构造函数
+        // （以及隐式构造函数）必须能显式调用 super(...)。
+        check_super_ctor_availability(cls, &index, &mut errors);
         check_ctor_param_order(cls, &mut errors);
         // 6.1.2.1(55)：构造函数返回前须初始化全部实例成员变量。
         check_ctor_definite_assignment(cls, &mut errors);
@@ -404,6 +411,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         // 6.1.2.1(56)：open/abstract 类构造函数不得调用实例成员函数/属性。
         check_open_class_ctor_member_calls(cls, &index, &mut errors);
     }
+    // 6.1.2.1(39)：类的全部构造函数均为 private 时，类外（含子类的 super()）不可调用。
+    check_private_ctor_access(program, &mut errors);
+    // 6.1.2.1(48)：没有显式构造函数的类不能存在未初始化的实例成员变量。
+    check_implicit_ctor_uninit_fields(program, &mut errors);
     for st in &program.structs {
         check_struct_interfaces(st, program, &index, &mut errors);
         // 6.3.3(1)：struct 成员不得遮蔽父接口同名成员。
@@ -4126,6 +4137,18 @@ fn check_member_modifiers(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
                 ),
             });
         }
+
+        // 6.1.2.4(12)：抽象成员函数不能带可选参数（有默认值的参数）。
+        if (m.is_abstract || implicitly_abstract_instance)
+            && m.func.params.iter().any(|p| p.default.is_some())
+        {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的抽象成员函数 '{}' 不能带可选参数（6.1.2.4(12)）",
+                    cls.name, m.func.name
+                ),
+            });
+        }
     }
 }
 
@@ -6327,6 +6350,371 @@ fn check_class_supertypes(
     }
 }
 
+/// 6.1.1(4)：`<:` 列表中的每个名字必须是合法的类型引用。
+///
+/// 保守实现：只拒绝本地可判定的明显错误形态——
+/// - 父类/接口位置出现 `Range`（范围类型不能作为父类/接口）；
+/// - 父类或接口位置出现绑定到顶层变量/函数的标识符；
+/// - 父类型的泛型实参是变量名/函数名/包名。
+/// 未在本地声明的名字（可能来自 import / 预置库）一律放行。
+fn check_supertype_declaration_kinds(
+    cls: &ClassDef,
+    program: &Program,
+    _index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let is_global_value_name = |n: &str| -> bool {
+        program.constants.iter().any(|c| c.name == n)
+            || program
+                .functions
+                .iter()
+                .any(|f| !f.name.contains('.') && !f.name.contains("::") && f.name == n)
+    };
+    if let Some(parent) = cls.extends.as_deref() {
+        if parent == "Range" {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 不能以范围类型作为父类（6.1.1(4)）",
+                    cls.name
+                ),
+            });
+        } else if is_global_value_name(parent) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的父类 '{}' 绑定到变量/函数而非类型（6.1.1(4)）",
+                    cls.name, parent
+                ),
+            });
+        }
+    }
+    for name in &cls.implements {
+        if name == "Range" {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 不能以范围类型作为接口（6.1.1(4)）",
+                    cls.name
+                ),
+            });
+        } else if is_global_value_name(name) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的接口 '{}' 绑定到变量/函数而非类型（6.1.1(4)）",
+                    cls.name, name
+                ),
+            });
+        }
+    }
+    // 6.1.1.2(6)：父类型的泛型实参必须是类型；变量名/函数名/包名均非法。
+    let package_name = program.package_name.as_deref();
+    for (_, args) in &cls.supertype_args {
+        for a in args {
+            let bad = match a {
+                Type::Struct(n, inner) if inner.is_empty() => {
+                    is_global_value_name(n) || package_name == Some(n.as_str())
+                }
+                Type::TypeParam(n) => is_global_value_name(n),
+                _ => false,
+            };
+            if bad {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的父类型泛型实参必须是类型，不能是变量/函数/包名（6.1.1.2(6)）",
+                        cls.name
+                    ),
+                });
+                break;
+            }
+        }
+    }
+}
+
+/// 6.1.1.2(13)：子类不能通过 `super.父类名()` 显式调用父类的主构造函数。
+///
+/// 主构造函数只能由 `super(...)` 隐式/显式调用来触发；写成 `super.ClassName()`
+/// 会被解析为 `SuperCall { method: "ClassName" }`，属于非法访问。
+/// 只有父类名在本地可解析时才判定，外部父类型保守放行。
+fn check_super_primary_ctor_access(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut ancestors: HashSet<&str> = HashSet::new();
+    let mut cur = cls.extends.as_deref();
+    let mut guard = 0usize;
+    while let Some(name) = cur {
+        if !ancestors.insert(name) {
+            break;
+        }
+        guard += 1;
+        if guard > 64 {
+            break;
+        }
+        cur = index.classes.get(name).and_then(|c| c.extends.as_deref());
+    }
+    if ancestors.is_empty() {
+        return;
+    }
+    let mut hit: Option<String> = None;
+    {
+        let mut scan = |e: &Expr| {
+            if hit.is_none() {
+                if let Expr::SuperCall { method, .. } = e {
+                    if ancestors.contains(method.as_str()) {
+                        hit = Some(method.clone());
+                    }
+                }
+            }
+        };
+        for m in &cls.methods {
+            walk_stmts(&m.func.body, &mut scan);
+        }
+        for init in &cls.inits {
+            walk_stmts(&init.body, &mut scan);
+        }
+        if let Some(d) = &cls.deinit {
+            walk_stmts(d, &mut scan);
+        }
+        if let Some(body) = &cls.static_init {
+            walk_stmts(body, &mut scan);
+        }
+        for f in &cls.fields {
+            if let Some(e) = &f.default {
+                walk_expr(e, &mut scan);
+            }
+        }
+    }
+    if let Some(name) = hit {
+        errors.push(SemanticError {
+            message: format!(
+                "类 '{}' 不能通过 'super.{}()' 访问父类的主构造函数（6.1.1.2(13)）",
+                cls.name, name
+            ),
+        });
+    }
+}
+
+/// 6.1.2.1(39)：当类的全部构造函数都是 `private` 时，类外不能实例化该类，
+/// 子类也不能通过 `super()` 调用其构造函数。只有本地可判定的情况才报错。
+fn check_private_ctor_access(program: &Program, errors: &mut Vec<SemanticError>) {
+    let all_private: HashSet<&str> = program
+        .classes
+        .iter()
+        .filter(|c| {
+            !c.inits.is_empty()
+                && c.inits
+                    .iter()
+                    .all(|i| matches!(i.visibility, Visibility::Private))
+        })
+        .map(|c| c.name.as_str())
+        .collect();
+    if all_private.is_empty() {
+        return;
+    }
+    let parents: HashMap<&str, &str> = program
+        .classes
+        .iter()
+        .filter_map(|c| c.extends.as_deref().map(|p| (c.name.as_str(), p)))
+        .collect();
+    let mut scan = |stmts: &[Stmt],
+                    cur: Option<&str>,
+                    parent: Option<&str>,
+                    errors: &mut Vec<SemanticError>| {
+        walk_stmts(stmts, &mut |e| match e {
+            Expr::Call { name, .. } | Expr::ConstructorCall { name, .. } => {
+                if all_private.contains(name.as_str()) && cur != Some(name.as_str()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的构造函数均为 private，不能在类外实例化（6.1.2.1(39)）",
+                            name
+                        ),
+                    });
+                }
+            }
+            Expr::SuperCall { method, .. } if method == "init" => {
+                if let Some(p) = parent {
+                    if all_private.contains(p) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "父类 '{}' 的构造函数均为 private，不能通过 super() 调用（6.1.2.1(39)）",
+                                p
+                            ),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        });
+    };
+    for f in &program.functions {
+        scan(&f.body, None, None, errors);
+    }
+    for c in &program.constants {
+        let one = [Stmt::Expr(c.init.clone())];
+        scan(&one, None, None, errors);
+    }
+    for cls in &program.classes {
+        let parent = parents.get(cls.name.as_str()).copied();
+        for m in &cls.methods {
+            scan(&m.func.body, Some(&cls.name), parent, errors);
+        }
+        for init in &cls.inits {
+            scan(&init.body, Some(&cls.name), parent, errors);
+        }
+        if let Some(d) = &cls.deinit {
+            scan(d, Some(&cls.name), parent, errors);
+        }
+        if let Some(si) = &cls.static_init {
+            scan(si, Some(&cls.name), parent, errors);
+        }
+        for f in &cls.fields {
+            if let Some(e) = &f.default {
+                let one = [Stmt::Expr(e.clone())];
+                scan(&one, Some(&cls.name), parent, errors);
+            }
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            scan(&f.body, None, None, errors);
+        }
+    }
+}
+
+/// 6.1.2.1(46)/(53)：若父类没有可访问的无参构造函数，子类的每个构造函数都必须
+/// 显式调用 `super(...)`（或通过 `this(...)` 委托给已调用 super 的构造函数）；
+/// 没有显式构造函数的子类使用隐式无参构造函数，同样要求父类有无参构造函数。
+///
+/// 只检查本地可解析的父类；父类无显式构造函数时视为存在隐式无参构造函数。
+fn check_super_ctor_availability(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let Some(parent_name) = cls.extends.as_deref() else {
+        return;
+    };
+    let Some(parent) = index.classes.get(parent_name) else {
+        return;
+    };
+    if parent.inits.is_empty() {
+        return;
+    }
+    // 无参可调用：形参为空，或全部形参都有默认值；且不是 private。
+    let callable_without_args = |init: &InitDef| -> bool {
+        !matches!(init.visibility, Visibility::Private)
+            && (init.params.is_empty() || init.params.iter().all(|p| p.default.is_some()))
+    };
+    if parent.inits.iter().any(callable_without_args) {
+        return;
+    }
+    let stmt_has_super_call = |stmts: &[Stmt]| -> bool {
+        let mut found = false;
+        walk_stmts(stmts, &mut |e| {
+            if let Expr::SuperCall { method, .. } = e {
+                if method == "init" {
+                    found = true;
+                }
+            }
+        });
+        found
+    };
+    let stmt_has_this_call = |stmts: &[Stmt]| -> bool {
+        let mut found = false;
+        walk_stmts(stmts, &mut |e| match e {
+            Expr::Call { name, .. } if name == "this" || name == "self" => found = true,
+            Expr::Invoke { callee, .. }
+                if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self") =>
+            {
+                found = true
+            }
+            _ => {}
+        });
+        found
+    };
+    let missing = if cls.inits.is_empty() {
+        true
+    } else {
+        cls.inits.iter().any(|init| {
+            !stmt_has_super_call(&init.body) && !stmt_has_this_call(&init.body)
+        })
+    };
+    if missing {
+        errors.push(SemanticError {
+            message: format!(
+                "父类 '{}' 没有可访问的无参构造函数，子类 '{}' 的构造函数必须显式调用 super(...)（6.1.2.1(46)/(53)）",
+                parent_name, cls.name
+            ),
+        });
+    }
+}
+
+/// 6.1.2.1(48)：没有显式构造函数的非抽象类，若存在没有初始值的实例成员变量，
+/// 隐式无参构造函数无法完成初始化，属于非法声明。
+///
+/// 保守处理：泛型类跳过；若该类型在本程序中以字面量构造 / 带实参实例化（即
+/// 项目方言的 `Rect { width: 1 }` 形态）则跳过，避免误伤方言用法。
+fn check_implicit_ctor_uninit_fields(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut instantiated: HashSet<String> = HashSet::new();
+    {
+        let mut collect = |stmts: &[Stmt]| {
+            walk_stmts(stmts, &mut |e| match e {
+                Expr::StructInit { name, .. }
+                | Expr::Call { name, .. }
+                | Expr::ConstructorCall { name, .. } => {
+                    instantiated.insert(name.clone());
+                }
+                _ => {}
+            });
+        };
+        for f in &program.functions {
+            collect(&f.body);
+        }
+        for c in &program.constants {
+            let one = [Stmt::Expr(c.init.clone())];
+            collect(&one);
+        }
+        for cls in &program.classes {
+            for m in &cls.methods {
+                collect(&m.func.body);
+            }
+            for i in &cls.inits {
+                collect(&i.body);
+            }
+            if let Some(d) = &cls.deinit {
+                collect(d);
+            }
+            if let Some(s) = &cls.static_init {
+                collect(s);
+            }
+            for f in &cls.fields {
+                if let Some(e) = &f.default {
+                    let one = [Stmt::Expr(e.clone())];
+                    collect(&one);
+                }
+            }
+        }
+    }
+    for cls in &program.classes {
+        if cls.is_abstract || !cls.type_params.is_empty() || !cls.inits.is_empty() {
+            continue;
+        }
+        if instantiated.contains(cls.name.as_str()) {
+            continue;
+        }        if let Some(f) = cls
+            .fields
+            .iter()
+            .find(|f| !f.is_static && f.default.is_none())
+        {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 没有显式构造函数，成员变量 '{}' 没有初始值（6.1.2.1(48)）",
+                    cls.name, f.name
+                ),
+            });
+        }
+    }
+}
+
 /// 扫描所有函数体，禁止实例化抽象类或接口。
 fn check_instantiation_targets(
     program: &Program,
@@ -6339,7 +6727,14 @@ fn check_instantiation_targets(
         .map(|c| c.name.as_str())
         .collect();
     let interfaces: HashSet<&str> = program.interfaces.iter().map(|i| i.name.as_str()).collect();
-    if abstract_classes.is_empty() && interfaces.is_empty() {
+    // 6.1.2.1(47)：没有显式构造函数的类只提供无参（隐式）构造函数。
+    let no_ctor_classes: HashSet<&str> = program
+        .classes
+        .iter()
+        .filter(|c| !c.is_abstract && c.inits.is_empty())
+        .map(|c| c.name.as_str())
+        .collect();
+    if abstract_classes.is_empty() && interfaces.is_empty() && no_ctor_classes.is_empty() {
         return;
     }
 
@@ -6374,6 +6769,7 @@ fn check_instantiation_targets(
     let mut ctx = InstantiationScan {
         abstract_classes,
         interfaces,
+        no_ctor_classes,
         shadowed,
         scopes: Vec::new(),
         errors,
@@ -6427,6 +6823,8 @@ fn check_instantiation_targets(
 struct InstantiationScan<'a, 'i> {
     abstract_classes: HashSet<&'a str>,
     interfaces: HashSet<&'a str>,
+    /// 没有显式构造函数（只有隐式无参构造函数）的类。
+    no_ctor_classes: HashSet<&'a str>,
     /// 可能与类型名重名的可调用/成员名（遮蔽时跳过实例化判定）。
     shadowed: HashSet<&'a str>,
     /// 局部作用域栈：记录参数、局部变量、局部函数等名字。
@@ -6595,11 +6993,28 @@ impl<'a, 'i> InstantiationScan<'a, 'i> {
         }
     }
 
+    fn check_implicit_ctor_args(&mut self, name: &str, args: &[Expr]) {
+        // 6.1.2.1(47)：没有显式构造函数的类只有隐式无参构造函数，
+        // 带实参的实例化必然无匹配构造函数。
+        if args.is_empty() || name.contains('.') || self.is_shadowed(name) {
+            return;
+        }
+        if self.no_ctor_classes.contains(name) {
+            self.errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 没有显式构造函数，只有隐式无参构造函数，不能用实参实例化（6.1.2.1(47)）",
+                    name
+                ),
+            });
+        }
+    }
+
     fn scan_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::Call { name, args, named_args, .. }
             | Expr::ConstructorCall { name, args, named_args, .. } => {
                 self.check_ctor_name(name);
+                self.check_implicit_ctor_args(name, args);
                 self.scan_exprs(args);
                 self.scan_named(named_args);
             }
@@ -10205,6 +10620,15 @@ fn check_this_type_usage(program: &Program, errors: &mut Vec<SemanticError>) {
                         errors,
                     );
                 }
+            }
+            // 6.1.4(1)：This 只能用作实例成员函数的返回类型，不能用作属性类型。
+            if is_property_method_name(&sig.name)
+                && m.func.return_type.as_ref().map_or(false, contains_this)
+            {
+                bad(
+                    &format!("类 '{}' 的属性 '{}' 的类型", cls.name, m.func.name),
+                    errors,
+                );
             }
             check_constraints(&m.func.constraints, &m.func.name, errors);
             for_each_type_in_stmts(&m.func.body, &mut |ty| {
@@ -16787,4 +17211,77 @@ main() {}"#,
         );
     }
 
+    // ─── w15a 06_class_and_interface/01_class ────────────────────────────────
+
+    #[test]
+    fn test_w15a_implicit_ctor_args() {
+        // 6.1.2.1(47)：没有显式构造函数的类只有隐式无参构造函数。
+        assert_invalid("class A {}\nmain() { let x = A(12) }");
+        assert_valid("class A {}\nmain() { let x = A() }");
+        assert_valid("class A {\n init(x: Int64) {}\n}\nmain() { let x = A(1) }");
+    }
+
+    #[test]
+    fn test_w15a_abstract_function_rules() {
+        // 6.1.2.4(12)：抽象函数不能带可选参数。
+        assert_invalid("abstract class A {\n public func f(x!: Int64 = 1): Unit\n}\nmain() {}");
+        assert_valid("abstract class A {\n public func f(x: Int64): Unit\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_two_class_supertypes() {
+        // 6.1.1.2(1) 在解析阶段校验（见 parser::decl 的测试）；此处验证
+        // “一个类 + 一个接口”不被误判。
+        assert_valid(
+            "interface I {}\nopen class A {}\nclass C <: A & I {}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w15a_super_primary_ctor_call() {
+        // 6.1.1.2(13)：不能通过 super.父类名() 访问父类主构造函数。
+        assert_invalid(
+            "open class A {\n A() {}\n}\nclass B <: A {\n func t() { super.A() }\n}\nmain() {}",
+        );
+        assert_valid("open class A {\n A() {}\n}\nclass B <: A {\n init() { super() }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_this_typed_property_rejected() {
+        // 6.1.4(1)：This 不能用作属性类型。
+        assert_invalid("class A {\n prop p: This {\n get() { this }\n }\n}\nmain() {}");
+        assert_valid("class A {\n func f(): This { this }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_private_ctor_access() {
+        // 6.1.2.1(39)：全部构造函数 private 时类外不可实例化。
+        assert_invalid("class A {\n private init() {}\n}\nmain() { let a = A() }");
+        assert_valid(
+            "class A {\n private init() {}\n static func make(): A { A() }\n}\nmain() {}",
+        );
+        // 子类也不能通过 super() 调用。
+        assert_invalid(
+            "open class A {\n private init() {}\n}\nclass B <: A {\n init() { super() }\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w15a_super_ctor_availability() {
+        // 6.1.2.1(46)/(53)：父类无可访问无参构造函数且子类未调用 super(...)。
+        assert_invalid(
+            "open class P {\n init(x: Int64) {}\n}\nclass C <: P {\n init() {}\n}\nmain() {}",
+        );
+        assert_invalid("open class P {\n init(x: Int64) {}\n}\nclass C <: P {}\nmain() {}");
+        assert_valid(
+            "open class P {\n init(x: Int64) {}\n}\nclass C <: P {\n init() { super(0) }\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w15a_generic_supertype_arg_must_be_type() {
+        // 6.1.1.2(6)：父类型泛型实参不能是变量名。
+        assert_invalid("var x = 1\nopen class A<T> {}\nclass B <: A<x> {}\nmain() {}");
+        assert_valid("open class A<T> {}\nclass B <: A<Int64> {}\nmain() {}");
+    }
 }
