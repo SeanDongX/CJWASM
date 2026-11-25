@@ -67,12 +67,29 @@ impl Parser {
     /// 解析语句列表
     pub(crate) fn parse_stmts(&mut self) -> Result<Vec<Stmt>, ParseErrorAt> {
         let mut stmts = Vec::new();
+        // 规范 4(1)：表达式由操作数+操作符组成；两个相邻表达式/语句之间
+        // 必须由 `;` 或换行分隔。同一行内直接相邻的语句非法。
+        let mut need_sep = false;
         while !self.check(&Token::RBrace) && self.peek().is_some() {
             if self.check(&Token::Semicolon) {
                 self.advance();
+                need_sep = false;
                 continue;
             }
+            // 下一 token 为 `{` 时存在“尾随 Lambda / 块表达式”歧义，不强制分隔符。
+            // 无 source（如部分单元测试）时无法判定换行，跳过检查。
+            if need_sep
+                && !self.source.is_empty()
+                && !self.newline_before_current()
+                && !self.check(&Token::LBrace)
+            {
+                return self.bail(ParseError::UnexpectedToken(
+                    self.peek().cloned().unwrap_or(Token::Semicolon),
+                    "语句之间缺少分隔符（`;` 或换行）".to_string(),
+                ));
+            }
             stmts.push(self.parse_stmt()?);
+            need_sep = true;
         }
         Ok(stmts)
     }
@@ -1100,5 +1117,23 @@ main() {
     (x, b) = (1, true)
 }
 "#);
+    }
+
+    // ==== w9b: 语句分隔（同/异行）====
+
+    #[test]
+    fn test_w9b_adjacent_statements_same_line_rejected() {
+        // 规范 4(1)：同一行内两个相邻表达式缺操作符/分隔符非法
+        assert!(parse_source("main() { 1 2 }").is_err());
+        assert!(parse_source("main() {\n    let a = 1\n    let b = 2 a b\n}").is_err());
+        assert!(parse_source("func f1(): Int64 { 0 }\nfunc f2(): Int64 { 1 }\nmain() { f1() f2() }").is_err());
+    }
+
+    #[test]
+    fn test_w9b_statements_separated_ok() {
+        // 换行分隔合法
+        ok("main() {\n    let a = 1\n    let b = 2\n    let c = a + b\n}");
+        // 分号分隔合法
+        ok("main() { let a = 1; let b = 2; let c = a + b }");
     }
 }

@@ -472,6 +472,14 @@ fn is_comparison_expr(e: &Expr) -> bool {
     matches!(e, Expr::Binary { op, .. } if is_comparison_op(op))
 }
 
+/// `return`/`break`/`continue` 不能作为（算术/比较/位/逻辑）二元或一元运算符的操作数
+/// （规范 4(1)：表达式须由操作数经操作符作用于其上；`i + return`、`- return` 等非法）。
+/// 注意：`throw e` 具有 Nothing 类型、可作为表达式操作数（如 `x ?? throw E()` 合法）；
+/// `??` 的右侧亦允许 `return`（如 `x ?? return ()`），故二者均不在此列。
+fn is_ctrl_transfer_expr(e: &Expr) -> bool {
+    matches!(e, Expr::Return(_) | Expr::Break | Expr::Continue)
+}
+
 /// 操作数是否“可静态确定”：变量、字面量、基础类型转换，以及由它们
 /// 直接构成的算术/位运算表达式。方法调用、lambda、`is`、字段访问等
 /// 形态返回 false，交由后续阶段处理。
@@ -2715,6 +2723,12 @@ impl<'a> Checker<'a> {
                 .unwrap_or(Ty::Unknown),
 
             Expr::Unary { op, expr } => {
+                if is_ctrl_transfer_expr(expr) {
+                    self.err(
+                        "一元运算符的操作数不能是控制转移表达式（return/break/continue）"
+                            .to_string(),
+                    );
+                }
                 // `-128i8` 由一元负号作用于 `128i8`：后者超出 i8 上界但整体合法，
                 // 因此在负号上下文按“取负后的值”做范围检查，并跳过内层检查。
                 if matches!(op, UnaryOp::Neg) {
@@ -2728,6 +2742,12 @@ impl<'a> Checker<'a> {
             }
 
             Expr::Binary { op, left, right } => {
+                if is_ctrl_transfer_expr(left) || is_ctrl_transfer_expr(right) {
+                    self.err(format!(
+                        "运算符 '{}' 的操作数不能是控制转移表达式（return/break/continue）",
+                        bin_symbol(op)
+                    ));
+                }
                 let lt = self.check_expr(left);
                 let rt = self.check_expr(right);
                 // 解析器把所有比较/相等运算符放在同一优先级左结合解析。
@@ -5072,4 +5092,25 @@ mod tests {
         assert_ok("class C {}\nmain() { var v: C = C()\n let x = !v }");
     }
 
+    // ==== w9b: 控制转移表达式不能作为运算符操作数（规范 4(1)）====
+
+    #[test]
+    fn test_w9b_ctrl_transfer_operand_rejected() {
+        // 反例：算术/比较/位运算的右操作数为 return
+        assert_err("main() { var i = 0\n let x = i + return }", "控制转移");
+        assert_err("main() { var i = 0\n let x = i * return }", "控制转移");
+        assert_err("main() { var i = 0\n let x = i == return }", "控制转移");
+        // 反例：一元操作数为 return
+        assert_err("main() { let x = -return }", "控制转移");
+        // 反例：左操作数为 break/continue
+        assert_err("main() {\n loop {\n let x = break + 1\n }\n}", "控制转移");
+    }
+
+    #[test]
+    fn test_w9b_ctrl_transfer_operand_positives() {
+        // 正例：普通二元运算
+        assert_ok("main() { var i = 1\n let x = i + 2\n let y = i * 3 }");
+        // 正例：`??` 的右侧允许 return（Nothing 类型可作为表达式操作数）
+        assert_ok("main() { var o: Option<Int64> = None\n let x = o ?? return 0 }");
+    }
 }
