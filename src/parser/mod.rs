@@ -38,6 +38,8 @@ pub struct Parser {
     last_attr_c: bool,
     /// 顶层声明是否带 `@C`（由属性跳过逻辑置位，供声明分派消费）。
     pending_c_decl: bool,
+    /// 是否刚跳过了 `@attribute`（供类声明保守豁免 ctor 签名重复等检查）。
+    pending_decl_attr: bool,
     /// 本文件中带 `@C` 的结构体名（用于字段 CType 约束校验）。
     c_structs: std::collections::HashSet<String>,
     /// `@C` 结构体中显式书写 `Array<T>` 的字段 `(结构体名, 字段名)`。
@@ -71,6 +73,7 @@ impl Parser {
             in_static_method: false,
             last_attr_c: false,
             pending_c_decl: false,
+            pending_decl_attr: false,
             c_structs: std::collections::HashSet::new(),
             c_struct_explicit_array_fields: Vec::new(),
             in_extern_params: false,
@@ -535,6 +538,9 @@ impl Parser {
         use crate::lexer::StringOrInterpolated;
         let mut should_skip_next = false;
         self.last_attr_c = false;
+        if self.check(&Token::At) {
+            self.pending_decl_attr = true;
+        }
         while self.check(&Token::At) {
             self.advance(); // @
             let attr_name = match self.advance_ident() {

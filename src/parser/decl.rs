@@ -17,6 +17,8 @@ pub(crate) struct MemberModifiers {
     pub is_override: bool,
     /// 是否显式写了 `override` 关键字（`redef` 不计入）。
     pub has_override_kw: bool,
+    /// 是否显式写了 `redef` 关键字（用于拒绝 `redef override` 组合）。
+    pub has_redef_kw: bool,
     pub is_open: bool,
     pub is_abstract: bool,
     pub is_sealed: bool,
@@ -73,6 +75,7 @@ impl Parser {
                 Some(Token::Redef) => {
                     self.advance();
                     m.is_override = true;
+                    m.has_redef_kw = true;
                 }
                 Some(Token::Open) => {
                     self.advance();
@@ -382,6 +385,8 @@ impl Parser {
                     functions.push(f);
                 }
             } else {
+                // 本声明的属性标记（`@When`/`@Test` 等），供类声明保守豁免使用。
+                let decl_attr = std::mem::take(&mut self.pending_decl_attr);
                 match self.peek() {
                     Some(Token::Struct) => {
                         let sd = self.parse_struct_with_visibility(visibility, c_attr)?;
@@ -433,12 +438,17 @@ impl Parser {
                             }
                             interfaces.push(self.parse_interface_with_visibility(vis)?)
                         } else {
-                            classes.push(self.parse_class_body(
+                            // 类级属性（`@Test`/`@TestTemplate` 等）可能由宏处理，
+                            // 供类体内的保守豁免（ctor 签名重复）使用。
+                            self.pending_decl_attr = decl_attr;
+                            let cls = self.parse_class_body(
                                 vis,
                                 is_abstract,
                                 is_sealed,
                                 is_open,
-                            )?)
+                            )?;
+                            self.pending_decl_attr = false;
+                            classes.push(cls);
                         }
                     }
                     Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
@@ -1166,6 +1176,8 @@ impl Parser {
         let mut primary_seen = false;
         let mut primary_ctor_visibility = Visibility::Internal;
         let mut ctor_sigs: Vec<Vec<Type>> = Vec::new();
+        // 静态初始化器函数体（延迟到字段表完整后校验 6.1.2.2 系列规则）。
+        let mut static_init_bodies: Vec<Vec<Stmt>> = Vec::new();
 
         while !self.check(&Token::RBrace) {
             // 容忍成员声明后的多余分号（如 `init(...) {...};`）
@@ -1396,6 +1408,26 @@ impl Parser {
                 // static init 是静态初始化器，不是构造函数（不入 inits），
                 // 且其中不能通过 this(...) 调用构造函数（2.1.10.2(39)）。
                 if mods.is_static {
+                    // 6.1.2.2(29)：static init 不能带可访问性修饰符。
+                    if matches!(
+                        &mods.visibility,
+                        Some(Visibility::Public)
+                            | Some(Visibility::Private)
+                            | Some(Visibility::Protected)
+                    ) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Init,
+                            "static 初始化器不能声明可访问性修饰符（6.1.2.2(29)）".to_string(),
+                        ));
+                    }
+                    // 6.1.2.2(22)：结构体 static init 不能带参数。
+                    if !params.is_empty() {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Init,
+                            "结构体 static 初始化器不能带参数（6.1.2.2(22)）".to_string(),
+                        ));
+                    }
+                    static_init_bodies.push(body.clone());
                     let calls_this = body.iter().any(|s| {
                         matches!(
                             s,
@@ -1668,6 +1700,11 @@ impl Parser {
 
         self.expect(Token::RBrace)?;
         self.current_type_params = prev_params;
+
+        // 6.1.2.2：static 初始化器的重复/控制流/成员访问/初始化完整性。
+        if let Some(msg) = validate_static_init_blocks(&name, &fields, &static_init_bodies) {
+            return self.bail(ParseError::UnexpectedToken(Token::Init, msg));
+        }
 
         // 将 struct 内部方法存入 pending_methods，在解析完成后合并到 functions
         self.pending_struct_methods.extend(methods);
@@ -2938,6 +2975,8 @@ impl Parser {
         let mut inits: Vec<crate::ast::InitDef> = Vec::new();
         let mut deinit = None;
         let mut methods = Vec::new();
+        // 静态初始化器函数体（延迟到字段表完整后校验 6.1.2.2 系列规则）。
+        let mut static_init_bodies: Vec<Vec<Stmt>> = Vec::new();
         while !self.check(&Token::RBrace) {
             // 容忍成员声明后的多余分号（如 `init(...) {...};`）
             if self.check(&Token::Semicolon) {
@@ -2946,6 +2985,13 @@ impl Parser {
             }
             // 成员修饰符可任意顺序组合（public static var / static public var / ...）
             let mods = self.parse_member_modifiers();
+            // 6.1.2.4(44)：redef 与 override 是互斥的两种语义，不能同时书写。
+            if mods.has_redef_kw && mods.has_override_kw {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Redef,
+                    "redef 与 override 不能同时使用（6.1.2.4(44)）".to_string(),
+                ));
+            }
             let member_vis = mods.visibility.clone().unwrap_or_default();
             if self.check(&Token::Var) || self.check(&Token::Let) {
                 let field_is_mut = self.check(&Token::Var);
@@ -3025,12 +3071,25 @@ impl Parser {
                 }
                 if mods.is_static {
                     // static init() { ... } — 静态初始化块，编译为 ClassName.__static_init
+                    // 6.1.2.2(29)：static init 不能带可访问性修饰符。
+                    if matches!(
+                        &mods.visibility,
+                        Some(Visibility::Public)
+                            | Some(Visibility::Private)
+                            | Some(Visibility::Protected)
+                    ) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Init,
+                            "static 初始化器不能声明可访问性修饰符（6.1.2.2(29)）".to_string(),
+                        ));
+                    }
                     self.advance(); // consume init
                     self.expect(Token::LParen)?;
                     self.expect(Token::RParen)?;
                     self.expect(Token::LBrace)?;
                     let body = self.parse_stmts()?;
                     self.expect(Token::RBrace)?;
+                    static_init_bodies.push(body.clone());
                     methods.push(crate::ast::ClassMethod {
                         is_const: false,
                         func: Function {
@@ -3059,6 +3118,24 @@ impl Parser {
                 self.advance();
                 self.expect(Token::LParen)?;
                 let params = self.parse_params()?;
+                // 6.1.2.1(33)/(44)：init 构造函数必须与已有构造函数（含主构造函数）
+                // 构成重载——参数类型序列相同即签名冲突（参数名/命名/默认值/修饰符
+                // 均不影响签名）。带属性（@TestCase/@Bench 等宏）的类保守豁免。
+                if !self.pending_decl_attr
+                    && inits.iter().any(|prev| {
+                        prev.params.len() == params.len()
+                            && prev
+                                .params
+                                .iter()
+                                .zip(params.iter())
+                                .all(|(a, b)| a.ty == b.ty)
+                    })
+                {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Init,
+                        "构造函数签名重复（6.1.2.1(33)）".to_string(),
+                    ));
+                }
                 // 6.1.2.1(34)：init 构造函数不支持变长参数列表。
                 if params.iter().any(|p| p.variadic) {
                     return self.bail(ParseError::UnexpectedToken(
@@ -3148,6 +3225,13 @@ impl Parser {
                     return self.bail(ParseError::UnexpectedToken(
                         Token::Colon,
                         "finalizer 不能有返回类型".to_string(),
+                    ));
+                }
+                // 6.1.2.5(6)：一个类至多只能有一个 finalizer。
+                if deinit.is_some() {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Tilde,
+                        "类只能定义一个 finalizer（6.1.2.5(6)）".to_string(),
                     ));
                 }
                 self.expect(Token::LBrace)?;
@@ -3526,6 +3610,13 @@ impl Parser {
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
                 self.receiver_name = None;
+                // 6.1.2.1(24)：主构造函数不能通过 this(...) 调用自身或其它构造函数。
+                if stmts_call_this_ctor(&body) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Init,
+                        "主构造函数不能通过 this(...) 调用构造函数（6.1.2.1(24)）".to_string(),
+                    ));
+                }
                 let idef = crate::ast::InitDef {
                     is_const: mods.is_const,
                     visibility: mods.visibility.clone().unwrap_or(Visibility::Internal),
@@ -3882,6 +3973,15 @@ impl Parser {
                 class_def.init = Some(implicit);
             }
         }
+        // 6.1.2.2：static 初始化器的重复/控制流/成员访问/初始化完整性。
+        if let Some(msg) = validate_static_init_blocks(
+            &class_def.name,
+            &class_def.fields,
+            &static_init_bodies,
+        ) {
+            return self.bail(ParseError::UnexpectedToken(Token::Init, msg));
+        }
+        // 6.1.2.1(48) 由语义阶段校验（需要“是否存在按字面量/带参实例化”的全程序信息）。
         Ok(class_def)
     }
 
@@ -4290,6 +4390,508 @@ fn is_ctype_type(t: &Type) -> bool {
         Type::Qualified(segs) => segs.last().map_or(false, |s| s == "CType"),
         _ => false,
     }
+}
+
+// ─── 6.1.2.2 静态初始化器（static init）校验 ────────────────────────────────
+//
+// struct 的 static init 函数体在解析后即被丢弃，class 的 static init 也不进入
+// 语义阶段的统一遍历，因此可见性/参数/重复/控制流/成员访问等规则在此实现。
+// 所有检查都只覆盖官方测试明确给出的非法形态：涉及其它类型成员、跨类/跨文件
+// 信息不足的一律放行（宁可漏判不可误判）。
+
+/// 静态初始化器体内的顺序敏感事件（按语句出现顺序记录）。
+enum SiEvent {
+    /// 读取：`(限定类型名, 成员名)`；裸标识符时限定类型名为 None。
+    Read(Option<String>, String),
+    /// 赋值：`(限定类型名, 成员名)`；裸标识符时限定类型名为 None。
+    Assign(Option<String>, String),
+    /// `this.field` 形式的访问/赋值。
+    ThisField(String),
+    /// 体内声明的局部名（含 let/var/const 绑定与 for 循环变量）。
+    Local(String),
+}
+
+struct SiScan {
+    events: Vec<SiEvent>,
+    has_return: bool,
+    ctor_decl: bool,
+}
+
+fn si_scan_pattern_bindings(p: &crate::ast::Pattern, s: &mut SiScan) {    match p {
+        crate::ast::Pattern::Binding(n) => s.events.push(SiEvent::Local(n.clone())),
+        crate::ast::Pattern::Tuple(ps) | crate::ast::Pattern::Or(ps) => {
+            for q in ps {
+                si_scan_pattern_bindings(q, s);
+            }
+        }
+        crate::ast::Pattern::Struct { fields, .. } => {
+            for (_, q) in fields {
+                si_scan_pattern_bindings(q, s);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 表达式是否为本类构造函数调用 `this(...)`（或 `self(...)`）。
+fn expr_calls_this_ctor(e: &Expr) -> bool {
+    matches!(e, Expr::Call { name, .. } if name == "this" || name == "self")
+        || matches!(
+            e,
+            Expr::Invoke { callee, .. }
+                if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self")
+        )
+}
+
+/// 语句列表（含嵌套块/循环体，不含嵌套函数与 lambda）中是否出现 `this(...)` 调用。
+fn stmts_call_this_ctor(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Expr(e) => expr_calls_this_ctor(e),
+        Stmt::Assign { value, .. }
+        | Stmt::Let { value, .. }
+        | Stmt::Var { value, .. }
+        | Stmt::Const { value, .. } => expr_calls_this_ctor(value),
+        Stmt::While { body, .. }
+        | Stmt::WhileLet { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::UnsafeBlock { body } => stmts_call_this_ctor(body),
+        _ => false,
+    })
+}
+
+/// 实参是否为本方言对 `C() { }` 解析出的“空 lambda”形态。
+fn si_args_are_empty_lambda(args: &[Expr]) -> bool {
+    args.len() == 1
+        && matches!(
+            &args[0],
+            Expr::Lambda { params, body, .. }
+                if params.is_empty()
+                    && matches!(body.as_ref(), Expr::Block(stmts, None) if stmts.is_empty())
+        )
+}
+
+fn si_scan_target(t: &AssignTarget, type_name: &str, s: &mut SiScan) {
+    match t {
+        AssignTarget::Var(n) => s.events.push(SiEvent::Assign(None, n.clone())),
+        AssignTarget::Field { object, field } => {
+            if object == "this" {
+                s.events.push(SiEvent::ThisField(field.clone()));
+            } else {
+                s.events.push(SiEvent::Assign(Some(object.clone()), field.clone()));
+            }
+        }
+        AssignTarget::FieldPath { base, fields } => {
+            if let Some(f) = fields.first() {
+                if base == "this" {
+                    s.events.push(SiEvent::ThisField(f.clone()));
+                } else {
+                    s.events.push(SiEvent::Assign(Some(base.clone()), f.clone()));
+                }
+            }
+        }
+        AssignTarget::Index { array, index } => {
+            s.events.push(SiEvent::Read(None, array.clone()));
+            si_scan_expr(index, type_name, s);
+        }
+        AssignTarget::Tuple(ts) => {
+            for x in ts {
+                si_scan_target(x, type_name, s);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn si_scan_expr(e: &Expr, type_name: &str, s: &mut SiScan) {
+    match e {
+        Expr::Var(n) => s.events.push(SiEvent::Read(None, n.clone())),
+        Expr::Field { object, field } => match object.as_ref() {
+            Expr::Var(m) if m == "this" => s.events.push(SiEvent::ThisField(field.clone())),
+            Expr::Var(m) => s.events.push(SiEvent::Read(Some(m.clone()), field.clone())),
+            other => si_scan_expr(other, type_name, s),
+        },
+        // `C() { }` 在 static init 体内会被解析为「对本类类型的构造调用 + 空 lambda」，
+        // 对应官方非法的“static 初始化器中定义主构造函数”形态（6.1.2.2(3)）。
+        Expr::ConstructorCall { name, args, .. } | Expr::Call { name, args, .. }
+            if name == type_name && si_args_are_empty_lambda(args) =>
+        {
+            s.ctor_decl = true;
+        }
+        Expr::Call { args, named_args, .. }
+        | Expr::ConstructorCall { args, named_args, .. } => {
+            for a in args {
+                si_scan_expr(a, type_name, s);
+            }
+            for (_, a) in named_args {
+                si_scan_expr(a, type_name, s);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            si_scan_expr(object, type_name, s);
+            for a in args {
+                si_scan_expr(a, type_name, s);
+            }
+            for (_, a) in named_args {
+                si_scan_expr(a, type_name, s);
+            }
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            si_scan_expr(callee, type_name, s);
+            for a in args {
+                si_scan_expr(a, type_name, s);
+            }
+            for (_, a) in named_args {
+                si_scan_expr(a, type_name, s);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            si_scan_expr(left, type_name, s);
+            si_scan_expr(right, type_name, s);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsType { expr, .. }
+        | Expr::Try(expr)
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr) => si_scan_expr(expr, type_name, s),
+        Expr::Index { array, index } => {
+            si_scan_expr(array, type_name, s);
+            si_scan_expr(index, type_name, s);
+        }
+        Expr::SliceExpr {
+            array, start, end, ..
+        } => {
+            si_scan_expr(array, type_name, s);
+            si_scan_expr(start, type_name, s);
+            si_scan_expr(end, type_name, s);
+        }
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            si_scan_expr(start, type_name, s);
+            si_scan_expr(end, type_name, s);
+            if let Some(st) = step {
+                si_scan_expr(st, type_name, s);
+            }
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            si_scan_expr(cond, type_name, s);
+            si_scan_expr(then_branch, type_name, s);
+            if let Some(e) = else_branch {
+                si_scan_expr(e, type_name, s);
+            }
+        }
+        Expr::IfLet {
+            expr,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            si_scan_expr(expr, type_name, s);
+            si_scan_expr(then_branch, type_name, s);
+            if let Some(e) = else_branch {
+                si_scan_expr(e, type_name, s);
+            }
+        }
+        Expr::Block(stmts, tail) => {
+            si_scan_stmts(stmts, type_name, s);
+            if let Some(t) = tail {
+                si_scan_expr(t, type_name, s);
+            }
+        }
+        Expr::Tuple(items) | Expr::Array(items) => {
+            for it in items {
+                si_scan_expr(it, type_name, s);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            si_scan_expr(expr, type_name, s);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    si_scan_expr(g, type_name, s);
+                }
+                si_scan_expr(&arm.body, type_name, s);
+            }
+        }
+        Expr::TryBlock {
+            resources,
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            for (_, x) in resources {
+                si_scan_expr(x, type_name, s);
+            }
+            si_scan_stmts(body, type_name, s);
+            si_scan_stmts(catch_body, type_name, s);
+            if let Some(fb) = finally_body {
+                si_scan_stmts(fb, type_name, s);
+            }
+        }
+        Expr::Spawn { body } => si_scan_stmts(body, type_name, s),
+        Expr::Synchronized { lock, body } => {
+            si_scan_expr(lock, type_name, s);
+            si_scan_stmts(body, type_name, s);
+        }
+        Expr::NullCoalesce { option, default } => {
+            si_scan_expr(option, type_name, s);
+            si_scan_expr(default, type_name, s);
+        }
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(x) = p {
+                    si_scan_expr(x, type_name, s);
+                }
+            }
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                si_scan_expr(k, type_name, s);
+                si_scan_expr(v, type_name, s);
+            }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, v) in fields {
+                si_scan_expr(v, type_name, s);
+            }
+        }
+        Expr::TrailingClosure { callee, args, .. } => {
+            // 尾随闭包体是新的函数作用域，不扫描。
+            si_scan_expr(callee, type_name, s);
+            for a in args {
+                si_scan_expr(a, type_name, s);
+            }
+        }
+        // 嵌套 lambda：独立函数作用域，return/赋值不计入静态初始化器。
+        Expr::Lambda { .. } => {}
+        _ => {}
+    }
+}
+
+fn si_scan_stmts(stmts: &[Stmt], type_name: &str, s: &mut SiScan) {
+    let mut prev_self_call = false;
+    for st in stmts {
+        let prev = prev_self_call;
+        prev_self_call = false;
+        match st {
+            Stmt::Let { pattern, value, .. } | Stmt::Var { pattern, value, .. } => {
+                si_scan_pattern_bindings(pattern, s);
+                si_scan_expr(value, type_name, s);
+            }
+            Stmt::Const { name, value, .. } => {
+                s.events.push(SiEvent::Local(name.clone()));
+                si_scan_expr(value, type_name, s);
+            }
+            Stmt::Assign { target, value } => {
+                si_scan_target(target, type_name, s);
+                si_scan_expr(value, type_name, s);
+            }
+            Stmt::Expr(e) => {
+                // `C() { }` 在语句层是“主构造函数声明”的非法形态（6.1.2.2(3)）：
+                // 解析为「对本类类型的无参调用」紧跟一个块语句。
+                if prev {
+                    if let Expr::Block(..) = e {
+                        s.ctor_decl = true;
+                    }
+                }
+                prev_self_call = matches!(
+                    e,
+                    Expr::Call { name, args, named_args, .. }
+                        if name == type_name && args.is_empty() && named_args.is_empty()
+                );
+                si_scan_expr(e, type_name, s);
+            }
+            Stmt::Return(v) => {
+                s.has_return = true;
+                if let Some(e) = v {
+                    si_scan_expr(e, type_name, s);
+                }
+            }
+            Stmt::While { cond, body } => {
+                si_scan_expr(cond, type_name, s);
+                si_scan_stmts(body, type_name, s);
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                si_scan_expr(expr, type_name, s);
+                si_scan_stmts(body, type_name, s);
+            }
+            Stmt::DoWhile { body, cond } => {
+                si_scan_stmts(body, type_name, s);
+                si_scan_expr(cond, type_name, s);
+            }
+            Stmt::For {
+                var,
+                iterable,
+                body,
+            } => {
+                s.events.push(SiEvent::Local(var.clone()));
+                si_scan_expr(iterable, type_name, s);
+                si_scan_stmts(body, type_name, s);
+            }
+            Stmt::Loop { body } => si_scan_stmts(body, type_name, s),
+            Stmt::UnsafeBlock { body } => si_scan_stmts(body, type_name, s),
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                si_scan_expr(left, type_name, s);
+                si_scan_expr(right, type_name, s);
+            }
+            // 局部函数：独立函数作用域。
+            Stmt::LocalFunc(_) => {}
+            _ => {}
+        }
+    }
+}
+
+/// 校验类型的全部 static 初始化器（同一类型至多一个 `bodies` 项合法）。
+/// 返回第一个错误消息；无错误返回 None。
+fn validate_static_init_blocks(
+    type_name: &str,
+    fields: &[crate::ast::FieldDef],
+    bodies: &[Vec<Stmt>],
+) -> Option<String> {
+    if bodies.is_empty() {
+        return None;
+    }
+    // 6.1.2.2(6)：一个类型至多只能有一个 static 初始化器。
+    if bodies.len() > 1 {
+        return Some(format!(
+            "类型 '{}' 不能有多个 static 初始化器（6.1.2.2(6)）",
+            type_name
+        ));
+    }
+    let mut scan = SiScan {
+        events: Vec::new(),
+        has_return: false,
+        ctor_decl: false,
+    };
+    si_scan_stmts(&bodies[0], type_name, &mut scan);
+    // 6.1.2.2(23)：static 初始化器中不允许 return（带值/不带值均非法）。
+    if scan.has_return {
+        return Some(format!(
+            "类型 '{}' 的 static 初始化器中不允许 return（6.1.2.2(23)）",
+            type_name
+        ));
+    }
+    // 6.1.2.2(3)：static 初始化器中不能定义主构造函数。
+    if scan.ctor_decl {
+        return Some(format!(
+            "类型 '{}' 的 static 初始化器中不能定义主构造函数（6.1.2.2(3)）",
+            type_name
+        ));
+    }
+    let locals: std::collections::HashSet<&str> = scan
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            SiEvent::Local(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    let find = |n: &str| fields.iter().find(|f| f.name == n);
+    let mut initialized: std::collections::HashSet<&str> = fields
+        .iter()
+        .filter(|f| f.is_static && f.default.is_some())
+        .map(|f| f.name.as_str())
+        .collect();
+    let mut immutable_assigns: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for ev in &scan.events {
+        match ev {
+            SiEvent::ThisField(f) => {
+                return Some(format!(
+                    "类型 '{}' 的 static 初始化器中不能访问实例成员 'this.{}'（6.1.2.2(25)）",
+                    type_name, f
+                ));
+            }
+            SiEvent::Read(qual, n) => {
+                if let Some(q) = qual {
+                    // 其它类型（含父类）的成员：跨类信息在此不可得，保守放行。
+                    if q != type_name {
+                        continue;
+                    }
+                } else if locals.contains(n.as_str()) {
+                    continue;
+                }
+                if let Some(f) = find(n) {
+                    if !f.is_static {
+                        if qual.is_none() {
+                            return Some(format!(
+                                "类型 '{}' 的 static 初始化器中不能访问实例成员 '{}'（6.1.2.2(25)）",
+                                type_name, n
+                            ));
+                        }
+                    } else if f.default.is_none() && !initialized.contains(n.as_str()) {
+                        return Some(format!(
+                            "类型 '{}' 的 static 初始化器在初始化前读取静态成员 '{}'（6.1.2.2(25)）",
+                            type_name, n
+                        ));
+                    }
+                }
+            }
+            SiEvent::Assign(qual, n) => {
+                if let Some(q) = qual {
+                    if q != type_name {
+                        continue;
+                    }
+                }
+                if let Some(f) = find(n) {
+                    if !f.is_static {
+                        if qual.is_none() {
+                            return Some(format!(
+                                "类型 '{}' 的 static 初始化器中不能给实例成员 '{}' 赋值（6.1.2.2(25)）",
+                                type_name, n
+                            ));
+                        }
+                    } else if !f.is_mut {
+                        // 注：不可变静态成员“已有直接初始值又在 static init 中赋值”的
+                        // 6.1.2.2(19) 判定保留给语义阶段（类）处理，此处只拒绝重复赋值。
+                        let c = immutable_assigns.entry(f.name.as_str()).or_insert(0);
+                        *c += 1;
+                        if *c > 1 {
+                            return Some(format!(
+                                "类型 '{}' 的不可变静态成员 '{}' 不能在 static 初始化器中多次赋值（6.1.2.2(20)）",
+                                type_name, n
+                            ));
+                        }
+                    }
+                    initialized.insert(f.name.as_str());
+                }
+            }
+            SiEvent::Local(_) => {}
+        }
+    }
+    // 6.1.2.2(21)：存在 static 初始化器时，没有直接初始值的静态成员必须被赋值。
+    if let Some(f) = fields
+        .iter()
+        .find(|f| f.is_static && f.default.is_none() && !initialized.contains(f.name.as_str()))
+    {
+        return Some(format!(
+            "类型 '{}' 的静态成员变量 '{}' 既没有初始值，也没有在 static 初始化器中赋值（6.1.2.2(21)）",
+            type_name, f.name
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -4839,5 +5441,126 @@ main() {}
             .expect("plain struct tuple element should parse");
         parse_only("struct ABC { var x: Int32 = 0 }\nenum E { First(ABC) }\nmain() {}")
             .expect("plain struct enum payload should parse");
+    }
+
+    // ─── w15a 06_class_and_interface/01_class ────────────────────────────────
+
+    #[test]
+    fn test_w15a_static_init_visibility_rejected() {
+        // 6.1.2.2(29)：static init 不能带可访问性修饰符（class/abstract/generic/struct）。
+        err("class C {\n private static init() {}\n}\nmain() {}");
+        err("class C {\n public static init() {}\n}\nmain() {}");
+        err("class C {\n protected static init() {}\n}\nmain() {}");
+        err("abstract class A {\n private static init() {}\n}\nmain() {}");
+        err("class G<T> {\n public static init() {}\n}\nmain() {}");
+        err("struct S {\n public static init() {}\n}\nmain() {}");
+        // 正例：无修饰符的 static init。
+        ok("class C {\n static init() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_static_init_duplicate_rejected() {
+        // 6.1.2.2(6)：至多一个 static 初始化器。
+        err("class C {\n static init() {}\n static init() {}\n}\nmain() {}");
+        err("struct S {\n static init() {}\n static init() {}\n}\nmain() {}");
+        ok("class C {\n static init() {}\n init() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_static_init_return_rejected() {
+        // 6.1.2.2(23)：static init 中不允许 return（有值/无值均非法）。
+        err("class C {\n static init() { return }\n}\nmain() {}");
+        err("class C {\n static init() { return 1 }\n}\nmain() {}");
+        err("struct S {\n static init() { return }\n}\nmain() {}");
+        ok("class C {\n static init() { let f = { => 1 }\n f()\n }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_static_init_instance_access_rejected() {
+        // 6.1.2.2(25)：static init 中不能访问实例成员。
+        err("class C {\n let x = 1\n static init() { let y = x\n }\n}\nmain() {}");
+        err("class C {\n var x: Int64 = 0\n static init() { x = 1\n }\n}\nmain() {}");
+        err("class C {\n let x = 1\n static init() { let y = this.x\n }\n}\nmain() {}");
+        // 正例：通过局部对象访问实例成员是允许的。
+        ok("class C {\n var x: Int64 = 0\n static init() { let o = C()\n let y = o.x\n }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_static_init_uninitialized_static_rejected() {
+        // 6.1.2.2(21)：无初始值的静态成员必须由 static init 赋值。
+        err("class C {\n static let x: Int64\n static init() {}\n}\nmain() {}");
+        err("class C {\n static var x: Int64\n static init() {}\n}\nmain() {}");
+        err("struct S {\n static let x: Int64\n static init() {}\n}\nmain() {}");
+        ok("class C {\n static let x: Int64\n static init() { x = 1 }\n}\nmain() {}");
+        ok("class C {\n static let x = 1\n static init() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_static_init_immutable_assign_rejected() {
+        // 6.1.2.2(20)：不可变静态成员不能在 static init 中重复赋值。
+        err("class C {\n static let x: Int64\n static init() { x = 1\n x = 2 }\n}\nmain() {}");
+        ok("class C {\n static var x = 0\n static init() { x = 1 }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_static_init_primary_ctor_decl_rejected() {
+        // 6.1.2.2(3)：static init 中不能定义主构造函数形态 `C() { }`。
+        err("class C {\n static init() { C() { } }\n}\nmain() {}");
+        err("struct S {\n static init() { S() { } }\n}\nmain() {}");
+        ok("class C {\n static init() { let o = C() }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_static_init_read_before_init_rejected() {
+        // 6.1.2.2(25)：不能在本体内初始化前读取静态成员。
+        err("class C {\n static let a: Int64\n static var c: Int64\n static init() { C.c\n c = 1\n a = 1 }\n}\nmain() {}");
+        ok("class C {\n static let a: Int64\n static var c: Int64\n static init() { c = 1\n let y = C.c\n a = 1 }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_struct_static_init_params_rejected() {
+        // 6.1.2.2(22)/(3)：struct static init 不能带参数。
+        err("struct S {\n static init(x: Int64) {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_ctor_signature_duplicate_rejected() {
+        // 6.1.2.1(33)：次构造函数不得与主构造函数签名重复。
+        err("class A {\n A() {}\n init() {}\n}\nmain() {}");
+        err("class A {\n A(x: Int64) {}\n init(x: Int64) {}\n}\nmain() {}");
+        err("class A {\n A(private let x: Int64) {}\n init(x: Int64) {}\n}\nmain() {}");
+        err("class A {\n A(x: Int64) {}\n init(x!: Int64 = 1) {}\n}\nmain() {}");
+        err("class A {\n A(x: Int64) {}\n init(x: Int64) {}\n init(x: Int64) {}\n}\nmain() {}");
+        // 正例：不同参数类型的重载。
+        ok("class A {\n A(x: Int64) {}\n init(y: Bool) {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_redef_override_combined_rejected() {
+        // 6.1.2.4(44)：redef 与 override 不能同时书写。
+        err("open class P {\n public open func f() {}\n}\nclass C <: P {\n redef override public func f() {}\n}\nmain() {}");
+        err("open class P {\n public open func f() {}\n}\nclass C <: P {\n override redef public func f() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_primary_ctor_this_call_rejected() {
+        // 6.1.2.1(24)：主构造函数不能通过 this(...) 调用构造函数。
+        err("class A {\n A() { this() }\n}\nmain() {}");
+        err("class A {\n A() { this(15) }\n init(x: Int64) {}\n}\nmain() {}");
+        // 正例：次构造函数之间通过 this(...) 委托。
+        ok("class A {\n init() {}\n init(x: Int64) { this() }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_duplicate_finalizer_rejected() {
+        // 6.1.2.5(6)：一个类至多一个 finalizer。
+        err("class C {\n ~init() {}\n ~init() {}\n}\nmain() {}");
+        ok("class C {\n ~init() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w15a_ctor_signature_attr_class_exempt() {
+        // 带属性的类（unittest 宏）不参与 ctor 签名重复的严格检查。
+        ok("@Test\nclass Foo {\n @TestCase\n Foo() {}\n @Bench\n init() {}\n}\nmain() {}");
     }
 }
