@@ -455,6 +455,14 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 表达式/赋值类型检查：运算符操作数类型、可赋值性、不可变绑定等。
     expr_check::check_program(program, &mut errors);
 
+    // 4.5.4(6)/4.7(6)/(7)/(10)：break/continue 必须在（同一函数的）循环体内，
+    // return 必须在函数体内（不能出现在字段默认值 / 顶层初始化式 / 嵌套函数外）。
+    check_control_transfer_placement(program, &mut errors);
+
+    // 10.2.3(4)-(14)：运算符重载函数的参数个数须与运算符元数一致；
+    // `&&` / `||` 不支持重载。
+    check_operator_function_signatures(program, &mut errors);
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -10869,6 +10877,493 @@ fn check_function_param_rules(program: &Program, errors: &mut Vec<SemanticError>
     check_call_arguments(program, errors);
 }
 
+// ─── 4.5.4/4.7：控制转移表达式（break/continue/return）的上下文合法性 ────────
+//
+// 规范 4.5.4(6)/4.7(6)/(10)：break/continue 必须（词法上）直接位于同一函数的
+// 循环体内——出现在嵌套函数、lambda、顶层初始化式或字段默认值中均非法。
+// 规范 4.7(7)：return 必须位于函数体内（不能出现在字段默认值等位置）。
+//
+// 这里用一趟独立的只读遍历实现：跟踪“循环深度”与“是否在函数体内”。进入
+// 嵌套函数 / lambda 时重置循环深度（新函数上下文），其余控制结构（if/match/
+// try/unsafe/synchronized 等）不改变循环深度。throw 因官方测试自相矛盾
+// （@Description“允许”但 @Negative: yes）暂不校验。
+
+fn check_control_transfer_placement(program: &Program, errors: &mut Vec<SemanticError>) {
+    for f in &program.functions {
+        scan_ct_stmts(&f.body, 0, true, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan_ct_stmts(&init.body, 0, true, errors);
+        }
+        if let Some(d) = &c.deinit {
+            scan_ct_stmts(d, 0, true, errors);
+        }
+        if let Some(s) = &c.static_init {
+            scan_ct_stmts(s, 0, true, errors);
+        }
+        for m in &c.methods {
+            scan_ct_stmts(&m.func.body, 0, true, errors);
+        }
+        for fdef in &c.fields {
+            if let Some(d) = &fdef.default {
+                scan_ct_expr(d, 0, false, errors);
+            }
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan_ct_stmts(&init.body, 0, true, errors);
+        }
+        for fdef in &s.fields {
+            if let Some(d) = &fdef.default {
+                scan_ct_expr(d, 0, false, errors);
+            }
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(b) = &m.default_body {
+                scan_ct_stmts(b, 0, true, errors);
+            }
+        }
+    }
+    for en in &program.enums {
+        for p in &en.props {
+            if let Some(g) = &p.getter {
+                scan_ct_stmts(g, 0, true, errors);
+            }
+            if let Some((_, set_body)) = &p.setter {
+                scan_ct_stmts(set_body, 0, true, errors);
+            }
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan_ct_stmts(&m.body, 0, true, errors);
+        }
+    }
+    for c in &program.constants {
+        scan_ct_expr(&c.init, 0, false, errors);
+    }
+}
+
+fn scan_ct_stmts(
+    stmts: &[Stmt],
+    loop_depth: usize,
+    in_func: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::Break => {
+                if loop_depth == 0 {
+                    errors.push(SemanticError {
+                        message: "'break' 只能用于循环体内（4.5.4(6)/4.7(6)）".to_string(),
+                    });
+                }
+            }
+            Stmt::Continue => {
+                if loop_depth == 0 {
+                    errors.push(SemanticError {
+                        message: "'continue' 只能用于循环体内（4.7(6)）".to_string(),
+                    });
+                }
+            }
+            Stmt::Return(v) => {
+                if !in_func {
+                    errors.push(SemanticError {
+                        message: "'return' 只能用于函数体内（4.7(7)）".to_string(),
+                    });
+                }
+                if let Some(e) = v {
+                    scan_ct_expr(e, loop_depth, in_func, errors);
+                }
+            }
+            Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Const { value, .. } => {
+                scan_ct_expr(value, loop_depth, in_func, errors);
+            }
+            Stmt::Assign { target, value } => {
+                scan_ct_target(target, loop_depth, in_func, errors);
+                scan_ct_expr(value, loop_depth, in_func, errors);
+            }
+            Stmt::Expr(e) => scan_ct_expr(e, loop_depth, in_func, errors),
+            Stmt::While { cond, body } => {
+                scan_ct_expr(cond, loop_depth, in_func, errors);
+                scan_ct_stmts(body, loop_depth + 1, in_func, errors);
+            }
+            Stmt::DoWhile { body, cond } => {
+                scan_ct_stmts(body, loop_depth + 1, in_func, errors);
+                scan_ct_expr(cond, loop_depth, in_func, errors);
+            }
+            Stmt::Loop { body } => scan_ct_stmts(body, loop_depth + 1, in_func, errors),
+            Stmt::For {
+                iterable, body, ..
+            } => {
+                scan_ct_expr(iterable, loop_depth, in_func, errors);
+                scan_ct_stmts(body, loop_depth + 1, in_func, errors);
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                scan_ct_expr(expr, loop_depth, in_func, errors);
+                scan_ct_stmts(body, loop_depth + 1, in_func, errors);
+            }
+            Stmt::UnsafeBlock { body } => scan_ct_stmts(body, loop_depth, in_func, errors),
+            Stmt::LocalFunc(f) => scan_ct_stmts(&f.body, 0, true, errors),
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                scan_ct_expr(left, loop_depth, in_func, errors);
+                scan_ct_expr(right, loop_depth, in_func, errors);
+            }
+        }
+    }
+}
+
+fn scan_ct_target(
+    target: &AssignTarget,
+    loop_depth: usize,
+    in_func: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    match target {
+        AssignTarget::Index { index, .. } => scan_ct_expr(index, loop_depth, in_func, errors),
+        AssignTarget::IndexPath { index, .. } => scan_ct_expr(index, loop_depth, in_func, errors),
+        AssignTarget::ExprIndex { expr, index } => {
+            scan_ct_expr(expr, loop_depth, in_func, errors);
+            scan_ct_expr(index, loop_depth, in_func, errors);
+        }
+        AssignTarget::ExprField { object, .. } | AssignTarget::OptionalField { object, .. } => {
+            scan_ct_expr(object, loop_depth, in_func, errors)
+        }
+        AssignTarget::Slice {
+            array, start, end, ..
+        } => {
+            scan_ct_expr(array, loop_depth, in_func, errors);
+            scan_ct_expr(start, loop_depth, in_func, errors);
+            scan_ct_expr(end, loop_depth, in_func, errors);
+        }
+        AssignTarget::Tuple(ts) => {
+            for t in ts {
+                scan_ct_target(t, loop_depth, in_func, errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_ct_expr(
+    expr: &Expr,
+    loop_depth: usize,
+    in_func: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    match expr {
+        Expr::Break => {
+            if loop_depth == 0 {
+                errors.push(SemanticError {
+                    message: "'break' 只能用于循环体内（4.5.4(6)/4.7(6)）".to_string(),
+                });
+            }
+        }
+        Expr::Continue => {
+            if loop_depth == 0 {
+                errors.push(SemanticError {
+                    message: "'continue' 只能用于循环体内（4.7(6)）".to_string(),
+                });
+            }
+        }
+        Expr::Return(v) => {
+            if !in_func {
+                errors.push(SemanticError {
+                    message: "'return' 只能用于函数体内（4.7(7)）".to_string(),
+                });
+            }
+            if let Some(e) = v {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        // lambda 是独立函数上下文：循环深度重置，return 合法。
+        Expr::Lambda { body, .. } => scan_ct_expr(body, 0, true, errors),
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(e) = p {
+                    scan_ct_expr(e, loop_depth, in_func, errors);
+                }
+            }
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsType { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr) => scan_ct_expr(expr, loop_depth, in_func, errors),
+        Expr::Field { object, .. }
+        | Expr::OptionalChain { object, .. }
+        | Expr::TupleIndex { object, .. } => scan_ct_expr(object, loop_depth, in_func, errors),
+        Expr::VariantConst { arg, .. } => {
+            if let Some(a) = arg {
+                scan_ct_expr(a, loop_depth, in_func, errors);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            scan_ct_expr(left, loop_depth, in_func, errors);
+            scan_ct_expr(right, loop_depth, in_func, errors);
+        }
+        Expr::NullCoalesce { option, default } => {
+            scan_ct_expr(option, loop_depth, in_func, errors);
+            scan_ct_expr(default, loop_depth, in_func, errors);
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            scan_ct_expr(cond, loop_depth, in_func, errors);
+            scan_ct_expr(then_branch, loop_depth, in_func, errors);
+            if let Some(e) = else_branch {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        Expr::IfLet {
+            expr,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            scan_ct_expr(expr, loop_depth, in_func, errors);
+            scan_ct_expr(then_branch, loop_depth, in_func, errors);
+            if let Some(e) = else_branch {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        Expr::Block(stmts, tail) => {
+            scan_ct_stmts(stmts, loop_depth, in_func, errors);
+            if let Some(e) = tail {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        Expr::Tuple(es) | Expr::Array(es) => {
+            for e in es {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        Expr::Index { array, index } => {
+            scan_ct_expr(array, loop_depth, in_func, errors);
+            scan_ct_expr(index, loop_depth, in_func, errors);
+        }
+        Expr::SliceExpr { array, start, end } => {
+            scan_ct_expr(array, loop_depth, in_func, errors);
+            scan_ct_expr(start, loop_depth, in_func, errors);
+            scan_ct_expr(end, loop_depth, in_func, errors);
+        }
+        Expr::Range {
+            start,
+            end,
+            step,
+            ..
+        } => {
+            scan_ct_expr(start, loop_depth, in_func, errors);
+            scan_ct_expr(end, loop_depth, in_func, errors);
+            if let Some(s) = step {
+                scan_ct_expr(s, loop_depth, in_func, errors);
+            }
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        Expr::ConstructorCall {
+            args, named_args, ..
+        }
+        | Expr::Call {
+            args, named_args, ..
+        }
+        | Expr::SuperCall {
+            args, named_args, ..
+        } => {
+            for e in args {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+            for (_, e) in named_args {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            scan_ct_expr(object, loop_depth, in_func, errors);
+            for e in args {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+            for (_, e) in named_args {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            scan_ct_expr(expr, loop_depth, in_func, errors);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    scan_ct_expr(g, loop_depth, in_func, errors);
+                }
+                scan_ct_expr(&arm.body, loop_depth, in_func, errors);
+            }
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                scan_ct_expr(k, loop_depth, in_func, errors);
+                scan_ct_expr(v, loop_depth, in_func, errors);
+            }
+        }
+        Expr::TryBlock {
+            resources,
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            for (_, e) in resources {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+            scan_ct_stmts(body, loop_depth, in_func, errors);
+            scan_ct_stmts(catch_body, loop_depth, in_func, errors);
+            if let Some(f) = finally_body {
+                scan_ct_stmts(f, loop_depth, in_func, errors);
+            }
+        }
+        // spawn 创建独立并发上下文：循环深度重置。
+        Expr::Spawn { body } => scan_ct_stmts(body, 0, in_func, errors),
+        Expr::Synchronized { lock, body } => {
+            scan_ct_expr(lock, loop_depth, in_func, errors);
+            scan_ct_stmts(body, loop_depth, in_func, errors);
+        }
+        Expr::TrailingClosure {
+            callee,
+            args,
+            closure,
+        } => {
+            scan_ct_expr(callee, loop_depth, in_func, errors);
+            for e in args {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+            // 尾随闭包本身是一个 lambda 表达式，交给 Lambda 分支重置循环深度。
+            scan_ct_expr(closure, loop_depth, in_func, errors);
+        }
+        Expr::Invoke {
+            callee,
+            args,
+            named_args,
+        } => {
+            scan_ct_expr(callee, loop_depth, in_func, errors);
+            for e in args {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+            for (_, e) in named_args {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        Expr::Macro { args, .. } => {
+            for e in args {
+                scan_ct_expr(e, loop_depth, in_func, errors);
+            }
+        }
+        // 叶子节点。
+        Expr::Integer(_)
+        | Expr::IntegerSuffixed(_, _)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::Bool(_)
+        | Expr::Rune(_)
+        | Expr::String(_)
+        | Expr::Var(_)
+        | Expr::None
+        | Expr::SuperFieldAccess { .. } => {}
+    }
+}
+
+// ─── 10.2.3(4)-(14)：运算符重载函数的元数（参数个数）校验 ───────────────────
+
+fn check_operator_function_signatures(program: &Program, errors: &mut Vec<SemanticError>) {
+    fn check_one(name: &str, params: &[Param], errors: &mut Vec<SemanticError>) {
+        let last = name.rsplit('.').next().unwrap_or(name);
+        // 剥离隐式/显式接收者（this/self），只统计“操作数”形参。
+        let (ps, _, _) = split_receiver(params);
+        let arity = ps.len();
+        // (符号, 允许的参数个数)；空切片表示该运算符不可重载。
+        let (symbol, allowed): (&str, &[usize]) = match last {
+            "op_and" => ("&&", &[]),
+            "op_or" => ("||", &[]),
+            "op_not" => ("!", &[0]),
+            "op_bitnot" => ("~", &[0]),
+            // `-` 既可一元（0 参）也可二元（1 参）。
+            "op_sub" => ("-", &[0, 1]),
+            "op_add" => ("+", &[1]),
+            "op_mul" => ("*", &[1]),
+            "op_pow" => ("**", &[1]),
+            "op_div" => ("/", &[1]),
+            "op_mod" => ("%", &[1]),
+            "op_eq" => ("==", &[1]),
+            "op_ne" => ("!=", &[1]),
+            "op_lt" => ("<", &[1]),
+            "op_gt" => (">", &[1]),
+            "op_le" => ("<=", &[1]),
+            "op_ge" => (">=", &[1]),
+            "op_shl" => ("<<", &[1]),
+            "op_shr" => (">>", &[1]),
+            "op_bitand" => ("&", &[1]),
+            "op_bitor" => ("|", &[1]),
+            "op_bitxor" => ("^", &[1]),
+            // op_index / op_call 的形参规则另有约定，此处不校验。
+            _ => return,
+        };
+        if allowed.is_empty() {
+            errors.push(SemanticError {
+                message: format!("运算符 '{}' 不能被重载（10.2.3(14)）", symbol),
+            });
+            return;
+        }
+        if !allowed.contains(&arity) {
+            let need = allowed
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(" 或 ");
+            errors.push(SemanticError {
+                message: format!(
+                    "运算符函数 '{}' 的参数个数不合法：需要 {} 个（不含接收者），实际 {} 个（10.2.3）",
+                    symbol, need, arity
+                ),
+            });
+        }
+    }
+
+    for f in &program.functions {
+        check_one(&f.name, &f.params, errors);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            check_one(&m.func.name, &m.func.params, errors);
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            check_one(&m.name, &m.params, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            check_one(&m.name, &m.params, errors);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13592,6 +14087,58 @@ main() {}"#,
              struct S <: I { public func f(): Int8 { 1i8 } }\n\
              main() {}",
         );
+    }
+
+
+    // ─── w11d：04 章 4.5.4/4.7 控制转移表达式上下文 ──────────────────────────
+
+    #[test]
+    fn test_w11d_break_continue_require_loop() {
+        // 4.7(6)：break/continue 必须位于循环体内。
+        assert_invalid("main() {\n break\n return 0\n}");
+        assert_invalid("main() {\n continue\n return 0\n}");
+        assert_invalid("func f() {\n break\n}\nmain() { while (true) { f() } }");
+        // 嵌套函数 / lambda 中的 break 不能借用外层循环。
+        assert_invalid("main() {\n for (x in 1..10) {\n func inner() { break }\n inner()\n }\n}");
+        // 顶层/字段默认值中的 break 非法。
+        assert_invalid("var n = break\nmain() {}");
+        assert_invalid("class C {\n var n = break\n}\nmain() {}");
+        // 正例：循环体内、嵌套控制结构中的 break/continue 合法。
+        assert_valid("main() { for (x in 1..10) { if (x > 0) { break } } }");
+        assert_valid("main() { var i = 0; while (i < 10) { i++; if (i == 3) { continue } } }");
+        assert_valid("main() { loop { break } }");
+    }
+
+
+    #[test]
+    fn test_w11d_return_requires_function_body() {
+        // 4.7(7)：return 只能出现在函数体内（字段默认值非法）。
+        assert_invalid("class C {\n var n = return\n}\nmain() {}");
+        assert_invalid("struct S {\n var n = return\n}\nmain() {}");
+        // 正例：函数体 / lambda 内的 return。
+        assert_valid("func f(): Int64 { return 0 }\nmain() { f() }");
+        assert_valid("main() { let g = { => return }; g() }");
+    }
+
+
+    // ─── w11d：10 章 10.2.3(4)-(14) 运算符重载元数 ──────────────────────────
+
+    #[test]
+    fn test_w11d_operator_arity_rules() {
+        // 二元运算符必须恰有 1 个（非接收者）参数。
+        assert_invalid("class C {\n operator func >() { }\n}\nmain() {}");
+        assert_invalid("class C {\n operator func +() { }\n}\nmain() {}");
+        assert_invalid("class C {\n operator func **() { }\n}\nmain() {}");
+        // 一元运算符必须无参数。
+        assert_invalid("class C {\n operator func !(other: C) { }\n}\nmain() {}");
+        // `&&` / `||` 不支持重载。
+        assert_invalid("class C {\n operator func &&(other: C) { }\n}\nmain() {}");
+        assert_invalid("class C {\n operator func ||(other: C) { }\n}\nmain() {}");
+        // 正例：正确的元数；`-` 一元/二元均可；`[]`/`()` 不在此限。
+        assert_valid("class C {\n operator func >(other: C) { }\n}\nmain() {}");
+        assert_valid("class C {\n operator func !() { }\n}\nmain() {}");
+        assert_valid("class C {\n operator func -() { }\n operator func -(o: C) { }\n}\nmain() {}");
+        assert_valid("class C {\n operator func [](i: Int64) { }\n}\nmain() {}");
     }
 
 }

@@ -58,6 +58,7 @@ func testHashMap(): Int64 {
 struct Vec2 {
     var x: Int64;
     var y: Int64;
+    init(x: Int64, y: Int64) { this.x = x; this.y = y }
 }
 
 extend Vec2 {

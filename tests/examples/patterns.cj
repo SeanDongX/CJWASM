@@ -3,12 +3,14 @@
 struct Point {
     var x: Int64;
     var y: Int64
+    init(x: Int64, y: Int64) { this.x = x; this.y = y }
 }
 
 struct Rectangle {
     var topLeft: Point;
     var width: Int64;
     var height: Int64
+    init(topLeft: Point, width: Int64, height: Int64) { this.topLeft = topLeft; this.width = width; this.height = height }
 }
 
 // if-let 模式 (cjc: if (let x <- expr))

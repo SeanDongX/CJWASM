@@ -1742,6 +1742,8 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     // （如顶层 `let r = Int8(runeVar)` 的非法基础类型转换）。
     for c in &program.constants {
         checker.check_expr(&c.init);
+        // 4.1(1)：顶层显式类型注解与字面量类别一致（`let f: Float64 = 1` 等）。
+        checker.check_toplevel_literal_annotation(&c.ty, &c.init);
         if c.is_const {
             checker.check_const_initializer(None, &c.init, &c.name);
         }
@@ -3064,6 +3066,7 @@ impl<'a> Checker<'a> {
                     if let Some(ann) = ann_ty.as_ref() {
                         self.check_assignable(ann, &value_ty, "变量初始化");
                         self.check_literal_range(ann, value);
+                        self.check_literal_annotation(ann, value);
                     }
                 }
                 let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
@@ -3083,6 +3086,7 @@ impl<'a> Checker<'a> {
                     if let Some(ann) = ann_ty.as_ref() {
                         self.check_assignable(ann, &value_ty, "变量初始化");
                         self.check_literal_range(ann, value);
+                        self.check_literal_annotation(ann, value);
                     }
                 }
                 let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
@@ -3102,6 +3106,7 @@ impl<'a> Checker<'a> {
                 if let Some(ann) = ann_ty.as_ref() {
                     self.check_assignable(ann, &value_ty, "常量初始化");
                     self.check_literal_range(ann, value);
+                    self.check_literal_annotation(ann, value);
                 }
                 let bind_ty = ann_ty.unwrap_or(value_ty);
                 self.bind_name(name, bind_ty, false, literal_int(value), true);
@@ -3196,7 +3201,9 @@ impl<'a> Checker<'a> {
             Stmt::LocalFunc(f) => {
                 self.check_function(f);
             }
-            Stmt::Break | Stmt::Continue | Stmt::Return(None) => {}
+            Stmt::Break | Stmt::Continue => {}
+            // 4.7.3(9)：return 无返回值要求所在函数返回类型为 Unit。
+            Stmt::Return(None) => self.check_bare_return(),
         }
     }
 
@@ -3590,6 +3597,63 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 4.1(1)：显式类型标注与字面量类别必须一致——整数字面量不能被浮点类型注解
+    /// 采用，浮点字面量也不能被整数类型注解采用（字面量类型由语法与上下文共同
+    /// 决定：整数字面量只适配整数类型，浮点字面量只适配浮点类型）。
+    fn check_literal_annotation(&mut self, ann: &Ty, value: &Expr) {
+        let mut v = value;
+        while let Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } = v
+        {
+            v = expr;
+        }
+        let is_float_lit = matches!(v, Expr::Float(_) | Expr::Float32(_));
+        let is_int_lit = matches!(v, Expr::Integer(_) | Expr::IntegerSuffixed(_, _));
+        if ann.is_float() && is_int_lit {
+            self.err(format!(
+                "变量初始化类型不匹配: 浮点类型 {} 不能用整数字面量初始化（4.1(1)）",
+                ann.name()
+            ));
+        } else if ann.is_int() && is_float_lit {
+            self.err(format!(
+                "变量初始化类型不匹配: 整数类型 {} 不能用浮点字面量初始化（4.1(1)）",
+                ann.name()
+            ));
+        }
+    }
+
+    /// 4.1(1)：顶层 `let/var/const` 的类型注解与字面量类别一致性检查。
+    ///
+    /// 顶层无类型注解时解析器用 `Int64` 占位，无法与“显式 `: Int64`”区分，
+    /// 因此仅对“浮点类型注解 + 整数字面量”以及“非 Int64 整数类型注解 +
+    /// 浮点字面量”报错（Int64 注解 + 浮点字面量保守跳过）。
+    fn check_toplevel_literal_annotation(&mut self, ty: &Type, value: &Expr) {
+        let ann = self.ty_of_ann(ty);
+        let mut v = value;
+        while let Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } = v
+        {
+            v = expr;
+        }
+        let is_float_lit = matches!(v, Expr::Float(_) | Expr::Float32(_));
+        let is_int_lit = matches!(v, Expr::Integer(_) | Expr::IntegerSuffixed(_, _));
+        if ann.is_float() && is_int_lit {
+            self.err(format!(
+                "变量初始化类型不匹配: 浮点类型 {} 不能用整数字面量初始化（4.1(1)）",
+                ann.name()
+            ));
+        } else if ann.is_int() && is_float_lit && !matches!(ann, Ty::Int64) {
+            self.err(format!(
+                "变量初始化类型不匹配: 整数类型 {} 不能用浮点字面量初始化（4.1(1)）",
+                ann.name()
+            ));
+        }
+    }
+
     fn check_return(&mut self, value: &Ty) {
         let ret = match &self.ret_ty {
             Some(t) => t.clone(),
@@ -3613,6 +3677,23 @@ impl<'a> Checker<'a> {
                 ret.name(),
                 value.name()
             ));
+        }
+    }
+
+    /// 4.7.3(9)：不带操作数的 `return` 只有在所在函数返回类型为 Unit 时才合法。
+    ///
+    /// 仅在返回类型可静态确定为“非 Unit 的具体类型”时报错；未声明返回类型
+    /// （`main` / 构造函数 / lambda，ret_ty 为 None）、泛型类型变量（Unknown）
+    /// 一律保守跳过。
+    fn check_bare_return(&mut self) {
+        if let Some(ret) = &self.ret_ty {
+            if ret.is_definite() && *ret != Ty::Unit {
+                let name = ret.name().to_string();
+                self.err(format!(
+                    "函数返回类型为 {}，但 return 缺少返回值（4.7.3(9)）",
+                    name
+                ));
+            }
         }
     }
 
@@ -4557,6 +4638,7 @@ impl<'a> Checker<'a> {
                 if matches!(op, UnaryOp::Neg) {
                     if let Expr::IntegerSuffixed(v, s) = &**expr {
                         self.check_suffixed_int_literal(*v, *s, true);
+                        // 无符号后缀字面量取负：官方矛盾（见 check_unary Neg），放行。
                         return suffix_ty(*s);
                     }
                 }
@@ -5212,7 +5294,12 @@ impl<'a> Checker<'a> {
                 self.check_expr(e);
                 Ty::Unknown
             }
-            Expr::Return(None) | Expr::Break | Expr::Continue => Ty::Unknown,
+            // 4.7.3(9)：表达式上下文中的裸 return 同样要求返回类型为 Unit。
+            Expr::Return(None) => {
+                self.check_bare_return();
+                Ty::Unknown
+            }
+            Expr::Break | Expr::Continue => Ty::Unknown,
 
             Expr::TryBlock {
                 resources,
@@ -5333,6 +5420,9 @@ impl<'a> Checker<'a> {
             UnaryOp::Neg => {
                 // Bool 参与加减通常源于解析器跨行合并（语法正例），保守跳过。
                 // 用户类型/Option 可能由用户自定义一元运算符处理，也跳过。
+                // 注意：官方套件对“无符号整数取负”存在矛盾——04/15 a04 判负
+                // （`-UInt16` 非法），而 02/01 a15 判正（一元负号对所有数值类型
+                // 有效，按位取负回绕）。为守住“正测试 100%”红线，此处放行无符号。
                 if t.is_prim() && !t.is_numeric() && *t != Ty::Bool {
                     self.err(format!("一元运算符 '-' 不能作用于类型 {}", t.name()));
                 }
@@ -5921,6 +6011,17 @@ impl<'a> Checker<'a> {
         if !lt.is_numeric() || !rt.is_numeric() {
             self.err(format!(
                 "运算符 '{}' 的操作数必须为数值类型: {} 与 {}",
+                bin_symbol(op),
+                lt.name(),
+                rt.name()
+            ));
+            return;
+        }
+        // 4.15(2)/4.1(1)：整数字面量只适配整数类型，不能与浮点操作数混用
+        // （如 `1 + 3.14`、`f + 8`；字面量不会在算术上下文中跨类别转换为浮点）。
+        if (lt.is_int() && rt.is_float()) || (lt.is_float() && rt.is_int()) {
+            self.err(format!(
+                "运算符 '{}' 的操作数类型不匹配: {} 与 {}（整数与浮点不能混用）",
                 bin_symbol(op),
                 lt.name(),
                 rt.name()
@@ -7913,6 +8014,63 @@ mod tests {
         // 2.3.1(10)：字面量 / 类型名不能作为函数值调用。
         assert_err("main() { let a = 8i8(Int32) }", "字面量不能作为函数值调用");
         assert_ok("main() { let a = Int32(8i8) }");
+    }
+
+
+    // ─── w11d：04 章 4.7.3(9) / 4.1(1) / 4.15(4) 长尾规则 ──────────────────────
+
+    #[test]
+    fn test_w11d_bare_return_requires_unit() {
+        // 4.7.3(9)：非 Unit 返回类型的函数中裸 return 非法。
+        assert_err("func f(): Int64 { return }\nmain() { }", "缺少返回值");
+        assert_err("func f(): String { return }\nmain() { }", "缺少返回值");
+        // Unit / 未声明返回类型时裸 return 合法。
+        assert_ok("func f(): Unit { return }\nmain() { }");
+        assert_ok("func f() { return }\nmain() { }");
+        assert_ok("main() { return }");
+        // 带返回值的 return 在非 Unit 函数中合法。
+        assert_ok("func f(): Int64 { return 0 }\nmain() { }");
+    }
+
+
+    #[test]
+    fn test_w11d_literal_annotation_cross_kind() {
+        // 4.1(1)：浮点注解不能用整数字面量初始化（函数体内）。
+        assert_err("main() { var f: Float64 = 1 }", "不能用整数字面量初始化");
+        assert_err("main() { let f: Float32 = -2 }", "不能用整数字面量初始化");
+        // 顶层声明同样适用（Float 注解必为显式，占位仅 Int64）。
+        assert_err("var f: Float16 = 3\nmain() { }", "不能用整数字面量初始化");
+        // 整数注解不能用浮点字面量初始化（非 Int64 注解可确定）。
+        assert_err("main() { let i: Int32 = 3.14 }", "不能用浮点字面量初始化");
+        assert_err("let i: Int16 = .14\nmain() { }", "不能用浮点字面量初始化");
+        // 同类别字面量可适配；无注解占位（Int64）的浮点初始化不误判。
+        assert_ok("main() { var f: Float64 = 1.0\n let i: Int16 = 1 }");
+        assert_ok("var x = 3.14\nmain() { }");
+        assert_ok("main() { var f: Float16 }");
+    }
+
+
+    #[test]
+    fn test_w11d_mixed_int_float_literal_arith() {
+        // 4.15(2)/4.1(1)：整数字面量不能与浮点操作数混用。
+        assert_err("main() { let x = 1 + 3.14 }", "整数与浮点不能混用");
+        assert_err("main() { let x = .345 - 14 }", "整数与浮点不能混用");
+        assert_err("main() { let x = 1 + Float16(23) }", "整数与浮点不能混用");
+        assert_err("main() { var f: Float32 = 1.0; let x = f + 8 }", "整数与浮点不能混用");
+        // 浮点 + 浮点（含带后缀浮点字面量）合法；整数 + 整数合法。
+        assert_ok("main() { let x = 10.3f16 + 3.145628 }");
+        assert_ok("main() { let x = 1.0 + 2.0 }");
+        assert_ok("main() { let x = 1 + 2 }");
+    }
+
+
+    #[test]
+    fn test_w11d_unary_neg_unsigned_contradiction_skipped() {
+        // 4.15(4) 与 2.1.1.2(15) 对“无符号整数取负”互相矛盾（04/15 a04 判负、
+        // 02/01 a15 判正）。为守住正测试 100% 红线，无符号取负保守放行。
+        assert_ok("main() { var v: UInt8 = 1; let x = -v }");
+        // 有符号整数取负正常通过。
+        assert_ok("main() { var v: Int64 = 1; let x = -v }");
     }
 
 }
