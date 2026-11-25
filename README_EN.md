@@ -8,19 +8,42 @@ CJWasm compiles Cangjie source code into WASM bytecode: sources are parsed into 
 
 ## Project Status
 
-- ✅ **Coverage**: **80.15%** line coverage / 89.93% region coverage
-- ✅ **Tests**: 1,320 tests passing (675 unit + 631 integration + 14 stdlib)
+- ✅ **Official Conformance Suite**: overall **93.7%** (positive tests 5,132/5,132 = **100%**, negative tests 18,477/20,069 = **92.1%**)
+- ✅ **std API Suite**: **99.4%** (1,414/1,441; L1 **100%** / L2 99.3%, 99.8% excluding @Unittest cases)
+- ✅ **Tests**: 1,867 tests passing (1,222 unit + 631 integration + 14 stdlib)
 - ✅ **Examples**: 40/40 system tests passing (100%), 0 WASM validation errors
-- ✅ **Code Size**: ~64,700 lines of Rust including tests
-- ✅ **AST Nodes**: 91 nodes (Expr: 47, Stmt: 15, Pattern: 10, Type: 19)
+- ✅ **Code Size**: ~87,100 lines of Rust including tests
+- ✅ **AST Nodes**: 144 nodes (Expr: 68, Stmt: 19, Pattern: 15, Type: 42)
 - ✅ **CHIR Optimizer**: small-function inlining + redundant local elimination; 1.22x on wasmtime / ~1.7x on an interpreter for the heavy benchmark
-- ✅ **Completion**: ~98%
+
+## Official Test Suite Compatibility
+
+Compatibility is measured against the official Cangjie test suite (`third_party/cangjie_test`, a git submodule):
+
+| Suite | Scale | Pass criteria | Current |
+|------|------|----------|----------|
+| **Conformance compiler suite** | 29,705 test files across 17 spec chapters (25,201 executed after skipping 4,504 multi-file structural cases) | positive tests must compile; negative tests (`@Negative: yes`) must fail compilation | **93.7%** (positive **100%** / negative 92.1%) |
+| **std API suite** | 1,441 test files across 33 std modules (L1 + L2) | source files must be accepted by the compiler | **99.4%** (L1 **100%** / L2 99.3%) |
+
+During the full-compatibility sprint started on 2026-11-24, overall compatibility rose from a **49.1%** baseline (positive 60.1% / negative 46.3%) batch by batch:
+
+```
+49.1% ──▶ 65.1% ──▶ 79.3% ──▶ 91.2% ──▶ 92.6% ──▶ 93.7%
+baseline  batch 4   batch 7   batch 12  batch 13  batch 14
+```
+
+Red lines enforced on every merged batch: positive tests stay at 100%, std suite shows zero regression, all 1,867 cargo tests pass, and system tests stay at 40/40. The sprint runs a 4-agent parallel workflow (git-worktree isolated) implementing semantic checks in batches, with 30-minute heartbeat measurements.
+
+The remaining failing negative tests (1,592/20,069 ≈ 7.9%) fall into: contradiction groups inside the official suite itself (e.g. the 144-file chapter-13 pointer group whose positive and negative cases share identical sources, `String <<|` returning `Rune` yet annotated `@Negative: no`), interop cases requiring runtime C linking (ch. 13), metaprogramming/annotation cases requiring macro expansion (ch. 14/17), cases requiring cross-file package structure (ch. 11), and string-interpolation diagnostics requiring stronger intra-interpolation type inference (ch. 01).
+
+To reproduce the measurement: `git submodule update --init third_party/cangjie_test`, then compile every suite file with `target/release/cjwasm` — positive tests must succeed, negative tests must fail (non-zero exit).
 
 ## Features
 
 ### Core Language
 - **Complete type system**: Int8~Int64, UInt8~UInt64, Float16/32/64, Bool, Rune, String, Array, Tuple, Option, Result
-- **Object-oriented features**: structs, classes (including inheritance and abstract/sealed), interfaces with default implementations, properties (`prop`), extension methods (`extend`)
+- **Literal precision**: integer type suffixes (`i8`/`i16`/`i32`/`i64`/`u8`/`u16`/`u32`/`u64`), hexadecimal floats, nested block comments, UTF-8 escape whitelist
+- **Object-oriented features**: structs, classes (inheritance, abstract/sealed/open, primary constructors, multiple inits, static initializers), interfaces with default implementations and generic methods, properties (`prop`/`mut prop`), extension methods (`extend`)
 - **Generics**: generic functions, structs, classes, enums, constraints, multiple bounds, `where` clauses
 - **Pattern matching**: `match`, enum destructuring, struct destructuring, tuple destructuring, `if-let`, `while-let`, guards
 - **Error handling**: `try-catch-finally`, `throws`, `Result<T, E>` / `Option<T>`, `?`, null-coalescing `??`
@@ -34,6 +57,7 @@ CJWasm compiles Cangjie source code into WASM bytecode: sources are parsed into 
 - **String interpolation**: `"Hello, ${name}!"`
 - **Optional chaining**: `obj?.method()?.field`
 - **Conditional compilation**: `@When[os == "Windows"]`
+- **@C interoperability**: `@C` structs/foreign functions, `CFunc`/`CType` cross-language type rules (compile-time-checkable subset of ch. 13)
 
 ### Memory and Runtime
 - **Memory management**: free-list allocator + reference counting + mark-sweep GC
@@ -222,6 +246,8 @@ More examples are available under [`tests/examples/`](tests/examples/).
 
 ### Code Coverage
 
+> The figures below were measured on **2026-11-23, before the compatibility sprint** (64.7k lines / 1,320 tests at the time); they have not been re-measured after the sprint added ~22.5k lines of semantic checks (requires the `cargo-llvm-cov` toolchain).
+
 Total line coverage is **80.15%** and region coverage is **89.93%**.
 
 | Module | Line | Region |
@@ -244,32 +270,43 @@ Total line coverage is **80.15%** and region coverage is **89.93%**.
 ./scripts/coverage.sh --html
 ```
 
-### Unit and Integration Tests (1,320 Passing)
+### Unit and Integration Tests (1,867 Passing)
 
 ```bash
 cargo test
+# 1,222 passed (unit) + 631 passed (integration) + 14 passed (stdlib)
 ```
 
 | Category | Count | Notes |
 |------|--------|------|
-| **Lexing** | 229 | token recognition, keywords, operators |
-| **Parsing** | 190 | declarations, statements, expressions, types, patterns |
-| **Type checking** | 7 | symbol resolution, inference |
-| **Semantic analysis** | 36 | expression inference, function analysis |
-| **CHIR lowering** | ~65 | AST → CHIR |
-| **Code generation** | 42 | WASM generation, macro compilation |
-| **Monomorphization** | 12 | generic instantiation |
-| **Optimizer** | 36 | constant folding, DCE |
-| **Pipeline** | 35 | end-to-end compilation |
+| **Semantic analysis** | 384 | class/interface/member/constructor rules (230) + expression typing and operator rules (154) — the bulk of the compatibility sprint |
+| **Parsing** | 356 | declarations, statements, expressions, patterns (incl. property syntax, modifiers, @C retention) |
+| **CHIR lowering** | 161 | AST → CHIR expressions/statements, CHIR-level type inference |
+| **Code generation** | 91 | WASM generation, CHIR codegen, macro compilation |
+| **Lexing** | 74 | tokens, integer suffixes, hex floats, nested comments |
+| **Pipeline** | 57 | end-to-end compilation, cjpm project parsing |
+| **Optimizer/monomorph** | 41 | constant folding, DCE, generic instantiation |
 | **Metadata** | 31 | stdlib type metadata |
+| **Type checking** | 12 | symbol resolution, inference |
 | **Integration** | 631 | full source → WASM pipeline |
 | **Stdlib** | 14 | std module compile validation |
 
+### Official Suite Compatibility Tests
+
+`third_party/cangjie_test` (git submodule) provides two official suites:
+
+- **Conformance compiler suite** (29,705 files / 17 spec chapters): positive tests (5,132) must compile, negative tests (20,069) must fail compilation — currently **93.7%** (positive **100%**)
+- **std API suite** (1,441 files / 33 std modules): L1+L2 compile validation — currently **99.4%** (L1 **100%**)
+
+See the "Official Test Suite Compatibility" section above for methodology and sprint progress.
+
 ### Known Limitations
 
-1. **`std/` package WASM validation**: large packages with 97 stdlib files compile, but the generated WASM still has type mismatch issues during validation for complex nested generic types such as `Map<K, Tuple<Array<...>>>`.
-2. **Generic monomorphization**: some generic methods still use stubs instead of complete monomorphization.
-3. **Macro system**: macro expansion is still limited.
+1. **Official-suite contradictions and boundary categories** — about 340 of the remaining 1,592 negative tests belong to contradiction groups inside the official suite itself (the 144-file chapter-13 pointer group with identical positive/negative sources, the `String <<|` annotation contradiction), or require runtime C linking (ch. 13), macro expansion (ch. 14/17), or cross-file package structure (ch. 11) — not decidable by a single-file compilation frontend
+2. **String-interpolation deep diagnostics** — type errors inside interpolation expressions need stronger intra-interpolation inference (ch. 01, ~122 negative tests)
+3. **`std/` package WASM validation**: large packages with 97 stdlib files compile, but the generated WASM still has type mismatch issues during validation for complex nested generic types such as `Map<K, Tuple<Array<...>>>`.
+4. **Generic monomorphization**: some generic methods still use stubs instead of complete monomorphization.
+5. **Macro system**: macro expansion is still limited.
 
 ## Project Layout
 
@@ -354,6 +391,7 @@ Cangjie source (.cj)
 | **WASI** | println/print, time, random, sort, exit | ✅ |
 | **Testing** | `@Assert`, `@Expect`, single-argument boolean form, automatic type coercion | ✅ |
 | **External interfaces** | `extern func` + `@import("module", "name")` | ✅ |
+| **C interop** | `@C` structs/classes, foreign functions, `CFunc`/`CType` type rules, `@C` constructor rules (compile-time subset of ch. 13) | ✅ |
 
 For the full grammar, see [`docs/spec.md`](docs/spec.md).
 
@@ -428,10 +466,13 @@ Outputs:
 
 ```bash
 cargo build --release
-cargo test
+cargo test                       # 1,867 tests
 ./scripts/run_test.sh
 ./scripts/coverage.sh
 ./scripts/coverage.sh --html
+
+# Official suite compatibility (initialize the submodule first)
+git submodule update --init third_party/cangjie_test
 ```
 
 ### Dependencies
