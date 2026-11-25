@@ -476,10 +476,12 @@ impl Parser {
                     Some(Token::Main) => {
                         functions.push(self.parse_main_function(visibility)?);
                     }
-                    // cjc: const func — const 作为函数前缀（常量求值语义），本阶段按普通函数解析
+                    // cjc: const func — const 作为函数前缀（常量求值语义）
                     Some(Token::Const) if matches!(self.peek_next(), Some(Token::Func)) => {
                         self.advance(); // consume const
-                        functions.push(self.parse_function_with_visibility(visibility)?)
+                        let mut f = self.parse_function_with_visibility(visibility)?;
+                        f.is_const = true;
+                        functions.push(f)
                     }
                     // cjc: 顶层常量 let/var/const name: Type = expr
                     Some(Token::Let) | Some(Token::Var) | Some(Token::Const) => {
@@ -688,6 +690,7 @@ impl Parser {
     /// 支持元组解构：public let (a, b): (T1, T2) = expr
     pub(crate) fn parse_top_level_const(&mut self) -> Result<Vec<ConstDef>, ParseErrorAt> {
         let is_mut = matches!(self.peek(), Some(Token::Var)); // w4b: 可变性跟踪
+        let is_const = matches!(self.peek(), Some(Token::Const));
         self.advance(); // consume let/var/const
         // 元组解构声明：展开为多个常量（每个绑定取 TupleIndex）
         if self.check(&Token::LParen) {
@@ -726,6 +729,7 @@ impl Parser {
                         index: i as u32,
                     },
                     is_mut,
+                    is_const,
                 })
                 .collect());
         }
@@ -748,7 +752,13 @@ impl Parser {
         if self.check(&Token::Semicolon) {
             self.advance();
         }
-        Ok(vec![ConstDef { name, ty, init, is_mut }])
+        Ok(vec![ConstDef {
+            name,
+            ty,
+            init,
+            is_mut,
+            is_const,
+        }])
     }
 
     /// 解析 @import("module", "name") 属性（用于 extern func 前）
@@ -813,6 +823,7 @@ impl Parser {
             })
         });
         Ok(Function {
+            is_const: false,
             visibility,
             name,
             type_params: vec![],
@@ -1089,6 +1100,7 @@ impl Parser {
                 }
                 init_body.extend(primary_body);
                 inits.push(crate::ast::InitDef {
+                    is_const: false,
                     params: primary_params.clone(),
                     body: init_body,
                     member_param_flags: primary_member_flags.clone(),
@@ -1160,6 +1172,7 @@ impl Parser {
                 // init 构造函数参数均为普通参数（无成员变量参数）。
                 let member_flags = vec![false; params.len()];
                 let idef = crate::ast::InitDef {
+                    is_const: mods.is_const,
                     params,
                     body,
                     member_param_flags: member_flags,
@@ -1210,6 +1223,7 @@ impl Parser {
                         },
                     );
                 }
+                func.is_const = mods.is_const;
                 methods.push(func);
                 continue;
             }
@@ -1241,6 +1255,7 @@ impl Parser {
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
                             methods.push(crate::ast::Function {
+                                is_const: false,
                                 visibility: crate::ast::Visibility::Public,
                                 name: format!("{}.__get_{}", name, prop_name),
                                 type_params: vec![],
@@ -1279,6 +1294,7 @@ impl Parser {
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
                             methods.push(crate::ast::Function {
+                                is_const: false,
                                 visibility: crate::ast::Visibility::Public,
                                 name: format!("{}.__set_{}", name, prop_name),
                                 type_params: vec![],
@@ -1584,6 +1600,7 @@ impl Parser {
                         },
                     );
                 }
+                func.is_const = mods.is_const;
                 self.pending_struct_methods.push(func);
                 continue;
             }
@@ -2109,6 +2126,7 @@ impl Parser {
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
                             methods.push(Function {
+                                is_const: false,
                                 visibility: member_vis.clone(),
                                 name: format!("{}.__get_{}", target_type, prop_name),
                                 type_params: vec![],
@@ -2147,6 +2165,7 @@ impl Parser {
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
                             methods.push(Function {
+                                is_const: false,
                                 visibility: member_vis.clone(),
                                 name: format!("{}.__set_{}", target_type, prop_name),
                                 type_params: vec![],
@@ -2191,6 +2210,7 @@ impl Parser {
             let prev_receiver = self.receiver_name.clone();
             self.receiver_name = Some("this".to_string());
             let mut func = self.parse_function_with_visibility(member_vis)?;
+            func.is_const = mods.is_const;
             self.receiver_name = prev_receiver;
             // P3: 添加隐式 this 参数（如同 struct/class 方法）
             let has_self = func
@@ -2217,6 +2237,7 @@ impl Parser {
                 format!("{}.{}", target_type, func.name)
             };
             methods.push(Function {
+                is_const: func.is_const,
                 name: method_name,
                 ..func
             });
@@ -2498,6 +2519,7 @@ impl Parser {
                     methods.push(crate::ast::ClassMethod {
                         is_const: false,
                         func: Function {
+                            is_const: false,
                             visibility: member_vis.clone(),
                             name: format!("{}.__static_init", name),
                             type_params: vec![],
@@ -2548,6 +2570,7 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 self.receiver_name = None;
                 let idef = crate::ast::InitDef {
+                    is_const: mods.is_const,
                     params,
                     body,
                     member_param_flags: vec![],
@@ -2640,6 +2663,7 @@ impl Parser {
                         has_body: false,
                         is_const: false,
                         func: crate::ast::Function {
+                            is_const: false,
                             visibility: member_vis.clone(),
                             name: format!("{}.__get_{}", name, prop_name),
                             type_params: vec![],
@@ -2671,6 +2695,7 @@ impl Parser {
                             has_body: false,
                             is_const: false,
                             func: crate::ast::Function {
+                                is_const: false,
                                 visibility: member_vis.clone(),
                                 name: format!("{}.__set_{}", name, prop_name),
                                 type_params: vec![],
@@ -2712,6 +2737,7 @@ impl Parser {
                                 has_body: true,
                                 is_const: false,
                                 func: crate::ast::Function {
+                                    is_const: false,
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__get_{}", name, prop_name),
                                     type_params: vec![],
@@ -2760,6 +2786,7 @@ impl Parser {
                                 has_body: true,
                                 is_const: false,
                                 func: crate::ast::Function {
+                                    is_const: false,
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__set_{}", name, prop_name),
                                     type_params: vec![],
@@ -2885,6 +2912,7 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 self.receiver_name = None;
                 let idef = crate::ast::InitDef {
+                    is_const: mods.is_const,
                     params,
                     body,
                     member_param_flags,
@@ -3038,6 +3066,7 @@ impl Parser {
                     has_body,
                     is_const: mods.is_const,
                     func: crate::ast::Function {
+                        is_const: false,
                         visibility: member_vis,
                         name: m_name,
                         type_params,
@@ -3095,7 +3124,7 @@ impl Parser {
             } else if self.check(&Token::Const) {
                 self.advance(); // consume const
                 if self.check(&Token::Init) {
-                    // const init() { ... } — 编译期常量构造函数，按普通 init 处理
+                    // const init() { ... } — 编译期常量构造函数
                     self.advance();
                     self.expect(Token::LParen)?;
                     let params = self.parse_params()?;
@@ -3107,6 +3136,7 @@ impl Parser {
                     self.expect(Token::RBrace)?;
                     self.receiver_name = None;
                     let idef = crate::ast::InitDef {
+                        is_const: true,
                         params,
                         body,
                         member_param_flags: vec![],
@@ -3207,6 +3237,7 @@ impl Parser {
                     })
                     .collect();
                 let implicit = InitDef {
+                    is_const: false,
                     params: primary_ctor_params,
                     body: init_body,
                     member_param_flags: primary_ctor_member_flags,
@@ -3371,6 +3402,7 @@ impl Parser {
         self.current_type_params = prev_params;
 
         Ok(Function {
+            is_const: false,
             visibility,
             name,
             type_params,
@@ -3403,6 +3435,7 @@ impl Parser {
         self.expect(Token::RBrace)?;
 
         Ok(Function {
+            is_const: false,
             visibility,
             name: "main".to_string(),
             type_params: vec![],

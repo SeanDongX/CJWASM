@@ -613,6 +613,8 @@ fn overload_name(op: &BinOp) -> &'static str {
 struct VarInfo {
     ty: Ty,
     mutable: bool,
+    /// 是否为 const 绑定（局部/全局 `const` 或 const 函数形参）：可作为常量表达式引用（16.2(3)）。
+    is_const: bool,
     /// 若绑定由整数字面量（或其负号形态）初始化且之后未被重新赋值，
     /// 记录其编译期常量值，用于移位越界 / 字面量越界检查。
     const_int: Option<i64>,
@@ -684,6 +686,17 @@ struct Checker<'a> {
     index_op_types: HashSet<String>,
     /// 定义了 set 形态 `[]`（索引参数 + 值参数）的用户类型。
     index_set_types: HashSet<String>,
+    /// const 函数全名集合（顶层裸名 / `Type.method` 限定名），16.2(6)。
+    const_funcs: HashSet<String>,
+    /// 类型名 → 该类型的 const 成员函数名集合（用于 `obj.constMethod()` 判定）。
+    const_type_methods: HashMap<String, HashSet<String>>,
+    /// 拥有 const init 的类型名（可作为常量构造，16.2(7)）。
+    const_init_types: HashSet<String>,
+    /// 当前是否处于允许 `this`/`super` 作为常量表达式的上下文
+    /// （const init 体或 const 函数体，16.2(13)）。
+    in_const_ctx: bool,
+    /// 程序中声明过的全部函数名（顶层裸名与 `Type.method` 限定名）。
+    known_funcs: HashSet<String>,
 }
 
 /// 泛型定义的类型参数与约束（实例化约束检查用）。
@@ -756,6 +769,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         globals.insert(
             c.name.clone(),
             VarInfo {
+                is_const: c.is_const,
                 ty: global_const_ty(c),
                 // 顶层 `let`/`const` 不可重新赋值；`var` 可以。
                 mutable: c.is_mut,
@@ -993,6 +1007,96 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     }
     drop(record_index_op);
 
+    // 常量求值语义（16.2）：收集 const 函数、const init 类型与 const 成员函数，
+    // 供 const 初始化式的“常量表达式”判定使用。
+    let mut const_funcs: HashSet<String> = HashSet::new();
+    let mut const_type_methods: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut const_init_types: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        if f.is_const {
+            const_funcs.insert(f.name.clone());
+            if let Some((ty, bare)) = f.name.rsplit_once('.') {
+                const_type_methods
+                    .entry(ty.to_string())
+                    .or_default()
+                    .insert(bare.to_string());
+            }
+        }
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            if m.is_const {
+                let bare = m
+                    .func
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&m.func.name)
+                    .to_string();
+                const_funcs.insert(format!("{}.{}", c.name, bare));
+                const_type_methods
+                    .entry(c.name.clone())
+                    .or_default()
+                    .insert(bare);
+            }
+        }
+        if c.inits.iter().chain(c.init.iter()).any(|i| i.is_const) {
+            const_init_types.insert(c.name.clone());
+        }
+    }
+    for s in &program.structs {
+        if s.inits.iter().any(|i| i.is_const) {
+            const_init_types.insert(s.name.clone());
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            if f.is_const {
+                const_funcs.insert(f.name.clone());
+                if let Some((ty, bare)) = f.name.rsplit_once('.') {
+                    const_type_methods
+                        .entry(ty.to_string())
+                        .or_default()
+                        .insert(bare.to_string());
+                }
+            }
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if m.is_const {
+                const_funcs.insert(format!("{}.{}", iface.name, m.name));
+            }
+        }
+    }
+
+    let mut known_funcs: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        known_funcs.insert(f.name.clone());
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            let bare = m
+                .func
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&m.func.name)
+                .to_string();
+            known_funcs.insert(format!("{}.{}", c.name, bare));
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            known_funcs.insert(f.name.clone());
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            known_funcs.insert(format!("{}.{}", iface.name, m.name));
+        }
+    }
+
     let mut checker = Checker {
         globals,
         funcs,
@@ -1024,6 +1128,11 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         qualified_methods,
         index_op_types,
         index_set_types,
+        const_funcs,
+        const_type_methods,
+        const_init_types,
+        in_const_ctx: false,
+        known_funcs,
     };
 
     // 结构体方法被脱糖为 `StructName.method` 顶层函数：为其注入实例字段作用域，
@@ -1045,6 +1154,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 (
                     f.name.clone(),
                     VarInfo {
+                        is_const: false,
                         ty: field_ty(f),
                         mutable: f.is_mut,
                         const_int: None,
@@ -1061,15 +1171,21 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             .find(|(_, prefix, _)| func.name.starts_with(prefix.as_str()))
         {
             let prev = checker.cur_struct.replace(st_name.clone());
+            let prev_c = checker.in_const_ctx;
+            checker.in_const_ctx = func.is_const;
             checker.check_params_body_extra(
                 &func.params,
                 &func.body,
                 Some(scope),
                 func.return_type.as_ref().map(|t| checker.ty_of_ann(t)),
             );
+            checker.in_const_ctx = prev_c;
             checker.cur_struct = prev;
         } else {
+            let prev_c = checker.in_const_ctx;
+            checker.in_const_ctx = func.is_const;
             checker.check_function(func);
+            checker.in_const_ctx = prev_c;
         }
     }
     for cls in &program.classes {
@@ -1082,6 +1198,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 (
                     f.name.clone(),
                     VarInfo {
+                        is_const: false,
                         ty: field_ty(f),
                         mutable: f.is_mut,
                         const_int: None,
@@ -1100,6 +1217,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 (
                     f.name.clone(),
                     VarInfo {
+                        is_const: false,
                         ty: field_ty(f),
                         mutable: f.is_mut || deferred_let,
                         const_int: None,
@@ -1119,6 +1237,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 (
                     f.name.clone(),
                     VarInfo {
+                        is_const: false,
                         ty: field_ty(f),
                         mutable: f.is_mut || deferred_static_let,
                         const_int: None,
@@ -1128,7 +1247,10 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             })
             .collect();
         if let Some(init) = &cls.init {
+            let prev_c = checker.in_const_ctx;
+            checker.in_const_ctx = init.is_const;
             checker.check_params_body_extra(&init.params, &init.body, Some(&ctor_fields), None);
+            checker.in_const_ctx = prev_c;
         }
         if let Some(deinit) = &cls.deinit {
             checker.scopes.push(fields.clone());
@@ -1154,12 +1276,15 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 } else {
                     &fields
                 };
+                let prev_c = checker.in_const_ctx;
+                checker.in_const_ctx = m.is_const;
                 checker.check_params_body_extra(
                     &m.func.params,
                     &m.func.body,
                     Some(field_scope),
                     m.func.return_type.as_ref().map(|t| checker.ty_of_ann(t)),
                 );
+                checker.in_const_ctx = prev_c;
             }
         }
         // primary constructor 参数类型也记录下来，供构造函数体中复用（保守）。
@@ -1169,6 +1294,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 scope.insert(
                     p.name.clone(),
                     VarInfo {
+                        is_const: true,
                         ty: checker.ty_of_ann(&p.ty),
                         mutable: true,
                         const_int: None,
@@ -1183,23 +1309,32 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     for iface in &program.interfaces {
         for m in &iface.methods {
             if let Some(body) = &m.default_body {
+                let prev_c = checker.in_const_ctx;
+                checker.in_const_ctx = m.is_const;
                 checker.check_params_and_body(
                     &m.params,
                     body,
                     m.return_type.as_ref().map(|t| checker.ty_of_ann(t)),
                 );
+                checker.in_const_ctx = prev_c;
             }
         }
     }
     for ext in &program.extends {
         for func in &ext.methods {
+            let prev_c = checker.in_const_ctx;
+            checker.in_const_ctx = func.is_const;
             checker.check_function(func);
+            checker.in_const_ctx = prev_c;
         }
     }
     // 顶层 `let`/`var`/`const` 的初始化表达式同样参与类型检查
     // （如顶层 `let r = Int8(runeVar)` 的非法基础类型转换）。
     for c in &program.constants {
         checker.check_expr(&c.init);
+        if c.is_const {
+            checker.check_const_initializer(None, &c.init, &c.name);
+        }
     }
 }
 
@@ -1871,6 +2006,7 @@ impl<'a> Checker<'a> {
             scope.insert(
                 p.name.clone(),
                 VarInfo {
+                    is_const: true,
                     ty,
                     mutable,
                     const_int: None,
@@ -1907,7 +2043,7 @@ impl<'a> Checker<'a> {
                 let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
                 let cinit = if deferred { None } else { literal_int(value) };
                 self.check_irrefutable_pattern(pattern);
-                self.bind_pattern_const(pattern, bind_ty, deferred, cinit);
+                self.bind_pattern_const(pattern, bind_ty, deferred, cinit, false);
                 if matches!(ty.as_ref(), Some(Type::Bool)) {
                     self.mark_explicit_bool(pattern);
                 }
@@ -1926,7 +2062,7 @@ impl<'a> Checker<'a> {
                 let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
                 let cinit = if deferred { None } else { literal_int(value) };
                 self.check_irrefutable_pattern(pattern);
-                self.bind_pattern_const(pattern, bind_ty, true, cinit);
+                self.bind_pattern_const(pattern, bind_ty, true, cinit, false);
                 if matches!(ty.as_ref(), Some(Type::Bool)) {
                     self.mark_explicit_bool(pattern);
                 }
@@ -1934,13 +2070,15 @@ impl<'a> Checker<'a> {
             Stmt::Const { name, ty, value } => {
                 let value_ty = self.check_expr(value);
                 self.check_const_init_ctors(value);
+                // 16.1(2)/16.2：const 变量必须以常量表达式初始化。
+                self.check_const_initializer(ty.as_ref(), value, name);
                 let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
                 if let Some(ann) = ann_ty.as_ref() {
                     self.check_assignable(ann, &value_ty, "常量初始化");
                     self.check_literal_range(ann, value);
                 }
                 let bind_ty = ann_ty.unwrap_or(value_ty);
-                self.bind_name(name, bind_ty, false, literal_int(value));
+                self.bind_name(name, bind_ty, false, literal_int(value), true);
             }
             Stmt::Assign { target, value } => {
                 let value_ty = self.check_expr(value);
@@ -1996,6 +2134,7 @@ impl<'a> Checker<'a> {
                 scope.insert(
                     var.clone(),
                     VarInfo {
+                        is_const: false,
                         ty: elem_ty,
                         mutable: true,
                         const_int: None,
@@ -2057,7 +2196,7 @@ impl<'a> Checker<'a> {
     }
 
     fn bind_pattern(&mut self, pattern: &Pattern, ty: Ty, mutable: bool) {
-        self.bind_pattern_const(pattern, ty, mutable, None)
+        self.bind_pattern_const(pattern, ty, mutable, None, false)
     }
 
     /// 将刚绑定的简单变量标记为“显式 `: Bool` 标注”（仅用于区分解析器
@@ -2143,15 +2282,235 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 16.1(2)/16.2：检查 const 变量的初始化式是否为一个常量表达式。
+    fn check_const_initializer(&mut self, _ty: Option<&Type>, value: &Expr, name: &str) {
+        if !self.is_const_expr(value) {
+            self.err(format!(
+                "const 变量 '{}' 的初始化式不是常量表达式（16.1(2)/16.2）",
+                name
+            ));
+        }
+    }
+
+    /// 判断表达式是否为常量表达式（16.2）。设计红线：仅在能够确定“非常量”时返回
+    /// false，对未知形态（内建函数、类型名、枚举变体、未知类型等）保守返回 true。
+    fn is_const_expr(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Integer(_)
+            | Expr::IntegerSuffixed(..)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Bool(_)
+            | Expr::Rune(_)
+            | Expr::String(_)
+            | Expr::None => true,
+            // 16.2(3)：插值字符串不是常量表达式。
+            Expr::Interpolate(_) => false,
+            Expr::Var(name) => {
+                if name == "this" || name == "super" {
+                    return self.in_const_ctx;
+                }
+                match self.lookup(name) {
+                    Some(v) => v.is_const,
+                    // 未知标识符（枚举变体/类型名/内建值）保守放行。
+                    None => true,
+                }
+            }
+            Expr::Unary { expr, .. } => self.is_const_expr(expr),
+            Expr::Binary { left, right, .. } => {
+                self.is_const_expr(left) && self.is_const_expr(right)
+            }
+            Expr::Call {
+                name,
+                args,
+                named_args,
+                ..
+            } => self.call_is_const(name, args, named_args),
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                named_args,
+                ..
+            } => {
+                self.is_const_expr(object)
+                    && self.receiver_method_const(object, method)
+                    && args.iter().all(|a| self.is_const_expr(a))
+                    && named_args.iter().all(|(_, a)| self.is_const_expr(a))
+            }
+            Expr::SuperCall { .. } | Expr::SuperFieldAccess { .. } => self.in_const_ctx,
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                self.is_const_expr(cond)
+                    && self.is_const_expr(then_branch)
+                    && else_branch.as_ref().map_or(true, |b| self.is_const_expr(b))
+            }
+            Expr::IfLet {
+                expr,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.is_const_expr(expr)
+                    && self.is_const_expr(then_branch)
+                    && else_branch.as_ref().map_or(true, |b| self.is_const_expr(b))
+            }
+            Expr::Block(stmts, tail) => {
+                self.const_stmts_ok(stmts)
+                    && tail.as_ref().map_or(true, |t| self.is_const_expr(t))
+            }
+            Expr::Tuple(es) => es.iter().all(|e| self.is_const_expr(e)),
+            Expr::TupleIndex { object, .. } => self.is_const_expr(object),
+            Expr::Array(es) => es.iter().all(|e| self.is_const_expr(e)),
+            Expr::Index { array, index } => {
+                self.is_const_expr(array) && self.is_const_expr(index)
+            }
+            Expr::StructInit { fields, .. } => {
+                fields.iter().all(|(_, e)| self.is_const_expr(e))
+            }
+            Expr::ConstructorCall {
+                name,
+                args,
+                named_args,
+                ..
+            } => {
+                // 用户类型：仅当存在 const init 时可作常量构造（16.2(7)）；
+                // 内建/未知类型（Object、String 等）保守放行。
+                let ctor_ok = self.const_init_types.contains(name)
+                    || !self.type_names.contains(name);
+                ctor_ok
+                    && args.iter().all(|a| self.is_const_expr(a))
+                    && named_args.iter().all(|(_, a)| self.is_const_expr(a))
+            }
+            Expr::Field { object, .. } => self.is_const_expr(object),
+            Expr::OptionalChain { object, .. } => self.is_const_expr(object),
+            // 16.2(10)：控制转移表达式不是常量表达式。
+            Expr::Throw(_) | Expr::Return(_) | Expr::Break | Expr::Continue => false,
+            Expr::Range { .. } => true,
+            Expr::VariantConst { arg, .. } => arg.as_ref().map_or(true, |a| self.is_const_expr(a)),
+            Expr::Match { expr, arms } => {
+                self.is_const_expr(expr)
+                    && arms.iter().all(|arm| {
+                        arm.guard.as_ref().map_or(true, |g| self.is_const_expr(g))
+                            && self.is_const_expr(&arm.body)
+                    })
+            }
+            Expr::Cast { expr, .. } => self.is_const_expr(expr),
+            Expr::Lambda { body, .. } => self.is_const_expr(body),
+            Expr::Some(v) | Expr::Ok(v) | Expr::Err(v) => self.is_const_expr(v),
+            Expr::NullCoalesce { option, default } => {
+                self.is_const_expr(option) && self.is_const_expr(default)
+            }
+            Expr::Try(v) => self.is_const_expr(v),
+            Expr::TryBlock {
+                resources,
+                body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                resources.iter().all(|(_, e)| self.is_const_expr(e))
+                    && self.const_stmts_ok(body)
+                    && self.const_stmts_ok(catch_body)
+                    && finally_body.as_ref().map_or(true, |b| self.const_stmts_ok(b))
+            }
+            Expr::SliceExpr { array, start, end } => {
+                self.is_const_expr(array)
+                    && self.is_const_expr(start)
+                    && self.is_const_expr(end)
+            }
+            Expr::PostfixIncr(_)
+            | Expr::PostfixDecr(_)
+            | Expr::PrefixIncr(_)
+            | Expr::PrefixDecr(_) => false,
+            Expr::MapLiteral { entries } => entries
+                .iter()
+                .all(|(k, v)| self.is_const_expr(k) && self.is_const_expr(v)),
+            Expr::IsType { expr, .. } => self.is_const_expr(expr),
+            Expr::Spawn { .. } | Expr::Synchronized { .. } => false,
+            Expr::TrailingClosure { .. } => false,
+            Expr::Invoke {
+                callee,
+                args,
+                named_args,
+            } => {
+                self.is_const_expr(callee)
+                    && args.iter().all(|a| self.is_const_expr(a))
+                    && named_args.iter().all(|(_, a)| self.is_const_expr(a))
+            }
+            // 宏调用形态无法静态判定，保守放行。
+            Expr::Macro { .. } => true,
+        }
+    }
+
+    /// 函数调用是否可构成常量表达式（16.2(6)/(7)）：被调用者须为 const 函数，
+    /// 且全部实参为常量表达式。
+    fn call_is_const(
+        &self,
+        name: &str,
+        args: &[Expr],
+        named_args: &[(String, Expr)],
+    ) -> bool {
+        let callee_ok = if self.const_funcs.contains(name) {
+            true
+        } else if self.known_funcs.contains(name) {
+            // 已知的用户函数但不是 const：非常量。
+            false
+        } else {
+            // 未知（内建函数/类型转换等）：保守放行。
+            true
+        };
+        callee_ok
+            && args.iter().all(|a| self.is_const_expr(a))
+            && named_args.iter().all(|(_, a)| self.is_const_expr(a))
+    }
+
+    /// 方法调用是否可构成常量表达式：接收者必须是常量表达式；若接收者类型已知
+    /// 且该方法为非 const 成员函数，则不是常量表达式。
+    fn receiver_method_const(&self, object: &Expr, method: &str) -> bool {
+        if !self.is_const_expr(object) {
+            return false;
+        }
+        let ty = self.check_expr_ty_peek(object);
+        if let Ty::User(t) = ty {
+            if let Some(set) = self.const_type_methods.get(&t) {
+                if set.contains(method) {
+                    return true;
+                }
+                // 该方法可能来自父类型，无法确定其 const 性，保守放行。
+                return true;
+            }
+        }
+        true
+    }
+
+    /// 语句块是否只由常量声明/常量表达式组成（用于 const lambda / try 块，16.2）。
+    /// 局部 `let`/`var` 声明属于“声明”，按 a07 正例可出现在 const 函数/lambda 中。
+    fn const_stmts_ok(&self, stmts: &[Stmt]) -> bool {
+        stmts.iter().all(|s| match s {
+            Stmt::Const { value, .. } => self.is_const_expr(value),
+            Stmt::Let { .. } | Stmt::Var { .. } | Stmt::LocalFunc(_) => true,
+            Stmt::Expr(e) => self.is_const_expr(e),
+            Stmt::Return(Some(e)) => self.is_const_expr(e),
+            Stmt::Return(None) => true,
+            Stmt::Break | Stmt::Continue => true,
+            _ => false,
+        })
+    }
+
     fn bind_pattern_const(
         &mut self,
         pattern: &Pattern,
         ty: Ty,
         mutable: bool,
         const_int: Option<i64>,
+        is_const: bool,
     ) {
         if let Pattern::Binding(name) = pattern {
-            self.bind_name(name, ty, mutable, const_int);
+            self.bind_name(name, ty, mutable, const_int, is_const);
         } else {
             let mut tmp = HashMap::new();
             bind_pattern_unknown(pattern, &mut tmp);
@@ -2163,8 +2522,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn bind_name(&mut self, name: &str, ty: Ty, mutable: bool, const_int: Option<i64>) {
+    fn bind_name(&mut self, name: &str, ty: Ty, mutable: bool, const_int: Option<i64>, is_const: bool) {
         let info = VarInfo {
+            is_const,
             ty,
             mutable,
             const_int,
@@ -3128,6 +3488,7 @@ impl<'a> Checker<'a> {
                     scope.insert(
                         name.clone(),
                         VarInfo {
+                            is_const: true,
                             ty: pty,
                             mutable: true,
                             const_int: None,
@@ -3201,7 +3562,7 @@ impl<'a> Checker<'a> {
                 self.scopes.pop();
                 self.scopes.push(HashMap::new());
                 if let Some(cv) = catch_var {
-                    self.bind_name(cv, Ty::Unknown, true, None);
+                    self.bind_name(cv, Ty::Unknown, true, None, false);
                 }
                 for s in catch_body {
                     self.check_stmt(s);
@@ -3958,6 +4319,7 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
             scope.insert(
                 name.clone(),
                 VarInfo {
+                    is_const: false,
                     ty: Ty::Unknown,
                     mutable: true,
                     const_int: None,
@@ -3980,6 +4342,7 @@ fn bind_pattern_unknown(pattern: &Pattern, scope: &mut HashMap<String, VarInfo>)
             scope.insert(
                 binding.clone(),
                 VarInfo {
+                    is_const: false,
                     ty: Ty::Unknown,
                     mutable: true,
                     const_int: None,
@@ -5003,6 +5366,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_const_arith_overflow_literals() {
         // 4.15(62)/(65)：同类型后缀字面量的常量算术溢出在编译期报错。
@@ -5022,6 +5386,7 @@ mod tests {
         assert_ok("main() { var a: Int16 = 32767\n var b: Int16 = 1\n let x = a + b }");
     }
 
+
     #[test]
     fn test_compound_assign_same_type() {
         // 4.23(24)：复合赋值两侧操作数类型必须相同。
@@ -5040,6 +5405,7 @@ mod tests {
         assert_ok("main() { var a: Int64 = 2\n a **= 2u64 }");
     }
 
+
     #[test]
     fn test_multi_assign_targets() {
         // 4.23(30)：多元赋值左侧逐元素检查左值合法性。
@@ -5051,6 +5417,7 @@ mod tests {
         assert_err("main() { var t = (1, 1)\n (t[0], _) = (1, 1) }", "元组");
         assert_ok("main() { var a = 1\n var b = 2\n (a, b) = (1, 2) }");
     }
+
 
     #[test]
     fn test_pipeline_rhs_must_be_callable() {
@@ -5070,6 +5437,7 @@ mod tests {
         // 用户类型可能定义 operator ()，保守放行。
         assert_ok("class F {}\nmain() { var v1: Int64 = 1\n var v2 = F()\n let v3 = v1 |> v2 }");
     }
+
 
     #[test]
     fn test_bitwise_bool_and_unary_not() {
@@ -5092,6 +5460,7 @@ mod tests {
         assert_ok("class C {}\nmain() { var v: C = C()\n let x = !v }");
     }
 
+
     // ==== w9b: 控制转移表达式不能作为运算符操作数（规范 4(1)）====
 
     #[test]
@@ -5106,6 +5475,7 @@ mod tests {
         assert_err("main() {\n loop {\n let x = break + 1\n }\n}", "控制转移");
     }
 
+
     #[test]
     fn test_w9b_ctrl_transfer_operand_positives() {
         // 正例：普通二元运算
@@ -5113,4 +5483,51 @@ mod tests {
         // 正例：`??` 的右侧允许 return（Nothing 类型可作为表达式操作数）
         assert_ok("main() { var o: Option<Int64> = None\n let x = o ?? return 0 }");
     }
+
+
+    // ─── w9d 16 章：const 初始化式必须是常量表达式 ─────────────────────────
+
+    #[test]
+    fn test_w9d_const_init_requires_const_expr() {
+        // 非 const 函数调用不能初始化 const（16.2(6)/(7)）。
+        assert_err("func f() { 1 }\nmain() { const c = f() }", "不是常量表达式");
+        // const 函数调用可以。
+        assert_ok("const func f() { 1 }\nmain() { const c = f() }");
+        // 引用 let 变量不可以（16.2(4)）。
+        assert_err("main() { let x = 1\n const c = (1, x) }", "不是常量表达式");
+        // 引用 const 变量可以。
+        assert_ok("main() { const x = 1\n const c = (1, x) }");
+    }
+
+
+    #[test]
+    fn test_w9d_const_init_operands_must_be_const() {
+        // 一元/二元运算的操作数须均为常量表达式（16.2(9)）。
+        assert_err("func i() { 1 }\nmain() { const c = -i() }", "不是常量表达式");
+        assert_ok("const func i() { 1 }\nmain() { const c = -i() + 1 }");
+    }
+
+
+    #[test]
+    fn test_w9d_const_init_this_rejected_outside_const_ctx() {
+        // 非 const init/函数中 this 不是常量表达式（16.2(13)）。
+        assert_err("class C { init() { const c = this } }\nmain() {}", "不是常量表达式");
+    }
+
+
+    #[test]
+    fn test_w9d_const_init_ctor_requires_const_init() {
+        // 无 const init 的用户类型构造不是常量表达式（16.2(7)）。
+        assert_err("class C { }\nmain() { const c = C() }", "不是常量表达式");
+        assert_ok("class C { const init() { } }\nmain() { const c = C() }");
+    }
+
+
+    #[test]
+    fn test_w9d_global_const_requires_const_expr() {
+        // 顶层 const 初始化式同样须为常量表达式（16.1(2)）。
+        assert_err("func f() { 1 }\nconst a = f()\nmain() {}", "不是常量表达式");
+        assert_ok("const func f() { 1 }\nconst a = f()\nmain() {}");
+    }
+
 }

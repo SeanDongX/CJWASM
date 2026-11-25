@@ -279,6 +279,7 @@ impl CodeGen {
         let body = init_def.body.clone();
 
         FuncDef {
+            is_const: false,
             visibility: Visibility::Public,
             name: func_name,
             type_params: vec![],
@@ -309,6 +310,7 @@ impl CodeGen {
         params.extend(init_def.params.iter().cloned());
 
         FuncDef {
+            is_const: false,
             visibility: Visibility::Public,
             name: func_name,
             type_params: vec![],
@@ -327,6 +329,7 @@ impl CodeGen {
         let func_name = format!("__{}_deinit", class_name);
 
         FuncDef {
+            is_const: false,
             visibility: Visibility::Public,
             name: func_name,
             type_params: vec![],
