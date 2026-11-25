@@ -4230,4 +4230,42 @@ mod tests {
         assert!(parses("struct S { init(x: Int64) {} init(x: Bool) {} }"));
         assert!(parses("struct S { S(x: Int64) {} init(y: Bool) {} }"));
     }
+
+    #[test]
+    fn test_w11c_struct_field_conflicting_visibility() {
+        let parses = |s: &str| {
+            let tokens: Vec<_> = Lexer::new(s).filter_map(|r| r.ok()).collect();
+            Parser::new(tokens).with_source(s).parse_program().is_ok()
+        };
+        // 2.1.10.1(1)：字段声明的可见性修饰符至多一个。
+        assert!(!parses("struct S { public private let v = 0 }"));
+        assert!(!parses("struct S { private public var v = 0 }"));
+        assert!(parses("struct S { private let v = 0 }"));
+        assert!(parses("struct S { public var v = 0 }"));
+    }
+
+    #[test]
+    fn test_w11c_varray_negative_length_rejected() {
+        let parses = |s: &str| {
+            let tokens: Vec<_> = Lexer::new(s).filter_map(|r| r.ok()).collect();
+            Parser::new(tokens).with_source(s).parse_program().is_ok()
+        };
+        // 2.1.12(5)：VArray 长度不能为负。
+        assert!(!parses("main() { let a: VArray<Int64, $-3> = [] }"));
+        assert!(parses("main() { let a: VArray<Int64, $3> = [] }"));
+    }
+
+    #[test]
+    fn test_w11c_struct_private_prop_visibility_preserved() {
+        let program = parse_ok("struct S { private prop p: Int64 { get() { 1 } } }");
+        let getter = program
+            .functions
+            .iter()
+            .find(|f| f.name == "S.__get_p")
+            .expect("应脱糖出属性访问器");
+        assert!(matches!(
+            getter.visibility,
+            crate::ast::Visibility::Private
+        ));
+    }
 }

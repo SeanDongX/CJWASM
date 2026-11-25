@@ -781,6 +781,7 @@ mod tests {
                 ty: Type::Int64,
                 default: None,
                 is_mut: true,
+                decl_kw: true,
             }],
             init: None,
             deinit: None,

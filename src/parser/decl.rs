@@ -9,6 +9,8 @@ use crate::lexer::{StringOrInterpolated, Token};
 #[derive(Default, Clone)]
 pub(crate) struct MemberModifiers {
     pub visibility: Option<Visibility>,
+    /// 已消费的可见性修饰符个数（>1 表示出现 public private 这类冲突组合）。
+    pub visibility_count: usize,
     pub is_static: bool,
     /// const 作为 func / init 的前缀修饰符（常量求值语义，本阶段按普通 func/init 处理）
     pub is_const: bool,
@@ -38,18 +40,22 @@ impl Parser {
                 Some(Token::Public) => {
                     self.advance();
                     m.visibility = Some(Visibility::Public);
+                    m.visibility_count += 1;
                 }
                 Some(Token::Private) => {
                     self.advance();
                     m.visibility = Some(Visibility::Private);
+                    m.visibility_count += 1;
                 }
                 Some(Token::Protected) => {
                     self.advance();
                     m.visibility = Some(Visibility::Protected);
+                    m.visibility_count += 1;
                 }
                 Some(Token::Internal) => {
                     self.advance();
                     m.visibility = Some(Visibility::Internal);
+                    m.visibility_count += 1;
                 }
                 Some(Token::Static) => {
                     self.advance();
@@ -1060,6 +1066,7 @@ impl Parser {
                         ty,
                         default,
                         is_mut: field_is_mut,
+                        decl_kw: true,
                     });
                     if !self.check(&Token::Comma) {
                         break;
@@ -1101,6 +1108,7 @@ impl Parser {
                 init_body.extend(primary_body);
                 inits.push(crate::ast::InitDef {
                     is_const: false,
+                    visibility: primary_ctor_visibility.clone(),
                     params: primary_params.clone(),
                     body: init_body,
                     member_param_flags: primary_member_flags.clone(),
@@ -1173,6 +1181,7 @@ impl Parser {
                 let member_flags = vec![false; params.len()];
                 let idef = crate::ast::InitDef {
                     is_const: mods.is_const,
+                    visibility: mods.visibility.clone().unwrap_or(Visibility::Internal),
                     params,
                     body,
                     member_param_flags: member_flags,
@@ -1256,7 +1265,12 @@ impl Parser {
                             self.receiver_name = None;
                             methods.push(crate::ast::Function {
                                 is_const: false,
-                                visibility: crate::ast::Visibility::Public,
+                                // 保留属性声明的可见性（private 属性仅在定义体内可见，
+                                // 2.1.10.4(6)）；未标注时维持 public，避免影响既有代码生成。
+                                visibility: mods
+                                    .visibility
+                                    .clone()
+                                    .unwrap_or(crate::ast::Visibility::Public),
                                 name: format!("{}.__get_{}", name, prop_name),
                                 type_params: vec![],
                                 constraints: vec![],
@@ -1295,7 +1309,10 @@ impl Parser {
                             self.receiver_name = None;
                             methods.push(crate::ast::Function {
                                 is_const: false,
-                                visibility: crate::ast::Visibility::Public,
+                                visibility: mods
+                                    .visibility
+                                    .clone()
+                                    .unwrap_or(crate::ast::Visibility::Public),
                                 name: format!("{}.__set_{}", name, prop_name),
                                 type_params: vec![],
                                 constraints: vec![],
@@ -1335,8 +1352,18 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 continue;
             }
+            // 2.1.10.1(1)：字段声明的可见性修饰符至多一个（public private 冲突非法）。
+            if mods.visibility_count > 1 {
+                return self.bail(ParseError::UnexpectedToken(
+                    self.peek().cloned().unwrap_or(Token::Semicolon),
+                    "字段声明只能有一个可见性修饰符".to_string(),
+                ));
+            }
+            let has_decl_kw = self.check(&Token::Var)
+                || self.check(&Token::Let)
+                || self.check(&Token::Const);
             let mut field_is_mut = true;
-            if self.check(&Token::Var) || self.check(&Token::Let) || self.check(&Token::Const) {
+            if has_decl_kw {
                 field_is_mut = self.check(&Token::Var);
                 self.advance();
             }
@@ -1379,6 +1406,7 @@ impl Parser {
                 ty,
                 default,
                 is_mut: field_is_mut,
+                decl_kw: has_decl_kw,
             });
 
             // 成员之间允许逗号或分号分隔，也容忍 `;;`/`,;` 等重复分隔符
@@ -2677,6 +2705,7 @@ impl Parser {
                     ty,
                     default,
                     is_mut: field_is_mut,
+                    decl_kw: true,
                 });
             } else if self.check(&Token::Init) {
                 if mods.is_static {
@@ -2742,6 +2771,7 @@ impl Parser {
                 self.receiver_name = None;
                 let idef = crate::ast::InitDef {
                     is_const: mods.is_const,
+                    visibility: mods.visibility.clone().unwrap_or(Visibility::Internal),
                     params,
                     body,
                     member_param_flags: vec![],
@@ -3084,6 +3114,7 @@ impl Parser {
                 self.receiver_name = None;
                 let idef = crate::ast::InitDef {
                     is_const: mods.is_const,
+                    visibility: mods.visibility.clone().unwrap_or(Visibility::Internal),
                     params,
                     body,
                     member_param_flags,
@@ -3289,6 +3320,7 @@ impl Parser {
                     ty,
                     default,
                     is_mut: false,
+                    decl_kw: true,
                     is_static: false,
                     visibility: member_vis.clone(),
                 });
@@ -3308,6 +3340,7 @@ impl Parser {
                     self.receiver_name = None;
                     let idef = crate::ast::InitDef {
                         is_const: true,
+                        visibility: Visibility::Internal,
                         params,
                         body,
                         member_param_flags: vec![],
@@ -3354,6 +3387,7 @@ impl Parser {
                         ty,
                         default,
                         is_mut: false,
+                        decl_kw: true,
                     });
                 }
             } else {
@@ -3395,6 +3429,7 @@ impl Parser {
                     ty: p.ty.clone(),
                     default: p.default.clone(),
                     is_mut: true,
+                    decl_kw: true,
                 });
             }
             if class_def.init.is_none() {
@@ -3410,6 +3445,7 @@ impl Parser {
                     .collect();
                 let implicit = InitDef {
                     is_const: false,
+                    visibility: Visibility::Internal,
                     params: primary_ctor_params,
                     body: init_body,
                     member_param_flags: primary_ctor_member_flags,

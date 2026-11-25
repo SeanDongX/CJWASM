@@ -54,6 +54,10 @@ enum Ty {
     User(String),
     /// 内建聚合类型（tuple/array/range/...）：不同类别之间互不可比较/赋值
     Agg(&'static str),
+    /// 元组类型 (T1, T2, ...)：元素类型逐一记录，用于元组赋值/比较规则（2.1.7）。
+    Tuple(Vec<Ty>),
+    /// 数组类型 Array<T>：记录元素类型，用于元素赋值类型检查（2.2.1(2)）。
+    Array(Box<Ty>),
     /// Option<T>
     Option(Box<Ty>),
     /// 显式标注的函数类型 `(P1, P2, ...) -> R`（4.22.1(2) 管道形参检查用）。
@@ -88,6 +92,8 @@ impl Ty {
             Ty::FloatLit => "浮点字面量",
             Ty::User(n) => n,
             Ty::Agg(a) => a,
+            Ty::Tuple(_) => "元组",
+            Ty::Array(_) => "数组",
             Ty::Option(_) => "Option",
             Ty::Func { .. } => "函数类型",
             Ty::Unknown => "未知类型",
@@ -142,6 +148,8 @@ impl Ty {
                 | Ty::Unit
                 | Ty::User(_)
                 | Ty::Agg(_)
+                | Ty::Tuple(_)
+                | Ty::Array(_)
                 | Ty::Option(_)
                 | Ty::Func { .. }
         )
@@ -218,8 +226,10 @@ fn ty_of(ty: &Type) -> Ty {
         // `Nothing` 是底类型，但与 `Unit` 等具体类型并不相同：用于构造实参匹配时
         // 必须能区分（`A(())` 不能赋给 `Nothing` 形参）。用独立 `User` 名表示。
         Type::Nothing => Ty::User("Nothing".to_string()),
-        Type::Tuple(_) => Ty::Agg("tuple"),
-        Type::Array(_) => Ty::Agg("array"),
+        // `()` 类型即 Unit（2.1.4）。
+        Type::Tuple(ts) if ts.is_empty() => Ty::Unit,
+        Type::Tuple(ts) => Ty::Tuple(ts.iter().map(ty_of).collect()),
+        Type::Array(inner) => Ty::Array(Box::new(ty_of(inner))),
         Type::Range => Ty::Agg("range"),
         // 函数类型：与元组/数组等聚合类型互不可赋值；lambda 实参推断为 Unknown，
         // 因此不会误伤把 lambda 传给函数形参的合法调用。
@@ -256,9 +266,11 @@ fn ty_of(ty: &Type) -> Ty {
         Type::Struct(name, args) if name == "Option" && args.len() == 1 => {
             Ty::Option(Box::new(ty_of(&args[0])))
         }
-        Type::Struct(name, _args) if name == "Range" || name == "Array" => {
+        Type::Struct(name, args) if name == "Range" || name == "Array" => {
             if name == "Range" {
                 Ty::Agg("range")
+            } else if args.len() == 1 {
+                Ty::Array(Box::new(ty_of(&args[0])))
             } else {
                 Ty::Agg("array")
             }
@@ -337,6 +349,15 @@ fn static_expr_ty(e: &Expr) -> Ty {
             _ => Ty::Unknown,
         },
         Expr::IsType { .. } => Ty::Bool,
+        Expr::Tuple(elems) if elems.is_empty() => Ty::Unit,
+        Expr::Tuple(elems) => Ty::Tuple(elems.iter().map(static_expr_ty).collect()),
+        Expr::Array(elems) => Ty::Array(Box::new(
+            elems
+                .iter()
+                .map(static_expr_ty)
+                .find(|t| *t != Ty::Unknown)
+                .unwrap_or(Ty::Unknown),
+        )),
         _ => Ty::Unknown,
     }
 }
@@ -358,6 +379,14 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
         (Ty::User(_), Ty::User(_)) => true,
         // 聚合类型（tuple/array/range）只有同类才可赋值/比较。
         (Ty::Agg(x), Ty::Agg(y)) => x == y,
+        // 元组：元素个数一致且逐元素兼容（2.1.7）。
+        (Ty::Tuple(x), Ty::Tuple(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| compatible(a, b))
+        }
+        (Ty::Tuple(_), Ty::Agg("tuple")) | (Ty::Agg("tuple"), Ty::Tuple(_)) => true,
+        // 数组：元素类型兼容即兼容（2.2.1(2)）。
+        (Ty::Array(x), Ty::Array(y)) => compatible(x, y),
+        (Ty::Array(_), Ty::Agg("array")) | (Ty::Agg("array"), Ty::Array(_)) => true,
         _ => a == b,
     }
 }
@@ -436,9 +465,13 @@ fn merged(a: &Ty, b: &Ty) -> Ty {
         return Ty::Unknown;
     }
     // 用户类型/聚合/Option 的运算结果不做推断（可能来自重载），保守置为未知。
-    if matches!(a, Ty::User(_) | Ty::Agg(_) | Ty::Option(_))
-        || matches!(b, Ty::User(_) | Ty::Agg(_) | Ty::Option(_))
-    {
+    if matches!(
+        a,
+        Ty::User(_) | Ty::Agg(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Option(_)
+    ) || matches!(
+        b,
+        Ty::User(_) | Ty::Agg(_) | Ty::Tuple(_) | Ty::Array(_) | Ty::Option(_)
+    ) {
         return Ty::Unknown;
     }
     if a.is_concrete() {
@@ -690,6 +723,14 @@ struct Checker<'a> {
     struct_private_ctor: HashSet<String>,
     /// 结构体名 → 私有成员函数名集合（2.1.10.4(6)）。
     struct_private_methods: HashMap<String, HashSet<String>>,
+    /// 结构体成员分类（实例/静态/私有），用于 2.1.10.4(10) 的访问方式检查。
+    struct_members: HashMap<String, StructMembers>,
+    /// 定义了 `operator func ==` 的结构体名集合（2.1.10(5)：结构体默认不支持 ==）。
+    struct_with_eq: HashSet<String>,
+    /// 定义了 `operator func !=` 的结构体名集合（`!=` 亦可由 `==` 定义）。
+    struct_with_ne: HashSet<String>,
+    /// 用户泛型类型（class/struct/enum）名 → (类型参数个数, 是否可由构造实参推断)。
+    generic_type_arity: HashMap<String, (usize, bool)>,
     /// struct 名 → 字段名 → 是否可变。
     struct_fields: HashMap<String, HashMap<String, bool>>,
     /// 全部 enum 变体名（`E1 = E1` 这类构造值不可赋值，4.23(15)）。
@@ -736,6 +777,22 @@ struct CtorParam {
 #[derive(Clone)]
 struct CtorSig {
     params: Vec<CtorParam>,
+}
+
+/// 结构体成员分类（2.1.10.4(10)：实例成员须经实例访问、静态成员须经类型名访问）。
+#[derive(Clone, Default)]
+struct StructMembers {
+    /// 实例成员名（字段 / 属性 / 方法 / 运算符）。
+    instance: HashSet<String>,
+    /// 静态成员名（字段 / 属性 / 方法）。
+    statics: HashSet<String>,
+    /// 私有实例成员名（字段 / 属性 / 方法 / 运算符）。
+    private_instance: HashSet<String>,
+    /// 私有静态成员名（字段 / 属性 / 方法）。
+    private_statics: HashSet<String>,
+    /// 私有属性名（属性访问器脱糖为 `__get_p` / `__set_p`，其 static 与否
+    /// 未在 AST 中保留；私有属性无论静态与否都只能在定义体内访问）。
+    private_props: HashSet<String>,
 }
 
 /// 对整个 Program 做表达式/赋值类型检查，错误追加到 `errors`。
@@ -958,15 +1015,16 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             struct_private_fields.insert(s.name.clone(), private);
         }
     }
-    // 主构造函数为 private 的结构体：仅可在结构体定义体内构造（2.1.10.2(3)）。
+    // 主构造函数或全部 init 均为 private 的结构体：仅可在结构体定义体内构造
+    // （2.1.10.2(3)）。存在任一非私有构造函数时保守放行（调用可能解析到它）。
     let struct_private_ctor: HashSet<String> = program
         .structs
         .iter()
         .filter(|s| {
-            s.has_primary_ctor
-                && matches!(s.primary_ctor_visibility, crate::ast::Visibility::Private)
-                // 存在其它（非私有）构造函数时，调用可能解析到它们，保守放行。
-                && s.inits.len() <= 1
+            !s.inits.is_empty()
+                && s.inits
+                    .iter()
+                    .all(|i| matches!(i.visibility, crate::ast::Visibility::Private))
         })
         .map(|s| s.name.clone())
         .collect();
@@ -985,6 +1043,137 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                     .insert(m.to_string());
             }
         }
+    }
+    // 2.1.10.4(10)：结构体成员分类（实例/静态）与私有可见性。
+    // struct 方法/属性访问器被脱糖为 `StructName.member` 顶层函数（无 `this`
+    // 形参者视为静态）；属性访问器 `__get_p` / `__set_p` 按属性名 `p` 登记。
+    let mut struct_members: HashMap<String, StructMembers> = HashMap::new();
+    for s in &program.structs {
+        let entry = struct_members.entry(s.name.clone()).or_default();
+        for f in &s.fields {
+            let private = matches!(f.visibility, crate::ast::Visibility::Private);
+            if f.is_static {
+                entry.statics.insert(f.name.clone());
+                if private {
+                    entry.private_statics.insert(f.name.clone());
+                }
+            } else {
+                entry.instance.insert(f.name.clone());
+                if private {
+                    entry.private_instance.insert(f.name.clone());
+                }
+            }
+        }
+    }
+    // 定义了 `operator func ==` / `!=` 的结构体（含 extend 补充）。
+    // 2.1.10(5)：结构体默认不支持 ==/!=；仅当定义了对应运算符才可用。
+    let mut struct_with_eq: HashSet<String> = HashSet::new();
+    let mut struct_with_ne: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        let member = member_name(&f.name);
+        if member != "op_eq" && member != "op_ne" {
+            continue;
+        }
+        if let Some((owner, _)) = f.name.rsplit_once('.') {
+            if struct_names_set.contains(owner) {
+                if member == "op_eq" {
+                    struct_with_eq.insert(owner.to_string());
+                } else {
+                    struct_with_ne.insert(owner.to_string());
+                }
+            }
+        }
+    }
+    for ext in &program.extends {
+        if !struct_names_set.contains(ext.target_type.as_str()) {
+            continue;
+        }
+        for m in &ext.methods {
+            match member_name(&m.name) {
+                "op_eq" => {
+                    struct_with_eq.insert(ext.target_type.clone());
+                }
+                "op_ne" => {
+                    struct_with_ne.insert(ext.target_type.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    for f in &program.functions {
+        let Some((owner, member)) = f.name.rsplit_once('.') else {
+            continue;
+        };
+        if !struct_names_set.contains(owner) {
+            continue;
+        }
+        let entry = struct_members.entry(owner.to_string()).or_default();
+        let is_static = !f
+            .params
+            .first()
+            .map_or(false, |p| p.name == "this" || p.name == "self");
+        let private = matches!(f.visibility, crate::ast::Visibility::Private);
+        // 属性访问器 `__get_p` / `__set_p`：parser 对 struct 属性访问器一律附加
+        // `this` 形参，即便属性声明为 static，故无法从 AST 判定静态性。
+        // 只登记“私有属性名”，不参与静态/实例访问方式检查（避免误伤合法
+        // 的 `S.p` / `obj.p` 两种访问）；私有属性无论静态与否均不可在定义体外访问。
+        if let Some(prop) = member
+            .strip_prefix("__get_")
+            .or_else(|| member.strip_prefix("__set_"))
+        {
+            if private {
+                entry.private_props.insert(prop.to_string());
+            }
+            continue;
+        }
+        if is_static {
+            entry.statics.insert(member.to_string());
+            if private {
+                entry.private_statics.insert(member.to_string());
+            }
+        } else {
+            entry.instance.insert(member.to_string());
+            if private {
+                entry.private_instance.insert(member.to_string());
+            }
+        }
+    }
+    // 用户泛型类型（class/struct/enum）的类型参数个数（与约束无关），以及
+    // 其构造函数能否从实参推断类型参数（可推断时允许省略显式类型实参）。
+    let mut generic_type_arity: HashMap<String, (usize, bool)> = HashMap::new();
+    let type_param_names = |tps: &[String]| -> HashSet<String> {
+        tps.iter().cloned().collect()
+    };
+    for c in &program.classes {
+        if c.type_params.is_empty() {
+            continue;
+        }
+        let tps = type_param_names(&c.type_params);
+        let _ = tps;
+        // 类的类型实参可由构造实参或期望类型上下文推断（6.1.2.7(4)），
+        // 省略时不做强制检查；显式给出时仍检查个数。
+        generic_type_arity.insert(c.name.clone(), (c.type_params.len(), true));
+    }
+    for s in &program.structs {
+        if s.type_params.is_empty() {
+            continue;
+        }
+        let tps = type_param_names(&s.type_params);
+        let inferable = !s.constraints.is_empty()
+            || s.inits
+                .iter()
+                .any(|i| i.params.iter().any(|p| type_mentions(&p.ty, &tps)))
+            || s.primary_ctor_params
+                .iter()
+                .any(|p| type_mentions(&p.ty, &tps));
+        generic_type_arity.insert(s.name.clone(), (s.type_params.len(), inferable));
+    }
+    for e in &program.enums {
+        if e.type_params.is_empty() {
+            continue;
+        }
+        // 枚举构造器的类型实参同样可由实参/上下文推断，省略时保守放行。
+        generic_type_arity.insert(e.name.clone(), (e.type_params.len(), true));
     }
     let mut enum_variants: HashSet<String> = HashSet::new();
     for e in &program.enums {
@@ -1128,6 +1317,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         }
     }
 
+    // 结构体类型细则（2.1.10）：仅凭声明即可判定的规则。
+    check_struct_type_rules(program, &type_names, errors);
+
     let mut checker = Checker {
         globals,
         funcs,
@@ -1156,6 +1348,10 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         struct_private_fields,
         struct_private_ctor,
         struct_private_methods,
+        struct_members,
+        struct_with_eq,
+        struct_with_ne,
+        generic_type_arity,
         cur_struct: None,
         enum_variants,
         qualified_methods,
@@ -1371,6 +1567,254 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     }
 }
 
+/// 收集字段默认值表达式中引用到的裸标识符与调用名（2.1.10.1(3)）。
+fn collect_default_uses(e: &Expr, vars: &mut Vec<String>, calls: &mut Vec<String>) {
+    match e {
+        Expr::Var(n) => vars.push(n.clone()),
+        Expr::Call {
+            name,
+            args,
+            named_args,
+            ..
+        } => {
+            calls.push(name.clone());
+            for a in args {
+                collect_default_uses(a, vars, calls);
+            }
+            for (_, a) in named_args {
+                collect_default_uses(a, vars, calls);
+            }
+        }
+        Expr::ConstructorCall {
+            name: _,
+            args,
+            named_args,
+            ..
+        } => {
+            for a in args {
+                collect_default_uses(a, vars, calls);
+            }
+            for (_, a) in named_args {
+                collect_default_uses(a, vars, calls);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_default_uses(left, vars, calls);
+            collect_default_uses(right, vars, calls);
+        }
+        Expr::Unary { expr, .. } => collect_default_uses(expr, vars, calls),
+        Expr::Cast { expr, .. } => collect_default_uses(expr, vars, calls),
+        Expr::Tuple(es) | Expr::Array(es) => {
+            for x in es {
+                collect_default_uses(x, vars, calls);
+            }
+        }
+        Expr::Index { array, index } => {
+            collect_default_uses(array, vars, calls);
+            collect_default_uses(index, vars, calls);
+        }
+        Expr::Invoke { callee, args, .. } => {
+            collect_default_uses(callee, vars, calls);
+            for a in args {
+                collect_default_uses(a, vars, calls);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 2.1.10 结构体类型细则：隐式构造函数初始值、继承限制、字段初始值类型、
+/// 默认值表达式的引用顺序、递归/互递归包含（仅凭声明即可判定）。
+fn check_struct_type_rules(
+    program: &Program,
+    type_names: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let struct_names: HashSet<&str> = program.structs.iter().map(|s| s.name.as_str()).collect();
+    let class_names: HashSet<&str> = program.classes.iter().map(|c| c.name.as_str()).collect();
+    // C 互操作（foreign func）签名中出现的结构体按外部布局处理，成员可由外部
+    // 初始化，不参与“隐式构造函数要求初始值”检查。
+    let mut ffi_types: HashSet<&str> = HashSet::new();
+    for f in program.functions.iter().filter(|f| f.extern_import.is_some()) {
+        for t in f
+            .params
+            .iter()
+            .map(|p| &p.ty)
+            .chain(f.return_type.iter())
+        {
+            if let Type::Struct(n, _) = t {
+                ffi_types.insert(n.as_str());
+            }
+        }
+    }
+
+    // 实例方法名（脱糖为 `S.f` 且带 `this`/`self` 形参）。
+    let mut instance_methods: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for f in &program.functions {
+        let Some((owner, member)) = f.name.rsplit_once('.') else {
+            continue;
+        };
+        if !struct_names.contains(owner) {
+            continue;
+        }
+        if f.params
+            .first()
+            .map_or(false, |p| p.name == "this" || p.name == "self")
+        {
+            instance_methods.entry(owner).or_default().insert(member);
+        }
+    }
+
+    for s in &program.structs {
+        // 1) 无显式构造函数时，隐式构造函数要求实例成员变量均有初始值（2.1.10.2(44)）。
+        if !s.has_primary_ctor && s.inits.is_empty() && !ffi_types.contains(s.name.as_str()) {
+            for f in &s.fields {
+                if f.is_static || f.default.is_some() || !f.decl_kw {
+                    continue;
+                }
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的实例成员变量 '{}' 没有初始值，且结构体未定义显式构造函数（2.1.10.1(1)/2.1.10.2(44)）",
+                        s.name, f.name
+                    ),
+                });
+            }
+        }
+        // 2) 结构体不能被继承（2.1.10(7)）。
+        for c in s.constraints.iter().filter(|c| c.param == s.name) {
+            for b in &c.bounds {
+                if struct_names.contains(b.as_str()) || class_names.contains(b.as_str()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "结构体 '{}' 不能继承类型 '{}'（2.1.10(7)）",
+                            s.name, b
+                        ),
+                    });
+                }
+            }
+        }
+        // 3) 成员变量初始化表达式类型须与声明类型一致（2.1.10.1(1)）。
+        for f in &s.fields {
+            let Some(d) = &f.default else {
+                continue;
+            };
+            let target = ty_of_known(&f.ty, type_names);
+            let value = static_expr_ty(d);
+            if target.is_concrete() && value.is_definite() && !compatible(&target, &value) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的成员变量 '{}' 初始化表达式类型与声明类型不匹配（2.1.10.1(1)）：{} 与 {}",
+                        s.name,
+                        f.name,
+                        target.name(),
+                        value.name()
+                    ),
+                });
+            }
+        }
+        // 4) 默认值表达式只能引用此前已初始化的实例成员与静态函数（2.1.10.1(3)）。
+        //    主构造函数形参（含常规参数与成员变量参数）不是成员变量，其默认值
+        //    表达式可相互引用，不适用该规则。
+        let primary_names: HashSet<&str> =
+            s.primary_ctor_params.iter().map(|p| p.name.as_str()).collect();
+        for (i, f) in s.fields.iter().enumerate() {
+            if primary_names.contains(f.name.as_str()) {
+                continue;
+            }
+            let Some(d) = &f.default else {
+                continue;
+            };
+            let mut vars = Vec::new();
+            let mut calls = Vec::new();
+            collect_default_uses(d, &mut vars, &mut calls);
+            for name in vars {
+                if primary_names.contains(name.as_str()) {
+                    continue;
+                }
+                if let Some(j) = s
+                    .fields
+                    .iter()
+                    .position(|g| g.name == name && !g.is_static)
+                {
+                    if j >= i {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "结构体 '{}' 的成员变量 '{}' 的默认值引用了在其之后声明的成员 '{}'（2.1.10.1(3)）",
+                                s.name, f.name, name
+                            ),
+                        });
+                    } else if s.fields[j].default.is_none() {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "结构体 '{}' 的成员变量 '{}' 的默认值引用了尚未初始化的成员 '{}'（2.1.10.1(3)）",
+                                s.name, f.name, name
+                            ),
+                        });
+                    }
+                }
+            }
+            if let Some(methods) = instance_methods.get(s.name.as_str()) {
+                for name in calls {
+                    if methods.contains(name.as_str()) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "结构体 '{}' 的成员变量 '{}' 的默认值不能调用实例成员函数 '{}'（2.1.10.1(3)）",
+                                s.name, f.name, name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 5) 结构体递归/互递归包含（2.1.10(11)）：非静态成员变量的类型直接引用
+    //    结构体（未经 class/interface/enum/函数类型包裹）构成循环即非法。
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for s in &program.structs {
+        let mut out = Vec::new();
+        for f in &s.fields {
+            if f.is_static {
+                continue;
+            }
+            if let Type::Struct(n, _) = &f.ty {
+                if struct_names.contains(n.as_str()) {
+                    out.push(n.as_str());
+                }
+            }
+        }
+        edges.insert(s.name.as_str(), out);
+    }
+    for s in &program.structs {
+        let mut stack: Vec<&str> = vec![s.name.as_str()];
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cyclic = false;
+        while let Some(n) = stack.pop() {
+            let nexts = edges.get(n).cloned().unwrap_or_default();
+            for next in nexts {
+                if next == s.name.as_str() {
+                    cyclic = true;
+                    break;
+                }
+                if seen.insert(next) {
+                    stack.push(next);
+                }
+            }
+            if cyclic {
+                break;
+            }
+        }
+        if cyclic {
+            errors.push(SemanticError {
+                message: format!(
+                    "结构体 '{}' 递归地包含自身实例，未用 class/interface/enum/函数类型打破递归链（2.1.10(11)）",
+                    s.name
+                ),
+            });
+        }
+    }
+}
+
 fn record_return(
     funcs: &mut HashMap<String, Ty>,
     generic_returns: &mut HashMap<String, usize>,
@@ -1451,7 +1895,18 @@ fn collect_inferred_returns(
         if f.return_type.is_some() || f.extern_import.is_some() || f.body.is_empty() {
             return;
         }
-        if let Some(Stmt::Expr(e)) = f.body.last() {
+        // 保留原有“末尾表达式”推断；额外支持单条 `return expr` 的简单函数体。
+        let expr_opt: Option<&Expr> = if let Some(Stmt::Expr(e)) = f.body.last() {
+            Some(e)
+        } else if f.body.len() == 1 {
+            match &f.body[0] {
+                Stmt::Return(Some(e)) => Some(e),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(e) = expr_opt {
             let t = static_expr_ty(e);
             if t.is_definite() {
                 let t = default_literal(&t);
@@ -1811,6 +2266,51 @@ fn illegal_type_arg_head(t: &Type, type_names: &HashSet<String>) -> Option<Strin
     }
 }
 
+/// 显式类型实参里“显然不是类型名”的形态（字面量/占位符），用于 2.3.1(10)
+/// 一类语法错误的判定。未声明的普通标识符视为外部/标准库类型名，不在此拒绝。
+fn non_type_literal_arg(t: &Type) -> Option<String> {
+    fn bad(n: &str) -> bool {
+        n == "_"
+            || n.starts_with('$')
+            || n.chars().next().map_or(false, |c| c.is_ascii_digit())
+            || n.starts_with('"')
+            || n.starts_with('\'')
+    }
+    match t {
+        Type::TypeParam(n) if bad(n) => Some(n.clone()),
+        Type::Struct(n, args) => {
+            if bad(n) {
+                return Some(n.clone());
+            }
+            args.iter().find_map(non_type_literal_arg)
+        }
+        Type::Array(i) | Type::Option(i) | Type::Slice(i) => non_type_literal_arg(i),
+        Type::Tuple(ts) => ts.iter().find_map(non_type_literal_arg),
+        _ => None,
+    }
+}
+
+/// 类型是否提及任一类型参数（用于判定泛型实参可否由构造实参推断）。
+fn type_mentions(t: &Type, tps: &HashSet<String>) -> bool {
+    match t {
+        Type::TypeParam(n) => tps.contains(n),
+        Type::Struct(_, args) => args.iter().any(|a| type_mentions(a, tps)),
+        Type::Array(i) | Type::Option(i) | Type::Slice(i) => type_mentions(i, tps),
+        Type::Tuple(ts) => ts.iter().any(|x| type_mentions(x, tps)),
+        Type::Result(a, b) | Type::Map(a, b) => {
+            type_mentions(a, tps) || type_mentions(b, tps)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(|p| type_mentions(p, tps))
+                || ret
+                    .as_ref()
+                    .as_ref()
+                    .map_or(false, |r| type_mentions(r, tps))
+        }
+        _ => false,
+    }
+}
+
 fn collect_static_method_returns(
     program: &Program,
     type_names: &HashSet<String>,
@@ -2137,7 +2637,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// 类型标注 → 轻量类型（识别用户定义类型名，并递归到 Option 内部）。
+    /// 类型标注 → 轻量类型（识别用户定义类型名，并递归到 Option/Tuple/Array 内部）。
     fn ty_of_ann(&self, ty: &Type) -> Ty {
         match ty {
             Type::Struct(name, args) if args.is_empty() && self.type_names.contains(name) => {
@@ -2149,6 +2649,10 @@ impl<'a> Checker<'a> {
             Type::Struct(name, args) if name == "Option" && args.len() == 1 => {
                 Ty::Option(Box::new(self.ty_of_ann(&args[0])))
             }
+            // 元组/数组内部同样需要识别用户类型名（2.1.7 / 2.2.1）。
+            Type::Tuple(ts) if ts.is_empty() => Ty::Unit,
+            Type::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.ty_of_ann(t)).collect()),
+            Type::Array(inner) => Ty::Array(Box::new(self.ty_of_ann(inner))),
             _ => ty_of(ty),
         }
     }
@@ -2311,6 +2815,8 @@ impl<'a> Checker<'a> {
             } => {
                 let iter_ty = self.check_expr(iterable);
                 let elem_ty = match iter_ty {
+                    // 数组迭代变量类型即元素类型（2.2.1）。
+                    Ty::Array(elem) => (*elem).clone(),
                     Ty::Unknown | Ty::Agg("range") | Ty::Agg("array") => match iterable {
                         // Range 迭代变量类型无法可靠确定（字面量后缀在词法中已剥离），
                         // 保守置为 Unknown，避免把 `for (i in 2u64..)` 误判为 Int64。
@@ -2801,6 +3307,12 @@ impl<'a> Checker<'a> {
                 } else if self.enum_variants.contains(name) {
                     // 4.23(15)：enum 构造值不是左值（`E1 = E1`）。
                     self.err(format!("enum 构造值 '{}' 不可被赋值", name));
+                } else if self.known_funcs.contains(name) {
+                    // 2.1.9(1)：函数类型不可变，不能给函数标识符重新赋值。
+                    self.err(format!(
+                        "函数 '{}' 是函数类型的值，不能被重新赋值（2.1.9(1)）",
+                        name
+                    ));
                 }
                 self.clear_const(name);
             }
@@ -2816,7 +3328,15 @@ impl<'a> Checker<'a> {
                 }
             }
             // 4.23(15)：元组元素 / 缺少 set 形态 [] 的用户类型索引不可赋值。
-            AssignTarget::Index { array, .. } => self.check_index_assign_target(array),
+            AssignTarget::Index { array, .. } => {
+                self.check_index_assign_target(array);
+                // 2.2.1(2)：数组元素赋值要求值类型可赋给元素类型。
+                if let Some(info) = self.lookup(array).cloned() {
+                    if let Ty::Array(elem) = info.ty {
+                        self.check_assignable(elem.as_ref(), value_ty, "数组元素赋值");
+                    }
+                }
+            }
             // `a?[b] = v`：解析为对 `a?`（Try）结果的索引，属可选链索引赋值。
             AssignTarget::ExprIndex { expr, .. } => {
                 if let crate::ast::Expr::Try(inner) = &**expr {
@@ -2840,7 +3360,25 @@ impl<'a> Checker<'a> {
                     self.check_assign_target(t, &Ty::Unknown);
                 }
             }
-            // 其余目标（切片 / 解构 / super）保守跳过。
+            // 2.2.1.4(8)：切片赋值时右值须为元素类型，或为数组/切片整体。
+            AssignTarget::Slice { array, .. } => {
+                if let Ty::Array(elem) = self.target_base_ty(array) {
+                    if value_ty.is_definite()
+                        && !matches!(
+                            value_ty,
+                            Ty::Array(_) | Ty::Agg("array") | Ty::Agg("range")
+                        )
+                        && !compatible(elem.as_ref(), value_ty)
+                    {
+                        self.err(format!(
+                            "切片赋值类型不匹配：数组元素类型 {} 与值类型 {}（2.2.1.4(8)）",
+                            elem.name(),
+                            value_ty.name()
+                        ));
+                    }
+                }
+            }
+            // 其余目标（解构 / super）保守跳过。
             _ => {}
         }
     }
@@ -2856,13 +3394,36 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 2.2.1.2(1)：数组下标必须是 Int64；编译期可确定的负下标非法。
+    fn check_array_index_type(&mut self, index: &Expr, idx_ty: &Ty) {
+        if let Some(v) = literal_int(index) {
+            if v < 0 {
+                self.err(format!(
+                    "数组下标不能为负数（2.2.1.2(1)）：{}",
+                    v
+                ));
+                return;
+            }
+        }
+        // Range 切片下标（`a[1..3]`）单独由切片规则处理，此处跳过。
+        if matches!(idx_ty, Ty::Agg("range")) {
+            return;
+        }
+        if idx_ty.is_definite() && !matches!(idx_ty, Ty::Int64 | Ty::IntLit) {
+            self.err(format!(
+                "数组下标必须是 Int64 类型，当前为 '{}'（2.2.1.2(1)）",
+                idx_ty.name()
+            ));
+        }
+    }
+
     /// `a[i] = v`：元组元素不可赋值；用户类型需提供 set 形态的 `[]`。
     fn check_index_assign_target(&mut self, array: &str) {
         let Some(info) = self.lookup(array).cloned() else {
             return;
         };
         match &info.ty {
-            Ty::Agg("tuple") => {
+            Ty::Agg("tuple") | Ty::Tuple(_) => {
                 self.err(format!("元组变量 '{}' 的元素不能被赋值", array));
             }
             Ty::User(ty) => {
@@ -2886,7 +3447,7 @@ impl<'a> Checker<'a> {
         let ty = self.target_base_ty(base);
         match ty {
             Ty::Option(inner) => match *inner {
-                Ty::Agg("array") => {}
+                Ty::Agg("array") | Ty::Array(_) => {}
                 Ty::User(name) => {
                     if !self.struct_names.contains(&name)
                         && self.index_op_types.contains(&name)
@@ -2975,6 +3536,16 @@ impl<'a> Checker<'a> {
     }
 
     fn check_field_target(&mut self, object: &str, field: &str) {
+        // 2.2.1(4)：数组长度固定，`arr.size` 只读。
+        if field == "size" {
+            if let Some(Ty::Array(_)) = self.lookup(object).map(|v| v.ty.clone()) {
+                self.err(format!(
+                    "数组 '{}' 的长度 size 不可修改（2.2.1(4)）",
+                    object
+                ));
+                return;
+            }
+        }
         if self.enum_names.contains(object) {
             self.err(format!("enum 构造值 '{}.{}' 不可被赋值", object, field));
             return;
@@ -3041,6 +3612,41 @@ impl<'a> Checker<'a> {
     /// 仅在“能证明违反”时报告：实参与被约束上界都必须是本文件可见的用户类型，
     /// 内建类型、含类型实参的泛型形态、未声明的上界一律保守跳过。
     fn check_type_instantiation(&mut self, name: &str, type_args: Option<&[Type]>) {
+        // 2.1.10.5(5)：用户泛型类型（class/struct/enum）实例化时必须给出
+        // 个数正确的类型实参；但类型实参可由构造实参推断时可省略。
+        if let Some(&(arity, inferable)) = self.generic_type_arity.get(name) {
+            if !self.known_funcs.contains(name) {
+                match type_args {
+                    None => {
+                        if !inferable {
+                            self.err(format!(
+                                "泛型类型 '{}' 实例化必须给出 {} 个类型实参（2.1.10.5(5)）",
+                                name, arity
+                            ));
+                        }
+                    }
+                    Some(args) => {
+                        if args.len() != arity {
+                            self.err(format!(
+                                "泛型类型 '{}' 需要 {} 个类型实参，实际提供了 {} 个（2.1.10.5(5)）",
+                                name,
+                                arity,
+                                args.len()
+                            ));
+                        }
+                        for a in args {
+                            if let Some(bad) = non_type_literal_arg(a) {
+                                self.err(format!(
+                                    "显式类型实参 '{}' 不是合法类型名（2.1.10.5(5)）",
+                                    bad
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let Some(args) = type_args else {
             return;
         };
@@ -3453,6 +4059,13 @@ impl<'a> Checker<'a> {
                         return Ty::Bool;
                     }
                 }
+                // 2.1.10.4(6)/(2.1.10(5))：结构体私有运算符可见性与默认不支持比较。
+                // 需在“简单操作数”过滤之前执行，以覆盖 `S() + S()` 这类构造调用操作数。
+                self.check_struct_binary_members(op, &lt, &rt);
+                // 2.1.9(7)：函数类型不支持 == / != 比较。
+                self.check_function_type_binary(op, &lt, &rt);
+                // 2.1.7(5)：元组比较要求每个元素类型都支持 == / !=。
+                self.check_tuple_comparison(op, &lt, &rt);
                 // 仅对“可静态确定”的操作数形态执行类型规则（变量、字面量、
                 // 基础转换及由它们构成的算术表达式）。方法调用、lambda、
                 // `is` 等语法正例中的复杂形态不参与，避免误伤。
@@ -3534,6 +4147,39 @@ impl<'a> Checker<'a> {
                             "不能调用结构体 '{}' 的私有成员函数 '{}'（2.1.10.4(6)）",
                             ty_name, method
                         ));
+                    }
+                }
+                // 2.1.10.4(10)：经结构体类型名调用实例成员函数 / 私有静态函数非法；
+                // 静态成员函数不能通过实例调用。
+                if let Expr::Var(type_name) = &**object {
+                    if self.struct_names.contains(type_name)
+                        && self.cur_struct.as_deref() != Some(type_name.as_str())
+                    {
+                        if let Some(members) = self.struct_members.get(type_name) {
+                            if members.private_statics.contains(method) {
+                                self.err(format!(
+                                    "不能调用结构体 '{}' 的私有静态成员函数 '{}'（2.1.10.4(6)）",
+                                    type_name, method
+                                ));
+                            } else if members.instance.contains(method) {
+                                self.err(format!(
+                                    "实例成员函数 '{}' 不能通过结构体类型名 '{}' 调用（2.1.10.4(10)）",
+                                    method, type_name
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(ty_name) = self.receiver_struct_ty(object) {
+                    if self.cur_struct.as_deref() != Some(ty_name.as_str()) {
+                        if let Some(members) = self.struct_members.get(&ty_name) {
+                            if members.statics.contains(method) {
+                                self.err(format!(
+                                    "静态成员函数 '{}' 不能通过结构体 '{}' 的实例调用（2.1.10.4(10)）",
+                                    method, ty_name
+                                ));
+                            }
+                        }
                     }
                 }
                 // 构造函数不能作为实例/静态成员方法调用（2.1.10.2(3)）：
@@ -3629,21 +4275,28 @@ impl<'a> Checker<'a> {
             }
 
             Expr::Tuple(elems) => {
-                for e in elems {
-                    self.check_expr(e);
-                }
-                if elems.is_empty() {
+                let tys: Vec<Ty> = elems.iter().map(|e| self.check_expr(e)).collect();
+                if tys.is_empty() {
                     Ty::Unit
                 } else {
-                    Ty::Agg("tuple")
+                    Ty::Tuple(tys)
                 }
             }
 
             Expr::Array(elems) => {
+                let mut elem_ty = Ty::Unknown;
                 for e in elems {
-                    self.check_expr(e);
+                    let t = self.check_expr(e);
+                    if elem_ty == Ty::Unknown {
+                        elem_ty = t;
+                    } else if !compatible(&elem_ty, &t) {
+                        // 元素类型不一致的数组字面量：无法确定统一元素类型。
+                        elem_ty = Ty::Unknown;
+                    } else {
+                        elem_ty = merged(&elem_ty, &t);
+                    }
                 }
-                Ty::Agg("array")
+                Ty::Array(Box::new(elem_ty))
             }
 
             Expr::Macro { args: elems, .. } => {
@@ -3663,16 +4316,69 @@ impl<'a> Checker<'a> {
                 self.check_expr(object);
                 // 2.1.10.4(6)：私有实例成员仅可在结构体定义体内访问。
                 if let Some(ty_name) = self.receiver_struct_ty(object) {
-                    if self.cur_struct.as_deref() != Some(ty_name.as_str())
-                        && self
+                    if self.cur_struct.as_deref() != Some(ty_name.as_str()) {
+                        if self
                             .struct_private_fields
                             .get(&ty_name)
                             .map_or(false, |set| set.contains(field))
+                        {
+                            self.err(format!(
+                                "不能访问结构体 '{}' 的私有成员 '{}'（2.1.10.4(6)）",
+                                ty_name, field
+                            ));
+                        } else if self
+                            .struct_members
+                            .get(&ty_name)
+                            .map_or(false, |m| m.private_props.contains(field))
+                        {
+                            self.err(format!(
+                                "不能访问结构体 '{}' 的私有属性 '{}'（2.1.10.4(6)）",
+                                ty_name, field
+                            ));
+                        }
+                    }
+                }
+                // 2.1.10.4(10)：经结构体类型名访问实例成员或私有静态成员非法。
+                if let Expr::Var(type_name) = &**object {
+                    if self.struct_names.contains(type_name)
+                        && self.cur_struct.as_deref() != Some(type_name.as_str())
                     {
-                        self.err(format!(
-                            "不能访问结构体 '{}' 的私有成员 '{}'（2.1.10.4(6)）",
-                            ty_name, field
-                        ));
+                        if let Some(members) = self.struct_members.get(type_name) {
+                            if members.private_props.contains(field) {
+                                self.err(format!(
+                                    "不能访问结构体 '{}' 的私有属性 '{}'（2.1.10.4(6)）",
+                                    type_name, field
+                                ));
+                            } else if members.private_statics.contains(field) {
+                                self.err(format!(
+                                    "不能访问结构体 '{}' 的私有静态成员 '{}'（2.1.10.4(6)）",
+                                    type_name, field
+                                ));
+                            } else if members.private_instance.contains(field) {
+                                self.err(format!(
+                                    "不能访问结构体 '{}' 的私有成员 '{}'（2.1.10.4(6)）",
+                                    type_name, field
+                                ));
+                            } else if members.instance.contains(field) {
+                                self.err(format!(
+                                    "实例成员 '{}' 不能通过结构体类型名 '{}' 访问（2.1.10.4(10)）",
+                                    field, type_name
+                                ));
+                            }
+                        }
+                    }
+                }
+                // 2.1.10.4(10)：静态成员不能通过结构体实例访问。
+                if let Some(ty_name) = self.receiver_struct_ty(object) {
+                    if self.cur_struct.as_deref() != Some(ty_name.as_str()) {
+                        if let Some(members) = self.struct_members.get(&ty_name) {
+                            if members.statics.contains(field) {
+                                self.err(format!(
+                                    "静态成员 '{}' 不能通过结构体 '{}' 的实例访问（2.1.10.4(10)）",
+                                    field, ty_name
+                                ));
+                            }
+                        }
                     }
                 }
                 Ty::Unknown
@@ -3685,6 +4391,26 @@ impl<'a> Checker<'a> {
                 }
                 for (_, a) in named_args {
                     self.check_expr(a);
+                }
+                // 2.3.1(10)：字面量或类型名不能作为函数值被调用
+                // （如 `8_i8(Int32)` / `(Int32)(8_i8)`）。
+                match &**callee {
+                    Expr::Integer(_)
+                    | Expr::IntegerSuffixed(..)
+                    | Expr::Float(_)
+                    | Expr::Float32(_)
+                    | Expr::Bool(_)
+                    | Expr::Rune(_)
+                    | Expr::String(_) => {
+                        self.err("字面量不能作为函数值调用（2.3.1(10)）".to_string());
+                    }
+                    Expr::Var(n) if self.type_names.contains(n) || is_core_type_name(n) => {
+                        self.err(format!(
+                            "类型名 '{}' 不能作为函数值调用（2.3.1(10)）",
+                            n
+                        ));
+                    }
+                    _ => {}
                 }
                 // 2.1.10.2(3)：`a.A()` / `A.A()` 经字段形态调用的构造函数。
                 if let Expr::Field { object, field } = &**callee {
@@ -3705,9 +4431,37 @@ impl<'a> Checker<'a> {
             }
 
             Expr::Index { array, index } => {
-                self.check_expr(array);
-                self.check_expr(index);
-                Ty::Unknown
+                let base_ty = self.check_expr(array);
+                let idx_ty = self.check_expr(index);
+                match &base_ty {
+                    // 2.1.7.3(1)：元组下标只能是 Int64 整数字面量；元素类型按字面量定位。
+                    Ty::Tuple(elems) => {
+                        if let Expr::IntegerSuffixed(_, s) = &**index {
+                            if *s != IntSuffix::I64 {
+                                self.err(format!(
+                                    "元组下标必须是 Int64 整数字面量，当前为 '{}'（2.1.7.3(1)）",
+                                    suffix_ty(*s).name()
+                                ));
+                            }
+                        }
+                        if let Expr::Integer(n) = &**index {
+                            elems.get(*n as usize).cloned().unwrap_or(Ty::Unknown)
+                        } else {
+                            Ty::Unknown
+                        }
+                    }
+                    // 2.2.1.2(1)：数组下标必须是 Int64；常量负下标非法。
+                    Ty::Array(elem) => {
+                        self.check_array_index_type(index, &idx_ty);
+                        // 2.2.1.4(1)：Range<Int64> 下标表示切片，结果仍为数组类型。
+                        if matches!(idx_ty, Ty::Agg("range")) {
+                            Ty::Array(elem.clone())
+                        } else {
+                            (**elem).clone()
+                        }
+                    }
+                    _ => Ty::Unknown,
+                }
             }
 
             Expr::StructInit {
@@ -3747,6 +4501,15 @@ impl<'a> Checker<'a> {
                         "构造函数 '{}' 为 private，不能在该结构体定义体之外调用（2.1.10.2(3)）",
                         name
                     ));
+                }
+                // 内建数组构造 `Array<T>(n) { ... }`：结果类型 Array<T>（2.2.1(2)）。
+                if name == "Array" {
+                    if let Some(tas) = type_args.as_deref() {
+                        if tas.len() == 1 {
+                            return Ty::Array(Box::new(self.ty_of_ann(&tas[0])));
+                        }
+                    }
+                    return Ty::Agg("array");
                 }
                 // 用户类型构造调用 `T()`：结果类型即该类型，便于后续复合赋值
                 // 运算符返回类型校验确定左操作数类型。内建类（Object/Exception 等）
@@ -3938,7 +4701,8 @@ impl<'a> Checker<'a> {
             Expr::PostfixIncr(inner) | Expr::PostfixDecr(inner) => {
                 let t = self.check_expr(inner);
                 self.check_incr_decr(inner, &t, false);
-                t
+                // 4.13.1：自增/自减表达式的类型为 Unit。
+                Ty::Unit
             }
 
             Expr::PrefixIncr(inner) | Expr::PrefixDecr(inner) => {
@@ -4211,6 +4975,141 @@ impl<'a> Checker<'a> {
             }
             // 字段/索引等左值保守跳过。
             _ => {}
+        }
+    }
+
+    /// 结构体二元运算相关的成员可见性/比较支持检查（2.1.10.4(6)、2.1.10(5)）。
+    fn check_struct_binary_members(&mut self, op: &BinOp, lt: &Ty, rt: &Ty) {
+        // 2.1.10.4(6)：结构体私有运算符函数仅可在结构体定义体内使用。
+        let op_member = overload_name(op);
+        for t in [lt, rt] {
+            if let Ty::User(tn) = t {
+                if self.struct_names.contains(tn)
+                    && self.cur_struct.as_deref() != Some(tn.as_str())
+                    && self
+                        .struct_members
+                        .get(tn)
+                        .map_or(false, |m| m.private_instance.contains(op_member))
+                {
+                    self.err(format!(
+                        "不能使用结构体 '{}' 的私有运算符函数 '{}'（2.1.10.4(6)）",
+                        tn, op_member
+                    ));
+                    break;
+                }
+            }
+        }
+        // 2.1.10(5)：结构体类型默认不支持 == / !=，需显式定义对应运算符
+        // （`!=` 可由 `operator func ==` 或 `operator func !=` 提供）。
+        if matches!(op, BinOp::Eq | BinOp::NotEq) {
+            for t in [lt, rt] {
+                if let Ty::User(tn) = t {
+                    if !self.struct_names.contains(tn) {
+                        continue;
+                    }
+                    let ok = if *op == BinOp::Eq {
+                        self.struct_with_eq.contains(tn)
+                    } else {
+                        self.struct_with_eq.contains(tn) || self.struct_with_ne.contains(tn)
+                    };
+                    if !ok {
+                        self.err(format!(
+                            "结构体类型 '{}' 默认不支持 {} 比较，未定义对应 operator func（2.1.10(5)）",
+                            tn,
+                            bin_symbol(op)
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 类型是否为函数类型（含经类型别名解析后的函数类型）。
+    fn ty_is_function(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Func { .. } => true,
+            Ty::User(n) => matches!(
+                self.resolve_alias_type(&Type::Struct(n.clone(), vec![])),
+                Type::Function { .. }
+            ),
+            _ => false,
+        }
+    }
+
+    /// 2.1.9(7)：函数类型不支持 == / !=。
+    fn check_function_type_binary(&mut self, op: &BinOp, lt: &Ty, rt: &Ty) {
+        if matches!(op, BinOp::Eq | BinOp::NotEq)
+            && (self.ty_is_function(lt) || self.ty_is_function(rt))
+        {
+            self.err(format!(
+                "函数类型不支持 {} 比较（2.1.9(7)）",
+                bin_symbol(op)
+            ));
+        }
+    }
+
+    /// 某类型是否支持 == / !=（2.1.7(5) 元组元素比较用）。
+    fn ty_eq_comparable(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Unknown
+            | Ty::IntLit
+            | Ty::FloatLit
+            | Ty::Int8
+            | Ty::Int16
+            | Ty::Int32
+            | Ty::Int64
+            | Ty::IntNative
+            | Ty::UInt8
+            | Ty::UInt16
+            | Ty::UInt32
+            | Ty::UInt64
+            | Ty::UIntNative
+            | Ty::Float16
+            | Ty::Float32
+            | Ty::Float64
+            | Ty::Bool
+            | Ty::Rune
+            | Ty::String
+            | Ty::Unit => true,
+            Ty::Option(inner) => self.ty_eq_comparable(inner),
+            Ty::Tuple(es) => es.iter().all(|e| self.ty_eq_comparable(e)),
+            // Range<T> 提供 == / !=（std.core），视为可比较。
+            Ty::Agg("range") => true,
+            // 用户类型（struct/enum/class）默认不支持 ==；类型别名解析后按底层类型判断，
+            // 显式定义了 operator func == / != 的用户类型视为支持。
+            Ty::User(n) => match self.alias_types.get(n) {
+                Some(next) => self.ty_eq_comparable(&ty_of(next)),
+                None => {
+                    self.known_funcs.contains(&format!("{}.op_eq", n))
+                        || self.known_funcs.contains(&format!("{}.op_ne", n))
+                }
+            },
+            _ => false,
+        }
+    }
+
+    /// 2.1.7(5)：元组支持 == / != 的条件是每个元素类型都支持。
+    fn check_tuple_comparison(&mut self, op: &BinOp, lt: &Ty, rt: &Ty) {
+        if !matches!(op, BinOp::Eq | BinOp::NotEq) {
+            return;
+        }
+        let mut tuples: Vec<&Vec<Ty>> = Vec::new();
+        if let Ty::Tuple(es) = lt {
+            tuples.push(es);
+        }
+        if let Ty::Tuple(es) = rt {
+            tuples.push(es);
+        }
+        for es in tuples {
+            if let Some(bad) = es.iter().find(|e| !self.ty_eq_comparable(e)) {
+                self.err(format!(
+                    "元组类型不支持 {} 比较：元素类型 '{}' 不支持相等比较（2.1.7(5)）",
+                    bin_symbol(op),
+                    bad.name()
+                ));
+                break;
+            }
         }
     }
 
@@ -6119,4 +7018,173 @@ mod tests {
         assert_err("struct S { private func f() {} }\nmain() { S().f() }", "私有成员函数");
     }
 
+    // ─── w11c：02 章 struct 类型细则 / tuple / array / 类型转换 ───────────────
+
+    #[test]
+    fn test_w11c_struct_static_instance_access() {
+        // 2.1.10.4(10)：静态成员须经类型名访问，实例成员须经实例访问。
+        assert_err("struct S { static let v = 1 }\nmain() { S().v }", "静态成员");
+        assert_err("struct S { static func f() {} }\nmain() { S().f() }", "静态成员函数");
+        assert_err("struct S { func f() {} }\nmain() { S.f() }", "实例成员函数");
+        assert_err("struct S { let v = 1 }\nmain() { S.v }", "实例成员");
+        assert_ok("struct S { static let v = 1 }\nmain() { let x = S.v }");
+        assert_ok("struct S { let v = 1 }\nmain() { let s = S(); let x = s.v }");
+        assert_ok("struct S { static func f() {} }\nmain() { S.f() }");
+    }
+
+    #[test]
+    fn test_w11c_struct_private_static_and_prop() {
+        // 2.1.10.4(6)：私有静态成员 / 私有属性仅在定义体内可见。
+        assert_err("struct S { private static let v = 1 }\nmain() { S.v }", "私有静态成员");
+        assert_err("struct S { private static func f() {} }\nmain() { S.f() }", "私有静态成员函数");
+        assert_err(
+            "struct S { private prop p: Int64 { get() { 1 } } }\nmain() { S().p }",
+            "私有属性",
+        );
+        assert_err(
+            "struct S { private prop p: Int64 { get() { 1 } } }\nmain() { S.p }",
+            "私有属性",
+        );
+        assert_ok("struct S { private prop p: Int64 { get() { 1 } } func g(): Int64 { this.p } }");
+    }
+
+    #[test]
+    fn test_w11c_struct_private_operator() {
+        // 2.1.10.4(6)：结构体私有运算符函数不可在定义体外使用。
+        assert_err(
+            "struct S { private operator func +(_: S) {} }\nmain() { S() + S() }",
+            "私有运算符函数",
+        );
+        assert_ok("struct S { operator func +(_: S) {} }\nmain() { S() + S() }");
+    }
+
+    #[test]
+    fn test_w11c_struct_implicit_ctor_uninitialized_field() {
+        // 2.1.10.2(44)：无显式构造函数时实例成员变量必须有初始值。
+        assert_err("struct A { var x: Int64 }", "没有初始值");
+        assert_err("struct A { let s: String = \"x\"; var y: Int64 }", "没有初始值");
+        assert_ok("struct A { var x: Int64 = 0 }");
+        assert_ok("struct A { A(var x: Int64) {} }");
+    }
+
+    #[test]
+    fn test_w11c_struct_inheritance_forbidden() {
+        // 2.1.10(7)：结构体不能被继承。
+        assert_err("struct A {}\nstruct B <: A {}", "不能继承");
+        assert_ok("interface I {}\nstruct B <: I {}");
+    }
+
+    #[test]
+    fn test_w11c_struct_field_default_rules() {
+        // 2.1.10.1(1)：成员变量初始化表达式类型须一致。
+        assert_err("struct S { let v: Int32 = \"a\" + \"b\" }", "初始化表达式类型");
+        assert_ok("struct S { let v: Int32 = 1 }");
+        // 2.1.10.1(3)：默认值只能引用此前已初始化的成员、不能调用实例函数。
+        assert_err("struct S { var a: String; var b: String = a }", "尚未初始化");
+        assert_err(
+            "struct S { var b: String = a; var a: String = \"x\" }",
+            "在其之后声明",
+        );
+        assert_err("struct S { var a: String = f(); func f(): String { \"x\" } }", "实例成员函数");
+        assert_ok("struct S { var a: String = \"x\"; var b: String = a }");
+    }
+
+    #[test]
+    fn test_w11c_generic_type_instantiation_arity() {
+        // 2.1.10.5(5)：泛型类型实例化须给出类型实参（可由构造实参推断时除外）。
+        assert_err("struct S<T, U> {}\nmain() { S() }", "类型实参");
+        assert_err("struct S<T, U> {}\nmain() { S<Int64>() }", "类型实参");
+        assert_err("struct S<T> {}\nmain() { S<Int64, Int64>() }", "类型实参");
+        assert_ok("struct S<T> { let v: T = 0 }"); // 仅声明，不实例化
+        assert_ok("struct S<T> { S(var x: T) {} }\nmain() { let s = S(1) }");
+        assert_ok("struct S<T> { S(var x: T) {} }\nmain() { let s = S<Int64>(1) }");
+    }
+
+    #[test]
+    fn test_w11c_struct_equality() {
+        // 2.1.10(5)：结构体默认不支持 == / !=，需显式定义运算符。
+        assert_err(
+            "struct S { let v = 1 }\nmain() { let a = S(); let b = S(); a == b }",
+            "不支持 ==",
+        );
+        assert_err(
+            "struct S { let v = 1 }\nmain() { let a = S(); let b = S(); a != b }",
+            "不支持 !=",
+        );
+        assert_ok("struct S { operator func ==(o: S) { true } }\nmain() { let a = S(); a == a }");
+        assert_ok("struct S { operator func !=(o: S) { false } }\nmain() { let a = S(); a != a }");
+    }
+
+    #[test]
+    fn test_w11c_struct_recursive_containment() {
+        // 2.1.10(11)：结构体不得递归/互递归直接包含自身实例。
+        assert_err("struct R { let o: R }", "递归");
+        assert_err("struct A1 { let b: A2 }\nstruct A2 { let a: A1 }", "递归");
+        assert_ok("struct R { let o: Box<R> = Box<R>() }");
+    }
+
+    #[test]
+    fn test_w11c_tuple_rules() {
+        // 2.1.7(1)：元组赋值要求元素个数与类型一致。
+        assert_err("main() { var t = (1, 2); t = (3, 4, 5) }", "类型不匹配");
+        assert_err("main() { var t: (Int64, Int64) = (1, 2); t = (\"a\", 2) }", "类型不匹配");
+        assert_ok("main() { var t = (1, 2); t = (3, 4) }");
+        // 2.1.7.3(1)：元组下标必须是 Int64 整数字面量。
+        assert_err("main() { let t = (1, 2); let x = t[1u64] }", "元组下标");
+        assert_ok("main() { let t = (1, 2); let x = t[1] }");
+        // 2.1.7(5)：元组比较要求元素类型支持 == / !=。
+        assert_err(
+            "struct R { let v = 1 }\nmain() { let r = R(); let t = (1, r); t == t }",
+            "元组类型不支持",
+        );
+        assert_ok("main() { let t = (1, 2); t == t }");
+    }
+
+    #[test]
+    fn test_w11c_function_type_rules() {
+        // 2.1.9(7)：函数类型不支持 == / !=。
+        assert_err(
+            "type F = () -> Int32\nfunc f(): Int32 { 1 }\nmain() { let a: F = f; let b: F = f; a == b }",
+            "函数类型不支持",
+        );
+        // 2.1.9(1)：函数标识符不可被重新赋值。
+        assert_err("func f() {}\nfunc g() {}\nmain() { f = g }", "不能被重新赋值");
+        assert_ok("func f() {}\nmain() { f() }");
+    }
+
+    #[test]
+    fn test_w11c_array_element_rules() {
+        // 2.2.1(2)：数组元素赋值要求值类型可赋给元素类型。
+        assert_err(
+            "main() { let a = Array<Int64>(3) { i => 1 }; a[0] = 34i8 }",
+            "数组元素",
+        );
+        assert_ok("main() { let a = Array<Int64>(3) { i => 1 }; a[0] = 34 }");
+        // 2.2.1.2(1)：数组下标必须是 Int64。
+        assert_err(
+            "main() { let a = Array<Int64>(3) { i => 1 }; let x = a[1i32] }",
+            "数组下标",
+        );
+        assert_ok("main() { let a = Array<Int64>(3) { i => 1 }; let x = a[1] }");
+        // 2.2.1(4)：数组长度不可修改。
+        assert_err(
+            "main() { let a = Array<Int64>(3) { i => 1 }; a.size = 4 }",
+            "size",
+        );
+        assert_ok("main() { let a = Array<Int64>(3) { i => 1 }; let n = a.size }");
+    }
+
+    #[test]
+    fn test_w11c_numeric_implicit_conversion_forbidden() {
+        // 2.3.1(9)：数值类型间必须显式转换，不能按返回值隐式加宽。
+        assert_err("func f(): UInt8 { return 7u8 }\nmain() { var a: UInt16 = f() }", "类型不匹配");
+        assert_ok("func f(): UInt8 { return 7u8 }\nmain() { var a: UInt8 = f() }");
+    }
+
+    #[test]
+    fn test_w11c_literal_or_type_call_forbidden() {
+        // 2.3.1(10)：字面量 / 类型名不能作为函数值调用。
+        assert_err("main() { let a = 8i8(Int32) }", "字面量不能作为函数值调用");
+        assert_ok("main() { let a = Int32(8i8) }");
+    }
 }
