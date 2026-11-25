@@ -419,6 +419,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // `This` 类型只能作为类的实例成员函数返回类型（6.1.4(1)）。
     check_this_type_usage(program, &mut errors);
 
+    // 13 章：C 语言互操作的单文件类型约束（foreign func / CFunc）。
+    check_c_interop(program, &index, &mut errors);
+
     // 不允许实例化抽象类 / 接口；不能继承 struct/enum。
     check_instantiation_targets(program, &mut errors);
 
@@ -6227,6 +6230,266 @@ fn for_each_type_in_stmts<'a>(stmts: &'a [Stmt], f: &mut dyn FnMut(&'a Type)) {
     }
 }
 
+// ─── 13 章 C 语言互操作：单文件可判定的类型约束 ────────────────────────────
+//
+// 覆盖以下规则（均可仅凭单个 AST 精确定位，且保守放行无法在本地判定的类型）：
+//   * 13.1.2.2：foreign func 的形参不允许使用命名参数（`x!: T`）或默认值；
+//   * 13.1.3.1：foreign func 的形参/返回类型必须是 C 类型（CPointer/CString/
+//     CFunc/基本整型/浮点/bool 等）；已知非 C 类型（String/Rune/Nothing/
+//     元组/Range/函数类型/本地声明的 class、enum、interface）予以拒绝；
+//   * 13.1.3.2：`CFunc<F>` 中的函数签名 F 的形参与返回类型同样必须是 C 类型。
+//
+// 注意：`Unit` 作为**形参**非法，但作为**返回值**合法（C 的 void）；VArray
+// 在解析阶段会降级为 Array，二者无法区分，故 Array 一律放行以避免误伤合法
+// 的 VArray 形参；@C struct 与本地无法解析的具名类型（别名/泛型参数/外部
+// 声明）一律放行。
+
+/// 判断某个类型是否属于「本地可确认的非 CType」。
+///
+/// 返回 `Some(说明)` 表示该类型确定不能用作 C 函数签名中的类型；`None`
+/// 表示它是 C 类型或无法在本地判定（保守放行）。
+fn non_ctype_kind(
+    ty: &Type,
+    index: &ProgramIndex,
+    reject_array: bool,
+    depth: usize,
+) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    match ty {
+        Type::Rune => Some("Rune".to_string()),
+        Type::Nothing => Some("Nothing".to_string()),
+        Type::String => Some("String".to_string()),
+        Type::Tuple(_) => Some("元组".to_string()),
+        Type::Range => Some("Range".to_string()),
+        Type::Function { .. } => Some("函数类型".to_string()),
+        Type::Array(_) if reject_array => Some("Array".to_string()),
+        Type::Struct(name, _) => {
+            if name == "Range" {
+                return Some("Range".to_string());
+            }
+            if index.classes.contains_key(name.as_str()) {
+                return Some("class 类型".to_string());
+            }
+            if index.enums.contains(name.as_str()) {
+                return Some("枚举类型".to_string());
+            }
+            if index.interfaces.contains_key(name.as_str()) {
+                return Some("interface 类型".to_string());
+            }
+            // 解析本地类型别名后继续判定（如 `type S = String`）。
+            if let Some(target) = index.aliases.get(name.as_str()) {
+                return non_ctype_kind(target, index, reject_array, depth + 1);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// 校验 foreign func 的形参与返回类型，以及命名参数/默认值限制。
+fn check_foreign_func(func: &Function, index: &ProgramIndex, errors: &mut Vec<SemanticError>) {
+    for p in &func.params {
+        // 变长参数占位（`...`）本身不携带可校验类型。
+        if p.variadic {
+            continue;
+        }
+        if p.is_named {
+            errors.push(SemanticError {
+                message: format!(
+                    "外来函数 '{}' 的形参 '{}' 不允许使用命名参数（13.1.2.2）",
+                    func.name, p.name
+                ),
+            });
+            continue;
+        }
+        if p.default.is_some() {
+            errors.push(SemanticError {
+                message: format!(
+                    "外来函数 '{}' 的形参 '{}' 不允许指定默认值（13.1.2.2）",
+                    func.name, p.name
+                ),
+            });
+            continue;
+        }
+        if p.ty == Type::Unit {
+            errors.push(SemanticError {
+                message: format!(
+                    "Unit 不能作为外来函数 '{}' 的形参 '{}' 的类型（13.1.3.1）",
+                    func.name, p.name
+                ),
+            });
+            continue;
+        }
+        if let Some(kind) = non_ctype_kind(&p.ty, index, false, 0) {
+            errors.push(SemanticError {
+                message: format!(
+                    "{} 不能作为外来函数 '{}' 的形参 '{}' 的类型（13.1.3.1）",
+                    kind, func.name, p.name
+                ),
+            });
+        }
+    }
+    if let Some(ret) = &func.return_type {
+        // Unit 作为返回值（C 的 void）合法。
+        if *ret != Type::Unit {
+            if let Some(kind) = non_ctype_kind(ret, index, false, 0) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "{} 不能作为外来函数 '{}' 的返回类型（13.1.3.1）",
+                        kind, func.name
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 校验 `CFunc<F>` 中函数签名 F 的形参/返回类型是否为 C 类型。
+fn check_cfunc_type(ty: &Type, index: &ProgramIndex, errors: &mut Vec<SemanticError>) {
+    let Type::Struct(name, args) = ty else {
+        return;
+    };
+    if name != "CFunc" {
+        return;
+    }
+    let Some(Type::Function { params, ret }) = args.first() else {
+        return;
+    };
+    // CFunc 内部允许 Unit（C 的 void 返回值常见）。VArray 在解析阶段降级为
+    // Array，无法与普通 Array 区分，故 Array 一律放行。
+    for p in params {
+        if let Some(kind) = non_ctype_kind(p, index, false, 0) {
+            errors.push(SemanticError {
+                message: format!(
+                    "{} 不能用作 CFunc 函数签名的形参类型（13.1.3.2）",
+                    kind
+                ),
+            });
+        }
+    }
+    if let Some(r) = ret.as_ref().as_ref() {
+        if *r != Type::Unit {
+            if let Some(kind) = non_ctype_kind(r, index, false, 0) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "{} 不能用作 CFunc 函数签名的返回类型（13.1.3.2）",
+                        kind
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 遍历程序中所有类型出现位置（声明类型实参、形参、返回类型、函数体）。
+fn for_each_type_in_program<'a>(program: &'a Program, f: &mut dyn FnMut(&'a Type)) {
+    for func in &program.functions {
+        for p in &func.params {
+            f(&p.ty);
+        }
+        if let Some(r) = &func.return_type {
+            f(r);
+        }
+        for_each_type_in_stmts(&func.body, f);
+    }
+    for c in &program.constants {
+        f(&c.ty);
+    }
+    for cls in &program.classes {
+        for fld in &cls.fields {
+            f(&fld.ty);
+        }
+        for p in &cls.primary_ctor_params {
+            f(&p.ty);
+        }
+        if let Some(init) = &cls.init {
+            for p in &init.params {
+                f(&p.ty);
+            }
+            for_each_type_in_stmts(&init.body, f);
+        }
+        for m in &cls.methods {
+            for p in &m.func.params {
+                f(&p.ty);
+            }
+            if let Some(r) = &m.func.return_type {
+                f(r);
+            }
+            for_each_type_in_stmts(&m.func.body, f);
+        }
+    }
+    for st in &program.structs {
+        for fld in &st.fields {
+            f(&fld.ty);
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            for p in &m.params {
+                f(&p.ty);
+            }
+            if let Some(r) = &m.return_type {
+                f(r);
+            }
+        }
+    }
+    for en in &program.enums {
+        for v in &en.variants {
+            if let Some(p) = &v.payload {
+                f(p);
+            }
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            for p in &m.params {
+                f(&p.ty);
+            }
+            if let Some(r) = &m.return_type {
+                f(r);
+            }
+            for_each_type_in_stmts(&m.body, f);
+        }
+    }
+}
+
+fn check_c_interop(program: &Program, index: &ProgramIndex, errors: &mut Vec<SemanticError>) {
+    // foreign func（extern 导入，无函数体）的参数/返回类型与命名参数限制。
+    for func in &program.functions {
+        if func.extern_import.is_some() {
+            check_foreign_func(func, index, errors);
+        }
+    }
+    // 所有位置出现的 CFunc<F> 签名类型。
+    for_each_type_in_program(program, &mut |ty| {
+        check_cfunc_type(ty, index, errors);
+    });
+    // 13.1.4：class / enum / interface 不能实现内建 CType 接口；CType 亦不可
+    // 被 extend 实现（@C struct 隐式满足 CType，无需也无法显式实现）。
+    for cls in &program.classes {
+        // `class X <: CType` 会被解析为继承（extends），而非 implements。
+        if cls.extends.as_deref() == Some("CType")
+            || cls.implements.iter().any(|i| i == "CType")
+        {
+            errors.push(SemanticError {
+                message: format!("class '{}' 不能实现 CType 接口（13.1.4）", cls.name),
+            });
+        }
+    }
+    for ext in &program.extends {
+        if ext.interface.as_deref() == Some("CType") {
+            errors.push(SemanticError {
+                message: format!(
+                    "类型 '{}' 不能通过 extend 实现 CType 接口（13.1.4）",
+                    ext.target_type
+                ),
+            });
+        }
+    }
+}
+
 fn check_this_type_usage(program: &Program, errors: &mut Vec<SemanticError>) {
     let mut bad = |what: &str, errors: &mut Vec<SemanticError>| {
         errors.push(SemanticError {
@@ -9537,6 +9800,94 @@ main() {}"#,
         assert_invalid(
             "struct A {\n A(var p: Int64) {}\n func check() {\n let t = A.p\n }\n}\n",
         );
+    }
+
+
+    // ─── 13 章 C 互操作（foreign func / CFunc 类型约束） ────────────────────
+
+    #[test]
+    fn test_c_interop_foreign_param_non_ctype_rejected() {
+        // String / Rune / 元组 / Range / 函数类型 均非 CType。
+        assert_invalid("foreign func f(x: String): Int32\nmain() {}");
+        assert_invalid("foreign func f(x: Rune): Int32\nmain() {}");
+        assert_invalid("foreign func f(x: (Int32, Int32)): Int32\nmain() {}");
+        assert_invalid("foreign func f(x: Range<Int32>): Int32\nmain() {}");
+        assert_invalid("foreign func f(x: (Int32)->Int32): Int32\nmain() {}");
+        // Unit 不能作形参。
+        assert_invalid("foreign func f(x: Unit): Int32\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_c_interop_foreign_return_non_ctype_rejected() {
+        assert_invalid("foreign func f(): String\nmain() {}");
+        assert_invalid("foreign func f(): Rune\nmain() {}");
+        assert_invalid("foreign func f(): Nothing\nmain() {}");
+        assert_invalid("foreign func f(): (Int32, Int32)\nmain() {}");
+        assert_invalid("foreign func f(): Range<Int32>\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_c_interop_foreign_local_class_enum_interface_rejected() {
+        assert_invalid("class ABC {}\nforeign func f(x: ABC): Int32\nmain() {}");
+        assert_invalid("class ABC {}\nforeign func f(): ABC\nmain() {}");
+        assert_invalid("enum TimeUnit { Year | Month }\nforeign func f(x: TimeUnit): Int32\nmain() {}");
+        assert_invalid("interface I {}\nforeign func f(x: I): Int32\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_c_interop_foreign_named_or_default_param_rejected() {
+        assert_invalid("foreign func f(x: Int32, y!: Int32): Int32\nmain() {}");
+        assert_invalid("foreign func f(x: Int32 = 666)\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_c_interop_foreign_alias_to_non_ctype_rejected() {
+        assert_invalid("type S = String\nforeign func f(x: S): Int32\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_c_interop_foreign_legal_forms_accepted() {
+        // 基本 C 类型、CPointer/CString/CFunc、Unit 返回值均合法。
+        assert_valid("foreign func f(x: Int32, y: Float64): Int32\nmain() {}");
+        assert_valid("foreign func f(p: CPointer<Int8>): Unit\nmain() {}");
+        assert_valid("foreign func f(s: CString): CString\nmain() {}");
+        assert_valid("foreign func f(cb: CFunc<(Int32)->Int32>): Unit\nmain() {}");
+        // 无显式返回类型（隐式 Unit）应保持兼容（既有代码依赖）。
+        assert_valid("foreign func f(x: Int32)\nmain() {}");
+        // @C struct 与本地无法判定的具名类型（struct）保守放行。
+        assert_valid("struct S { let x: Int32 }\nforeign func f(p: S): S\nmain() {}");
+        // VArray 在解析阶段降级为 Array，须放行以免误伤合法形参。
+        assert_valid("foreign func f(a: VArray<Int32, $3>): Unit\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_c_interop_cfunc_signature_types_checked() {
+        // CFunc 内部签名出现非 C 类型应被拒绝。
+        assert_invalid("func f(cb: CFunc<(String)->Int32>) {}\nmain() {}");
+        assert_invalid("func f(cb: CFunc<()->Rune>) {}\nmain() {}");
+        assert_invalid("func f(cb: CFunc<(Int32)->(Int32)->Int32>) {}\nmain() {}");
+        assert_invalid("enum E { A }\nfunc f(cb: CFunc<(E)->Int32>) {}\nmain() {}");
+        assert_invalid("class C {}\nfunc f(cb: CFunc<()->C>) {}\nmain() {}");
+        // 合法 CFunc：基本类型、Unit 返回、VArray 形参（降级为 Array）。
+        assert_valid("func f(cb: CFunc<(Int32)->Int32>) {}\nmain() {}");
+        assert_valid("func f(cb: CFunc<()->Unit>) {}\nmain() {}");
+        assert_valid("func f(cb: CFunc<(VArray<Int32, $3>)->Int32>) {}\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_c_interop_implementation_of_ctype_rejected() {
+        // class 不能实现 CType；CType 也不能被 extend 实现。
+        assert_invalid("class ABC <: CType {}\nmain() {}");
+        assert_invalid("class C {}\nextend C <: CType {}\nmain() {}");
+        // 泛型约束 `where T <: CType` 合法，不应被误判。
+        assert_valid("class D<T> where T <: CType {}\nmain() {}");
     }
 
 }
