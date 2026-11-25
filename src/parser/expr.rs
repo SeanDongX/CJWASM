@@ -1414,6 +1414,15 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 // catch 是可选的（try-with-resources 或 try-finally 可无 catch）
                 if !self.check(&Token::Catch) && !self.check(&Token::Finally) {
+                    // 12.1.1(2)：普通 try 表达式必须至少有一个 catch 或 finally 块；
+                    // 仅 try-with-resources（带资源声明）允许两者都没有。
+                    if resources.is_empty() {
+                        let tok = self.peek().cloned().unwrap_or(Token::Semicolon);
+                        return self.bail(ParseError::UnexpectedToken(
+                            tok,
+                            "try 表达式至少需要一个 catch 或 finally 块（12.1.1(2)）".to_string(),
+                        ));
+                    }
                     // try-with-resources without catch/finally: auto-generate empty finally
                     return Ok(Expr::TryBlock {
                         resources,
@@ -3240,5 +3249,39 @@ main() { Test.f<Array<Int64>>(1) }
         err("class Test { static func f<T>() {} }\nmain() { Test.f<_>() }");
         err("class Test { static func f<T>() {} }\nmain() { Test.f<1 + 2>() }");
         err("class Test { static func f<T>() {} }\nmain() { Test.f<if (true) {1} else {2}>() }");
+    }
+
+    /// 仅解析（不跑语义校验），断言解析失败。
+    fn parse_err_only(src: &str) {
+        let tokens: Result<Vec<_>, _> = crate::lexer::Lexer::new(src).collect();
+        let tokens = tokens.expect("lex error");
+        let mut parser = crate::parser::Parser::new(tokens).with_source(src);
+        assert!(
+            parser.parse_program().is_err(),
+            "期望解析失败，实际成功:\n{}",
+            src
+        );
+    }
+
+    /// 仅解析（不跑语义校验），断言解析成功。
+    fn parse_ok_only(src: &str) {
+        let tokens: Result<Vec<_>, _> = crate::lexer::Lexer::new(src).collect();
+        let tokens = tokens.expect("lex error");
+        let mut parser = crate::parser::Parser::new(tokens).with_source(src);
+        parser
+            .parse_program()
+            .unwrap_or_else(|e| panic!("期望解析成功，实际报错: {:?}\n{}", e, src));
+    }
+
+    #[test]
+    fn test_w12d_try_requires_catch_or_finally() {
+        // 12.1.1(2)：普通 try 表达式（无资源声明）必须至少有一个 catch 或 finally 块。
+        parse_err_only("main() { try {} }");
+        // 合法的 try 形态仍应解析成功。
+        parse_ok_only("main() { try {} catch (_) {} }");
+        parse_ok_only("main() { try {} catch (e: Exception) {} }");
+        parse_ok_only("main() { try {} finally {} }");
+        // try-with-resources 允许既无 catch 也无 finally。
+        parse_ok_only("main() { try (r = 1) {} }");
     }
 }

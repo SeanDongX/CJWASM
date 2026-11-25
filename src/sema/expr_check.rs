@@ -5258,6 +5258,32 @@ impl<'a> Checker<'a> {
             // 12.2(1)：throw 的操作数必须是 Exception 或 Error（可按继承链判定）。
             Expr::Throw(inner) => {
                 let t = self.check_expr(inner);
+                // 枚举成员（`EnumName.Variant`）不是异常类型。
+                let enum_member = match &**inner {
+                    Expr::VariantConst { .. } => true,
+                    Expr::Field { object, field } => match &**object {
+                        Expr::Var(n) => {
+                            self.enum_names.contains(n) && self.enum_variants.contains(field)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if enum_member {
+                    self.err(
+                        "throw 的操作数类型必须为 Exception 或 Error 的子类型，实际为枚举成员（12.2(1)）"
+                            .to_string(),
+                    );
+                }
+                // 裸函数名（未调用）不是异常类型；若同名变量存在（遮蔽函数）则放行。
+                if let Expr::Var(n) = &**inner {
+                    if self.lookup(n).is_none() && self.known_funcs.contains(n) {
+                        self.err(format!(
+                            "throw 的操作数不能为函数引用 '{}'，必须为 Exception 或 Error 的子类型（12.2(1)）",
+                            n
+                        ));
+                    }
+                }
                 self.check_throw_operand(&t);
                 Ty::Unknown
             }
@@ -8071,6 +8097,23 @@ mod tests {
         assert_ok("main() { var v: UInt8 = 1; let x = -v }");
         // 有符号整数取负正常通过。
         assert_ok("main() { var v: Int64 = 1; let x = -v }");
+    }
+
+    #[test]
+    fn test_w12d_throw_enum_member_and_function_ref_rejected() {
+        // 12.2(1)：枚举成员不是异常类型。
+        assert_err(
+            "enum H { ROCK | PAPER }\nmain() { throw H.ROCK }",
+            "throw 的操作数类型",
+        );
+        // 12.2(1)：裸函数名（未调用）不是 Exception/Error。
+        assert_err(
+            "func foo(): Error { Error() }\nmain() { throw foo }",
+            "throw 的操作数",
+        );
+        // 抛出异常变量或构造调用仍合法。
+        assert_ok("main() { let e = Exception()\n throw e }");
+        assert_ok("main() { throw Error() }");
     }
 
 }

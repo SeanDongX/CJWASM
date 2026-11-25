@@ -307,6 +307,21 @@ impl Parser {
                     let skip_next = self.skip_optional_attributes()?;
                     if skip_next {
                         self.skip_next_top_level_decl()?;
+                    } else if self.last_attr_c {
+                        // 13.1.2.1(3)：`@C` 只能修饰 foreign 函数、非泛型顶层函数、
+                        // 非泛型顶层结构体；其它目标（class/enum/interface/extend/
+                        // macro/type/变量/泛型函数/泛型结构体）均为非法。
+                        if let Some(kind) = self.c_attr_decl_violation() {
+                            let tok = self.peek().cloned().unwrap_or(Token::Semicolon);
+                            return self.bail(ParseError::UnexpectedToken(
+                                tok,
+                                format!(
+                                    "@C 只能修饰 foreign 函数、非泛型顶层函数或顶层结构体，不能修饰{}（13.1.2.1(3)）",
+                                    kind
+                                ),
+                            ));
+                        }
+                        self.pending_c_decl = true;
                     }
                     continue;
                 }
@@ -338,6 +353,9 @@ impl Parser {
                 None
             };
 
+            // 消费上一轮 `@C` 属性标记（若本次声明带 `@C`）。
+            let c_attr = std::mem::take(&mut self.pending_c_decl);
+
             if self.check(&Token::Foreign) {
                 self.advance();
                 // cjc: foreign { func ... } 块语法（多个 FFI 函数）
@@ -358,7 +376,31 @@ impl Parser {
             } else {
                 match self.peek() {
                     Some(Token::Struct) => {
-                        structs.push(self.parse_struct_with_visibility(visibility)?)
+                        let sd = self.parse_struct_with_visibility(visibility)?;
+                        if c_attr {
+                            // 13.1.3.5(8)：@C 结构体不能带类型参数。
+                            if !sd.type_params.is_empty() {
+                                return self.bail(ParseError::UnexpectedToken(
+                                    Token::Struct,
+                                    format!(
+                                        "@C 结构体 '{}' 不能带类型参数（13.1.3.5(8)）",
+                                        sd.name
+                                    ),
+                                ));
+                            }
+                            // 13.1.3.5(4)：@C 结构体不能实现/继承接口。
+                            if sd.constraints.iter().any(|c| c.param == sd.name) {
+                                return self.bail(ParseError::UnexpectedToken(
+                                    Token::Struct,
+                                    format!(
+                                        "@C 结构体 '{}' 不能实现接口（13.1.3.5(4)）",
+                                        sd.name
+                                    ),
+                                ));
+                            }
+                            self.c_structs.insert(sd.name.clone());
+                        }
+                        structs.push(sd)
                     }
                     Some(Token::Interface) => {
                         interfaces.push(self.parse_interface_with_visibility(visibility)?)
@@ -392,7 +434,17 @@ impl Parser {
                         }
                     }
                     Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
-                    Some(Token::Extend) => extends.push(self.parse_extend()?),
+                    Some(Token::Extend) => {
+                        // 8.6：扩展定义的可见性由被扩展类型的可见性决定，
+                        // 不允许显式 `public extend`（private/protected 同理非法）。
+                        if !matches!(visibility, Visibility::Internal) {
+                            return self.bail(ParseError::UnexpectedToken(
+                                Token::Extend,
+                                "扩展定义不能使用可见性修饰符（8.6）".to_string(),
+                            ));
+                        }
+                        extends.push(self.parse_extend()?)
+                    }
                     // P2.2: type Name = Type  /  type Name<T, U> = Type<T, U>
                     Some(Token::TypeAlias) => {
                         self.advance();
@@ -424,13 +476,25 @@ impl Parser {
                         type_aliases.push((alias_name, target_ty));
                     }
                     Some(Token::Func) => {
-                        functions.push(self.parse_function_with_visibility(visibility)?)
+                        let f = self.parse_function_with_visibility(visibility)?;
+                        if c_attr {
+                            if let Some(msg) = self.validate_c_func(&f) {
+                                return self.bail(ParseError::UnexpectedToken(Token::Func, msg));
+                            }
+                        }
+                        functions.push(f)
                     }
                     // cjc: unsafe func — 忽略 unsafe 修饰符，当普通函数处理
                     Some(Token::Unsafe) => {
                         self.advance(); // consume unsafe
                         if self.check(&Token::Func) {
-                            functions.push(self.parse_function_with_visibility(visibility)?)
+                            let f = self.parse_function_with_visibility(visibility)?;
+                            if c_attr {
+                                if let Some(msg) = self.validate_c_func(&f) {
+                                    return self.bail(ParseError::UnexpectedToken(Token::Func, msg));
+                                }
+                            }
+                            functions.push(f)
                         } else {
                             let tok = self.advance().unwrap_or(Token::Semicolon);
                             return self.bail(ParseError::UnexpectedToken(
@@ -520,6 +584,56 @@ impl Parser {
             }
         }
         functions.extend(self.pending_struct_methods.drain(..));
+        // 13.1.3.5(3)：@C 结构体字段必须是满足 CType 约束的类型。
+        if !self.c_structs.is_empty() {
+            let mut bad_users: std::collections::HashSet<String> = std::collections::HashSet::new();
+            bad_users.extend(classes.iter().map(|c| c.name.clone()));
+            bad_users.extend(enums.iter().map(|e| e.name.clone()));
+            bad_users.extend(interfaces.iter().map(|i| i.name.clone()));
+            for s in &structs {
+                if !self.c_structs.contains(&s.name) {
+                    bad_users.insert(s.name.clone());
+                }
+            }
+            if let Some((sname, what)) =
+                c_struct_field_violation(&structs, &self.c_structs, &bad_users)
+            {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Struct,
+                    format!(
+                        "@C 结构体 '{}' 的字段类型不能为 {}（13.1.3.5(3)）",
+                        sname, what
+                    ),
+                ));
+            }
+        }
+        // 7.1(4)：数值、Bool、Unit、Nothing、Rune、String、Range、Function、枚举、
+        // 元组类型不能定义 mut 属性。扩展中的 `mut prop` 会被脱糖为 `__set_` 方法，
+        // 以此判定并拦截。
+        {
+            let mut no_mut_targets: std::collections::HashSet<&str> = [
+                "Int8", "Int16", "Int32", "Int64", "IntNative", "UInt8", "UInt16", "UInt32",
+                "UInt64", "UIntNative", "Float16", "Float32", "Float64", "Bool", "Unit",
+                "Nothing", "Rune", "String", "Range", "Function", "Tuple", "Option",
+            ]
+            .into_iter()
+            .collect();
+            for e in &enums {
+                no_mut_targets.insert(e.name.as_str());
+            }
+            for ext in &extends {
+                let has_setter = ext.methods.iter().any(|m| m.name.contains(".__set_"));
+                if has_setter && no_mut_targets.contains(ext.target_type.as_str()) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Extend,
+                        format!(
+                            "类型 '{}' 不能定义 mut 属性（7.1(4)）",
+                            ext.target_type
+                        ),
+                    ));
+                }
+            }
+        }
         Ok(Program {
             package_name,
             imports,
@@ -532,6 +646,31 @@ impl Parser {
             type_aliases,
             constants,
         })
+    }
+
+    /// `@C` 函数约束（13.1.2.1(3)/13.1.4(4)）：非泛型，且参数/返回类型不得为 `CType`。
+    fn validate_c_func(&self, f: &Function) -> Option<String> {
+        if !f.type_params.is_empty() {
+            return Some(format!(
+                "@C 函数 '{}' 不能为泛型函数（13.1.2.1(3)）",
+                f.name
+            ));
+        }
+        if let Some(p) = f.params.iter().find(|p| is_ctype_type(&p.ty)) {
+            return Some(format!(
+                "@C 函数 '{}' 的参数 '{}' 不能为 CType（13.1.4(4)）",
+                f.name, p.name
+            ));
+        }
+        if let Some(rt) = &f.return_type {
+            if is_ctype_type(rt) {
+                return Some(format!(
+                    "@C 函数 '{}' 的返回类型不能为 CType（13.1.4(4)）",
+                    f.name
+                ));
+            }
+        }
+        None
     }
 
     /// 解析 import 语句 (cjc: import path.to.Item 或 import path.to.*)
@@ -1892,6 +2031,12 @@ impl Parser {
                 continue;
             }
             self.skip_optional_attributes()?;
+            if self.last_attr_c {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::At,
+                    "@C 不能修饰接口成员（13.1.2.1(3)）".to_string(),
+                ));
+            }
             // 接口成员修饰符（static / public / mut / const / operator ...）可任意顺序。
             let mods = self.parse_member_modifiers();
             // cjc: 接口中的 prop 声明，脱糖为抽象 getter/setter 方法
@@ -2273,6 +2418,13 @@ impl Parser {
             }
             // 成员修饰符可任意顺序组合（public static func / static public ...）
             let mods = self.parse_member_modifiers();
+            // 8.2：扩展成员不支持 open/override/redef 修饰符（无继承语义）。
+            if mods.is_open || mods.is_override {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Extend,
+                    "扩展成员不支持 open/override/redef 修饰符（8.2）".to_string(),
+                ));
+            }
             // 关联类型绑定: type Element = ConcreteType; (cjc: type 是保留字)
             if matches!(self.peek(), Some(Token::TypeAlias)) {
                 self.advance(); // consume "type"
@@ -2292,6 +2444,12 @@ impl Parser {
             }
             if self.check(&Token::At) {
                 self.skip_optional_attributes()?;
+                if self.last_attr_c {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::At,
+                        "@C 不能修饰扩展成员（13.1.2.1(3)）".to_string(),
+                    ));
+                }
                 continue;
             }
             // 方法: [public/private/...] func name(args): Ret { body } (cjc 兼容)
@@ -3123,6 +3281,12 @@ impl Parser {
                 init = Some(idef);
             } else if self.check(&Token::At) {
                 self.skip_optional_attributes()?;
+                if self.last_attr_c {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::At,
+                        "@C 不能修饰类成员（13.1.2.1(3)）".to_string(),
+                    ));
+                }
                 continue; // 跳过属性后重新循环，下一次会看到 Func 等
             } else if self.check(&Token::Func) || self.check(&Token::Operator) {
                 // 修饰符已由 parse_member_modifiers() 以任意顺序收集
@@ -3761,6 +3925,61 @@ impl Parser {
     }
 }
 
+/// `@C` 结构体字段类型是否违反 CType 约束（13.1.3.5(3)）。
+///
+/// 返回首个违规 `(结构体名, 类型描述)`。`bad_users` 为本文件中不能作为 @C
+/// 字段类型的用户类型名（class/enum/interface 及非 @C 结构体）。
+fn c_struct_field_violation(
+    structs: &[StructDef],
+    c_structs: &std::collections::HashSet<String>,
+    bad_users: &std::collections::HashSet<String>,
+) -> Option<(String, String)> {
+    for s in structs {
+        if !c_structs.contains(&s.name) {
+            continue;
+        }
+        for f in &s.fields {
+            if let Some(what) = c_bad_field_type(&f.ty, bad_users) {
+                return Some((s.name.clone(), what.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// 单个 @C 结构体字段类型是否为非法 CType 形态。
+///
+/// 注意：`Array<T>` 与 `VArray<T, N>` 在解析阶段均降级为 `Type::Array`，
+/// 而 `VArray` 是合法 CType 字段，故此处不对 `Type::Array` 报错。
+fn c_bad_field_type(
+    t: &Type,
+    bad_users: &std::collections::HashSet<String>,
+) -> Option<&'static str> {
+    match t {
+        Type::Rune => Some("Rune 类型"),
+        Type::String => Some("String 类型"),
+        Type::Range => Some("Range 类型"),
+        Type::Tuple(_) => Some("元组类型"),
+        Type::Function { .. } => Some("函数类型"),
+        Type::TypeParam(_) => Some("类型参数"),
+        // `Range<T>` 带实参时解析为 Struct("Range", ...)。
+        Type::Struct(name, _) if name == "Range" => Some("Range 类型"),
+        Type::Struct(name, _) if bad_users.contains(name) => {
+            Some("类、枚举、接口或非 @C 结构体类型")
+        }
+        _ => None,
+    }
+}
+
+/// 类型是否为内置 `CType` 接口。
+fn is_ctype_type(t: &Type) -> bool {
+    match t {
+        Type::Struct(name, _) => name == "CType",
+        Type::Qualified(segs) => segs.last().map_or(false, |s| s == "CType"),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod decl_tests {
     use crate::pipeline::parse_source;
@@ -4014,5 +4233,201 @@ main() {}
         let f = cls.fields.iter().find(|f| f.name == "d").expect("field d");
         assert!(f.is_static, "static const field should be static");
         assert!(!f.is_mut, "const field should be immutable");
+    }
+
+    /// 仅解析（不跑语义校验），便于精确断言解析期规则。返回错误消息文本。
+    fn parse_only(src: &str) -> Result<crate::ast::Program, String> {
+        let lexer = crate::lexer::Lexer::new(src);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = crate::parser::Parser::new(tokens).with_source(src);
+        parser
+            .parse_program()
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn expect_parse_err_contains(src: &str, needle: &str) {
+        match parse_only(src) {
+            Ok(_) => panic!("expected parse error containing {:?}, got Ok\n{}", needle, src),
+            Err(msg) => assert!(
+                msg.contains(needle),
+                "expected error containing {:?}, got {:?}\n{}",
+                needle,
+                msg,
+                src
+            ),
+        }
+    }
+
+    // ---- @C 属性目标限制（13.1.2.1(3)）----
+
+    #[test]
+    fn test_w12d_c_attr_on_class_rejected() {
+        expect_parse_err_contains("@C\nclass A {}\nmain() {}", "@C");
+    }
+
+    #[test]
+    fn test_w12d_c_attr_on_enum_interface_extend_rejected() {
+        expect_parse_err_contains("@C\nenum E { A }\nmain() {}", "@C");
+        expect_parse_err_contains("@C\ninterface I {}\nmain() {}", "@C");
+        expect_parse_err_contains("@C\nextend Int64 {}\nmain() {}", "@C");
+    }
+
+    #[test]
+    fn test_w12d_c_attr_on_type_alias_and_var_rejected() {
+        expect_parse_err_contains("@C\ntype MyInt = Int64\nmain() {}", "@C");
+        expect_parse_err_contains("@C\nvar x = 1\nmain() {}", "@C");
+        expect_parse_err_contains("@C\nlet y: Int64 = 1\nmain() {}", "@C");
+    }
+
+    #[test]
+    fn test_w12d_c_attr_on_generic_func_and_struct_rejected() {
+        expect_parse_err_contains("@C\nfunc f<T>(x: T): T { return x }\nmain() {}", "@C");
+        expect_parse_err_contains("@C\nstruct S<T> {}\nmain() {}", "@C");
+    }
+
+    #[test]
+    fn test_w12d_c_attr_on_macro_and_class_member_rejected() {
+        expect_parse_err_contains("@C\nmacro M() { 1 }\nmain() {}", "@C");
+        // 类/接口/扩展成员上的 @C 同样非法。
+        expect_parse_err_contains("class A { @C func f() {} }\nmain() {}", "@C");
+        expect_parse_err_contains("interface I { @C func f() }\nmain() {}", "@C");
+        expect_parse_err_contains(
+            "class A {}\nextend A { @C func f() {} }\nmain() {}",
+            "@C",
+        );
+    }
+
+    #[test]
+    fn test_w12d_c_attr_on_func_foreign_struct_allowed() {
+        // 合法目标：非泛型顶层函数、foreign 函数、非泛型顶层结构体。
+        parse_only("@C\nfunc f(x: Int32): Int32 { return x }\nmain() {}")
+            .expect("@C func should parse");
+        parse_only("@C\nforeign func g(x: Int32): Unit\nmain() {}")
+            .expect("@C foreign func should parse");
+        parse_only("@C\nstruct S { var x: Int32 }\nmain() {}")
+            .expect("@C struct should parse");
+        parse_only("@C\npublic func f(x: Int32): Int32 { return x }\nmain() {}")
+            .expect("@C public func should parse");
+    }
+
+    // ---- @C 结构体/函数 CType 约束（13.1.3.5(3)/13.1.3.5(8)/13.1.3.5(4)/13.1.4(4)）----
+
+    #[test]
+    fn test_w12d_c_struct_bad_field_types_rejected() {
+        expect_parse_err_contains("@C\nstruct S { var f: String }\nmain() {}", "@C 结构体");
+        expect_parse_err_contains("@C\nstruct S { var f: Rune }\nmain() {}", "@C 结构体");
+        expect_parse_err_contains("@C\nstruct S { var f: (Int32, Int32) }\nmain() {}", "@C 结构体");
+        expect_parse_err_contains("@C\nstruct S { var f: Range<Int32> }\nmain() {}", "@C 结构体");
+        expect_parse_err_contains(
+            "@C\nstruct S { var f: (Int32)->Int32 }\nmain() {}",
+            "@C 结构体",
+        );
+    }
+
+    #[test]
+    fn test_w12d_c_struct_non_c_user_field_rejected() {
+        // 非 @C 结构体 / class / enum / interface 作为 @C 结构体字段均非法。
+        expect_parse_err_contains(
+            "struct N { var x: Int32 }\n@C\nstruct S { var f: N }\nmain() {}",
+            "@C 结构体",
+        );
+        expect_parse_err_contains(
+            "class N {}\n@C\nstruct S { var f: N }\nmain() {}",
+            "@C 结构体",
+        );
+        expect_parse_err_contains(
+            "enum N { A }\n@C\nstruct S { var f: N }\nmain() {}",
+            "@C 结构体",
+        );
+        expect_parse_err_contains(
+            "interface N {}\n@C\nstruct S { var f: N }\nmain() {}",
+            "@C 结构体",
+        );
+    }
+
+    #[test]
+    fn test_w12d_c_struct_allowed_field_types() {
+        // CPointer / CString / 嵌套 @C 结构体 / VArray 均为合法字段类型。
+        parse_only(
+            "@C\nstruct Inner { var x: Int32 }\n@C\nstruct S { var a: CPointer<Int32>\n var b: CString\n var c: Inner\n var d: VArray<Int32, $3> }\nmain() {}",
+        )
+        .expect("allowed @C struct fields should parse");
+    }
+
+    #[test]
+    fn test_w12d_c_struct_implements_interface_rejected() {
+        expect_parse_err_contains(
+            "interface I {}\n@C\nstruct S <: I { var x: Int32 }\nmain() {}",
+            "@C 结构体",
+        );
+    }
+
+    #[test]
+    fn test_w12d_c_func_ctype_param_or_return_rejected() {
+        expect_parse_err_contains("@C\nfunc f(x: CType): Unit {}\nmain() {}", "CType");
+        expect_parse_err_contains("@C\nfunc f(x: Int32): CType { return x }\nmain() {}", "CType");
+    }
+
+    // ---- 扩展语义（8.2/8.6）----
+
+    #[test]
+    fn test_w12d_extend_member_open_override_redef_rejected() {
+        expect_parse_err_contains("class A {}\nextend A { open func f() {} }\nmain() {}", "open");
+        expect_parse_err_contains(
+            "class A {}\nextend A { override func f() {} }\nmain() {}",
+            "override",
+        );
+        expect_parse_err_contains(
+            "class A {}\nextend A { redef func f() {} }\nmain() {}",
+            "redef",
+        );
+        expect_parse_err_contains(
+            "class A {}\nextend A { open prop p: Int32 { get() { 1 } } }\nmain() {}",
+            "open",
+        );
+    }
+
+    #[test]
+    fn test_w12d_public_extend_rejected() {
+        expect_parse_err_contains("public extend Int64 {}\nmain() {}", "可见性");
+    }
+
+    #[test]
+    fn test_w12d_plain_extend_allowed() {
+        parse_only("class A {}\nextend A { func f() {} }\nmain() {}")
+            .expect("plain extend should parse");
+        parse_only("class A {}\nextend A { public func f() {} }\nmain() {}")
+            .expect("public member in extend should parse");
+    }
+
+    // ---- 7.1(4)：内建/枚举类型不能定义 mut 属性 ----
+
+    #[test]
+    fn test_w12d_builtin_mut_prop_in_extend_rejected() {
+        expect_parse_err_contains(
+            "extend Int64 { mut prop val: Int64 { get() { 0 } set(v) { } } }\nmain() {}",
+            "mut 属性",
+        );
+        expect_parse_err_contains(
+            "extend Bool { mut prop val: Bool { get() { true } set(v) { } } }\nmain() {}",
+            "mut 属性",
+        );
+        expect_parse_err_contains(
+            "enum E { A }\nextend E { mut prop val: Int64 { get() { 0 } set(v) { } } }\nmain() {}",
+            "mut 属性",
+        );
+        expect_parse_err_contains(
+            "extend Option<T> { mut prop val: Int64 { get() { 0 } set(v) { } } }\nmain() {}",
+            "mut 属性",
+        );
+    }
+
+    #[test]
+    fn test_w12d_builtin_immutable_prop_in_extend_allowed() {
+        // 7.1(4) 仅限制 mut 属性；不可变属性在数值类型上合法。
+        parse_only("extend Int64 { prop val: Int64 { get() { 0 } } }\nmain() {}")
+            .expect("immutable prop on Int64 should parse");
+        parse_only("extend Float64 { prop val: Int64 { get() { 0 } } }\nmain() {}")
+            .expect("immutable prop on Float64 should parse");
     }
 }
