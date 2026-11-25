@@ -4553,4 +4553,60 @@ mod tests {
         ));
     }
 
+    // ─── w15b：接口/属性语法补充 ─────────────────────────────────────────
+
+    #[test]
+    fn test_w15b_interface_single_super_list() {
+        assert!(parse_or_err(
+            "interface A {}\ninterface B {}\ninterface C {}\ninterface I <: A & B <: C {}\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "interface A {}\ninterface B {}\ninterface I <: A & B {}\nmain() {}"
+        ));
+    }
+
+    #[test]
+    fn test_w15b_interface_static_open_rejected() {
+        assert!(parse_or_err(
+            "interface I {\n open static func f(): Unit\n}\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "interface I {\n open func f(): Unit\n}\nmain() {}"
+        ));
+    }
+
+    #[test]
+    fn test_w15b_interface_func_requires_return_type_without_body() {
+        assert!(parse_or_err("interface I {\n func f()\n}\nmain() {}"));
+        assert!(!parse_or_err("interface I {\n func f(): Unit\n}\nmain() {}"));
+        assert!(!parse_or_err("interface I {\n func f() {}\n}\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w15b_interface_prop_default_accessors() {
+        // 默认实现缺少 getter / mut 属性缺少 setter 非法。
+        assert!(parse_or_err(
+            "interface I {\n prop p: Int64 {\n  set(v) {}\n }\n}\nmain() {}"
+        ));
+        assert!(parse_or_err(
+            "interface I {\n mut prop p: Int64 {\n  get() { 1 }\n }\n}\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "interface I {\n prop p: Int64 {\n  get() { 1 }\n }\n}\nmain() {}"
+        ));
+    }
+
+    #[test]
+    fn test_w15b_class_prop_body_and_visibility() {
+        // 空体属性非法。
+        assert!(parse_or_err("class A {\n prop p: Int64 {}\n}\nmain() {}"));
+        // 重复/冲突可见性修饰符非法。
+        assert!(parse_or_err(
+            "class A {\n public public mut prop p: Int64 {\n  get() { 0 }\n  set(v) {}\n }\n}\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "class A {\n public mut prop p: Int64 {\n  get() { 0 }\n  set(v) {}\n }\n}\nmain() {}"
+        ));
+    }
+
 }

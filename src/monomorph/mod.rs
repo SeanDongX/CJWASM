@@ -1653,6 +1653,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     is_open: m.is_open,
                     is_abstract: m.is_abstract,
                     has_body: m.has_body,
+                    is_prop_mut: m.is_prop_mut,
                     is_const: m.is_const,
                     func: Function {
                         is_const: false,
@@ -2440,6 +2441,7 @@ is_c: false,
                         is_open: false,
                         is_abstract: false,
                         has_body: true,
+                        is_prop_mut: false,
                         is_const: false,
                         func: Function {
                             is_const: false,

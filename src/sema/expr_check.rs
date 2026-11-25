@@ -753,6 +753,9 @@ struct Checker<'a> {
     cur_interface: Option<String>,
     /// 当前 interface 默认函数体是否为 static 成员（6.2.2.2(5)）。
     cur_iface_static: bool,
+    /// 顶层函数 / 接口函数名 → 各签名的“参数是否命名参数”列表。
+    /// 用于 6.2.2.1(3)：命名参数必须以 `名字:` 形式传入。
+    named_call_sigs: HashMap<String, Vec<Vec<bool>>>,
     /// 用户类型名 → 直接父类型名（类继承 + 接口实现 + 接口继承）。
     /// 用于判断运算符返回类型是否为左操作数类型的子类型。
     user_parents: HashMap<String, Vec<String>>,
@@ -1057,6 +1060,16 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             c.name.clone(),
             c.fields.iter().map(|f| (f.name.clone(), f.is_mut)).collect(),
         );
+        // 7.1(6)/7.4(10)：非 mut 属性没有 setter，不能作为赋值目标；
+        // 将属性按“名字 → 是否 mut”并入字段表，复用赋值目标检查。
+        if let Some(map) = class_fields.get_mut(&c.name) {
+            for m in &c.methods {
+                let leaf = m.func.name.rsplit('.').next().unwrap_or("");
+                if let Some(base) = leaf.strip_prefix("__get_") {
+                    map.entry(base.to_string()).or_insert(m.is_prop_mut);
+                }
+            }
+        }
         class_has_init.insert(c.name.clone(), c.init.is_some());
     }
     for s in &program.structs {
@@ -1588,6 +1601,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         cur_class: None,
         cur_interface: None,
         cur_iface_static: false,
+        named_call_sigs: collect_named_call_sigs(program),
         user_parents,
         ctor_types,
         operator_returns,
@@ -1775,6 +1789,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                     Some(field_scope),
                     m.func.return_type.as_ref().map(|t| checker.ty_of_ann(t)),
                 );
+                checker.check_property_accessor_tail(&m.func);
                 checker.in_const_ctx = prev_c;
             }
         }
@@ -3139,6 +3154,33 @@ fn collect_interface_members(
 
 /// 收集每个用户接口传递可见的静态成员函数（名、参数个数、是否有默认实现体）。
 /// 用于 6.2.2.1(8)：无函数体的静态函数不能通过接口类型直接调用。
+/// 收集顶层函数与接口函数的签名（仅记录每个形参是否为命名参数）。
+///
+/// 用于 6.2.2.1(3)：命名参数必须以 `名字:` 形式传入，不能按位置传入。
+fn collect_named_call_sigs(program: &Program) -> HashMap<String, Vec<Vec<bool>>> {
+    let mut map: HashMap<String, Vec<Vec<bool>>> = HashMap::new();
+    {
+        let mut add = |full: &str, params: &[crate::ast::Param]| {
+            let sig: Vec<bool> = params
+                .iter()
+                .filter(|p| p.name != "this" && p.name != "self")
+                .map(|p| p.is_named)
+                .collect();
+            let bare = full.rsplit('.').next().unwrap_or(full).to_string();
+            map.entry(bare).or_default().push(sig);
+        };
+        for f in &program.functions {
+            add(&f.name, &f.params);
+        }
+        for i in &program.interfaces {
+            for m in &i.methods {
+                add(&m.name, &m.params);
+            }
+        }
+    }
+    map
+}
+
 fn collect_iface_static_methods(program: &Program) -> HashMap<String, Vec<IfaceStaticMethod>> {
     let user: HashSet<&str> = program
         .interfaces
@@ -3356,6 +3398,40 @@ impl<'a> Checker<'a> {
         self.globals.get(name)
     }
 
+    /// 6.2.2.1(3)：调用含命名参数的函数时，命名参数必须以 `名字:` 传入。
+    ///
+    /// 仅在调用的位置实参个数落在某个已知签名范围内、且所有候选签名对应位置
+    /// 都是命名参数时判定为错误（多签名/本地遮蔽等不确定场景保守放行）。
+    fn check_named_arg_positions(&mut self, name: &str, args: &[Expr]) {
+        // 尾随 lambda 以位置实参形态传入，但可绑定到命名函数参数（尾随闭包语法），
+        // 因此不计入“位置实参占用命名参数位”的判定。
+        let mut positional = args.len();
+        if matches!(args.last(), Some(Expr::Lambda { .. })) {
+            positional -= 1;
+        }
+        if positional == 0 {
+            return;
+        }
+        if self.lookup(name).is_some() {
+            return;
+        }
+        let Some(sigs) = self.named_call_sigs.get(name) else {
+            return;
+        };
+        if !sigs.iter().any(|s| positional <= s.len()) {
+            return;
+        }
+        let ok = sigs
+            .iter()
+            .any(|sig| positional <= sig.len() && sig[..positional].iter().all(|n| !*n));
+        if !ok {
+            self.err(format!(
+                "命名参数必须以 `名字:` 形式传入（函数 '{}'，6.2.2.1(3)）",
+                name
+            ));
+        }
+    }
+
     /// 表达式各操作数的类型是否均可静态确定（用于比较链检查，避免解析歧义误判）。
     fn operand_known(&self, e: &Expr) -> bool {
         match e {
@@ -3431,6 +3507,26 @@ impl<'a> Checker<'a> {
         self.check_params_body_extra(&func.params, &func.body, None, ret);
     }
 
+    /// 7.3(2)/(5)：属性访问器尾表达式的类型必须与访问器返回类型一致。
+    ///
+    /// 仅检查函数体最后一个语句为表达式语句的情形；返回值/控制流形态保守跳过。
+    fn check_property_accessor_tail(&mut self, func: &Function) {
+        let leaf = func.name.rsplit('.').next().unwrap_or("");
+        let Some(Stmt::Expr(e)) = func.body.last() else {
+            return;
+        };
+        let ty = static_expr_ty(e);
+        if !ty.is_definite() {
+            return;
+        }
+        if leaf.starts_with("__get_") {
+            if let Some(rt) = func.return_type.as_ref() {
+                let target = self.ty_of_ann(rt);
+                self.check_assignable(&target, &ty, "属性 getter 返回值");
+            }
+        }
+    }
+
     fn check_params_and_body(&mut self, params: &[crate::ast::Param], body: &[Stmt], ret: Option<Ty>) {
         self.check_params_body_extra(params, body, None, ret);
     }
@@ -3466,6 +3562,19 @@ impl<'a> Checker<'a> {
         }
         let saved_ret = self.ret_ty.take();
         self.ret_ty = ret;
+        // 6.2.2.2(4)：接口实例成员默认实现中的 `this` 的编译期类型即当前接口类型；
+        // 静态成员体内不存在 `this`（由 check_expr 另行报错）。
+        if let Some(iface) = self.cur_interface.clone() {
+            if !self.cur_iface_static {
+                scope.entry("this".to_string()).or_insert(VarInfo {
+                    is_const: true,
+                    ty: Ty::User(iface),
+                    mutable: false,
+                    const_int: None,
+                    explicit_bool: false,
+                });
+            }
+        }
         self.scopes.push(scope);
         for stmt in body {
             self.check_stmt(stmt);
@@ -4824,6 +4933,17 @@ impl<'a> Checker<'a> {
         let Ty::User(ty) = &info.ty else {
             return;
         };
+        // 6.1.2.4(14)：静态成员不能通过实例赋值。
+        if self
+            .lookup_class_member(ty, field)
+            .map_or(false, |i| i.is_static)
+        {
+            self.err(format!(
+                "静态成员 '{}' 不能通过实例访问（6.1.2.4(14)）",
+                field
+            ));
+            return;
+        }
         let struct_map = self.struct_fields.get(ty);
         let class_map = self.class_fields.get(ty);
         let has_field = struct_map.map_or(false, |m| m.contains_key(field))
@@ -5599,6 +5719,12 @@ impl<'a> Checker<'a> {
             Expr::String(_) => Ty::String,
 
             Expr::Var(name) => {
+                // 6.2.2.2(4)：静态接口成员体内不能使用 this。
+                if name == "this" && self.cur_interface.is_some() && self.cur_iface_static {
+                    self.err(
+                        "接口的 static 成员体内不能使用 this（6.2.2.2(4)）".to_string(),
+                    );
+                }
                 // 6.2.2.2(5)：interface static 成员体不能直接引用实例成员。
                 self.check_static_iface_member_ref(name);
                 // 6.2.2(1)：interface 默认函数体不能裸名引用其它接口成员。
@@ -5687,6 +5813,8 @@ impl<'a> Checker<'a> {
                 // 2.1.3(4)/2.3.1(1)：基础类型转换的合法性（Bool↔数值、Rune↔数值）。
                 self.check_builtin_conversion(name, args, &arg_tys);
                 self.check_type_instantiation(name, type_args.as_deref());
+                // 6.2.2.1(3)：命名参数必须以 `名字:` 形式传入。
+                self.check_named_arg_positions(name, args);
                 // 6.2.2.2(5)：interface static 成员体不能直接引用实例成员。
                 self.check_static_iface_member_ref(name);
                 // 6.2.2(1)：interface 默认函数体不能裸名引用其它接口成员。

@@ -1137,6 +1137,7 @@ impl Parser {
         if self.check(&Token::SubType) {
             self.advance();
             let mut bounds = Vec::new();
+            let mut bound_args: Vec<Vec<Type>> = Vec::new();
             loop {
                 let bound = match self.advance() {
                     Some(Token::Ident(n)) => n,
@@ -1149,9 +1150,12 @@ impl Parser {
                     None => return self.bail(ParseError::UnexpectedEof),
                 };
                 bounds.push(bound);
-                if self.check(&Token::Lt) {
-                    let _ = self.parse_opt_type_args()?;
-                }
+                let args = if self.check(&Token::Lt) {
+                    self.parse_opt_type_args()?.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                bound_args.push(args);
                 if self.check(&Token::And) {
                     self.advance();
                 } else {
@@ -1161,6 +1165,7 @@ impl Parser {
             constraints.push(crate::ast::TypeConstraint {
                 param: name.clone(),
                 bounds,
+                bound_args,
             });
         }
         self.expect(Token::LBrace)?;
@@ -1527,11 +1532,17 @@ impl Parser {
                 self.expect(Token::Colon)?;
                 let prop_ty = self.parse_type()?;
                 self.expect(Token::LBrace)?;
+                let mut saw_getter = false;
+                let mut saw_setter = false;
                 while !self.check(&Token::RBrace) {
                     if let Some(Token::Ident(ref kw)) = self.peek() {
                         let kw = kw.clone();
+                        if kw == "set" {
+                            saw_setter = true;
+                        }
                         if kw == "get" {
                             self.advance();
+                            saw_getter = true;
                             self.expect(Token::LParen)?;
                             self.expect(Token::RParen)?;
                             self.receiver_name = Some("this".to_string());
@@ -1626,6 +1637,19 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RBrace)?;
+                // 7.1(2)/(6)：属性必须定义 getter；不可变属性不得定义 setter。
+                if !saw_getter {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Prop,
+                        "属性必须定义 getter（7.1(2)）".to_string(),
+                    ));
+                }
+                if !mods.is_mut && saw_setter {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Prop,
+                        "不可变属性不能定义 setter（7.1(6)）".to_string(),
+                    ));
+                }
                 continue;
             }
             // 2.1.10.1(1)：字段声明的可见性修饰符至多一个（public private 冲突非法）。
@@ -1779,6 +1803,7 @@ impl Parser {
             // `<:` 后面的名字是枚举实现的父接口，记录到约束中供语义检查使用
             // （`:` 形式可能是泛型约束等，不复用）。
             let mut super_bounds: Vec<String> = Vec::new();
+            let mut super_bound_args: Vec<Vec<Type>> = Vec::new();
             if self.check(&Token::Lt)
                 && matches!(self.peek_next(), Some(Token::Colon) | Some(Token::Ident(_)))
             {
@@ -1800,10 +1825,11 @@ impl Parser {
                 }
                 None => return self.bail(ParseError::UnexpectedEof),
             };
+            let mut first_args: Vec<Type> = Vec::new();
             if self.check(&Token::Lt) {
                 self.advance();
                 loop {
-                    let _ = self.parse_type()?;
+                    first_args.push(self.parse_type()?);
                     if self.check(&Token::Gt) {
                         self.advance();
                         break;
@@ -1817,6 +1843,9 @@ impl Parser {
                         ));
                     }
                 }
+            }
+            if super_uses_subtype {
+                super_bound_args.push(first_args);
             }
             // cjc: enum Name <: A & B & C { ... } — 多继承约束用 & 连接
             while self.check(&Token::And) {
@@ -1832,19 +1861,24 @@ impl Parser {
                     None => return self.bail(ParseError::UnexpectedEof),
                 }
                 // 可选的泛型参数
+                let mut args: Vec<Type> = Vec::new();
                 if self.check(&Token::Lt) {
                     self.advance();
                     loop {
-                        let _ = self.parse_type()?;
+                        args.push(self.parse_type()?);
                         if self.check(&Token::Gt) { self.advance(); break; }
                         if self.check(&Token::Comma) { self.advance(); } else { break; }
                     }
+                }
+                if super_uses_subtype {
+                    super_bound_args.push(args);
                 }
             }
             if super_uses_subtype && !super_bounds.is_empty() {
                 constraints.push(TypeConstraint {
                     param: name.clone(),
                     bounds: super_bounds,
+                    bound_args: super_bound_args,
                 });
             }
         }
@@ -2171,6 +2205,16 @@ impl Parser {
             Ok(())
         };
         parse_parents(self, &mut parents, &mut parent_types)?;
+        // 6.2.1.1(4)：一个接口声明只能有一个父接口列表（`<: A & B`）。
+        // 第二个 `<:`/`:` 紧随其后（未经过 where 约束）时非法。
+        if !parents.is_empty()
+            && (self.check(&Token::SubType) || self.check(&Token::Colon))
+        {
+            return self.bail(ParseError::UnexpectedToken(
+                self.peek().cloned().unwrap_or(Token::SubType),
+                "接口声明只能有一个父接口列表（6.2.1.1(4)）".to_string(),
+            ));
+        }
         iface_own_constraints.extend(self.parse_where_clause()?);
         // 兼容 where 之后仍跟 <: 的写法
         parse_parents(self, &mut parents, &mut parent_types)?;
@@ -2203,6 +2247,14 @@ impl Parser {
             }
             // 接口成员修饰符（static / public / mut / const / operator ...）可任意顺序。
             let mods = self.parse_member_modifiers();
+            // 6.2.2.1(12)：static 接口成员函数不能加 open 修饰符（实例成员天然 open，
+            // open 仅对实例成员有意义）。
+            if mods.is_open && mods.is_static {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Open,
+                    "接口的 static 成员函数不能使用 open 修饰符（6.2.2.1(12)）".to_string(),
+                ));
+            }
             // cjc: 接口中的 prop 声明，脱糖为抽象 getter/setter 方法
             if self.check(&Token::Prop) {
                 self.advance(); // consume prop
@@ -2234,6 +2286,7 @@ impl Parser {
                         type_params: vec![],
                         constraints: vec![],
                         is_const: false,
+                        is_prop_mut: prop_is_mut_decl,
                     });
                     if prop_is_mut_decl {
                         methods.push(crate::ast::InterfaceMethod {
@@ -2253,17 +2306,20 @@ impl Parser {
                             type_params: vec![],
                             constraints: vec![],
                             is_const: false,
+                            is_prop_mut: prop_is_mut_decl,
                         });
                     }
                     continue;
                 }
                 self.advance(); // consume {
                 let mut saw_setter = false;
+                let mut saw_getter = false;
                 while !self.check(&Token::RBrace) {
                     if let Some(Token::Ident(ref kw)) = self.peek() {
                         let kw = kw.clone();
                         if kw == "get" {
                             self.advance();
+                            saw_getter = true;
                             self.expect(Token::LParen)?;
                             self.expect(Token::RParen)?;
                             let default_body = if self.check(&Token::LBrace) {
@@ -2289,6 +2345,7 @@ impl Parser {
                                 type_params: vec![],
                                 constraints: vec![],
                                 is_const: false,
+                                is_prop_mut: prop_is_mut_decl,
                             });
                         } else if kw == "set" {
                             self.advance();
@@ -2336,6 +2393,7 @@ impl Parser {
                                 type_params: vec![],
                                 constraints: vec![],
                                 is_const: false,
+                                is_prop_mut: prop_is_mut_decl,
                             });
                         } else {
                             break;
@@ -2345,6 +2403,22 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RBrace)?;
+                // 6.2.2.2(1)/7.1(2)：带默认实现的接口属性必须给出正确的访问器组合：
+                // - 必须有 getter；
+                // - 不可变属性（无 mut）不得定义 setter；
+                // - mut 属性必须同时定义 setter。
+                if !saw_getter {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Prop,
+                        "属性的默认实现必须包含 getter".to_string(),
+                    ));
+                }
+                if prop_is_mut_decl && !saw_setter {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Prop,
+                        "mut 属性的默认实现必须包含 setter".to_string(),
+                    ));
+                }
                 // 声明为 `mut prop` 但只写了 getter 时，同样补登抽象 setter 以
                 // 保持 mut 语义可被实现类型校验观察到。
                 if prop_is_mut_decl && !saw_setter {
@@ -2365,6 +2439,7 @@ impl Parser {
                         type_params: vec![],
                         constraints: vec![],
                         is_const: false,
+                        is_prop_mut: true,
                     });
                 }
                 continue;
@@ -2433,6 +2508,13 @@ impl Parser {
                 None
             };
             self.current_type_params = prev_type_params;
+            // 6.2.2.1(1)：无函数体的接口函数必须显式标注返回类型。
+            if default_body.is_none() && return_type.is_none() {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Func,
+                    "无函数体的接口成员函数必须显式标注返回类型（6.2.2.1(1)）".to_string(),
+                ));
+            }
             // 5.8.1(1)：mut 只能修饰实例成员函数；接口 static 成员函数不能为 mut。
             if mods.is_mut && mods.is_static {
                 return self.bail(ParseError::UnexpectedToken(
@@ -2450,6 +2532,7 @@ impl Parser {
                 type_params: iface_type_params,
                 constraints: method_constraints,
                 is_const: mods.is_const,
+                is_prop_mut: false,
             });
         }
         self.expect(Token::RBrace)?;
@@ -3112,6 +3195,7 @@ impl Parser {
                         is_open: false,
                         is_abstract: false,
                         has_body: true,
+                        is_prop_mut: false,
                     });
                     continue;
                 }
@@ -3239,6 +3323,13 @@ impl Parser {
                 self.expect(Token::RBrace)?;
                 deinit = Some(body);
             } else if self.check(&Token::Prop) {
+                // 7.1(1)：属性修饰符列表至多一个可见性修饰符。
+                if mods.visibility_count > 1 {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Prop,
+                        "属性只能有一个可见性修饰符（7.1(1)）".to_string(),
+                    ));
+                }
                 // prop name: Type { get() { ... } set(value) { ... } }
                 self.advance();
                 let prop_name = match self.advance() {
@@ -3288,6 +3379,7 @@ impl Parser {
                         // 无体属性声明（抽象属性）的访问器没有实现体：
                         // has_body=false 使父类型的抽象访问器被视为可覆写/可实现。
                         has_body: false,
+                        is_prop_mut: mods.is_mut,
                         is_const: false,
                         func: crate::ast::Function {
                             is_const: false,
@@ -3320,6 +3412,7 @@ impl Parser {
                             is_abstract: false,
                             // 无体 mut 属性的抽象 setter 同样没有实现体。
                             has_body: false,
+                            is_prop_mut: mods.is_mut,
                             is_const: false,
                             func: crate::ast::Function {
                                 is_const: false,
@@ -3365,6 +3458,7 @@ impl Parser {
                                 is_open: mods.is_open,
                                 is_abstract: mods.is_abstract,
                                 has_body: true,
+                                is_prop_mut: mods.is_mut,
                                 is_const: false,
                                 func: crate::ast::Function {
                                     is_const: false,
@@ -3415,6 +3509,7 @@ impl Parser {
                                 is_open: mods.is_open,
                                 is_abstract: mods.is_abstract,
                                 has_body: true,
+                                is_prop_mut: mods.is_mut,
                                 is_const: false,
                                 func: crate::ast::Function {
                                     is_const: false,
@@ -3480,6 +3575,13 @@ impl Parser {
                             "属性必须定义 getter 实现（7.1(2)）".to_string(),
                         ));
                     }
+                } else if !saw_get && !saw_set {
+                    // 7.4(11)：override/redef 的 mut 属性允许只重实现 getter 或
+                    // setter 之一，但必须至少重实现一个访问器。
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Prop,
+                        "覆写/重定义的属性必须重实现至少一个访问器（7.4(11)）".to_string(),
+                    ));
                 }
             } else if {
                 // 仓颉允许用类名代替 init 作为构造函数: ClassName(let param: Type) {}
@@ -3785,6 +3887,7 @@ impl Parser {
                     is_open: mods.is_open,
                     is_abstract: mods.is_abstract,
                     has_body,
+                    is_prop_mut: false,
                     is_const: mods.is_const,
                     func: crate::ast::Function {
                         is_const: false,

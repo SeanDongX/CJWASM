@@ -1162,6 +1162,7 @@ is_c: false,
                 is_open: false,
                 is_abstract: false,
                 has_body: true,
+                is_prop_mut: false,
                 is_const: false,
                 func: make_function("Counter.get", vec![
                     make_param("this", Type::Struct("Counter".into(), vec![])),

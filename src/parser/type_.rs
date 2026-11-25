@@ -131,9 +131,11 @@ impl Parser {
                         break;
                     }
                 }
+                let bound_count = bounds.len();
                 constraints.push(TypeConstraint {
                     param: p.clone(),
                     bounds,
+                    bound_args: vec![Vec::new(); bound_count],
                 });
             }
             params.push(p);
@@ -181,6 +183,7 @@ impl Parser {
             }
             self.advance();
             let mut bounds = Vec::new();
+            let mut bound_args: Vec<Vec<Type>> = Vec::new();
             loop {
                 let bound = match self.advance() {
                     Some(Token::Ident(n)) => n,
@@ -191,16 +194,23 @@ impl Parser {
                     None => return self.bail(ParseError::UnexpectedEof),
                 };
                 bounds.push(bound);
-                if self.check(&Token::Lt) {
-                    let _ = self.parse_opt_type_args()?;
-                }
+                let args = if self.check(&Token::Lt) {
+                    self.parse_opt_type_args()?.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                bound_args.push(args);
                 if self.check(&Token::And) {
                     self.advance();
                 } else {
                     break;
                 }
             }
-            constraints.push(TypeConstraint { param, bounds });
+            constraints.push(TypeConstraint {
+                param,
+                bounds,
+                bound_args,
+            });
             if self.check(&Token::Comma) {
                 self.advance();
             } else {

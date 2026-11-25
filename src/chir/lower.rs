@@ -793,6 +793,7 @@ mod tests {
                 is_open: false,
                 is_abstract: false,
                 has_body: true,
+                is_prop_mut: false,
                 is_const: false,
                 func: class_method_func,
             }],
