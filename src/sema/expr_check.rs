@@ -653,6 +653,8 @@ struct Checker<'a> {
     operator_returns: HashMap<(String, String), Ty>,
     /// (类型名, 方法名) → 静态/类型限定方法返回类型（`T.m()`）。
     static_method_returns: HashMap<(String, String), Ty>,
+    /// (类型名, 静态方法名) → 该方法的类型参数与约束（显式类型实参检查，6.1.2.4(24)）。
+    static_method_generics: HashMap<(String, String), GenericDef>,
     /// 当前函数声明的返回类型（用于 `return expr` 类型检查）
     ret_ty: Option<Ty>,
     /// 属于多构造器枚举的变体名集合：不可反驳绑定（let/var）不可使用这些变体模式。
@@ -1112,6 +1114,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         ctor_types,
         operator_returns,
         static_method_returns,
+        static_method_generics: collect_static_method_generics(program),
         ret_ty: None,
         multi_variant_names,
         class_has_init,
@@ -1636,6 +1639,135 @@ fn collect_operator_returns(
 }
 
 /// 收集 (类型名, 方法名) → 返回类型，用于解析 `T.m()` 形式的类型限定调用。
+/// 构建 (类型名, 方法名) → 类型参数/约束表，用于显式类型实参检查（6.1.2.4(24)）。
+///
+/// 类的成员函数来自 `ClassDef.methods`；struct / enum 成员函数被脱糖为
+/// `TypeName.method` 顶层函数（无接收者参数者视为静态）。
+fn collect_static_method_generics(
+    program: &Program,
+) -> HashMap<(String, String), GenericDef> {
+    fn insert(
+        out: &mut HashMap<(String, String), GenericDef>,
+        dup: &mut HashSet<(String, String)>,
+        key: (String, String),
+        type_params: Vec<String>,
+        constraints: Vec<TypeConstraint>,
+    ) {
+        if dup.contains(&key) {
+            return;
+        }
+        if out.contains_key(&key) {
+            // 同名重载：无法确定唯一目标，保守移除。
+            out.remove(&key);
+            dup.insert(key);
+            return;
+        }
+        out.insert(key, GenericDef { type_params, constraints });
+    }
+    let mut out: HashMap<(String, String), GenericDef> = HashMap::new();
+    let mut dup: HashSet<(String, String)> = HashSet::new();
+    for cls in &program.classes {
+        for m in &cls.methods {
+            let member = member_name(&m.func.name).to_string();
+            if member.starts_with("__get_") || member.starts_with("__set_") {
+                continue;
+            }
+            insert(
+                &mut out,
+                &mut dup,
+                (cls.name.clone(), member),
+                m.func.type_params.clone(),
+                m.func.constraints.clone(),
+            );
+        }
+    }
+    for f in &program.functions {
+        let Some((owner, member)) = f.name.rsplit_once('.') else {
+            continue;
+        };
+        if f
+            .params
+            .first()
+            .map_or(false, |p| p.name == "this" || p.name == "self")
+        {
+            continue;
+        }
+        insert(
+            &mut out,
+            &mut dup,
+            (owner.to_string(), member.to_string()),
+            f.type_params.clone(),
+            f.constraints.clone(),
+        );
+    }
+    out
+}
+
+/// 语言内建/核心类型名（非用户声明，但可作为合法类型实参）。
+fn is_core_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Object"
+            | "Any"
+            | "Nothing"
+            | "Unit"
+            | "String"
+            | "Bool"
+            | "Rune"
+            | "Array"
+            | "VArray"
+            | "Range"
+            | "Option"
+            | "Result"
+            | "Tuple"
+            | "Map"
+            | "Slice"
+            | "Iterator"
+            | "Iterable"
+            | "Collection"
+            | "Comparable"
+            | "Equatable"
+            | "Hashable"
+            | "ToString"
+            | "Countable"
+            | "LessThan"
+            | "GreaterThan"
+            | "LessThanOrEqual"
+            | "GreaterThanOrEqual"
+            | "CType"
+            | "CPointer"
+    )
+}
+
+/// 显式类型实参是否为“合法类型名”。返回 `Some(head)` 表示非法（head 为非法名）。
+fn illegal_type_arg_head(t: &Type, type_names: &HashSet<String>) -> Option<String> {
+    match t {
+        Type::Struct(name, args) => {
+            if !type_names.contains(name) && !is_core_type_name(name) {
+                return Some(name.clone());
+            }
+            for a in args {
+                if let Some(h) = illegal_type_arg_head(a, type_names) {
+                    return Some(h);
+                }
+            }
+            None
+        }
+        Type::TypeParam(name) => {
+            if name == "_" || name.starts_with('$') {
+                Some(name.clone())
+            } else {
+                None
+            }
+        }
+        Type::Array(inner) | Type::Slice(inner) => illegal_type_arg_head(inner, type_names),
+        Type::Option(inner) => illegal_type_arg_head(inner, type_names),
+        Type::Tuple(ts) => ts.iter().find_map(|x| illegal_type_arg_head(x, type_names)),
+        // 其它形态（基础类型、函数类型、限定名等）视为合法。
+        _ => None,
+    }
+}
+
 fn collect_static_method_returns(
     program: &Program,
     type_names: &HashSet<String>,
@@ -2891,6 +3023,36 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 类型限定静态泛型调用 `T.m<Args>(...)` 的显式类型实参检查（6.1.2.4(24)）：
+    /// 实参个数必须与声明一致，且每个实参必须是合法类型名。
+    fn check_static_type_args(&mut self, type_name: &str, method: &str, type_args: &[Type]) {
+        let Some(def) = self
+            .static_method_generics
+            .get(&(type_name.to_string(), method.to_string()))
+            .cloned()
+        else {
+            return;
+        };
+        for a in type_args {
+            if let Some(bad) = illegal_type_arg_head(a, &self.type_names) {
+                self.err(format!(
+                    "显式类型实参 '{}' 不是合法类型名（6.1.2.4(24)）",
+                    bad
+                ));
+                return;
+            }
+        }
+        if def.type_params.len() != type_args.len() {
+            self.err(format!(
+                "类型 '{}' 的静态函数 '{}' 需要 {} 个类型实参，实际提供了 {} 个（6.1.2.4(24)）",
+                type_name,
+                method,
+                def.type_params.len(),
+                type_args.len()
+            ));
+        }
+    }
+
     /// 目标类型与值类型是否可赋值（无隐式跨类别/跨宽度转换）。
     fn check_assignable(&mut self, target: &Ty, value: &Ty, ctx: &str) {
         if !target.is_concrete() || !value.is_definite() {
@@ -3175,7 +3337,7 @@ impl<'a> Checker<'a> {
                 method,
                 args,
                 named_args,
-                ..
+                type_args,
             } => {
                 self.check_expr(object);
                 for a in args {
@@ -3183,6 +3345,13 @@ impl<'a> Checker<'a> {
                 }
                 for (_, a) in named_args {
                     self.check_expr(a);
+                }
+                // 类型限定的泛型静态调用 `T.m<...>(...)`：显式类型实参元数与
+                // 合法性检查（6.1.2.4(24)）。
+                if let (Some(tas), Expr::Var(type_name)) = (type_args.as_deref(), &**object) {
+                    if self.type_names.contains(type_name) {
+                        self.check_static_type_args(type_name, method, tas);
+                    }
                 }
                 // 构造函数不能作为实例/静态成员方法调用（2.1.10.2(3)）：
                 // - `a.A()`（实例上调用构造函数）
@@ -5528,6 +5697,41 @@ mod tests {
         // 顶层 const 初始化式同样须为常量表达式（16.1(2)）。
         assert_err("func f() { 1 }\nconst a = f()\nmain() {}", "不是常量表达式");
         assert_ok("const func f() { 1 }\nconst a = f()\nmain() {}");
+    }
+
+    #[test]
+    fn test_w10a_explicit_type_args_arity() {
+        // 6.1.2.4(24)：显式类型实参个数必须与声明一致。
+        assert_err(
+            "class Test { static func f<T1, T2>(x: Int64) {} }\nmain() { Test.f<Int64>(1) }",
+            "6.1.2.4(24)",
+        );
+        assert_err(
+            "class Test { static func f<T>() {} }\nmain() { Test.f<Int64, Int32>() }",
+            "6.1.2.4(24)",
+        );
+        assert_ok(
+            "class Test { static func f<T1, T2>(x: Int64) {} }\nmain() { Test.f<Int64, Int32>(1) }",
+        );
+    }
+
+    #[test]
+    fn test_w10a_explicit_type_args_must_be_legal_type_names() {
+        // 6.1.2.4(24)：显式类型实参必须是合法类型名，不能是变量/函数/未绑定标识符。
+        assert_err(
+            "class Test { static func f<T>() {} }\nmain() { let x = 1; Test.f<x>() }",
+            "不是合法类型名",
+        );
+        assert_err(
+            "func g() {}\nclass Test { static func f<T>() {} }\nmain() { Test.f<g>() }",
+            "不是合法类型名",
+        );
+        assert_ok(
+            "class Test { static func f<T>() {} }\nmain() { Test.f<Array<Int64>>() }",
+        );
+        assert_ok(
+            "class Test { static func f<T>() {} }\nmain() { Test.f<Object>() }",
+        );
     }
 
 }

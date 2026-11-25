@@ -1598,6 +1598,7 @@ pub fn monomorphize_program(program: &mut Program) {
             type_params: vec![],
             constraints: vec![],
             variants,
+            props: def.props.clone(),
         });
     }
     program.enums.append(&mut new_enums);
@@ -1734,6 +1735,18 @@ pub fn monomorphize_program(program: &mut Program) {
             is_open: def.is_open,
             extends: def.extends.clone(),
             implements: def.implements.clone(),
+            supertype_args: def
+                .supertype_args
+                .iter()
+                .map(|(n, args)| {
+                    (
+                        n.clone(),
+                        args.iter()
+                            .map(|t| substitute_type(t, &subst))
+                            .collect(),
+                    )
+                })
+                .collect(),
             fields,
             init,
             deinit,
@@ -2376,6 +2389,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                     is_open: false,
                     extends: None,
                     implements: vec![],
+                    supertype_args: vec![],
                     fields: vec![crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "data".to_string(),
                         ty: Type::TypeParam("T".to_string()),
@@ -2630,6 +2644,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                             payload: None,
                         },
                     ],
+                    props: vec![],
                 },
             ],
             functions: vec![Function {

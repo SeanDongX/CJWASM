@@ -650,6 +650,9 @@ pub struct ClassDef {
     pub extends: Option<String>,
     /// 实现的接口列表
     pub implements: Vec<String>,
+    /// 父类型（extends + implements）的泛型实参，如 `class A <: I<Int32>` 的
+    /// `[("I", [Int32])]`。用于重定义/覆写的显式泛型替换比较（6.3.4.1(3)）。
+    pub supertype_args: Vec<(String, Vec<Type>)>,
     pub fields: Vec<FieldDef>,
     /// init 构造函数（无方法名，参数列表 + body）
     ///
@@ -710,6 +713,16 @@ pub struct PropDef {
     pub ty: Type,
     pub getter: Option<Vec<Stmt>>,
     pub setter: Option<(String, Vec<Stmt>)>, // (参数名, body)
+    /// 是否声明为 `static prop`。
+    pub is_static: bool,
+    /// 是否声明为 `mut prop`（带 setter 语义）。
+    pub is_mut: bool,
+    /// 是否使用了 `override` 修饰符。
+    pub is_override: bool,
+    /// 是否使用了 `redef` 修饰符（重定义）。
+    pub is_redef: bool,
+    /// 声明可见性（无修饰符时为 internal）。
+    pub visibility: Visibility,
 }
 
 /// 类型参数约束：<T: Comparable & Hashable>
@@ -731,6 +744,11 @@ pub struct EnumDef {
     /// 类型约束
     pub constraints: Vec<TypeConstraint>,
     pub variants: Vec<EnumVariant>,
+    /// 枚举体中的属性声明（`prop p: T { get() {...} }`）。
+    ///
+    /// 解析器同时把这些属性脱糖为 `EnumName.__get_p` / `__set_p` 方法以便语义
+    /// 检查与代码生成；此字段保留原始声明供接口属性规则（6.2.4.1(6)/(7)）使用。
+    pub props: Vec<PropDef>,
 }
 
 impl EnumDef {

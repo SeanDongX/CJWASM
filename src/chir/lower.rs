@@ -348,6 +348,7 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
                 crate::ast::EnumVariant { name: "None".to_string(), payload: None },
                 crate::ast::EnumVariant { name: "Some".to_string(), payload: Some(Type::Int64) },
             ],
+            props: vec![],
         });
     }
     if !has_user_result {
@@ -360,6 +361,7 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
                 crate::ast::EnumVariant { name: "Ok".to_string(), payload: Some(Type::Int64) },
                 crate::ast::EnumVariant { name: "Err".to_string(), payload: Some(Type::String) },
             ],
+            props: vec![],
         });
     }
 
@@ -773,6 +775,7 @@ mod tests {
             is_open: false,
             extends: None,
             implements: vec![],
+            supertype_args: vec![],
             fields: vec![FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                 name: "n".to_string(),
                 ty: Type::Int64,

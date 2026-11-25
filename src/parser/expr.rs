@@ -2976,7 +2976,54 @@ impl Parser {
         if matches!(next, Token::Ident(_)) {
             return matches!(self.peek_at(2), Some(Token::Gt | Token::Comma));
         }
-        false
+        // 显式类型实参的合法性由语义检查保证：这里还需把 `m<1>(...)`、`m<_>(...)`、
+        // `m<1 + 2>(...)` 这类“<...> 后紧接调用括号”的形态识别为泛型调用，
+        // 交由 parse_type 在遇到非法类型实参时报错（6.1.2.4(24)）。
+        //
+        // 形如 `a < b > (c)` 的链式比较在仓颉中恒为类型错误（Bool 无法与其它类型比较），
+        // 因此只要匹配到配对的 `>` 且其后紧跟 `(` / `{`，即可安全判定为泛型调用。
+        let mut depth: usize = 0;
+        let mut nest: usize = 0;
+        let mut i = 1usize;
+        loop {
+            match self.peek_at(i) {
+                None => return false,
+                Some(Token::LParen) | Some(Token::LBracket) | Some(Token::LBrace) => nest += 1,
+                Some(Token::RParen) | Some(Token::RBracket) | Some(Token::RBrace) => {
+                    if nest == 0 {
+                        return false;
+                    }
+                    nest -= 1;
+                }
+                Some(Token::Semicolon) if nest == 0 => return false,
+                Some(Token::Lt) if nest == 0 => depth += 1,
+                Some(Token::Gt) if nest == 0 => {
+                    if depth == 0 {
+                        return matches!(
+                            self.peek_at(i + 1),
+                            Some(Token::LParen) | Some(Token::LBrace)
+                        );
+                    }
+                    depth -= 1;
+                }
+                Some(Token::Shr) if nest == 0 => {
+                    // `>>` 关闭两层泛型
+                    if depth <= 1 {
+                        if depth == 0 {
+                            return matches!(
+                                self.peek_at(i + 1),
+                                Some(Token::LParen) | Some(Token::LBrace)
+                            );
+                        }
+                        depth -= 1;
+                    } else {
+                        depth -= 2;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
     }
 }
 
@@ -3168,5 +3215,30 @@ class B <: A {
 }
 main() {}
 "#);
+    }
+
+    #[test]
+    fn test_generic_static_call_type_args_parsed() {
+        // 合法显式类型实参仍应正常解析为泛型调用。
+        ok(r#"
+class Test { static func f<T1, T2>(x: Int64) {} }
+main() { Test.f<Int64, String>(1) }
+"#);
+        ok(r#"
+class Test { static func f<T1>(x: Int64) {} }
+main() { Test.f<Array<Int64>>(1) }
+"#);
+    }
+
+    #[test]
+    fn test_generic_static_call_invalid_type_args_rejected() {
+        // 6.1.2.4(24)：`<...>` 后紧跟调用括号时按泛型实参解析，非类型实参报语法错误。
+        fn err(src: &str) {
+            assert!(parse_source(src).is_err(), "expected parse error:\n{}", src);
+        }
+        err("class Test { static func f<T>() {} }\nmain() { Test.f<1>() }");
+        err("class Test { static func f<T>() {} }\nmain() { Test.f<_>() }");
+        err("class Test { static func f<T>() {} }\nmain() { Test.f<1 + 2>() }");
+        err("class Test { static func f<T>() {} }\nmain() { Test.f<if (true) {1} else {2}>() }");
     }
 }

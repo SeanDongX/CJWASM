@@ -1142,6 +1142,8 @@ struct Sig {
     name: String,
     /// 参数类型（不含接收者）。
     params: Vec<Type>,
+    /// 各参数是否为“命名参数”（声明带 `!`），与 `params` 对齐。
+    named: Vec<bool>,
     /// 返回类型；None 表示未标注（Unit 推断）。
     ret: Option<Type>,
     /// 是否带方法级泛型参数；None 表示语言层不可见（接口方法）。
@@ -1149,6 +1151,8 @@ struct Sig {
     /// 声明顺序的类型参数（类级在前、方法级在后）。
     /// 用于按声明顺序做 alpha 等价；为空时按首次出现顺序编号。
     tp_order: Vec<String>,
+    /// `tp_order` 中属于类级（父类型）的类型参数个数，其后为方法级参数。
+    class_tp_count: usize,
     /// 是否为静态函数（无实例接收者）。
     is_static: bool,
     /// 声明可见性；`None` 表示语言层不可见（接口方法在 AST 中不保存可见性）。
@@ -1161,20 +1165,28 @@ fn is_receiver_param(name: &str) -> bool {
     name == "this" || name == "self"
 }
 
-/// 剥离第一个隐式/显式接收者参数，返回（其余参数, 是否静态）。
-fn split_receiver(params: &[crate::ast::Param]) -> (Vec<Type>, bool) {
+/// 剥离第一个隐式/显式接收者参数，返回（其余参数类型, 命名参数标记, 是否静态）。
+fn split_receiver(params: &[crate::ast::Param]) -> (Vec<Type>, Vec<bool>, bool) {
     if params
         .first()
         .map_or(false, |p| is_receiver_param(&p.name))
     {
-        (params[1..].iter().map(|p| p.ty.clone()).collect(), false)
+        (
+            params[1..].iter().map(|p| p.ty.clone()).collect(),
+            params[1..].iter().map(|p| p.is_named).collect(),
+            false,
+        )
     } else {
-        (params.iter().map(|p| p.ty.clone()).collect(), true)
+        (
+            params.iter().map(|p| p.ty.clone()).collect(),
+            params.iter().map(|p| p.is_named).collect(),
+            true,
+        )
     }
 }
 
 fn sig_of_function(func: &Function, outer_tp: &[String]) -> Sig {
-    let (params, is_static) = split_receiver(&func.params);
+    let (params, named, is_static) = split_receiver(&func.params);
     // 属性访问器脱糖方法名形如 `Class.__get_p`，按成员名比较时去掉前缀。
     let name = func
         .name
@@ -1186,9 +1198,11 @@ fn sig_of_function(func: &Function, outer_tp: &[String]) -> Sig {
     Sig {
         name,
         params,
+        named,
         ret: func.return_type.clone(),
         generic: Some(!func.type_params.is_empty()),
         tp_order,
+        class_tp_count: outer_tp.len(),
         is_static,
         vis: Some(func.visibility.clone()),
         display: func.name.clone(),
@@ -1202,22 +1216,38 @@ fn sig_of_class_method(m: &ClassMethod, outer_tp: &[String]) -> Sig {
     sig
 }
 
-fn sig_of_interface_method(method: &InterfaceMethod) -> Sig {    // 接口方法的参数列表不含隐式接收者；若显式写了 this/self 也剥离。
-    let params = if method
+fn sig_of_interface_method(method: &InterfaceMethod) -> Sig {
+    sig_of_interface_method_tp(method, &[])
+}
+
+/// 接口方法签名；`outer_tp` 为接口自身的类型参数（类级）。
+fn sig_of_interface_method_tp(method: &InterfaceMethod, outer_tp: &[String]) -> Sig {
+    // 接口方法的参数列表不含隐式接收者；若显式写了 this/self 也剥离。
+    let (params, named) = if method
         .params
         .first()
         .map_or(false, |p| is_receiver_param(&p.name))
     {
-        method.params[1..].iter().map(|p| p.ty.clone()).collect()
+        (
+            method.params[1..].iter().map(|p| p.ty.clone()).collect(),
+            method.params[1..].iter().map(|p| p.is_named).collect(),
+        )
     } else {
-        method.params.iter().map(|p| p.ty.clone()).collect()
+        (
+            method.params.iter().map(|p| p.ty.clone()).collect(),
+            method.params.iter().map(|p| p.is_named).collect(),
+        )
     };
+    let mut tp_order = outer_tp.to_vec();
+    tp_order.extend(method.type_params.iter().cloned());
     Sig {
         name: method.name.clone(),
         params,
+        named,
         ret: method.return_type.clone(),
         generic: Some(!method.type_params.is_empty()),
-        tp_order: method.type_params.clone(),
+        tp_order,
+        class_tp_count: outer_tp.len(),
         is_static: method.is_static,
         vis: Some(method.visibility.clone()),
         display: method.name.clone(),
@@ -2421,6 +2451,7 @@ fn check_class(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut Vec<Semant
                 .map(|m| sig_of_class_method(m, &cls.type_params))
                 .collect();
             check_interface_property_types(&cls.name, &own, &parents, index, errors);
+            check_interface_property_mut(&cls.name, &own, &parents, errors);
         }
     }
 
@@ -5003,8 +5034,59 @@ fn check_interface_property_types(
     }
 }
 
-fn check_duplicate_fields<'a, I: Iterator<Item = &'a str>>(
+/// 实现接口属性时，属性的 `mut` 修饰符必须与接口声明一致（6.2.4.1(6)）。
+///
+/// 属性访问器脱糖为 `__get_p` / `__set_p`：存在 setter 即视为 `mut`。抽象 `mut prop`
+/// 声明在解析器中同样会脱糖出抽象 setter，因此可据父类型签名判断其可变性。
+fn check_interface_property_mut(
     owner: &str,
+    own_sigs: &[Sig],
+    parents: &[ParentMethod],
+    errors: &mut Vec<SemanticError>,
+) {
+    // 父接口属性基名 → 是否可变（存在 setter）。
+    let mut parent_props: HashMap<&str, bool> = HashMap::new();
+    for p in parents.iter().filter(|p| p.is_interface) {
+        let base = member_base_name(&p.sig.name);
+        if !p.sig.name.starts_with("__get_") && !p.sig.name.starts_with("__set_") {
+            continue;
+        }
+        let e = parent_props.entry(base).or_insert(false);
+        if p.sig.name.starts_with("__set_") {
+            *e = true;
+        }
+    }
+    if parent_props.is_empty() {
+        return;
+    }
+    let own_set: HashSet<&str> = own_sigs
+        .iter()
+        .filter(|s| s.name.starts_with("__set_"))
+        .map(|s| member_base_name(&s.name))
+        .collect();
+    let own_get: HashSet<&str> = own_sigs
+        .iter()
+        .filter(|s| s.name.starts_with("__get_"))
+        .map(|s| member_base_name(&s.name))
+        .collect();
+    let mut reported: HashSet<&str> = HashSet::new();
+    for (base, parent_mut) in parent_props {
+        if !own_get.contains(base) && !own_set.contains(base) {
+            continue;
+        }
+        let own_mut = own_set.contains(base);
+        if own_mut != parent_mut && reported.insert(base) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类型 '{}' 实现的属性 '{}' 的 mut 修饰符与接口声明不一致（6.2.4.1(6)）",
+                    owner, base
+                ),
+            });
+        }
+    }
+}
+
+fn check_duplicate_fields<'a, I: Iterator<Item = &'a str>>(    owner: &str,
     fields: I,
     errors: &mut Vec<SemanticError>,
 ) {
@@ -5304,6 +5386,10 @@ fn signature_matches(a: &Sig, b: &Sig, strict_types: bool, index: &ProgramIndex<
     if a.params.len() != b.params.len() {
         return false;
     }
+    // “相同的参数列表”包含命名参数标记：`y` 与 `y!` 不构成同一签名（6.3.4.1(3)）。
+    if a.named.len() == b.named.len() && a.named != b.named {
+        return false;
+    }
     if !strict_types {
         return true;
     }
@@ -5336,6 +5422,57 @@ fn signature_matches(a: &Sig, b: &Sig, strict_types: bool, index: &ProgramIndex<
     }
 }
 
+/// 重定义（`redef`）的函数签名比较（6.3.4.1(3)）。
+///
+/// 在父类型的类级泛型已按 `<: Parent<Args>>` 消解（`fully_concrete`）时，
+/// 对含类型参数的签名做规范的严格比较：参数类型必须“相同”，不允许泛型参数
+/// 与具体类型互换，也不允许不同位置的泛型参数互换。
+fn redef_signature_matches(
+    a: &Sig,
+    b: &Sig,
+    fully_concrete: bool,
+    strict_types: bool,
+    index: &ProgramIndex<'_>,
+) -> bool {
+    if a.params.len() != b.params.len() {
+        return false;
+    }
+    if a.named.len() == b.named.len() && a.named != b.named {
+        return false;
+    }
+    fn has_tp(t: &Type) -> bool {
+        match t {
+            Type::TypeParam(_) => true,
+            Type::Struct(_, args) => args.iter().any(has_tp),
+            Type::Array(i) | Type::Option(i) | Type::Slice(i) => has_tp(i),
+            Type::Tuple(ts) => ts.iter().any(has_tp),
+            Type::Result(x, y) | Type::Map(x, y) => has_tp(x) || has_tp(y),
+            Type::Function { params, ret } => {
+                params.iter().any(has_tp)
+                    || ret.as_ref().as_ref().map_or(false, has_tp)
+            }
+            _ => false,
+        }
+    }
+    let generic_side = a
+        .params
+        .iter()
+        .chain(a.ret.iter())
+        .chain(b.params.iter())
+        .chain(b.ret.iter())
+        .any(has_tp);
+    if !fully_concrete || !generic_side {
+        return signature_matches(a, b, strict_types, index);
+    }
+    let (ap, ar) = canon_signature(a);
+    let (bp, br) = canon_signature(b);
+    ap == bp
+        && match (ar, br) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        }
+}
+
 /// 父类型方法的来源签名。
 struct ParentMethod {
     sig: Sig,
@@ -5345,6 +5482,9 @@ struct ParentMethod {
     abstract_: bool,
     /// 是否可被覆写（class 成员需 open/abstract；接口成员天然可被实现/覆写）。
     open_: bool,
+    /// 父类型的类级泛型均已消解（无类级参数，或已按 `<: T<...>>` 的实参替换），
+    /// 用于重定义时按规范形状严格比较参数（6.3.4.1(3)）。
+    fully_concrete: bool,
     /// 是否来自接口。
     is_interface: bool,
     /// 声明该方法的类型名（用于识别多个接口的默认实现冲突）。
@@ -5353,6 +5493,51 @@ struct ParentMethod {
     type_params: Vec<String>,
     /// 方法级泛型约束（6.2.4.1(5) / 6.3.4.1(5)）。
     constraints: Vec<crate::ast::TypeConstraint>,
+}
+
+/// 按类型参数替换表递归替换类型中的泛型参数。
+fn subst_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::TypeParam(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+        // 解析器在部分上下文（如接口方法签名）把类型参数记为不带实参的 Struct，
+        // 同样按替换表处理。
+        Type::Struct(n, args) if args.is_empty() && subst.contains_key(n) => {
+            subst.get(n).cloned().unwrap()
+        }
+        Type::Struct(n, args) => Type::Struct(
+            n.clone(),
+            args.iter().map(|a| subst_type(a, subst)).collect(),
+        ),
+        Type::Array(inner) => Type::Array(Box::new(subst_type(inner, subst))),
+        Type::Option(inner) => Type::Option(Box::new(subst_type(inner, subst))),
+        Type::Slice(inner) => Type::Slice(Box::new(subst_type(inner, subst))),
+        Type::Tuple(items) => Type::Tuple(items.iter().map(|t| subst_type(t, subst)).collect()),
+        Type::Result(a, b) => Type::Result(
+            Box::new(subst_type(a, subst)),
+            Box::new(subst_type(b, subst)),
+        ),
+        Type::Map(a, b) => Type::Map(
+            Box::new(subst_type(a, subst)),
+            Box::new(subst_type(b, subst)),
+        ),
+        Type::Function { params, ret } => Type::Function {
+            params: params.iter().map(|t| subst_type(t, subst)).collect(),
+            ret: Box::new((**ret).as_ref().map(|t| subst_type(t, subst))),
+        },
+        _ => ty.clone(),
+    }
+}
+
+/// 由父类型类型参数与 `<: Parent<Args>>` 实参构建替换表；形态不匹配时返回 None。
+fn build_supertype_subst(
+    parent_tps: &[String],
+    args: Option<&Vec<Type>>,
+) -> Option<HashMap<String, Type>> {
+    let args = args?;
+    if args.len() != parent_tps.len() {
+        return None;
+    }
+    Some(parent_tps.iter().cloned().zip(args.iter().cloned()).collect())
 }
 
 /// 收集一个 class 的所有本地父类型（父类 + 接口，含传递）的方法。
@@ -5366,6 +5551,12 @@ fn collect_parent_methods<'a>(
     let mut visited: HashSet<&'a str> = HashSet::new();
     let mut class_chain: Vec<&'a str> = Vec::new();
     let mut iface_names: Vec<&'a str> = Vec::new();
+    // 直接父类型的泛型实参（仅 `<: Parent<Args>>` 书写处可用）。
+    let direct_args: HashMap<&str, Vec<Type>> = cls
+        .supertype_args
+        .iter()
+        .map(|(n, a)| (n.as_str(), a.clone()))
+        .collect();
 
     // 直接父类型（extends 可能是父类或接口，implements 为接口）
     let mut direct: Vec<&'a str> = Vec::new();
@@ -5401,10 +5592,20 @@ fn collect_parent_methods<'a>(
         let Some(parent) = index.classes.get(name) else {
             return None;
         };
-        let strict = parent.type_params.is_empty();
+        let subst = build_supertype_subst(&parent.type_params, direct_args.get(name));
+        let strict = parent.type_params.is_empty() || subst.is_some();
+        let fully_concrete = strict;
         for m in &parent.methods {
+            let mut sig = sig_of_class_method(m, &parent.type_params);
+            if let Some(s) = &subst {
+                sig.params = sig.params.iter().map(|t| subst_type(t, s)).collect();
+                sig.ret = sig.ret.as_ref().map(|t| subst_type(t, s));
+                sig.tp_order = cls.type_params.clone();
+                sig.tp_order.extend(m.func.type_params.iter().cloned());
+                sig.class_tp_count = cls.type_params.len();
+            }
             out.push(ParentMethod {
-                sig: sig_of_class_method(m, &parent.type_params),
+                sig,
                 strict_types: strict,
                 // 无体成员函数在抽象类中视为隐式抽象；抽象/open 方法可被子类覆写。
                 abstract_: m.is_abstract || !m.has_body,
@@ -5413,6 +5614,7 @@ fn collect_parent_methods<'a>(
                 owner: name.to_string(),
                 type_params: m.func.type_params.clone(),
                 constraints: m.func.constraints.clone(),
+                fully_concrete,
             });
         }
         if let Some(exts) = index.extends.get(name) {
@@ -5426,6 +5628,7 @@ fn collect_parent_methods<'a>(
                     owner: name.to_string(),
                     type_params: f.type_params.clone(),
                     constraints: f.constraints.clone(),
+                    fully_concrete: true,
                 });
             }
         }
@@ -5458,9 +5661,19 @@ fn collect_parent_methods<'a>(
         let Some(iface) = index.interfaces.get(name) else {
             return None;
         };
+        let subst = build_supertype_subst(&iface.type_params, direct_args.get(name));
+        let fully_concrete = iface.type_params.is_empty() || subst.is_some();
         for m in &iface.methods {
+            let mut sig = sig_of_interface_method_tp(m, &iface.type_params);
+            if let Some(s) = &subst {
+                sig.params = sig.params.iter().map(|t| subst_type(t, s)).collect();
+                sig.ret = sig.ret.as_ref().map(|t| subst_type(t, s));
+                sig.tp_order = cls.type_params.clone();
+                sig.tp_order.extend(m.type_params.iter().cloned());
+                sig.class_tp_count = cls.type_params.len();
+            }
             out.push(ParentMethod {
-                sig: sig_of_interface_method(m),
+                sig,
                 strict_types: true,
                 abstract_: m.default_body.is_none(),
                 open_: true,
@@ -5468,6 +5681,7 @@ fn collect_parent_methods<'a>(
                 owner: name.to_string(),
                 type_params: m.type_params.clone(),
                 constraints: m.constraints.clone(),
+                fully_concrete,
             });
         }
         if let Some(exts) = index.extends.get(name) {
@@ -5481,6 +5695,7 @@ fn collect_parent_methods<'a>(
                     owner: name.to_string(),
                     type_params: f.type_params.clone(),
                     constraints: f.constraints.clone(),
+                    fully_concrete: true,
                 });
             }
         }
@@ -5574,8 +5789,13 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
             continue;
         }
         let matched = same_name.iter().any(|p| {
-            (p.sig.name == sig.name && signature_matches(&sig, &p.sig, p.strict_types, index))
-                || alt_getter.as_deref() == Some(p.sig.name.as_str())
+            let s = if method.has_override_kw {
+                signature_matches(&sig, &p.sig, p.strict_types, index)
+            } else {
+                // redef：显式泛型替换后的严格比较（6.3.4.1(3)）。
+                redef_signature_matches(&sig, &p.sig, p.fully_concrete, p.strict_types, index)
+            };
+            (p.sig.name == sig.name && s) || alt_getter.as_deref() == Some(p.sig.name.as_str())
         });
         if !matched {
             errors.push(SemanticError {
@@ -6309,6 +6529,9 @@ fn collect_interface_methods<'a>(
                 owner: name.to_string(),
                 type_params: m.type_params.clone(),
                 constraints: m.constraints.clone(),
+                // struct/enum 的 `<: I<...>>` 实参未保留在 AST 中；带类级参数的接口
+                // 视为未消解，泛型参数比较保持保守。
+                fully_concrete: iface.type_params.is_empty(),
             });
         }
         if let Some(exts) = index.extends.get(name) {
@@ -6322,6 +6545,7 @@ fn collect_interface_methods<'a>(
                     owner: name.to_string(),
                     type_params: f.type_params.clone(),
                     constraints: f.constraints.clone(),
+                    fully_concrete: true,
                 });
             }
         }
@@ -6370,6 +6594,7 @@ fn check_struct_interfaces<'a>(
         check_abstract_methods_implemented(&st.name, own_impls.clone(), &parents, index, errors);
     }
     check_interface_property_types(&st.name, &own_impls, &parents, index, errors);
+    check_interface_property_mut(&st.name, &own_impls, &parents, errors);
 }
 
 fn is_property_method_name(name: &str) -> bool {
@@ -6398,11 +6623,11 @@ fn check_enum_interfaces<'a>(
     let Some(parents) = collect_interface_methods(&bounds, index) else {
         return;
     };
-    let parents: Vec<ParentMethod> = parents
-        .into_iter()
+    let mut parents = parents;
+    let has_abstract = parents
+        .iter()
         .filter(|p| !is_property_method_name(&p.sig.name))
-        .collect();
-    let has_abstract = parents.iter().any(|p| p.abstract_);
+        .any(|p| p.abstract_);
     let mut own_impls: Vec<Sig> = program
         .functions
         .iter()
@@ -6414,6 +6639,10 @@ fn check_enum_interfaces<'a>(
             own_impls.push(sig_of_function(f, &en.type_params));
         }
     }
+    // 枚举实现的接口属性：类型（6.2.4.1(7)）与 mut 修饰符（6.2.4.1(6)）必须一致。
+    check_interface_property_types(&en.name, &own_impls, &parents, index, errors);
+    check_interface_property_mut(&en.name, &own_impls, &parents, errors);
+    parents.retain(|p| !is_property_method_name(&p.sig.name));
     // 访问级别不得低于接口声明（6.3.5(3)）；即使接口成员带默认实现也同样适用。
     check_impl_visibility(&en.name, &own_impls, &parents, index, errors);
     if has_abstract {
@@ -10054,6 +10283,7 @@ mod tests {
                 is_open: false,
                 extends: None,
                 implements: vec![],
+                supertype_args: vec![],
                 fields: vec![],
                 init: None,
                 deinit: None,
@@ -11991,6 +12221,77 @@ main() {}"#,
         assert_invalid("struct S {\n const init() {\n var x = 0\n }\n}\nmain() {}");
         // 合法的 const init：对实例字段赋值。
         assert_valid("class C {\n let v: Int64\n const init() {\n v = 1\n }\n}\nmain() {}");
+    }
+
+    // ─── w10a: 枚举属性 / 显式类型实参 / 重定义签名比较 ──────────────────────
+
+    #[test]
+    fn test_w10a_enum_property_type_must_match_interface() {
+        // 6.2.4.1(7)：枚举实现的属性类型必须与接口一致（不允许协变/逆变）。
+        assert_invalid(
+            "open class Sup {}\nclass Sub <: Sup {}\n\
+             interface I { prop p: Sup { get() { Sup() } } }\n\
+             enum A <: I {\n E\n public override prop p: Sub { get() { Sub() } }\n}\nmain() {}",
+        );
+        // 类型一致则合法。
+        assert_valid(
+            "interface I { prop p: Int64 { get() { 0 } } }\n\
+             enum A <: I {\n E\n public override prop p: Int64 { get() { 1 } }\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w10a_enum_property_mut_must_match_interface() {
+        // 6.2.4.1(6)：不可变接口属性被实现为 mut 属性非法。
+        assert_invalid(
+            "interface I { prop p: Int64 { get() { 0 } } }\n\
+             enum A <: I {\n E\n public override mut prop p: Int64 { get() { 1 } set(v) {} }\n}\nmain() {}",
+        );
+        // 抽象 mut 属性被实现为不可变属性非法。
+        assert_invalid(
+            "interface I { static mut prop p: Int64 }\n\
+             enum A <: I {\n E\n public redef static prop p: Int64 { get() { 1 } }\n}\nmain() {}",
+        );
+        // mut 一致则合法。
+        assert_valid(
+            "interface I { mut prop p: Int64 { get() { 0 } set(v) {} } }\n\
+             struct S <: I {\n public override mut prop p: Int64 { get() { 1 } set(v) {} }\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w10a_redef_named_parameter_flag_must_match() {
+        // 6.3.4.1(3)：命名参数标记属于参数列表的一部分，redef 必须一致。
+        assert_invalid(
+            "interface I { static func f(x: Int64, y: Int64) {} }\n\
+             class A <: I { public redef static func f(x: Int64, y!: Int64) {} }\nmain() {}",
+        );
+        assert_invalid(
+            "interface I { static func f(x: Int64, y!: Int64) {} }\n\
+             class A <: I { public redef static func f(x: Int64, y: Int64) {} }\nmain() {}",
+        );
+        assert_valid(
+            "interface I { static func f(x: Int64, y: Int64) {} }\n\
+             class A <: I { public redef static func f(x: Int64, y: Int64) {} }\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w10a_redef_generic_instantiation_substitution() {
+        // 6.3.4.1(3)：父接口按 `<: I<Int32>>` 实例化后，参数应比较替换后的类型。
+        assert_invalid(
+            "interface I<T> { static func f<U>(x: T): Unit }\n\
+             abstract class A <: I<Int32> { public redef static func f<U>(x: Int64) {} }\nmain() {}",
+        );
+        assert_valid(
+            "interface I<T> { static func f<U>(x: T): Unit }\n\
+             class A <: I<Int64> { public redef static func f<U>(x: Int64) {} }\nmain() {}",
+        );
+        // 泛型参数与具体类型不可互换。
+        assert_invalid(
+            "interface I { static func f(x: Rune): Unit }\n\
+             abstract class A<T> <: I { public redef static func f(x: T) {} }\nmain() {}",
+        );
     }
 
 }

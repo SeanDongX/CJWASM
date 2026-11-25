@@ -1533,6 +1533,7 @@ impl Parser {
         }
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
+        let mut props: Vec<crate::ast::PropDef> = Vec::new();
         while !self.check(&Token::RBrace) {
             // 容忍成员声明后的多余分号
             if self.check(&Token::Semicolon) {
@@ -1541,25 +1542,147 @@ impl Parser {
             }
             // cjc 兼容: enum 成员修饰符可任意顺序（如 public operator func）
             let mods = self.parse_member_modifiers();
-            // cjc 兼容: enum 内部 prop 声明，解析后丢弃
+            // cjc 兼容: enum 内部 prop 声明，保留声明并脱糖为 __get_/__set_ 方法，
+            // 以便语义检查（接口属性规则 6.2.4.1(6)/(7)）与代码生成。
             if self.check(&Token::Prop) {
                 self.advance(); // consume prop
-                let _ = self.advance(); // prop name
-                if self.check(&Token::Colon) {
+                let prop_name = match self.advance() {
+                    Some(Token::Ident(n)) => n,
+                    Some(tok) => {
+                        return self.bail(ParseError::UnexpectedToken(tok, "属性名".to_string()))
+                    }
+                    None => return self.bail(ParseError::UnexpectedEof),
+                };
+                let prop_ty = if self.check(&Token::Colon) {
                     self.advance();
-                    let _ = self.parse_type()?;
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                let member_vis = mods.visibility.clone().unwrap_or(Visibility::Internal);
+                let enum_this = crate::ast::Param {
+                    name: "this".to_string(),
+                    ty: Type::Struct(
+                        name.clone(),
+                        type_params
+                            .iter()
+                            .map(|t| Type::TypeParam(t.clone()))
+                            .collect(),
+                    ),
+                    default: None,
+                    variadic: false,
+                    is_named: false,
+                    is_inout: false,
+                };
+                let mk_getter = |body: Vec<Stmt>| crate::ast::Function {
+                    is_const: false,
+                    visibility: member_vis.clone(),
+                    name: format!("{}.__get_{}", name, prop_name),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: if mods.is_static {
+                        vec![]
+                    } else {
+                        vec![enum_this.clone()]
+                    },
+                    return_type: prop_ty.clone(),
+                    throws: None,
+                    body,
+                    extern_import: None,
+                };
+                let mk_setter = |val_name: String, body: Vec<Stmt>| crate::ast::Function {
+                    is_const: false,
+                    visibility: member_vis.clone(),
+                    name: format!("{}.__set_{}", name, prop_name),
+                    type_params: vec![],
+                    constraints: vec![],
+                    params: {
+                        let mut ps = if mods.is_static {
+                            Vec::new()
+                        } else {
+                            vec![enum_this.clone()]
+                        };
+                        ps.push(crate::ast::Param {
+                            name: val_name,
+                            ty: prop_ty.clone().unwrap_or(Type::TypeParam("_".to_string())),
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        });
+                        ps
+                    },
+                    return_type: None,
+                    throws: None,
+                    body,
+                    extern_import: None,
+                };
+                let mut prop = crate::ast::PropDef {
+                    name: prop_name.clone(),
+                    ty: prop_ty.clone().unwrap_or(Type::TypeParam("_".to_string())),
+                    getter: None,
+                    setter: None,
+                    is_static: mods.is_static,
+                    is_mut: mods.is_mut,
+                    is_override: mods.is_override,
+                    is_redef: mods.is_override && !mods.has_override_kw,
+                    visibility: member_vis.clone(),
+                };
+                // 无体属性声明（纯签名）：仅登记声明，不生成实现。
+                if !self.check(&Token::LBrace) {
+                    while self.check(&Token::Semicolon) {
+                        self.advance();
+                    }
+                    props.push(prop);
+                    continue;
                 }
-                // 跳过 { get() { ... } set(...) { ... } } 块
                 self.expect(Token::LBrace)?;
-                let mut depth = 1usize;
-                while depth > 0 {
-                    match self.advance() {
-                        Some(Token::LBrace) => depth += 1,
-                        Some(Token::RBrace) => depth -= 1,
-                        None => break,
-                        _ => {}
+                while !self.check(&Token::RBrace) {
+                    if let Some(Token::Ident(ref kw)) = self.peek() {
+                        let kw = kw.clone();
+                        if kw == "get" {
+                            self.advance();
+                            self.expect(Token::LParen)?;
+                            self.expect(Token::RParen)?;
+                            self.receiver_name = Some("this".to_string());
+                            self.expect(Token::LBrace)?;
+                            let body = self.parse_stmts()?;
+                            self.expect(Token::RBrace)?;
+                            self.receiver_name = None;
+                            prop.getter = Some(body.clone());
+                            self.pending_struct_methods.push(mk_getter(body));
+                        } else if kw == "set" {
+                            self.advance();
+                            self.expect(Token::LParen)?;
+                            let val_name = match self.advance() {
+                                Some(Token::Ident(n)) => n,
+                                Some(Token::Underscore) => "_".to_string(),
+                                Some(tok) => {
+                                    return self.bail(ParseError::UnexpectedToken(
+                                        tok,
+                                        "setter 参数名".to_string(),
+                                    ))
+                                }
+                                None => return self.bail(ParseError::UnexpectedEof),
+                            };
+                            self.expect(Token::RParen)?;
+                            self.receiver_name = Some("this".to_string());
+                            self.expect(Token::LBrace)?;
+                            let body = self.parse_stmts()?;
+                            self.expect(Token::RBrace)?;
+                            self.receiver_name = None;
+                            prop.is_mut = true;
+                            prop.setter = Some((val_name.clone(), body.clone()));
+                            self.pending_struct_methods.push(mk_setter(val_name, body));
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
                     }
                 }
+                self.expect(Token::RBrace)?;
+                props.push(prop);
                 continue;
             }
             // cjc 兼容: enum 内部方法 → 转为外部方法 func EnumName.method(this, ...)
@@ -1665,6 +1788,7 @@ impl Parser {
             type_params,
             constraints,
             variants,
+            props,
         })
     }
 
@@ -1740,6 +1864,8 @@ impl Parser {
                 continue;
             }
             self.skip_optional_attributes()?;
+            // 接口成员修饰符（static / public / mut / const / operator ...）可任意顺序。
+            let mods = self.parse_member_modifiers();
             // cjc: 接口中的 prop 声明，脱糖为抽象 getter/setter 方法
             if self.check(&Token::Prop) {
                 self.advance(); // consume prop
@@ -1755,22 +1881,47 @@ impl Parser {
                 if self.check(&Token::Semicolon) {
                     self.advance();
                 }
+                // 记录 prop 的 mut/static 语义：抽象 mut 属性需同时脱糖出抽象 setter，
+                // 供实现类型的 mut 修饰符一致性检查（6.2.4.1(6)）使用。
+                let prop_is_static = mods.is_static;
+                let prop_is_mut_decl = mods.is_mut;
                 // 抽象 prop 可以没有 { get()... } 块（纯签名声明）
                 if !self.check(&Token::LBrace) {
                     methods.push(crate::ast::InterfaceMethod {
                         name: format!("__get_{}", prop_name),
                         params: vec![],
-                        return_type: Some(prop_ty),
+                        return_type: Some(prop_ty.clone()),
                         default_body: None,
                         visibility: Visibility::Public,
-                        is_static: false,
+                        is_static: prop_is_static,
                         type_params: vec![],
                         constraints: vec![],
                         is_const: false,
                     });
+                    if prop_is_mut_decl {
+                        methods.push(crate::ast::InterfaceMethod {
+                            name: format!("__set_{}", prop_name),
+                            params: vec![Param {
+                                name: "value".to_string(),
+                                ty: prop_ty.clone(),
+                                default: None,
+                                variadic: false,
+                                is_named: false,
+                                is_inout: false,
+                            }],
+                            return_type: None,
+                            default_body: None,
+                            visibility: Visibility::Public,
+                            is_static: prop_is_static,
+                            type_params: vec![],
+                            constraints: vec![],
+                            is_const: false,
+                        });
+                    }
                     continue;
                 }
                 self.advance(); // consume {
+                let mut saw_setter = false;
                 while !self.check(&Token::RBrace) {
                     if let Some(Token::Ident(ref kw)) = self.peek() {
                         let kw = kw.clone();
@@ -1797,7 +1948,7 @@ impl Parser {
                                 return_type: Some(prop_ty.clone()),
                                 default_body,
                                 visibility: Visibility::Public,
-                                is_static: false,
+                                is_static: prop_is_static,
                                 type_params: vec![],
                                 constraints: vec![],
                                 is_const: false,
@@ -1817,6 +1968,7 @@ impl Parser {
                                 None => return self.bail(ParseError::UnexpectedEof),
                             };
                             self.expect(Token::RParen)?;
+                            saw_setter = true;
                             let default_body = if self.check(&Token::LBrace) {
                                 self.advance();
                                 self.receiver_name = Some("this".to_string());
@@ -1843,7 +1995,7 @@ impl Parser {
                                 return_type: None,
                                 default_body,
                                 visibility: Visibility::Public,
-                                is_static: false,
+                                is_static: prop_is_static,
                                 type_params: vec![],
                                 constraints: vec![],
                                 is_const: false,
@@ -1856,15 +2008,31 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RBrace)?;
+                // 声明为 `mut prop` 但只写了 getter 时，同样补登抽象 setter 以
+                // 保持 mut 语义可被实现类型校验观察到。
+                if prop_is_mut_decl && !saw_setter {
+                    methods.push(crate::ast::InterfaceMethod {
+                        name: format!("__set_{}", prop_name),
+                        params: vec![Param {
+                            name: "value".to_string(),
+                            ty: prop_ty.clone(),
+                            default: None,
+                            variadic: false,
+                            is_named: false,
+                            is_inout: false,
+                        }],
+                        return_type: None,
+                        default_body: None,
+                        visibility: Visibility::Public,
+                        is_static: prop_is_static,
+                        type_params: vec![],
+                        constraints: vec![],
+                        is_const: false,
+                    });
+                }
                 continue;
             }
             // cjc: 接口方法修饰符可任意顺序（static / public / override / mut / const / operator ...）
-            let mods = self.parse_member_modifiers();
-            // After consuming modifiers, could still be prop or func
-            if self.check(&Token::Prop) {
-                // continue循环头部会重新处理 prop
-                continue;
-            }
             self.expect(Token::Func)?;
             let m_name = if mods.is_operator {
                 self.parse_operator_name()?.to_string()
@@ -2319,15 +2487,17 @@ impl Parser {
         let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
         let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
         // cjc: 使用 <: 表示继承 (class Foo <: Base & Interface1 & Interface2)
+        let mut supertype_args: Vec<(String, Vec<Type>)> = Vec::new();
         let (extends, implements) = if self.check(&Token::SubType) {
             self.advance();
             let mut types = Vec::new();
             loop {
                 // 解析类型（支持泛型，如 Iterable<Token>）
                 let ty = self.parse_type()?;
-                // 提取基础类型名
-                let type_name = match ty {
-                    Type::Struct(name, _) => name,
+                // 提取基础类型名与泛型实参
+                let (type_name, type_args) = match ty {
+                    Type::Struct(name, args) => (name, args),
+                    Type::TypeParam(name) => (name, Vec::new()),
                     _ => {
                         return self.bail(ParseError::UnexpectedToken(
                             Token::Ident("unknown".to_string()),
@@ -2335,6 +2505,7 @@ impl Parser {
                         ))
                     }
                 };
+                supertype_args.push((type_name.clone(), type_args));
                 types.push(type_name);
                 if self.check(&Token::And) {
                     self.advance();
@@ -3204,6 +3375,7 @@ impl Parser {
             is_open,
             extends,
             implements,
+            supertype_args,
             fields,
             init,
             inits,
@@ -3733,5 +3905,61 @@ main() {}
 public let (x, y): (Int8, Float16) = (12, 1.0)
 main() {}
 "#);
+    }
+
+    #[test]
+    fn test_enum_property_preserved_and_desugared() {
+        // 枚举体中的 prop 声明应保留到 EnumDef.props，并脱糖为 __get_/__set_ 方法。
+        let program = parse_source(
+            r#"
+interface I { mut prop p: Int64 { get() { 0 } set(v) {} } }
+enum A <: I {
+    E
+    public mut prop p: Int64 {
+        get() { 1 }
+        set(v) {}
+    }
+}
+main() {}
+"#,
+        )
+        .expect("parse ok");
+        let en = program.enums.iter().find(|e| e.name == "A").expect("enum A");
+        assert_eq!(en.props.len(), 1);
+        assert_eq!(en.props[0].name, "p");
+        assert!(en.props[0].is_mut);
+        let names: Vec<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"A.__get_p"), "missing getter in {:?}", names);
+        assert!(names.contains(&"A.__set_p"), "missing setter in {:?}", names);
+    }
+
+    #[test]
+    fn test_interface_abstract_mut_prop_emits_setter() {
+        // 抽象 `mut prop` 应同时脱糖出抽象 setter，供 mut 一致性检查使用。
+        let program = parse_source(
+            r#"
+interface I { static mut prop p: Int64 }
+main() {}
+"#,
+        )
+        .expect("parse ok");
+        let iface = program.interfaces.iter().find(|i| i.name == "I").expect("iface I");
+        assert!(iface.methods.iter().any(|m| m.name == "__get_p"));
+        assert!(iface.methods.iter().any(|m| m.name == "__set_p" && m.is_static));
+    }
+
+    #[test]
+    fn test_interface_prop_static_modifier_recorded() {
+        // 接口属性前的 static/mut 修饰符不应丢失。
+        let program = parse_source(
+            r#"
+interface I { static prop p: Int64 }
+main() {}
+"#,
+        )
+        .expect("parse ok");
+        let iface = program.interfaces.iter().find(|i| i.name == "I").expect("iface I");
+        let getter = iface.methods.iter().find(|m| m.name == "__get_p").expect("getter");
+        assert!(getter.is_static, "getter should be static");
     }
 }
