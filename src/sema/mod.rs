@@ -436,6 +436,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 13 章：C 语言互操作的单文件类型约束（foreign func / CFunc）。
     check_c_interop(program, &index, &mut errors);
 
+    // 10.2.4(12)：数值/Bool/Unit/Nothing/Rune/String/Range 等类型不支持带赋值形态的
+    // 下标运算符重载；函数/元组类型亦不允许被 extend。
+    check_index_operator_extensions(program, &mut errors);
+
     // 不允许实例化抽象类 / 接口；不能继承 struct/enum。
     check_instantiation_targets(program, &mut errors);
 
@@ -8553,6 +8557,58 @@ fn check_c_interop(program: &Program, index: &ProgramIndex, errors: &mut Vec<Sem
     }
 }
 
+/// 10.2.4(12)：数值、Bool、Unit、Nothing、Rune、String、Range、函数、枚举、元组
+/// 类型不支持带赋值形态（set 形态，含命名参数）的下标运算符重载；函数/元组类型
+/// 本身也不允许被 extend。
+fn check_index_operator_extensions(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 别名 → 是否函数/元组类型（不允许被 extend）。
+    let mut alias_forbidden: HashSet<String> = HashSet::new();
+    for (name, ty) in &program.type_aliases {
+        if matches!(ty, Type::Function { .. } | Type::Tuple(_)) {
+            alias_forbidden.insert(name.clone());
+        }
+    }
+    let base_forbidden: HashSet<&str> = [
+        "Int8", "Int16", "Int32", "Int64", "IntNative", "UInt8", "UInt16", "UInt32",
+        "UInt64", "UIntNative", "Float16", "Float32", "Float64", "Bool", "Unit",
+        "Nothing", "Rune", "String", "Range",
+    ]
+    .into_iter()
+    .collect();
+
+    for ext in &program.extends {
+        let target = ext.target_type.trim();
+        // `extend Range<T>` / `extend Array<Int64>` 等：取基础名。
+        let base = target.split('<').next().unwrap_or(target).trim();
+        // 函数/元组别名不允许被 extend（10.2.4(12)）。
+        if alias_forbidden.contains(base) {
+            errors.push(SemanticError {
+                message: format!(
+                    "函数/元组类型 '{}' 不能被 extend（10.2.4(12)）",
+                    target
+                ),
+            });
+            continue;
+        }
+        // 其余内建受限类型：仅拒绝带赋值形态（set）的 [] 运算符重载。
+        if !base_forbidden.contains(base) {
+            continue;
+        }
+        let has_set_index = ext.methods.iter().any(|m| {
+            let is_index = m.name == "op_index" || m.name.ends_with(".op_index");
+            is_index && m.params.iter().any(|p| p.is_named)
+        });
+        if has_set_index {
+            errors.push(SemanticError {
+                message: format!(
+                    "类型 '{}' 不支持带赋值形态的下标运算符重载（10.2.4(12)）",
+                    base
+                ),
+            });
+        }
+    }
+}
+
 fn check_this_type_usage(program: &Program, errors: &mut Vec<SemanticError>) {
     let mut bad = |what: &str, errors: &mut Vec<SemanticError>| {
         errors.push(SemanticError {
@@ -13130,6 +13186,25 @@ main() {}"#,
         // 3.1(3)：同一 class 内字段名与成员函数名不能相同。
         assert_invalid("class C {\n let a = 0\n func a() {}\n}\nmain() {}");
         assert_valid("class C {\n let a = 0\n func b() {}\n}\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_w10d_index_operator_forbidden_builtin_types() {
+        // 10.2.4(12)：内建受限类型不支持带赋值形态的 [] 重载。
+        assert_invalid("extend Int64 { operator func[](index: Int64, value!: Int64) {} }\nmain() {}");
+        assert_invalid("extend Bool { operator func[](index: Int64, value!: Bool) {} }\nmain() {}");
+        assert_invalid("extend String { operator func[](index: Int64, value!: String) {} }\nmain() {}");
+        // 仅取 subscript（无赋值形态）不在此限。
+        assert_valid("extend Int64 { operator func[](index: Int64) { 0 } }\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_w10d_extend_function_tuple_alias_forbidden() {
+        // 10.2.4(12)：函数/元组类型不允许被 extend。
+        assert_invalid("type F = (Int64) -> Int64\nextend F { func g() {} }\nmain() {}");
+        assert_invalid("type T = (Int64, Int64)\nextend T { func g() {} }\nmain() {}");
     }
 
 }

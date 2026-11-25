@@ -688,6 +688,8 @@ struct Checker<'a> {
     struct_private_fields: HashMap<String, HashSet<String>>,
     /// 主构造函数为 private 的 struct 名集合。
     struct_private_ctor: HashSet<String>,
+    /// 结构体名 → 私有成员函数名集合（2.1.10.4(6)）。
+    struct_private_methods: HashMap<String, HashSet<String>>,
     /// struct 名 → 字段名 → 是否可变。
     struct_fields: HashMap<String, HashMap<String, bool>>,
     /// 全部 enum 变体名（`E1 = E1` 这类构造值不可赋值，4.23(15)）。
@@ -968,6 +970,22 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         })
         .map(|s| s.name.clone())
         .collect();
+    // 2.1.10.4(6)：结构体私有成员函数（脱糖为 `StructName.method` 顶层函数）。
+    let struct_names_set: HashSet<&str> = program.structs.iter().map(|s| s.name.as_str()).collect();
+    let mut struct_private_methods: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in &program.functions {
+        if !matches!(f.visibility, crate::ast::Visibility::Private) {
+            continue;
+        }
+        if let Some((ty, m)) = f.name.rsplit_once('.') {
+            if struct_names_set.contains(ty) {
+                struct_private_methods
+                    .entry(ty.to_string())
+                    .or_default()
+                    .insert(m.to_string());
+            }
+        }
+    }
     let mut enum_variants: HashSet<String> = HashSet::new();
     for e in &program.enums {
         for v in &e.variants {
@@ -1137,6 +1155,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         struct_fields,
         struct_private_fields,
         struct_private_ctor,
+        struct_private_methods,
         cur_struct: None,
         enum_variants,
         qualified_methods,
@@ -1589,16 +1608,29 @@ fn operator_func_return_ty(func: &Function, type_names: &HashSet<String>) -> Ty 
             return t;
         }
     }
+    let static_ret_ty = |e: &Expr| -> Ty {
+        let t = static_expr_to_ty(e, type_names);
+        if t != Ty::Unknown {
+            return t;
+        }
+        // 无标注返回的内建类构造（如 `{ Object() }` / `{ Exception() }`）。
+        if let Expr::ConstructorCall { name, .. } = e {
+            if is_builtin_class_name(name) {
+                return Ty::User(name.clone());
+            }
+        }
+        Ty::Unknown
+    };
     for stmt in &func.body {
         if let Stmt::Return(Some(e)) = stmt {
-            let t = static_expr_to_ty(e, type_names);
+            let t = static_ret_ty(e);
             if t != Ty::Unknown {
                 return t;
             }
         }
     }
     if let Some(Stmt::Expr(e)) = func.body.last() {
-        return static_expr_to_ty(e, type_names);
+        return static_ret_ty(e);
     }
     Ty::Unknown
 }
@@ -1812,11 +1844,37 @@ fn collect_user_graph(program: &Program) -> (HashMap<String, Vec<String>>, HashS
         ctor_types.insert(cls.name.clone());
     }
     for st in &program.structs {
-        parents.insert(st.name.clone(), Vec::new());
+        // `struct S <: I1 & I2` 会被解析器记为以结构体名为 param 的约束。
+        let ps: Vec<String> = st
+            .constraints
+            .iter()
+            .filter(|c| c.param == st.name)
+            .flat_map(|c| c.bounds.iter().cloned())
+            .collect();
+        parents.insert(st.name.clone(), ps);
         ctor_types.insert(st.name.clone());
+    }
+    for en in &program.enums {
+        // 枚举同样可实现接口（`enum E <: I { ... }`）。
+        let ps: Vec<String> = en
+            .constraints
+            .iter()
+            .filter(|c| c.param == en.name)
+            .flat_map(|c| c.bounds.iter().cloned())
+            .collect();
+        parents.insert(en.name.clone(), ps);
     }
     for iface in &program.interfaces {
         parents.insert(iface.name.clone(), iface.parents.clone());
+    }
+    // `extend T <: I { ... }`：T 通过扩展实现接口 I。
+    for ext in &program.extends {
+        if let Some(i) = &ext.interface {
+            let base = ext.target_type.trim().split('<').next().unwrap_or("").trim().to_string();
+            if !base.is_empty() {
+                parents.entry(base).or_default().push(i.clone());
+            }
+        }
     }
     (parents, ctor_types)
 }
@@ -3065,8 +3123,47 @@ impl<'a> Checker<'a> {
     }
 
     /// 目标类型与值类型是否可赋值（无隐式跨类别/跨宽度转换）。
+    /// 接收者表达式对应的结构体类型名（用于私有成员访问检查）。
+    /// 支持变量接收者与直接构造调用 `S()` 接收者。
+    fn receiver_struct_ty(&self, e: &Expr) -> Option<String> {
+        let name = match e {
+            Expr::Var(n) if n != "this" && n != "self" => {
+                match self.lookup(n).map(|v| v.ty.clone()) {
+                    Some(Ty::User(t)) => t,
+                    _ => return None,
+                }
+            }
+            Expr::ConstructorCall { name, .. } if self.ctor_types.contains(name) => {
+                name.clone()
+            }
+            _ => return None,
+        };
+        if self.struct_names.contains(&name) {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
     fn check_assignable(&mut self, target: &Ty, value: &Ty, ctx: &str) {
         if !target.is_concrete() || !value.is_definite() {
+            return;
+        }
+        // 2(1)：强类型——用户类型之间仅当存在继承/实现关系（值类型为声明类型的
+        // 同类型或子类型）时才可赋值。此前对所有 `User(_)` 一律放行（担心继承图
+        // 不完整），导致 struct/enum/class/interface 之间的错误赋值被放行。
+        if let (Ty::User(tn), Ty::User(vn)) = (target, value) {
+            let related = is_same_or_subtype_name(vn, tn, &self.user_parents)
+                || tn == "Any"
+                || vn == "Nothing";
+            if !related {
+                self.err(format!(
+                    "{}类型不匹配: 声明类型 {} 与值类型 {}（2(1)）",
+                    ctx,
+                    tn,
+                    vn
+                ));
+            }
             return;
         }
         // 2.1.4(1)：Unit 只有一个值 `()`，其它类型的值不能赋给 Unit。
@@ -3175,6 +3272,51 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 12.2(1)：`throw e` 中 e 的类型必须是 `Exception` 或 `Error`（含其子类）。
+    /// 仅在类型可静态确定为“非异常”时报错；未知类型（内建/泛型/调用结果）保守跳过。
+    fn check_throw_operand(&mut self, t: &Ty) {
+        let bad = match t {
+            Ty::Unknown | Ty::Option(_) => false,
+            Ty::User(n) => !self.is_throwable_type(n),
+            // 基础类型与聚合类型（tuple/array/range）都不是异常类型。
+            other => other.is_prim(),
+        };
+        if bad {
+            self.err(format!(
+                "throw 的操作数类型必须为 Exception 或 Error 的子类型，实际为 {}（12.2(1)）",
+                t.name()
+            ));
+        }
+    }
+
+    /// 名称对应的类型是否为 `Exception` / `Error`（含经继承链可达者）。
+    /// std 内建异常子类（如 ArithmeticException、IndexOutOfBoundsException）
+    /// 未在本地程序中定义，按其命名约定（以 Exception/Error 结尾）识别。
+    fn is_throwable_type(&self, name: &str) -> bool {
+        let is_exc = |n: &str| {
+            n == "Exception" || n == "Error" || n.ends_with("Exception") || n.ends_with("Error")
+        };
+        if is_exc(name) {
+            return true;
+        }
+        let mut stack: Vec<String> = vec![name.to_string()];
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            if is_exc(&n) {
+                return true;
+            }
+            if let Some(ps) = self.user_parents.get(&n) {
+                for p in ps {
+                    stack.push(p.clone());
+                }
+            }
+        }
+        false
+    }
+
     /// 赋值目标可静态确定的类型。
     fn assign_target_ty(&self, target: &crate::ast::AssignTarget) -> Option<Ty> {
         use crate::ast::AssignTarget;
@@ -3248,7 +3390,18 @@ impl<'a> Checker<'a> {
             Expr::Float32(_) => Ty::FloatLit,
             Expr::Bool(_) => Ty::Bool,
             Expr::Rune(_) => Ty::Rune,
-            Expr::String(_) | Expr::Interpolate(_) => Ty::String,
+            // 字符串插值 `${expr}` 内的表达式同样要接受运算符、类型与常量溢出
+            // 检查（1.3.6(4)/(9)：插值内容为表达式）。此前直接返回 String 而
+            // 不递归，导致插值内的类型/溢出错误被放行。
+            Expr::Interpolate(parts) => {
+                for p in parts {
+                    if let crate::ast::InterpolatePart::Expr(e) = p {
+                        self.check_expr(e);
+                    }
+                }
+                Ty::String
+            }
+            Expr::String(_) => Ty::String,
 
             Expr::Var(name) => self
                 .lookup(name)
@@ -3340,6 +3493,11 @@ impl<'a> Checker<'a> {
                         ));
                     }
                 }
+                // 小写首字母的结构体/类名构造调用会被解析为普通 Call（首字母大写
+                // 启发式），若名称是已知用户类型则结果类型即该类型（2(1)）。
+                if self.ctor_types.contains(name) {
+                    return Ty::User(name.clone());
+                }
                 self.call_return_ty(name, type_args.as_deref())
             }
 
@@ -3362,6 +3520,20 @@ impl<'a> Checker<'a> {
                 if let (Some(tas), Expr::Var(type_name)) = (type_args.as_deref(), &**object) {
                     if self.type_names.contains(type_name) {
                         self.check_static_type_args(type_name, method, tas);
+                    }
+                }
+                // 2.1.10.4(6)：结构体私有成员函数仅可在定义体内调用。
+                if let Some(ty_name) = self.receiver_struct_ty(object) {
+                    if self.cur_struct.as_deref() != Some(ty_name.as_str())
+                        && self
+                            .struct_private_methods
+                            .get(&ty_name)
+                            .map_or(false, |set| set.contains(method))
+                    {
+                        self.err(format!(
+                            "不能调用结构体 '{}' 的私有成员函数 '{}'（2.1.10.4(6)）",
+                            ty_name, method
+                        ));
                     }
                 }
                 // 构造函数不能作为实例/静态成员方法调用（2.1.10.2(3)）：
@@ -3490,23 +3662,17 @@ impl<'a> Checker<'a> {
             Expr::Field { object, field } => {
                 self.check_expr(object);
                 // 2.1.10.4(6)：私有实例成员仅可在结构体定义体内访问。
-                if let Expr::Var(n) = &**object {
-                    if n != "this" && n != "self" {
-                        if let Some(info) = self.lookup(n) {
-                            if let Ty::User(ty_name) = &info.ty {
-                                if self.cur_struct.as_deref() != Some(ty_name.as_str())
-                                    && self
-                                        .struct_private_fields
-                                        .get(ty_name)
-                                        .map_or(false, |set| set.contains(field))
-                                {
-                                    self.err(format!(
-                                        "不能访问结构体 '{}' 的私有成员 '{}'（2.1.10.4(6)）",
-                                        ty_name, field
-                                    ));
-                                }
-                            }
-                        }
+                if let Some(ty_name) = self.receiver_struct_ty(object) {
+                    if self.cur_struct.as_deref() != Some(ty_name.as_str())
+                        && self
+                            .struct_private_fields
+                            .get(&ty_name)
+                            .map_or(false, |set| set.contains(field))
+                    {
+                        self.err(format!(
+                            "不能访问结构体 '{}' 的私有成员 '{}'（2.1.10.4(6)）",
+                            ty_name, field
+                        ));
                     }
                 }
                 Ty::Unknown
@@ -3583,8 +3749,9 @@ impl<'a> Checker<'a> {
                     ));
                 }
                 // 用户类型构造调用 `T()`：结果类型即该类型，便于后续复合赋值
-                // 运算符返回类型校验确定左操作数类型。
-                if self.ctor_types.contains(name) {
+                // 运算符返回类型校验确定左操作数类型。内建类（Object/Exception 等）
+                // 也按同类型处理，以参与复合赋值返回类型与 throw 判定。
+                if self.ctor_types.contains(name) || is_builtin_class_name(name) {
                     Ty::User(name.clone())
                 } else {
                     Ty::Unknown
@@ -3685,8 +3852,15 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
 
-            Expr::Some(inner) | Expr::Ok(inner) | Expr::Err(inner) | Expr::Throw(inner) => {
+            Expr::Some(inner) | Expr::Ok(inner) | Expr::Err(inner) => {
                 self.check_expr(inner);
+                Ty::Unknown
+            }
+
+            // 12.2(1)：throw 的操作数必须是 Exception 或 Error（可按继承链判定）。
+            Expr::Throw(inner) => {
+                let t = self.check_expr(inner);
+                self.check_throw_operand(&t);
                 Ty::Unknown
             }
 
@@ -4462,6 +4636,27 @@ fn int_ty_range(t: &Ty) -> Option<(i128, i128)> {
         Ty::UInt64 | Ty::UIntNative => (0, u64::MAX as i128),
         _ => return None,
     })
+}
+
+/// 内建类名（构造调用 `Name(...)` 结果为该类型）。用于复合赋值返回类型与 throw
+/// 判定；不将其并入 `ctor_types` 以免影响“构造函数不能作方法调用”等规则。
+fn is_builtin_class_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Object"
+            | "Exception"
+            | "Error"
+            | "ArithmeticException"
+            | "IllegalArgumentException"
+            | "IndexOutOfBoundsException"
+            | "NoneValueException"
+            | "OverflowException"
+            | "ClassCastException"
+            | "IllegalStateException"
+            | "NegativeArraySizeException"
+            | "OutOfMemoryError"
+            | "StackOverflowError"
+    )
 }
 
 /// 基础类型转换构造函数名 → 类型。
@@ -5858,6 +6053,70 @@ mod tests {
             "class C { init() { let x = 1 |> this } }\nmain() {}",
             "this",
         );
+    }
+
+
+    // ─── w10d-tail：长尾语义规则 ─────────────────────────────────────────────
+
+    #[test]
+    fn test_w10d_interpolation_expr_checked() {
+        // 1.3.6(4)/(9)：插值 `${...}` 内的表达式须接受类型检查。
+        assert_err("main() { let s = \"${1i8 + 1u8}\" }", "操作数类型");
+        assert_err("main() { let s = \"${-2i8 - 127i8}\" }", "溢出");
+        // 合法插值仍通过。
+        assert_ok("main() { let s = \"${1i64 + 2i64}\" }");
+        assert_ok("main() { let s = \"${1 + 2}\" }");
+    }
+
+
+    #[test]
+    fn test_w10d_throw_operand_must_be_exception() {
+        // 12.2(1)：throw 的操作数必须是 Exception/Error 子类型。
+        assert_err("main() { throw 1 }", "throw 的操作数类型");
+        assert_err("main() { throw \"x\" }", "throw 的操作数类型");
+        assert_err("struct R1 { let v = 1 }\nmain() { throw R1() }", "throw 的操作数类型");
+        // 合法异常类型通过。
+        assert_ok("main() { throw Exception() }");
+        assert_ok("open class MyExc <: Exception {}\nmain() { throw MyExc() }");
+    }
+
+
+    #[test]
+    fn test_w10d_user_type_assignability() {
+        // 2(1)：无继承/实现关系的用户类型之间赋值非法。
+        assert_err(
+            "struct A { let x = 1 }\nstruct B { let y = 2 }\nmain() { let s: A = A(); let t: B = s }",
+            "类型不匹配",
+        );
+        // 子类型赋值给父类型/接口通过。
+        assert_ok("interface I {}\nclass C <: I {}\nmain() { let i: I = C() }");
+        assert_ok("open class Base {}\nclass D <: Base {}\nmain() { let b: Base = D() }");
+        // 结构体实现接口（<: 记为约束）通过。
+        assert_ok("interface I {}\nstruct S <: I {}\nmain() { let i: I = S() }");
+    }
+
+
+    #[test]
+    fn test_w10d_compound_assign_return_type_object_receiver() {
+        // 10.2.3(15)：`a op= b` 中运算符返回类型须与左操作数类型一致（含 Object 接收者）。
+        assert_err(
+            "extend Object { public operator func %(x: Unit) { true } }\n\
+             main() { var a = Object(); a %= () }",
+            "复合赋值运算符",
+        );
+        assert_err(
+            "extend UInt8 { public operator func <<(x: Unit) { Object() } }\n\
+             main() { var a = 1u8; a <<= () }",
+            "复合赋值运算符",
+        );
+    }
+
+
+    #[test]
+    fn test_w10d_struct_private_member_access() {
+        // 2.1.10.4(6)：结构体私有成员不可在定义体外访问。
+        assert_err("struct S { private let v = 1 }\nmain() { S().v }", "私有成员");
+        assert_err("struct S { private func f() {} }\nmain() { S().f() }", "私有成员函数");
     }
 
 }
