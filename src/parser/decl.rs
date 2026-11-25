@@ -902,10 +902,15 @@ impl Parser {
         self.expect(Token::LBrace)?;
         let mut fields = Vec::new();
         let mut methods = Vec::new();
+        // 结构体全部构造函数（主构造函数展开为首项）与主构造参数信息。
+        let mut inits: Vec<crate::ast::InitDef> = Vec::new();
+        let mut primary_params: Vec<Param> = Vec::new();
+        let mut primary_member_flags: Vec<bool> = Vec::new();
 
         // 结构体构造函数：主构造函数至多一个；构造函数之间不得签名重复
         // （规范 2.1.10.2(29)：其它构造函数须与主构造函数构成重载）。
         let mut primary_seen = false;
+        let mut primary_ctor_visibility = Visibility::Internal;
         let mut ctor_sigs: Vec<Vec<Type>> = Vec::new();
 
         while !self.check(&Token::RBrace) {
@@ -929,7 +934,11 @@ impl Parser {
                     ));
                 }
                 primary_seen = true;
-                if mods.count > 2
+                primary_ctor_visibility = mods
+                    .visibility
+                    .clone()
+                    .unwrap_or(Visibility::Internal);
+                if mods.count > 1
                     || mods.is_static
                     || mods.is_open
                     || mods.is_abstract
@@ -947,18 +956,39 @@ impl Parser {
                 self.advance(); // consume struct name
                 self.expect(Token::LParen)?;
                 let mut primary_sig: Vec<Type> = Vec::new();
-                // 解析 (public|private|...)? (var|let)? name: Type, ... 作为主构造参数，并转为 fields
+                // 解析 (public|private|...)? (var|let)? name[!]: Type[= default], ...
+                // 成员变量参数（带 let/var）生成字段；普通参数不生成字段。
                 while !self.check(&Token::RParen) {
-                    if self.check(&Token::Public) || self.check(&Token::Private)
-                        || self.check(&Token::Protected) || self.check(&Token::Internal)
-                    {
+                    let has_vis = self.check(&Token::Public)
+                        || self.check(&Token::Private)
+                        || self.check(&Token::Protected)
+                        || self.check(&Token::Internal);
+                    let param_vis = if has_vis {
+                        let v = match self.peek() {
+                            Some(Token::Public) => crate::ast::Visibility::Public,
+                            Some(Token::Private) => crate::ast::Visibility::Private,
+                            Some(Token::Protected) => crate::ast::Visibility::Protected,
+                            _ => crate::ast::Visibility::Internal,
+                        };
                         self.advance();
-                    }
+                        v
+                    } else {
+                        crate::ast::Visibility::Public
+                    };
                     let mut field_is_mut = true;
-                    if self.check(&Token::Var) || self.check(&Token::Let) {
+                    let has_var_let = self.check(&Token::Var) || self.check(&Token::Let);
+                    if has_var_let {
                         field_is_mut = self.check(&Token::Var);
                         self.advance();
                     }
+                    // 2.1.10.2(12)：成员变量参数带可见性前缀时必须同时带 let/var.
+                    if has_vis && !has_var_let {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::RParen),
+                            "成员变量参数在可见性修饰符后必须带 let/var".to_string(),
+                        ));
+                    }
+                    let is_member = has_var_let;
                     let param_name = match self.advance_ident() {
                         Some(n) => n,
                         None => {
@@ -968,11 +998,21 @@ impl Parser {
                         }
                     };
                     // cjc: 必需命名参数 name!: Type = default，或确定赋值声明
-                    if self.check(&Token::Bang) {
+                    let is_named = if self.check(&Token::Bang) {
                         self.advance();
-                    }
+                        true
+                    } else {
+                        false
+                    };
                     self.expect(Token::Colon)?;
                     let ty = self.parse_type()?;
+                    // 2.1.10.2(2)：参数类型必须合法，不能是 unit 字面量 `()`。
+                    if matches!(&ty, Type::Tuple(ts) if ts.is_empty()) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::RParen),
+                            "参数类型不能是 unit 字面量".to_string(),
+                        ));
+                    }
                     primary_sig.push(ty.clone());
                     let default = if self.check(&Token::Assign) {
                         self.advance();
@@ -980,7 +1020,31 @@ impl Parser {
                     } else {
                         None
                     };
-                    fields.push(FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
+                    primary_params.push(Param {
+                        name: param_name.clone(),
+                        ty: ty.clone(),
+                        default: default.clone(),
+                        variadic: false,
+                        is_named,
+                        is_inout: false,
+                    });
+                    primary_member_flags.push(is_member);
+                    // 2.1.10.2(12)：成员变量参数不能用通配符 `_` 命名。
+                    if is_member && param_name == "_" {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Underscore,
+                            "成员变量参数不能用通配符命名".to_string(),
+                        ));
+                    }
+                    // 2.1.10.2(2)：仅命名参数（`name!`）允许默认值；
+                    // 非命名参数带默认值不符合主构造函数文法。
+                    if !is_named && default.is_some() {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Assign,
+                            "非命名参数不能有默认值".to_string(),
+                        ));
+                    }
+                    fields.push(FieldDef { is_static: false, visibility: param_vis,
                         name: param_name,
                         ty,
                         default,
@@ -993,21 +1057,42 @@ impl Parser {
                 }
                 self.expect(Token::RParen)?;
                 ctor_sigs.push(primary_sig);
-                // 跳过可选的 { body } 或 ;
-                if self.check(&Token::LBrace) {
-                    self.advance();
-                    let mut depth = 1;
-                    while depth > 0 {
-                        match self.advance() {
-                            Some(Token::LBrace) => depth += 1,
-                            Some(Token::RBrace) => depth -= 1,
-                            None => return self.bail(ParseError::UnexpectedEof),
-                            _ => {}
-                        }
-                    }
-                } else if self.check(&Token::Semicolon) {
-                    self.advance();
+                // 主构造函数体（表达式或声明），保留用于构造语义校验。
+                // 2.1.10.2(2)：主构造函数必须有 `{ ... }` 函数体。
+                if !self.check(&Token::LBrace) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        self.peek().cloned().unwrap_or(Token::RParen),
+                        "主构造函数体（`{`）".to_string(),
+                    ));
                 }
+                let primary_body = {
+                    let prev_receiver = self.receiver_name.clone();
+                    self.receiver_name = Some("this".to_string());
+                    self.advance();
+                    let body = self.parse_stmts()?;
+                    self.expect(Token::RBrace)?;
+                    self.receiver_name = prev_receiver;
+                    body
+                };
+                // 主构造函数展开为 InitDef：成员变量参数隐式赋值 this.name = name.
+                let mut init_body: Vec<Stmt> = Vec::new();
+                for (p, flag) in primary_params.iter().zip(primary_member_flags.iter()) {
+                    if *flag {
+                        init_body.push(Stmt::Assign {
+                            target: AssignTarget::Field {
+                                object: "this".to_string(),
+                                field: p.name.clone(),
+                            },
+                            value: Expr::Var(p.name.clone()),
+                        });
+                    }
+                }
+                init_body.extend(primary_body);
+                inits.push(crate::ast::InitDef {
+                    params: primary_params.clone(),
+                    body: init_body,
+                    member_param_flags: primary_member_flags.clone(),
+                });
                 continue;
             }
 
@@ -1045,16 +1130,41 @@ impl Parser {
                 }
                 self.expect(Token::RParen)?;
                 self.expect(Token::LBrace)?;
-                // 跳过 init body（平衡大括号）
-                let mut depth = 1;
-                while depth > 0 {
-                    match self.advance() {
-                        Some(Token::LBrace) => depth += 1,
-                        Some(Token::RBrace) => depth -= 1,
-                        None => return self.bail(ParseError::UnexpectedEof),
-                        _ => {}
+                // 解析并保留 init body（供 2.1.10.2 构造语义校验）。
+                let prev_receiver = self.receiver_name.clone();
+                self.receiver_name = Some("this".to_string());
+                let body = self.parse_stmts()?;
+                self.expect(Token::RBrace)?;
+                self.receiver_name = prev_receiver;
+                // static init 是静态初始化器，不是构造函数（不入 inits），
+                // 且其中不能通过 this(...) 调用构造函数（2.1.10.2(39)）。
+                if mods.is_static {
+                    let calls_this = body.iter().any(|s| {
+                        matches!(
+                            s,
+                            Stmt::Expr(Expr::Call { name, .. }) if name == "this" || name == "self"
+                        ) || matches!(
+                            s,
+                            Stmt::Expr(Expr::Invoke { callee, .. })
+                                if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self")
+                        )
+                    });
+                    if calls_this {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Init,
+                            "static init 中不能调用构造函数 this(...)".to_string(),
+                        ));
                     }
+                    continue;
                 }
+                // init 构造函数参数均为普通参数（无成员变量参数）。
+                let member_flags = vec![false; params.len()];
+                let idef = crate::ast::InitDef {
+                    params,
+                    body,
+                    member_param_flags: member_flags,
+                };
+                inits.push(idef);
                 continue;
             }
 
@@ -1245,7 +1355,8 @@ impl Parser {
                 ));
             };
 
-            fields.push(FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
+            fields.push(FieldDef { is_static: mods.is_static,
+                visibility: mods.visibility.clone().unwrap_or(crate::ast::Visibility::Public),
                 name: field_name,
                 ty,
                 default,
@@ -1270,6 +1381,11 @@ impl Parser {
             type_params,
             constraints,
             fields,
+            inits,
+            primary_ctor_params: primary_params,
+            primary_ctor_member_flags: primary_member_flags,
+            has_primary_ctor: primary_seen,
+            primary_ctor_visibility,
         })
     }
 

@@ -227,6 +227,11 @@ impl CodeGen {
                     type_params: vec![],
                     constraints: vec![],
                     fields: info.all_fields.clone(),
+                    inits: vec![],
+                    primary_ctor_params: vec![],
+                    primary_ctor_member_flags: vec![],
+                    has_primary_ctor: false,
+                    primary_ctor_visibility: crate::ast::Visibility::Internal,
                 },
             );
 

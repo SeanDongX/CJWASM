@@ -379,6 +379,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     }
     for st in &program.structs {
         check_struct_interfaces(st, program, &index, &mut errors);
+        // 2.1.10.2 结构体构造器规则（参数顺序/默认值/确定赋值/this 使用等）。
+        check_struct_ctor_rules(st, program, &mut errors);
         check_impl_generic_constraint_loosening(
             &st.name,
             &st.type_params,
@@ -389,6 +391,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
             &mut errors,
         );
     }
+    // 2.1.10.2(41)：跨结构体构造函数的无条件互相调用形成循环。
+    check_struct_mutual_ctor_cycles(program, &mut errors);
     for iface in &program.interfaces {
         check_interface(iface, &mut errors);
     }
@@ -6312,6 +6316,1261 @@ fn check_this_type_usage(program: &Program, errors: &mut Vec<SemanticError>) {
     }
 }
 
+// ── 2.1.10.2 结构体构造器语义规则 ────────────────────────────────────────
+//
+// 结构体主构造函数（`StructName(...) { ... }`）与 `init` 构造函数的文法/语义
+// 规则。主构造函数在 parser 中被展开为 `inits` 的首项（成员变量参数隐式赋值），
+// 普通参数保留在 `primary_ctor_params` 中但不生成字段。
+
+/// 计算结构体实例成员信息：返回 (实例成员名集合, 显式字段默认值集合, 主构造成员参数名集合)。
+fn struct_member_info(
+    st: &crate::ast::StructDef,
+) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+    let primary_names: HashSet<&str> = st
+        .primary_ctor_params
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    let mut members: HashSet<String> = HashSet::new();
+    let mut auto: HashSet<String> = HashSet::new();
+    for f in &st.fields {
+        if f.is_static {
+            continue;
+        }
+        // parser 会把主构造参数也塞进 `fields`；普通参数不是成员，
+        // 成员变量参数在下面单独处理（其默认值是参数默认值，不是字段初始值）。
+        if primary_names.contains(f.name.as_str()) {
+            continue;
+        }
+        members.insert(f.name.clone());
+        if f.default.is_some() {
+            auto.insert(f.name.clone());
+        }
+    }
+    let mut primary_member: HashSet<String> = HashSet::new();
+    for (p, flag) in st
+        .primary_ctor_params
+        .iter()
+        .zip(st.primary_ctor_member_flags.iter())
+    {
+        if *flag {
+            members.insert(p.name.clone());
+            primary_member.insert(p.name.clone());
+        }
+    }
+    (members, auto, primary_member)
+}
+
+/// 判断某个 init 是否是主构造函数展开（形参与 `primary_ctor_params` 完全一致）。
+fn is_primary_struct_init(init: &crate::ast::InitDef, st: &crate::ast::StructDef) -> bool {
+    st.has_primary_ctor
+        && init.params.len() == st.primary_ctor_params.len()
+        && init
+            .params
+            .iter()
+            .zip(st.primary_ctor_params.iter())
+            .all(|(a, b)| a.name == b.name && a.ty == b.ty)
+        && init
+            .member_param_flags
+            .iter()
+            .zip(st.primary_ctor_member_flags.iter())
+            .all(|(a, b)| a == b)
+}
+
+/// 结构体构造函数语义规则总入口。
+fn check_struct_ctor_rules(
+    st: &crate::ast::StructDef,
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    check_struct_ctor_param_order(st, errors);
+    check_struct_ctor_param_reassign(st, errors);
+    check_struct_ctor_overload(st, program, errors);
+    check_struct_ctor_cycles(st, errors);
+    check_struct_ctor_defaults(st, errors);
+    check_struct_member_duplicates(st, errors);
+    check_struct_ctor_definite_assignment(st, errors);
+    check_struct_use_before_init(st, program, errors);
+    check_struct_return_types(st, errors);
+    check_struct_this_calls(st, program, errors);
+    check_struct_field_self_ctor(st, errors);
+    check_struct_static_field_access(st, program, errors);
+}
+
+/// 2.1.10.2(21)/(22)：普通参数必须在成员变量参数之前；非命名参数必须在命名参数之前。
+fn check_struct_ctor_param_order(
+    st: &crate::ast::StructDef,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut seen_member = false;
+    for (idx, is_member) in st.primary_ctor_member_flags.iter().enumerate() {
+        if *is_member {
+            seen_member = true;
+        } else if seen_member {
+            errors.push(SemanticError {
+                message: format!(
+                    "结构体 '{}' 的主构造函数第 {} 个普通参数位于成员变量参数之后（2.1.10.2(21)）",
+                    st.name,
+                    idx + 1
+                ),
+            });
+            break;
+        }
+    }
+    if let Some(idx) = first_unnamed_after_named(&st.primary_ctor_params) {
+        errors.push(SemanticError {
+            message: format!(
+                "结构体 '{}' 的主构造函数第 {} 个非命名参数位于命名参数之后（2.1.10.2(22)）",
+                st.name,
+                idx + 1
+            ),
+        });
+    }
+    for init in &st.inits {
+        if let Some(idx) = first_unnamed_after_named(&init.params) {
+            errors.push(SemanticError {
+                message: format!(
+                    "结构体 '{}' 的构造函数第 {} 个非命名参数位于命名参数之后（2.1.10.2(22)）",
+                    st.name,
+                    idx + 1
+                ),
+            });
+        }
+    }
+}
+
+/// 2.1.10.2(8)/(9)：构造参数在构造函数体内不可被重新赋值。
+fn check_struct_ctor_param_reassign(st: &crate::ast::StructDef, errors: &mut Vec<SemanticError>) {
+    for init in &st.inits {
+        let names: HashSet<&str> = init.params.iter().map(|p| p.name.as_str()).collect();
+        if names.is_empty() {
+            continue;
+        }
+        let mut assigned: Vec<String> = Vec::new();
+        for s in &init.body {
+            collect_param_assigns_stmt(s, &names, &mut assigned);
+        }
+        assigned.sort();
+        assigned.dedup();
+        for name in assigned {
+            errors.push(SemanticError {
+                message: format!(
+                    "结构体 '{}' 的构造函数形参 '{}' 不能被重新赋值（2.1.10.2(8)/(9)）",
+                    st.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 2.1.10.2(29)：可省略参数（带默认值）导致两个构造函数在调用时无法区分。
+fn check_struct_ctor_overload(
+    st: &crate::ast::StructDef,
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    let inits = &st.inits;
+    for i in 0..inits.len() {
+        for j in (i + 1)..inits.len() {
+            if ctor_signatures_ambiguous(&inits[i], &inits[j]) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的构造函数重载冲突：可选参数导致调用无法区分（2.1.10.2(29)）",
+                        st.name
+                    ),
+                });
+            }
+        }
+    }
+    // 泛型结构体：在实际实例化类型实参下，若两个构造函数签名变为相同则冲突。
+    if !st.type_params.is_empty() {
+        let insts = collect_struct_type_instantiations(program, st);
+        'outer: for args in insts {
+            if args.len() != st.type_params.len() {
+                continue;
+            }
+            let subst: HashMap<&str, &Type> = st
+                .type_params
+                .iter()
+                .map(|s| s.as_str())
+                .zip(args.iter())
+                .collect();
+            for i in 0..inits.len() {
+                for j in (i + 1)..inits.len() {
+                    if ctor_signatures_equal_after_subst(&inits[i], &inits[j], &subst) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "结构体 '{}' 的构造函数重载冲突：泛型实例化后签名相同（2.1.10.2(29)）",
+                                st.name
+                            ),
+                        });
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn subst_ty(ty: &Type, subst: &HashMap<&str, &Type>) -> Type {
+    match ty {
+        Type::TypeParam(n) => subst.get(n.as_str()).map(|t| (*t).clone()).unwrap_or_else(|| ty.clone()),
+        Type::Array(inner) => Type::Array(Box::new(subst_ty(inner, subst))),
+        Type::Slice(inner) => Type::Slice(Box::new(subst_ty(inner, subst))),
+        Type::Option(inner) => Type::Option(Box::new(subst_ty(inner, subst))),
+        Type::Struct(n, args) => {
+            Type::Struct(n.clone(), args.iter().map(|a| subst_ty(a, subst)).collect())
+        }
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| subst_ty(t, subst)).collect()),
+        _ => ty.clone(),
+    }
+}
+
+fn ctor_signatures_equal_after_subst(
+    a: &crate::ast::InitDef,
+    b: &crate::ast::InitDef,
+    subst: &HashMap<&str, &Type>,
+) -> bool {
+    a.params.len() == b.params.len()
+        && a.params.iter().zip(b.params.iter()).all(|(pa, pb)| {
+            pa.is_named == pb.is_named && subst_ty(&pa.ty, subst) == subst_ty(&pb.ty, subst)
+        })
+}
+
+/// 收集程序中以显式类型实参构造某结构体的实例化实参（`S<A,B>(...)`）。
+fn collect_struct_type_instantiations(
+    program: &Program,
+    st: &crate::ast::StructDef,
+) -> Vec<Vec<Type>> {
+    let mut out: Vec<Vec<Type>> = Vec::new();
+    let mut visit = |stmts: &[Stmt], out: &mut Vec<Vec<Type>>| {
+        walk_stmts(stmts, &mut |e| {
+            if let Expr::ConstructorCall {
+                name,
+                type_args: Some(args),
+                ..
+            } = e
+            {
+                if name == &st.name {
+                    out.push(args.clone());
+                }
+            }
+        });
+    };
+    for f in &program.functions {
+        visit(&f.body, &mut out);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            visit(&m.func.body, &mut out);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            visit(&init.body, &mut out);
+        }
+        for f in &s.fields {
+            if let Some(d) = &f.default {
+                walk_expr(d, &mut |e| {
+                    if let Expr::ConstructorCall {
+                        name,
+                        type_args: Some(args),
+                        ..
+                    } = e
+                    {
+                        if name == &st.name {
+                            out.push(args.clone());
+                        }
+                    }
+                });
+            }
+        }
+    }
+    out
+}
+
+fn ctor_signatures_ambiguous(a: &crate::ast::InitDef, b: &crate::ast::InitDef) -> bool {
+    let pos_a: Vec<&crate::ast::Param> = a.params.iter().filter(|p| !p.is_named).collect();
+    let pos_b: Vec<&crate::ast::Param> = b.params.iter().filter(|p| !p.is_named).collect();
+    let (short, long, long_init) = if pos_a.len() <= pos_b.len() {
+        (&pos_a, &pos_b, b)
+    } else {
+        (&pos_b, &pos_a, a)
+    };
+    // 较短者的位置参数类型必须是较长者的前缀。
+    for (i, p) in short.iter().enumerate() {
+        if p.ty != long[i].ty {
+            return false;
+        }
+    }
+    // 较长者多出的可省略参数必须全部带默认值，才能在调用时被省略。
+    let mut extra = false;
+    for p in &long[short.len()..] {
+        if p.default.is_none() {
+            return false;
+        }
+        extra = true;
+    }
+    for p in long_init.params.iter().filter(|p| p.is_named) {
+        if p.default.is_none() && !short.iter().any(|s| s.name == p.name) {
+            return false;
+        }
+        extra = true;
+    }
+    extra
+}
+
+/// 2.1.10.2(37)/(41)：`this(...)` 构造函数调用的循环调用检测。
+fn check_struct_ctor_cycles(st: &crate::ast::StructDef, errors: &mut Vec<SemanticError>) {
+    let n = st.inits.len();
+    if n == 0 {
+        return;
+    }
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, init) in st.inits.iter().enumerate() {
+        // 局部绑定/局部函数若与结构体同名，会遮蔽构造调用，保守跳过同类型构造边。
+        let mut bindings: HashSet<String> = HashSet::new();
+        collect_bindings_stmts(&init.body, &mut bindings);
+        collect_local_func_names(&init.body, &mut bindings);
+        let type_shadowed = bindings.contains(&st.name);
+        // 收集构造函数体内的委托调用（this(...)）与同类型构造调用（Type(...)）。
+        let mut calls: Vec<(&Vec<Expr>, &Vec<(String, Expr)>)> = Vec::new();
+        for s in &init.body {
+            walk_stmt(s, &mut |e| match e {
+                Expr::Call {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } if name == "this" || name == "self" => {
+                    calls.push((args, named_args));
+                }
+                Expr::Invoke {
+                    callee,
+                    args,
+                    named_args,
+                } if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self") => {
+                    calls.push((args, named_args));
+                }
+                Expr::ConstructorCall {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } if name == &st.name && !type_shadowed => {
+                    calls.push((args, named_args));
+                }
+                _ => {}
+            });
+        }
+        for (args, named) in calls {
+            if let Some(j) = resolve_struct_ctor(st, args, named) {
+                edges[i].push(j);
+            }
+        }
+    }
+    // DFS 三色标记检测环。
+    let mut color = vec![0u8; n]; // 0=white 1=gray 2=black
+    let mut has_cycle = false;
+    fn dfs(u: usize, edges: &[Vec<usize>], color: &mut [u8], has_cycle: &mut bool) {
+        color[u] = 1;
+        for &v in &edges[u] {
+            if color[v] == 1 {
+                *has_cycle = true;
+            } else if color[v] == 0 {
+                dfs(v, edges, color, has_cycle);
+            }
+        }
+        color[u] = 2;
+    }
+    for u in 0..n {
+        if color[u] == 0 {
+            dfs(u, &edges, &mut color, &mut has_cycle);
+        }
+    }
+    if has_cycle {
+        errors.push(SemanticError {
+            message: format!(
+                "结构体 '{}' 的构造函数通过 this(...) 形成循环调用（2.1.10.2(37)/(41)）",
+                st.name
+            ),
+        });
+    }
+}
+
+fn find_this_call<'a>(body: &'a [Stmt]) -> Option<(&'a [Expr], &'a [(String, Expr)])> {
+    for s in body {
+        if let Stmt::Expr(e) = s {
+            match e {
+                Expr::Call {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } if name == "this" || name == "self" => {
+                    return Some((args.as_slice(), named_args.as_slice()));
+                }
+                Expr::Invoke {
+                    callee,
+                    args,
+                    named_args,
+                } if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self") => {
+                    return Some((args.as_slice(), named_args.as_slice()));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn resolve_struct_ctor(
+    st: &crate::ast::StructDef,
+    args: &[Expr],
+    named: &[(String, Expr)],
+) -> Option<usize> {
+    let arg_tys: Vec<Option<Type>> = args.iter().map(|a| infer_expr(a, &HashMap::new())).collect();
+    let mut cands = Vec::new();
+    for (j, init) in st.inits.iter().enumerate() {
+        if ctor_accepts_call(init, &arg_tys, named) {
+            cands.push(j);
+        }
+    }
+    if cands.len() == 1 {
+        Some(cands[0])
+    } else {
+        None
+    }
+}
+
+fn ctor_accepts_call(
+    init: &crate::ast::InitDef,
+    arg_tys: &[Option<Type>],
+    named: &[(String, Expr)],
+) -> bool {
+    let positional: Vec<&crate::ast::Param> = init.params.iter().filter(|p| !p.is_named).collect();
+    if arg_tys.len() > positional.len() {
+        return false;
+    }
+    for (i, ty) in arg_tys.iter().enumerate() {
+        if let Some(t) = ty {
+            let pt = &positional[i].ty;
+            if !matches!(pt, Type::TypeParam(_)) && !matches!(t, Type::TypeParam(_)) && t != pt {
+                return false;
+            }
+        }
+    }
+    for p in positional[arg_tys.len()..].iter() {
+        if p.default.is_none() {
+            return false;
+        }
+    }
+    let named_params: Vec<&crate::ast::Param> = init.params.iter().filter(|p| p.is_named).collect();
+    for (n, _) in named {
+        if !named_params.iter().any(|p| &p.name == n) {
+            return false;
+        }
+    }
+    for p in &named_params {
+        if p.default.is_none() && !named.iter().any(|(n, _)| n == &p.name) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 2.1.10.2(19)/(33)：构造参数默认值不得引用 `this`，也不得引用其后的参数
+/// 或构造参数之外的实例成员变量。
+fn check_struct_ctor_defaults(st: &crate::ast::StructDef, errors: &mut Vec<SemanticError>) {
+    let (members, _, _) = struct_member_info(st);
+    let mut check_params = |params: &[crate::ast::Param], what: &str| {
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        for (i, p) in params.iter().enumerate() {
+            let Some(default) = &p.default else { continue };
+            // 2.1.10.2(33)：默认值中不得使用 this。
+            if expr_contains_this(default) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的{}参数 '{}' 的默认值不能引用 this（2.1.10.2(33)）",
+                        st.name, what, p.name
+                    ),
+                });
+                continue;
+            }
+            // 2.1.10.2(19)：默认值只能引用其之前定义的参数，且不得引用实例成员变量。
+            let mut violation: Option<String> = None;
+            walk_expr(default, &mut |e| {
+                if violation.is_some() {
+                    return;
+                }
+                if let Expr::Var(n) = e {
+                    if let Some(j) = names.iter().position(|x| *x == n.as_str()) {
+                        if j >= i {
+                            violation = Some(format!(
+                                "默认值引用了自身或其后的参数 '{}'（2.1.10.2(19)）",
+                                n
+                            ));
+                        }
+                    } else if members.contains(n) {
+                        violation = Some(format!(
+                            "默认值引用了实例成员变量 '{}'（2.1.10.2(19)）",
+                            n
+                        ));
+                    }
+                }
+            });
+            // 2.1.10.2(19)：默认值不得修改所引用的参数。
+            if violation.is_none() && expr_modifies_param(default, &names) {
+                violation = Some("默认值修改了所引用的参数（2.1.10.2(19)）".to_string());
+            }
+            if let Some(reason) = violation {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的{}参数 '{}' 的{}",
+                        st.name, what, p.name, reason
+                    ),
+                });
+            }
+        }
+    };
+    check_params(&st.primary_ctor_params, "主构造");
+    for init in &st.inits {
+        check_params(&init.params, "构造");
+    }
+}
+
+/// 2.1.10.2(16)：成员变量参数不能与已声明的实例成员变量同名。
+fn check_struct_member_duplicates(st: &crate::ast::StructDef, errors: &mut Vec<SemanticError>) {
+    // parser 会为每个主构造参数（含普通参数与成员变量参数）生成一个 FieldDef，
+    // 显式声明字段也生成 FieldDef。普通参数不是成员，允许与同名字段共存
+    // （如 `Test(name: String) { let name = ... }`）；成员变量参数与成员变量
+    // 同名、或字段重复声明则非法（2.1.10.2(16)）。
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for f in &st.fields {
+        if f.is_static {
+            continue;
+        }
+        *counts.entry(f.name.as_str()).or_insert(0) += 1;
+    }
+    let member_params: HashSet<&str> = st
+        .primary_ctor_params
+        .iter()
+        .zip(st.primary_ctor_member_flags.iter())
+        .filter(|(_, flag)| **flag)
+        .map(|(p, _)| p.name.as_str())
+        .collect();
+    let regular_params: HashSet<&str> = st
+        .primary_ctor_params
+        .iter()
+        .zip(st.primary_ctor_member_flags.iter())
+        .filter(|(_, flag)| !**flag)
+        .map(|(p, _)| p.name.as_str())
+        .collect();
+    let mut reported: HashSet<&str> = HashSet::new();
+    for (name, cnt) in &counts {
+        let bad = if member_params.contains(name) {
+            // 成员变量参数与显式字段同名，或成员变量参数重复。
+            *cnt > 1
+        } else if regular_params.contains(name) {
+            // 普通参数及其同名字段最多各一份；出现 3 次以上才是字段重复。
+            *cnt > 2
+        } else {
+            *cnt > 1
+        };
+        if bad && reported.insert(*name) {
+            errors.push(SemanticError {
+                message: format!(
+                    "结构体 '{}' 的实例成员变量/成员变量参数 '{}' 重复声明（2.1.10.2(16)）",
+                    st.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 2.1.10.2(11)/(40)/(44)：构造函数返回前须初始化全部实例成员变量；
+/// 无显式构造函数时，所有实例成员变量都必须有初始值（隐式构造函数）。
+fn check_struct_ctor_definite_assignment(
+    st: &crate::ast::StructDef,
+    errors: &mut Vec<SemanticError>,
+) {
+    let (members, auto, primary_member) = struct_member_info(st);
+    if st.inits.is_empty() {
+        // 本方言支持结构体字面量构造，未定义显式构造函数的结构体不在此报错
+        // （交由构造调用实参匹配与字面量规则处理）。
+        return;
+    }
+    let required: HashSet<String> = members.difference(&auto).cloned().collect();
+    if required.is_empty() {
+        return;
+    }
+    for init in &st.inits {
+        let mut start = auto.clone();
+        // 主构造函数隐式初始化其成员变量参数；其它构造函数必须显式初始化。
+        if is_primary_struct_init(init, st) {
+            start.extend(primary_member.iter().cloned());
+        }
+        for (p, flag) in init.params.iter().zip(init.member_param_flags.iter()) {
+            if *flag {
+                start.insert(p.name.clone());
+            }
+        }
+        let mut viol: Vec<String> = Vec::new();
+        let (cur, flows) = da_stmt_list(&init.body, start, &required, &members, &mut viol);
+        if flows {
+            for name in &required {
+                if !cur.contains(name) {
+                    viol.push(name.clone());
+                }
+            }
+        }
+        viol.sort();
+        viol.dedup();
+        for name in viol {
+            errors.push(SemanticError {
+                message: format!(
+                    "结构体 '{}' 的构造函数返回前未初始化实例成员变量 '{}'（2.1.10.2(11)/(40)）",
+                    st.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 2.1.10.2(24)/(34)/(36)：全部实例成员变量初始化完成之前，构造函数内不得
+/// 单独使用 `this`、读取未初始化成员、调用实例成员函数/属性或让 `this` 逃逸。
+fn check_struct_use_before_init(
+    st: &crate::ast::StructDef,
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    let (field_names, auto, primary_member) = struct_member_info(st);
+    // 主构造成员变量参数在构造函数入口处即已确定传入，保守视为已初始化。
+    let mut auto_all = auto;
+    auto_all.extend(primary_member.iter().cloned());
+    if st.inits.is_empty() {
+        return;
+    }
+    // 实例方法名 / 属性名：结构体内部方法被脱糖为 `StructName.method` 顶层函数。
+    let prefix = format!("{}.", st.name);
+    let mut method_names: HashSet<String> = HashSet::new();
+    let mut prop_names: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        let Some(base) = f.name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Some(p) = base.strip_prefix("__get_").or_else(|| base.strip_prefix("__set_")) {
+            prop_names.insert(p.to_string());
+        } else {
+            method_names.insert(base.to_string());
+        }
+    }
+    for init in &st.inits {
+        let param_names: HashSet<String> = init.params.iter().map(|p| p.name.clone()).collect();
+        // 2.1.10.2(24)/(34)/(35)：构造函数中 this 不能被 lambda / 局部函数捕获。
+        for s in &init.body {
+            if let Some(reason) = nested_captures_this(
+                s,
+                &field_names,
+                &method_names,
+                &prop_names,
+                &param_names,
+            ) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的构造函数中 {} 捕获了 this（2.1.10.2(24)/(34)/(35)）",
+                        st.name, reason
+                    ),
+                });
+            }
+        }
+        let mut start = auto_all.clone();
+        for (p, flag) in init.params.iter().zip(init.member_param_flags.iter()) {
+            if *flag {
+                start.insert(p.name.clone());
+            }
+        }
+        let tracked: HashSet<String> = field_names.difference(&start).cloned().collect();
+        if tracked.is_empty() {
+            continue;
+        }
+        let param_names: HashSet<String> = init.params.iter().map(|p| p.name.clone()).collect();
+        let mut cur = start;
+        for s in &init.body {
+            let all_init = tracked.is_subset(&cur);
+            if !all_init {
+                if let Some(reason) = stmt_use_reason(
+                    s,
+                    &cur,
+                    &tracked,
+                    &field_names,
+                    &method_names,
+                    &prop_names,
+                    &param_names,
+                ) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "结构体 '{}' 的构造函数在所有实例成员变量初始化之前使用了 {}（2.1.10.2(24)/(34)/(36)）",
+                            st.name, reason
+                        ),
+                    });
+                }
+            }
+            let (nc, flows) = da_stmt(s, cur.clone(), &tracked, &field_names, &mut Vec::new());
+            cur = nc;
+            if !flows {
+                break;
+            }
+        }
+    }
+}
+
+/// 2.1.10.2(42)：构造函数的返回类型为 Unit，`return` 表达式必须是 Unit 类型。
+fn check_struct_return_types(st: &crate::ast::StructDef, errors: &mut Vec<SemanticError>) {
+    for init in &st.inits {
+        let mut local_types: HashMap<String, Type> = HashMap::new();
+        collect_explicit_local_types(&init.body, &mut local_types);
+        let mut returns: Vec<&Expr> = Vec::new();
+        collect_return_exprs(&init.body, &mut returns);
+        for e in returns {
+            // 返回显式标注为非 Unit 类型的局部变量（如 `let x: I = ...; return x`）。
+            let local_nonunit = match e {
+                Expr::Var(n) => local_types
+                    .get(n)
+                    .map(|ty| !matches!(ty, Type::Unit | Type::Nothing | Type::TypeParam(_)))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            // 语法形态即可判定为非 Unit 的返回表达式。
+            let syntactic_nonunit = matches!(
+                e,
+                Expr::Range { .. }
+                    | Expr::Array(_)
+                    | Expr::StructInit { .. }
+                    | Expr::VariantConst { .. }
+                    | Expr::MapLiteral { .. }
+            ) || matches!(e, Expr::Tuple(v) if !v.is_empty());
+            let inferred = infer_expr(e, &HashMap::new());
+            let inferred_nonunit = match inferred {
+                Some(ty) => {
+                    !matches!(ty, Type::Unit | Type::Nothing | Type::TypeParam(_))
+                        && !matches!(e, Expr::Tuple(v) if v.is_empty())
+                }
+                None => false,
+            };
+            if syntactic_nonunit || inferred_nonunit || local_nonunit {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的构造函数的 return 表达式必须是 Unit 类型（2.1.10.2(42)）",
+                        st.name
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 收集语句块中所有 `return <expr>` 的表达式（递归进入控制流块）。
+fn collect_return_exprs<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Expr>) {
+    for s in stmts {
+        match s {
+            Stmt::Return(Some(e)) => out.push(e),
+            Stmt::Expr(e)
+            | Stmt::Let { value: e, .. }
+            | Stmt::Var { value: e, .. }
+            | Stmt::Const { value: e, .. }
+            | Stmt::Assign { value: e, .. } => collect_return_exprs_expr(e, out),
+            Stmt::While { body, .. }
+            | Stmt::WhileLet { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => collect_return_exprs(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_return_exprs_expr<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_return_exprs_expr(then_branch, out);
+            if let Some(b) = else_branch {
+                collect_return_exprs_expr(b, out);
+            }
+        }
+        Expr::Block(stmts, trailing) => {
+            collect_return_exprs(stmts, out);
+            if let Some(t) = trailing {
+                collect_return_exprs_expr(t, out);
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for a in arms {
+                collect_return_exprs_expr(&a.body, out);
+            }
+        }
+        // lambda / 局部函数内的 return 属于其自身的返回，不属于构造函数。
+        _ => {}
+    }
+}
+
+/// 收集语句块（含嵌套控制流块）中局部函数的名称。
+fn collect_local_func_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::LocalFunc(f) => {
+                out.insert(f.name.clone());
+                collect_local_func_names(&f.body, out);
+            }
+            Stmt::Expr(e)
+            | Stmt::Let { value: e, .. }
+            | Stmt::Var { value: e, .. }
+            | Stmt::Const { value: e, .. }
+            | Stmt::Assign { value: e, .. } => collect_local_func_names_expr(e, out),
+            Stmt::While { body, .. }
+            | Stmt::WhileLet { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => collect_local_func_names(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_local_func_names_expr(e: &Expr, out: &mut HashSet<String>) {
+    match e {
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_local_func_names_expr(then_branch, out);
+            if let Some(b) = else_branch {
+                collect_local_func_names_expr(b, out);
+            }
+        }
+        Expr::Block(stmts, trailing) => {
+            collect_local_func_names(stmts, out);
+            if let Some(t) = trailing {
+                collect_local_func_names_expr(t, out);
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for a in arms {
+                collect_local_func_names_expr(&a.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 默认值表达式是否修改了其中的参数（`x = ...`、`x++` 等，2.1.10.2(19)）。
+fn expr_modifies_param(e: &Expr, names: &[&str]) -> bool {
+    match e {
+        Expr::Block(stmts, trailing) => {
+            stmts.iter().any(|s| stmt_modifies_param(s, names))
+                || trailing
+                    .as_ref()
+                    .map(|t| expr_modifies_param(t, names))
+                    .unwrap_or(false)
+        }
+        Expr::PrefixIncr(x)
+        | Expr::PrefixDecr(x)
+        | Expr::PostfixIncr(x)
+        | Expr::PostfixDecr(x) => {
+            matches!(x.as_ref(), Expr::Var(n) if names.contains(&n.as_str()))
+                || expr_modifies_param(x, names)
+        }
+        _ => false,
+    }
+}
+
+fn stmt_modifies_param(s: &Stmt, names: &[&str]) -> bool {
+    match s {
+        Stmt::Assign { target, value } => {
+            assign_target_is_param(target, names) || expr_modifies_param(value, names)
+        }
+        Stmt::Expr(e) => expr_modifies_param(e, names),
+        _ => false,
+    }
+}
+
+fn assign_target_is_param(t: &crate::ast::AssignTarget, names: &[&str]) -> bool {
+    match t {
+        crate::ast::AssignTarget::Var(n) => names.contains(&n.as_str()),
+        crate::ast::AssignTarget::Tuple(ts) => {
+            ts.iter().any(|x| assign_target_is_param(x, names))
+        }
+        _ => false,
+    }
+}
+
+/// 单条语句中的 lambda / 局部函数是否捕获了 this（2.1.10.2(24)/(34)/(35)）。
+fn nested_captures_this(
+    s: &Stmt,
+    members: &HashSet<String>,
+    methods: &HashSet<String>,
+    props: &HashSet<String>,
+    params: &HashSet<String>,
+) -> Option<String> {
+    let mut hit: Option<String> = None;
+    walk_stmt(s, &mut |e| {
+        if hit.is_some() {
+            return;
+        }
+        // lambda 直接引用 this/self，或引用实例成员函数/属性/成员变量（经隐式 this
+        // 访问），均视为捕获 this。函数复合 `~>` 脱糖出的 lambda 引用已初始化的
+        // 成员函数值属合法用法，不视为捕获。被构造参数遮蔽的裸名引用不视为捕获。
+        if let Expr::Lambda { params: lparams, .. } = e {
+            let is_composition = lparams.iter().any(|(n, _)| n == "__compose_arg");
+            if !is_composition
+                && (expr_contains_this(e)
+                    || expr_refs_method_or_prop(e, methods, props)
+                    || expr_refs_member(e, members, params))
+            {
+                hit = Some("lambda".to_string());
+            }
+        }
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    if let Stmt::LocalFunc(f) = s {
+        if stmts_contain_this(&f.body)
+            || stmts_ref_method_or_prop(&f.body, methods, props)
+            || stmts_ref_member(&f.body, members, params)
+        {
+            return Some("局部函数".to_string());
+        }
+    }
+    None
+}
+
+/// 语句块是否直接引用实例成员变量。
+fn stmts_ref_member(
+    stmts: &[Stmt],
+    members: &HashSet<String>,
+    params: &HashSet<String>,
+) -> bool {
+    let mut found = false;
+    walk_stmts(stmts, &mut |e| {
+        if expr_refs_member(e, members, params) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// 表达式是否直接引用实例成员变量（裸名或 this.field）；被参数遮蔽的裸名忽略。
+fn expr_refs_member(
+    e: &Expr,
+    members: &HashSet<String>,
+    params: &HashSet<String>,
+) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |x| match x {
+        Expr::Var(n) if members.contains(n) && !params.contains(n) => found = true,
+        Expr::Field { object, field } => {
+            if members.contains(field)
+                && matches!(object.as_ref(), Expr::Var(n) if n == "this" || n == "self")
+            {
+                found = true;
+            }
+        }
+        _ => {}
+    });
+    found
+}
+
+/// 表达式是否引用实例成员函数/属性（经隐式 this 访问）。
+fn expr_refs_method_or_prop(
+    e: &Expr,
+    methods: &HashSet<String>,
+    props: &HashSet<String>,
+) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |x| match x {
+        Expr::Var(n) if methods.contains(n) || props.contains(n) => found = true,
+        Expr::Call { name, .. } if methods.contains(name) => found = true,
+        Expr::MethodCall { object, .. } | Expr::Field { object, .. } => {
+            if matches!(object.as_ref(), Expr::Var(n) if n == "this" || n == "self") {
+                found = true;
+            }
+        }
+        _ => {}
+    });
+    found
+}
+
+/// 语句块是否引用实例成员函数/属性（经隐式 this 访问，视为捕获 this）。
+fn stmts_ref_method_or_prop(
+    stmts: &[Stmt],
+    methods: &HashSet<String>,
+    props: &HashSet<String>,
+) -> bool {
+    let mut found = false;
+    walk_stmts(stmts, &mut |e| match e {
+        Expr::Var(n) if methods.contains(n) || props.contains(n) => found = true,
+        Expr::Call { name, .. } if methods.contains(name) => found = true,
+        Expr::MethodCall { object, .. } | Expr::Field { object, .. } => {
+            if matches!(object.as_ref(), Expr::Var(n) if n == "this" || n == "self") {
+                found = true;
+            }
+        }
+        _ => {}
+    });
+    found
+}
+
+/// 判断表达式是否在调用构造函数（`this(...)` 或其脱糖 `Invoke` 形态）。
+fn expr_is_this_ctor_call(e: &Expr) -> bool {
+    match e {
+        Expr::Call { name, .. } => name == "this" || name == "self",
+        Expr::Invoke { callee, .. } => {
+            matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self")
+        }
+        _ => false,
+    }
+}
+
+fn expr_contains_this_ctor_call(e: &Expr) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |x| {
+        if expr_is_this_ctor_call(x) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn stmt_contains_this_ctor_call(s: &Stmt) -> bool {
+    let mut found = false;
+    walk_stmt(s, &mut |x| {
+        if expr_is_this_ctor_call(x) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn stmts_contain_this_ctor_call(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_contains_this_ctor_call)
+}
+
+/// 2.1.10.2(23)/(38)/(39)：构造函数调用规则。
+/// - 主构造函数不得通过 `this(...)` 调用其它构造函数；
+/// - `this(...)` 必须是构造函数体中的第一条语句；
+/// - 构造函数体之外（成员函数、属性访问器、字段初始值）不得调用 `this(...)`。
+fn check_struct_this_calls(
+    st: &crate::ast::StructDef,
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 字段初始值中调用 this(...)。
+    for f in &st.fields {
+        if let Some(d) = &f.default {
+            if expr_contains_this_ctor_call(d) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的字段 '{}' 的初始值不能调用构造函数 this(...)（2.1.10.2(39)）",
+                        st.name, f.name
+                    ),
+                });
+            }
+        }
+    }
+    // 结构体成员函数（含属性访问器）中调用 this(...)。
+    let prefix = format!("{}.", st.name);
+    for func in &program.functions {
+        if func.name.starts_with(&prefix) && stmts_contain_this_ctor_call(&func.body) {
+            errors.push(SemanticError {
+                message: format!(
+                    "结构体 '{}' 的成员函数 '{}' 中不能调用构造函数 this(...)（2.1.10.2(39)）",
+                    st.name, func.name
+                ),
+            });
+        }
+    }
+    // 构造函数体内的 this(...) 规则。
+    for init in &st.inits {
+        if is_primary_struct_init(init, st) {
+            if stmts_contain_this_ctor_call(&init.body) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的主构造函数不能通过 this(...) 调用其它构造函数（2.1.10.2(23)）",
+                        st.name
+                    ),
+                });
+            }
+        } else {
+            for (i, s) in init.body.iter().enumerate() {
+                if !stmt_contains_this_ctor_call(s) {
+                    continue;
+                }
+                let is_first_expr = i == 0
+                    && matches!(s, Stmt::Expr(e) if expr_is_this_ctor_call(e));
+                if !is_first_expr {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "结构体 '{}' 的构造函数中的 this(...) 必须是第一条语句（2.1.10.2(38)）",
+                            st.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 2.1.10.2(41)：字段初始值中直接构造同类型实例会导致无限递归。
+fn check_struct_field_self_ctor(st: &crate::ast::StructDef, errors: &mut Vec<SemanticError>) {
+    for f in &st.fields {
+        let Some(d) = &f.default else { continue };
+        let mut found = false;
+        walk_expr(d, &mut |e| {
+            if let Expr::ConstructorCall { name, .. } = e {
+                if name == &st.name {
+                    found = true;
+                }
+            }
+        });
+        if found {
+            errors.push(SemanticError {
+                message: format!(
+                    "结构体 '{}' 的字段 '{}' 的初始值直接构造同类型实例会导致无限递归（2.1.10.2(41)）",
+                    st.name, f.name
+                ),
+            });
+        }
+    }
+}
+
+/// 2.1.10.2(15)/(14)：实例成员变量只能通过实例访问，不能经结构体名访问。
+fn check_struct_static_field_access(
+    st: &crate::ast::StructDef,
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    let (members, _, _) = struct_member_info(st);
+    if members.is_empty() {
+        return;
+    }
+    let name = st.name.clone();
+    let mut scan = |stmts: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let mut hit: Option<String> = None;
+        walk_stmts(stmts, &mut |e| {
+            if hit.is_some() {
+                return;
+            }
+            if let Expr::Field { object, field } = e {
+                if let Expr::Var(n) = object.as_ref() {
+                    if n == &name && members.contains(field) {
+                        hit = Some(field.clone());
+                    }
+                }
+            }
+        });
+        if let Some(f) = hit {
+            errors.push(SemanticError {
+                message: format!(
+                    "结构体 '{}' 的实例成员变量 '{}' 不能通过结构体名访问（2.1.10.2(15)）",
+                    st.name, f
+                ),
+            });
+        }
+    };
+    for func in &program.functions {
+        scan(&func.body, errors);
+    }
+    for f in &st.fields {
+        if let Some(d) = &f.default {
+            let mut hit: Option<String> = None;
+            walk_expr(d, &mut |e| {
+                if hit.is_some() {
+                    return;
+                }
+                if let Expr::Field { object, field } = e {
+                    if let Expr::Var(n) = object.as_ref() {
+                        if n == &name && members.contains(field) {
+                            hit = Some(field.clone());
+                        }
+                    }
+                }
+            });
+            if let Some(field) = hit {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的实例成员变量 '{}' 不能通过结构体名访问（2.1.10.2(15)）",
+                        st.name, field
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 2.1.10.2(41)：跨结构体构造函数在顶层无条件互相调用形成的循环依赖。
+fn check_struct_mutual_ctor_cycles(program: &Program, errors: &mut Vec<SemanticError>) {
+    use std::collections::HashSet as Set;
+    let n = program.structs.len();
+    if n == 0 {
+        return;
+    }
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for (i, s) in program.structs.iter().enumerate() {
+        index.insert(s.name.as_str(), i);
+    }
+    let mut edges: Vec<Set<usize>> = vec![Set::new(); n];
+    for (i, s) in program.structs.iter().enumerate() {
+        for init in &s.inits {
+            for stmt in &init.body {
+                if let Stmt::Expr(e) = stmt {
+                    let target = match e {
+                        Expr::ConstructorCall { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    };
+                    if let Some(t) = target {
+                        if t != s.name.as_str() {
+                            if let Some(&j) = index.get(t) {
+                                edges[i].insert(j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut color = vec![0u8; n];
+    let mut has_cycle = false;
+    fn dfs(u: usize, edges: &[Set<usize>], color: &mut [u8], has_cycle: &mut bool) {
+        color[u] = 1;
+        for &v in &edges[u] {
+            if color[v] == 1 {
+                *has_cycle = true;
+            } else if color[v] == 0 {
+                dfs(v, edges, color, has_cycle);
+            }
+        }
+        color[u] = 2;
+    }
+    for u in 0..n {
+        if color[u] == 0 {
+            dfs(u, &edges, &mut color, &mut has_cycle);
+        }
+    }
+    if has_cycle {
+        errors.push(SemanticError {
+            message: "结构体构造函数之间存在循环调用（2.1.10.2(41)）".to_string(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7970,4 +9229,89 @@ mod tests {
         assert_valid("func foo() {}\nmain() {\n foo()\n}");
     }
 
+    // ─── 2.1.10.2 结构体构造器规则 ──────────────────────────────────────
+
+    #[test]
+    fn test_struct_ctor_argument_mismatch_invalid() {
+        // 实参类型与构造形参不匹配。
+        assert_invalid("struct A {\n A(x: Int8) {}\n}\nmain() {\n let a = A(())\n}");
+        // 多余的位置实参。
+        assert_invalid("struct A {\n A() {}\n}\nmain() {\n A(1)\n}");
+    }
+
+    #[test]
+    fn test_struct_ctor_argument_match_valid() {
+        assert_valid("struct A {\n A(x: Int64) {}\n}\nmain() {\n let a = A(1)\n}");
+        // 命名参数。
+        assert_valid(
+            "struct A {\n A(x!: Int64) {}\n}\nmain() {\n let a = A(x: 1)\n}",
+        );
+    }
+
+    #[test]
+    fn test_struct_ctor_param_order_invalid() {
+        // 普通参数位于成员变量参数之后。
+        assert_invalid("struct A {\n A(public var a: Int64, b: Bool) {}\n}\n");
+        // 命名参数之后出现非命名参数。
+        assert_invalid("struct A {\n A(a!: Int64, b: Int64) {}\n}\n");
+    }
+
+    #[test]
+    fn test_struct_ctor_default_references_later_param_invalid() {
+        assert_invalid("struct A {\n A(x!: Int64 = y, let y!: Int64) {}\n}\n");
+        // 默认值引用自身。
+        assert_invalid("struct A {\n A(x!: Int64 = x) {}\n}\n");
+    }
+
+    #[test]
+    fn test_struct_ctor_definite_assignment_invalid() {
+        // 其它构造函数未初始化成员变量参数。
+        assert_invalid("struct A {\n A(let a: Int64) {}\n init() {}\n}\n");
+        // 构造函数返回前未初始化成员。
+        assert_invalid("struct A {\n init() {}\n var x: Int64\n}\n");
+    }
+
+    #[test]
+    fn test_struct_ctor_definite_assignment_valid() {
+        assert_valid("struct A {\n A(let a: Int64) {}\n init() {\n a = 1\n }\n}\n");
+    }
+
+    #[test]
+    fn test_struct_private_member_access_invalid() {
+        assert_invalid(
+            "struct A {\n A(private var x: Int64) {}\n}\nmain() {\n let t = A(0)\n t.x\n}",
+        );
+    }
+
+    #[test]
+    fn test_struct_duplicate_member_invalid() {
+        assert_invalid("struct A {\n A(var a: Int64) {}\n var a = 1\n}\n");
+    }
+
+    #[test]
+    fn test_struct_ctor_lambda_captures_this_invalid() {
+        assert_invalid("struct A {\n A() {\n let f = { => this }\n }\n}\n");
+        // 通过成员函数间接捕获。
+        assert_invalid("struct A {\n A() {\n let f = { => g }\n }\n func g() {}\n}\n");
+    }
+
+    #[test]
+    fn test_struct_ctor_return_non_unit_invalid() {
+        assert_invalid("struct A {\n init() {\n return 1i64\n }\n}\n");
+        // Unit 返回允许。
+        assert_valid("struct A {\n init() {\n return ()\n }\n}\n");
+    }
+
+    #[test]
+    fn test_struct_ctor_this_call_must_be_first_invalid() {
+        assert_invalid("struct A {\n init(x: Int64) {\n let y = 1\n this()\n }\n init() {}\n}\n");
+    }
+
+    #[test]
+    fn test_struct_member_via_type_name_invalid() {
+        assert_invalid(
+            "struct A {\n A(var p: Int64) {}\n func check() {\n let t = A.p\n }\n}\n",
+        );
+    }
 }
+

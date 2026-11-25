@@ -659,6 +659,12 @@ struct Checker<'a> {
     class_ctors: HashMap<String, Vec<CtorSig>>,
     /// struct 类型名（值类型），用于区分引用/值语义下的成员可变性。
     struct_names: HashSet<String>,
+    /// 当前正在检查的成员所属结构体名（用于放行结构体定义体内对私有成员的访问）。
+    cur_struct: Option<String>,
+    /// struct 名 → 私有实例成员名集合（2.1.10.4(6)：私有成员仅在定义体内可见）。
+    struct_private_fields: HashMap<String, HashSet<String>>,
+    /// 主构造函数为 private 的 struct 名集合。
+    struct_private_ctor: HashSet<String>,
     /// struct 名 → 字段名 → 是否可变。
     struct_fields: HashMap<String, HashMap<String, bool>>,
     /// 全部 enum 变体名（`E1 = E1` 这类构造值不可赋值，4.23(15)）。
@@ -843,19 +849,90 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             class_ctors.insert(c.name.clone(), sigs);
         }
     }
+    // 结构体构造函数签名（2.1.10.2(8)/(9)/(13)）：主构造函数与 init 构造函数。
+    // 无显式构造函数时，仅当所有实例成员变量都有初始值时存在隐式无参构造函数
+    // （2.1.10.2(43)/(44)）。
+    for s in &program.structs {
+        let mut sigs: Vec<CtorSig> = Vec::new();
+        for init in &s.inits {
+            let params = init
+                .params
+                .iter()
+                .map(|p| CtorParam {
+                    name: p.name.clone(),
+                    ty: ty_of_known(&p.ty, &type_names),
+                    is_named: p.is_named,
+                    has_default: p.default.is_some(),
+                    variadic: p.variadic,
+                })
+                .collect();
+            sigs.push(CtorSig { params });
+        }
+        if sigs.is_empty() {
+            let primary_names: HashSet<&str> = s
+                .primary_ctor_params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect();
+            let mut all_default = true;
+            for f in &s.fields {
+                if f.is_static || primary_names.contains(f.name.as_str()) {
+                    continue;
+                }
+                if f.default.is_none() {
+                    all_default = false;
+                }
+            }
+            // 若存在与结构体同名的成员函数（`func StructName(...)`）或同名顶层函数，
+            // 该名字的调用是函数调用而非构造调用，不登记隐式构造函数。
+            let method_prefix = format!("{}.", s.name);
+            let has_named_func = program
+                .functions
+                .iter()
+                .any(|f| f.name == s.name || f.name.starts_with(&method_prefix));
+            if all_default && !has_named_func {
+                sigs.push(CtorSig { params: vec![] });
+            }
+        }
+        if !sigs.is_empty() {
+            class_ctors.insert(s.name.clone(), sigs);
+        }
+    }
     // 4.23(15)：赋值左侧可变性的辅助信息。
     // - struct 为值类型：成员赋值要求“基础对象可变”且“字段可变”；
     // - class 为引用类型：仅要求字段可变；
     // - 方法（`obj.m = ...`）不是变量，始终不可赋值。
     let mut struct_names: HashSet<String> = HashSet::new();
     let mut struct_fields: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    let mut struct_private_fields: HashMap<String, HashSet<String>> = HashMap::new();
     for s in &program.structs {
         struct_names.insert(s.name.clone());
         struct_fields.insert(
             s.name.clone(),
             s.fields.iter().map(|f| (f.name.clone(), f.is_mut)).collect(),
         );
+        let private: HashSet<String> = s
+            .fields
+            .iter()
+            .filter(|f| !f.is_static && matches!(f.visibility, crate::ast::Visibility::Private))
+            .map(|f| f.name.clone())
+            .collect();
+        if !private.is_empty() {
+            struct_private_fields.insert(s.name.clone(), private);
+        }
     }
+    // 主构造函数为 private 的结构体：仅可在结构体定义体内构造（2.1.10.2(3)）。
+    let struct_private_ctor: HashSet<String> = program
+        .structs
+        .iter()
+        .filter(|s| {
+            s.has_primary_ctor
+                && matches!(s.primary_ctor_visibility, crate::ast::Visibility::Private)
+                // 存在其它（非私有）构造函数时，调用可能解析到它们，保守放行。
+                && s.inits.len() <= 1
+        })
+        .map(|s| s.name.clone())
+        .collect();
     let mut enum_variants: HashSet<String> = HashSet::new();
     for e in &program.enums {
         for v in &e.variants {
@@ -932,14 +1009,60 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         class_ctors,
         struct_names,
         struct_fields,
+        struct_private_fields,
+        struct_private_ctor,
+        cur_struct: None,
         enum_variants,
         qualified_methods,
         index_op_types,
         index_set_types,
     };
 
+    // 结构体方法被脱糖为 `StructName.method` 顶层函数：为其注入实例字段作用域，
+    // 以便检查“给不可变成员赋值”等（2.1.10.4）。普通主构造参数不是成员，排除。
+    let mut struct_scopes: Vec<(String, String, HashMap<String, VarInfo>)> = Vec::new();
+    for s in &program.structs {
+        let regular: HashSet<&str> = s
+            .primary_ctor_params
+            .iter()
+            .zip(s.primary_ctor_member_flags.iter())
+            .filter(|(_, flag)| !**flag)
+            .map(|(p, _)| p.name.as_str())
+            .collect();
+        let scope: HashMap<String, VarInfo> = s
+            .fields
+            .iter()
+            .filter(|f| !regular.contains(f.name.as_str()))
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    VarInfo {
+                        ty: field_ty(f),
+                        mutable: f.is_mut,
+                        const_int: None,
+                        explicit_bool: false,
+                    },
+                )
+            })
+            .collect();
+        struct_scopes.push((s.name.clone(), format!("{}.", s.name), scope));
+    }
     for func in &program.functions {
-        checker.check_function(func);
+        if let Some((st_name, _, scope)) = struct_scopes
+            .iter()
+            .find(|(_, prefix, _)| func.name.starts_with(prefix.as_str()))
+        {
+            let prev = checker.cur_struct.replace(st_name.clone());
+            checker.check_params_body_extra(
+                &func.params,
+                &func.body,
+                Some(scope),
+                func.return_type.as_ref().map(|t| checker.ty_of_ann(t)),
+            );
+            checker.cur_struct = prev;
+        } else {
+            checker.check_function(func);
+        }
     }
     for cls in &program.classes {
         // 类字段先入作用域，避免方法体内同名字段被解析成同名全局变量。
@@ -1604,6 +1727,16 @@ fn check_builtin_operator_redefinitions(program: &Program, errors: &mut Vec<Sema
 impl<'a> Checker<'a> {
     fn err(&mut self, message: String) {
         self.errors.push(SemanticError { message });
+    }
+
+    /// 是否存在任意类型上名为 `name` 的成员函数（含静态/属性访问器脱糖名）。
+    /// 用于区分“构造函数被当作方法调用”和“恰与某类型同名的真实成员函数”。
+    fn has_any_method_named(&self, name: &str) -> bool {
+        self.qualified_methods.iter().any(|q| {
+            q.rsplit_once('.')
+                .map(|(_, m)| m == name)
+                .unwrap_or(false)
+        })
     }
 
     /// 6.1.2.1(8)/(9)：校验构造调用 `ClassName(args, named: ..)` 与某个构造函数
@@ -2612,6 +2745,20 @@ impl<'a> Checker<'a> {
                 // 2.1.3(4)/2.3.1(1)：基础类型转换的合法性（Bool↔数值、Rune↔数值）。
                 self.check_builtin_conversion(name, args, &arg_tys);
                 self.check_type_instantiation(name, type_args.as_deref());
+                // 2.1.10.2(3)：`A.A()` 形态（经类型名调用构造函数）非法；若该类型确有
+                // 同名成员函数则视为普通限定调用，放行。
+                if let Some((prefix, method)) = name.rsplit_once('.') {
+                    if prefix == method
+                        && self.type_names.contains(prefix)
+                        && self.ctor_types.contains(method)
+                        && !self.has_any_method_named(method)
+                    {
+                        self.err(format!(
+                            "构造函数 '{}' 不能作为成员方法调用（2.1.10.2(3)）",
+                            name
+                        ));
+                    }
+                }
                 self.call_return_ty(name, type_args.as_deref())
             }
 
@@ -2628,6 +2775,23 @@ impl<'a> Checker<'a> {
                 }
                 for (_, a) in named_args {
                     self.check_expr(a);
+                }
+                // 构造函数不能作为实例/静态成员方法调用（2.1.10.2(3)）：
+                // - `a.A()`（实例上调用构造函数）
+                // - `A.A()`（经类型名调用构造函数）
+                if self.ctor_types.contains(method) && !self.has_any_method_named(method) {
+                    let is_illegal = match &**object {
+                        // 经类型名调用：仅当方法名与类型名相同（即构造函数名）时非法。
+                        Expr::Var(n) if self.type_names.contains(n) => n == method,
+                        // 实例上调用同名的构造函数：非法。
+                        _ => true,
+                    };
+                    if is_illegal {
+                        self.err(format!(
+                            "构造函数 '{}' 不能作为成员方法调用（2.1.10.2(3)）",
+                            method
+                        ));
+                    }
                 }
                 // 类型限定静态调用 `T.m()`：可解析时返回其声明返回类型。
                 if let Expr::Var(type_name) = &**object {
@@ -2730,9 +2894,33 @@ impl<'a> Checker<'a> {
             }
 
             Expr::TupleIndex { object, .. }
-            | Expr::OptionalChain { object, .. }
-            | Expr::Field { object, .. } => {
+            | Expr::OptionalChain { object, .. } => {
                 self.check_expr(object);
+                Ty::Unknown
+            }
+
+            Expr::Field { object, field } => {
+                self.check_expr(object);
+                // 2.1.10.4(6)：私有实例成员仅可在结构体定义体内访问。
+                if let Expr::Var(n) = &**object {
+                    if n != "this" && n != "self" {
+                        if let Some(info) = self.lookup(n) {
+                            if let Ty::User(ty_name) = &info.ty {
+                                if self.cur_struct.as_deref() != Some(ty_name.as_str())
+                                    && self
+                                        .struct_private_fields
+                                        .get(ty_name)
+                                        .map_or(false, |set| set.contains(field))
+                                {
+                                    self.err(format!(
+                                        "不能访问结构体 '{}' 的私有成员 '{}'（2.1.10.4(6)）",
+                                        ty_name, field
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
                 Ty::Unknown
             }
 
@@ -2743,6 +2931,21 @@ impl<'a> Checker<'a> {
                 }
                 for (_, a) in named_args {
                     self.check_expr(a);
+                }
+                // 2.1.10.2(3)：`a.A()` / `A.A()` 经字段形态调用的构造函数。
+                if let Expr::Field { object, field } = &**callee {
+                    if self.ctor_types.contains(field) && !self.has_any_method_named(field) {
+                        let is_illegal = match &**object {
+                            Expr::Var(n) if self.type_names.contains(n) => n == field,
+                            _ => true,
+                        };
+                        if is_illegal {
+                            self.err(format!(
+                                "构造函数 '{}' 不能作为成员方法调用（2.1.10.2(3)）",
+                                field
+                            ));
+                        }
+                    }
                 }
                 Ty::Unknown
             }
@@ -2781,8 +2984,16 @@ impl<'a> Checker<'a> {
                     named_tys.push((n.clone(), t));
                 }
                 self.check_type_instantiation(name, type_args.as_deref());
-                // 6.1.2.1(8)/(9)：构造调用实参的类型/个数/命名匹配。
                 self.check_ctor_call(name, &pos_tys, &named_tys);
+                // 2.1.10.2(3)：private 主构造函数仅在结构体定义体内可见。
+                if self.struct_private_ctor.contains(name)
+                    && self.cur_struct.as_deref() != Some(name.as_str())
+                {
+                    self.err(format!(
+                        "构造函数 '{}' 为 private，不能在该结构体定义体之外调用（2.1.10.2(3)）",
+                        name
+                    ));
+                }
                 // 用户类型构造调用 `T()`：结果类型即该类型，便于后续复合赋值
                 // 运算符返回类型校验确定左操作数类型。
                 if self.ctor_types.contains(name) {
@@ -2806,9 +3017,25 @@ impl<'a> Checker<'a> {
                 Ty::Agg("range")
             }
 
-            Expr::VariantConst { arg, .. } => {
+            Expr::VariantConst {
+                enum_name,
+                variant_name,
+                arg,
+            } => {
                 if let Some(a) = arg {
                     self.check_expr(a);
+                }
+                // 2.1.10.2(3)：`Type.Type` 形态（如 `A.A()`）解析为变体构造，
+                // 若 `Type` 是 class/struct 等非枚举类型，则实为经类型名调用构造函数。
+                if self.type_names.contains(enum_name)
+                    && !self.enum_names.contains(enum_name)
+                    && enum_name == variant_name
+                    && !self.has_any_method_named(variant_name)
+                {
+                    self.err(format!(
+                        "构造函数 '{}' 不能作为成员方法调用（2.1.10.2(3)）",
+                        variant_name
+                    ));
                 }
                 Ty::Unknown
             }

@@ -1123,7 +1123,15 @@ mod tests {
             name: "Point".into(),
             type_params: vec![], constraints: vec![],
             fields: vec![make_field("x", Type::Float64), make_field("y", Type::Float64)],
-        });
+        
+        inits: vec![],
+        primary_ctor_params: vec![],
+        primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+});
         let ctx = TypeInferenceContext::from_program(&prog);
         let fields = ctx.struct_fields.get("Point").unwrap();
         assert_eq!(fields.get("x").unwrap(), &Type::Float64);

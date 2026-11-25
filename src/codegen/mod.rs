@@ -7040,7 +7040,15 @@ mod tests {
                         is_mut: true,
                     },
                 ],
-            }],
+            
+            inits: vec![],
+            primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+}],
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
@@ -7107,7 +7115,15 @@ mod tests {
                         is_mut: true,
                     },
                 ],
-            }],
+            
+            inits: vec![],
+            primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+}],
             interfaces: vec![],
             classes: vec![],
             enums: vec![],
@@ -8206,7 +8222,15 @@ mod tests {
                         is_mut: true,
                     },
                 ],
-            }],
+            
+            inits: vec![],
+            primary_ctor_params: vec![],
+            primary_ctor_member_flags: vec![],
+
+has_primary_ctor: false,
+
+primary_ctor_visibility: crate::ast::Visibility::Internal,
+}],
             interfaces: vec![InterfaceDef {
                 visibility: Visibility::default(),
                 name: "Printable".to_string(),
