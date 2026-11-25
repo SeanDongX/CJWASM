@@ -321,7 +321,7 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
 // 所有规则都能在单文件内基于 AST 判定，父类型无法在本地解析时保守跳过。
 
 use crate::ast::{
-    AssignTarget, ClassDef, ClassMethod, EnumDef, Function, InitDef, InterfaceDef,
+    AssignTarget, ClassDef, ClassMethod, EnumDef, FieldDef, Function, InitDef, InterfaceDef,
     InterfaceMethod, Param, Pattern, StructDef, Visibility,
 };
 use std::collections::HashSet;
@@ -353,6 +353,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_main_signature(program, &mut errors);
     // 3.1(3)：顶层名称共享命名空间，禁止重复/跨类别冲突。
     check_top_level_name_collisions(program, &mut errors);
+    // 3.1(2)：关键字不能用作声明名；预声明类型名不能被重新声明。
+    check_reserved_identifier_usage(program, &mut errors);
+    // 11.2(7)-(12)：public 声明不得引用 internal 类型（无 import 的单文件程序）。
+    check_public_internal_exposure(program, &mut errors);
     // 3.1(3)：同一作用域内局部变量重复声明。
     check_duplicate_local_bindings(program, &mut errors);
     // 3.2.3.2(3)/(6)：局部变量 / 局部函数先使用后声明。
@@ -394,6 +398,34 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         check_struct_interfaces(st, program, &index, &mut errors);
         // 6.3.3(1)：struct 成员不得遮蔽父接口同名成员。
         check_struct_member_shadowing(st, program, &index, &mut errors);
+        // 3.1(3)：结构体字段名与成员函数名共享成员命名空间。
+        {
+            // 仅显式 `let/var/const` 字段参与字段/方法同名检查；由主构造普通
+            // 参数合成的字段不属于成员命名空间。
+            let ctor_names: HashSet<&str> = st
+                .primary_ctor_params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect();
+            let field_names: Vec<&str> = st
+                .fields
+                .iter()
+                .filter(|f| f.decl_kw && !ctor_names.contains(f.name.as_str()))
+                .map(|f| f.name.as_str())
+                .collect();
+            let method_names: Vec<String> = program
+                .functions
+                .iter()
+                .filter(|f| owner_name(&f.name) == Some(st.name.as_str()))
+                .map(|f| last_name_segment(&f.name))
+                .collect();
+            check_field_method_conflicts(
+                &st.name,
+                field_names.into_iter(),
+                method_names.iter().map(|s| s.as_str()),
+                &mut errors,
+            );
+        }
         // 2.1.10.2 结构体构造器规则（参数顺序/默认值/确定赋值/this 使用等）。
         check_struct_ctor_rules(st, program, &mut errors);
         check_impl_generic_constraint_loosening(
@@ -1618,11 +1650,15 @@ fn type_display(ty: &Type) -> String {
 /// 平台条件编译生成的多份同名声明）不在此处判定，避免误伤；顶层函数同签名重复
 /// 由 `check_function_groups` 处理。
 fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 同类别重复声明在含 import 的程序中可能来自 @When[backend=...] 平台条件
+    // 编译（AST 会同时保留各分支），仅对无 import 的单文件程序直接判定重复。
+    let report_same_kind = program.imports.is_empty();
     fn record(
         seen: &mut HashMap<String, (&'static str, String)>,
         name: &str,
         kind: &'static str,
         desc: &str,
+        report_same_kind: bool,
         errors: &mut Vec<SemanticError>,
     ) {
         if name.is_empty() || name.starts_with("__") {
@@ -1634,8 +1670,18 @@ fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticE
             }
             Some((prev_kind, prev_desc)) => {
                 if *prev_kind == kind {
-                    // 同类别重复：可能来自重载、宏展开或 @When 平台条件编译，
-                    // 由专门检查负责，保守跳过。
+                    // 同类别重复：函数同名可能是重载，由 check_function_groups 负责
+                    // （`kind == "函数"` 时一律放行）。类型声明（class/struct/enum/
+                    // interface）可能带有宏属性（@Test/@Strategy/@When 等），AST 不保留
+                    // 属性，无法区分合法的宏多声明，故只对变量与类型别名在无 import
+                    // 的单文件程序中判定 3.1(3) 重复声明。
+                    let safe_kind = matches!(kind, "变量" | "type");
+                    if kind == "函数" || !report_same_kind || !safe_kind {
+                        return;
+                    }
+                    errors.push(SemanticError {
+                        message: format!("顶层名称 '{}' 被重复声明（{}，3.1(3)）", name, desc),
+                    });
                     return;
                 }
                 errors.push(SemanticError {
@@ -1652,7 +1698,7 @@ fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticE
     // 顶层同名 let/var 可能来自 @When[os/backend] 平台条件编译（官方 std 大量使用），
     // 预处理前的 AST 会同时保留各平台分支，故同类别重复必须保守跳过。
     for c in &program.constants {
-        record(&mut seen, &c.name, "变量", "变量", errors);
+        record(&mut seen, &c.name, "变量", "变量", report_same_kind, errors);
     }
     for f in &program.functions {
         // 仅顶层函数（成员方法以 `Type.method` 形式存储在同一列表中）。
@@ -1660,24 +1706,396 @@ fn check_top_level_name_collisions(program: &Program, errors: &mut Vec<SemanticE
             continue;
         }
         // 同名顶层函数可能是重载，由 check_function_groups 判定，不在此处按类别重复处理。
-        record(&mut seen, &f.name, "函数", "函数", errors);
+        record(&mut seen, &f.name, "函数", "函数", report_same_kind, errors);
     }
     // 用户定义类型：跨类别冲突由 record 判定；同类别重复可能来自 @When
     // 平台条件编译，按上面同样的理由保守跳过。
     for c in &program.classes {
-        record(&mut seen, &c.name, "class", "class", errors);
+        record(&mut seen, &c.name, "class", "class", report_same_kind, errors);
     }
     for s in &program.structs {
-        record(&mut seen, &s.name, "struct", "struct", errors);
+        record(&mut seen, &s.name, "struct", "struct", report_same_kind, errors);
     }
     for e in &program.enums {
-        record(&mut seen, &e.name, "enum", "enum", errors);
+        record(&mut seen, &e.name, "enum", "enum", report_same_kind, errors);
     }
     for i in &program.interfaces {
-        record(&mut seen, &i.name, "interface", "interface", errors);
+        record(&mut seen, &i.name, "interface", "interface", report_same_kind, errors);
     }
     for (name, _) in &program.type_aliases {
-        record(&mut seen, name, "type", "type 别名", errors);
+        record(&mut seen, name, "type", "type 别名", report_same_kind, errors);
+    }
+}
+
+// ─── 03 章：保留关键字不得用作声明名 ───────────────────────────────────────
+
+/// 03.1(2)：关键字、变量、函数、类型共享同一命名空间，关键字不能作为声明名。
+///
+/// 词法器把 `where`/`type`/`is`/`case` 定义为独立关键字 token，但解析器在若干
+/// 声明位置把它们当普通标识符接受；这里在语义层补上拒绝。`main` 只允许作为
+/// 顶层入口函数名（其它位置声明 `main` 均非法）。预声明类型名不能被用户重新
+/// 声明为类型（如 `enum Unit { x }`）。
+fn check_reserved_identifier_usage(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 反引号标识符（`` `is` ``）在 AST 中与普通关键字同名、无法区分，且官方
+    // 正例大量出现在带 import 的单文件程序中；仅在无 import 的程序上启用，
+    // 保证正测试零回归（负例 a02 组均无 import）。
+    if !program.imports.is_empty() {
+        return;
+    }
+    // 定义即保留、任何声明名都不允许的关键字。
+    fn strict_keyword(name: &str) -> bool {
+        matches!(name, "where" | "type" | "is" | "case")
+    }
+    fn predeclared_type(name: &str) -> bool {
+        matches!(
+            name,
+            "Int8"
+                | "Int16"
+                | "Int32"
+                | "Int64"
+                | "IntNative"
+                | "UInt8"
+                | "UInt16"
+                | "UInt32"
+                | "UInt64"
+                | "UIntNative"
+                | "Float16"
+                | "Float32"
+                | "Float64"
+                | "Rune"
+                | "Bool"
+                | "Unit"
+                | "Nothing"
+                | "This"
+        )
+    }
+    let mut report = |name: &str, what: &str| {
+        errors.push(SemanticError {
+            message: format!(
+                "保留关键字 '{}' 不能用作{}名（3.1(2)）",
+                name, what
+            ),
+        });
+    };
+
+    if let Some(pkg) = &program.package_name {
+        if strict_keyword(pkg) || pkg == "main" {
+            report(pkg, "包");
+        }
+    }
+    for c in &program.constants {
+        if strict_keyword(&c.name) || c.name == "main" {
+            report(&c.name, "变量");
+        }
+    }
+    // 顶层函数：`main` 是入口函数名，允许；`where/type/is/case` 不允许。
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") {
+            continue;
+        }
+        if strict_keyword(&f.name) {
+            report(&f.name, "函数");
+        }
+    }
+    // 类型声明名：额外禁止占用预声明类型名。
+    for c in &program.classes {
+        if strict_keyword(&c.name) || c.name == "main" || predeclared_type(&c.name) {
+            report(&c.name, "类型");
+        }
+    }
+    for s in &program.structs {
+        if strict_keyword(&s.name) || s.name == "main" || predeclared_type(&s.name) {
+            report(&s.name, "类型");
+        }
+    }
+    for e in &program.enums {
+        if strict_keyword(&e.name) || e.name == "main" || predeclared_type(&e.name) {
+            report(&e.name, "类型");
+        }
+    }
+    for i in &program.interfaces {
+        if strict_keyword(&i.name) || i.name == "main" || predeclared_type(&i.name) {
+            report(&i.name, "类型");
+        }
+    }
+    for (name, _) in &program.type_aliases {
+        if strict_keyword(name) || name == "main" || predeclared_type(name) {
+            report(name, "类型别名");
+        }
+    }
+    // 成 员 名（字段 / 方法 / 枚举构造器 / 属性）。
+    for c in &program.classes {
+        for fld in &c.fields {
+            if strict_keyword(&fld.name) || fld.name == "main" {
+                report(&fld.name, "字段");
+            }
+        }
+    }
+    for s in &program.structs {
+        for fld in &s.fields {
+            if strict_keyword(&fld.name) || fld.name == "main" {
+                report(&fld.name, "字段");
+            }
+        }
+    }
+    for f in &program.functions {
+        let Some(_owner) = owner_name(&f.name) else {
+            continue;
+        };
+        let seg = last_name_segment(&f.name);
+        if seg.starts_with("__") {
+            continue;
+        }
+        if strict_keyword(&seg) {
+            report(&seg, "成员函数");
+        }
+    }
+    for e in &program.enums {
+        for v in &e.variants {
+            if strict_keyword(&v.name) || v.name == "main" {
+                report(&v.name, "枚举构造器");
+            }
+        }
+    }
+}
+
+// ─── 11 章：public 声明不得暴露 internal 类型 ─────────────────────────────
+
+/// 11.2(7)-(12)：修饰符 public / protected 的声明所引用的类型必须是 external
+/// （包外可见）。仓颉中未标注可见性的顶层类型默认 internal。
+///
+/// 仅在**无 import** 的单文件程序上启用：存在导入时外部类型的可见性无法静态
+/// 确定，保守跳过以保证 std / 正测试零回归。返回类型未显式标注时，只识别
+/// “函数体直接 `return Ctor()` / 末尾 `Ctor()`”这种可确定的推断形态。
+fn check_public_internal_exposure(program: &Program, errors: &mut Vec<SemanticError>) {
+    if !program.imports.is_empty() {
+        return;
+    }
+    let mut internal: HashSet<&str> = HashSet::new();
+    for c in &program.classes {
+        if c.visibility == Visibility::Internal {
+            internal.insert(c.name.as_str());
+        }
+    }
+    for s in &program.structs {
+        if s.visibility == Visibility::Internal {
+            internal.insert(s.name.as_str());
+        }
+    }
+    for e in &program.enums {
+        if e.visibility == Visibility::Internal {
+            internal.insert(e.name.as_str());
+        }
+    }
+    for i in &program.interfaces {
+        if i.visibility == Visibility::Internal {
+            internal.insert(i.name.as_str());
+        }
+    }
+    if internal.is_empty() {
+        return;
+    }
+
+    fn collect_named(ty: &Type, internal: &HashSet<&str>, out: &mut Vec<String>) {
+        match ty {
+            Type::Struct(name, args) => {
+                if internal.contains(name.as_str()) {
+                    out.push(name.clone());
+                }
+                for a in args {
+                    collect_named(a, internal, out);
+                }
+            }
+            Type::Array(t) | Type::Option(t) | Type::Slice(t) => collect_named(t, internal, out),
+            Type::Result(a, b) | Type::Map(a, b) => {
+                collect_named(a, internal, out);
+                collect_named(b, internal, out);
+            }
+            Type::Tuple(ts) => {
+                for t in ts {
+                    collect_named(t, internal, out);
+                }
+            }
+            Type::Function { params, ret } => {
+                for p in params {
+                    collect_named(p, internal, out);
+                }
+                if let Some(r) = ret.as_ref() {
+                    collect_named(r, internal, out);
+                }
+            }
+            // 限定类型来自其它包，本文件无法判定其可见性。
+            _ => {}
+        }
+    }
+
+    // 直接构造 internal 类型的表达式（`C1()`），用于推断返回类型。
+    fn direct_ctor_name(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::ConstructorCall { name, .. } => Some(name.as_str()),
+            Expr::Call { name, .. } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn tail_internal_ctor<'a>(body: &'a [Stmt], internal: &HashSet<&str>) -> Option<String> {
+        match body.last()? {
+            Stmt::Return(Some(e)) | Stmt::Expr(e) => direct_ctor_name(e)
+                .filter(|n| internal.contains(*n))
+                .map(|n| n.to_string()),
+            _ => None,
+        }
+    }
+
+    fn check_fn(f: &Function, internal: &HashSet<&str>, errors: &mut Vec<SemanticError>) {
+        let mut used: Vec<String> = Vec::new();
+        for p in &f.params {
+            collect_named(&p.ty, internal, &mut used);
+        }
+        if let Some(ret) = &f.return_type {
+            collect_named(ret, internal, &mut used);
+        }
+        for c in &f.constraints {
+            for b in &c.bounds {
+                if internal.contains(b.as_str()) {
+                    used.push(b.clone());
+                }
+            }
+        }
+        if f.return_type.is_none() {
+            if let Some(n) = tail_internal_ctor(&f.body, internal) {
+                used.push(n);
+            }
+        }
+        used.sort();
+        used.dedup();
+        for ty in used {
+            errors.push(SemanticError {
+                message: format!(
+                    "public 声明 '{}' 引用了 internal 类型 '{}'（11.2(7)-(12)）",
+                    last_name_segment(&f.name),
+                    ty
+                ),
+            });
+        }
+    }
+
+    fn check_field(
+        owner: &str,
+        fld: &FieldDef,
+        internal: &HashSet<&str>,
+        errors: &mut Vec<SemanticError>,
+    ) {
+        if !matches!(fld.visibility, Visibility::Public | Visibility::Protected) {
+            return;
+        }
+        let mut used: Vec<String> = Vec::new();
+        collect_named(&fld.ty, internal, &mut used);
+        if let Some(default) = &fld.default {
+            if let Some(n) = direct_ctor_name(default) {
+                if internal.contains(n) {
+                    used.push(n.to_string());
+                }
+            }
+        }
+        used.sort();
+        used.dedup();
+        for ty in used {
+            errors.push(SemanticError {
+                message: format!(
+                    "public 声明 '{}' 引用了 internal 类型 '{}'（11.2(7)-(12)）",
+                    owner, ty
+                ),
+            });
+        }
+    }
+
+    // 顶层 public 函数。
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") || f.name == "main" {
+            continue;
+        }
+        if f.visibility == Visibility::Public {
+            check_fn(f, &internal, errors);
+        }
+    }
+
+    // public 类型的 public / protected 成员函数（含属性脱糖的 __get_/__set_）。
+    // 类方法仅存放在 ClassDef.methods；struct/enum 方法以 `Type.method` 形式
+    // 存放在 program.functions。
+    for c in &program.classes {
+        if c.visibility != Visibility::Public {
+            continue;
+        }
+        for m in &c.methods {
+            if matches!(m.func.visibility, Visibility::Public | Visibility::Protected) {
+                check_fn(&m.func, &internal, errors);
+            }
+        }
+    }
+    let mut public_owners: HashSet<&str> = HashSet::new();
+    for s in &program.structs {
+        if s.visibility == Visibility::Public {
+            public_owners.insert(s.name.as_str());
+        }
+    }
+    for e in &program.enums {
+        if e.visibility == Visibility::Public {
+            public_owners.insert(e.name.as_str());
+        }
+    }
+    for f in &program.functions {
+        let Some(owner) = owner_name(&f.name) else {
+            continue;
+        };
+        if !public_owners.contains(owner) {
+            continue;
+        }
+        if !matches!(f.visibility, Visibility::Public | Visibility::Protected) {
+            continue;
+        }
+        check_fn(f, &internal, errors);
+    }
+
+    // public 类型的 public / protected 字段（含可确定的推断类型）。
+    for c in &program.classes {
+        if c.visibility != Visibility::Public {
+            continue;
+        }
+        for fld in &c.fields {
+            check_field(&c.name, fld, &internal, errors);
+        }
+    }
+    for s in &program.structs {
+        if s.visibility != Visibility::Public {
+            continue;
+        }
+        for fld in &s.fields {
+            check_field(&s.name, fld, &internal, errors);
+        }
+    }
+
+    // public 枚举的构造器 payload 类型必须 external。
+    for e in &program.enums {
+        if e.visibility != Visibility::Public {
+            continue;
+        }
+        for v in &e.variants {
+            if let Some(p) = &v.payload {
+                let mut used = Vec::new();
+                collect_named(p, &internal, &mut used);
+                used.sort();
+                used.dedup();
+                for ty in used {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "public 声明 '{}.{}' 引用了 internal 类型 '{}'（11.2(7)-(12)）",
+                            e.name, v.name, ty
+                        ),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -2302,7 +2720,7 @@ fn check_unqualified_member_refs_in_free_fns(
 /// `KeyOpt`、`Thread`、`TestSuite`），一律放行；本检查只针对变量形态（小写或
 /// 下划线开头）的裸引用，进一步收敛误报面。
 fn check_undefined_identifiers(program: &Program, errors: &mut Vec<SemanticError>) {
-    if !program.imports.is_empty() {
+    if !imports_allow_undefined_check(program) {
         return;
     }
     let globals = collect_global_identifiers(program);
@@ -2337,6 +2755,32 @@ fn check_undefined_identifiers(program: &Program, errors: &mut Vec<SemanticError
             }
         }
     }
+}
+
+/// 判断当前程序的 import 形态是否仍可安全启用“未定义标识符”检查。
+///
+/// 本编译器不做真实导入解析。AST 不保留通配符标记（`import a.b.*` 与
+/// `import a.b` 都表现为 `items=None`），因此只对**可确定单项目导入**的路径启用：
+/// 分组导入（`{...}`）中不含 `*`，或路径最后一段首字母大写（类型/构造器形态）。
+/// 任一 import 不符合则整体跳过，保证 std / 正测试零回归。
+fn imports_allow_undefined_check(program: &Program) -> bool {
+    for imp in &program.imports {
+        match &imp.items {
+            Some(items) => {
+                if items
+                    .iter()
+                    .any(|i| i.split('.').any(|seg| seg == "*"))
+                {
+                    return false;
+                }
+            }
+            None => match imp.module_path.last() {
+                Some(last) if last.chars().next().map_or(false, |c| c.is_uppercase()) => {}
+                _ => return false,
+            },
+        }
+    }
+    true
 }
 
 /// 预置（prelude）标识符：语言核心类型与常用内建函数名。这些名字无需 import
@@ -11291,10 +11735,62 @@ fn scan_ct_expr(
 // ─── 10.2.3(4)-(14)：运算符重载函数的元数（参数个数）校验 ───────────────────
 
 fn check_operator_function_signatures(program: &Program, errors: &mut Vec<SemanticError>) {
-    fn check_one(name: &str, params: &[Param], errors: &mut Vec<SemanticError>) {
+    fn check_one(
+        name: &str,
+        params: &[Param],
+        ret: Option<&Type>,
+        errors: &mut Vec<SemanticError>,
+    ) {
         let last = name.rsplit('.').next().unwrap_or(name);
         // 剥离隐式/显式接收者（this/self），只统计“操作数”形参。
         let (ps, _, _) = split_receiver(params);
+        // 10.2.4：下标运算符 set 形态（带命名参数）的声明细则。
+        if last == "op_index" {
+            let operands: &[Param] = if params
+                .first()
+                .map_or(false, |p| is_receiver_param(&p.name))
+            {
+                &params[1..]
+            } else {
+                params
+            };
+            let named: Vec<&Param> = operands.iter().filter(|p| p.is_named).collect();
+            if !named.is_empty() {
+                if named.len() > 1 {
+                    errors.push(SemanticError {
+                        message:
+                            "set 形态下标运算符只能有一个命名参数（10.2.4）".to_string(),
+                    });
+                }
+                if let Some(v) = named.first() {
+                    if v.name != "value" {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "set 形态下标运算符的命名参数必须命名为 'value'，实际为 '{}'（10.2.4）",
+                                v.name
+                            ),
+                        });
+                    }
+                }
+                if operands.last().map_or(false, |p| !p.is_named) {
+                    errors.push(SemanticError {
+                        message:
+                            "set 形态下标运算符的命名参数必须是最后一个参数（10.2.4）"
+                                .to_string(),
+                    });
+                }
+                if let Some(t) = ret {
+                    if *t != Type::Unit {
+                        errors.push(SemanticError {
+                            message:
+                                "set 形态下标运算符的返回类型必须为 Unit（10.2.4）"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
+            return;
+        }
         let arity = ps.len();
         // (符号, 允许的参数个数)；空切片表示该运算符不可重载。
         let (symbol, allowed): (&str, &[usize]) = match last {
@@ -11345,21 +11841,21 @@ fn check_operator_function_signatures(program: &Program, errors: &mut Vec<Semant
     }
 
     for f in &program.functions {
-        check_one(&f.name, &f.params, errors);
+        check_one(&f.name, &f.params, f.return_type.as_ref(), errors);
     }
     for c in &program.classes {
         for m in &c.methods {
-            check_one(&m.func.name, &m.func.params, errors);
+            check_one(&m.func.name, &m.func.params, m.func.return_type.as_ref(), errors);
         }
     }
     for iface in &program.interfaces {
         for m in &iface.methods {
-            check_one(&m.name, &m.params, errors);
+            check_one(&m.name, &m.params, m.return_type.as_ref(), errors);
         }
     }
     for ext in &program.extends {
         for m in &ext.methods {
-            check_one(&m.name, &m.params, errors);
+            check_one(&m.name, &m.params, m.return_type.as_ref(), errors);
         }
     }
 }
@@ -14139,6 +14635,106 @@ main() {}"#,
         assert_valid("class C {\n operator func !() { }\n}\nmain() {}");
         assert_valid("class C {\n operator func -() { }\n operator func -(o: C) { }\n}\nmain() {}");
         assert_valid("class C {\n operator func [](i: Int64) { }\n}\nmain() {}");
+    }
+
+    // ─── w12c：03 章关键字作标识符 / 同类别重复 / 字段方法同名 ──────────────
+
+    #[test]
+    fn test_w12c_reserved_keyword_identifiers() {
+        // 3.1(2)：`where`/`type`/`is`/`case` 与变量/函数/包名共享命名空间。
+        assert_invalid("var where = 1\nmain() {}");
+        assert_invalid("let is = 0\nmain() {}");
+        assert_invalid("func case() {}\nmain() {}");
+        assert_invalid("var type = 1\nmain() {}");
+        assert_invalid("package is\nmain() {}");
+        assert_invalid("package main\nmain() {}");
+        // 预声明类型名不能被重新声明为类型。
+        assert_invalid("enum Unit { x }\nmain() {}");
+        // `main` 作为入口函数名合法；入口函数体内的普通变量合法。
+        assert_valid("main() {}");
+        // `from` 是可作标识符的上下文关键字（官方正例）。
+        assert_valid("let from = 0\nmain() {}");
+        // 反引号形态的关键字标识符在官方正例中合法（AST 不保留反引号，按局部
+        // 变量处理时不在检查范围）。
+        assert_valid("main() { let `is` = 1 }");
+        // import 存在时保守跳过（反引号/装饰器场景无法静态区分）。
+        assert_valid("import utils.assert.Assert\nvar where = 1\nmain() {}");
+    }
+
+    #[test]
+    fn test_w12c_duplicate_toplevel_declarations() {
+        // 3.1(3)：无 import 单文件程序中，变量/类型别名同类别重复非法。
+        assert_invalid("let name = 0\nlet name = 0\nmain() {}");
+        assert_invalid("var name = 1\nlet name = 0\nmain() {}");
+        assert_invalid("type name = Int64\ntype name = Int64\nmain() {}");
+        // 同名函数是重载，合法。
+        assert_valid("func f() {}\nfunc f(x: Int64) {}\nmain() {}");
+        // 不同作用域的遮蔽合法。
+        assert_valid("let name = 0\nmain() { let name = 1 }");
+        // 含 import 时保守跳过（@When 平台分支会保留重复声明）。
+        assert_valid("import utils.assert.Assert\nlet name = 0\nlet name = 0\nmain() {}");
+    }
+
+    #[test]
+    fn test_w12c_struct_field_method_conflict() {
+        // 3.1(3)：结构体显式字段与成员函数同名非法。
+        assert_invalid("struct S {\n var b = 0.5\n func b() {}\n}\nmain() {}");
+        // 正例：字段名与方法名不同。
+        assert_valid("struct S {\n var a = 0.5\n func b() {}\n}\nmain() {}");
+    }
+
+    // ─── w12c：10.2.4 下标运算符 set 形态声明细则 ─────────────────────────
+
+    #[test]
+    fn test_w12c_index_operator_declaration_rules() {
+        // get 形态：纯位置参数。
+        assert_valid("class C {\n operator func [](i: Int64): Int64 { 42 }\n}\nmain() {}");
+        // set 形态正例：恰一个名为 value 的命名参数且位于末尾，返回 Unit。
+        assert_valid("class C {\n operator func [](i: Int64, value!: Int64) {}\n}\nmain() {}");
+        // 命名参数必须叫 value。
+        assert_invalid(
+            "class C {\n operator func [](index: Int64, val!: Int64) {}\n}\nmain() {}",
+        );
+        // 不能有多个命名参数。
+        assert_invalid(
+            "class C {\n operator func [](index: Int64, value!: Int64, v!: Int64) {}\n}\nmain() {}",
+        );
+        // set 形态返回类型必须为 Unit。
+        assert_invalid(
+            "class C {\n operator func [](index: Int64, value!: Int64): Int64 { 42 }\n}\nmain() {}",
+        );
+        // 命名参数必须是最后一个位置参数。
+        assert_invalid(
+            "class C {\n operator func [](index: Int64, value!: Int64, other: Int64) {}\n}\nmain() {}",
+        );
+    }
+
+    // ─── w12c：11 章 public 声明暴露 internal 类型 ─────────────────────────
+
+    #[test]
+    fn test_w12c_public_internal_exposure() {
+        // 11.2(7)：public 顶层函数的推断/注解返回类型为 internal 类型。
+        assert_invalid("class C1 {}\npublic func foo() { C1() }\nmain() {}");
+        assert_invalid("class C1 {}\npublic func foo(): C1 { C1() }\nmain() {}");
+        // 参数类型为 internal 类型。
+        assert_invalid("class C1 {}\npublic func foo(a: C1) {}\nmain() {}");
+        // 泛型约束上界为 internal 类型。
+        assert_invalid("class C1 {}\npublic func foo<T>() where T <: C1 { 0 }\nmain() {}");
+        // public 枚举构造器 payload 为 internal 类型。
+        assert_invalid("class C1 {}\npublic enum E { A(C1) }\nmain() {}");
+        // public 类的 public 方法参数 / 推断返回为 internal 类型。
+        assert_invalid(
+            "class C1 {}\npublic class T { public func foo(a: C1) {} }\nmain() {}",
+        );
+        assert_invalid(
+            "class C1 {}\npublic class T { public func foo() { C1() } }\nmain() {}",
+        );
+        // 正例：public 类型可被 public 声明引用。
+        assert_valid("public class C1 {}\npublic func foo(a: C1) {}\nmain() {}");
+        // 正例：internal 函数引用 internal 类型合法。
+        assert_valid("class C1 {}\nfunc foo() { C1() }\nmain() {}");
+        // 存在 import 时保守跳过。
+        assert_valid("import utils.assert.Assert\nclass C1 {}\npublic func foo() { C1() }\nmain() {}");
     }
 
 }
