@@ -3024,8 +3024,10 @@ impl Parser {
                             body,
                             extern_import: None,
                         },
-                        override_: false,
-                        has_override_kw: false,
+                        // 保留 redef/override 修饰符，供 sema 拒绝
+                        // `redef static init()`（6.3.4.1(9)）。
+                        override_: mods.is_override,
+                        has_override_kw: mods.has_override_kw,
                         is_static: true,
                         is_open: false,
                         is_abstract: false,

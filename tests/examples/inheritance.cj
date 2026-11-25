@@ -25,7 +25,7 @@ open class Animal {
         this.age = age
     }
 
-    open func speak(): Int64 {
+    public open func speak(): Int64 {
         return 0
     }
 
@@ -42,7 +42,7 @@ class Dog <: Animal {
         this.breed = breed
     }
 
-    override func speak(): Int64 {
+    public override func speak(): Int64 {
         return 1  // "Woof"
     }
 
@@ -59,7 +59,7 @@ class Cat <: Animal {
         this.indoor = indoor
     }
 
-    override func speak(): Int64 {
+    public override func speak(): Int64 {
         return 2  // "Meow"
     }
 }

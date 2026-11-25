@@ -82,7 +82,7 @@ open class Animal {
         this.legs = legs
     }
 
-    open func getLegs(): Int64 {
+    public open func getLegs(): Int64 {
         return this.legs
     }
 }
@@ -95,7 +95,7 @@ class Dog <: Animal {
         this.loyal = loyal
     }
 
-    override func getLegs(): Int64 {
+    public override func getLegs(): Int64 {
         return 4
     }
 
