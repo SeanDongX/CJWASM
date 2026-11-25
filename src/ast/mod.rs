@@ -600,6 +600,8 @@ pub struct InterfaceMethod {
     pub constraints: Vec<TypeConstraint>,
     /// 是否为 const 函数（const func）。const 接口函数必须由 const 函数实现。
     pub is_const: bool,
+    /// 是否由 `mut prop` 脱糖出的访问器（用于接口属性 mut 规则，7.1(6)）。
+    pub is_prop_mut: bool,
 }
 
 /// 接口关联类型定义（如 type Element）
@@ -716,6 +718,9 @@ pub struct ClassMethod {
     pub has_body: bool,
     /// 是否为 const 函数（const func / const static func）
     pub is_const: bool,
+    /// 是否为 `mut prop` 脱糖出的访问器（用于属性 mut 修饰符一致性校验，
+    /// 7.4(10)/(13)；普通成员函数为 false）。
+    pub is_prop_mut: bool,
     pub func: Function,
 }
 
@@ -745,6 +750,9 @@ pub struct TypeConstraint {
     pub param: String,
     /// 约束的接口名列表（如 ["Comparable", "Hashable"]）
     pub bounds: Vec<String>,
+    /// 与 `bounds` 一一对应的显式泛型实参（结构体/枚举 `<: I<Int64>>` 场景）。
+    /// 未写实参时对应项为空列表；用于语义阶段按接口泛型实参消解父方法签名。
+    pub bound_args: Vec<Vec<Type>>,
 }
 
 /// 枚举定义（支持无关联值或单关联值变体，支持泛型）
