@@ -24,7 +24,7 @@ func charDemo(): Int64 {
     let tab = '\t'
 
     // cjc: as returns Option, use Int64() constructor for Rune->Int64
-    return Int64(ch)   // 65 ('A' 的 Unicode)
+    return Int64(UInt32(ch))   // Rune→UInt32→Int64（规范路径）
 }
 
 // === 3. Tuple 类型 ===
