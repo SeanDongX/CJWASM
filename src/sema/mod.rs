@@ -3578,6 +3578,21 @@ fn check_member_modifiers(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
                 });
             }
         }
+
+        // 6.1.1.1(9) / 6.1.2.4(36)：open 成员函数具有可被覆写的语义；抽象实例成员
+        // 函数（显式 `abstract` 或抽象类中无实现体的实例函数）隐含 open。二者都不能
+        // 声明为 private（private 成员无法被子类访问/覆写）。
+        let implicitly_abstract_instance = !is_static && !m.has_body;
+        if (m.is_open || m.is_abstract || implicitly_abstract_instance)
+            && matches!(m.func.visibility, Visibility::Private)
+        {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的 open/抽象成员函数 '{}' 不能声明为 private（6.1.1.1(9)/6.1.2.4(36)）",
+                    cls.name, m.func.name
+                ),
+            });
+        }
     }
 }
 
@@ -5560,6 +5575,35 @@ fn check_class_supertypes(
             });
         }
     }
+
+    // 6.1.1.3(8)/(9)：同一接口不得以相同泛型实参被直接实现两次。
+    // 不同实参（如 I<Int> & I<String>）是合法的，因此按规范化后的完整类型比较。
+    let mut seen_supers: HashMap<String, ()> = HashMap::new();
+    for (name, args) in &cls.supertype_args {
+        if !index.interfaces.contains_key(name.as_str()) {
+            continue;
+        }
+        let mut map = HashMap::new();
+        let canon = if args.is_empty() {
+            format!("S:{}", name)
+        } else {
+            let inner: Vec<String> = args
+                .iter()
+                .map(|a| canon_type(a, &cls.type_params, &mut map))
+                .collect();
+            format!("S:{}<{}>", name, inner.join(","))
+        };
+        if seen_supers.contains_key(&canon) {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 不能以相同泛型实参重复实现接口 '{}'（6.1.1.3(8)/(9)）",
+                    cls.name, name
+                ),
+            });
+            break;
+        }
+        seen_supers.insert(canon, ());
+    }
 }
 
 /// 扫描所有函数体，禁止实例化抽象类或接口。
@@ -6176,10 +6220,44 @@ fn check_interface(
         // 接口内部同样不允许 static 与实例成员函数同名互为重载（6.3.2(1)）。
         check_signature_group(&iface.name, group, true, errors);
     }
+    // 6.2.3(4)/(5)：同一接口不得被以相同泛型实参直接继承多次。
+    check_interface_duplicate_parents(iface, errors);
     // 接口继承：子接口成员不得与父接口同名成员构成 static/实例重载冲突（6.3.2(1)）。
     check_interface_inherited_static_conflicts(iface, index, errors);
     // 接口继承：子接口成员不得遮蔽父接口同名成员（6.3.3(1)）。
     check_interface_inherited_kind_shadowing(iface, index, errors);
+}
+
+/// 6.2.3(4)/(5)：同一接口不得被以相同泛型实参直接继承多次
+/// （`interface J <: I & I` 或 `J <: I<Int> & I<Int>`）。
+/// 不同泛型实参（`I<Int> & I<String>`）是合法的，按规范化后的完整类型比较。
+fn check_interface_duplicate_parents(
+    iface: &InterfaceDef,
+    errors: &mut Vec<SemanticError>,
+) {
+    if iface.parent_types.is_empty() {
+        return;
+    }
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    for (i, ty) in iface.parent_types.iter().enumerate() {
+        let mut map = HashMap::new();
+        let canon = canon_type(ty, &iface.type_params, &mut map);
+        if seen.contains_key(&canon) {
+            let name = iface
+                .parents
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| "<未知>".to_string());
+            errors.push(SemanticError {
+                message: format!(
+                    "接口 '{}' 不能以相同泛型实参重复直接继承父接口 '{}'（6.2.3(4)/(5)）",
+                    iface.name, name
+                ),
+            });
+            return;
+        }
+        seen.insert(canon, ());
+    }
 }
 
 /// 接口继承中 static 与实例成员函数同名冲突（6.3.2(1)）。
@@ -6874,6 +6952,18 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
                     errors.push(SemanticError {
                         message: format!(
                             "类 '{}' 的 '{}' 覆写了父类型中不可覆写（非 open/abstract）的函数（6.1.2.4(32)）",
+                            cls.name, sig.display
+                        ),
+                    });
+                }
+            } else {
+                // 6.1.2.4(44) / 6.3.4.1(1)：`redef` 只能用于重定义父类型中的 static
+                // 函数（以及属性 / 接口默认实现的再定义，属性访问器脱糖为 __get_/__set_，
+                // 不计入）。实例成员函数重定义父类型函数必须使用 override。
+                if !method.is_static && !is_property_method_name(&sig.name) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的实例成员函数 '{}' 不能使用 redef（redef 只能重定义 static 函数，实例函数须用 override，6.1.2.4(44)）",
                             cls.name, sig.display
                         ),
                     });
@@ -14139,6 +14229,64 @@ main() {}"#,
         assert_valid("class C {\n operator func !() { }\n}\nmain() {}");
         assert_valid("class C {\n operator func -() { }\n operator func -(o: C) { }\n}\nmain() {}");
         assert_valid("class C {\n operator func [](i: Int64) { }\n}\nmain() {}");
+    }
+
+    // ─── w12a-class7：06 章第六轮 open/abstract 可见性、redef、重复父接口 ─────
+
+    #[test]
+    fn test_w12a_class7_open_abstract_private() {
+        // 6.1.1.1(9)：抽象类中 private 的无实现体实例函数（抽象函数）非法。
+        assert_invalid("abstract class A {\n private func f(): Unit\n}\nmain() {}");
+        assert_invalid("abstract class A {\n private func f(x: Int64): Unit\n}\nmain() {}");
+        // 6.1.2.4(36)：open 成员函数不能声明为 private。
+        assert_invalid("open class A {\n open private func f() {}\n}\nmain() {}");
+        assert_invalid("abstract class A {\n open private func f(x: Int64) {}\n}\nmain() {}");
+        // 正例：public / protected 的 open / 抽象函数合法。
+        assert_valid("open class A {\n protected open func f() {}\n}\nmain() {}");
+        assert_valid("open class A {\n public open func f() {}\n}\nmain() {}");
+        assert_valid("abstract class A {\n public func f(): Unit\n}\nmain() {}");
+        assert_valid("abstract class A {\n protected func g(): Unit\n}\nmain() {}");
+        // 正例：private 的普通（有实现体、非 open）实例函数合法。
+        assert_valid("class A {\n private func f() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w12a_class7_redef_instance() {
+        // 6.1.2.4(44) / 6.3.4.1(1)：redef 不能修饰实例成员函数（须用 override）。
+        assert_invalid(
+            "open class A {\n public open func f() {}\n}\n\
+             class B <: A {\n public redef func f() {}\n}\nmain() {}",
+        );
+        assert_invalid(
+            "interface I {\n func f() {}\n}\n\
+             class A <: I {\n public redef func f() {}\n}\nmain() {}",
+        );
+        // 正例：redef 修饰 static 函数（重定义父类型同名 static 函数）合法。
+        assert_valid(
+            "open class A {\n public static func f() {}\n}\n\
+             class B <: A {\n public redef static func f() {}\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w12a_class7_duplicate_super_interfaces() {
+        // 6.1.1.3(8)/(9)：同一接口不得以相同泛型实参被直接实现多次。
+        assert_invalid("interface I {}\nclass A <: I & I {}\nmain() {}");
+        assert_invalid("interface I<T> {}\nclass A<T> <: I<T> & I<T> {}\nmain() {}");
+        assert_invalid("interface I {}\nopen class P {}\nclass A <: P & I & I {}\nmain() {}");
+        // 正例：不同泛型实参直接实现多次合法。
+        assert_valid("interface I<T> {}\nclass A<T> <: I<T> & I<Int64> {}\nmain() {}");
+        assert_valid("interface I<T> {}\nclass A <: I<Bool> & I<Rune> & I<Int64> {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w12a_class7_duplicate_interface_parents() {
+        // 6.2.3(4)/(5)：接口不得以相同泛型实参重复直接继承父接口。
+        assert_invalid("interface I {}\ninterface J <: I & I {}\nmain() {}");
+        assert_invalid("interface I<T> {}\ninterface J <: I<Int64> & I<Int64> {}\nmain() {}");
+        // 正例：不同泛型实参重复继承合法。
+        assert_valid("interface I<T> {}\ninterface J <: I<Int64> & I<String> {}\nmain() {}");
+        assert_valid("interface I<T> {}\ninterface J<T> <: I<T> {}\nmain() {}");
     }
 
 }

@@ -616,6 +616,10 @@ pub struct InterfaceDef {
     pub constraints: Vec<TypeConstraint>,
     /// 父接口列表（接口继承）
     pub parents: Vec<String>,
+    /// 父接口的完整类型（保留泛型实参），与 `parents` 一一对应。
+    /// 用于 6.2.3(4)/(5)：同一泛型实参的父接口不得被直接继承多次。
+    /// 旧构造路径未填充时为空（相关检查保守跳过）。
+    pub parent_types: Vec<Type>,
     pub methods: Vec<InterfaceMethod>,
     /// 关联类型列表
     pub assoc_types: Vec<AssocTypeDef>,

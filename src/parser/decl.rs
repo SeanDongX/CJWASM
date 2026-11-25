@@ -1839,14 +1839,21 @@ impl Parser {
         // 语法顺序: interface Name<T> [<: Parents] [where T <: Bound] { ... }
         // 兼容 where 在 <: 之前出现的写法。
         let mut parents = Vec::new();
-        let parse_parents = |this: &mut Self, parents: &mut Vec<String>| -> Result<(), ParseErrorAt> {
+        let mut parent_types: Vec<Type> = Vec::new();
+        let parse_parents = |this: &mut Self,
+                             parents: &mut Vec<String>,
+                             parent_types: &mut Vec<Type>|
+         -> Result<(), ParseErrorAt> {
             if !(this.check(&Token::Colon) || this.check(&Token::SubType)) {
                 return Ok(());
             }
             this.advance();
             loop {
                 // 用 parse_type 消费父接口类型（支持泛型参数，如 I1<U>）
-                match this.parse_type()? {
+                let ty = this.parse_type()?;
+                // 保留完整父接口类型（含泛型实参），用于 6.2.3(4)/(5) 重复继承检查。
+                parent_types.push(ty.clone());
+                match ty {
                     Type::Struct(n, _) => parents.push(n),
                     Type::TypeParam(n) => parents.push(n),
                     Type::Qualified(path) => parents.push(path.join(".")),
@@ -1867,10 +1874,10 @@ impl Parser {
             }
             Ok(())
         };
-        parse_parents(self, &mut parents)?;
+        parse_parents(self, &mut parents, &mut parent_types)?;
         iface_own_constraints.extend(self.parse_where_clause()?);
         // 兼容 where 之后仍跟 <: 的写法
-        parse_parents(self, &mut parents)?;
+        parse_parents(self, &mut parents, &mut parent_types)?;
         iface_own_constraints.extend(self.parse_where_clause()?);
         self.expect(Token::LBrace)?;
         let mut methods = Vec::new();
@@ -2143,6 +2150,7 @@ impl Parser {
             type_params: iface_own_type_params,
             constraints: iface_own_constraints,
             parents,
+            parent_types,
             methods,
             assoc_types,
         })
