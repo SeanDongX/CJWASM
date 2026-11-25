@@ -470,6 +470,8 @@ pub struct ConstDef {
     pub init: Expr,
     /// 顶层绑定是否可变（`var` 为 true，`let`/`const` 为 false）。
     pub is_mut: bool,
+    /// 是否为顶层 `const`（其初始化式须为常量表达式，16.1(2)）。
+    pub is_const: bool,
 }
 
 /// 结构体定义
@@ -560,6 +562,8 @@ pub struct Function {
     pub body: Vec<Stmt>,
     /// 若为 Some，则为 extern 函数，从 (module, name) 导入；无 body
     pub extern_import: Option<ExternImport>,
+    /// 是否为 const 函数（`const func`）：可用于常量表达式/常量初始化（16.2(6)）。
+    pub is_const: bool,
 }
 
 /// 枚举变体（可选关联类型）
@@ -676,6 +680,8 @@ pub struct InitDef {
     pub body: Vec<Stmt>,
     /// 参数是否为成员变量参数（`var`/`let` 前缀），与 `params` 一一对应。
     pub member_param_flags: Vec<bool>,
+    /// 是否为 const 初始化器（`const init`）：可作为常量表达式/常量构造（16.2(7)）。
+    pub is_const: bool,
 }
 
 /// 类方法（含 override 标记）

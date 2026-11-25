@@ -595,6 +595,7 @@ fn substitute_stmt(stmt: Stmt, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .collect(),
         },
         LocalFunc(f) => LocalFunc(crate::ast::Function {
+            is_const: false,
             visibility: f.visibility.clone(),
             name: f.name.clone(),
             type_params: f.type_params.clone(),
@@ -1650,6 +1651,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     has_body: m.has_body,
                     is_const: m.is_const,
                     func: Function {
+                        is_const: false,
                         visibility: m.func.visibility.clone(),
                         name: method_name,
                         type_params: vec![],
@@ -1689,6 +1691,7 @@ pub fn monomorphize_program(program: &mut Program) {
             })
             .collect();
         let init = def.init.as_ref().map(|i| InitDef {
+            is_const: false,
             params: i
                 .params
                 .iter()
@@ -1803,6 +1806,7 @@ pub fn monomorphize_program(program: &mut Program) {
             .collect();
 
         new_functions.push(Function {
+            is_const: false,
             visibility: def.visibility.clone(),
             name: mangled_name,
             type_params: vec![],
@@ -1939,6 +1943,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             functions: vec![Function {
+                is_const: false,
                 visibility: crate::ast::Visibility::default(),
                 name: "main".to_string(),
                 type_params: vec![],
@@ -1968,6 +1973,7 @@ mod tests {
             enums: vec![],
             functions: vec![
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "pair".to_string(),
                     type_params: vec!["T".to_string(), "U".to_string()],
@@ -2002,6 +2008,7 @@ mod tests {
                     extern_import: None,
                 },
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "main".to_string(),
                     type_params: vec![],
@@ -2070,6 +2077,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             classes: vec![],
             enums: vec![],
             functions: vec![Function {
+                is_const: false,
                 visibility: Visibility::default(),
                 name: "main".to_string(),
                 type_params: vec![],
@@ -2136,6 +2144,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             classes: vec![],
             enums: vec![],
             functions: vec![Function {
+                is_const: false,
                 visibility: Visibility::default(),
                 name: "main".to_string(),
                 type_params: vec![],
@@ -2197,6 +2206,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             classes: vec![],
             enums: vec![],
             functions: vec![Function {
+                is_const: false,
                 visibility: Visibility::default(),
                 name: "main".to_string(),
                 type_params: vec![],
@@ -2233,6 +2243,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             enums: vec![],
             functions: vec![
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "id".to_string(),
                     type_params: vec!["T".to_string()],
@@ -2251,6 +2262,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                     extern_import: None,
                 },
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "main".to_string(),
                     type_params: vec![],
@@ -2316,6 +2328,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             classes: vec![],
             enums: vec![],
             functions: vec![Function {
+                is_const: false,
                 visibility: Visibility::default(),
                 name: "get".to_string(),
                 type_params: vec![],
@@ -2370,6 +2383,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                         is_mut: true,
                     }],
                     init: Some(InitDef {
+                        is_const: false,
                         params: vec![crate::ast::Param {
                             name: "d".to_string(),
                             ty: Type::TypeParam("T".to_string()),
@@ -2398,6 +2412,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                         has_body: true,
                         is_const: false,
                         func: Function {
+                            is_const: false,
                             visibility: Visibility::default(),
                             name: "Wrapper.get".to_string(),
                             type_params: vec![],
@@ -2423,6 +2438,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             ],
             enums: vec![],
             functions: vec![Function {
+                is_const: false,
                 visibility: Visibility::default(),
                 name: "main".to_string(),
                 type_params: vec![],
@@ -2497,6 +2513,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             classes: vec![],
             enums: vec![],
             functions: vec![Function {
+                is_const: false,
                 visibility: Visibility::default(),
                 name: "main".to_string(),
                 type_params: vec![],
@@ -2537,6 +2554,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             enums: vec![],
             functions: vec![
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "wrap".to_string(),
                     type_params: vec!["T".to_string()],
@@ -2555,6 +2573,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                     extern_import: None,
                 },
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "main".to_string(),
                     type_params: vec![],
@@ -2614,6 +2633,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                 },
             ],
             functions: vec![Function {
+                is_const: false,
                 visibility: Visibility::default(),
                 name: "unwrap".to_string(),
                 type_params: vec![],
@@ -2651,6 +2671,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             enums: vec![],
             functions: vec![
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "id".to_string(),
                     type_params: vec!["T".to_string()],
@@ -2669,6 +2690,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                     extern_import: None,
                 },
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "main".to_string(),
                     type_params: vec![],
@@ -2730,6 +2752,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
             classes: vec![],
             enums: vec![],
             functions: vec![Function {
+                is_const: false,
                 visibility: Visibility::default(),
                 name: "main".to_string(),
                 type_params: vec![],

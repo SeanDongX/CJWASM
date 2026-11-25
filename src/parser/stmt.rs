@@ -620,7 +620,8 @@ impl Parser {
                 }
                 // cjc: 局部 const func Name(...) { ... } — const 修饰的局部函数声明
                 if self.check(&Token::Func) {
-                    let f = self.parse_function_with_visibility(Visibility::default())?;
+                    let mut f = self.parse_function_with_visibility(Visibility::default())?;
+                    f.is_const = true;
                     return Ok(Stmt::LocalFunc(f));
                 }
                 let name = match self.advance_ident() {

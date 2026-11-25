@@ -425,6 +425,12 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 不允许实例化抽象类 / 接口；不能继承 struct/enum。
     check_instantiation_targets(program, &mut errors);
 
+    // 16.4/16.5：const init / const 成员函数的声明层限制
+    // （var 实例成员、非常量初始值、非 const init 类型上的 const 实例函数、open const 函数）。
+    check_const_declarations(program, &mut errors);
+    // 16.4：const 函数体只能包含声明、常量表达式与 return。
+    check_const_function_bodies(program, &mut errors);
+
     // 表达式/赋值类型检查：运算符操作数类型、可赋值性、不可变绑定等。
     expr_check::check_program(program, &mut errors);
 
@@ -432,6 +438,687 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+// ─── 16.4/16.5：const init 与 const 成员函数声明限制 ─────────────────────────
+
+/// const 声明层上下文：用于判定字段默认值是否为常量表达式。
+struct ConstDeclCtx {
+    /// const 函数全名（顶层裸名 / `Type.method`）。
+    const_funcs: HashSet<String>,
+    /// 全部已声明函数名，用于区分“已知的非 const 函数”与未知内建调用。
+    all_funcs: HashSet<String>,
+    /// 用户定义类型名（class/struct）。
+    user_types: HashSet<String>,
+    /// 拥有 const init 的类型名。
+    const_init_types: HashSet<String>,
+    /// 顶层 const 变量名（可作常量表达式引用）。
+    const_globals: HashSet<String>,
+    /// 顶层 let/var 变量名（不是常量表达式）。
+    nonconst_globals: HashSet<String>,
+}
+
+impl ConstDeclCtx {
+    fn is_const(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Integer(_)
+            | Expr::IntegerSuffixed(..)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Bool(_)
+            | Expr::Rune(_)
+            | Expr::String(_)
+            | Expr::None => true,
+            Expr::Interpolate(_) => false,
+            Expr::Var(name) => {
+                if name == "this" || name == "super" {
+                    return false;
+                }
+                if self.const_globals.contains(name) {
+                    true
+                } else if self.nonconst_globals.contains(name) {
+                    false
+                } else {
+                    true
+                }
+            }
+            Expr::Unary { expr, .. } => self.is_const(expr),
+            Expr::Binary { left, right, .. } => self.is_const(left) && self.is_const(right),
+            Expr::Call { name, args, named_args, .. } => {
+                let callee = if self.const_funcs.contains(name) {
+                    true
+                } else if self.all_funcs.contains(name) {
+                    false
+                } else {
+                    true
+                };
+                callee
+                    && args.iter().all(|a| self.is_const(a))
+                    && named_args.iter().all(|(_, a)| self.is_const(a))
+            }
+            Expr::ConstructorCall { name, args, named_args, .. } => {
+                let ctor = self.const_init_types.contains(name) || !self.user_types.contains(name);
+                ctor
+                    && args.iter().all(|a| self.is_const(a))
+                    && named_args.iter().all(|(_, a)| self.is_const(a))
+            }
+            Expr::Tuple(es) | Expr::Array(es) => es.iter().all(|e| self.is_const(e)),
+            Expr::TupleIndex { object, .. } => self.is_const(object),
+            Expr::Index { array, index } => self.is_const(array) && self.is_const(index),
+            Expr::Field { object, .. } => self.is_const(object),
+            Expr::Cast { expr, .. } => self.is_const(expr),
+            Expr::Some(v) | Expr::Ok(v) | Expr::Err(v) | Expr::Try(v) => self.is_const(v),
+            Expr::VariantConst { arg, .. } => arg.as_ref().map_or(true, |a| self.is_const(a)),
+            Expr::Throw(_) | Expr::Return(_) | Expr::Break | Expr::Continue => false,
+            // 其余形态保守放行（无法确定是非常量）。
+            _ => true,
+        }
+    }
+}
+
+/// 16.4/16.5：const init 与 const 成员函数的声明层约束。
+fn check_const_declarations(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut const_funcs: HashSet<String> = HashSet::new();
+    let mut all_funcs: HashSet<String> = HashSet::new();
+    let mut const_init_types: HashSet<String> = HashSet::new();
+    let mut user_types: HashSet<String> = HashSet::new();
+
+    for f in &program.functions {
+        all_funcs.insert(f.name.clone());
+        if f.is_const {
+            const_funcs.insert(f.name.clone());
+        }
+    }
+    for c in &program.classes {
+        user_types.insert(c.name.clone());
+        for m in &c.methods {
+            let bare = m
+                .func
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&m.func.name)
+                .to_string();
+            all_funcs.insert(format!("{}.{}", c.name, bare));
+            if m.is_const {
+                const_funcs.insert(format!("{}.{}", c.name, bare));
+            }
+        }
+        if c.inits.iter().chain(c.init.iter()).any(|i| i.is_const) {
+            const_init_types.insert(c.name.clone());
+        }
+    }
+    for s in &program.structs {
+        user_types.insert(s.name.clone());
+        if s.inits.iter().any(|i| i.is_const) {
+            const_init_types.insert(s.name.clone());
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            all_funcs.insert(f.name.clone());
+            if f.is_const {
+                const_funcs.insert(f.name.clone());
+            }
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            all_funcs.insert(format!("{}.{}", iface.name, m.name));
+            if m.is_const {
+                const_funcs.insert(format!("{}.{}", iface.name, m.name));
+            }
+        }
+    }
+    let mut const_globals: HashSet<String> = HashSet::new();
+    let mut nonconst_globals: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        if c.is_const {
+            const_globals.insert(c.name.clone());
+        } else {
+            nonconst_globals.insert(c.name.clone());
+        }
+    }
+    let ctx = ConstDeclCtx {
+        const_funcs,
+        all_funcs,
+        user_types,
+        const_init_types,
+        const_globals,
+        nonconst_globals,
+    };
+
+    for cls in &program.classes {
+        let has_const_init = cls.inits.iter().chain(cls.init.iter()).any(|i| i.is_const);
+        if has_const_init {
+            if cls.fields.iter().any(|f| !f.is_static && f.is_mut) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "含有 var 实例成员变量的类 '{}' 不能定义 const init（16.5）",
+                        cls.name
+                    ),
+                });
+            }
+            for f in &cls.fields {
+                if f.is_static {
+                    continue;
+                }
+                if let Some(def) = &f.default {
+                    if !ctx.is_const(def) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "const init 类型的实例成员 '{}' 的初始值必须是常量表达式（16.5）",
+                                f.name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        for m in &cls.methods {
+            if m.is_const && !m.is_static && !has_const_init {
+                errors.push(SemanticError {
+                    message: format!(
+                        "const 实例成员函数 '{}' 要求类型 '{}' 定义 const init（16.4）",
+                        m.func.name, cls.name
+                    ),
+                });
+            }
+            if m.is_const && m.is_open {
+                errors.push(SemanticError {
+                    message: format!(
+                        "const 成员函数 '{}' 不能声明为 open（16.4）",
+                        m.func.name
+                    ),
+                });
+            }
+        }
+    }
+    for st in &program.structs {
+        let has_const_init = st.inits.iter().any(|i| i.is_const);
+        if !has_const_init {
+            continue;
+        }
+        for f in &st.fields {
+            if f.is_static {
+                continue;
+            }
+            if let Some(def) = &f.default {
+                if !ctx.is_const(def) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "const init 类型的实例成员 '{}' 的初始值必须是常量表达式（16.5）",
+                            f.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    // struct 的 const 实例成员函数（脱糖为 `StructName.method` 顶层函数）要求 const init。
+    for f in &program.functions {
+        if !f.is_const {
+            continue;
+        }
+        if let Some((ty, _)) = f.name.rsplit_once('.') {
+            if let Some(st) = program.structs.iter().find(|s| s.name == ty) {
+                if !st.inits.iter().any(|i| i.is_const) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "const 实例成员函数 '{}' 要求类型 '{}' 定义 const init（16.4）",
+                            f.name, ty
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+// ─── 16.4：const 函数体限制（只允许声明、常量表达式与 return） ───────────────
+
+/// 内置数值/基础类型名（用于识别 `Float64(x)` 这类类型转换调用）。
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "IntNative"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "UIntNative"
+            | "Float16"
+            | "Float32"
+            | "Float64"
+            | "Rune"
+            | "String"
+            | "Bool"
+            | "Array"
+            | "VArray"
+    )
+}
+
+/// const 函数体内表达式是否允许（形参/局部变量可自由引用；外部非常量全局、
+/// 非常量函数调用、Range、类型转换等不允许）。
+fn const_fn_expr_ok(e: &Expr, locals: &HashSet<String>, ctx: &ConstDeclCtx) -> bool {
+    match e {
+        Expr::Var(name) => {
+            if locals.contains(name) || name == "this" || name == "super" {
+                return true;
+            }
+            if ctx.const_globals.contains(name) {
+                true
+            } else if ctx.nonconst_globals.contains(name) {
+                false
+            } else {
+                true
+            }
+        }
+        Expr::Call {
+            name,
+            args,
+            named_args,
+            ..
+        } => {
+            let callee = if ctx.const_funcs.contains(name) || locals.contains(name) {
+                true
+            } else if ctx.all_funcs.contains(name) {
+                false
+            } else if is_builtin_type_name(name) {
+                // 16.4：const 函数内不允许类型转换表达式。
+                false
+            } else {
+                true
+            };
+            callee
+                && args.iter().all(|a| const_fn_expr_ok(a, locals, ctx))
+                && named_args.iter().all(|(_, a)| const_fn_expr_ok(a, locals, ctx))
+        }
+        Expr::ConstructorCall {
+            name,
+            args,
+            named_args,
+            ..
+        } => {
+            let ctor = ctx.const_init_types.contains(name) || !ctx.user_types.contains(name);
+            ctor
+                && args.iter().all(|a| const_fn_expr_ok(a, locals, ctx))
+                && named_args.iter().all(|(_, a)| const_fn_expr_ok(a, locals, ctx))
+        }
+        Expr::Range { .. } => false,
+        Expr::Unary { expr, .. }
+        | Expr::TupleIndex { object: expr, .. }
+        | Expr::Field { object: expr, .. }
+        | Expr::OptionalChain { object: expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::IsType { expr, .. }
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr) => const_fn_expr_ok(expr, locals, ctx),
+        Expr::Return(v) => v
+            .as_ref()
+            .map_or(true, |v| const_fn_expr_ok(v, locals, ctx)),
+        Expr::Binary { left, right, .. } => {
+            const_fn_expr_ok(left, locals, ctx) && const_fn_expr_ok(right, locals, ctx)
+        }
+        Expr::Tuple(es) | Expr::Array(es) => {
+            es.iter().all(|e| const_fn_expr_ok(e, locals, ctx))
+        }
+        Expr::Index { array, index } => {
+            const_fn_expr_ok(array, locals, ctx) && const_fn_expr_ok(index, locals, ctx)
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            const_fn_expr_ok(object, locals, ctx)
+                && args.iter().all(|a| const_fn_expr_ok(a, locals, ctx))
+                && named_args.iter().all(|(_, a)| const_fn_expr_ok(a, locals, ctx))
+        }
+        Expr::VariantConst { arg, .. } => arg
+            .as_ref()
+            .map_or(true, |a| const_fn_expr_ok(a, locals, ctx)),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            const_fn_expr_ok(cond, locals, ctx)
+                && const_fn_expr_ok(then_branch, locals, ctx)
+                && else_branch
+                    .as_ref()
+                    .map_or(true, |b| const_fn_expr_ok(b, locals, ctx))
+        }
+        Expr::Block(stmts, tail) => {
+            let mut inner = locals.clone();
+            const_fn_body_ok(stmts, &mut inner, ctx)
+                && tail
+                    .as_ref()
+                    .map_or(true, |t| const_fn_expr_ok(t, &inner, ctx))
+        }
+        Expr::Match { expr, arms } => {
+            const_fn_expr_ok(expr, locals, ctx)
+                && arms.iter().all(|arm| {
+                    arm.guard
+                        .as_ref()
+                        .map_or(true, |g| const_fn_expr_ok(g, locals, ctx))
+                        && const_fn_expr_ok(&arm.body, locals, ctx)
+                })
+        }
+        Expr::StructInit { fields, .. } => fields
+            .iter()
+            .all(|(_, e)| const_fn_expr_ok(e, locals, ctx)),
+        // 其余形态（字面量、lambda、宏等）保守放行。
+        _ => true,
+    }
+}
+
+/// const 函数体语句块是否合法：禁止 var 声明、循环语句、赋值、Range 与非 const 表达式。
+fn const_fn_body_ok(stmts: &[Stmt], locals: &mut HashSet<String>, ctx: &ConstDeclCtx) -> bool {
+    let mut ok = true;
+    for s in stmts {
+        match s {
+            Stmt::Var { .. } => ok = false,
+            Stmt::Assign { .. } => ok = false,
+            Stmt::For { .. }
+            | Stmt::While { .. }
+            | Stmt::DoWhile { .. }
+            | Stmt::Loop { .. }
+            | Stmt::WhileLet { .. } => ok = false,
+            Stmt::Let { pattern, value, .. } => {
+                if !const_fn_expr_ok(value, locals, ctx) {
+                    ok = false;
+                }
+                collect_pattern_names_local(pattern, locals);
+            }
+            Stmt::Const { name, value, .. } => {
+                if !const_fn_expr_ok(value, locals, ctx) {
+                    ok = false;
+                }
+                locals.insert(name.clone());
+            }
+            Stmt::LocalFunc(f) => {
+                locals.insert(f.name.clone());
+            }
+            Stmt::Expr(e) => {
+                if !const_fn_expr_ok(e, locals, ctx) {
+                    ok = false;
+                }
+            }
+            Stmt::Return(Some(e)) => {
+                if !const_fn_expr_ok(e, locals, ctx) {
+                    ok = false;
+                }
+            }
+            Stmt::UnsafeBlock { body } => {
+                if !const_fn_body_ok(body, locals, ctx) {
+                    ok = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    ok
+}
+
+/// const init 体语句块是否合法：与 const 函数体类似，但允许对实例成员的赋值，
+/// 且禁止对 static 成员的赋值（16.5）。
+fn const_init_body_ok(
+    stmts: &[Stmt],
+    locals: &mut HashSet<String>,
+    static_fields: &HashSet<String>,
+    ctx: &ConstDeclCtx,
+) -> bool {
+    let mut ok = true;
+    for s in stmts {
+        match s {
+            Stmt::Var { .. } => ok = false,
+            Stmt::For { .. }
+            | Stmt::While { .. }
+            | Stmt::DoWhile { .. }
+            | Stmt::Loop { .. }
+            | Stmt::WhileLet { .. } => ok = false,
+            Stmt::Assign { target, value } => {
+                if !const_fn_expr_ok(value, locals, ctx) {
+                    ok = false;
+                }
+                let hits_static = match target {
+                    crate::ast::AssignTarget::Var(n) => static_fields.contains(n),
+                    crate::ast::AssignTarget::Field { object, field } => {
+                        object != "this" && static_fields.contains(field)
+                    }
+                    _ => false,
+                };
+                if hits_static {
+                    ok = false;
+                }
+            }
+            Stmt::Let { pattern, value, .. } => {
+                if !const_fn_expr_ok(value, locals, ctx) {
+                    ok = false;
+                }
+                collect_pattern_names_local(pattern, locals);
+            }
+            Stmt::Const { name, value, .. } => {
+                if !const_fn_expr_ok(value, locals, ctx) {
+                    ok = false;
+                }
+                locals.insert(name.clone());
+            }
+            Stmt::LocalFunc(f) => {
+                locals.insert(f.name.clone());
+            }
+            Stmt::Expr(e) => {
+                if !const_fn_expr_ok(e, locals, ctx) {
+                    ok = false;
+                }
+            }
+            Stmt::Return(Some(e)) => {
+                if !const_fn_expr_ok(e, locals, ctx) {
+                    ok = false;
+                }
+            }
+            Stmt::UnsafeBlock { body } => {
+                if !const_init_body_ok(body, locals, static_fields, ctx) {
+                    ok = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    ok
+}
+
+/// 收集模式绑定的名字到局部变量集合。
+fn collect_pattern_names_local(p: &crate::ast::Pattern, out: &mut HashSet<String>) {
+    use crate::ast::Pattern;
+    match p {
+        Pattern::Binding(n) => {
+            out.insert(n.clone());
+        }
+        Pattern::Tuple(ps) | Pattern::Or(ps) => {
+            for p in ps {
+                collect_pattern_names_local(p, out);
+            }
+        }
+        Pattern::Struct { fields, .. } => {
+            for (_, p) in fields {
+                collect_pattern_names_local(p, out);
+            }
+        }
+        Pattern::Variant { payload: Some(p), .. } => collect_pattern_names_local(p, out),
+        _ => {}
+    }
+}
+
+/// 16.4：校验全部 const 函数体。
+fn check_const_function_bodies(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut const_funcs: HashSet<String> = HashSet::new();
+    let mut all_funcs: HashSet<String> = HashSet::new();
+    let mut const_init_types: HashSet<String> = HashSet::new();
+    let mut user_types: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        all_funcs.insert(f.name.clone());
+        if f.is_const {
+            const_funcs.insert(f.name.clone());
+        }
+    }
+    for c in &program.classes {
+        user_types.insert(c.name.clone());
+        for m in &c.methods {
+            let bare = m
+                .func
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&m.func.name)
+                .to_string();
+            all_funcs.insert(format!("{}.{}", c.name, bare));
+            if m.is_const {
+                const_funcs.insert(format!("{}.{}", c.name, bare));
+            }
+        }
+        if c.inits.iter().chain(c.init.iter()).any(|i| i.is_const) {
+            const_init_types.insert(c.name.clone());
+        }
+    }
+    for s in &program.structs {
+        user_types.insert(s.name.clone());
+        if s.inits.iter().any(|i| i.is_const) {
+            const_init_types.insert(s.name.clone());
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            all_funcs.insert(f.name.clone());
+            if f.is_const {
+                const_funcs.insert(f.name.clone());
+            }
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            all_funcs.insert(format!("{}.{}", iface.name, m.name));
+            if m.is_const {
+                const_funcs.insert(format!("{}.{}", iface.name, m.name));
+            }
+        }
+    }
+    let mut const_globals: HashSet<String> = HashSet::new();
+    let mut nonconst_globals: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        if c.is_const {
+            const_globals.insert(c.name.clone());
+        } else {
+            nonconst_globals.insert(c.name.clone());
+        }
+    }
+    let ctx = ConstDeclCtx {
+        const_funcs,
+        all_funcs,
+        user_types,
+        const_init_types,
+        const_globals,
+        nonconst_globals,
+    };
+
+    // 16.5：const init 体限制（不允许 var、循环、非 const 表达式与 static 成员赋值）。
+    for c in &program.classes {
+        let static_fields: HashSet<String> = c
+            .fields
+            .iter()
+            .filter(|f| f.is_static)
+            .map(|f| f.name.clone())
+            .collect();
+        for init in &c.inits {
+            if !init.is_const {
+                continue;
+            }
+            let mut locals: HashSet<String> = init.params.iter().map(|p| p.name.clone()).collect();
+            if !const_init_body_ok(&init.body, &mut locals, &static_fields, &ctx) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的 const init 体只能包含声明、常量表达式与实例成员赋值（16.5）",
+                        c.name
+                    ),
+                });
+            }
+        }
+    }
+    for st in &program.structs {
+        let static_fields: HashSet<String> = st
+            .fields
+            .iter()
+            .filter(|f| f.is_static)
+            .map(|f| f.name.clone())
+            .collect();
+        for init in &st.inits {
+            if !init.is_const {
+                continue;
+            }
+            let mut locals: HashSet<String> = init.params.iter().map(|p| p.name.clone()).collect();
+            if !const_init_body_ok(&init.body, &mut locals, &static_fields, &ctx) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的 const init 体只能包含声明、常量表达式与实例成员赋值（16.5）",
+                        st.name
+                    ),
+                });
+            }
+        }
+    }
+
+    let mut check = |name: &str, params: &[crate::ast::Param], body: &[Stmt]| {
+        let mut locals: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+        if !const_fn_body_ok(body, &mut locals, &ctx) {
+            errors.push(SemanticError {
+                message: format!(
+                    "const 函数 '{}' 的函数体只能包含声明、常量表达式与 return（16.4）",
+                    name
+                ),
+            });
+        }
+    };
+    for f in &program.functions {
+        if f.is_const {
+            check(&f.name, &f.params, &f.body);
+        }
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            if m.is_const && !m.func.body.is_empty() {
+                check(&m.func.name, &m.func.params, &m.func.body);
+            }
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            if f.is_const {
+                check(&f.name, &f.params, &f.body);
+            }
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if m.is_const {
+                if let Some(body) = &m.default_body {
+                    check(&m.name, &m.params, body);
+                }
+            }
+        }
     }
 }
 
@@ -8342,6 +9029,7 @@ mod tests {
             enums: vec![],
             functions: vec![
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "annotated".to_string(),
                     type_params: vec![],
@@ -8353,6 +9041,7 @@ mod tests {
                     extern_import: None,
                 },
                 Function {
+                    is_const: false,
                     visibility: Visibility::default(),
                     name: "inferred".to_string(),
                     type_params: vec![],
@@ -8387,6 +9076,7 @@ mod tests {
             classes: vec![],
             enums: vec![],
             functions: vec![Function {
+                is_const: false,
                 visibility: Visibility::default(),
                 name: "with_return".to_string(),
                 type_params: vec![],
@@ -8442,6 +9132,7 @@ mod tests {
                     has_body: true,
                     is_const: false,
                     func: Function {
+                        is_const: false,
                         visibility: Visibility::default(),
                         name: "Foo.getVal".to_string(),
                         type_params: vec![],
@@ -9888,6 +10579,47 @@ main() {}"#,
         assert_invalid("class C {}\nextend C <: CType {}\nmain() {}");
         // 泛型约束 `where T <: CType` 合法，不应被误判。
         assert_valid("class D<T> where T <: CType {}\nmain() {}");
+    }
+
+    // ─── w9d 16 章：const 函数体 / const 声明限制 ─────────────────────────
+
+    #[test]
+    fn test_w9d_const_function_body_restrictions() {
+        // const 函数不能声明 var（16.4(2)）。
+        assert_invalid("const func f() {\n var x = 0\n}\nmain() {}");
+        // const 函数不能包含 for 循环。
+        assert_invalid("const func f() {\n for (_ in 0..3) {}\n}\nmain() {}");
+        // const 函数不能调用非 const 函数。
+        assert_invalid("func g() {}\nconst func f() {\n g()\n}\nmain() {}");
+        // const 函数不能包含 Range 表达式。
+        assert_invalid("const func f() {\n 1..2\n return 0\n}\nmain() {}");
+        // let 声明 + return 常量表达式合法。
+        assert_valid("const func f(x: Int64) {\n let y = 1\n return x + y\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w9d_const_declaration_rules() {
+        // 含 var 实例成员变量的类不能定义 const init（16.5）。
+        assert_invalid("class C {\n var v = 0\n const init() {}\n}\nmain() {}");
+        // const 实例成员函数要求类型定义 const init（16.4）。
+        assert_invalid("class C {\n const func f() {}\n}\nmain() {}");
+        assert_valid("class C {\n const init() {}\n const func f() {}\n}\nmain() {}");
+        // const 成员函数不能是 open（16.4）。
+        assert_invalid("class C {\n open const func f() {}\n const init() {}\n}\nmain() {}");
+        // const init 类型中非 const 初始值的 let 成员非法（16.5）。
+        assert_invalid(
+            "func g() { 1 }\nstruct S {\n let v = g()\n const init() {}\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w9d_const_init_body_restrictions() {
+        // const init 不能调用非 const 函数（16.5）。
+        assert_invalid("func g() {}\nstruct S {\n const init() { g() }\n}\nmain() {}");
+        // const init 不能声明 var。
+        assert_invalid("struct S {\n const init() {\n var x = 0\n }\n}\nmain() {}");
+        // 合法的 const init：对实例字段赋值。
+        assert_valid("class C {\n let v: Int64\n const init() {\n v = 1\n }\n}\nmain() {}");
     }
 
 }
