@@ -1429,6 +1429,13 @@ impl Parser {
 
             // cjc 兼容: struct 内部方法 → 转为外部方法 func StructName.method(self, ...)
             if self.check(&Token::Func) {
+                // 5.8.1(2)：mut 只能修饰实例成员函数，不能作用于 static 成员函数。
+                if mods.is_mut && mods.is_static {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Mut,
+                        "struct 静态成员函数不能声明为 mut（5.8.1(2)）".to_string(),
+                    ));
+                }
                 // 预设 receiver_name 使方法体内 this 可用
                 let prev_receiver = self.receiver_name.clone();
                 self.receiver_name = Some("this".to_string());
@@ -1960,6 +1967,13 @@ impl Parser {
             }
             // cjc 兼容: enum 内部方法 → 转为外部方法 func EnumName.method(this, ...)
             if self.check(&Token::Func) {
+                // 5.8.1(1)：enum 成员函数不能声明为 mut。
+                if mods.is_mut {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Mut,
+                        "enum 成员函数不能声明为 mut（5.8.1(1)）".to_string(),
+                    ));
+                }
                 let prev_receiver = self.receiver_name.clone();
                 self.receiver_name = Some("this".to_string());
                 if mods.is_operator {
@@ -2382,6 +2396,13 @@ impl Parser {
                 None
             };
             self.current_type_params = prev_type_params;
+            // 5.8.1(1)：mut 只能修饰实例成员函数；接口 static 成员函数不能为 mut。
+            if mods.is_mut && mods.is_static {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Mut,
+                    "接口静态成员函数不能声明为 mut（5.8.1(1)）".to_string(),
+                ));
+            }
             methods.push(crate::ast::InterfaceMethod {
                 name: m_name,
                 params,
@@ -3148,6 +3169,24 @@ impl Parser {
                 // 无体属性声明（如 abstract class 中的 `public mut prop x: T`）：
                 // 不生成具体实现，但登记抽象 getter/setter 方法，供子类 override 检查匹配。
                 if !self.check(&Token::LBrace) {
+                    // 7.1(1)：抽象类中的无体属性只能为 public/protected，且不能是
+                    // static/open（这些修饰符仅用于有实现体的属性）。
+                    if is_abstract {
+                        if !matches!(member_vis, Visibility::Public | Visibility::Protected) {
+                            return self.bail(ParseError::UnexpectedToken(
+                                Token::Prop,
+                                "抽象类中的无体属性必须声明为 public 或 protected（7.1(1)）"
+                                    .to_string(),
+                            ));
+                        }
+                        if mods.is_static || mods.is_open {
+                            return self.bail(ParseError::UnexpectedToken(
+                                Token::Prop,
+                                "抽象类中的无体属性不能声明为 static 或 open（7.1(1)）"
+                                    .to_string(),
+                            ));
+                        }
+                    }
                     let this_param = Param {
                         name: "this".to_string(),
                         ty: Type::Struct(name.clone(), vec![]),
@@ -3219,6 +3258,8 @@ impl Parser {
                 }
                 self.expect(Token::LBrace)?;
                 // 解析 get/set 块
+                let mut saw_get = false;
+                let mut saw_set = false;
                 while !self.check(&Token::RBrace) {
                     if let Some(Token::Ident(ref kw)) = self.peek() {
                         let kw = kw.clone();
@@ -3231,6 +3272,7 @@ impl Parser {
                             let body = self.parse_stmts()?;
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
+                            saw_get = true;
                             // 脱糖为 getter 方法: ClassName.__get_propName(this): Type
                             methods.push(crate::ast::ClassMethod {
                                 override_: mods.is_override,
@@ -3280,6 +3322,7 @@ impl Parser {
                             let body = self.parse_stmts()?;
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
+                            saw_set = true;
                             // 脱糖为 setter 方法: ClassName.__set_propName(this, value)
                             methods.push(crate::ast::ClassMethod {
                                 override_: mods.is_override,
@@ -3330,6 +3373,30 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RBrace)?;
+                // 7.1(2)/(3)/(6)：mut 属性须同时定义 getter 与 setter；非 mut 属性须有
+                // getter，且不能定义 setter。7.4(11)：override/redef 的 mut 属性允许
+                // 仅重实现 getter 或 setter 之一，故跳过“两者兼具”的要求。
+                if mods.is_mut && !mods.is_override {
+                    if !saw_get || !saw_set {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Prop,
+                            "mut 属性必须同时定义 getter 和 setter（7.1(3)）".to_string(),
+                        ));
+                    }
+                } else if !mods.is_mut {
+                    if saw_set {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Prop,
+                            "非 mut 属性不能定义 setter（7.1(6)）".to_string(),
+                        ));
+                    }
+                    if !saw_get {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Prop,
+                            "属性必须定义 getter 实现（7.1(2)）".to_string(),
+                        ));
+                    }
+                }
             } else if {
                 // 仓颉允许用类名代替 init 作为构造函数: ClassName(let param: Type) {}
                 let is_named_ctor = if let Some(Token::Ident(ref n)) = self.peek() {
@@ -3482,6 +3549,14 @@ impl Parser {
                 let is_static = mods.is_static;
                 let override_ = mods.is_override;
                 let is_operator = mods.is_operator;
+                // 5.8.1(1)：mut 成员函数只允许定义在 interface / struct（及 struct 扩展）中，
+                // 类（以及 enum）成员函数不能声明为 mut。
+                if mods.is_mut {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Mut,
+                        "类成员函数不能声明为 mut（5.8.1(1)）".to_string(),
+                    ));
+                }
                 self.expect(Token::Func)?;
                 let (m_name, type_params) = if is_operator {
                     // 运算符方法名：解析运算符 token，转为 __op_xxx

@@ -976,7 +976,7 @@ mod tests {
                 var y: String;
                 init(x: Int64) { this.x = x }
                 ~init { }
-                prop value: Int64 {
+                mut prop value: Int64 {
                     get() { return this.x }
                     set(v) { this.x = v }
                 }
@@ -2004,9 +2004,9 @@ mod tests {
     #[test]
     fn test_p_class_override_prop() {
         let source = r#"
-            class Bar { prop x: Int64 { get() { 0 } set(_) { } } }
+            class Bar { mut prop x: Int64 { get() { 0 } set(_) { } } }
             class Foo <: Bar {
-                override prop x: Int64 { get() { 1 } set(_) { } }
+                override mut prop x: Int64 { get() { 1 } set(_) { } }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3318,7 +3318,7 @@ mod tests {
     fn test_pf_class_mut_prop() {
         let source = r#"
             class X {
-                public mut prop value: Int64 {
+                public mut mut prop value: Int64 {
                     get() { return 0 }
                     set(v) { }
                 }
@@ -3704,7 +3704,7 @@ mod tests {
                 public static var b: Int32 = 0
                 static protected var c: Int32 = 1
                 static private var d: Int32 = 2
-                public mut func f() {}
+                public unsafe func f() {}
                 protected override func g() {}
                 override func h() {}
             }
@@ -4459,4 +4459,92 @@ mod tests {
         // 正例：`Unit` 类型名合法。
         assert!(try_parse_ok("class A {\n  A(public let a: Unit) {}\n}\nmain() {}"));
     }
+
+    // ─── w14d：07 属性语法 / 修饰符规则（7.1） ─────────────────────────────
+
+    fn parse_or_err(src: &str) -> bool {
+        let lexer = Lexer::new(src);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        Parser::new(tokens).parse_program().is_err()
+    }
+
+    #[test]
+    fn test_w14_nonmut_prop_setter_rejected() {
+        // 7.1(6)：非 mut 属性不能定义 setter；7.1(2)：属性必须有 getter。
+        assert!(parse_or_err(
+            "class A {\n prop p: Int64 { get() { 0 } set(v) { } }\n}\nmain() {}"
+        ));
+        assert!(parse_or_err(
+            "class A {\n prop p: Int64 { set(v) { } }\n}\nmain() {}"
+        ));
+        // getter-only 非 mut 属性合法。
+        assert!(!parse_or_err(
+            "class A {\n prop p: Int64 { get() { 0 } }\n}\nmain() {}"
+        ));
+    }
+
+    #[test]
+    fn test_w14_mut_prop_requires_both_accessors() {
+        // 7.1(3)：mut 属性须同时定义 getter 与 setter。
+        assert!(parse_or_err(
+            "class A {\n mut prop p: Int64 { get() { 0 } }\n}\nmain() {}"
+        ));
+        assert!(parse_or_err(
+            "class A {\n mut prop p: Int64 { set(v) { } }\n}\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "class A {\n mut prop p: Int64 { get() { 0 } set(v) { } }\n}\nmain() {}"
+        ));
+        // 7.4(11)：override/redef 的 mut 属性允许仅重实现其中一个访问器。
+        assert!(!parse_or_err(
+            "open class A {\n mut prop p: Int64 { get() { 0 } set(v) { } }\n}\nclass B <: A {\n override mut prop p: Int64 { get() { 1 } }\n}\nmain() {}"
+        ));
+    }
+
+    #[test]
+    fn test_w14_abstract_class_prop_modifier_rules() {
+        // 7.1(1)：抽象类中的无体属性须为 public/protected，且不能 static/open。
+        assert!(parse_or_err("abstract class A {\n prop p: Int64\n}\nmain() {}"));
+        assert!(parse_or_err(
+            "abstract class A {\n open prop p: Int64\n}\nmain() {}"
+        ));
+        assert!(parse_or_err(
+            "abstract class A {\n static prop p: Int64\n}\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "abstract class A {\n public prop p: Int64\n}\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "abstract class A {\n protected mut prop p: Int64\n}\nmain() {}"
+        ));
+    }
+
+    // ─── w14d：05 mut 成员函数声明位置（5.8.1） ─────────────────────────────
+
+    #[test]
+    fn test_w14_mut_member_function_placement() {
+        // 类 / 枚举成员函数不能为 mut。
+        assert!(parse_or_err(
+            "class A {\n mut func f(): Unit {}\n}\nmain() {}"
+        ));
+        assert!(parse_or_err(
+            "enum E {\n A\n mut func f(): Unit {}\n}\nmain() {}"
+        ));
+        // 接口 static mut 非法。
+        assert!(parse_or_err(
+            "interface I {\n static mut func f(): Unit\n}\nmain() {}"
+        ));
+        // struct static mut 非法，实例 mut 合法。
+        assert!(parse_or_err(
+            "struct S {\n mut static func f(): Unit {}\n}\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "struct S {\n var x: Int64 = 0\n mut func f(): Unit {}\n}\nmain() {}"
+        ));
+        // 接口实例 mut 合法。
+        assert!(!parse_or_err(
+            "interface I {\n mut func f(): Unit\n}\nmain() {}"
+        ));
+    }
+
 }

@@ -4196,6 +4196,12 @@ impl<'a> Checker<'a> {
         }
         let is_float_lit = matches!(v, Expr::Float(_) | Expr::Float32(_));
         let is_int_lit = matches!(v, Expr::Integer(_) | Expr::IntegerSuffixed(_, _));
+        let is_str_lit = matches!(v, Expr::String(_));
+        let is_rune_lit = matches!(v, Expr::Rune(_));
+        let is_bool_lit = matches!(v, Expr::Bool(_));
+        // 顶层无类型注解的 let/var 以 Int64 占位（解析器约定），此时 `ann` 并非真实
+        // 标注类型，故下述非数值字面量检查一律跳过 Int64，避免误报。
+        let explicit_ann = !matches!(ann, Ty::Int64 | Ty::Unknown);
         if ann.is_float() && is_int_lit {
             self.err(format!(
                 "变量初始化类型不匹配: 浮点类型 {} 不能用整数字面量初始化（4.1(1)）",
@@ -4204,6 +4210,30 @@ impl<'a> Checker<'a> {
         } else if ann.is_int() && is_float_lit && !matches!(ann, Ty::Int64) {
             self.err(format!(
                 "变量初始化类型不匹配: 整数类型 {} 不能用浮点字面量初始化（4.1(1)）",
+                ann.name()
+            ));
+        } else if explicit_ann
+            && is_str_lit
+            && (ann.is_int() || ann.is_float() || matches!(ann, Ty::Bool | Ty::Rune))
+        {
+            self.err(format!(
+                "变量初始化类型不匹配: {} 不能用字符串字面量初始化（3.3.1(1)）",
+                ann.name()
+            ));
+        } else if explicit_ann
+            && is_rune_lit
+            && (ann.is_int() || ann.is_float() || matches!(ann, Ty::Bool | Ty::String))
+        {
+            self.err(format!(
+                "变量初始化类型不匹配: {} 不能用 Rune 字面量初始化（3.3.1(1)）",
+                ann.name()
+            ));
+        } else if explicit_ann
+            && is_bool_lit
+            && (ann.is_int() || ann.is_float() || matches!(ann, Ty::Rune | Ty::String))
+        {
+            self.err(format!(
+                "变量初始化类型不匹配: {} 不能用布尔字面量初始化（3.3.1(1)）",
                 ann.name()
             ));
         }
@@ -9970,6 +10000,7 @@ mod tests {
         assert_ok("@C\nstruct S { var x: Int32 = 0 }\nmain() { var v: CType = S() }");
     }
 
+
     // ---- batch-14 w14c-mid-f：04/02 章中章推进 ----
 
     #[test]
@@ -9985,6 +10016,7 @@ mod tests {
         );
         assert_ok("main() { var a: Int64 = 1\n var b: Int64 = 2\n let c = a << b }");
     }
+
 
     #[test]
     fn test_w14c_logical_operand_must_be_bool() {
@@ -10002,6 +10034,7 @@ mod tests {
         assert_ok("main() { let a = true && false\n let b = true || false }");
     }
 
+
     #[test]
     fn test_w14c_numeric_type_aliases() {
         // 2.1.1(19)：Byte≡UInt8、Int≡Int64、UInt≡UInt64。
@@ -10014,6 +10047,7 @@ mod tests {
         );
         assert_ok("main() { let b: Byte = 200\n let i: Int = 5\n let u: UInt = 5 }");
     }
+
 
     #[test]
     fn test_w14c_enum_member_name_collision() {
@@ -10031,6 +10065,7 @@ mod tests {
         assert_ok("enum E { A\n A(Int8) }\nmain() {}");
     }
 
+
     #[test]
     fn test_w14c_tuple_pattern_requires_tuple_selector() {
         // 4.4.1.4(1)：元组模式只能匹配元组类型选择子。
@@ -10047,6 +10082,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn test_w14c_incr_decr_requires_mutable_lvalue() {
         // 4.14(7)：`++`/`--` 只能作用于可变左值。
@@ -10060,6 +10096,21 @@ mod tests {
         );
         assert_ok("class C { var x: Int64 = 0 }\nmain() { var c = C()\n c.x++\n return }");
         assert_ok("main() { var arr = [1, 2, 3]\n arr[0]++\n return }");
+    }
+
+
+    // ─── w14d：顶层常量字面量类别与显式类型注解一致性（3.3.1(1)） ─────────
+
+    #[test]
+    fn test_w14d_toplevel_literal_annotation_mismatch() {
+        assert_err("let x: Int32 = 'A'\nmain() {}", "不能用 Rune 字面量初始化");
+        assert_err("var x: Int32 = \"12\"\nmain() {}", "不能用字符串字面量初始化");
+        assert_err("let s: String = true\nmain() {}", "不能用布尔字面量初始化");
+        // 一致与无注解（Int64 占位）的情形不得误报。
+        assert_ok("let c: Rune = 'A'\nmain() {}");
+        assert_ok("let s: String = \"ok\"\nmain() {}");
+        assert_ok("var any = \"hi\"\nmain() {}");
+        assert_ok("var flag = true\nmain() {}");
     }
 
 }

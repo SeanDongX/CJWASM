@@ -496,6 +496,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 下标运算符重载；函数/元组类型亦不允许被 extend。
     check_index_operator_extensions(program, &mut errors);
 
+    // 8.4(9)：同一类型的多个扩展之间不得定义同名同签名的成员。
+    check_extension_member_shadowing(program, &mut errors);
+
     // 不允许实例化抽象类 / 接口；不能继承 struct/enum。
     check_instantiation_targets(program, &mut errors);
 
@@ -10085,6 +10088,33 @@ fn check_index_operator_extensions(program: &Program, errors: &mut Vec<SemanticE
     }
 }
 
+/// 8.4(9)：同一类型的多个扩展之间不得定义同名同参数类型的成员。
+///
+/// 说明：这里只比较“方法名 + 形参类型列表”（扩展方法自带 `this` 形参，其类型为被
+/// 扩展类型），从而既能发现真正的覆盖，又允许跨扩展按参数类型重载。
+fn check_extension_member_shadowing(program: &Program, errors: &mut Vec<SemanticError>) {
+    // (被扩展类型, 方法末段名) → 已出现的形参类型签名列表。
+    let mut seen: HashMap<(String, String), Vec<Vec<Type>>> = HashMap::new();
+    for ext in &program.extends {
+        let target = ext.target_type.trim().to_string();
+        for m in &ext.methods {
+            let mname = last_name_segment(&m.name);
+            let sig: Vec<Type> = m.params.iter().map(|p| p.ty.clone()).collect();
+            let entry = seen.entry((target.clone(), mname.clone())).or_default();
+            if entry.iter().any(|s| *s == sig) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类型 '{}' 的扩展成员 '{}' 与其它扩展的成员重名且签名相同（8.4(9)）",
+                        target, mname
+                    ),
+                });
+            } else {
+                entry.push(sig);
+            }
+        }
+    }
+}
+
 fn check_this_type_usage(program: &Program, errors: &mut Vec<SemanticError>) {
     let mut bad = |what: &str, errors: &mut Vec<SemanticError>| {
         errors.push(SemanticError {
@@ -14087,7 +14117,7 @@ mod tests {
              \x20   open func f() {}\n\
              }\n\
              class C <: P {\n\
-             \x20   override func f(x: Int64) {}\n\
+             \x20   public override func f(x: Int64) {}\n\
              }\n\
              main() {}\n",
         );
@@ -14098,10 +14128,10 @@ mod tests {
     fn test_validate_override_matching_signature_ok() {
         assert_valid(
             "open class P {\n\
-             \x20   open func f(x: Int64) {}\n\
+             \x20   public open func f(x: Int64) {}\n\
              }\n\
              class C <: P {\n\
-             \x20   override func f(x: Int64) {}\n\
+             \x20   public override func f(x: Int64) {}\n\
              }\n\
              main() {}\n",
         );
@@ -14114,10 +14144,10 @@ mod tests {
             "open class Sup {}\n\
              class Sub <: Sup {}\n\
              open class P {\n\
-             \x20   open func f(): Sup { Sup() }\n\
+             \x20   public open func f(): Sup { Sup() }\n\
              }\n\
              class C <: P {\n\
-             \x20   override func f(): Sub { Sub() }\n\
+             \x20   public override func f(): Sub { Sub() }\n\
              }\n\
              main() {}\n",
         );
@@ -16497,10 +16527,10 @@ main() {}"#,
     fn test_w13d_this_override_return() {
         // 覆写返回 This 的父函数时返回类型必须保持 This。
         assert_invalid(
-            "open class A {\n open func f(): This { this }\n}\nclass B <: A {\n func f(): A { this }\n}\nmain() {}",
+            "open class A {\n public open func f(): This { this }\n}\nclass B <: A {\n public func f(): A { this }\n}\nmain() {}",
         );
         assert_valid(
-            "open class A {\n open func f(): This { this }\n}\nclass B <: A {\n override func f(): This { this }\n}\nmain() {}",
+            "open class A {\n public open func f(): This { this }\n}\nclass B <: A {\n public override func f(): This { this }\n}\nmain() {}",
         );
     }
 
@@ -16735,6 +16765,25 @@ main() {}"#,
         // 返回类型对每个父类型都满足协变：合法。
         assert_valid(
             "open class R {}\nclass Sub <: R {}\ninterface I {\n static func f(): R\n}\ninterface J {\n static func f(): Object { Object() }\n}\nclass A <: I & J {\n public redef static func f(): Sub { Sub() }\n}\nmain() {}",
+        );
+    }
+
+
+    // ─── w14d：08 扩展间成员遮蔽（8.4(9)） ─────────────────────────────────
+
+    #[test]
+    fn test_w14d_extension_member_shadowing() {
+        // 同一类型的不同扩展定义同名同签名成员 → 非法。
+        assert_invalid(
+            "class C {}\nextend C {\n func f() { 1 }\n}\nextend C {\n func f() { 2 }\n}\nmain() {}",
+        );
+        // 不同方法名的扩展合法。
+        assert_valid(
+            "class C {}\nextend C {\n func f() { 1 }\n}\nextend C {\n func g() { 2 }\n}\nmain() {}",
+        );
+        // 同名但参数类型不同的重载合法。
+        assert_valid(
+            "class C {}\nextend C {\n func f(x: Int64) { 1 }\n}\nextend C {\n func f(x: Bool) { 2 }\n}\nmain() {}",
         );
     }
 

@@ -742,7 +742,7 @@ fn test_compile_class_prop_getter_setter() {
                 this.count = n
             }
 
-            prop value: Int64 {
+            mut prop value: Int64 {
                 get() { return this.count }
                 set(v) { this.count = v }
             }
@@ -3903,7 +3903,7 @@ fn test_parse_class_with_prop() {
         class WithProp {
             var _val: Int64
             init(v: Int64) { this._val = v }
-            prop value: Int64 { get() { return this._val } set(v) { this._val = v } }
+            mut prop value: Int64 { get() { return this._val } set(v) { this._val = v } }
         }
         func main() : Int64 {
             let w = WithProp(7)
@@ -5222,7 +5222,7 @@ fn test_class_prop_with_setter() {
         class Box {
             var _value: Int64;
             init(v: Int64) { this._value = v }
-            prop value: Int64 {
+            mut prop value: Int64 {
                 get() { return this._value }
                 set(v) { this._value = v }
             }
@@ -7765,11 +7765,11 @@ fn test_cg3_class_with_multiple_props() {
             var _w: Int64;
             var _h: Int64;
             init(w: Int64, h: Int64) { this._w = w; this._h = h }
-            prop width: Int64 {
+            mut prop width: Int64 {
                 get() { return this._w }
                 set(v) { this._w = v }
             }
-            prop height: Int64 {
+            mut prop height: Int64 {
                 get() { return this._h }
                 set(v) { this._h = v }
             }
@@ -10499,7 +10499,7 @@ fn test_cg8_class_with_all_features() {
             var n: Int64;
             init(v: Int64) { this.n = v }
             ~init { }
-            prop value: Int64 {
+            mut prop value: Int64 {
                 get() { return this.n }
                 set(v) { this.n = v }
             }
