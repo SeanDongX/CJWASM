@@ -500,6 +500,9 @@ pub struct StructDef {
     pub has_primary_ctor: bool,
     /// 主构造函数的可访问性修饰符（无修饰符时为 internal）。
     pub primary_ctor_visibility: Visibility,
+    /// 是否为 `@C` 修饰的结构体（13.1.3.5）：隐式满足 CType，且字段/用法受
+    /// C 互操作约束。语义阶段据此区分 @C 结构体与普通结构体。
+    pub is_c: bool,
 }
 
 impl StructDef {

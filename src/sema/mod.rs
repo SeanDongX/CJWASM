@@ -6807,6 +6807,8 @@ struct ProgramIndex<'a> {
     classes: HashMap<&'a str, &'a ClassDef>,
     interfaces: HashMap<&'a str, &'a InterfaceDef>,
     structs: HashSet<&'a str>,
+    /// `@C` 修饰的结构体名（隐式满足 CType，可作为 C 签名类型）。
+    c_structs: HashSet<&'a str>,
     enums: HashSet<&'a str>,
     /// 各类型的声明类型参数（class/struct/enum）。接口的泛型参数未进入 AST。
     type_params: HashMap<&'a str, Vec<String>>,
@@ -6825,6 +6827,7 @@ impl<'a> ProgramIndex<'a> {
         let mut type_params = HashMap::new();
         let mut known_types = HashSet::new();
         let mut structs = HashSet::new();
+        let mut c_structs = HashSet::new();
         let mut enums = HashSet::new();
 
         for c in &program.classes {
@@ -6838,6 +6841,9 @@ impl<'a> ProgramIndex<'a> {
         }
         for s in &program.structs {
             structs.insert(s.name.as_str());
+            if s.is_c {
+                c_structs.insert(s.name.as_str());
+            }
             type_params.insert(s.name.as_str(), s.type_params.clone());
             known_types.insert(s.name.as_str());
         }
@@ -6864,6 +6870,7 @@ impl<'a> ProgramIndex<'a> {
             classes,
             interfaces,
             structs,
+            c_structs,
             enums,
             type_params,
             known_types,
@@ -9205,6 +9212,13 @@ fn non_ctype_kind(
             if index.interfaces.contains_key(name.as_str()) {
                 return Some("interface 类型".to_string());
             }
+            // 13.1.3.5(1)/13.1.3.1：只有 `@C` 修饰的结构体隐式满足 CType，可作为
+            // C 签名类型；本地普通结构体不是 CType（外部声明的结构体无法判定，放行）。
+            if index.structs.contains(name.as_str())
+                && !index.c_structs.contains(name.as_str())
+            {
+                return Some("非 @C 结构体类型".to_string());
+            }
             // 解析本地类型别名后继续判定（如 `type S = String`）。
             if let Some(target) = index.aliases.get(name.as_str()) {
                 return non_ctype_kind(target, index, reject_array, depth + 1);
@@ -9412,6 +9426,19 @@ fn check_c_interop(program: &Program, index: &ProgramIndex, errors: &mut Vec<Sem
                     "类型 '{}' 不能通过 extend 实现 CType 接口（13.1.4）",
                     ext.target_type
                 ),
+            });
+        }
+    }
+    // 13.1.4(5)：CType 接口不能被继承（含 interface 直接继承）。
+    for iface in &program.interfaces {
+        if iface.parents.iter().any(|p| p == "CType")
+            || iface.parent_types.iter().any(|p| {
+                matches!(p, Type::Struct(n, _) if n == "CType")
+                    || matches!(p, Type::Qualified(segs) if segs.last().map_or(false, |s| s == "CType"))
+            })
+        {
+            errors.push(SemanticError {
+                message: format!("interface '{}' 不能继承 CType 接口（13.1.4(5)）", iface.name),
             });
         }
     }
@@ -13897,6 +13924,9 @@ main() {}"#,
         assert_invalid("class ABC {}\nforeign func f(): ABC\nmain() {}");
         assert_invalid("enum TimeUnit { Year | Month }\nforeign func f(x: TimeUnit): Int32\nmain() {}");
         assert_invalid("interface I {}\nforeign func f(x: I): Int32\nmain() {}");
+        // 13.1.3.5(1)/13.1.3.1：普通本地 struct 不是 CType，仅 @C struct 可以。
+        assert_invalid("struct ABC { var f1: Int32 = 0 }\nforeign func f(x: ABC): Int32\nmain() {}");
+        assert_invalid("struct ABC { var f1: Int32 = 0 }\nforeign func f(): ABC\nmain() {}");
     }
 
 
@@ -13922,8 +13952,8 @@ main() {}"#,
         assert_valid("foreign func f(cb: CFunc<(Int32)->Int32>): Unit\nmain() {}");
         // 无显式返回类型（隐式 Unit）应保持兼容（既有代码依赖）。
         assert_valid("foreign func f(x: Int32)\nmain() {}");
-        // @C struct 与本地无法判定的具名类型（struct）保守放行。
-        assert_valid("struct S { let x: Int32 }\nforeign func f(p: S): S\nmain() {}");
+        // @C struct 隐式满足 CType，可作为 C 签名类型；普通本地 struct 不是 CType。
+        assert_valid("@C\nstruct S { let x: Int32 }\nforeign func f(p: S): S\nmain() {}");
         // VArray 在解析阶段降级为 Array，须放行以免误伤合法形参。
         assert_valid("foreign func f(a: VArray<Int32, $3>): Unit\nmain() {}");
     }
@@ -14892,6 +14922,32 @@ main() {}"#,
         assert_valid("class C1 {}\nfunc foo() { C1() }\nmain() {}");
         // 存在 import 时保守跳过。
         assert_valid("import utils.assert.Assert\nclass C1 {}\npublic func foo() { C1() }\nmain() {}");
+    }
+
+    // ---- w13c：@C 结构体/foreign func/CFunc 的 CType 细化（13.1.3.x/13.1.4(5)）----
+
+    #[test]
+    fn test_w13c_foreign_non_c_struct_rejected() {
+        // 普通本地 struct 不满足 CType，只有 @C struct 可作外来函数签名类型。
+        assert_invalid("struct ABC { var f1: Int32 = 0 }\nforeign func f(x: ABC): Int32\nmain() {}");
+        assert_invalid("struct ABC { var f1: Int32 = 0 }\nforeign func f(): ABC\nmain() {}");
+        assert_valid("@C\nstruct ABC { var x: Int32 }\nforeign func f(x: ABC): ABC\nmain() {}");
+    }
+
+    #[test]
+    fn test_w13c_cfunc_non_c_struct_rejected() {
+        // CFunc<F> 的签名同样要求 CType：普通 struct 非法，@C struct 合法。
+        assert_invalid("struct ABC { var f1: Int32 = 0 }\nfunc f(cb: CFunc<(ABC)->Int32>) {}\nmain() {}");
+        assert_invalid("struct ABC { var f1: Int32 = 0 }\nfunc f(cb: CFunc<()->ABC>) {}\nmain() {}");
+        assert_valid("@C\nstruct ABC { var f1: Int32 = 0 }\nfunc f(cb: CFunc<(ABC)->ABC>) {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w13c_interface_cannot_inherit_ctype() {
+        // 13.1.4(5)：CType 接口不能被继承（含 interface 直接继承）。
+        assert_invalid("interface ABC <: CType {}\nmain() {}");
+        // 泛型约束 `where T <: CType` 仍合法。
+        assert_valid("class D<T> where T <: CType {}\nmain() {}");
     }
 
 }

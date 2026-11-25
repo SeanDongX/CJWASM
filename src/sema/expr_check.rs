@@ -730,6 +730,8 @@ struct Checker<'a> {
     class_members: HashMap<String, HashMap<String, MemberInfo>>,
     /// 用户类型名 → 类别（class/struct/enum/interface），用于 prelude 子类型关系。
     type_kinds: HashMap<String, TypeKind>,
+    /// `@C` 修饰的结构体名（隐式满足 CType，13.1.3.5(9)/13.1.4(1)）。
+    c_structs: HashSet<String>,
     /// 用户 interface 名 → 全部成员名（含属性脱糖名与属性短名，传递可见）。
     interface_members: HashMap<String, HashSet<String>>,
     /// 用户 interface 名 → 实例成员名（用于静态上下文引用检查）。
@@ -1128,6 +1130,12 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         .collect();
     let constraint_parents = collect_constraint_parents(program);
     let type_kinds = collect_type_kinds(program);
+    let c_structs: HashSet<String> = program
+        .structs
+        .iter()
+        .filter(|s| s.is_c)
+        .map(|s| s.name.clone())
+        .collect();
     let class_members = collect_class_members(program);
     let (interface_members, interface_instance_members, interface_open_parents) =
         collect_interface_members(program);
@@ -1553,6 +1561,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         class_fields,
         class_members,
         type_kinds,
+        c_structs,
         interface_members,
         interface_instance_members,
         interface_open_parents,
@@ -3238,6 +3247,10 @@ impl<'a> Checker<'a> {
     /// 类型标注 → 轻量类型（识别用户定义类型名，并递归到 Option/Tuple/Array 内部）。
     fn ty_of_ann(&self, ty: &Type) -> Ty {
         match ty {
+            // 内建 CType 接口：用作显式标注时需校验值的 CType 兼容性（13.1.4(1)）。
+            Type::Struct(name, args) if name == "CType" && args.is_empty() => {
+                Ty::User("CType".to_string())
+            }
             Type::Struct(name, args) if args.is_empty() && self.type_names.contains(name) => {
                 Ty::User(name.clone())
             }
@@ -5045,6 +5058,42 @@ impl<'a> Checker<'a> {
 
     fn check_assignable(&mut self, target: &Ty, value: &Ty, ctx: &str) {
         if !target.is_concrete() || !value.is_definite() {
+            return;
+        }
+        // 13.1.4(1)：CType 为内建空接口，仅 C 互操作支持的类型隐式实现它。
+        // 只拒绝能够静态确定为非 CType 的值形态（Rune/String/聚合/数组/元组/
+        // 函数类型，以及本地 class/enum/interface/非 @C struct）；未知类型放行。
+        if matches!(target, Ty::User(n) if n == "CType") {
+            let ok = match value {
+                Ty::Int8
+                | Ty::Int16
+                | Ty::Int32
+                | Ty::Int64
+                | Ty::IntNative
+                | Ty::UInt8
+                | Ty::UInt16
+                | Ty::UInt32
+                | Ty::UInt64
+                | Ty::UIntNative
+                | Ty::Float16
+                | Ty::Float32
+                | Ty::Float64
+                | Ty::Bool
+                | Ty::Unit
+                | Ty::IntLit
+                | Ty::FloatLit => true,
+                // @C 结构体与其他 CType 值（如 CType 变量）可赋值。
+                Ty::User(n) => n == "CType" || self.c_structs.contains(n),
+                // Rune/String/Range/Array/Tuple/Func/Option 等均非 CType。
+                _ => false,
+            };
+            if !ok {
+                self.err(format!(
+                    "{}类型不匹配: 值类型 {} 不满足 CType 约束（13.1.4(1)）",
+                    ctx,
+                    value.name()
+                ));
+            }
             return;
         }
         // 2(1)：强类型——用户类型之间仅当存在继承/实现关系（值类型为声明类型的
@@ -9249,6 +9298,31 @@ mod tests {
         // 抛出异常变量或构造调用仍合法。
         assert_ok("main() { let e = Exception()\n throw e }");
         assert_ok("main() { throw Error() }");
+    }
+
+    // ---- w13c：CType 显式标注的值的 CType 兼容性（13.1.4(1)）----
+
+    #[test]
+    fn test_w13c_ctype_assignment_rejects_non_ctype_values() {
+        assert_err("main() { var v: CType = 'A' }", "CType");
+        assert_err("main() { var v: CType = \"s\" }", "CType");
+        assert_err("main() { var v: CType = (1, 2) }", "CType");
+        assert_err("main() { var v: CType = [1, 2] }", "CType");
+        assert_err("class C {}\nmain() { var v: CType = C() }", "CType");
+        assert_err("struct S { var x: Int32 = 0 }\nmain() { var v: CType = S() }", "CType");
+        assert_err(
+            "interface I {}\nclass C <: I {}\nmain() { var i: I = C()\n var v: CType = i }",
+            "CType",
+        );
+    }
+
+    #[test]
+    fn test_w13c_ctype_assignment_accepts_ctype_values() {
+        assert_ok("main() { var v: CType = 1 }");
+        assert_ok("main() { var v: CType = true }");
+        assert_ok("main() { var v: CType = () }");
+        assert_ok("main() { var v: CType = 1.5 }");
+        assert_ok("@C\nstruct S { var x: Int32 = 0 }\nmain() { var v: CType = S() }");
     }
 
 }

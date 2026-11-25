@@ -232,6 +232,7 @@ impl CodeGen {
                     primary_ctor_member_flags: vec![],
                     has_primary_ctor: false,
                     primary_ctor_visibility: crate::ast::Visibility::Internal,
+                    is_c: false,
                 },
             );
 

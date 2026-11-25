@@ -40,6 +40,18 @@ pub struct Parser {
     pending_c_decl: bool,
     /// 本文件中带 `@C` 的结构体名（用于字段 CType 约束校验）。
     c_structs: std::collections::HashSet<String>,
+    /// `@C` 结构体中显式书写 `Array<T>` 的字段 `(结构体名, 字段名)`。
+    /// VArray<T,N> 在解析阶段降级为 Array，无法从类型区分，故在解析时记录
+    /// 源级拼写，仅拒绝显式 `Array<T>`（13.1.3.5(3)）。
+    c_struct_explicit_array_fields: Vec<(String, String)>,
+    /// 正在解析 foreign func 的形参列表（用于拒绝显式 `Array<T>` 形参）。
+    in_extern_params: bool,
+    /// 正在解析 `CFunc<F>` 的类型实参（F 为函数类型）。
+    in_cfunc_sig: bool,
+    /// `CFunc<F>` 内部：0=非签名位置，1=形参位置（拒绝 Array），2=返回位置（拒绝 Array/VArray）。
+    cfunc_array_ctx: u8,
+    /// 解析过程中出现的元组类型（用于检查 @C 结构体不能作为元组元素）。
+    parsed_tuple_types: Vec<Type>,
 }
 
 impl Parser {
@@ -60,6 +72,11 @@ impl Parser {
             last_attr_c: false,
             pending_c_decl: false,
             c_structs: std::collections::HashSet::new(),
+            c_struct_explicit_array_fields: Vec::new(),
+            in_extern_params: false,
+            in_cfunc_sig: false,
+            cfunc_array_ctx: 0,
+            parsed_tuple_types: Vec::new(),
         }
     }
 

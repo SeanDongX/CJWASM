@@ -1132,6 +1132,7 @@ mod tests {
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 });
         let ctx = TypeInferenceContext::from_program(&prog);
         let fields = ctx.struct_fields.get("Point").unwrap();

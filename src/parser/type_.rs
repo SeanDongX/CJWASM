@@ -316,6 +316,11 @@ impl Parser {
             Some(Token::TypeBool) => Ok(Type::Bool),
             Some(Token::LParen) => {
                 let mut types = Vec::new();
+                // `CFunc<F>` 的形参位置：拒绝显式 Array（VArray 合法）。
+                let saved_ctx = self.cfunc_array_ctx;
+                if self.in_cfunc_sig {
+                    self.cfunc_array_ctx = 1;
+                }
                 if !self.check(&Token::RParen) {
                     if matches!(self.peek(), Some(Token::Ident(_)))
                         && matches!(self.peek_next(), Some(Token::Colon))
@@ -335,10 +340,17 @@ impl Parser {
                         types.push(self.parse_type()?);
                     }
                 }
+                self.cfunc_array_ctx = saved_ctx;
                 self.expect(Token::RParen)?;
                 if self.check(&Token::Arrow) {
                     self.advance();
+                    // `CFunc<F>` 的返回位置：Array 与 VArray 均非法。
+                    let saved_ret_ctx = self.cfunc_array_ctx;
+                    if self.in_cfunc_sig {
+                        self.cfunc_array_ctx = 2;
+                    }
                     let ret = self.parse_type()?;
+                    self.cfunc_array_ctx = saved_ret_ctx;
                     Ok(Type::Function {
                         params: types,
                         ret: Box::new(Some(ret)),
@@ -347,6 +359,10 @@ impl Parser {
                     if types.len() == 1 {
                         Ok(types.into_iter().next().unwrap())
                     } else {
+                        // 记录元组类型：@C 结构体不能作为元组元素（13.1.3.5(5)）。
+                        if types.len() > 1 {
+                            self.parsed_tuple_types.push(Type::Tuple(types.clone()));
+                        }
                         Ok(Type::Tuple(types))
                     }
                 }
@@ -355,6 +371,14 @@ impl Parser {
             Some(Token::TypeUnit) => Ok(Type::Unit),
             Some(Token::TypeString) => Ok(Type::String),
             Some(Token::TypeArray) => {
+                // 13.1.3.2：`CFunc<F>` 的签名中 Array 不是 CType（VArray 才合法）。
+                // 二者在 AST 中均降级为 Type::Array，只能在解析时按源级拼写判定。
+                if self.cfunc_array_ctx >= 1 {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::TypeArray,
+                        "Array 不能用作 CFunc 函数签名的类型（13.1.3.2）".to_string(),
+                    ));
+                }
                 // 裸 Array（无泛型实参）可用于类型别名场景：type Array = Array<Int64>
                 if !self.check(&Token::Lt) {
                     if let Some(alias_ty) = self.type_aliases.get("Array").cloned() {
@@ -369,6 +393,13 @@ impl Parser {
             }
             // VArray<T, N>：值类型定长数组，兼容优先降级为 Array<T>（N 为编译期常量，仅消费不求值）
             Some(Token::TypeVArray) => {
+                // 13.1.3.2：VArray 可作 CFunc 形参，但不能作返回类型。
+                if self.cfunc_array_ctx >= 2 {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::TypeVArray,
+                        "VArray 不能用作 CFunc 函数签名的返回类型（13.1.3.2）".to_string(),
+                    ));
+                }
                 self.expect(Token::Lt)?;
                 let elem_type = self.parse_type()?;
                 self.expect(Token::Comma)?;
@@ -414,6 +445,9 @@ impl Parser {
                             "`,` 或 `>`".to_string(),
                         ));
                     }
+                }
+                if types.len() > 1 {
+                    self.parsed_tuple_types.push(Type::Tuple(types.clone()));
                 }
                 Ok(Type::Tuple(types))
             }
@@ -488,6 +522,12 @@ impl Parser {
                 // 单个标识符的处理
                 if self.check(&Token::Lt) {
                     self.advance();
+                    // `CFunc<F>` 的函数签名内部受 CType 约束（13.1.3.2）。
+                    let is_cfunc = name == "CFunc";
+                    let saved_cfunc = self.in_cfunc_sig;
+                    if is_cfunc {
+                        self.in_cfunc_sig = true;
+                    }
                     let mut type_args = Vec::new();
                     loop {
                         type_args.push(self.parse_type()?);
@@ -501,12 +541,14 @@ impl Parser {
                             self.pushback = Some(Token::Gt);
                             break;
                         } else {
+                            self.in_cfunc_sig = saved_cfunc;
                             return self.bail(ParseError::UnexpectedToken(
                                 self.peek().cloned().unwrap_or(Token::Comma),
                                 "`,` 或 `>`".to_string(),
                             ));
                         }
                     }
+                    self.in_cfunc_sig = saved_cfunc;
                     Ok(Type::Struct(name, type_args))
                 } else if self.current_type_params.contains(&name) {
                     Ok(Type::TypeParam(name))

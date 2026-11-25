@@ -805,6 +805,7 @@ mod tests {
 has_primary_ctor: false,
 
 primary_ctor_visibility: crate::ast::Visibility::Internal,
+is_c: false,
 },
         );
         let classes = HashMap::new();

@@ -371,12 +371,20 @@ impl Parser {
                     }
                     self.expect(Token::RBrace)?;
                 } else {
-                    functions.push(self.parse_extern_func(visibility, extern_import)?);
+                    let f = self.parse_extern_func(visibility, extern_import)?;
+                    // 13.1.2.1(3)/13.1.2.2：`@C foreign func` 同样受 @C 函数约束
+                    // （非泛型、形参不得为 CType、不得有命名参数/默认值）。
+                    if c_attr {
+                        if let Some(msg) = self.validate_c_func(&f) {
+                            return self.bail(ParseError::UnexpectedToken(Token::Func, msg));
+                        }
+                    }
+                    functions.push(f);
                 }
             } else {
                 match self.peek() {
                     Some(Token::Struct) => {
-                        let sd = self.parse_struct_with_visibility(visibility)?;
+                        let sd = self.parse_struct_with_visibility(visibility, c_attr)?;
                         if c_attr {
                             // 13.1.3.5(8)：@C 结构体不能带类型参数。
                             if !sd.type_params.is_empty() {
@@ -606,6 +614,65 @@ impl Parser {
                     ),
                 ));
             }
+            // 13.1.3.5(3)：@C 结构体字段不允许显式写 `Array<T>`（VArray 才合法，
+            // 二者在 AST 中都降级为 Type::Array，此处依据解析时的源级拼写判定）。
+            if let Some((sname, fname)) = self
+                .c_struct_explicit_array_fields
+                .iter()
+                .find(|(s, _)| self.c_structs.contains(s))
+            {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Struct,
+                    format!(
+                        "@C 结构体 '{}' 的字段 '{}' 不能为 Array 类型，应使用 VArray（13.1.3.5(3)）",
+                        sname, fname
+                    ),
+                ));
+            }
+            // 13.1.3.5(5)：@C 结构体不能作为元组元素类型。
+            for t in &self.parsed_tuple_types {
+                if let Type::Tuple(elems) = t {
+                    for e in elems {
+                        if let Some(n) = type_mentions_c_struct(e, &self.c_structs, 0) {
+                            return self.bail(ParseError::UnexpectedToken(
+                                Token::Struct,
+                                format!(
+                                    "@C 结构体 '{}' 不能作为元组元素类型（13.1.3.5(5)）",
+                                    n
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            // 13.1.3.5(6)：@C 结构体不能作为枚举关联值类型。
+            for en in &enums {
+                for v in &en.variants {
+                    if let Some(p) = &v.payload {
+                        if let Some(n) = type_mentions_c_struct(p, &self.c_structs, 0) {
+                            return self.bail(ParseError::UnexpectedToken(
+                                Token::Struct,
+                                format!(
+                                    "@C 结构体 '{}' 不能作为枚举关联值类型（13.1.3.5(6)）",
+                                    n
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            // 13.1.3.5(4)：@C 结构体不能实现/继承接口（含 extend）。
+            if let Some(ext) = extends.iter().find(|e| {
+                e.interface.is_some() && self.c_structs.contains(&e.target_type)
+            }) {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Extend,
+                    format!(
+                        "@C 结构体 '{}' 不能通过 extend 实现接口（13.1.3.5(4)）",
+                        ext.target_type
+                    ),
+                ));
+            }
         }
         // 7.1(4)：数值、Bool、Unit、Nothing、Rune、String、Range、Function、枚举、
         // 元组类型不能定义 mut 属性。扩展中的 `mut prop` 会被脱糖为 `__set_` 方法，
@@ -654,6 +721,18 @@ impl Parser {
             return Some(format!(
                 "@C 函数 '{}' 不能为泛型函数（13.1.2.1(3)）",
                 f.name
+            ));
+        }
+        if let Some(p) = f.params.iter().find(|p| p.is_named) {
+            return Some(format!(
+                "@C 函数 '{}' 的形参 '{}' 不允许使用命名参数（13.1.2.2）",
+                f.name, p.name
+            ));
+        }
+        if let Some(p) = f.params.iter().find(|p| p.default.is_some()) {
+            return Some(format!(
+                "@C 函数 '{}' 的形参 '{}' 不允许指定默认值（13.1.2.2）",
+                f.name, p.name
             ));
         }
         if let Some(p) = f.params.iter().find(|p| is_ctype_type(&p.ty)) {
@@ -953,11 +1032,29 @@ impl Parser {
             }
         };
         self.expect(Token::LParen)?;
-        let params = self.parse_params()?;
+        // 外来函数形参显式写 `Array<T>` 非法（VArray<T,N> 是合法 CType 形参，
+        // 但二者在 AST 中都降级为 Type::Array，只能在解析时按源级拼写判定）。
+        let saved_extern = self.in_extern_params;
+        self.in_extern_params = true;
+        let params = self.parse_params();
+        self.in_extern_params = saved_extern;
+        let params = params?;
         self.expect(Token::RParen)?;
         let return_type = if self.check(&Token::Colon) {
             self.advance();
-            Some(self.parse_type()?)
+            let explicit_array = self.check(&Token::TypeArray);
+            let explicit_varray = self.check(&Token::TypeVArray);
+            let ty = self.parse_type()?;
+            if explicit_array || explicit_varray {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::TypeArray,
+                    format!(
+                        "外来函数 '{}' 的返回类型不能为 Array/VArray（13.1.3.1）",
+                        name
+                    ),
+                ));
+            }
+            Some(ty)
         } else {
             None
         };
@@ -983,13 +1080,14 @@ impl Parser {
 
     /// 解析结构体定义
     pub(crate) fn parse_struct(&mut self) -> Result<StructDef, ParseErrorAt> {
-        self.parse_struct_with_visibility(Visibility::default())
+        self.parse_struct_with_visibility(Visibility::default(), false)
     }
 
     /// 解析结构体定义（带可见性）
     pub(crate) fn parse_struct_with_visibility(
         &mut self,
         visibility: Visibility,
+        is_c: bool,
     ) -> Result<StructDef, ParseErrorAt> {
         self.expect(Token::Struct)?;
 
@@ -1523,7 +1621,14 @@ impl Parser {
                 (Type::TypeParam("_".to_string()), Some(self.parse_expr()?))
             } else if self.check(&Token::Colon) {
                 self.advance();
+                // VArray<T, N> 与 Array<T> 在解析阶段都降级为 Type::Array，源级拼写
+                // 仅在此处可见：记录 @C 结构体中显式写 Array 的字段（13.1.3.5(3)）。
+                let explicit_array = self.check(&Token::TypeArray);
                 let ty = self.parse_type()?;
+                if explicit_array {
+                    self.c_struct_explicit_array_fields
+                        .push((name.clone(), field_name.clone()));
+                }
                 let default = if self.check(&Token::Assign) {
                     self.advance();
                     Some(self.parse_expr()?)
@@ -1571,6 +1676,7 @@ impl Parser {
             primary_ctor_member_flags: primary_member_flags,
             has_primary_ctor: primary_seen,
             primary_ctor_visibility,
+            is_c,
         })
     }
 
@@ -3886,7 +3992,17 @@ impl Parser {
             };
             let (ty, default, variadic) = if self.check(&Token::Colon) {
                 self.advance();
+                let explicit_array = self.check(&Token::TypeArray);
                 let ty = self.parse_type()?;
+                if explicit_array && self.in_extern_params {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::TypeArray,
+                        format!(
+                            "外来函数的形参 '{}' 不能为 Array 类型，应使用 VArray（13.1.3.1）",
+                            name
+                        ),
+                    ));
+                }
                 let variadic = if self.check(&Token::DotDotDot) {
                     self.advance();
                     true
@@ -3975,6 +4091,44 @@ fn c_bad_field_type(
         Type::Struct(name, _) if bad_users.contains(name) => {
             Some("类、枚举、接口或非 @C 结构体类型")
         }
+        _ => None,
+    }
+}
+
+/// 类型中是否直接出现某个 `@C` 结构体（用于 13.1.3.5(5)/(6) 元组/枚举位置限制）。
+fn type_mentions_c_struct(
+    t: &Type,
+    c_structs: &std::collections::HashSet<String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    match t {
+        Type::Struct(name, args) => {
+            if c_structs.contains(name) {
+                return Some(name.clone());
+            }
+            args.iter()
+                .find_map(|a| type_mentions_c_struct(a, c_structs, depth + 1))
+        }
+        Type::Tuple(ts) => ts
+            .iter()
+            .find_map(|a| type_mentions_c_struct(a, c_structs, depth + 1)),
+        Type::Array(inner)
+        | Type::Option(inner)
+        | Type::Slice(inner)
+        | Type::Result(inner, _) => type_mentions_c_struct(inner, c_structs, depth + 1),
+        Type::Map(k, v) => type_mentions_c_struct(k, c_structs, depth + 1)
+            .or_else(|| type_mentions_c_struct(v, c_structs, depth + 1)),
+        Type::Function { params, ret } => params
+            .iter()
+            .find_map(|a| type_mentions_c_struct(a, c_structs, depth + 1))
+            .or_else(|| {
+                ret.as_ref()
+                    .as_ref()
+                    .and_then(|r| type_mentions_c_struct(r, c_structs, depth + 1))
+            }),
         _ => None,
     }
 }
@@ -4437,5 +4591,103 @@ main() {}
             .expect("immutable prop on Int64 should parse");
         parse_only("extend Float64 { prop val: Int64 { get() { 0 } } }\nmain() {}")
             .expect("immutable prop on Float64 should parse");
+    }
+
+    // ---- w13c：@C 函数/结构体与 foreign func 的 CType 细化（13.1.2.2/13.1.3.x）----
+
+    #[test]
+    fn test_w13c_c_func_named_or_default_param_rejected() {
+        expect_parse_err_contains(
+            "@C\nfunc f(x: Int32, y!: Int32): Int32 { x }\nmain() {}",
+            "命名参数",
+        );
+        expect_parse_err_contains(
+            "@C\nfunc f(x: Int32 = 1): Int32 { x }\nmain() {}",
+            "默认值",
+        );
+        // `@C foreign func` 同样受 @C 函数约束。
+        expect_parse_err_contains(
+            "@C\nforeign func f(x: Int32, y!: Int32): Int32\nmain() {}",
+            "命名参数",
+        );
+        // 普通函数仍允许命名参数/默认值。
+        parse_only("func f(x: Int32 = 1): Int32 { x }\nmain() {}")
+            .expect("plain func default param should parse");
+    }
+
+    #[test]
+    fn test_w13c_c_struct_explicit_array_field_rejected() {
+        expect_parse_err_contains(
+            "@C\nstruct S { var f: Array<Int32> = [] }\nmain() {}",
+            "Array",
+        );
+        // VArray 字段合法：二者在 AST 中均降级为 Array，按源级拼写区分。
+        parse_only("@C\nstruct S { var f: VArray<Int32, $3> = [] }\nmain() {}")
+            .expect("VArray field in @C struct should parse");
+        // 非 @C 结构体的 Array 字段不受限制。
+        parse_only("struct S { var f: Array<Int32> = [] }\nmain() {}")
+            .expect("Array field in plain struct should parse");
+    }
+
+    #[test]
+    fn test_w13c_foreign_array_and_varray_rules() {
+        // 13.1.3.1：外来函数形参不能为 Array（VArray 合法），返回类型二者皆不可。
+        expect_parse_err_contains(
+            "foreign func f(x: Array<Int32>): Int32\nmain() {}",
+            "Array",
+        );
+        expect_parse_err_contains(
+            "foreign func f(): Array<Int32>\nmain() {}",
+            "Array",
+        );
+        expect_parse_err_contains(
+            "foreign func f(): VArray<Int32, $3>\nmain() {}",
+            "Array/VArray",
+        );
+        parse_only("foreign func f(x: VArray<Int32, $3>): Int32\nmain() {}")
+            .expect("VArray parameter in foreign func should parse");
+    }
+
+    #[test]
+    fn test_w13c_cfunc_array_signature_rules() {
+        // 13.1.3.2：CFunc 签名不允许显式 Array；VArray 可作形参但不能作返回类型。
+        expect_parse_err_contains(
+            "func f(cb: CFunc<(Array<Int32>)->Int64>) {}\nmain() {}",
+            "CFunc",
+        );
+        expect_parse_err_contains(
+            "func f(cb: CFunc<(Int32)->Array<Int32>>) {}\nmain() {}",
+            "CFunc",
+        );
+        expect_parse_err_contains(
+            "func f(cb: CFunc<(Int32)->VArray<Int32, $3>>) {}\nmain() {}",
+            "VArray",
+        );
+        parse_only("func f(cb: CFunc<(VArray<Int8, $3>)->Int64>) {}\nmain() {}")
+            .expect("VArray parameter in CFunc signature should parse");
+    }
+
+    #[test]
+    fn test_w13c_c_struct_tuple_enum_extend_rejected() {
+        // 13.1.3.5(5)：@C 结构体不能作为元组元素类型。
+        expect_parse_err_contains(
+            "@C\nstruct ABC { var x: Int32 = 0 }\nmain() { var t: (Int32, ABC) = (1, ABC()) }",
+            "元组元素",
+        );
+        // 13.1.3.5(6)：@C 结构体不能作为枚举关联值类型。
+        expect_parse_err_contains(
+            "@C\nstruct ABC { var x: Int32 = 0 }\nenum E { First(ABC) }\nmain() {}",
+            "枚举关联值",
+        );
+        // 13.1.3.5(4)：@C 结构体不能通过 extend 实现接口。
+        expect_parse_err_contains(
+            "interface I {}\n@C\nstruct ABC { var x: Int32 = 0 }\nextend ABC <: I {}\nmain() {}",
+            "extend",
+        );
+        // 正例：普通结构体可用于元组/枚举/接口实现。
+        parse_only("struct ABC { var x: Int32 = 0 }\nmain() { var t: (Int32, ABC) = (1, ABC()) }")
+            .expect("plain struct tuple element should parse");
+        parse_only("struct ABC { var x: Int32 = 0 }\nenum E { First(ABC) }\nmain() {}")
+            .expect("plain struct enum payload should parse");
     }
 }
