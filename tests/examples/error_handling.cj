@@ -31,7 +31,7 @@ func chainedCompute(a: Int64, b: Int64, c: Int64): Result<Int64, String> {
 func safeDivide(a: Int64, b: Int64): Int64 {
     try {
         if (b == 0) {
-            throw "Division error"
+            throw Exception("Division error")
         }
         return a / b
     } catch (e: Exception) {
@@ -46,7 +46,7 @@ func safeCompute(a: Int64, b: Int64): Int64 {
 
     try {
         if (b == 0) {
-            throw 0
+            throw Exception("0")
         }
         result = a / b
     } catch (e: Exception) {
@@ -62,7 +62,7 @@ func safeCompute(a: Int64, b: Int64): Int64 {
 // throws 声明 (#38)
 func strictDivide(a: Int64, b: Int64): Int64 {
     if (b == 0) {
-        throw 0
+        throw Exception("0")
     }
     return a / b
 }

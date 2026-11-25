@@ -27,7 +27,7 @@ class ValidationError <: Error {
 // 可能 throw 的函数（throw 在函数体内）
 func safeDivide(a: Int64, b: Int64): Int64 {
     if (b == 0) {
-        throw 1001
+        throw Exception("1001")
     }
     return a / b
 }
@@ -35,7 +35,7 @@ func safeDivide(a: Int64, b: Int64): Int64 {
 // 可能 throw 的函数
 func validate(value: Int64): Int64 {
     if (value < 0) {
-        throw 0
+        throw Exception("0")
     }
     return value
 }
@@ -51,7 +51,7 @@ func computeWithCleanup(a: Int64, b: Int64): Int64 {
 
     try {
         if (b == 0) {
-            throw 0
+            throw Exception("0")
         }
         result = a / b
     } catch (e: Exception) {
@@ -72,7 +72,7 @@ func nestedTry(x: Int64): Int64 {
     try {
         try {
             if (x == 0) {
-                throw 0
+                throw Exception("0")
             }
             inner = x * 10
         } catch (e1: Exception) {
@@ -94,7 +94,7 @@ func nestedTry(x: Int64): Int64 {
 func tryCatchOnly(x: Int64): Int64 {
     try {
         if (x < 0) {
-            throw 0
+            throw Exception("0")
         }
         return x * 2
     } catch (e: Exception) {
