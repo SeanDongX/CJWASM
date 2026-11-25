@@ -4150,6 +4150,12 @@ impl<'a> Checker<'a> {
         }
         let is_float_lit = matches!(v, Expr::Float(_) | Expr::Float32(_));
         let is_int_lit = matches!(v, Expr::Integer(_) | Expr::IntegerSuffixed(_, _));
+        let is_str_lit = matches!(v, Expr::String(_));
+        let is_rune_lit = matches!(v, Expr::Rune(_));
+        let is_bool_lit = matches!(v, Expr::Bool(_));
+        // 顶层无类型注解的 let/var 以 Int64 占位（解析器约定），此时 `ann` 并非真实
+        // 标注类型，故下述非数值字面量检查一律跳过 Int64，避免误报。
+        let explicit_ann = !matches!(ann, Ty::Int64 | Ty::Unknown);
         if ann.is_float() && is_int_lit {
             self.err(format!(
                 "变量初始化类型不匹配: 浮点类型 {} 不能用整数字面量初始化（4.1(1)）",
@@ -4158,6 +4164,30 @@ impl<'a> Checker<'a> {
         } else if ann.is_int() && is_float_lit && !matches!(ann, Ty::Int64) {
             self.err(format!(
                 "变量初始化类型不匹配: 整数类型 {} 不能用浮点字面量初始化（4.1(1)）",
+                ann.name()
+            ));
+        } else if explicit_ann
+            && is_str_lit
+            && (ann.is_int() || ann.is_float() || matches!(ann, Ty::Bool | Ty::Rune))
+        {
+            self.err(format!(
+                "变量初始化类型不匹配: {} 不能用字符串字面量初始化（3.3.1(1)）",
+                ann.name()
+            ));
+        } else if explicit_ann
+            && is_rune_lit
+            && (ann.is_int() || ann.is_float() || matches!(ann, Ty::Bool | Ty::String))
+        {
+            self.err(format!(
+                "变量初始化类型不匹配: {} 不能用 Rune 字面量初始化（3.3.1(1)）",
+                ann.name()
+            ));
+        } else if explicit_ann
+            && is_bool_lit
+            && (ann.is_int() || ann.is_float() || matches!(ann, Ty::Rune | Ty::String))
+        {
+            self.err(format!(
+                "变量初始化类型不匹配: {} 不能用布尔字面量初始化（3.3.1(1)）",
                 ann.name()
             ));
         }
@@ -9855,6 +9885,20 @@ mod tests {
         assert_ok("main() { var v: CType = () }");
         assert_ok("main() { var v: CType = 1.5 }");
         assert_ok("@C\nstruct S { var x: Int32 = 0 }\nmain() { var v: CType = S() }");
+    }
+
+    // ─── w14d：顶层常量字面量类别与显式类型注解一致性（3.3.1(1)） ─────────
+
+    #[test]
+    fn test_w14d_toplevel_literal_annotation_mismatch() {
+        assert_err("let x: Int32 = 'A'\nmain() {}", "不能用 Rune 字面量初始化");
+        assert_err("var x: Int32 = \"12\"\nmain() {}", "不能用字符串字面量初始化");
+        assert_err("let s: String = true\nmain() {}", "不能用布尔字面量初始化");
+        // 一致与无注解（Int64 占位）的情形不得误报。
+        assert_ok("let c: Rune = 'A'\nmain() {}");
+        assert_ok("let s: String = \"ok\"\nmain() {}");
+        assert_ok("var any = \"hi\"\nmain() {}");
+        assert_ok("var flag = true\nmain() {}");
     }
 
 }

@@ -492,6 +492,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 下标运算符重载；函数/元组类型亦不允许被 extend。
     check_index_operator_extensions(program, &mut errors);
 
+    // 8.4(9)：同一类型的多个扩展之间不得定义同名同签名的成员。
+    check_extension_member_shadowing(program, &mut errors);
+
     // 不允许实例化抽象类 / 接口；不能继承 struct/enum。
     check_instantiation_targets(program, &mut errors);
 
@@ -9813,6 +9816,33 @@ fn check_index_operator_extensions(program: &Program, errors: &mut Vec<SemanticE
     }
 }
 
+/// 8.4(9)：同一类型的多个扩展之间不得定义同名同参数类型的成员。
+///
+/// 说明：这里只比较“方法名 + 形参类型列表”（扩展方法自带 `this` 形参，其类型为被
+/// 扩展类型），从而既能发现真正的覆盖，又允许跨扩展按参数类型重载。
+fn check_extension_member_shadowing(program: &Program, errors: &mut Vec<SemanticError>) {
+    // (被扩展类型, 方法末段名) → 已出现的形参类型签名列表。
+    let mut seen: HashMap<(String, String), Vec<Vec<Type>>> = HashMap::new();
+    for ext in &program.extends {
+        let target = ext.target_type.trim().to_string();
+        for m in &ext.methods {
+            let mname = last_name_segment(&m.name);
+            let sig: Vec<Type> = m.params.iter().map(|p| p.ty.clone()).collect();
+            let entry = seen.entry((target.clone(), mname.clone())).or_default();
+            if entry.iter().any(|s| *s == sig) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类型 '{}' 的扩展成员 '{}' 与其它扩展的成员重名且签名相同（8.4(9)）",
+                        target, mname
+                    ),
+                });
+            } else {
+                entry.push(sig);
+            }
+        }
+    }
+}
+
 fn check_this_type_usage(program: &Program, errors: &mut Vec<SemanticError>) {
     let mut bad = |what: &str, errors: &mut Vec<SemanticError>| {
         errors.push(SemanticError {
@@ -16293,6 +16323,24 @@ main() {}"#,
         );
         assert_valid(
             "interface I {\n func f() { 1 }\n}\ninterface J <: I {\n override func f() { 1 }\n}\nmain() {}",
+        );
+    }
+
+    // ─── w14d：08 扩展间成员遮蔽（8.4(9)） ─────────────────────────────────
+
+    #[test]
+    fn test_w14d_extension_member_shadowing() {
+        // 同一类型的不同扩展定义同名同签名成员 → 非法。
+        assert_invalid(
+            "class C {}\nextend C {\n func f() { 1 }\n}\nextend C {\n func f() { 2 }\n}\nmain() {}",
+        );
+        // 不同方法名的扩展合法。
+        assert_valid(
+            "class C {}\nextend C {\n func f() { 1 }\n}\nextend C {\n func g() { 2 }\n}\nmain() {}",
+        );
+        // 同名但参数类型不同的重载合法。
+        assert_valid(
+            "class C {}\nextend C {\n func f(x: Int64) { 1 }\n}\nextend C {\n func f(x: Bool) { 2 }\n}\nmain() {}",
         );
     }
 
