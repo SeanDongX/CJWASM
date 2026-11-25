@@ -144,6 +144,26 @@ fn parse_decimal_float32(s: &str) -> Option<f32> {
     }
 }
 
+/// 十进制字面量不能有前导零（规范 1.3.1/1.3.2 负例：`01`、`01.0`）。
+///
+/// 单个 `0`、`0.x` 分数部分、以及 `0x`/`0o`/`0b` 前缀均合法。
+fn decimal_leading_zero(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() > 1 && b[0] == b'0' && b[1].is_ascii_digit()
+}
+
+/// 结合上下文判定前导零是否非法：紧跟在 `.` 之后视为前导点浮点的分数部分
+/// （如 `.00e0` 被词法拆成 `.` + `00e0`），合法；其余前导零非法。
+fn leading_zero_invalid(lex: &logos::Lexer<Token>, s: &str) -> bool {
+    if !decimal_leading_zero(s) {
+        return false;
+    }
+    !matches!(
+        lex.source()[..lex.span().start].chars().next_back(),
+        Some('.')
+    )
+}
+
 /// 前导点浮点（`.5`）后紧跟标识符字符或另一个 `.` 时视为非法字面量
 /// （如 `.00xp0`、`.0.0`），返回 true 让词法器报错（规范 1.3.2 负样例）。
 fn leading_dot_malformed(lex: &logos::Lexer<Token>) -> bool {
@@ -183,6 +203,52 @@ fn lex_block_comment(lex: &mut logos::Lexer<Token>) -> logos::FilterResult<(), (
     logos::FilterResult::Error(())
 }
 
+/// 解码单个字符的合法转义（不含 `\u{...}`，其单独校验）。
+/// 规范 1.3.6：合法 EscapeSeq 为 `\n \r \t \b \f \v \0 \' \" \\ \$`。
+fn decode_simple_escape(next: u8) -> Option<char> {
+    match next {
+        b'n' => Some('\n'),
+        b't' => Some('\t'),
+        b'r' => Some('\r'),
+        b'b' => Some('\u{08}'),
+        b'f' => Some('\u{0C}'),
+        b'v' => Some('\u{0B}'),
+        b'0' => Some('\0'),
+        b'\'' => Some('\''),
+        b'"' => Some('"'),
+        b'\\' => Some('\\'),
+        b'$' => Some('$'),
+        _ => None,
+    }
+}
+
+/// 校验 `\u{HEX...}` 转义（`pos` 指向反斜杠，`bytes[pos+1] == 'u'`）。
+/// 合法形态：`\u{` + 1..=8 个十六进制数字 + `}`，且码点在 Unicode 标量范围内。
+fn validate_unicode_escape(remainder: &str, bytes: &[u8], pos: usize) -> bool {
+    // 必须紧跟 `u{`
+    if bytes.get(pos + 1) != Some(&b'u') || bytes.get(pos + 2) != Some(&b'{') {
+        return false;
+    }
+    let mut j = pos + 3;
+    while j < bytes.len() && bytes[j] != b'}' {
+        if !bytes[j].is_ascii_hexdigit() {
+            return false;
+        }
+        j += 1;
+    }
+    if j >= bytes.len() {
+        return false; // 缺少右花括号
+    }
+    let hex = &remainder[pos + 3..j];
+    if hex.is_empty() || hex.len() > 8 {
+        return false;
+    }
+    match u32::from_str_radix(hex, 16) {
+        Ok(v) => v <= 0x10FFFF,
+        Err(_) => false,
+    }
+}
+
 /// 解析多行字符串 """..."""，支持转义（`\"` `\\` `\$` `\n` `\t`）。
 ///
 /// 终止条件是未被反斜杠转义的 `"""`；`\"""` 中的 `\"` 是转义引号，不构成终止。
@@ -194,6 +260,13 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, 
     let mut current = String::new();
     let mut parts: Vec<StringPart> = Vec::new();
     let mut has_interpolation = false;
+
+    // 规范 1.3.6：多行字符串的起始 `"""` 之后必须紧跟行终止符
+    // （`""""""`、`"""123"""` 等无换行的形态均非法）。
+    match bytes.first() {
+        Some(&b'\n') | Some(&b'\r') => {}
+        _ => return None,
+    }
 
     while pos < bytes.len() {
         // 终止符 """（到达此处时一定未被转义，因为转义引号已在下面消耗）
@@ -215,19 +288,21 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, 
         let c = bytes[pos];
         if c == b'\\' && pos + 1 < bytes.len() {
             let next = bytes[pos + 1];
-            match next {
-                b'n' => current.push('\n'),
-                b't' => current.push('\t'),
-                b'"' => current.push('"'),
-                b'\\' => current.push('\\'),
-                b'$' => current.push('$'),
-                _ => {
-                    // 未知转义（含 \u{...}）按字面保留
-                    current.push('\\');
-                    current.push(next as char);
+            if next == b'u' {
+                // \u{...} 结构校验；通过后按原样保留（与既有行为一致）
+                if !validate_unicode_escape(remainder, bytes, pos) {
+                    return None;
                 }
+                current.push('\\');
+                current.push('u');
+                pos += 2;
+            } else if let Some(ch) = decode_simple_escape(next) {
+                current.push(ch);
+                pos += 2;
+            } else {
+                // 未知转义（如 \1 \a \^ \ ）在多行字符串中非法（规范 1.3.6）
+                return None;
             }
-            pos += 2;
         } else if c == b'$' && pos + 1 < bytes.len() && bytes[pos + 1] == b'{' {
             // 插值开始 ${
             has_interpolation = true;
@@ -263,6 +338,9 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, 
                 return None; // 未闭合的 ${
             }
             let expr_text = std::str::from_utf8(&bytes[expr_start..pos]).ok()?;
+            if expr_text.trim().is_empty() {
+                return None; // 规范 1.3.6：插值表达式不能为空（`${}` 非法）
+            }
             parts.push(StringPart::Interpolation(expr_text.to_string()));
             pos += 1; // 跳过 }
         } else {
@@ -300,20 +378,26 @@ fn lex_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, Vec<String
         let c = bytes[pos];
 
         if c == b'\\' && pos + 1 < bytes.len() {
-            // 转义字符
+            // 转义字符（规范 1.3.6 合法集）
             let next = bytes[pos + 1];
-            match next {
-                b'n' => current_literal.push('\n'),
-                b't' => current_literal.push('\t'),
-                b'"' => current_literal.push('"'),
-                b'\\' => current_literal.push('\\'),
-                b'$' => current_literal.push('$'), // 支持 \$ 转义
-                _ => {
-                    current_literal.push('\\');
-                    current_literal.push(next as char);
+            if next == b'u' {
+                // \u{...} 结构校验；通过后按原样保留（与既有行为一致）
+                if !validate_unicode_escape(remainder, bytes, pos) {
+                    return None;
                 }
+                current_literal.push('\\');
+                current_literal.push('u');
+                pos += 2;
+            } else if let Some(ch) = decode_simple_escape(next) {
+                current_literal.push(ch);
+                pos += 2;
+            } else {
+                // 非法转义序列（如 \% \A \1 \ ）（规范 1.3.6）
+                return None;
             }
-            pos += 2;
+        } else if c == b'\n' || c == b'\r' {
+            // 单行字符串不能跨行（规范 1.3.6 / 1.3.7 负例）
+            return None;
         } else if c == b'$' && pos + 1 < bytes.len() && bytes[pos + 1] == b'{' {
             // 插值开始 ${
             has_interpolation = true;
@@ -353,6 +437,9 @@ fn lex_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, Vec<String
             }
 
             let expr_text = std::str::from_utf8(&bytes[expr_start..pos]).ok()?;
+            if expr_text.trim().is_empty() {
+                return None; // 规范 1.3.6：插值表达式不能为空（`${}` 非法）
+            }
             parts.push(StringPart::Interpolation(expr_text.to_string()));
             pos += 1; // 跳过 }
         } else if c == b'"' {
@@ -732,6 +819,8 @@ pub enum Token {
         if s.starts_with("0x") || s.starts_with("0X") {
             // 十六进制浮点：0x1.8p3 / 0xA.BP-10 / 0x.1p1（十六进制无类型后缀）
             parse_hex_float_literal(&s)
+        } else if leading_zero_invalid(lex, &s) {
+            None // 前导零非法（`01.0`）
         } else {
             parse_decimal_float(&s)
         }
@@ -745,6 +834,9 @@ pub enum Token {
         }
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
         let s = s.trim_end_matches("f64");
+        if leading_zero_invalid(lex, s) {
+            return None;
+        }
         parse_decimal_float(s)
     })]
     Float64Suffix(f64),
@@ -756,6 +848,9 @@ pub enum Token {
         }
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
         let s = s.trim_end_matches("f32").trim_end_matches("f16").trim_end_matches('f');
+        if leading_zero_invalid(lex, s) {
+            return None;
+        }
         parse_decimal_float32(s)
     })]
     Float32(f32),
@@ -764,6 +859,9 @@ pub enum Token {
     // 变体按最长匹配优先识别。
     #[regex(r"(0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[oO][0-7][0-7_]*|0[bB][01][01_]*|[0-9][0-9_]*)", |lex| {
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
+        if leading_zero_invalid(lex, &s) {
+            return None; // 前导零非法（`01`）
+        }
         parse_integer_literal(&s)
     })]
     Integer(i64),
@@ -785,6 +883,9 @@ pub enum Token {
         for (suf, ty) in suffixes {
             if s.ends_with(suf) {
                 let body = &s[..s.len() - suf.len()];
+                if leading_zero_invalid(lex, body) {
+                    return None; // 前导零非法（`01u8`）
+                }
                 if let Some(v) = parse_integer_literal(body) {
                     return Some((v, ty));
                 }
@@ -1094,6 +1195,14 @@ impl<'a> Iterator for Lexer<'a> {
                             | Token::Float64Suffix(_)
                     ) {
                         let prev = self.inner.source()[..span.start].chars().next_back();
+                        // 相邻数字字面量（无任何分隔符）非法：如八进制中混入 8/9
+                        // （`0O1779u8` → `0O177` + `9u8`），或指数后紧贴小数（`1e0.0`）。
+                        if matches!(prev, Some(p) if p.is_ascii_digit()) {
+                            return Some(Err(format!(
+                                "无效的数字字面量: 相邻数字 '{}'",
+                                self.inner.slice()
+                            )));
+                        }
                         let float_suffix = matches!(
                             tok,
                             Token::Float32(_) | Token::Float64Suffix(_)
@@ -1168,6 +1277,16 @@ fn invalid_numeric_tail(
     let is_hex_float = (slice.starts_with("0x") || slice.starts_with("0X"))
         && (slice.contains('p') || slice.contains('P'));
     if is_hex_float {
+        // 十六进制浮点不允许类型后缀（规范 1.3.2 负例 `0x0p0f16`）
+        if remainder.starts_with("f16")
+            || remainder.starts_with("f32")
+            || remainder.starts_with("f64")
+        {
+            return Some(format!(
+                "无效的数字字面量: '{}{}'（十六进制浮点不能带类型后缀）",
+                slice, next
+            ));
+        }
         return None;
     }
     Some(format!("无效的数字字面量: '{}{}'", slice, next))
@@ -1316,7 +1435,8 @@ mod tests {
 
     #[test]
     fn test_multiline_string_inline() {
-        let source = r#"let s = """hello world""""#;
+        // 规范 1.3.6：`"""` 后必须紧跟换行
+        let source = "let s = \"\"\"\nhello world\"\"\"";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
 
@@ -1902,8 +2022,8 @@ mod tests {
 
     #[test]
     fn test_multiline_string_escaped_triple_quote() {
-        // 多行字符串中 \""" 不应提前终止，转义后内容为 """
-        let source = r####"let s = """abc\""" def""""####;
+        // 多行字符串中 \""" 不应提前终止，转义后内容为 """（`"""` 后须先换行）
+        let source = "let s = \"\"\"\nabc\\\"\"\" def\"\"\"";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(
@@ -1947,11 +2067,85 @@ mod batch04_tests {
         assert!(err_count("0F12") > 0);
         assert!(err_count("654f32") > 0);
         assert!(err_count("0f16") > 0);
+        // 十六进制浮点不允许类型后缀（规范 1.3.2 负例 `0x0p0f16`）
+        assert!(err_count("0x1p1f32") > 0);
+        // 前导零非法（`01` / `01.0`）
+        assert!(err_count("01") > 0);
+        assert!(err_count("01.0") > 0);
         // 合法形态不受影响：前缀、类型后缀、小数/指数浮点、前导点小数、
-        // 十六进制浮点（允许 f16/f32/f64 后缀）。
+        // 十六进制浮点（无后缀）。
         assert_eq!(
-            err_count("0x1F 0b101 0o77 0i64 0.5f32 .5f16 1e3f64 0x1p1f32 0.0f16"),
+            err_count("0x1F 0b101 0o77 0i64 0.5f32 .5f16 1e3f64 0x1p1 0.0f16"),
             0
         );
+        // 前导点浮点的分数部分前导零合法（`.00e0` 拆成 `.` + `00e0`）
+        assert_eq!(err_count("let a = .00e0"), 0);
+    }
+
+    // ==== w9b: 词法边角（字符串转义 / 跨行 / 数字前导零）====
+
+    #[test]
+    fn test_w9b_invalid_string_escape_rejected() {
+        let err_count = |s: &str| Lexer::new(s).filter(|r| r.is_err()).count();
+        // 规范 1.3.6：非法转义序列
+        assert!(err_count(r#"let s = "bad \%""#) > 0);
+        assert!(err_count(r#"let s = "bad \A""#) > 0);
+        assert!(err_count(r#"let s = "bad \1""#) > 0);
+        assert!(err_count("let s = \"bad \\ \"") > 0); // `\ `（反斜杠+空格）
+        // 正例：合法转义不报错
+        assert_eq!(err_count(r#"let s = "a\n\t\"\\\$${x}""#), 0);
+    }
+
+    #[test]
+    fn test_w9b_unicode_escape_structure() {
+        let err_count = |s: &str| Lexer::new(s).filter(|r| r.is_err()).count();
+        // 负例：空、超长、非十六进制
+        assert!(err_count(r#"let s = "\u{}""#) > 0);
+        assert!(err_count(r#"let s = "\u{00000006c}""#) > 0); // 9 位
+        assert!(err_count(r#"let s = "\u{zz}""#) > 0);
+        // 正例：1..=8 位十六进制
+        assert_eq!(err_count(r#"let s = "\u{41}\u{A}\u{00061}""#), 0);
+    }
+
+    #[test]
+    fn test_w9b_single_line_string_cannot_span_lines() {
+        let err_count = |s: &str| Lexer::new(s).filter(|r| r.is_err()).count();
+        assert!(err_count("let s = \"a\nb\"") > 0);
+        assert!(err_count("let s = \"line\r\nnext\"") > 0);
+        assert_eq!(err_count("let s = \"single line\"") , 0);
+    }
+
+    #[test]
+    fn test_w9b_multiline_string_rules() {
+        let err_count = |s: &str| Lexer::new(s).filter(|r| r.is_err()).count();
+        // 负例：`"""` 后无换行
+        assert!(err_count("let s = \"\"\"\"\"\"") > 0); // 六引号
+        assert!(err_count("let s = \"\"\"123\"\"\"") > 0);
+        // 负例：多行字符串内的非法转义
+        assert!(err_count("let s = \"\"\"\nbad \\1\"\"\"") > 0);
+        // 正例：以换行开头的多行字符串
+        assert_eq!(err_count("let s = \"\"\"\nhello\"\"\""), 0);
+    }
+
+    #[test]
+    fn test_w9b_empty_interpolation_rejected() {
+        let err_count = |s: &str| Lexer::new(s).filter(|r| r.is_err()).count();
+        assert!(err_count(r#"let s = "${}""#) > 0);
+        assert!(err_count("let s = \"\"\"\n${}\n\"\"\"") > 0);
+        // 正例
+        assert_eq!(err_count(r#"let s = "${x + 1}""#), 0);
+    }
+
+    #[test]
+    fn test_w9b_leading_zero_and_adjacent_numbers() {
+        let err_count = |s: &str| Lexer::new(s).filter(|r| r.is_err()).count();
+        assert!(err_count("let a = 01") > 0);
+        assert!(err_count("let a = 01.0") > 0);
+        // 八进制混入 8/9 → 被拆成相邻数字
+        assert!(err_count("let a = 0O1779u8") > 0);
+        // 正例
+        assert_eq!(err_count("let a = 0"), 0);
+        assert_eq!(err_count("let a = 0.5"), 0);
+        assert_eq!(err_count("let a = 0O177"), 0);
     }
 }

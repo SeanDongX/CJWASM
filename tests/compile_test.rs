@@ -4326,7 +4326,8 @@ fn test_parse_string_interpolation() {
 fn test_parse_multiline_string() {
     let source = r#"
         func main() : Int64 {
-            let s = """line1
+            let s = """
+            line1
             line2"""
             return 0
         }
