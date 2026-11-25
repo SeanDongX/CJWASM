@@ -367,7 +367,7 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         // 6.1.2.1(54)：super 成员访问时机 / 静态上下文禁用 super。
         check_super_access_rules(cls, &mut errors);
         // 6.1.2.1(58)/(26)：全部成员初始化完成前的受限使用。
-        check_use_before_init(cls, &mut errors);
+        check_use_before_init(cls, &index, &mut errors);
         // 6.1.2.1(57)：open/abstract 类构造函数中 this 不得逃逸。
         check_this_escape_open(cls, &mut errors);
         check_static_member_access(cls, program, &index, &mut errors);
@@ -2522,7 +2522,11 @@ fn is_explicit_ctor_call(e: &Expr) -> bool {
 /// - 以值的形式引用实例成员函数（裸 `f`、`this.f`、`f<T>`）；
 /// - 读取尚未初始化的成员变量（`this.m` 或裸 `m`；已初始化的可读）；
 /// - 单独使用 `this` 表达式、在 lambda/局部函数中捕获 `this`。
-fn check_use_before_init(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+fn check_use_before_init(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
     // 字段集合（排除 parser 为主构造普通参数误加的“字段”）。
     let mut nonmember: HashSet<&str> = HashSet::new();
     for (p, flag) in cls
@@ -2568,6 +2572,15 @@ fn check_use_before_init(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
             method_names.insert(base.to_string());
         }
     }
+    // 父类（含接口）实例成员：裸名 `f()` / `p` 与 `super.p` 同样构成实例成员访问。
+    // `parent_props` 单独保留，用于区分 `super.field`（父类字段，读取合法）与
+    // `super.property`（属性 getter，未完成初始化前访问非法）。
+    let mut parent_props: HashSet<String> = HashSet::new();
+    if let Some((pmethods, pprops)) = collect_parent_member_names(cls, index) {
+        method_names.extend(pmethods);
+        prop_names.extend(pprops.iter().cloned());
+        parent_props = pprops;
+    }
     let inits: Vec<&InitDef> = if cls.inits.is_empty() {
         cls.init.iter().collect()
     } else {
@@ -2597,6 +2610,7 @@ fn check_use_before_init(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
                     &method_names,
                     &prop_names,
                     &param_names,
+                    &parent_props,
                 ) {
                     errors.push(SemanticError {
                         message: format!(
@@ -2625,21 +2639,22 @@ fn stmt_use_reason(
     methods: &HashSet<String>,
     props: &HashSet<String>,
     params: &HashSet<String>,
+    parent_props: &HashSet<String>,
 ) -> Option<String> {
     match s {
-        Stmt::Expr(e) => expr_use_reason(e, cur, tracked, field_names, methods, props, params),
+        Stmt::Expr(e) => expr_use_reason(e, cur, tracked, field_names, methods, props, params, parent_props),
         Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Const { value, .. } => {
-            expr_use_reason(value, cur, tracked, field_names, methods, props, params)
+            expr_use_reason(value, cur, tracked, field_names, methods, props, params, parent_props)
         }
         Stmt::Assign { value, .. } => {
-            expr_use_reason(value, cur, tracked, field_names, methods, props, params)
+            expr_use_reason(value, cur, tracked, field_names, methods, props, params, parent_props)
         }
         Stmt::Return(Some(e)) => {
-            expr_use_reason(e, cur, tracked, field_names, methods, props, params)
+            expr_use_reason(e, cur, tracked, field_names, methods, props, params, parent_props)
         }
         Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
-            expr_use_reason(left, cur, tracked, field_names, methods, props, params)
-                .or_else(|| expr_use_reason(right, cur, tracked, field_names, methods, props, params))
+            expr_use_reason(left, cur, tracked, field_names, methods, props, params, parent_props)
+                .or_else(|| expr_use_reason(right, cur, tracked, field_names, methods, props, params, parent_props))
         }
         Stmt::LocalFunc(f) => {
             if stmts_contain_this(&f.body) {
@@ -2660,12 +2675,13 @@ fn expr_use_reason(
     methods: &HashSet<String>,
     props: &HashSet<String>,
     params: &HashSet<String>,
+    parent_props: &HashSet<String>,
 ) -> Option<String> {
     // 若该表达式内部对字段有赋值（控制流/顺序不确定），保守跳过。
     if expr_has_field_assign(e, field_names) {
         return None;
     }
-    use_scan(e, cur, tracked, methods, props, params)
+    use_scan(e, cur, tracked, methods, props, params, parent_props)
 }
 
 /// 结构感知扫描：在 receiver 位置（`this.x`、`this.f()` 的 object）上的 `this`
@@ -2677,6 +2693,7 @@ fn use_scan(
     methods: &HashSet<String>,
     props: &HashSet<String>,
     params: &HashSet<String>,
+    parent_props: &HashSet<String>,
 ) -> Option<String> {
     match e {
         Expr::Var(n) if n == "this" || n == "self" => Some("单独的 this 表达式".to_string()),
@@ -2705,7 +2722,7 @@ fn use_scan(
                     return None;
                 }
             }
-            use_scan(object, cur, tracked, methods, props, params)
+            use_scan(object, cur, tracked, methods, props, params, parent_props)
         }
         Expr::MethodCall {
             object,
@@ -2722,24 +2739,30 @@ fn use_scan(
                     return Some(format!("super.{}", method));
                 }
             }
-            if let Some(r) = use_scan(object, cur, tracked, methods, props, params) {
+            if let Some(r) = use_scan(object, cur, tracked, methods, props, params, parent_props) {
                 return Some(r);
             }
             for a in args {
-                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
             for (_, a) in named_args {
-                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
             None
         }
-        // 父类实例成员变量经 super 读取是允许的（父类构造函数隐式先执行）；
-        // 父类函数/属性访问由 `SuperCall`（方法）分支约束。
-        Expr::SuperFieldAccess { .. } => None,
+        // 父类实例字段经 super 读取是允许的（父类构造函数隐式先执行）；
+        // 但 `super.p` 若指向父类属性（getter），未完成初始化前访问同样非法。
+        Expr::SuperFieldAccess { field } => {
+            if parent_props.contains(field) {
+                Some(format!("super.{}", field))
+            } else {
+                None
+            }
+        }
         Expr::SuperCall { method, .. } if method != "init" => Some(format!("super.{}", method)),
         Expr::Call {
             name,
@@ -2751,12 +2774,12 @@ fn use_scan(
                 return Some(format!("实例成员函数 '{}'", name));
             }
             for a in args {
-                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
             for (_, a) in named_args {
-                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
@@ -2770,16 +2793,16 @@ fn use_scan(
             if matches!(callee.as_ref(), Expr::Var(n) if n == "this" || n == "self") {
                 return None; // this(...) 委托构造函数
             }
-            if let Some(r) = use_scan(callee, cur, tracked, methods, props, params) {
+            if let Some(r) = use_scan(callee, cur, tracked, methods, props, params, parent_props) {
                 return Some(r);
             }
             for a in args {
-                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
             for (_, a) in named_args {
-                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
@@ -2792,8 +2815,8 @@ fn use_scan(
                 None
             }
         }
-        Expr::Binary { left, right, .. } => use_scan(left, cur, tracked, methods, props, params)
-            .or_else(|| use_scan(right, cur, tracked, methods, props, params)),
+        Expr::Binary { left, right, .. } => use_scan(left, cur, tracked, methods, props, params, parent_props)
+            .or_else(|| use_scan(right, cur, tracked, methods, props, params, parent_props)),
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsType { expr, .. }
@@ -2808,53 +2831,53 @@ fn use_scan(
         | Expr::PrefixDecr(expr)
         | Expr::TupleIndex { object: expr, .. }
         | Expr::OptionalChain { object: expr, .. } => {
-            use_scan(expr, cur, tracked, methods, props, params)
+            use_scan(expr, cur, tracked, methods, props, params, parent_props)
         }
         Expr::Tuple(es) | Expr::Array(es) => {
             for x in es {
-                if let Some(r) = use_scan(x, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(x, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
             None
         }
-        Expr::Index { array, index } => use_scan(array, cur, tracked, methods, props, params)
-            .or_else(|| use_scan(index, cur, tracked, methods, props, params)),
+        Expr::Index { array, index } => use_scan(array, cur, tracked, methods, props, params, parent_props)
+            .or_else(|| use_scan(index, cur, tracked, methods, props, params, parent_props)),
         Expr::Range {
             start, end, step, ..
-        } => use_scan(start, cur, tracked, methods, props, params)
-            .or_else(|| use_scan(end, cur, tracked, methods, props, params))
+        } => use_scan(start, cur, tracked, methods, props, params, parent_props)
+            .or_else(|| use_scan(end, cur, tracked, methods, props, params, parent_props))
             .or_else(|| {
                 step.as_ref()
-                    .and_then(|s| use_scan(s, cur, tracked, methods, props, params))
+                    .and_then(|s| use_scan(s, cur, tracked, methods, props, params, parent_props))
             }),
         Expr::If {
             cond,
             then_branch,
             else_branch,
-        } => use_scan(cond, cur, tracked, methods, props, params)
-            .or_else(|| use_scan(then_branch, cur, tracked, methods, props, params))
+        } => use_scan(cond, cur, tracked, methods, props, params, parent_props)
+            .or_else(|| use_scan(then_branch, cur, tracked, methods, props, params, parent_props))
             .or_else(|| {
                 else_branch
                     .as_ref()
-                    .and_then(|b| use_scan(b, cur, tracked, methods, props, params))
+                    .and_then(|b| use_scan(b, cur, tracked, methods, props, params, parent_props))
             }),
         Expr::IfLet {
             expr,
             then_branch,
             else_branch,
             ..
-        } => use_scan(expr, cur, tracked, methods, props, params)
-            .or_else(|| use_scan(then_branch, cur, tracked, methods, props, params))
+        } => use_scan(expr, cur, tracked, methods, props, params, parent_props)
+            .or_else(|| use_scan(then_branch, cur, tracked, methods, props, params, parent_props))
             .or_else(|| {
                 else_branch
                     .as_ref()
-                    .and_then(|b| use_scan(b, cur, tracked, methods, props, params))
+                    .and_then(|b| use_scan(b, cur, tracked, methods, props, params, parent_props))
             }),
-        Expr::Match { expr, arms } => use_scan(expr, cur, tracked, methods, props, params).or_else(
+        Expr::Match { expr, arms } => use_scan(expr, cur, tracked, methods, props, params, parent_props).or_else(
             || {
                 for arm in arms {
-                    if let Some(r) = use_scan(&arm.body, cur, tracked, methods, props, params) {
+                    if let Some(r) = use_scan(&arm.body, cur, tracked, methods, props, params, parent_props) {
                         return Some(r);
                     }
                 }
@@ -2862,17 +2885,17 @@ fn use_scan(
             },
         ),
         Expr::NullCoalesce { option, default } => {
-            use_scan(option, cur, tracked, methods, props, params)
-                .or_else(|| use_scan(default, cur, tracked, methods, props, params))
+            use_scan(option, cur, tracked, methods, props, params, parent_props)
+                .or_else(|| use_scan(default, cur, tracked, methods, props, params, parent_props))
         }
         Expr::ConstructorCall { args, named_args, .. } => {
             for a in args {
-                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
             for (_, a) in named_args {
-                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
@@ -2880,7 +2903,7 @@ fn use_scan(
         }
         Expr::StructInit { fields, .. } => {
             for (_, a) in fields {
-                if let Some(r) = use_scan(a, cur, tracked, methods, props, params) {
+                if let Some(r) = use_scan(a, cur, tracked, methods, props, params, parent_props) {
                     return Some(r);
                 }
             }
@@ -3290,8 +3313,10 @@ fn check_open_class_ctor_member_calls(
     let Some(init) = &cls.init else {
         return;
     };
-    // 属性脱糖为 `__get_p` / `__set_p`，收集本类与可解析父类型的属性名。
+    // 属性脱糖为 `__get_p` / `__set_p`，收集本类与可解析父类型的属性名；
+    // 同时收集实例方法名，用于识别裸名 `f()` / `p` 形式的成员访问。
     let mut props: HashSet<String> = HashSet::new();
+    let mut methods: HashSet<String> = HashSet::new();
     for m in &cls.methods {
         let base = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
         if let Some(p) = base
@@ -3299,20 +3324,15 @@ fn check_open_class_ctor_member_calls(
             .or_else(|| base.strip_prefix("__set_"))
         {
             props.insert(p.to_string());
+        } else if !m.is_static {
+            methods.insert(base.to_string());
         }
     }
-    if let Some(parents) = collect_parent_methods(cls, index) {
-        for p in &parents {
-            if let Some(name) = p
-                .sig
-                .name
-                .strip_prefix("__get_")
-                .or_else(|| p.sig.name.strip_prefix("__set_"))
-            {
-                props.insert(name.to_string());
-            }
-        }
+    if let Some((pmethods, pprops)) = collect_parent_member_names(cls, index) {
+        methods.extend(pmethods);
+        props.extend(pprops);
     }
+    let params: HashSet<String> = init.params.iter().map(|p| p.name.clone()).collect();
 
     let mut report: Option<String> = None;
     for stmt in &init.body {
@@ -3341,6 +3361,13 @@ fn check_open_class_ctor_member_calls(
                     if matches!(object.as_ref(), Expr::Var(n) if n == "super") =>
                 {
                     report = Some(format!("super.{}()", method));
+                }
+                // 裸名形式：`f()`（实例方法）/ `p`（属性），本类或继承而来。
+                Expr::Call { name, .. } if !params.contains(name) && methods.contains(name) => {
+                    report = Some(format!("{}()", name));
+                }
+                Expr::Var(n) if !params.contains(n) && props.contains(n) => {
+                    report = Some(format!("{}", n));
                 }
                 _ => {}
             }
@@ -4531,6 +4558,35 @@ fn collect_parent_methods<'a>(
     }
 
     Some(out)
+}
+
+/// 收集可解析父类型的实例成员名：返回（方法名集合, 属性名集合）。
+///
+/// 属性访问器在 AST 中脱糖为 `__get_p` / `__set_p`，此处还原为属性名。
+/// 静态成员不计入（裸名引用静态成员不构成实例成员访问）。
+/// 任一父类型无法在本地解析时返回 `None`，调用方应保守跳过。
+fn collect_parent_member_names(
+    cls: &ClassDef,
+    index: &ProgramIndex<'_>,
+) -> Option<(HashSet<String>, HashSet<String>)> {
+    let parents = collect_parent_methods(cls, index)?;
+    let mut methods = HashSet::new();
+    let mut props = HashSet::new();
+    for p in &parents {
+        if p.sig.is_static {
+            continue;
+        }
+        let base = p.sig.name.rsplit('.').next().unwrap_or(&p.sig.name);
+        if let Some(prop) = base
+            .strip_prefix("__get_")
+            .or_else(|| base.strip_prefix("__set_"))
+        {
+            props.insert(prop.to_string());
+        } else {
+            methods.insert(base.to_string());
+        }
+    }
+    Some((methods, props))
 }
 
 /// unittest 框架注入到 TestCase 的生命周期钩子名。
@@ -7968,6 +8024,161 @@ mod tests {
         assert_valid("func f(tmp: Int64) {\n var vv = tmp\n let keep = 0\n}");
         // 引用顶层函数。
         assert_valid("func foo() {}\nmain() {\n foo()\n}");
+    }
+
+
+    // ─── 6.1.2.1(26)/(58)：成员初始化前的继承成员访问 ─────────────────────
+
+    #[test]
+    fn test_ctor_bare_inherited_method_before_init_invalid() {
+        // 裸名调用父类实例方法（继承而来的 f）在成员初始化前非法。
+        assert_invalid(
+            r#"open class P {
+  func f() {}
+}
+class A <: P {
+  init() {
+    f()
+    x = 1
+  }
+  var x: Int64
+}
+main() {}"#,
+        );
+    }
+
+
+    #[test]
+    fn test_ctor_super_property_before_init_invalid() {
+        // super.p 指向父类属性（getter），成员初始化前访问非法。
+        assert_invalid(
+            r#"open class P {
+  prop p: Int64 {
+    get() {
+      10
+    }
+  }
+}
+class A <: P {
+  init() {
+    let a = super.p
+    x = 1
+  }
+  var x: Int64
+}
+main() {}"#,
+        );
+    }
+
+
+    #[test]
+    fn test_ctor_bare_inherited_property_before_init_invalid() {
+        // 裸名读取父类属性（继承而来的 p）在成员初始化前非法。
+        assert_invalid(
+            r#"open class P {
+  prop p: Int64 {
+    get() {
+      10
+    }
+  }
+}
+class A <: P {
+  init() {
+    let a = p
+    x = 1
+  }
+  var x: Int64
+}
+main() {}"#,
+        );
+    }
+
+
+    #[test]
+    fn test_open_class_ctor_bare_member_invalid() {
+        // open 类构造函数内裸名调用实例方法（本类）非法。
+        assert_invalid(
+            r#"open class A {
+  init() {
+    f()
+  }
+  func f() {}
+}
+main() {}"#,
+        );
+        // open 类主构造函数内裸名调用继承方法非法。
+        assert_invalid(
+            r#"open class P {
+  func f() {}
+}
+open class A <: P {
+  A() {
+    f()
+  }
+}
+main() {}"#,
+        );
+    }
+
+
+    #[test]
+    fn test_abstract_class_ctor_bare_property_invalid() {
+        // abstract 类构造函数内裸名访问实例属性（本类）非法。
+        assert_invalid(
+            r#"abstract class A {
+  init() {
+    let a = p
+  }
+  prop p: Int64 {
+    get() {
+      10
+    }
+  }
+}
+main() {}"#,
+        );
+    }
+
+
+    #[test]
+    fn test_ctor_super_field_before_init_valid() {
+        // super 读取父类实例字段合法（父类构造函数已先行完成）。
+        assert_valid(
+            r#"open class P {
+  var fld: Int64 = 0
+}
+class A <: P {
+  init() {
+    let a = super.fld
+    x = 1
+  }
+  var x: Int64
+}
+main() {}"#,
+        );
+    }
+
+
+    #[test]
+    fn test_ctor_super_property_after_init_valid() {
+        // 全部成员初始化完成后，super 属性访问恢复合法。
+        assert_valid(
+            r#"open class P {
+  prop p: Int64 {
+    get() {
+      10
+    }
+  }
+}
+class A <: P {
+  init() {
+    x = 1
+    let a = super.p
+  }
+  var x: Int64
+}
+main() {}"#,
+        );
     }
 
 }
