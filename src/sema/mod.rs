@@ -4024,10 +4024,36 @@ fn visibility_rank(v: &Visibility) -> u8 {
 fn check_member_modifiers(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
     for m in &cls.methods {
         let sig = sig_of_class_method(m, &cls.type_params);
+        // 6.3.4.1(9)：static 初始化器只能被隐式调用，不能用 redef/override 修饰。
+        if sig.name == "__static_init" {
+            if m.override_ {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的 static 初始化器不能使用 redef/override（6.3.4.1(9)）",
+                        cls.name
+                    ),
+                });
+            }
+            continue;
+        }
         if is_synthetic_member(&sig.name) {
             continue;
         }
         let is_static = m.is_static;
+        // 6.1.2.4(36)：open 函数必须声明为 public 或 protected（默认 internal 不合法）。
+        // 属性访问器（__get_/__set_）不适用本规则：open 属性由属性声明自身约束。
+        if m.is_open
+            && !is_static
+            && !is_property_method_name(&sig.name)
+            && matches!(m.func.visibility, Visibility::Internal)
+        {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的 open 成员函数 '{}' 必须声明为 public 或 protected（6.1.2.4(36)）",
+                    cls.name, m.func.name
+                ),
+            });
+        }
         if m.is_open && is_static {
             errors.push(SemanticError {
                 message: format!(
@@ -7151,6 +7177,48 @@ fn signature_matches(a: &Sig, b: &Sig, strict_types: bool, index: &ProgramIndex<
     }
 }
 
+/// 类型中是否出现类型参数（泛型参数）。
+fn type_contains_type_param(t: &Type) -> bool {
+    match t {
+        Type::TypeParam(_) => true,
+        Type::Struct(_, args) => args.iter().any(type_contains_type_param),
+        Type::Array(i) | Type::Option(i) | Type::Slice(i) => type_contains_type_param(i),
+        Type::Tuple(ts) => ts.iter().any(type_contains_type_param),
+        Type::Result(x, y) | Type::Map(x, y) => {
+            type_contains_type_param(x) || type_contains_type_param(y)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(type_contains_type_param)
+                || ret
+                    .as_ref()
+                    .as_ref()
+                    .map_or(false, |t| type_contains_type_param(t))
+        }
+        _ => false,
+    }
+}
+
+/// 覆写时参数列表的严格匹配（6.3.1.1(3)）。
+///
+/// 当签名涉及类型参数且父类型的类级泛型已完全消解（`fully_concrete`）时，
+/// 参数类型必须严格一致：泛型参数不能与具体类型互换，不同位置的泛型参数
+/// 也不能互换。仅在 `signature_matches` 已通过时附加此判定，避免与既有
+/// 的宽松比较（类型不可比较时放行）冲突。
+fn strict_param_match(a: &Sig, b: &Sig, fully_concrete: bool) -> bool {
+    if !fully_concrete {
+        return true;
+    }
+    let generic_side = a
+        .params
+        .iter()
+        .chain(b.params.iter())
+        .any(type_contains_type_param);
+    if !generic_side {
+        return true;
+    }
+    canon_params(a) == canon_params(b)
+}
+
 /// 重定义（`redef`）的函数签名比较（6.3.4.1(3)）。
 ///
 /// 在父类型的类级泛型已按 `<: Parent<Args>>` 消解（`fully_concrete`）时，
@@ -7169,19 +7237,9 @@ fn redef_signature_matches(
     if a.named.len() == b.named.len() && a.named != b.named {
         return false;
     }
-    fn has_tp(t: &Type) -> bool {
-        match t {
-            Type::TypeParam(_) => true,
-            Type::Struct(_, args) => args.iter().any(has_tp),
-            Type::Array(i) | Type::Option(i) | Type::Slice(i) => has_tp(i),
-            Type::Tuple(ts) => ts.iter().any(has_tp),
-            Type::Result(x, y) | Type::Map(x, y) => has_tp(x) || has_tp(y),
-            Type::Function { params, ret } => {
-                params.iter().any(has_tp)
-                    || ret.as_ref().as_ref().map_or(false, has_tp)
-            }
-            _ => false,
-        }
+    // 6.3.4.1(1)：泛型函数与非泛型函数不构成同一签名/重定义。
+    if !generic_compatible(a.generic, b.generic) {
+        return false;
     }
     let generic_side = a
         .params
@@ -7189,7 +7247,7 @@ fn redef_signature_matches(
         .chain(a.ret.iter())
         .chain(b.params.iter())
         .chain(b.ret.iter())
-        .any(has_tp);
+        .any(type_contains_type_param);
     if !fully_concrete || !generic_side {
         return signature_matches(a, b, strict_types, index);
     }
@@ -7489,6 +7547,17 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
         if is_synthetic_member(&sig.name) {
             continue;
         }
+        // 6.3.1.1(1)：static 函数不能被 override（实例覆写语义），
+        // static 函数的再定义应使用 redef（6.3.4.1(1)）。
+        if method.has_override_kw && method.is_static {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的 static 成员函数 '{}' 不能使用 override（应使用 redef，6.3.1.1(1)）",
+                    cls.name, sig.display
+                ),
+            });
+            continue;
+        }
         // 抽象的 mut prop 只会脱糖出 __get_x（解析器不生成抽象 setter），
         // 因此 setter 的 override 只要能找到同名 getter 就视为合法。
         let alt_getter = sig
@@ -7517,19 +7586,67 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
             });
             continue;
         }
-        let matched = same_name.iter().any(|p| {
-            let s = if method.has_override_kw {
-                signature_matches(&sig, &p.sig, p.strict_types, index)
+        // 逐父成员判定是否构成合法覆写/重定义。
+        let mut any_matched = false;
+        let mut any_concrete = false;
+        // 6.3.4.1(6)：同一个 redef 函数重定义多个父类型中同名同参数列表的函数时，
+        // 必须与每一个都兼容（返回类型逐一对齐），不能只满足其中一个。
+        let mut redef_partial_conflict = false;
+        for p in &same_name {
+            let same_name_match = p.sig.name == sig.name;
+            let matched = if same_name_match {
+                if method.has_override_kw {
+                    signature_matches(&sig, &p.sig, p.strict_types, index)
+                        // 6.3.1.1(1)：泛型性质（方法级类型参数）不同不构成覆写。
+                        && generic_compatible(sig.generic, p.sig.generic)
+                        // 6.3.1.1(3)：类级泛型已消解时参数类型须严格一致。
+                        && strict_param_match(&sig, &p.sig, p.fully_concrete)
+                } else {
+                    // redef：显式泛型替换后的严格比较（6.3.4.1(3)）。
+                    redef_signature_matches(
+                        &sig,
+                        &p.sig,
+                        p.fully_concrete,
+                        p.strict_types,
+                        index,
+                    )
+                }
             } else {
-                // redef：显式泛型替换后的严格比较（6.3.4.1(3)）。
-                redef_signature_matches(&sig, &p.sig, p.fully_concrete, p.strict_types, index)
+                // 抽象 mut prop 只脱糖出 getter 时的兼容路径。
+                alt_getter.as_deref() == Some(p.sig.name.as_str())
             };
-            (p.sig.name == sig.name && s) || alt_getter.as_deref() == Some(p.sig.name.as_str())
-        });
-        if !matched {
+            if matched {
+                any_matched = true;
+                if same_name_match && !p.abstract_ {
+                    any_concrete = true;
+                }
+            } else if same_name_match
+                && !method.has_override_kw
+                && !is_property_method_name(&sig.name)
+                && canon_params(&sig) == canon_params(&p.sig)
+            {
+                redef_partial_conflict = true;
+            }
+        }
+        if !any_matched {
             errors.push(SemanticError {
                 message: format!(
                     "类 '{}' 的 '{}' 与父类型函数的参数列表或返回类型不一致",
+                    cls.name, sig.display
+                ),
+            });
+        } else if redef_partial_conflict {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的 '{}' 与部分父类型同名函数的参数列表相同但返回类型不兼容（6.3.4.1(6)）",
+                    cls.name, sig.display
+                ),
+            });
+        } else if !method.has_body && any_concrete {
+            // 6.3.1.1(1)/(2)：无实现体的覆写（抽象声明）不能覆写父类型中有实现的函数。
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的抽象成员函数 '{}' 不能覆写父类型中有实现的函数（6.3.1.1(1)）",
                     cls.name, sig.display
                 ),
             });
@@ -13826,10 +13943,10 @@ mod tests {
     fn test_validate_override_matching_signature_ok() {
         assert_valid(
             "open class P {\n\
-             \x20   open func f(x: Int64) {}\n\
+             \x20   public open func f(x: Int64) {}\n\
              }\n\
              class C <: P {\n\
-             \x20   override func f(x: Int64) {}\n\
+             \x20   public override func f(x: Int64) {}\n\
              }\n\
              main() {}\n",
         );
@@ -13842,10 +13959,10 @@ mod tests {
             "open class Sup {}\n\
              class Sub <: Sup {}\n\
              open class P {\n\
-             \x20   open func f(): Sup { Sup() }\n\
+             \x20   public open func f(): Sup { Sup() }\n\
              }\n\
              class C <: P {\n\
-             \x20   override func f(): Sub { Sub() }\n\
+             \x20   public override func f(): Sub { Sub() }\n\
              }\n\
              main() {}\n",
         );
@@ -16225,10 +16342,10 @@ main() {}"#,
     fn test_w13d_this_override_return() {
         // 覆写返回 This 的父函数时返回类型必须保持 This。
         assert_invalid(
-            "open class A {\n open func f(): This { this }\n}\nclass B <: A {\n func f(): A { this }\n}\nmain() {}",
+            "open class A {\n public open func f(): This { this }\n}\nclass B <: A {\n func f(): A { this }\n}\nmain() {}",
         );
         assert_valid(
-            "open class A {\n open func f(): This { this }\n}\nclass B <: A {\n override func f(): This { this }\n}\nmain() {}",
+            "open class A {\n public open func f(): This { this }\n}\nclass B <: A {\n public override func f(): This { this }\n}\nmain() {}",
         );
     }
 
@@ -16293,6 +16410,105 @@ main() {}"#,
         );
         assert_valid(
             "interface I {\n func f() { 1 }\n}\ninterface J <: I {\n override func f() { 1 }\n}\nmain() {}",
+        );
+    }
+
+
+    // ─── w14b：06 章接口/继承系细则（6.1.2.4(36)/6.3.1.1/6.3.4.1） ──────
+
+    #[test]
+    fn test_w14b_open_func_needs_public_protected() {
+        // 6.1.2.4(36)：open 函数只能 public/protected；默认 internal 非法。
+        assert_invalid("open class A {\n open func f() {}\n}\nmain() {}");
+        assert_invalid("abstract class A {\n open func f() {}\n}\nmain() {}");
+        assert_valid("open class A {\n public open func f() {}\n}\nmain() {}");
+        assert_valid("open class A {\n protected open func f() {}\n}\nmain() {}");
+    }
+
+
+    #[test]
+    fn test_w14b_redef_static_init_illegal() {
+        // 6.3.4.1(9)：static 初始化器不能被 redef 修饰。
+        assert_invalid(
+            "open class A {\n static init() {}\n}\nclass C <: A {\n redef static init() {}\n}\nmain() {}",
+        );
+        assert_valid(
+            "open class A {\n static init() {}\n}\nclass C <: A {\n static init() {}\n}\nmain() {}",
+        );
+    }
+
+
+    #[test]
+    fn test_w14b_static_cannot_override() {
+        // 6.3.1.1(1)：static 函数不能用 override（应用 redef）。
+        assert_invalid(
+            "interface I {\n static func f() {}\n}\nclass A <: I {\n public override static func f() {}\n}\nmain() {}",
+        );
+        assert_valid(
+            "interface I {\n static func f() {}\n}\nclass A <: I {\n public redef static func f() {}\n}\nmain() {}",
+        );
+    }
+
+
+    #[test]
+    fn test_w14b_override_generic_arity_mismatch() {
+        // 6.3.1.1(1)：泛型函数不能覆写同名的非泛型函数。
+        assert_invalid(
+            "abstract class A {\n public func f(): Unit\n}\nclass C <: A {\n public override func f<T>() {}\n}\nmain() {}",
+        );
+        assert_valid(
+            "abstract class A {\n public func f<T>(): Unit\n}\nclass C <: A {\n public override func f<T>() {}\n}\nmain() {}",
+        );
+    }
+
+
+    #[test]
+    fn test_w14b_override_type_param_param_mismatch() {
+        // 6.3.1.1(3)：类级类型参数作为参数类型时不能覆写具体类型的父函数。
+        assert_invalid(
+            "interface I {\n func f(x: Rune): Unit\n}\nabstract class A<T> <: I {\n public override func f(x: T) {}\n}\nmain() {}",
+        );
+        // 对齐的类级类型参数可以合法覆写。
+        assert_valid(
+            "abstract class P<T> {\n public open func f(x: T) {}\n}\nclass C<T> <: P<T> {\n public override func f(x: T) {}\n}\nmain() {}",
+        );
+    }
+
+
+    #[test]
+    fn test_w14b_abstract_override_concrete_illegal() {
+        // 6.3.1.1(1)：无实现体的（抽象）覆写不能覆盖有实现的父函数。
+        assert_invalid(
+            "abstract class A {\n public open func f() {}\n}\nabstract class C <: A {\n public override func f(): Unit\n}\nmain() {}",
+        );
+        assert_valid(
+            "abstract class A {\n public func f(): Unit\n}\nabstract class C <: A {\n public override func f(): Unit\n}\nmain() {}",
+        );
+    }
+
+
+    #[test]
+    fn test_w14b_redef_static_generic_arity_mismatch() {
+        // 6.3.4.1(1)：static 泛型函数不能 redef 同名的非泛型 static 函数。
+        assert_invalid(
+            "interface I {\n static func f() {}\n}\nclass A <: I {\n public redef static func f<T>() {}\n}\nmain() {}",
+        );
+        assert_valid(
+            "interface I {\n static func f<T>() {}\n}\nclass A <: I {\n public redef static func f<T>() {}\n}\nmain() {}",
+        );
+    }
+
+
+    #[test]
+    fn test_w14b_redef_multi_parent_return_conflict() {
+        // 6.3.4.1(6)：redef 同时重定义多个父类型中同名同参数的函数时，
+        // 返回类型必须与每一个都兼容。
+        assert_invalid(
+            "open class R {}\nclass Bad <: R {}\ninterface I {\n static func f(): Bad\n}\ninterface J {\n static func f(): Object { Object() }\n}\nclass A <: I & J {\n public redef static func f(): R { R() }\n}\nmain() {}",
+        );
+        // 返回类型对每个父类型都满足协变：合法。
+        assert_valid(
+            "open class R {}\nclass Sub <: R {}\ninterface I {\n static func f(): R\n}\ninterface J {\n static func f(): Object { Object() }\n}\nclass A <: I & J {\n public redef static func f(): Sub { Sub() }\n}\nmain() {}",
         );
     }
 
