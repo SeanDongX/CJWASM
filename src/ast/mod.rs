@@ -458,6 +458,10 @@ pub struct FieldDef {
     pub is_mut: bool,
     /// 是否为 static 字段（static let/var）。
     pub is_static: bool,
+    /// 字段声明是否显式带有 `let`/`var`/`const` 关键字（或来自主构造函数成员参数）。
+    /// 本方言兼容 `struct S { x: Int64 }` 这种无关键字的字面量构造形态，
+    /// 此类字段不参与“隐式构造函数要求初始值”（2.1.10.2(44)）检查。
+    pub decl_kw: bool,
     /// 字段可见性（接口/结构体字段未标注时按 public 处理）。
     pub visibility: Visibility,
 }
@@ -685,6 +689,8 @@ pub struct InitDef {
     pub member_param_flags: Vec<bool>,
     /// 是否为 const 初始化器（`const init`）：可作为常量表达式/常量构造（16.2(7)）。
     pub is_const: bool,
+    /// 构造函数可见性（`private init` 等，2.1.10.2(3)）。
+    pub visibility: Visibility,
 }
 
 /// 类方法（含 override 标记）

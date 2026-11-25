@@ -1552,6 +1552,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     .as_ref()
                     .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
                 is_mut: f.is_mut,
+                decl_kw: true,
             })
             .collect();
         new_structs.push(StructDef {
@@ -1631,6 +1632,7 @@ pub fn monomorphize_program(program: &mut Program) {
                     .as_ref()
                     .map(|d| substitute_expr(d.clone(), &subst, &rewrites)),
                 is_mut: f.is_mut,
+                decl_kw: true,
             })
             .collect();
         let methods: Vec<ClassMethod> = def
@@ -1693,6 +1695,7 @@ pub fn monomorphize_program(program: &mut Program) {
             .collect();
         let init = def.init.as_ref().map(|i| InitDef {
             is_const: false,
+            visibility: i.visibility.clone(),
             params: i
                 .params
                 .iter()
@@ -2069,12 +2072,14 @@ mod tests {
                         ty: Type::TypeParam("T".to_string()),
                         default: None,
                         is_mut: true,
+                        decl_kw: true,
                     },
                     crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "second".to_string(),
                         ty: Type::TypeParam("U".to_string()),
                         default: None,
                         is_mut: true,
+                        decl_kw: true,
                     },
                 ],
             
@@ -2136,12 +2141,14 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                         ty: Type::TypeParam("A".to_string()),
                         default: None,
                         is_mut: true,
+                        decl_kw: true,
                     },
                     crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "y".to_string(),
                         ty: Type::TypeParam("B".to_string()),
                         default: None,
                         is_mut: true,
+                        decl_kw: true,
                     },
                 ],
             
@@ -2205,6 +2212,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                     ty: Type::Int64,
                     default: None,
                     is_mut: true,
+                    decl_kw: true,
                 }],
             
             inits: vec![],
@@ -2327,6 +2335,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                     ty: Type::TypeParam("T".to_string()),
                     default: None,
                     is_mut: true,
+                    decl_kw: true,
                 }],
             
             inits: vec![],
@@ -2395,9 +2404,11 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                         ty: Type::TypeParam("T".to_string()),
                         default: None,
                         is_mut: true,
+                        decl_kw: true,
                     }],
                     init: Some(InitDef {
                         is_const: false,
+                        visibility: crate::ast::Visibility::Internal,
                         params: vec![crate::ast::Param {
                             name: "d".to_string(),
                             ty: Type::TypeParam("T".to_string()),
@@ -2506,12 +2517,14 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                         ty: Type::TypeParam("A".to_string()),
                         default: None,
                         is_mut: true,
+                        decl_kw: true,
                     },
                     crate::ast::FieldDef { is_static: false, visibility: crate::ast::Visibility::Public,
                         name: "b".to_string(),
                         ty: Type::TypeParam("B".to_string()),
                         default: None,
                         is_mut: true,
+                        decl_kw: true,
                     },
                 ],
             
@@ -2753,6 +2766,7 @@ primary_ctor_visibility: crate::ast::Visibility::Internal,
                     ty: Type::TypeParam("T".to_string()),
                     default: None,
                     is_mut: true,
+                    decl_kw: true,
                 }],
             
             inits: vec![],

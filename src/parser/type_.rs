@@ -248,6 +248,18 @@ impl Parser {
         if self.check(&Token::Dollar) {
             self.advance();
         }
+        // 2.1.12(5)：VArray 的长度必须为非负整数常量。
+        if self.check(&Token::Minus)
+            && matches!(
+                self.peek_next(),
+                Some(Token::Integer(_)) | Some(Token::IntegerSuffixed(_))
+            )
+        {
+            return self.bail(ParseError::UnexpectedToken(
+                Token::Minus,
+                "VArray 长度不能为负数（2.1.12(5)）".to_string(),
+            ));
+        }
         // 仅当恰好是一个整数字面量时才记录长度值
         if let Some(Token::Integer(n)) | Some(Token::IntegerSuffixed((n, _))) =
             self.peek().cloned()

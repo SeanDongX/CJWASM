@@ -7643,6 +7643,29 @@ fn check_struct_interfaces<'a>(
     }
     check_interface_property_types(&st.name, &own_impls, &parents, index, errors);
     check_interface_property_mut(&st.name, &own_impls, &parents, errors);
+    // 2.1.10(8)：结构体实现接口时，同名方法的签名必须与接口声明一致；
+    // 接口成员即使带默认实现也同样适用（与类的“重载”语义不同）。
+    for p in &parents {
+        if !p.is_interface || p.abstract_ || is_synthetic_member(&p.sig.name) {
+            continue;
+        }
+        for s in &own_impls {
+            if s.name != p.sig.name || is_synthetic_member(&s.name) {
+                continue;
+            }
+            if canon_params(s) == canon_params(&p.sig)
+                && !signature_matches(s, &p.sig, p.strict_types, index)
+            {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 实现的接口函数 '{}' 签名与接口声明不一致（2.1.10(8)）",
+                        st.name, s.display
+                    ),
+                });
+                break;
+            }
+        }
+    }
 }
 
 fn is_property_method_name(name: &str) -> bool {
@@ -13545,6 +13568,30 @@ main() {}"#,
         assert_valid("import std.math.*\nmain() {\n let x = PI\n}");
         // 首字母大写的裸名按类型/隐式导入符号放行。
         assert_valid("main() {\n let v = KeyOpt\n}");
+    }
+
+
+    #[test]
+    fn test_w11c_struct_interface_signature_mismatch() {
+        // 2.1.10(8)：结构体实现接口时同名方法签名必须与接口声明一致
+        // （即使接口成员带默认实现）。
+        let errs = assert_invalid(
+            "interface I { func f(): Int8 { 1i8 } }\n\
+             struct S <: I { public func f(): Int32 { 1 } }\n\
+             main() {}",
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("签名与接口声明不一致")),
+            "实际错误: {:?}",
+            errs
+        );
+        // 正例：签名一致时通过。
+        assert_valid(
+            "interface I { func f(): Int8 { 1i8 } }\n\
+             struct S <: I { public func f(): Int8 { 1i8 } }\n\
+             main() {}",
+        );
     }
 
 }
