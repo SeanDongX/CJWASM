@@ -1353,6 +1353,13 @@ impl Parser {
                     self.advance();
                 }
                 self.expect(Token::RParen)?;
+                // 5.7.1(3)/2.1.10.2：结构体主构造函数同样须与已解析的 init 构成重载。
+                if !self.pending_decl_attr && ctor_sigs.contains(&primary_sig) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::LParen,
+                        "结构体构造函数签名重复".to_string(),
+                    ));
+                }
                 ctor_sigs.push(primary_sig);
                 // 主构造函数体（表达式或声明），保留用于构造语义校验。
                 // 2.1.10.2(2)：主构造函数必须有 `{ ... }` 函数体。
@@ -1391,6 +1398,8 @@ impl Parser {
                     params: primary_params.clone(),
                     body: init_body,
                     member_param_flags: primary_member_flags.clone(),
+                    member_param_vis: Vec::new(),
+                    member_param_mut: Vec::new(),
                 });
                 continue;
             }
@@ -1484,6 +1493,8 @@ impl Parser {
                     params,
                     body,
                     member_param_flags: member_flags,
+                    member_param_vis: Vec::new(),
+                    member_param_mut: Vec::new(),
                 };
                 inits.push(idef);
                 continue;
@@ -3377,6 +3388,8 @@ impl Parser {
                     params,
                     body,
                     member_param_flags: vec![],
+                    member_param_vis: Vec::new(),
+                    member_param_mut: Vec::new(),
                 };
                 inits.push(idef.clone());
                 init = Some(idef);
@@ -3746,20 +3759,33 @@ impl Parser {
                 self.expect(Token::LParen)?;
                 let mut params = Vec::new();
                 let mut member_param_flags: Vec<bool> = Vec::new();
+                let mut member_param_vis: Vec<Visibility> = Vec::new();
+                let mut member_param_mut: Vec<bool> = Vec::new();
                 while !self.check(&Token::RParen) {
-                    // 跳过可选的可见性修饰符 (private/public/protected/internal)
-                    let has_vis = if self.check(&Token::Private)
-                        || self.check(&Token::Public)
-                        || self.check(&Token::Protected)
-                        || self.check(&Token::Internal)
-                    {
-                        self.advance();
-                        true
-                    } else {
-                        false
+                    // 可选的可见性修饰符 (private/public/protected/internal)；
+                    // 记录实际可见性以供 6.1.2.1(14) 校验。
+                    let (has_vis, param_vis) = match self.peek() {
+                        Some(Token::Private) => {
+                            self.advance();
+                            (true, Visibility::Private)
+                        }
+                        Some(Token::Public) => {
+                            self.advance();
+                            (true, Visibility::Public)
+                        }
+                        Some(Token::Protected) => {
+                            self.advance();
+                            (true, Visibility::Protected)
+                        }
+                        Some(Token::Internal) => {
+                            self.advance();
+                            (true, Visibility::Internal)
+                        }
+                        _ => (false, Visibility::Internal),
                     };
-                    // 跳过可选的 let/var 前缀，并记录是否为成员变量参数
-                    let is_member = self.check(&Token::Let) || self.check(&Token::Var);
+                    // 可选的 let/var 前缀，并记录是否为成员变量参数及其可变性
+                    let is_var = self.check(&Token::Var);
+                    let is_member = self.check(&Token::Let) || is_var;
                     if is_member {
                         self.advance();
                     }
@@ -3825,12 +3851,34 @@ impl Parser {
                         is_inout: false,
                     });
                     member_param_flags.push(is_member);
+                    member_param_vis.push(if is_member {
+                        param_vis.clone()
+                    } else {
+                        Visibility::Internal
+                    });
+                    member_param_mut.push(is_member && is_var);
                     if !self.check(&Token::Comma) {
                         break;
                     }
                     self.advance();
                 }
                 self.expect(Token::RParen)?;
+                // 6.1.2.1(33)：类名形式主构造函数同样须与已解析的 init 构造函数构成重载。
+                if !self.pending_decl_attr
+                    && inits.iter().any(|prev| {
+                        prev.params.len() == params.len()
+                            && prev
+                                .params
+                                .iter()
+                                .zip(params.iter())
+                                .all(|(a, b)| a.ty == b.ty)
+                    })
+                {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::LParen,
+                        "构造函数签名重复（6.1.2.1(33)）".to_string(),
+                    ));
+                }
                 let _ = self.parse_where_clause()?;
                 self.receiver_name = Some("this".to_string());
                 self.expect(Token::LBrace)?;
@@ -3850,6 +3898,8 @@ impl Parser {
                     params,
                     body,
                     member_param_flags,
+                    member_param_vis,
+                    member_param_mut,
                 };
                 inits.push(idef.clone());
                 init = Some(idef);
@@ -4117,6 +4167,8 @@ impl Parser {
                         params,
                         body,
                         member_param_flags: vec![],
+                        member_param_vis: Vec::new(),
+                        member_param_mut: Vec::new(),
                     };
                     inits.push(idef.clone());
                     init = Some(idef);
@@ -4229,6 +4281,8 @@ impl Parser {
                     params: primary_ctor_params,
                     body: init_body,
                     member_param_flags: primary_ctor_member_flags,
+                    member_param_vis: Vec::new(),
+                    member_param_mut: Vec::new(),
                 };
                 class_def.inits.push(implicit.clone());
                 class_def.init = Some(implicit);
@@ -5891,5 +5945,15 @@ main() {}
         err("struct S { }\nextend S {\n static mut func f() { }\n}\nmain() { }");
         // 5.8.1：类型别名扩展中的成员函数不能声明为 mut。
         err("type T = Int64\nextend T {\n mut func f(): T { this }\n}\nmain() { }");
+    }
+
+    #[test]
+    fn test_w19b_duplicate_ctor_signatures() {
+        // 5.7.1(3)：构造函数（含类名形式主构造函数）形参类型列表不得重复。
+        err("class A {\n init(x: Int64) {}\n init(x: Int64) {}\n}\nmain() { }");
+        err("class A {\n init(x: Int64) {}\n A(x: Int64) {}\n}\nmain() { }");
+        err("struct S {\n init(x: Int64) {}\n S(x: Int64) {}\n}\nmain() { }");
+        ok("class A {\n init(x: Int64) {}\n init(y: Bool) {}\n}\nmain() { }");
+        ok("class A {\n init(x: Int64) {}\n A(y: Bool) {}\n}\nmain() { }");
     }
 }

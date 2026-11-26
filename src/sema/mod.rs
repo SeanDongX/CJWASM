@@ -437,7 +437,11 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         check_instance_field_initializers(cls, &mut errors);
         // 6.1.2.1(56)：open/abstract 类构造函数不得调用实例成员函数/属性。
         check_open_class_ctor_member_calls(cls, &index, &mut errors);
+        // 6.1.2.1(9)：`let` 成员变量形参生成的成员不可重新赋值。
+        check_member_param_mutability(cls, &mut errors);
     }
+    // 6.1.2.1(14)：private 成员变量形参生成的成员在类外不可访问。
+    check_private_member_param_access(program, &mut errors);
     // 6.1.2.1(39)：类的全部构造函数均为 private 时，类外（含子类的 super()）不可调用。
     check_private_ctor_access(program, &mut errors);
     // 6.1.2.1(48)：没有显式构造函数的类不能存在未初始化的实例成员变量。
@@ -540,6 +544,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 13.1.1 / 13.1.2.2 / 13.1.4(1)：unsafe 上下文、CFunc 细则与变长 CType 实参。
     check_unsafe_context(program, &mut errors);
     check_cfunc_lambda_capture(program, &mut errors);
+    // 5.6(7)-(11)：捕获可变局部变量的闭包不能作为一等值使用。
+    check_mutable_closure_capture(program, &mut errors);
+    // 5.6(15)/(16)、5.1.3.2(2)：闭包捕获变量的可见性与初始化。
+    check_closure_capture_scope(program, &mut errors);
     check_ctype_annotation_binding(program, &mut errors);
     check_variadic_c_ctype_args(program, &index, &mut errors);
     // 6.1.2.1(60)：构造函数之间的循环调用依赖。
@@ -1441,6 +1449,9 @@ struct Sig {
     params: Vec<Type>,
     /// 各参数是否为“命名参数”（声明带 `!`），与 `params` 对齐。
     named: Vec<bool>,
+    /// 命名形参的名字（按声明顺序，仅 `named` 为 true 者）。
+    /// 5.1.2.1(6)：实现/覆写函数必须保持相同的命名形参名与顺序。
+    named_names: Vec<String>,
     /// 返回类型；None 表示未标注（Unit 推断）。
     ret: Option<Type>,
     /// 是否带方法级泛型参数；None 表示语言层不可见（接口方法）。
@@ -1460,6 +1471,28 @@ struct Sig {
 
 fn is_receiver_param(name: &str) -> bool {
     name == "this" || name == "self"
+}
+
+/// 命名形参名（剥离首个隐式/显式接收者，按声明顺序）。
+fn named_param_names(params: &[crate::ast::Param]) -> Vec<String> {
+    let ps = if params
+        .first()
+        .map_or(false, |p| is_receiver_param(&p.name))
+    {
+        &params[1..]
+    } else {
+        params
+    };
+    ps.iter()
+        .filter(|p| p.is_named)
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// 5.1.2.1(6)：父函数的命名形参名与顺序须被实现/覆写函数保持一致。
+/// 父函数没有命名形参时不做限制（保守）。
+fn named_names_compatible(own: &[String], parent: &[String]) -> bool {
+    parent.is_empty() || own == parent
 }
 
 /// 剥离第一个隐式/显式接收者参数，返回（其余参数类型, 命名参数标记, 是否静态）。
@@ -1484,6 +1517,7 @@ fn split_receiver(params: &[crate::ast::Param]) -> (Vec<Type>, Vec<bool>, bool) 
 
 fn sig_of_function(func: &Function, outer_tp: &[String]) -> Sig {
     let (params, named, is_static) = split_receiver(&func.params);
+    let named_names = named_param_names(&func.params);
     // 属性访问器脱糖方法名形如 `Class.__get_p`，按成员名比较时去掉前缀。
     let name = func
         .name
@@ -1496,6 +1530,7 @@ fn sig_of_function(func: &Function, outer_tp: &[String]) -> Sig {
         name,
         params,
         named,
+        named_names,
         ret: func.return_type.clone(),
         generic: Some(!func.type_params.is_empty()),
         tp_order,
@@ -1541,6 +1576,7 @@ fn sig_of_interface_method_tp(method: &InterfaceMethod, outer_tp: &[String]) -> 
         name: method.name.clone(),
         params,
         named,
+        named_names: named_param_names(&method.params),
         ret: method.return_type.clone(),
         generic: Some(!method.type_params.is_empty()),
         tp_order,
@@ -4685,13 +4721,13 @@ fn check_ctor_definite_assignment(cls: &ClassDef, errors: &mut Vec<SemanticError
     // 6.1.2.1(11)：以主构造函数成员变量参数（如类名形式的 `Foo(var x: Int64)`）
     // 隐式定义的实例成员变量同样要求在所有构造函数中初始化。这类字段未进入
     // `cls.fields`，需从各构造函数的 member_param_flags 补入。
+    // 6.1.2.1(20)：成员变量_form 形参的初始值只在主构造函数中有效，不构成成员
+    // 变量定义处的初始值——因此不能把它当作 `auto`（已初始化），否则其它构造
+    // 函数遗漏初始化时不会被发现（官方 06_01_02_03 a02、06_01_02_01 a20 负例）。
     for init in &inits {
         for (p, flag) in init.params.iter().zip(init.member_param_flags.iter()) {
             if *flag {
                 fields.insert(p.name.clone());
-                if p.default.is_some() {
-                    auto.insert(p.name.clone());
-                }
             }
         }
     }
@@ -6673,6 +6709,32 @@ fn check_supertype_declaration_kinds(
                 .iter()
                 .any(|f| !f.name.contains('.') && !f.name.contains("::") && f.name == n)
     };
+    // 6.1.1(4)：父类/接口必须是绑定到类型的有效引用。仅在无 import 的单文件
+    // 程序上启用（导入的依赖类型无法静态确定），确保 std 零回归。
+    let known_type = |n: &str| -> bool {
+        let base = n.split('<').next().unwrap_or(n).trim();
+        program.classes.iter().any(|c| c.name == base)
+            || program.structs.iter().any(|s| s.name == base)
+            || program.enums.iter().any(|e| e.name == base)
+            || program.interfaces.iter().any(|i| i.name == base)
+            || program.type_aliases.iter().any(|(a, _)| a == base)
+            || cls.type_params.iter().any(|t| t == base)
+            // 核心库中常见但未列入 is_prelude_identifier 的类型/接口名。
+            || matches!(
+                base,
+                "Resource"
+                    | "Countable"
+                    | "AutoCloseable"
+                    | "NamedResource"
+                    // std.unittest 测试模式下隐式可见的策略接口。
+                    | "DataStrategy"
+                    | "DataProvider"
+                    | "DataShrinker"
+                    | "Configuration"
+            )
+            || is_prelude_identifier(base)
+    };
+    let single_file = program.imports.is_empty();
     if let Some(parent) = cls.extends.as_deref() {
         if parent == "Range" {
             errors.push(SemanticError {
@@ -6696,6 +6758,16 @@ fn check_supertype_declaration_kinds(
                     cls.name, parent
                 ),
             });
+        } else if single_file
+            && parent.split('<').next().unwrap_or(parent).trim().len() > 1
+            && !known_type(parent)
+        {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的父类 '{}' 未绑定到任何类型（6.1.1(4)）",
+                    cls.name, parent
+                ),
+            });
         }
     }
     for name in &cls.implements {
@@ -6710,6 +6782,17 @@ fn check_supertype_declaration_kinds(
             errors.push(SemanticError {
                 message: format!(
                     "类 '{}' 的接口 '{}' 绑定到变量/函数而非类型（6.1.1(4)）",
+                    cls.name, name
+                ),
+            });
+        } else if single_file
+            && name.split('<').next().unwrap_or(name).trim().len() > 1
+            && !known_type(name)
+            && !program.interfaces.iter().any(|i| &i.name == name)
+        {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的接口 '{}' 未绑定到任何类型（6.1.1(4)）",
                     cls.name, name
                 ),
             });
@@ -8959,6 +9042,8 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
                             || !generic_signature_shape_conflict(&sig, &p.sig))
                         // 6.3.1.1(3)：类级泛型已消解时参数类型须严格一致。
                         && strict_param_match(&sig, &p.sig, p.fully_concrete)
+                        // 5.1.2.1(6)：命名形参名与顺序须与被覆写函数一致。
+                        && named_names_compatible(&sig.named_names, &p.sig.named_names)
                 } else {
                     // redef：显式泛型替换后的严格比较（6.3.4.1(3)）。
                     redef_signature_matches(
@@ -8967,7 +9052,7 @@ fn check_class_overrides(cls: &ClassDef, index: &ProgramIndex<'_>, errors: &mut 
                         p.fully_concrete,
                         p.strict_types,
                         index,
-                    )
+                    ) && named_names_compatible(&sig.named_names, &p.sig.named_names)
                 }
             } else {
                 // 抽象 mut prop 只脱糖出 getter 时的兼容路径。
@@ -9778,6 +9863,8 @@ fn check_abstract_methods_implemented(
                 && !(p.fully_concrete
                     && both_generic
                     && generic_signature_shape_conflict(s, &p.sig))
+                // 5.1.2.1(6)：命名形参名与顺序须与接口/父类声明一致。
+                && named_names_compatible(&s.named_names, &p.sig.named_names)
         });
         if matched {
             continue;
@@ -10114,7 +10201,9 @@ fn check_struct_interfaces<'a>(
                 continue;
             }
             if canon_params(s) == canon_params(&p.sig)
-                && !signature_matches(s, &p.sig, p.strict_types, index)
+                && (!signature_matches(s, &p.sig, p.strict_types, index)
+                    // 5.1.2.1(6)：命名形参名与顺序须与接口声明一致。
+                    || !named_names_compatible(&s.named_names, &p.sig.named_names))
             {
                 errors.push(SemanticError {
                     message: format!(
@@ -10879,6 +10968,22 @@ fn collect_private_parent_members<'a>(
                 out.insert(f.name.clone());
             }
         }
+        // 6.1.2.1(14)：类名形式主构造函数的 private 成员变量形参同样不可在子类中访问。
+        for init in &parent.inits {
+            if init.member_param_vis.len() != init.params.len() {
+                continue;
+            }
+            for ((p, flag), vis) in init
+                .params
+                .iter()
+                .zip(init.member_param_flags.iter())
+                .zip(init.member_param_vis.iter())
+            {
+                if *flag && *vis == Visibility::Private {
+                    out.insert(p.name.clone());
+                }
+            }
+        }
         for m in &parent.methods {
             let sig = sig_of_class_method(m, &parent.type_params);
             if m.func.visibility == Visibility::Private && !is_synthetic_member(&sig.name) {
@@ -10970,6 +11075,150 @@ fn check_private_parent_access(
                     cls.name, m.func.name, name
                 ),
             });
+        }
+    }
+}
+
+// ─── 6.1.2.1(9)/(14)：成员变量形参生成成员的 mut/可见性 ────────────────────
+
+/// 类名形式主构造函数（`ClassName(var x: T)` / `ClassName(let x: T)`）的成员
+/// 变量形参会生成实例字段。6.1.2.1(9)：`let` 生成的成员不可变，方法体内对
+/// 其重新赋值非法。
+fn check_member_param_mutability(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
+    let mut let_fields: HashSet<String> = HashSet::new();
+    for init in &cls.inits {
+        if init.member_param_mut.len() != init.params.len()
+            || init.member_param_flags.len() != init.params.len()
+        {
+            continue;
+        }
+        for ((p, flag), is_mut) in init
+            .params
+            .iter()
+            .zip(init.member_param_flags.iter())
+            .zip(init.member_param_mut.iter())
+        {
+            if *flag && !*is_mut {
+                let_fields.insert(p.name.clone());
+            }
+        }
+    }
+    if let_fields.is_empty() {
+        return;
+    }
+    fn scan(
+        stmts: &[Stmt],
+        let_fields: &HashSet<String>,
+        locals: &HashSet<String>,
+        hits: &mut Vec<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Assign { target, .. } => {
+                    let name = match target {
+                        AssignTarget::Var(n) => Some(n.as_str()),
+                        AssignTarget::Field { object, field } if object == "this" => {
+                            Some(field.as_str())
+                        }
+                        _ => None,
+                    };
+                    if let Some(n) = name {
+                        if let_fields.contains(n) && !locals.contains(n) {
+                            hits.push(n.to_string());
+                        }
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::WhileLet { body, .. } => scan(body, let_fields, locals, hits),
+                Stmt::LocalFunc(f) => scan(&f.body, let_fields, locals, hits),
+                _ => {}
+            }
+        }
+    }
+    for m in &cls.methods {
+        if is_synthetic_member(&m.func.name) || !m.has_body {
+            continue;
+        }
+        let mut locals: HashSet<String> = m.func.params.iter().map(|p| p.name.clone()).collect();
+        collect_bindings_stmts(&m.func.body, &mut locals);
+        let mut hits: Vec<String> = Vec::new();
+        scan(&m.func.body, &let_fields, &locals, &mut hits);
+        hits.sort();
+        hits.dedup();
+        for name in hits {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的方法 '{}' 不能给 `let` 成员变量 '{}' 重新赋值（6.1.2.1(9)）",
+                    cls.name, m.func.name, name
+                ),
+            });
+        }
+    }
+}
+
+/// 6.1.2.1(14)：类名形式主构造函数的 `private` 成员变量形参生成的成员
+/// 在类外不可访问（`obj.x`）。
+fn check_private_member_param_access(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut private_map: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for cls in &program.classes {
+        let mut set: HashSet<&str> = HashSet::new();
+        for init in &cls.inits {
+            if init.member_param_vis.len() != init.params.len() {
+                continue;
+            }
+            for ((p, flag), vis) in init
+                .params
+                .iter()
+                .zip(init.member_param_flags.iter())
+                .zip(init.member_param_vis.iter())
+            {
+                if *flag && *vis == Visibility::Private {
+                    set.insert(p.name.as_str());
+                }
+            }
+        }
+        if !set.is_empty() {
+            private_map.insert(cls.name.as_str(), set);
+        }
+    }
+    if private_map.is_empty() {
+        return;
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut scan_body = |params: &[Param], body: &[Stmt]| {
+        let vars = local_var_types_full(params, body);
+        walk_stmts(body, &mut |e| {
+            let Expr::Field { object, field } = e else {
+                return;
+            };
+            let Expr::Var(obj) = object.as_ref() else {
+                return;
+            };
+            let Some(Type::Struct(cname, _)) = vars.get(obj) else {
+                return;
+            };
+            let Some(set) = private_map.get(cname.as_str()) else {
+                return;
+            };
+            if set.contains(field.as_str()) {
+                let msg = format!(
+                    "不能访问类 '{}' 的 private 成员 '{}'（6.1.2.1(14)）",
+                    cname, field
+                );
+                if seen.insert(msg.clone()) {
+                    errors.push(SemanticError { message: msg });
+                }
+            }
+        });
+    };
+    // 只扫描顶层自由函数（含 main）：类/结构的成员函数属于类型内部作用域。
+    for f in &program.functions {
+        if owner_name(&f.name).is_none() {
+            scan_body(&f.params, &f.body);
         }
     }
 }
@@ -12150,6 +12399,818 @@ fn check_cfunc_lambda_capture(program: &Program, errors: &mut Vec<SemanticError>
 }
 
 /// 13.1.4(1)：CType 注解的绑定不能用函数值（函数名/lambda）初始化。
+/// 5.6(7)-(11)：捕获可变局部变量（`var`）的函数/lambda 只能被调用，不能作为
+/// 一等值（赋值、实参、返回值、表达式语句）。捕获是传递的：调用捕获可变变量
+/// 的局部函数同样使调用者捕获可变变量（5.6(8)/(11)）。
+///
+/// 保守实现：只分析顶层自由函数体及其直接嵌套的局部函数；lambda 体不再递归。
+fn check_mutable_closure_capture(program: &Program, errors: &mut Vec<SemanticError>) {
+    fn addr(e: &Expr) -> usize {
+        e as *const Expr as usize
+    }
+    fn addrs_expr(root: &Expr, out: &mut HashSet<usize>) {
+        walk_expr(root, &mut |e| {
+            out.insert(addr(e));
+        });
+    }
+    /// lambda 体与嵌套局部函数体内的表达式地址（这些属于子作用域）。
+    fn closure_body_addrs(stmts: &[Stmt], out: &mut HashSet<usize>) {
+        walk_stmts(stmts, &mut |e| {
+            if let Expr::Lambda { body, .. } = e {
+                addrs_expr(body, out);
+            }
+        });
+        fn rec(stmts: &[Stmt], out: &mut HashSet<usize>) {
+            for s in stmts {
+                match s {
+                    Stmt::LocalFunc(f) => {
+                        for p in &f.params {
+                            if let Some(d) = &p.default {
+                                addrs_expr(d, out);
+                            }
+                        }
+                        walk_stmts(&f.body, &mut |e| {
+                            out.insert(addr(e));
+                        });
+                        rec(&f.body, out);
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::Loop { body }
+                    | Stmt::UnsafeBlock { body }
+                    | Stmt::For { body, .. }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::WhileLet { body, .. } => rec(body, out),
+                    Stmt::Expr(Expr::Block(body, _)) => rec(body, out),
+                    Stmt::Expr(Expr::TryBlock {
+                        body,
+                        catch_body,
+                        finally_body,
+                        ..
+                    }) => {
+                        rec(body, out);
+                        rec(catch_body, out);
+                        if let Some(b) = finally_body {
+                            rec(b, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        rec(stmts, out);
+    }
+    fn collect_var_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Var { pattern, .. } => {
+                    let mut names = Vec::new();
+                    pattern_binding_names(pattern, &mut names);
+                    out.extend(names);
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::WhileLet { body, .. } => collect_var_names(body, out),
+                Stmt::Expr(Expr::Block(body, _)) => collect_var_names(body, out),
+                _ => {}
+            }
+        }
+    }
+    fn collect_direct_local_funcs<'a>(
+        stmts: &'a [Stmt],
+        out: &mut Vec<(&'a str, &'a Function)>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::LocalFunc(f) => {
+                    let name = f.name.rsplit('.').next().unwrap_or(&f.name);
+                    out.push((name, f));
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::WhileLet { body, .. } => collect_direct_local_funcs(body, out),
+                Stmt::Expr(Expr::Block(body, _)) => collect_direct_local_funcs(body, out),
+                _ => {}
+            }
+        }
+    }
+    /// 直接引用名与调用名（不下钻 lambda/嵌套局部函数体）。
+    fn refs_calls(params: &[Param], body: &[Stmt]) -> (HashSet<String>, HashSet<String>) {
+        let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+        collect_bindings_stmts(body, &mut bound);
+        let mut skip: HashSet<usize> = HashSet::new();
+        closure_body_addrs(body, &mut skip);
+        let mut refs: HashSet<String> = HashSet::new();
+        let mut calls: HashSet<String> = HashSet::new();
+        walk_stmts(body, &mut |e| {
+            if skip.contains(&addr(e)) {
+                return;
+            }
+            match e {
+                Expr::Var(n) => {
+                    if !bound.contains(n) {
+                        refs.insert(n.clone());
+                    }
+                }
+                Expr::Call { name, .. } => {
+                    calls.insert(last_name_segment(name).clone());
+                }
+                Expr::Invoke { callee, .. } => {
+                    if let Expr::Var(n) = callee.as_ref() {
+                        calls.insert(n.clone());
+                    }
+                }
+                _ => {}
+            }
+        });
+        (refs, calls)
+    }
+    fn lambda_refs(params: &[(String, Type)], body: &Expr) -> HashSet<String> {
+        let mut bound: HashSet<String> = params.iter().map(|(n, _)| n.clone()).collect();
+        let mut refs: HashSet<String> = HashSet::new();
+        match body {
+            Expr::Block(stmts, tail) => {
+                collect_bindings_stmts(stmts, &mut bound);
+                let mut skip: HashSet<usize> = HashSet::new();
+                closure_body_addrs(stmts, &mut skip);
+                walk_stmts(stmts, &mut |e| {
+                    if skip.contains(&addr(e)) {
+                        return;
+                    }
+                    if let Expr::Var(n) = e {
+                        if !bound.contains(n) {
+                            refs.insert(n.clone());
+                        }
+                    }
+                });
+                if let Some(t) = tail {
+                    walk_expr(t, &mut |e| {
+                        if let Expr::Var(n) = e {
+                            if !bound.contains(n) {
+                                refs.insert(n.clone());
+                            }
+                        }
+                    });
+                }
+            }
+            _ => walk_expr(body, &mut |e| {
+                if let Expr::Var(n) = e {
+                    if !bound.contains(n) {
+                        refs.insert(n.clone());
+                    }
+                }
+            }),
+        }
+        refs
+    }
+
+    struct FnCap {
+        /// 捕获的“外部”可变变量名（不含本函数自身声明的 var）。
+        capture: HashSet<String>,
+        /// 本函数自身声明的可变局部变量名。
+        own_mut: HashSet<String>,
+        /// 本函数体内直接调用的名字。
+        calls: HashSet<String>,
+    }
+
+    /// 递归计算函数的捕获集合（5.6(8)：调用捕获可变变量的函数使调用者同样捕获，
+    /// 但被调用者捕获的、由调用者自身声明的变量不计入）。
+    fn compute_capture(params: &[Param], body: &[Stmt], outer: &HashSet<String>) -> FnCap {
+        let mut own_mut: HashSet<String> = HashSet::new();
+        collect_var_names(body, &mut own_mut);
+        let (refs, calls) = refs_calls(params, body);
+        let mut child_visible = outer.clone();
+        child_visible.extend(own_mut.iter().cloned());
+        let mut children: HashMap<String, FnCap> = HashMap::new();
+        let mut cf: Vec<(&str, &Function)> = Vec::new();
+        collect_direct_local_funcs(body, &mut cf);
+        for (n, f) in cf {
+            children.insert(n.to_string(), compute_capture(&f.params, &f.body, &child_visible));
+        }
+        // 子函数之间的调用传递（同一作用域内的兄弟函数）。
+        loop {
+            let mut changed = false;
+            let names: Vec<String> = children.keys().cloned().collect();
+            for n in &names {
+                let cs = children[n].calls.clone();
+                let own = children[n].own_mut.clone();
+                let mut add: HashSet<String> = HashSet::new();
+                for c in &cs {
+                    if let Some(cj) = children.get(c) {
+                        for v in &cj.capture {
+                            if !own.contains(v) {
+                                add.insert(v.clone());
+                            }
+                        }
+                    }
+                }
+                let e = children.get_mut(n).unwrap();
+                for v in add {
+                    if e.capture.insert(v) {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut capture: HashSet<String> = refs
+            .into_iter()
+            .filter(|r| outer.contains(r))
+            .collect();
+        for c in &calls {
+            if let Some(cc) = children.get(c) {
+                for v in &cc.capture {
+                    if !own_mut.contains(v) {
+                        capture.insert(v.clone());
+                    }
+                }
+            }
+        }
+        FnCap {
+            capture,
+            own_mut,
+            calls,
+        }
+    }
+
+    fn analyze(
+        params: &[Param],
+        body: &[Stmt],
+        inherited: &HashSet<String>,
+        errors: &mut Vec<SemanticError>,
+        seen: &mut HashSet<String>,
+    ) {
+        let mut local_mut: HashSet<String> = HashSet::new();
+        collect_var_names(body, &mut local_mut);
+        let mut visible_mut = inherited.clone();
+        visible_mut.extend(local_mut.iter().cloned());
+
+        let mut funcs: Vec<(&str, &Function)> = Vec::new();
+        collect_direct_local_funcs(body, &mut funcs);
+
+        // 捕获可变变量的局部函数集合（含通过调用传递捕获）。
+        let mut caps: HashMap<String, FnCap> = HashMap::new();
+        for (n, f) in &funcs {
+            caps.insert(
+                n.to_string(),
+                compute_capture(&f.params, &f.body, &visible_mut),
+            );
+        }
+        // 顶层（当前作用域）兄弟函数之间的调用传递。
+        loop {
+            let mut changed = false;
+            let names: Vec<String> = caps.keys().cloned().collect();
+            for n in &names {
+                let cs = caps[n].calls.clone();
+                let own = caps[n].own_mut.clone();
+                let mut add: HashSet<String> = HashSet::new();
+                for c in &cs {
+                    if let Some(cj) = caps.get(c) {
+                        for v in &cj.capture {
+                            if !own.contains(v) {
+                                add.insert(v.clone());
+                            }
+                        }
+                    }
+                }
+                let e = caps.get_mut(n).unwrap();
+                for v in add {
+                    if e.capture.insert(v) {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mutcap: HashSet<String> = caps
+            .iter()
+            .filter(|(_, c)| !c.capture.is_empty())
+            .map(|(n, _)| n.clone())
+            .collect();
+
+        // 值使用扫描：lambda 体 / 嵌套局部函数体内的表达式不属于当前作用域。
+        let mut skip: HashSet<usize> = HashSet::new();
+        closure_body_addrs(body, &mut skip);
+        let mut callee_addrs: HashSet<usize> = HashSet::new();
+        walk_stmts(body, &mut |e| {
+            if skip.contains(&addr(e)) {
+                return;
+            }
+            if let Expr::Invoke { callee, .. } = e {
+                callee_addrs.insert(addr(callee));
+            }
+        });
+        walk_stmts(body, &mut |e| {
+            if skip.contains(&addr(e)) {
+                return;
+            }
+            match e {
+                Expr::Var(n) if mutcap.contains(n) && !callee_addrs.contains(&addr(e)) => {
+                    let msg = format!(
+                        "捕获可变变量的函数 '{}' 只能被调用，不能作为一等值使用（5.6(7)/(10)）",
+                        n
+                    );
+                    if seen.insert(msg.clone()) {
+                        errors.push(SemanticError { message: msg });
+                    }
+                }
+                Expr::Lambda { params, body: lb, .. }
+                    if !callee_addrs.contains(&addr(e))
+                        // `~>` 组合运算符脱糖出的闭包是语言内建构造，不适用该限制。
+                        && !params.iter().any(|(n, _)| n == "__compose_arg")
+                        && lambda_refs(params, lb)
+                            .iter()
+                            .any(|r| visible_mut.contains(r)) =>
+                {
+                    let msg = "捕获可变变量的 lambda 只能被调用，不能作为一等值使用（5.6(7)/(10)）"
+                        .to_string();
+                    if seen.insert(msg.clone()) {
+                        errors.push(SemanticError { message: msg });
+                    }
+                }
+                _ => {}
+            }
+        });
+
+        for (_, f) in &funcs {
+            analyze(&f.params, &f.body, &visible_mut, errors, seen);
+        }
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let empty: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        if owner_name(&f.name).is_some() {
+            continue;
+        }
+        analyze(&f.params, &f.body, &empty, errors, &mut seen);
+    }
+}
+
+/// 5.6(15)/(16)、5.1.3.2(2)：闭包（嵌套函数/lambda）捕获的变量必须在闭包定义
+/// 处可见且已初始化；闭包不能引用其后才声明的局部变量/局部函数。
+///
+/// 保守实现：只在顶层自由函数体内做顺序扫描；非局部名字（顶层/成员）不检查。
+fn check_closure_capture_scope(program: &Program, errors: &mut Vec<SemanticError>) {
+    let globals = collect_top_level_names(program);
+
+    fn bind_pattern(pattern: &Pattern, initialized: bool, declared: &mut HashMap<String, bool>) {
+        let mut names = Vec::new();
+        pattern_binding_names(pattern, &mut names);
+        for n in names {
+            declared.insert(n, initialized);
+        }
+    }
+    /// 闭包体的自由引用与调用名（包含更深层闭包中的引用；闭包自身绑定被排除）。
+    fn closure_free_refs(
+        params: &[Param],
+        body: &[Stmt],
+    ) -> (HashSet<String>, HashSet<String>) {
+        let mut bound: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+        collect_bindings_stmts(body, &mut bound);
+        walk_stmts(body, &mut |e| {
+            if let Expr::Lambda { params, .. } = e {
+                for (n, _) in params {
+                    bound.insert(n.clone());
+                }
+            }
+        });
+        let mut refs: HashSet<String> = HashSet::new();
+        let mut calls: HashSet<String> = HashSet::new();
+        let mut scan_expr = |e: &Expr, refs: &mut HashSet<String>, calls: &mut HashSet<String>| {
+            walk_expr(e, &mut |x| match x {
+                Expr::Var(n) => {
+                    if !bound.contains(n) {
+                        refs.insert(n.clone());
+                    }
+                }
+                Expr::Call { name, .. } => {
+                    let c = name.rsplit('.').next().unwrap_or(name).to_string();
+                    if !bound.contains(&c) {
+                        calls.insert(c);
+                    }
+                }
+                Expr::Invoke { callee, .. } => {
+                    if let Expr::Var(n) = callee.as_ref() {
+                        if !bound.contains(n) {
+                            calls.insert(n.clone());
+                        }
+                    }
+                }
+                _ => {}
+            });
+        };
+        for p in params {
+            if let Some(d) = &p.default {
+                scan_expr(d, &mut refs, &mut calls);
+            }
+        }
+        walk_stmts(body, &mut |e| {
+            // 直接对表达式子树扫描（walk_stmts 已遍历，这里按同样范围收集）。
+            match e {
+                Expr::Var(n) => {
+                    if !bound.contains(n) {
+                        refs.insert(n.clone());
+                    }
+                }
+                Expr::Call { name, .. } => {
+                    let c = name.rsplit('.').next().unwrap_or(name).to_string();
+                    if !bound.contains(&c) {
+                        calls.insert(c);
+                    }
+                }
+                Expr::Invoke { callee, .. } => {
+                    if let Expr::Var(n) = callee.as_ref() {
+                        if !bound.contains(n) {
+                            calls.insert(n.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+        (refs, calls)
+    }
+    fn closure_free_refs_expr(
+        params: &[(String, Type)],
+        body: &Expr,
+    ) -> (HashSet<String>, HashSet<String>) {
+        let mut bound: HashSet<String> = params.iter().map(|(n, _)| n.clone()).collect();
+        if let Expr::Block(stmts, _) = body {
+            collect_bindings_stmts(stmts, &mut bound);
+        }
+        let mut refs: HashSet<String> = HashSet::new();
+        let mut calls: HashSet<String> = HashSet::new();
+        walk_expr(body, &mut |x| match x {
+            Expr::Var(n) => {
+                if !bound.contains(n) {
+                    refs.insert(n.clone());
+                }
+            }
+            Expr::Call { name, .. } => {
+                let c = name.rsplit('.').next().unwrap_or(name).to_string();
+                if !bound.contains(&c) {
+                    calls.insert(c);
+                }
+            }
+            Expr::Invoke { callee, .. } => {
+                if let Expr::Var(n) = callee.as_ref() {
+                    if !bound.contains(n) {
+                        calls.insert(n.clone());
+                    }
+                }
+            }
+            Expr::Lambda { params, .. } => {
+                for (n, _) in params {
+                    bound.insert(n.clone());
+                }
+            }
+            _ => {}
+        });
+        (refs, calls)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_closure(
+        own_name: Option<&str>,
+        refs: &HashSet<String>,
+        calls: &HashSet<String>,
+        declared: &HashMap<String, bool>,
+        all_local_names: &HashSet<String>,
+        local_func_names: &HashSet<String>,
+        globals: &HashSet<String>,
+        errors: &mut Vec<SemanticError>,
+        seen: &mut HashSet<String>,
+    ) {
+        for r in refs {
+            if globals.contains(r) {
+                continue;
+            }
+            if let Some(init) = declared.get(r) {
+                if !*init {
+                    let msg = format!(
+                        "闭包捕获的变量 '{}' 在闭包定义处尚未初始化（5.6(16)）",
+                        r
+                    );
+                    if seen.insert(msg.clone()) {
+                        errors.push(SemanticError { message: msg });
+                    }
+                }
+            } else if all_local_names.contains(r) {
+                let msg = format!(
+                    "闭包引用的局部变量 '{}' 在闭包定义处尚不可见（5.6(15)）",
+                    r
+                );
+                if seen.insert(msg.clone()) {
+                    errors.push(SemanticError { message: msg });
+                }
+            }
+        }
+        for c in calls {
+            if globals.contains(c) || declared.contains_key(c) {
+                continue;
+            }
+            if local_func_names.contains(c) && own_name != Some(c.as_str()) {
+                let msg = format!(
+                    "闭包调用的局部函数 '{}' 在其定义之前使用（5.1.3.2(2)）",
+                    c
+                );
+                if seen.insert(msg.clone()) {
+                    errors.push(SemanticError { message: msg });
+                }
+            }
+        }
+    }
+
+    fn scan_lambdas_in_expr(
+        e: &Expr,
+        declared: &HashMap<String, bool>,
+        all_local_names: &HashSet<String>,
+        local_func_names: &HashSet<String>,
+        globals: &HashSet<String>,
+        errors: &mut Vec<SemanticError>,
+        seen: &mut HashSet<String>,
+    ) {
+        walk_expr(e, &mut |x| {
+            if let Expr::Lambda { params, body, .. } = x {
+                let (refs, calls) = closure_free_refs_expr(params, body);
+                check_closure(
+                    None,
+                    &refs,
+                    &calls,
+                    declared,
+                    all_local_names,
+                    local_func_names,
+                    globals,
+                    errors,
+                    seen,
+                );
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_stmts(
+        stmts: &[Stmt],
+        declared: &mut HashMap<String, bool>,
+        all_local_names: &HashSet<String>,
+        local_func_names: &HashSet<String>,
+        globals: &HashSet<String>,
+        errors: &mut Vec<SemanticError>,
+        seen: &mut HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Let { pattern, ty, value, .. }
+                | Stmt::Var { pattern, ty, value, .. } => {
+                    scan_lambdas_in_expr(
+                        value,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                    let initialized = !ty
+                        .as_ref()
+                        .map_or(false, |t| expr_check::is_default_value(t, value));
+                    bind_pattern(pattern, initialized, declared);
+                }
+                Stmt::Const { name, value, .. } => {
+                    scan_lambdas_in_expr(
+                        value,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                    declared.insert(name.clone(), true);
+                }
+                Stmt::Assign { target, value } => {
+                    scan_lambdas_in_expr(
+                        value,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                    if let AssignTarget::Var(n) = target {
+                        if let Some(v) = declared.get_mut(n) {
+                            *v = true;
+                        }
+                    }
+                }
+                Stmt::Expr(e) => scan_lambdas_in_expr(
+                    e,
+                    declared,
+                    all_local_names,
+                    local_func_names,
+                    globals,
+                    errors,
+                    seen,
+                ),
+                Stmt::Return(Some(e)) => scan_lambdas_in_expr(
+                    e,
+                    declared,
+                    all_local_names,
+                    local_func_names,
+                    globals,
+                    errors,
+                    seen,
+                ),
+                Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                    for e in [left, right] {
+                        scan_lambdas_in_expr(
+                            e,
+                            declared,
+                            all_local_names,
+                            local_func_names,
+                            globals,
+                            errors,
+                            seen,
+                        );
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    scan_lambdas_in_expr(
+                        cond,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                    scan_stmts(
+                        body,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                }
+                Stmt::WhileLet { pattern, expr, body } => {
+                    scan_lambdas_in_expr(
+                        expr,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                    bind_pattern(pattern, true, declared);
+                    scan_stmts(
+                        body,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                }
+                Stmt::DoWhile { body, cond } => {
+                    scan_stmts(
+                        body,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                    scan_lambdas_in_expr(
+                        cond,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                }
+                Stmt::For {
+                    var,
+                    iterable,
+                    body,
+                } => {
+                    scan_lambdas_in_expr(
+                        iterable,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                    declared.insert(var.clone(), true);
+                    scan_stmts(
+                        body,
+                        declared,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                }
+                Stmt::Loop { body } | Stmt::UnsafeBlock { body } => scan_stmts(
+                    body,
+                    declared,
+                    all_local_names,
+                    local_func_names,
+                    globals,
+                    errors,
+                    seen,
+                ),
+                Stmt::LocalFunc(f) => {
+                    let name = f.name.rsplit('.').next().unwrap_or(&f.name).to_string();
+                    let (refs, calls) = closure_free_refs(&f.params, &f.body);
+                    let mut snapshot = declared.clone();
+                    snapshot.insert(name.clone(), true);
+                    check_closure(
+                        Some(&name),
+                        &refs,
+                        &calls,
+                        &snapshot,
+                        all_local_names,
+                        local_func_names,
+                        globals,
+                        errors,
+                        seen,
+                    );
+                    declared.insert(name, true);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        // 全函数作用域内绑定名（含嵌套闭包内的绑定）与局部函数名。
+        let mut all_local_names: HashSet<String> = f.params.iter().map(|p| p.name.clone()).collect();
+        collect_bindings_stmts(&f.body, &mut all_local_names);
+        let mut local_func_names: HashSet<String> = HashSet::new();
+        walk_stmts(&f.body, &mut |e| {
+            if let Expr::Lambda { params, .. } = e {
+                for (n, _) in params {
+                    all_local_names.insert(n.clone());
+                }
+            }
+        });
+        fn collect_local_func_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+            for s in stmts {
+                match s {
+                    Stmt::LocalFunc(g) => {
+                        out.insert(g.name.rsplit('.').next().unwrap_or(&g.name).to_string());
+                        collect_local_func_names(&g.body, out);
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::Loop { body }
+                    | Stmt::UnsafeBlock { body }
+                    | Stmt::For { body, .. }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::WhileLet { body, .. } => collect_local_func_names(body, out),
+                    _ => {}
+                }
+            }
+        }
+        collect_local_func_names(&f.body, &mut local_func_names);
+        let mut declared: HashMap<String, bool> = f
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), true))
+            .collect();
+        scan_stmts(
+            &f.body,
+            &mut declared,
+            &all_local_names,
+            &local_func_names,
+            &globals,
+            errors,
+            &mut seen,
+        );
+    }
+}
+
 fn check_ctype_annotation_binding(program: &Program, errors: &mut Vec<SemanticError>) {
     let mut top_funcs: HashSet<&str> = HashSet::new();
     let mut top_counts: HashMap<&str, usize> = HashMap::new();
@@ -16328,6 +17389,30 @@ fn check_call_arguments(program: &Program, errors: &mut Vec<SemanticError>) {
                 in_macro.insert(x as *const Expr as usize);
             });
         }
+        // 本函数体内（含嵌套块）的局部函数：调用时同样按形参列表做静态检查。
+        fn collect_local_funcs<'a>(
+            stmts: &'a [Stmt],
+            out: &mut HashMap<&'a str, Vec<&'a Function>>,
+        ) {
+            for s in stmts {
+                match s {
+                    Stmt::LocalFunc(f) => {
+                        let n = f.name.rsplit('.').next().unwrap_or(&f.name);
+                        out.entry(n).or_default().push(f);
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::Loop { body }
+                    | Stmt::UnsafeBlock { body }
+                    | Stmt::For { body, .. }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::WhileLet { body, .. } => collect_local_funcs(body, out),
+                    Stmt::Expr(Expr::Block(body, _)) => collect_local_funcs(body, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut local_funcs: HashMap<&str, Vec<&Function>> = HashMap::new();
+        collect_local_funcs(stmts, &mut local_funcs);
         walk_stmts(stmts, &mut |e| {
             if in_macro.contains(&(e as *const Expr as usize)) {
                 return;
@@ -16341,13 +17426,20 @@ fn check_call_arguments(program: &Program, errors: &mut Vec<SemanticError>) {
             else {
                 return;
             };
-            let Some(cands) = funcs.get(name.as_str()) else {
-                return;
+            let f: &Function = if let Some(v) = local_funcs.get(name.as_str()) {
+                if v.len() != 1 {
+                    return;
+                }
+                v[0]
+            } else {
+                let Some(cands) = funcs.get(name.as_str()) else {
+                    return;
+                };
+                if cands.len() != 1 || blocked.contains(name.as_str()) {
+                    return;
+                }
+                cands[0]
             };
-            if cands.len() != 1 || blocked.contains(name.as_str()) {
-                return;
-            }
-            let f = cands[0];
             // 变长参数无法精确匹配实参数量，保守跳过。
             if f.params.iter().any(|p| p.variadic) {
                 return;
@@ -16423,7 +17515,6 @@ fn check_call_arguments(program: &Program, errors: &mut Vec<SemanticError>) {
     }
 }
 
-/// 5.1.2 / 5.3.4：遍历全部函数式声明，检查形参声明与默认值规则。
 fn check_function_param_rules(program: &Program, errors: &mut Vec<SemanticError>) {
     let globals = collect_top_level_names(program);
     for f in &program.functions {
@@ -18565,14 +19656,30 @@ fn check_func_var_call_no_defaults(program: &Program, errors: &mut Vec<SemanticE
     }
     // (类型名, 方法名) → 形参。
     let mut methods: HashMap<(String, String), Vec<Param>> = HashMap::new();
+    let mut msig: HashMap<(String, String), String> = HashMap::new();
     let mut mdup: HashSet<(String, String)> = HashSet::new();
     let mut add_method = |owner: &str, func: &Function| {
         let member = func.name.rsplit('.').next().unwrap_or(&func.name).to_string();
         let key = (owner.to_string(), member);
-        if methods.contains_key(&key) {
-            mdup.insert(key);
-        } else {
-            methods.insert(key, func.params.clone());
+        // 同一方法可能在 `cls.methods` 与 `program.functions` 中各出现一次；
+        // 仅当同名方法的形参签名不同（真正的重载集）时才视为不可静态解析。
+        let sig = func
+            .params
+            .iter()
+            .filter(|p| p.name != "this" && p.name != "self")
+            .map(|p| type_display(&p.ty))
+            .collect::<Vec<_>>()
+            .join(",");
+        match msig.get(&key) {
+            Some(prev) => {
+                if *prev != sig {
+                    mdup.insert(key);
+                }
+            }
+            None => {
+                msig.insert(key.clone(), sig);
+                methods.insert(key, func.params.clone());
+            }
         }
     };
     for c in &program.classes {
@@ -18589,8 +19696,12 @@ fn check_func_var_call_no_defaults(program: &Program, errors: &mut Vec<SemanticE
         methods.remove(key);
     }
     let has_default = |params: &[Param]| params.iter().any(|p| p.default.is_some());
+    let enum_names: HashSet<&str> = program.enums.iter().map(|e| e.name.as_str()).collect();
     // 把“函数引用表达式”解析为形参列表。
-    let resolve_ref = |e: &Expr, locals: &HashMap<String, Vec<Param>>| -> Option<Vec<Param>> {
+    let resolve_ref = |e: &Expr,
+                       locals: &HashMap<String, Vec<Param>>,
+                       var_types: &HashMap<String, String>|
+     -> Option<Vec<Param>> {
         match e {
             Expr::Var(n) => {
                 if let Some(p) = locals.get(n) {
@@ -18599,28 +19710,92 @@ fn check_func_var_call_no_defaults(program: &Program, errors: &mut Vec<SemanticE
                 globals.get(n).cloned()
             }
             Expr::Field { object, field } => {
-                let owner = match object.as_ref() {
-                    Expr::Var(n) => Some(n.clone()),
-                    _ => None,
+                // 枚举变体值上的方法：`EnumName.Variant.method`。
+                if let Expr::Field { object: inner, .. } = object.as_ref() {
+                    if let Expr::Var(t) = inner.as_ref() {
+                        if enum_names.contains(t.as_str()) {
+                            if let Some(p) = methods.get(&(t.clone(), field.clone())) {
+                                return Some(p.clone());
+                            }
+                        }
+                    }
+                }
+                let Expr::Var(n) = object.as_ref() else {
+                    return None;
                 };
-                owner.and_then(|o| methods.get(&(o, field.clone())).cloned())
+                if let Some(p) = methods.get(&(n.clone(), field.clone())) {
+                    return Some(p.clone());
+                }
+                // `obj.method`：按局部变量的构造类型解析成员方法
+                // （如 `var a = myClass(); var f = a.m;`）。
+                var_types
+                    .get(n)
+                    .and_then(|t| methods.get(&(t.clone(), field.clone())).cloned())
             }
             _ => None,
         }
     };
     let mut check_stmts = |stmts: &[Stmt]| {
+        let var_types = {
+            let mut map = local_var_type_map(stmts);
+            // 补足 `var x = myClass()` 形态：小写类型名的构造调用会被解析为
+            // 普通 Call（首字母启发式），按其名字是否对应本文件类型补入。
+            let mut type_names: HashSet<&str> = HashSet::new();
+            for c in &program.classes {
+                type_names.insert(c.name.as_str());
+            }
+            for s in &program.structs {
+                type_names.insert(s.name.as_str());
+            }
+            fn aug(stmts: &[Stmt], map: &mut HashMap<String, String>, names: &HashSet<&str>) {
+                for s in stmts {
+                    match s {
+                        Stmt::Let {
+                            pattern: Pattern::Binding(n),
+                            value,
+                            ..
+                        }
+                        | Stmt::Var {
+                            pattern: Pattern::Binding(n),
+                            value,
+                            ..
+                        } => {
+                            if let Expr::Call { name, .. } = value {
+                                let base = name.split('<').next().unwrap_or(name).trim();
+                                if names.contains(base) {
+                                    map.insert(n.clone(), base.to_string());
+                                }
+                            }
+                        }
+                        Stmt::While { body, .. }
+                        | Stmt::DoWhile { body, .. }
+                        | Stmt::Loop { body }
+                        | Stmt::UnsafeBlock { body } => aug(body, map, names),
+                        Stmt::For { body, .. } => aug(body, map, names),
+                        _ => {}
+                    }
+                }
+            }
+            aug(stmts, &mut map, &type_names);
+            map
+        };
         let mut locals: HashMap<String, Vec<Param>> = HashMap::new();
         // 收集 `var/let x = <func-ref>` 绑定。
         fn collect(
             stmts: &[Stmt],
             locals: &mut HashMap<String, Vec<Param>>,
-            resolve_ref: &dyn Fn(&Expr, &HashMap<String, Vec<Param>>) -> Option<Vec<Param>>,
+            var_types: &HashMap<String, String>,
+            resolve_ref: &dyn Fn(
+                &Expr,
+                &HashMap<String, Vec<Param>>,
+                &HashMap<String, String>,
+            ) -> Option<Vec<Param>>,
         ) {
             for s in stmts {
                 match s {
                     Stmt::Let { pattern, value, .. } | Stmt::Var { pattern, value, .. } => {
                         if let Pattern::Binding(name) = pattern {
-                            if let Some(params) = resolve_ref(value, locals) {
+                            if let Some(params) = resolve_ref(value, locals, var_types) {
                                 locals.insert(name.clone(), params);
                             }
                         }
@@ -18628,13 +19803,15 @@ fn check_func_var_call_no_defaults(program: &Program, errors: &mut Vec<SemanticE
                     Stmt::While { body, .. }
                     | Stmt::DoWhile { body, .. }
                     | Stmt::Loop { body }
-                    | Stmt::UnsafeBlock { body } => collect(body, locals, resolve_ref),
-                    Stmt::For { body, .. } => collect(body, locals, resolve_ref),
+                    | Stmt::UnsafeBlock { body } => {
+                        collect(body, locals, var_types, resolve_ref)
+                    }
+                    Stmt::For { body, .. } => collect(body, locals, var_types, resolve_ref),
                     _ => {}
                 }
             }
         }
-        collect(stmts, &mut locals, &resolve_ref);
+        collect(stmts, &mut locals, &var_types, &resolve_ref);
         if locals.is_empty() {
             return;
         }
@@ -18678,6 +19855,40 @@ fn check_func_var_call_no_defaults(program: &Program, errors: &mut Vec<SemanticE
     for s in &program.structs {
         for i in &s.inits {
             check_stmts(&i.body);
+        }
+    }
+    // 顶层常量初始化式中的函数值调用（5.1.2.2(15)/(18)）：
+    //   let gg = g1; let a = gg();  // 不能省略可选参数
+    {
+        let empty: HashMap<String, Vec<Param>> = HashMap::new();
+        let vt: HashMap<String, String> = HashMap::new();
+        let mut const_funcs: HashMap<String, Vec<Param>> = HashMap::new();
+        for c in &program.constants {
+            walk_expr(&c.init, &mut |e| {
+                if let Expr::Call {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } = e
+                {
+                    if let Some(params) = const_funcs.get(name) {
+                        let ps: Vec<&Param> = non_receiver(params);
+                        let provided = args.len() + named_args.len();
+                        if provided < ps.len() && has_default(params) {
+                            errors.push(SemanticError {
+                                message: format!(
+                                    "通过函数变量 '{}' 调用时不能省略可选参数（默认值不生效，5.1.2.2(15)/(18)）",
+                                    name
+                                ),
+                            });
+                        }
+                    }
+                }
+            });
+            if let Some(params) = resolve_ref(&c.init, &empty, &vt) {
+                const_funcs.insert(c.name.clone(), params);
+            }
         }
     }
 }
@@ -23261,8 +24472,10 @@ main() {}"#,
         assert_valid(
             "class A {\n A(var a: Int64) {}\n init() { a = 0 }\n}\nmain() {}",
         );
-        // 正例：成员变量参数带默认值。
-        assert_valid("class A {\n A(var a!: Int64 = 0) {}\n init() {}\n}\nmain() {}");
+        // 6.1.2.1(20)：成员变量形参默认值不构成字段初始值，其它构造函数仍须初始化
+        // （w19b 修正：原“带默认值即视为已初始化”的旧断言不再成立）。
+        assert_invalid("class A {\n A(var a!: Int64 = 0) {}\n init() {}\n}\nmain() {}");
+        assert_valid("class A {\n A(var a!: Int64 = 0) {}\n init() { a = 0 }\n}\nmain() {}");
     }
 
 
@@ -24285,6 +25498,23 @@ main() {}"#,
         );
     }
 
+    // ─── w19b：06/05 章构造函数、命名形参、闭包捕获 ────────────────────────
+
+    #[test]
+    fn test_w19b_primary_ctor_member_default_not_field_init() {
+        // 6.1.2.1(20)：成员变量形参的默认值只在主构造函数有效，不构成字段初始值。
+        assert_invalid(
+            "class A {\n A(var x!: Int64 = 1) {}\n init() {}\n}\nmain() {}",
+        );
+        assert_invalid(
+            "class A {\n A(public let x!: Int64 = 1) {}\n init(b: Bool) {}\n}\nmain() {}",
+        );
+        // 正例：其它构造函数显式初始化该成员。
+        assert_valid(
+            "class A {\n A(var x!: Int64 = 1) {}\n init() { x = 2 }\n}\nmain() {}",
+        );
+    }
+
     #[test]
     fn test_w19a_as_generic_without_args() {
         // 7.1(4)：as 的目标泛型类型必须带类型实参。
@@ -24300,6 +25530,87 @@ main() {}"#,
         assert_valid("main() { let x = Int64(1) }");
         // 4.8：括号包裹的类型名不能被调用。
         assert_invalid("main(): Unit { var a = (Int32)(8_i8) }");
+    }
+
+    #[test]
+    fn test_w19b_member_param_mut_and_visibility() {
+        // 6.1.2.1(9)：let 成员变量形参生成的成员不可重新赋值。
+        assert_invalid("class A {\n A(let x: Int64) {}\n func f() { x = 1 }\n}\nmain() {}");
+        // 6.1.2.1(14)：private 成员变量形参生成的成员在类外/子类不可访问。
+        assert_invalid(
+            "class A {\n A(private let x: Int64) {}\n}\nmain() { let a = A(0)\n a.x }",
+        );
+        assert_invalid(
+            "open class A {\n A(private let x: Int64) {}\n}\nclass B <: A {\n B() { super(0) }\n func f() { x }\n}\nmain() {}",
+        );
+        assert_valid(
+            "class A {\n A(public let x: Int64) {}\n}\nmain() { let a = A(0)\n a.x }",
+        );
+    }
+
+    #[test]
+    fn test_w19b_named_param_override_consistency() {
+        // 5.1.2.1(6)：实现/覆写须保持父类型命名形参名与顺序。
+        assert_invalid(
+            "open class A {\n public open func f(a!: Int32): Int32 { a }\n}\nclass B <: A {\n public override func f(b!: Int32): Int32 { b }\n}\nmain() {}",
+        );
+        assert_valid(
+            "open class A {\n public open func f(a!: Int32): Int32 { a }\n}\nclass B <: A {\n public override func f(a!: Int32): Int32 { a }\n}\nmain() {}",
+        );
+        // 接口抽象成员的实现同样受约束。
+        assert_invalid(
+            "interface I {\n func g(x!: Int32, y!: Int32): Unit\n}\nstruct S <: I {\n public func g(y!: Int32, x!: Int32) {}\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w19b_mutable_capture_not_first_class() {
+        // 5.6(7)/(10)：捕获 var 的函数/lambda 不能作为一等值。
+        assert_invalid(
+            "func f() {\n var x = 3\n func g() { x * 2 }\n let b = g\n}\nmain() {}",
+        );
+        assert_invalid("func f() {\n var x = 3\n return { => x * 2 }\n}\nmain() {}");
+        // 5.6(8)/(11)：调用捕获可变变量的函数使调用者同样捕获（传递性）。
+        assert_invalid(
+            "func h() {\n var x = 1\n func g() { x }\n func f() { g() }\n return f\n}\nmain() {}",
+        );
+        // 正例：只调用捕获可变变量的函数。
+        assert_valid("func f() {\n var x = 3\n func g() { x * 2 }\n g()\n}\nmain() {}");
+        // 正例：被调用者只捕获调用者自身的 var，调用者仍可作为一等值（5.6(12)）。
+        assert_valid(
+            "func h() {\n func f() {\n  var x = 1\n  func g() { x }\n  g()\n }\n return f\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w19b_closure_capture_visibility_and_init() {
+        // 5.6(16)：捕获的变量须在闭包定义处已初始化。
+        assert_invalid("main() {\n var x: Int64\n func f() { x * 2 }\n x = 3\n f()\n}");
+        // 5.6(15)：闭包不能引用其后才声明的局部变量。
+        assert_invalid("main() {\n func f() { x * 2 }\n var x = 3\n f()\n}");
+        // 5.1.3.2(2)：闭包不能调用其后才声明的局部函数。
+        assert_invalid(
+            "func f() {\n func g() { h() }\n func h() {}\n g()\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w19b_unbound_supertype_and_top_level_protected() {
+        // 6.1.1(4)：父类/接口必须是绑定到类型的有效引用。
+        assert_invalid("class A <: UnknownType {}\nmain() {}");
+        assert_invalid("class A <: Object & UnknownIface {}\nmain() {}");
+        assert_valid("open class P {}\nclass A <: P {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w19b_func_value_optional_args_and_local_call_arity() {
+        // 5.1.2.2(15)：通过函数变量调用不能省略可选参数（方法值形态）。
+        assert_invalid(
+            "class C {\n func f(a!: Int64 = 1): Int64 { a }\n}\nmain() {\n var c = C()\n var g = c.f\n var r = g()\n}",
+        );
+        // 5.3.1(4)：局部函数调用位置实参过多。
+        assert_invalid("main() {\n func f(a: Int64) {}\n f(1, 2)\n}");
+        assert_valid("main() {\n func f(a: Int64) {}\n f(1)\n}");
     }
 
 }
