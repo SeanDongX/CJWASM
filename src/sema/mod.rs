@@ -9389,6 +9389,13 @@ fn check_enum_payload_variant_types(
 }
 
 fn check_enum_variants(en: &EnumDef, errors: &mut Vec<SemanticError>) {
+    // 2.1.11.1(1)：枚举体必须至少声明一个构造器。
+    // `enum E {}` 与仅含成员函数/属性而无任何构造器的枚举体均非法。
+    if en.variants.is_empty() {
+        errors.push(SemanticError {
+            message: format!("枚举 '{}' 至少需要一个构造器（枚举体不能为空）", en.name),
+        });
+    }
     // 2.1.11(5)：同名构造器必须具有不同的参数个数；同名且参数个数相同构成重定义
     // （无论参数类型是否相同，如 `F(Rune) | F(String)` 非法）。
     fn arity(payload: &Option<Type>) -> usize {
@@ -33073,6 +33080,28 @@ main() {}"#,
              \x20   wfirst((WB1(), WB2()))\n\
              }\n",
         );
+    }
+
+
+    #[test]
+    fn test_validate_enum_empty_body_rejected() {
+        // 2.1.11.1(1)：枚举体必须至少声明一个构造器；`enum E {}` 非法。
+        let errs = assert_invalid("enum E {}\nmain() {}\n");
+        assert!(errs.iter().any(|e| e.message.contains("构造器")), "{:?}", errs);
+    }
+
+
+    #[test]
+    fn test_validate_enum_only_function_rejected() {
+        // 仅有成员函数而无任何构造器的枚举体同样非法。
+        let errs = assert_invalid("enum E {\n    func foo() {}\n}\nmain() {}\n");
+        assert!(errs.iter().any(|e| e.message.contains("构造器")), "{:?}", errs);
+    }
+
+
+    #[test]
+    fn test_validate_enum_with_constructor_ok() {
+        assert_valid("enum E {\n    A | B\n}\nmain() {}\n");
     }
 
 }
