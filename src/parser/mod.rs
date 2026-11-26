@@ -949,7 +949,7 @@ mod tests {
     fn test_parse_interface_with_inheritance() {
         let source = r#"
             interface Base { func id(): Int64; }
-            interface Extended: Base { func extra(): Int64; }
+            interface Extended <: Base { func extra(): Int64; }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();

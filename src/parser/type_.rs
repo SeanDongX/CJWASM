@@ -220,6 +220,14 @@ impl Parser {
                 break;
             }
         }
+        // 6.1.2.4(3)/9.2：一个声明至多只能有一个 `where` 约束子句；紧随其后的
+        // 第二个 `where` 非法（此前被上层 `while Where` 循环静默吞并）。
+        if self.check(&Token::Where) {
+            return self.bail(ParseError::UnexpectedToken(
+                Token::Where,
+                "至多一个 where 约束子句".to_string(),
+            ));
+        }
         Ok(constraints)
     }
 

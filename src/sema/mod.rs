@@ -7031,8 +7031,20 @@ fn check_this_escape_open(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
     } else {
         cls.inits.iter().collect()
     };
+    // 实例成员函数名集合：构造体内以“值”形式出现的裸成员函数名（如 `gv = f`）
+    // 会形成捕获 `this` 的函数引用，同样属于 this 逃逸。
+    let mut inst_methods: HashSet<String> = HashSet::new();
+    for m in &cls.methods {
+        if !m.is_static {
+            inst_methods.insert(method_short_name(&m.func.name).to_string());
+        }
+    }
     for init in &inits {
-        if init.body.iter().any(stmt_escapes_this) {
+        let mut shadow: HashSet<String> = init.params.iter().map(|p| p.name.clone()).collect();
+        collect_bindings_stmts(&init.body, &mut shadow);
+        let method_ref_escape =
+            body_exposes_method_value(&init.body, &inst_methods, &shadow);
+        if init.body.iter().any(stmt_escapes_this) || method_ref_escape {
             errors.push(SemanticError {
                 message: format!(
                     "类 '{}' 的构造函数中 this 不能逃逸（open/abstract 类禁止通过 lambda/局部函数捕获或作为值传出）（6.1.2.1(57)）",
@@ -7041,6 +7053,32 @@ fn check_this_escape_open(cls: &ClassDef, errors: &mut Vec<SemanticError>) {
             });
         }
     }
+}
+
+/// 6.1.2.1(57)：构造函数体内以“值”形式出现的裸实例成员函数名——即函数引用
+/// （捕获 `this`）。若该名被形参/局部绑定遮蔽则不判定。
+fn body_exposes_method_value(
+    body: &[Stmt],
+    inst_methods: &HashSet<String>,
+    shadow: &HashSet<String>,
+) -> bool {
+    if inst_methods.is_empty() {
+        return false;
+    }
+    let mut found = false;
+    walk_stmts(body, &mut |e| {
+        if let Expr::Var(n) = e {
+            if inst_methods.contains(n) && !shadow.contains(n) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// 成员函数名的短名（AST 中方法名被重命名为 `Type.method`，取 `method` 部分）。
+fn method_short_name(name: &str) -> &str {
+    name.rsplit_once('.').map(|(_, m)| m).unwrap_or(name)
 }
 
 fn stmt_escapes_this(s: &Stmt) -> bool {
@@ -7244,6 +7282,14 @@ fn check_instance_field_initializers(cls: &ClassDef, errors: &mut Vec<SemanticEr
         }
         order.entry(f.name.as_str()).or_insert(i);
     }
+    // 6.1.2.1(61)：用于判定字段初始化式是否通过 lambda / 函数引用捕获 `this`。
+    let field_set: HashSet<String> = order.keys().map(|s| s.to_string()).collect();
+    let mut inst_methods: HashSet<String> = HashSet::new();
+    for m in &cls.methods {
+        if !m.is_static {
+            inst_methods.insert(method_short_name(&m.func.name).to_string());
+        }
+    }
     for (i, f) in cls.fields.iter().enumerate() {
         if f.is_static {
             continue;
@@ -7270,6 +7316,28 @@ fn check_instance_field_initializers(cls: &ClassDef, errors: &mut Vec<SemanticEr
             }
             _ => {}
         });
+        // 6.1.2.1(61)：初始化式中通过 lambda / 函数引用捕获 `this`，若此刻仍有
+        // 后续（尚未初始化）的实例成员变量，则构成“this 在成员未全部初始化前逃逸”。
+        let has_later_field = cls
+            .fields
+            .iter()
+            .enumerate()
+            .any(|(j, g)| j > i && !g.is_static);
+        let captured = field_init_captures_this(
+            expr,
+            &field_set,
+            &inst_methods,
+            &locals,
+            matches!(f.ty, crate::ast::Type::Function { .. }),
+        );
+        if has_later_field && captured {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 的实例成员变量 '{}' 的初始化表达式在全部实例成员初始化完成前捕获了 this（6.1.2.1(61)）",
+                    cls.name, f.name
+                ),
+            });
+        }
         let mut later: Option<String> = None;
         let mut super_use: Option<String> = None;
         walk_expr(expr, &mut |e| match e {
@@ -7333,6 +7401,61 @@ fn check_instance_field_initializers(cls: &ClassDef, errors: &mut Vec<SemanticEr
 /// 是否为 `this` / `self` 接收者表达式。
 fn is_this_expr(e: &Expr) -> bool {
     matches!(e, Expr::Var(n) if n == "this" || n == "self")
+}
+
+/// 6.1.2.1(61)：字段初始化式是否通过 lambda / 函数引用捕获 `this`。
+/// - 裸实例成员函数名（函数引用，如 `var d = f`）；
+/// - lambda 体内引用 `this`、实例字段或实例成员函数/属性。
+/// 直接读取成员（`var e = a + 1`）不在此列（属于合法的值初始化）。
+fn field_init_captures_this(
+    expr: &Expr,
+    fields: &HashSet<String>,
+    methods: &HashSet<String>,
+    outer_locals: &HashSet<String>,
+    top_block_is_lambda: bool,
+) -> bool {
+    if let Expr::Var(n) = expr {
+        if methods.contains(n) && !outer_locals.contains(n) {
+            return true;
+        }
+    }
+    // 仓颉的 `{ ... }` 无箭头 lambda：当字段声明类型为函数类型时，`{ a }` 被解析为
+    // 块表达式，其块体即 lambda 体。
+    if top_block_is_lambda && matches!(expr, Expr::Block(..)) {
+        if lambda_body_captures_this(expr, fields, methods, outer_locals) {
+            return true;
+        }
+    }
+    let mut found = false;
+    walk_expr(expr, &mut |e| match e {
+        Expr::Lambda { params, body, .. } => {
+            let mut shadow: HashSet<String> = outer_locals.clone();
+            for (n, _) in params {
+                shadow.insert(n.clone());
+            }
+            if lambda_body_captures_this(body, fields, methods, &shadow) {
+                found = true;
+            }
+        }
+        Expr::TrailingClosure { closure, .. } => {
+            if lambda_body_captures_this(closure, fields, methods, outer_locals) {
+                found = true;
+            }
+        }
+        _ => {}
+    });
+    found
+}
+
+fn lambda_body_captures_this(
+    body: &Expr,
+    fields: &HashSet<String>,
+    methods: &HashSet<String>,
+    shadow: &HashSet<String>,
+) -> bool {
+    expr_contains_this(body)
+        || expr_refs_member(body, fields, shadow)
+        || expr_refs_method_or_prop(body, methods, &HashSet::new())
 }
 
 /// 6.1.2.1(56)：open/abstract 类的构造函数（成员尚未全部初始化）中
@@ -7659,8 +7782,10 @@ fn check_class_supertypes(
     }
     for name in &cls.implements {
         if let Some(p) = index.classes.get(name.as_str()) {
-            // 抽象类可能被误解析进 implements（如多模板标注用例）；仅对非抽象类报错，
-            // 避免误伤合法/宏相关用例。open 类出现在 implements 一定是多继承。
+            // 抽象类可能被误解析进 implements（如多模板标注用例 std/unittest/
+            // templates/checks/*：`class Suite <: Template1 & Template2` 两者均为
+            // abstract class，官方 std 用例期望其通过）；仅对非抽象类报错，避免误伤
+            // 合法/宏相关用例。open 类出现在 implements 一定是多继承。
             if !p.is_abstract {
                 errors.push(SemanticError {
                     message: format!(
@@ -31548,6 +31673,76 @@ main() {}"#,
         assert_valid("main() {\n let f = LibC.free\n}\n");
         // 正例：已知类型构造调用放行。
         assert_valid("struct Point { var x: Int64 = 0 }\nmain() {\n let p = Point()\n}\n");
+    }
+
+    #[test]
+    fn test_w22b_this_escape_open_method_ref() {
+        // 6.1.2.1(57)：open 类构造函数中把实例成员函数作为值赋给全局（函数引用捕获 this）。
+        assert_invalid(
+            "var gv = { => 1 }\n\
+             open class A {\n\
+             \x20   init() { gv = f }\n\
+             \x20   func f(): Int64 { return 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+        // abstract 类同样禁止。
+        assert_invalid(
+            "var gv = { => 1 }\n\
+             abstract class A {\n\
+             \x20   init() { gv = f }\n\
+             \x20   func f(): Int64 { return 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 非 open/abstract 类允许（a57_01 正例）。
+        assert_valid(
+            "var gv = { => 1 }\n\
+             class A {\n\
+             \x20   init() { gv = f }\n\
+             \x20   func f(): Int64 { return 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w22b_field_init_capture_this() {
+        // 6.1.2.1(61)：字段初始化式中的 lambda 捕获 this 且其后仍有未初始化成员。
+        assert_invalid(
+            "class A {\n\
+             \x20   var a: Int64 = 1\n\
+             \x20   var c: () -> Int64 = { a }\n\
+             \x20   var e: Int64 = 1\n\
+             }\n\
+             main() {}\n",
+        );
+        // 函数引用形式同样受限。
+        assert_invalid(
+            "class A {\n\
+             \x20   var a: Int64 = 1\n\
+             \x20   var d: () -> Int64 = f\n\
+             \x20   var e: Int64 = 1\n\
+             \x20   func f(): Int64 { return a }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 捕获式字段位于最后一个实例字段时允许（保守：无后续未初始化成员）。
+        assert_valid(
+            "class A {\n\
+             \x20   var a: Int64 = 1\n\
+             \x20   var c: () -> Int64 = { a }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 不捕获 this 的 lambda 始终允许。
+        assert_valid(
+            "class A {\n\
+             \x20   var b: () -> Int64 = { 3 }\n\
+             \x20   var e: Int64 = 1\n\
+             }\n\
+             main() {}\n",
+        );
     }
 
 }
