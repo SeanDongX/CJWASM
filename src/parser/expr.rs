@@ -2456,6 +2456,9 @@ impl Parser {
         if self.check(&Token::RParen) {
             return Ok((args, named_args));
         }
+        // 3.2.3.1 / 2.1.9(4)：实参列表中命名实参之后不能再出现位置实参
+        // （官方 05_03_01 a02/a04/a05 系列负例：`f(b: 6, 12)`）。
+        let mut seen_named_arg = false;
 
         loop {
             // 允许尾随逗号：f(a, b,)
@@ -2477,10 +2480,19 @@ impl Parser {
                         Some(Token::Ident(n)) => n,
                         _ => unreachable!(),
                     };
+                    // 3.2.3.1：同一实参列表中命名实参名不能重复
+                    // （官方 05_01_02_01 a04_04 负例 `f(b:12,b:6)`）。
+                    if !self.allow_wildcard_expr && named_args.iter().any(|(n, _)| n == &name) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Ident(name.clone()),
+                            "命名实参重复（3.2.3.1）".to_string(),
+                        ));
+                    }
                     self.advance(); // skip !
                     self.advance(); // skip :
                     let value = self.parse_expr()?;
                     named_args.push((name, value));
+                    seen_named_arg = true;
                     if !self.check(&Token::Comma) {
                         break;
                     }
@@ -2492,9 +2504,17 @@ impl Parser {
                         Some(Token::Ident(n)) => n,
                         _ => unreachable!(),
                     };
+                    // 3.2.3.1：同一实参列表中命名实参名不能重复。
+                    if !self.allow_wildcard_expr && named_args.iter().any(|(n, _)| n == &name) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Ident(name.clone()),
+                            "命名实参重复（3.2.3.1）".to_string(),
+                        ));
+                    }
                     self.advance(); // skip :
                     let value = self.parse_expr()?;
                     named_args.push((name, value));
+                    seen_named_arg = true;
                     if !self.check(&Token::Comma) {
                         break;
                     }
@@ -2517,6 +2537,12 @@ impl Parser {
                     self.advance();
                     continue;
                 }
+            }
+            if seen_named_arg && !self.allow_wildcard_expr {
+                return self.bail(ParseError::UnexpectedToken(
+                    self.peek().cloned().unwrap_or(Token::RParen),
+                    "位置实参不能出现在命名实参之后（3.2.3.1）".to_string(),
+                ));
             }
             args.push(self.parse_expr()?);
             if !self.check(&Token::Comma) {
@@ -3373,5 +3399,18 @@ main() { Test.f<Array<Int64>>(1) }
         parse_ok_only("main() { let x = (1 as Int64) as Int32 }");
         parse_ok_only("main() { let x = (1 is Int64) is Bool }");
         parse_ok_only("main() { let x = (1 as Int64) is Int32 }");
+    }
+
+    #[test]
+    fn test_w18d_named_arg_ordering_and_duplicate() {
+        // 3.2.3.1：命名实参之后不能出现位置实参。
+        parse_err_only("func f(a: Int32, b!: Int32) { }\nmain() { f(b: 6, 12) }");
+        parse_err_only(
+            "func f(a: Int32, b: Int32, c!: Int32) { }\nmain() { f(6, c: 6, 12) }",
+        );
+        // 位置实参在前、命名实参在后合法。
+        parse_ok_only("func f(a: Int32, b!: Int32) { }\nmain() { f(6, b: 12) }");
+        // 命名实参重复非法。
+        parse_err_only("func f(a!: Int32) { }\nmain() { f(a: 1, a: 2) }");
     }
 }
