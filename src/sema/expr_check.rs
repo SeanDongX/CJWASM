@@ -434,6 +434,14 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
     }
 }
 
+/// 判定位实参个数能否被某个自由函数重载接受（10.1.2.1）。仅按位置形参个数/默认值判定，
+/// 不比较类型（类型可能因泛型/函数类型等无法精确比较，避免误判）。
+fn free_sig_accepts(s: &FreeFuncSig, npos: usize) -> bool {
+    npos >= s.required
+        && npos <= s.positional
+        && s.positional_defaults.iter().skip(npos).all(|&d| d)
+}
+
 /// 构造调用实参与一个构造函数签名的匹配判定（6.1.2.1(8)/(9)）。
 /// 返回 `Ok(())` 表示匹配；`Err(..)` 给出首要不匹配原因。
 fn ctor_match(sig: &CtorSig, pos: &[Ty], named: &[(String, Ty)]) -> Result<(), String> {
@@ -814,6 +822,8 @@ struct Checker<'a> {
     constraint_parents: HashMap<String, Vec<String>>,
     /// 类名 → 全部构造函数签名（用于构造调用实参匹配，6.1.2.1(8)/(9)）。
     class_ctors: HashMap<String, Vec<CtorSig>>,
+    /// 顶层自由函数名 → 各重载的位置实参签名（10.1.2.1 可见函数集/重载决议）。
+    free_func_sigs: HashMap<String, Vec<FreeFuncSig>>,
     /// struct 类型名（值类型），用于区分引用/值语义下的成员可变性。
     struct_names: HashSet<String>,
     /// 当前正在检查的成员所属结构体名（用于放行结构体定义体内对私有成员的访问）。
@@ -910,6 +920,23 @@ struct CtorParam {
 #[derive(Clone)]
 struct CtorSig {
     params: Vec<CtorParam>,
+}
+
+/// 一个顶层自由函数的“位置实参接受能力”签名（10.1.2.1：可见函数集/重载决议）。
+/// 仅记录与本检查相关的量：位置形参个数、必需位置形参个数、各位置形参是否带默认值、
+/// 是否含变长形参。用于保守判定“调用位置实参个数无法匹配任何重载”。
+#[derive(Clone)]
+struct FreeFuncSig {
+    /// 位置形参（非命名、非 this/self）个数
+    positional: usize,
+    /// 其中必需（无默认值）的个数
+    required: usize,
+    /// 每个位置形参是否带默认值（按声明顺序）
+    positional_defaults: Vec<bool>,
+    /// 每个位置形参的类型（按声明顺序）
+    positional_types: Vec<Ty>,
+    /// 是否含变长（Array 变长实参糖）形参
+    variadic: bool,
 }
 
 /// 用户类型类别（用于 prelude 子类型关系与成员访问规则判定）。
@@ -1299,6 +1326,43 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         if !sigs.is_empty() {
             class_ctors.insert(s.name.clone(), sigs);
         }
+    }
+    // 顶层自由函数名 → 各重载的位置实参签名（10.1.2.1 可见函数集/重载决议）。
+    let mut free_func_sigs: HashMap<String, Vec<FreeFuncSig>> = HashMap::new();
+    for f in &program.functions {
+        let mut positional = 0usize;
+        let mut required = 0usize;
+        let mut positional_defaults: Vec<bool> = Vec::new();
+        let mut positional_types: Vec<Ty> = Vec::new();
+        let mut variadic = false;
+        for p in &f.params {
+            if p.name == "this" || p.name == "self" {
+                continue;
+            }
+            if p.variadic {
+                variadic = true;
+            }
+            if p.is_named {
+                continue;
+            }
+            positional += 1;
+            let has_def = p.default.is_some();
+            if !has_def {
+                required += 1;
+            }
+            positional_defaults.push(has_def);
+            positional_types.push(ty_of_known(&p.ty, &type_names));
+        }
+        free_func_sigs
+            .entry(f.name.clone())
+            .or_default()
+            .push(FreeFuncSig {
+                positional,
+                required,
+                positional_defaults,
+                positional_types,
+                variadic,
+            });
     }
     // 4.23(15)：赋值左侧可变性的辅助信息。
     // - struct 为值类型：成员赋值要求“基础对象可变”且“字段可变”；
@@ -1696,6 +1760,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         alias_types,
         constraint_parents,
         class_ctors,
+        free_func_sigs,
         struct_names,
         struct_fields,
         field_types,
@@ -3416,6 +3481,92 @@ fn is_builtin_float(name: &str) -> bool {
     matches!(name, "Float16" | "Float32" | "Float64")
 }
 
+/// 常见的 std/内建自由函数名：当用户顶层函数与其同名时，可视函数集还可能包含
+/// 跨文件/std 重载，无法在单文件内枚举完整，保守放行（10.1.2.1）。
+fn is_builtin_free_call_name(name: &str) -> bool {
+    matches!(
+        name,
+        "print"
+            | "println"
+            | "panic"
+            | "sqrt"
+            | "floor"
+            | "ceil"
+            | "trunc"
+            | "nearest"
+            | "abs"
+            | "neg"
+            | "copysign"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "atan2"
+            | "exp"
+            | "exp2"
+            | "expm1"
+            | "log"
+            | "ln"
+            | "log2"
+            | "log10"
+            | "log1p"
+            | "pow"
+            | "fmin"
+            | "fmax"
+            | "min"
+            | "max"
+            | "clamp"
+            | "fmod"
+            | "remainder"
+            | "ldexp"
+            | "hypot"
+            | "cbrt"
+            | "sinh"
+            | "cosh"
+            | "tanh"
+            | "asinh"
+            | "acosh"
+            | "atanh"
+            | "lgamma"
+            | "tgamma"
+            | "gamma"
+            | "erf"
+            | "erfc"
+            | "collectArray"
+            | "sort"
+            | "now"
+            | "exit"
+            | "sleep"
+            | "random"
+            | "line"
+            | "toString"
+            | "hashCode"
+            | "equals"
+            | "compare"
+            | "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "IntNative"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "UIntNative"
+            | "Float16"
+            | "Float32"
+            | "Float64"
+            | "Bool"
+            | "Rune"
+            | "String"
+            | "Unit"
+            | "BigInt"
+            | "BigDecimal"
+    )
+}
+
 fn builtin_ty_by_name(name: &str) -> Ty {
     ty_of(&Type::Struct(name.to_string(), vec![]))
 }
@@ -3544,6 +3695,58 @@ impl<'a> Checker<'a> {
         }
         if let Some(reason) = first_reason {
             self.err(format!("构造调用 '{}' 的实参与构造函数不匹配：{}", name, reason));
+        }
+    }
+
+    /// 10.1.2.1(1)(6)：判断“位置实参个数是否可能被某个重载接受”。
+    /// 仅当被调名只由本地顶层函数构成（不涉及类型/全局/局部函数/成员方法/内建名），
+    /// 且无变长形参、无命名实参时判定；任一条件不满足即保守放行。
+    fn check_free_func_arity(
+        &mut self,
+        name: &str,
+        arg_tys: &[Ty],
+        args: &[Expr],
+        named_args: &[(String, Expr)],
+    ) {
+        if name.contains('.') {
+            return;
+        }
+        // 尾随 lambda 可绑定到函数类型形参，形态特殊，保守跳过。
+        if matches!(args.last(), Some(Expr::Lambda { .. })) {
+            return;
+        }
+        if !named_args.is_empty() {
+            return;
+        }
+        let Some(sigs) = self.free_func_sigs.get(name) else {
+            return;
+        };
+        // 完整性门槛：该名不得同时作为类型/全局/局部函数/成员方法/内建自由函数出现，
+        // 否则本地自由函数集可能不完整（跨文件/std 重载无法枚举），一律放行。
+        if self.type_names.contains(name)
+            || self.enum_names.contains(name)
+            || self.globals.contains_key(name)
+            || self.local_func_names.contains(name)
+            || self.is_known_member_name(name)
+            || self.has_any_method_named(name)
+            || is_builtin_free_call_name(name)
+        {
+            return;
+        }
+        // 变长形参（含 Array 变长实参糖，5.3.4）会吸收任意多个位置实参，个数判定不可靠，跳过。
+        if sigs
+            .iter()
+            .any(|s| s.variadic || s.positional_types.iter().any(|t| matches!(t, Ty::Array(_))))
+        {
+            return;
+        }
+        let npos = arg_tys.len();
+        let accepts = sigs.iter().any(|s| free_sig_accepts(s, npos));
+        if !accepts {
+            self.err(format!(
+                "函数 '{}' 的重载均不接受 {} 个位置实参（10.1.2.1 可见函数集/重载决议）",
+                name, npos
+            ));
         }
     }
 
@@ -6304,6 +6507,8 @@ impl<'a> Checker<'a> {
                 }
                 // 2.1.3(4)/2.3.1(1)：基础类型转换的合法性（Bool↔数值、Rune↔数值）。
                 self.check_builtin_conversion(name, args, &arg_tys);
+                // 10.1.2.1：自由函数重载集完整时，位置实参个数/类型无法匹配任一重载则报错。
+                self.check_free_func_arity(name, &arg_tys, args, named_args);
                 self.check_type_instantiation(name, type_args.as_deref());
                 // 6.2.2.1(3)：命名参数必须以 `名字:` 形式传入。
                 self.check_named_arg_positions(name, args);

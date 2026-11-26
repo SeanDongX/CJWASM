@@ -2619,10 +2619,11 @@ impl Parser {
                 return self.bail(ParseError::UnexpectedToken(tok, "类型名".to_string()));
             }
         };
-        // 目标类型的泛型实参 Array<T>
-        let _ = self.parse_opt_type_args()?;
+        // 目标类型的泛型实参 Array<T>（8.3：扩展泛型类型必须保留实参以便校验）
+        let type_args = self.parse_opt_type_args()?.unwrap_or_default();
         // 可选: 实现的接口 (cjc: extend Type <: InterfaceName 或 <: InterfaceName<T>)
         // 兼容: <: 为 SubType；或 < 与 : 分开为 Lt+Colon；或误写为 < InterfaceName 即 Lt+Ident
+        let mut interface_args: Vec<Type> = Vec::new();
         let interface = if self.check(&Token::Colon)
             || self.check(&Token::SubType)
             || (self.check(&Token::Lt) && matches!(self.peek_next(), Some(Token::Colon)))
@@ -2644,10 +2645,11 @@ impl Parser {
                 }
             };
             // 消费接口的类型实参，如 SortByExtension<T> 中的 <T>（此处确定是泛型，直接解析）
+            // 记录实参以便 8.1.2(12) 判定泛型接口重复实现。
             if self.check(&Token::Lt) {
                 self.advance();
                 loop {
-                    let _ = self.parse_type()?;
+                    interface_args.push(self.parse_type()?);
                     if self.check(&Token::Gt) {
                         self.advance();
                         break;
@@ -2914,7 +2916,9 @@ impl Parser {
         self.expect(Token::RBrace)?;
         Ok(crate::ast::ExtendDef {
             target_type,
+            type_args,
             interface,
+            interface_args,
             assoc_type_bindings,
             methods,
         })
