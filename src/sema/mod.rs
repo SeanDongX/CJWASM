@@ -505,6 +505,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     }
     for en in &program.enums {
         check_enum_variants(en, &mut errors);
+        // 2.1.11.1(12)：枚举构造器名不是类型名，不能用作构造器参数类型
+        // （如 `enum E { E1 | E2(E1) }` 中的 `E1`）。
+        check_enum_payload_variant_types(en, program, &index, &mut errors);
         // 2.1.11(9)：enum 不能被枚举继承（`enum B <: A`，A 为 enum 或预声明 Option）。
         check_enum_inheritance(en, &index, &mut errors);
         check_enum_interfaces(en, program, &index, &mut errors);
@@ -8255,6 +8258,44 @@ fn check_enum_inheritance(
             if b == "Option" || index.enums.contains(b.as_str()) {
                 errors.push(SemanticError {
                     message: format!("枚举 '{}' 不能继承枚举类型 '{}'（2.1.11(9)）", en.name, b),
+                });
+            }
+        }
+    }
+}
+
+/// 2.1.11.1(12)：枚举构造器名是值而非类型，不能用作构造器参数的类型。
+/// 仅当该名字是某枚举的构造器名且不是任何本地可解析/类型别名类型名时报告。
+fn check_enum_payload_variant_types(
+    en: &EnumDef,
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut variants: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for e in &program.enums {
+        for v in &e.variants {
+            variants.insert(v.name.as_str());
+        }
+    }
+    fn bad(t: &Type, variants: &std::collections::HashSet<&str>, index: &ProgramIndex<'_>) -> bool {
+        match t {
+            Type::Struct(n, _) => {
+                variants.contains(n.as_str()) && !index.known_types.contains(n.as_str())
+            }
+            Type::Option(x) | Type::Array(x) | Type::Slice(x) => bad(x, variants, index),
+            Type::Tuple(ts) => ts.iter().any(|x| bad(x, variants, index)),
+            _ => false,
+        }
+    }
+    for v in &en.variants {
+        if let Some(p) = &v.payload {
+            if bad(p, &variants, index) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "枚举构造器 '{}' 的参数类型不能是枚举构造器名（2.1.11.1(12)）",
+                        v.name
+                    ),
                 });
             }
         }
@@ -29634,6 +29675,19 @@ main() {}"#,
              return 0\n\
              }\n",
         );
+    }
+
+    #[test]
+    fn test_w21b_enum_payload_variant_type_rejected() {
+        // 2.1.11.1(12)：枚举构造器名不是类型名，不能作为构造器参数类型。
+        let errs = assert_invalid("enum E { E1 | E2(E1) | E3(E2) }\nmain() {}");
+        assert!(
+            errs.iter().any(|e| e.message.contains("枚举构造器名")),
+            "期望枚举构造器名错误，实际: {:?}",
+            errs
+        );
+        // 正例：递归枚举引用枚举类型名本身合法。
+        assert_valid("enum E { E1 | E2(E) }\nmain() {}");
     }
 
 }
