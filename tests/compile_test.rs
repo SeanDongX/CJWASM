@@ -883,7 +883,7 @@ fn test_compile_interface_inheritance_default_assoc() {
             func id() : Int64;
         }
 
-        interface Extended: Base {
+        interface Extended <: Base {
             type Element;
 
             func doubled() : Int64 {
@@ -3783,7 +3783,7 @@ fn test_parse_interface_with_default() {
 fn test_parse_interface_extends() {
     let source = r#"
         interface Base { func id() : Int64; }
-        interface Extended: Base { func extra() : Int64; }
+        interface Extended <: Base { func extra() : Int64; }
         struct Impl { }
         extend Impl: Extended {
             func id(self: Impl) : Int64 { return 1 }

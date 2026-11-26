@@ -2274,7 +2274,9 @@ impl Parser {
                              parents: &mut Vec<String>,
                              parent_types: &mut Vec<Type>|
          -> Result<(), ParseErrorAt> {
-            if !(this.check(&Token::Colon) || this.check(&Token::SubType)) {
+            // 6.2.1.1(2)：接口的父接口列表只能以 `<:` 引导；`interface I: X` 中的
+            // `:` 不是接口继承语法（此前被兼容性地当作父接口分隔符接受）。
+            if !this.check(&Token::SubType) {
                 return Ok(());
             }
             this.advance();
@@ -6046,5 +6048,24 @@ main() {}
             .and_then(|i| i.methods.iter().find(|m| m.name == "h"))
             .expect("I.h");
         assert!(h.is_mut, "接口 mut func 应记录 is_mut=true");
+    }
+
+    #[test]
+    fn test_w22b_double_where_clause_rejected() {
+        // 6.1.2.4(3)：一个声明至多一个 where 约束子句。
+        err("func Nfhjk<T1, T2>() where T1 <: T2 where T1 <: T2 {}\nmain() {}");
+        // 单个 where 合法。
+        ok("func Nfhjk<T1, T2>() where T1 <: T2 {}\nmain() {}");
+        // class 单一 where 合法（回归保护）。
+        ok("class C<X, Y> where X <: Y {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w22b_interface_colon_parent_rejected() {
+        // 6.2.1.1(2)：接口父接口列表只能以 `<:` 引导，`:` 非法。
+        err("interface I1: Any {}\nmain() {}");
+        // 正规 `<:` 继承仍合法。
+        ok("interface I1 <: Any {}\nmain() {}");
+        ok("interface I2 {}\ninterface I3 <: I2 {}\nmain() {}");
     }
 }
