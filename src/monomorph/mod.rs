@@ -1724,6 +1724,8 @@ pub fn monomorphize_program(program: &mut Program) {
                 .map(|s| substitute_stmt(s, &subst, &rewrites))
                 .collect(),
             member_param_flags: i.member_param_flags.clone(),
+            member_param_vis: i.member_param_vis.clone(),
+            member_param_mut: i.member_param_mut.clone(),
         });
         let deinit = def.deinit.as_ref().map(|d| {
             d.iter()
@@ -2455,6 +2457,8 @@ is_c: false,
                             value: Expr::Var("d".to_string()),
                         }],
                         member_param_flags: vec![false],
+                        member_param_vis: Vec::new(),
+                        member_param_mut: Vec::new(),
                     }),
                     deinit: None,
                     static_init: None,

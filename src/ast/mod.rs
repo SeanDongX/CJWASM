@@ -710,6 +710,14 @@ pub struct InitDef {
     pub body: Vec<Stmt>,
     /// 参数是否为成员变量参数（`var`/`let` 前缀），与 `params` 一一对应。
     pub member_param_flags: Vec<bool>,
+    /// 成员变量形参的可见性（与 `params` 一一对应；非成员形参为 internal）。
+    /// 仅类名形式主构造函数会填充；长度与 `params` 不一致时相关检查保守跳过。
+    /// 用于 6.1.2.1(14)：private 成员在类外/子类不可见。
+    pub member_param_vis: Vec<Visibility>,
+    /// 成员变量形参是否为可变（`var` 为 true、`let` 为 false，与 `params` 一一
+    /// 对应）。仅类名形式主构造函数会填充；长度不一致时相关检查保守跳过。
+    /// 用于 6.1.2.1(9)：`let` 生成的成员不可被重新赋值。
+    pub member_param_mut: Vec<bool>,
     /// 是否为 const 初始化器（`const init`）：可作为常量表达式/常量构造（16.2(7)）。
     pub is_const: bool,
     /// 构造函数可见性（`private init` 等，2.1.10.2(3)）。

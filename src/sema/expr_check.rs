@@ -8655,7 +8655,7 @@ fn default_literal(value: &Ty) -> Ty {
 ///
 /// 解析器把合成默认值包装为 `Block([], Some(默认值))`；显式写出默认值
 /// （如 `let x: Int32 = 0`）没有这层包装，因此不会被误判为延迟赋值。
-fn is_default_value(ty: &Type, value: &Expr) -> bool {
+pub(crate) fn is_default_value(ty: &Type, value: &Expr) -> bool {
     let Expr::Block(_, Some(inner)) = value else {
         return false;
     };
