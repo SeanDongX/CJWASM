@@ -348,6 +348,7 @@ impl CodeGen {
                         },
                     ],
                     props: vec![],
+                    derives_equatable: false,
                 },
             );
         }
@@ -370,6 +371,7 @@ impl CodeGen {
                         },
                     ],
                     props: vec![],
+                    derives_equatable: false,
                 },
             );
         }
@@ -7745,6 +7747,7 @@ is_c: false,
                     },
                 ],
                 props: vec![],
+                derives_equatable: false,
             }],
             extends: vec![],
             type_aliases: vec![],

@@ -42,6 +42,9 @@ pub struct Parser {
     pending_decl_attr: bool,
     /// 上一次 `skip_optional_attributes` 是否跳过了 `@Annotation`（17.1(5)）。
     last_attr_annotation: bool,
+    /// 上一次 `skip_optional_attributes` 是否跳过了含 `Equatable` 的 `@Derive[...]`
+    /// （自动派生 `==`/`!=`；供 2.1.11.1(9) 枚举比较检查豁免）。
+    last_attr_derive_equatable: bool,
     /// 顶层类声明是否带 `@Annotation`（由属性跳过逻辑置位，供类声明分派消费）。
     pending_annotation_attr: bool,
     /// 本文件中带 `@C` 的结构体名（用于字段 CType 约束校验）。
@@ -79,6 +82,7 @@ impl Parser {
             pending_c_decl: false,
             pending_decl_attr: false,
             last_attr_annotation: false,
+            last_attr_derive_equatable: false,
             pending_annotation_attr: false,
             c_structs: std::collections::HashSet::new(),
             c_struct_explicit_array_fields: Vec::new(),
@@ -545,6 +549,7 @@ impl Parser {
         let mut should_skip_next = false;
         self.last_attr_c = false;
         self.last_attr_annotation = false;
+        self.last_attr_derive_equatable = false;
         if self.check(&Token::At) {
             self.pending_decl_attr = true;
         }
@@ -590,6 +595,14 @@ impl Parser {
                     if is_os_eq_windows {
                         should_skip_next = true;
                     }
+                }
+                // `@Derive[..., Equatable, ...]`：自动派生 `==`/`!=`（2.1.11.1(9)）。
+                if attr_name == "Derive"
+                    && collected
+                        .iter()
+                        .any(|t| matches!(t, Token::Ident(n) if n == "Equatable"))
+                {
+                    self.last_attr_derive_equatable = true;
                 }
             }
         }

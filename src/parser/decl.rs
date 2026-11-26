@@ -166,6 +166,10 @@ impl Parser {
         // 11.2(7)-(12)：`public type X = <internal 类型>` 为非法。type_aliases 的
         // AST 形态不保留可见性，故在解析期单独记录 public 别名，收尾时校验。
         let mut public_type_aliases: Vec<(String, Type)> = Vec::new();
+        // 2.4.1(18)：public 别名不得引用非 public 别名（别名是"类型"的一种）。
+        // type_aliases 的 AST 不保留可见性，故单独记录 public 别名名集合。
+        let mut public_alias_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut constants = Vec::new();
 
         // 解析可选的 package 声明（cjc: package prefix.path，支持点分路径）
@@ -506,6 +510,13 @@ impl Parser {
                         let prev_params =
                             std::mem::replace(&mut self.current_type_params, type_params);
                         self.expect(Token::Assign)?;
+                        // 2.4.1(18)：解析目标类型前先记录裸名，用于判定 public 别名
+                        // 是否引用了非 public 别名（parse_type 会把别名展开为目标类型，
+                        // 届时原始名已丢失）。
+                        let raw_target_ident = match self.peek() {
+                            Some(Token::Ident(n)) => Some(n.clone()),
+                            _ => None,
+                        };
                         let target_ty = self.parse_type()?;
                         self.current_type_params = prev_params;
                         // cjc 允许类型别名声明以分号结尾
@@ -516,6 +527,21 @@ impl Parser {
                             .insert(alias_name.clone(), target_ty.clone());
                         // 11.2(7)-(12)：记录 public 别名，收尾时校验其是否引用 internal 类型。
                         if matches!(visibility, Visibility::Public) {
+                            if let Some(n) = &raw_target_ident {
+                                if n != &alias_name
+                                    && self.type_aliases.contains_key(n)
+                                    && !public_alias_names.contains(n)
+                                {
+                                    return self.bail(ParseError::UnexpectedToken(
+                                        Token::TypeAlias,
+                                        format!(
+                                            "public 类型别名 '{}' 引用了非 public 别名 '{}'（2.4.1(18)）",
+                                            alias_name, n
+                                        ),
+                                    ));
+                                }
+                            }
+                            public_alias_names.insert(alias_name.clone());
                             public_type_aliases.push((alias_name.clone(), target_ty.clone()));
                         }
                         type_aliases.push((alias_name, target_ty));
@@ -783,6 +809,14 @@ impl Parser {
             for i in &interfaces {
                 if i.visibility == Visibility::Internal {
                     internal_types.insert(i.name.clone());
+                }
+            }
+            // 2.4.1(18)：别名的访问级别不能高于其原始类型的访问级别。a18_01：
+            // `public type S = <非 public 别名>` 非法。type_aliases 的 AST 不保留
+            // 可见性，此处以"未出现在 public_type_aliases 名单中"判定为非 public 别名。
+            for (n, _) in &type_aliases {
+                if !public_type_aliases.iter().any(|(p, _)| p == n) {
+                    internal_types.insert(n.clone());
                 }
             }
             for (alias, ty) in &public_type_aliases {
@@ -1934,6 +1968,10 @@ impl Parser {
         // 解析可选的泛型类型参数 <T, E: Bound, ...>
         let (type_params, mut constraints) = self.parse_type_params_with_constraints()?;
         let where_constraints = self.parse_where_clause()?;
+        // 2.1.11.1(1)：enum 头部语法顺序为 `typeParameters ('<:' superInterfaces)?
+        // genericConstraints?`，即 `where` 约束必须写在父接口 `<:` 之后。
+        // 此处若在 `where` 之后又遇到 `<:`，则为非法顺序（a01_06）。
+        let had_where_before_super = !where_constraints.is_empty();
         constraints.extend(where_constraints);
         let prev_params = std::mem::replace(&mut self.current_type_params, type_params.clone());
         // 兜底: where 中 Bound<T> 的 <T> 若未消费，此处消费
@@ -1957,6 +1995,14 @@ impl Parser {
         }
         // cjc: enum Name <: Protocol<Type> { ... } — 消费可选的 <: Bound 或 <: Bound<T>
         let super_uses_subtype = self.check(&Token::SubType);
+        // 2.1.11.1(1)：`where` 约束必须写在父接口 `<:` 之后；`where` 之后出现 `<:`
+        // 属于非法顺序（a01_06）。
+        if had_where_before_super && super_uses_subtype {
+            return self.bail(ParseError::UnexpectedToken(
+                Token::SubType,
+                "enum 泛型约束 `where` 必须位于父接口 `<:` 之后（2.1.11.1(1)）".to_string(),
+            ));
+        }
         if self.check(&Token::SubType)
             || self.check(&Token::Colon)
             || (self.check(&Token::Lt)
@@ -2316,6 +2362,7 @@ impl Parser {
             constraints,
             variants,
             props,
+            derives_equatable: self.last_attr_derive_equatable,
         })
     }
 
@@ -6136,5 +6183,35 @@ main() {}
         // 正规 `<:` 继承仍合法。
         ok("interface I1 <: Any {}\nmain() {}");
         ok("interface I2 {}\ninterface I3 <: I2 {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w24b_enum_variant_comma_newline_dialect_ok() {
+        // 本方言（见 00 档案 S 类"枚举体逗号"）兼容以 `,` / `;` / 换行分隔枚举变体，
+        // 与官方 `|` 语法并行支持。此处固化该方言行为（回归保护）。
+        ok("enum E {\n    A\n    B\n}\nmain() {}");
+        ok("enum E {\n    A, B\n}\nmain() {}");
+        ok("enum E {\n    | A\n    | B\n}\nmain() {}");
+        ok("enum E {\n    A | B\n}\nmain() {}");
+        ok("enum E {\n    A\n}\nmain() {}");
+        ok("enum E {\n    | A\n    func f(): Int64 { 0 }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w24b_enum_where_before_super_rejected() {
+        // 2.1.11.1(1)：enum 头部 `where` 约束必须位于父接口 `<:` 之后。
+        err("interface I {}\nenum E<T> where T <: I <: I {\n    | A\n    | B\n}\nmain() {}");
+        // 无父接口时 `where` 约束合法。
+        ok("interface I {}\nenum E<T> where T <: I {\n    | A(T)\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w24b_public_alias_of_private_alias_rejected() {
+        // 2.4.1(18)：别名访问级别不能高于原始类型；public 别名引用非 public 别名非法。
+        err("type AVeryLongAndUnintuitiveTypeName = Float16\npublic type SimpleType = AVeryLongAndUnintuitiveTypeName\nmain() {}");
+        // public 别名引用 public 别名合法。
+        ok("public type A = Int64\npublic type B = A\nmain() {}");
+        // 同为非 public 别名合法。
+        ok("type A = Int64\ntype B = A\nmain() {}");
     }
 }

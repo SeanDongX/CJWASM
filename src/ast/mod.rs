@@ -808,6 +808,9 @@ pub struct EnumDef {
     /// 解析器同时把这些属性脱糖为 `EnumName.__get_p` / `__set_p` 方法以便语义
     /// 检查与代码生成；此字段保留原始声明供接口属性规则（6.2.4.1(6)/(7)）使用。
     pub props: Vec<PropDef>,
+    /// 是否由 `@Derive[..., Equatable, ...]` 派生相等语义（自动生成 `==`/`!=`）。
+    /// 供语义检查（2.1.11.1(9) 枚举默认不支持 `==`/`!=`）判定时豁免。默认 false。
+    pub derives_equatable: bool,
 }
 
 impl EnumDef {

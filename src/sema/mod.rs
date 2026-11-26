@@ -6,7 +6,7 @@
 //!
 //! 设计目标：零 panic、无 I/O、纯函数，与 CodeGen 解耦。
 
-use crate::ast::{Expr, Program, Stmt, Type, TypeConstraint};
+use crate::ast::{BinOp, Expr, Program, Stmt, Type, TypeConstraint};
 use std::collections::HashMap;
 
 /// 语义分析上下文：保存预分析推断出的类型信息
@@ -669,6 +669,12 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_generic_class_inference(program, &index, &mut errors);
     // 5.3.4：类型名不是值，不能作为二元运算操作数（`A<1u8>()` 的降级形态）。
     check_type_name_as_operand(program, &index, &mut errors);
+    // w24b：2.1.11.1(9) 枚举默认不支持 == / != 比较。
+    check_enum_eq_without_operator(program, &mut errors);
+    // w24b：2.1.6 / 2.1.6.2 声明类型与初始化值的明显类别不匹配。
+    check_declared_value_category_mismatch(program, &mut errors);
+    // w24b：2.1.11.2(3) 泛型枚举构造器类型实参无法推断（保守子集）。
+    check_generic_enum_ctor_inference(program, &mut errors);
     // 6.1.2.1(12)：成员变量参数不能用通配符 `_` 命名。
     check_wildcard_member_params(program, &mut errors);
 
@@ -28841,6 +28847,391 @@ fn check_infinite_generic_instantiation(program: &Program, errors: &mut Vec<Sema
         }
     }
 }
+
+// ─── w24b：02_types 章剩余单文件项（保守子集）────────────────────────────────
+//
+// 仅处理"本地可枚举 + 静态可判"的形态，避免对不在判定范围内的程序误报。
+
+/// 遍历程序内所有函数体（顶层函数、类/结构体构造器与方法、扩展方法、接口默认
+/// 实现）及顶层常量的初始化表达式，对其中每个子表达式调用 `f`。
+fn w24_scan_all<F: FnMut(&Expr)>(program: &Program, f: &mut F) {
+    for fdef in &program.functions {
+        walk_stmts(&fdef.body, f);
+    }
+    for c in &program.classes {
+        for i in &c.inits {
+            walk_stmts(&i.body, f);
+        }
+        for m in &c.methods {
+            walk_stmts(&m.func.body, f);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            walk_stmts(&i.body, f);
+        }
+    }
+    for e in &program.extends {
+        for m in &e.methods {
+            walk_stmts(&m.body, f);
+        }
+    }
+    for i in &program.interfaces {
+        for m in &i.methods {
+            if let Some(b) = &m.default_body {
+                walk_stmts(b, f);
+            }
+        }
+    }
+    for c in &program.constants {
+        walk_expr(&c.init, f);
+    }
+}
+
+/// 递归收集语句块内 `let` / `var` / `const` 的（可选类型标注，初始化表达式）。
+fn w24_collect_bindings<F: FnMut(Option<&Type>, &Expr)>(stmts: &[Stmt], f: &mut F) {
+    for s in stmts {
+        match s {
+            Stmt::Let { ty, value, .. } | Stmt::Var { ty, value, .. } => f(ty.as_ref(), value),
+            Stmt::Const { ty, value, .. } => f(ty.as_ref(), value),
+            Stmt::While { body, .. }
+            | Stmt::WhileLet { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => w24_collect_bindings(body, f),
+            Stmt::LocalFunc(func) => w24_collect_bindings(&func.body, f),
+            _ => {}
+        }
+    }
+}
+
+/// 收集程序内所有"值名"（形参、局部绑定、字段、顶层变量/函数），供裸名解析判定。
+fn w24_declared_value_names(program: &Program) -> HashSet<String> {
+    let mut names: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        names.insert(c.name.clone());
+    }
+    for f in &program.functions {
+        if !f.name.contains('.') {
+            names.insert(f.name.clone());
+        }
+        for p in &f.params {
+            names.insert(p.name.clone());
+        }
+        collect_bindings_stmts(&f.body, &mut names);
+    }
+    for c in &program.classes {
+        for fd in &c.fields {
+            names.insert(fd.name.clone());
+        }
+        for p in &c.primary_ctor_params {
+            names.insert(p.name.clone());
+        }
+        for i in &c.inits {
+            for p in &i.params {
+                names.insert(p.name.clone());
+            }
+            collect_bindings_stmts(&i.body, &mut names);
+        }
+        for m in &c.methods {
+            for p in &m.func.params {
+                names.insert(p.name.clone());
+            }
+            collect_bindings_stmts(&m.func.body, &mut names);
+        }
+    }
+    for s in &program.structs {
+        for fd in &s.fields {
+            names.insert(fd.name.clone());
+        }
+        for p in &s.primary_ctor_params {
+            names.insert(p.name.clone());
+        }
+        for i in &s.inits {
+            for p in &i.params {
+                names.insert(p.name.clone());
+            }
+            collect_bindings_stmts(&i.body, &mut names);
+        }
+    }
+    for e in &program.extends {
+        for m in &e.methods {
+            for p in &m.params {
+                names.insert(p.name.clone());
+            }
+            collect_bindings_stmts(&m.body, &mut names);
+        }
+    }
+    for i in &program.interfaces {
+        for m in &i.methods {
+            for p in &m.params {
+                names.insert(p.name.clone());
+            }
+            if let Some(b) = &m.default_body {
+                collect_bindings_stmts(b, &mut names);
+            }
+        }
+    }
+    names
+}
+
+/// 2.1.11.1(9)：枚举类型默认不支持 `==` / `!=`（除非显式重载对应运算符）。
+/// 保守子集：两侧均为本文件可确定的**无关联值**枚举变体（裸名或 `E.V` 限定名），
+/// 且属于同一枚举、该枚举未定义 `op_eq` / `op_ne` 时报告。
+fn check_enum_eq_without_operator(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut variant_enum: HashMap<String, String> = HashMap::new();
+    for e in &program.enums {
+        for v in &e.variants {
+            if v.payload.is_none() {
+                variant_enum
+                    .entry(v.name.clone())
+                    .or_insert_with(|| e.name.clone());
+            }
+        }
+    }
+    if variant_enum.is_empty() {
+        return;
+    }
+    let declared = w24_declared_value_names(program);
+    let has_op = |enum_name: &str, op_short: &str| {
+        let want = format!("{}.{}", enum_name, op_short);
+        if program.functions.iter().any(|f| f.name == want) {
+            return true;
+        }
+        // 通过 extend 为枚举重载运算符的情形。
+        program.extends.iter().any(|ext| {
+            ext.target_type == enum_name
+                && ext.methods.iter().any(|m| {
+                    m.name == op_short
+                        || m.name
+                            .rsplit_once('.')
+                            .map_or(false, |(_, short)| short == op_short)
+                })
+        })
+    };
+    let resolve = |e: &Expr| -> Option<String> {
+        match e {
+            Expr::Var(n) if !declared.contains(n) => variant_enum.get(n).cloned(),
+            Expr::VariantConst { enum_name, .. } => {
+                Some(w23_strip_generic(enum_name).to_string())
+            }
+            _ => None,
+        }
+    };
+    let mut scan = |e: &Expr| {
+        let Expr::Binary { op, left, right } = e else {
+            return;
+        };
+        let op_short = match op {
+            BinOp::Eq => "op_eq",
+            BinOp::NotEq => "op_ne",
+            _ => return,
+        };
+        let (Some(le), Some(re)) = (resolve(left), resolve(right)) else {
+            return;
+        };
+        // `@Derive[..., Equatable, ...]` 自动派生 ==/!=，视为已支持比较。
+        if program
+            .enums
+            .iter()
+            .any(|e| e.name == le && e.derives_equatable)
+        {
+            return;
+        }
+        if le == re && !has_op(&le, op_short) {
+            errors.push(SemanticError {
+                message: format!(
+                    "枚举类型 '{}' 未重载 `{}`，不支持该比较（2.1.11.1(9)）",
+                    le,
+                    if op_short == "op_eq" { "==" } else { "!=" }
+                ),
+            });
+        }
+    };
+    w24_scan_all(program, &mut scan);
+}
+
+/// 声明类型与初始化值的明显类别不匹配（保守子集）：
+/// - 2.1.6(1)：`String` 变量不得以枚举构造值初始化（a01_07）；
+/// - 2.1.6.2(11)：元组类型未实现 `ToString`，不得赋给 `ToString` 接口类型（a11_03）。
+fn check_declared_value_category_mismatch(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut payload_variants: HashSet<String> = HashSet::new();
+    for e in &program.enums {
+        for v in &e.variants {
+            if v.payload.is_some() {
+                payload_variants.insert(v.name.clone());
+            }
+        }
+    }
+    let mut other_type_names: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        other_type_names.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        other_type_names.insert(s.name.clone());
+    }
+    for i in &program.interfaces {
+        other_type_names.insert(i.name.clone());
+    }
+    let mut scan = |ty: Option<&Type>, value: &Expr| {
+        if let Some(Type::String) = ty {
+            let is_enum_ctor = match value {
+                Expr::VariantConst { .. } => true,
+                Expr::ConstructorCall { name, .. } => {
+                    let b = w23_strip_generic(name);
+                    payload_variants.contains(&b) && !other_type_names.contains(&b)
+                }
+                _ => false,
+            };
+            if is_enum_ctor {
+                errors.push(SemanticError {
+                    message: "枚举构造值不能赋给 String 类型（2.1.6(1)）".to_string(),
+                });
+            }
+        }
+        if let Some(Type::Struct(n, args)) = ty {
+            if n == "ToString" && args.is_empty() {
+                if let Expr::Tuple(_) = value {
+                    errors.push(SemanticError {
+                        message: "元组类型未实现 ToString 接口，不能赋给 ToString（2.1.6.2(11)）"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    };
+    for f in &program.functions {
+        w24_collect_bindings(&f.body, &mut scan);
+    }
+    for c in &program.classes {
+        for i in &c.inits {
+            w24_collect_bindings(&i.body, &mut scan);
+        }
+        for m in &c.methods {
+            w24_collect_bindings(&m.func.body, &mut scan);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            w24_collect_bindings(&i.body, &mut scan);
+        }
+    }
+    for e in &program.extends {
+        for m in &e.methods {
+            w24_collect_bindings(&m.body, &mut scan);
+        }
+    }
+    for i in &program.interfaces {
+        for m in &i.methods {
+            if let Some(b) = &m.default_body {
+                w24_collect_bindings(b, &mut scan);
+            }
+        }
+    }
+    for c in &program.constants {
+        scan(Some(&c.ty), &c.init);
+    }
+}
+
+/// 2.1.11.2(3)：泛型枚举构造器在省略类型实参时，类型参数必须能由实参推断。
+/// 保守子集：仅当构造器 payload 未覆盖枚举的**全部**类型参数、且使用处没有给出
+/// 完整的枚举类型标注（无上下文可推断）时报错。仅检查 `let`/`var`/`const`
+/// 初始化位置（值直接为构造器/无关联值变体）。
+fn check_generic_enum_ctor_inference(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut vmap: HashMap<&str, Vec<&EnumDef>> = HashMap::new();
+    for e in &program.enums {
+        if e.type_params.is_empty() {
+            continue;
+        }
+        for v in &e.variants {
+            vmap.entry(v.name.as_str()).or_default().push(e);
+        }
+    }
+    if vmap.is_empty() {
+        return;
+    }
+    let annotation_ok = |ty: &Type, e: &EnumDef| -> bool {
+        matches!(ty, Type::Struct(n, args) if n == &e.name && args.len() == e.type_params.len())
+    };
+    let mut check_use = |ty: Option<&Type>, value: &Expr| {
+        // 仅处理 `EnumName.Variant(...)` 限定形态：裸名变体（`Year`、
+        // `Day<T1,T2>(...)`）在 AST 中不保留是否写了显式类型实参，无法可靠判定，
+        // 故保守放行。
+        let Expr::VariantConst {
+            enum_name,
+            variant_name,
+            ..
+        } = value
+        else {
+            return;
+        };
+        let ename = w23_strip_generic(enum_name);
+        let vname = variant_name.clone();
+        let Some(cands) = vmap.get(vname.as_str()) else {
+            return;
+        };
+        let cand: Option<&EnumDef> = cands.iter().copied().find(|e| e.name == ename);
+        let Some(e) = cand else {
+            return;
+        };
+        let Some(v) = e.variants.iter().find(|v| v.name == vname) else {
+            return;
+        };
+        let all_mentioned = e.type_params.iter().all(|tp| {
+            v.payload
+                .as_ref()
+                .map_or(false, |p| type_mentions_param(p, tp))
+        });
+        if all_mentioned {
+            return;
+        }
+        // 完整枚举类型标注可提供推断上下文。
+        if let Some(t) = ty {
+            if annotation_ok(t, e) {
+                return;
+            }
+        }
+        errors.push(SemanticError {
+            message: format!(
+                "泛型枚举 '{}' 的构造器 '{}' 类型实参无法完全推断，须显式指定类型实参（2.1.11.2(3)）",
+                e.name, vname
+            ),
+        });
+    };
+    for c in &program.constants {
+        check_use(Some(&c.ty), &c.init);
+    }
+    for f in &program.functions {
+        w24_collect_bindings(&f.body, &mut check_use);
+    }
+    for c in &program.classes {
+        for i in &c.inits {
+            w24_collect_bindings(&i.body, &mut check_use);
+        }
+        for m in &c.methods {
+            w24_collect_bindings(&m.func.body, &mut check_use);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            w24_collect_bindings(&i.body, &mut check_use);
+        }
+    }
+    for e in &program.extends {
+        for m in &e.methods {
+            w24_collect_bindings(&m.body, &mut check_use);
+        }
+    }
+    for i in &program.interfaces {
+        for m in &i.methods {
+            if let Some(b) = &m.default_body {
+                w24_collect_bindings(b, &mut check_use);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -34740,4 +35131,50 @@ main() {}"#,
         assert_valid("enum E {\n    A | B\n}\nmain() {}\n");
     }
 
+    #[test]
+    fn test_w24b_enum_eq_without_operator_rejected() {
+        // 2.1.11.1(9)：枚举默认不支持 == / !=。
+        let errs = assert_invalid("enum E {\n    | F\n}\nlet c = F == F\nmain() {}\n");
+        assert!(errs.iter().any(|e| e.message.contains("未重载")), "{:?}", errs);
+        let errs = assert_invalid("enum E {\n    | F\n}\nlet c = F != F\nmain() {}\n");
+        assert!(errs.iter().any(|e| e.message.contains("未重载")), "{:?}", errs);
+        // 未进行比较时合法。
+        assert_valid("enum E {\n    | F\n}\nmain() {\n    let f = F\n}\n");
+        // @Derive[Equatable] 自动派生 ==/!=，比较合法。
+        assert_valid(
+            "@Derive[Equatable]\nenum E {\n    | F\n}\nlet c = F == F\nmain() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w24b_string_from_enum_ctor_rejected() {
+        // 2.1.6(1)：String 变量不能以枚举构造值初始化。
+        let errs = assert_invalid(
+            "enum E {\n    A(Int32)\n}\nmain() {\n    let x: String = A(16)\n}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("String")), "{:?}", errs);
+        // 无 String 标注时合法。
+        assert_valid("enum E {\n    A(Int32)\n}\nmain() {\n    let x = A(16)\n}\n");
+    }
+
+    #[test]
+    fn test_w24b_tostring_from_tuple_rejected() {
+        // 2.1.6.2(11)：元组未实现 ToString。
+        let errs = assert_invalid("main() {\n    var x: ToString = (\"a\", true)\n}\n");
+        assert!(errs.iter().any(|e| e.message.contains("ToString")), "{:?}", errs);
+        assert_valid("main() {\n    var x: String = \"a\"\n}\n");
+    }
+
+    #[test]
+    fn test_w24b_generic_enum_ctor_inference_rejected() {
+        // 2.1.11.2(3)：payload 未覆盖全部类型参数且无完整类型标注时须显式给出类型实参。
+        let errs = assert_invalid(
+            "enum G<T1, T2> {\n    | Year\n    | Month(T1)\n}\nlet t = G.Month(\"Jan\")\nmain() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("无法完全推断")), "{:?}", errs);
+        // 完整枚举类型标注可提供推断上下文。
+        assert_valid(
+            "enum G<T1, T2> {\n    | Year\n    | Month(T1)\n}\nlet t: G<String, Int64> = G.Month(\"x\")\nmain() {}\n",
+        );
+    }
 }

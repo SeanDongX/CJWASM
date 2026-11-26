@@ -352,6 +352,7 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
                 crate::ast::EnumVariant { name: "Some".to_string(), payload: Some(Type::Int64) },
             ],
             props: vec![],
+            derives_equatable: false,
         });
     }
     if !has_user_result {
@@ -365,6 +366,7 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
                 crate::ast::EnumVariant { name: "Err".to_string(), payload: Some(Type::String) },
             ],
             props: vec![],
+            derives_equatable: false,
         });
     }
 

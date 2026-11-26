@@ -1609,6 +1609,7 @@ pub fn monomorphize_program(program: &mut Program) {
             constraints: vec![],
             variants,
             props: def.props.clone(),
+            derives_equatable: def.derives_equatable,
         });
     }
     program.enums.append(&mut new_enums);
@@ -2726,6 +2727,7 @@ is_c: false,
                         },
                     ],
                     props: vec![],
+                    derives_equatable: false,
                 },
             ],
             functions: vec![Function {
