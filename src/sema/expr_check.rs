@@ -800,6 +800,19 @@ struct Checker<'a> {
     cur_class: Option<String>,
     /// 当前正在检查的 interface（默认函数体），用于成员存在性判定。
     cur_interface: Option<String>,
+    /// 当前正在检查的函数所属类型（由 `Type.method` 全名推导），用于
+    /// 严格作用域解析时放行本类型的成员名。
+    cur_owner: Option<String>,
+    /// 是否启用“未定义标识符”严格检查：仅对无（复杂）import 的单文件程序开启，
+    /// 避免把导入符号误判为未定义。
+    strict_scope: bool,
+    /// 用户类型名 → 在该类型方法体内可不带资格引用的成员名集合
+    /// （自身全部成员 + 传递父类型的成员）。
+    owner_members: HashMap<String, HashSet<String>>,
+    /// 正在检查其初始化式的 `let/var` 绑定名（仅当初始化式不是裸同名变量时压制
+    /// 该名字的“未定义”判定——解析器会把下一行前导运算符并入上一行表达式，
+    /// 从而在初始化式中出现对自身的引用，如 `let x = 1.0` 换行 `-x`）。
+    self_init_ok: Vec<String>,
     /// 当前 interface 默认函数体是否为 static 成员（6.2.2.2(5)）。
     cur_iface_static: bool,
     /// 顶层函数 / 接口函数名 → 各签名的 (参数是否命名参数, 参数是否 Array 类型) 列表。
@@ -889,6 +902,9 @@ struct Checker<'a> {
     /// 延迟赋值 `let` 的“唯一一次初值赋值”近似判定（4.2(5)）：在条件分支内的
     /// 赋值只记为“可能已赋值”，不在该处报错，避免误伤 if/else 逐分支初始化。
     cond_depth: usize,
+    /// 当前处于第几层循环体。用于 4.2(5)：延迟 `let` 不能在循环体内赋值
+    /// （循环可能执行 0 次或多次，无法保证“恰好一次初值赋值”）。
+    loop_depth: usize,
     /// 延迟赋值 `let` 的初值赋值状态：0=尚未赋值，1=可能已赋值（条件分支内），
     /// 2=确定已赋值（直线代码）。再次的直线赋值视为非法重赋值。
     deferred_state: HashMap<String, u8>,
@@ -1694,6 +1710,21 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         for m in &c.methods {
             collect_local_func_names(&m.func.body, &mut local_func_names);
         }
+        // 构造函数 / 静态初始化 / 析构体中的局部函数同样可见（前向引用）。
+        for init in &c.inits {
+            collect_local_func_names(&init.body, &mut local_func_names);
+        }
+        if let Some(si) = &c.static_init {
+            collect_local_func_names(si, &mut local_func_names);
+        }
+        if let Some(d) = &c.deinit {
+            collect_local_func_names(d, &mut local_func_names);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            collect_local_func_names(&init.body, &mut local_func_names);
+        }
     }
     for ext in &program.extends {
         for f in &ext.methods {
@@ -1743,6 +1774,11 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     let field_types = collect_field_types(program, &type_names);
     let method_returns = collect_method_returns(program, &type_names, &field_types);
 
+    // 3.2.3.2：未定义标识符严格检查仅在**完全无 import**且未声明 package 的单文件
+    // 程序上启用——导入符号与同包其它文件的顶层名无法静态确定，必须放行。
+    let strict_scope = program.imports.is_empty() && program.package_name.is_none();
+    let owner_members = collect_owner_members(program);
+
     let mut checker = Checker {
         globals,
         funcs,
@@ -1763,6 +1799,10 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         iface_static_methods: collect_iface_static_methods(program),
         cur_class: None,
         cur_interface: None,
+        cur_owner: None,
+        strict_scope,
+        owner_members,
+        self_init_ok: Vec::new(),
         cur_iface_static: false,
         named_call_sigs: collect_named_call_sigs(program),
         user_parents,
@@ -1802,6 +1842,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         in_const_ctx: false,
         known_funcs,
         cond_depth: 0,
+        loop_depth: 0,
         deferred_state: HashMap::new(),
         deferred_var: HashSet::new(),
         deferred_owner: HashMap::new(),
@@ -1843,6 +1884,12 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         struct_scopes.push((s.name.clone(), format!("{}.", s.name), scope));
     }
     for func in &program.functions {
+        // `Type.method` 形态（结构体/枚举/扩展方法）记录所属类型，供严格作用域
+        // 检查放行本类型成员名。
+        checker.cur_owner = func
+            .name
+            .rfind(|ch| ch == '.' || ch == ':')
+            .map(|idx| func.name[..idx].to_string());
         if let Some((st_name, _, scope)) = struct_scopes
             .iter()
             .find(|(_, prefix, _)| func.name.starts_with(prefix.as_str()))
@@ -1865,6 +1912,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             checker.in_const_ctx = prev_c;
         }
     }
+    checker.cur_owner = None;
     for cls in &program.classes {
         let prev_class = checker.cur_class.replace(cls.name.clone());
         // 类字段先入作用域，避免方法体内同名字段被解析成同名全局变量。
@@ -2010,6 +2058,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         checker.cur_interface = prev_iface;
     }
     for ext in &program.extends {
+        checker.cur_owner = Some(ext.target_type.clone());
         for func in &ext.methods {
             let prev_c = checker.in_const_ctx;
             checker.in_const_ctx = func.is_const;
@@ -2017,10 +2066,17 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             checker.in_const_ctx = prev_c;
         }
     }
+    checker.cur_owner = None;
     // 顶层 `let`/`var`/`const` 的初始化表达式同样参与类型检查
     // （如顶层 `let r = Int8(runeVar)` 的非法基础类型转换）。
     for c in &program.constants {
+        // 3.2.3.1(5)：顶层变量作用域自声明后才开始，初始化式不得引用自身
+        // （`let c = c`）。检查该初始化式期间临时移除自身，使其解析为未定义。
+        let saved = checker.globals.remove(&c.name);
         checker.check_expr(&c.init);
+        if let Some(v) = saved {
+            checker.globals.insert(c.name.clone(), v);
+        }
         // 4.1(1)：顶层显式类型注解与字面量类别一致（`let f: Float64 = 1` 等）。
         checker.check_toplevel_literal_annotation(&c.ty, &c.init);
         if c.is_const {
@@ -2030,6 +2086,189 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
 }
 
 /// 收集字段默认值表达式中引用到的裸标识符与调用名（2.1.10.1(3)）。
+/// 取限定名（`Type.member` / `Type::member`）的最后一段。
+fn last_seg(name: &str) -> &str {
+    let s = name.rsplit('.').next().unwrap_or(name);
+    s.rsplit("::").next().unwrap_or(s)
+}
+
+/// 登记成员名；属性访问器（`__get_p` / `__set_p`）同时登记属性短名 `p`。
+fn add_member_and_prop_short(out: &mut HashSet<String>, full: &str) {
+    let base = last_seg(full);
+    out.insert(base.to_string());
+    if let Some(stripped) = base
+        .strip_prefix("__get_")
+        .or_else(|| base.strip_prefix("__set_"))
+    {
+        out.insert(stripped.to_string());
+    }
+}
+
+/// 合并 if 两分支后的“延迟赋值状态”：2=确定已赋、1=可能已赋、0=未赋。
+fn merge_deferred_state(
+    before: &HashMap<String, u8>,
+    a: &HashMap<String, u8>,
+    b: &HashMap<String, u8>,
+) -> HashMap<String, u8> {
+    let mut out = HashMap::new();
+    let keys: HashSet<&String> = before.keys().chain(a.keys()).chain(b.keys()).collect();
+    for k in keys {
+        let gb = *before.get(k).unwrap_or(&0);
+        let va = *a.get(k).unwrap_or(&gb);
+        let vb = *b.get(k).unwrap_or(&gb);
+        // 某分支“确定已赋” = 进入前已确定，或该分支内直线赋值（值为 2）。
+        let def_a = gb >= 2 || va >= 2;
+        let def_b = gb >= 2 || vb >= 2;
+        let merged = if def_a && def_b {
+            2
+        } else if gb >= 1 || va >= 1 || vb >= 1 {
+            1
+        } else {
+            0
+        };
+        out.insert(k.clone(), merged);
+    }
+    out
+}
+
+/// 3.2.3.3(1)：构建“各类型方法体内可不带资格引用的成员名集合”。
+///
+/// 集合 = 本类型全部成员（字段 / 方法 / 枚举变体 / 接口成员）∪ 传递父类型
+/// （父类、实现的接口、父接口、extend 追加的方法）的成员。仅用于严格作用域
+/// 检查时放行合法的无资格成员引用，不用于成员存在性判定。
+fn collect_owner_members(program: &Program) -> HashMap<String, HashSet<String>> {
+    let mut own: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &program.classes {
+        let mut s: HashSet<String> = c.fields.iter().map(|f| f.name.clone()).collect();
+        for m in &c.methods {
+            add_member_and_prop_short(&mut s, &m.func.name);
+        }
+        // 主构造函数的成员变量形参（`class C(let a: T, var b: T)`）生成实例字段，
+        // 即使未显式出现在 `fields` 中也属本类型成员。
+        for (p, flag) in c.primary_ctor_params.iter().zip(c.primary_ctor_member_flags.iter()) {
+            if *flag {
+                s.insert(p.name.clone());
+            }
+        }
+        for init in &c.inits {
+            if init.member_param_flags.len() != init.params.len() {
+                continue;
+            }
+            for (p, flag) in init.params.iter().zip(init.member_param_flags.iter()) {
+                if *flag {
+                    s.insert(p.name.clone());
+                }
+            }
+        }
+        own.insert(c.name.clone(), s);
+        let mut ps: Vec<String> = Vec::new();
+        if let Some(e) = &c.extends {
+            ps.push(e.clone());
+        }
+        ps.extend(c.implements.iter().cloned());
+        parents.insert(c.name.clone(), ps);
+    }
+    for sd in &program.structs {
+        let s: HashSet<String> = sd.fields.iter().map(|f| f.name.clone()).collect();
+        own.insert(sd.name.clone(), s);
+        // `struct A <: I` 以 `param == A` 的约束 bounds 记录（见 check_struct_interfaces）。
+        let mut ps: Vec<String> = Vec::new();
+        for c in sd.constraints.iter().filter(|c| c.param == sd.name) {
+            ps.extend(c.bounds.iter().cloned());
+        }
+        if !ps.is_empty() {
+            parents.insert(sd.name.clone(), ps);
+        }
+    }
+    for e in &program.enums {
+        let s: HashSet<String> = e.variants.iter().map(|v| v.name.clone()).collect();
+        own.insert(e.name.clone(), s);
+        // `enum E <: I` 同样以约束 bounds 记录父接口。
+        let mut ps: Vec<String> = Vec::new();
+        for c in e.constraints.iter().filter(|c| c.param == e.name) {
+            ps.extend(c.bounds.iter().cloned());
+        }
+        if !ps.is_empty() {
+            parents.insert(e.name.clone(), ps);
+        }
+    }
+    for i in &program.interfaces {
+        let mut s: HashSet<String> = HashSet::new();
+        for m in &i.methods {
+            add_member_and_prop_short(&mut s, &m.name);
+        }
+        own.insert(i.name.clone(), s);
+        parents.insert(i.name.clone(), i.parents.clone());
+    }
+    // 结构体/枚举方法以 `Type.method` 形式存放在 program.functions。
+    for f in &program.functions {
+        if let Some(idx) = f.name.rfind(|ch| ch == '.' || ch == ':') {
+            let owner = &f.name[..idx];
+            add_member_and_prop_short(own.entry(owner.to_string()).or_default(), &f.name);
+        }
+    }
+    // extend：追加的方法归入目标类型；实现的接口记为父类型。
+    for x in &program.extends {
+        let e = own.entry(x.target_type.clone()).or_default();
+        for m in &x.methods {
+            add_member_and_prop_short(e, &m.name);
+        }
+        if let Some(iface) = &x.interface {
+            parents
+                .entry(x.target_type.clone())
+                .or_default()
+                .push(iface.clone());
+        }
+    }
+    // 类型别名：别名体内可访问被别名类型的成员（`type R = S; extend R { ... lower ... }`）。
+    for (name, ty) in &program.type_aliases {
+        let target = match ty {
+            Type::Struct(t, _) => Some(t.clone()),
+            Type::TypeParam(t) => Some(t.clone()),
+            _ => None,
+        };
+        if let Some(target) = target {
+            if &target != name {
+                parents.entry(name.clone()).or_default().push(target);
+            }
+        }
+    }
+    // 传递闭包：visible(t) = own(t) ∪ ⋃ visible(parent)。
+    fn visible(
+        ty: &str,
+        own: &HashMap<String, HashSet<String>>,
+        parents: &HashMap<String, Vec<String>>,
+        memo: &mut HashMap<String, HashSet<String>>,
+        visiting: &mut HashSet<String>,
+    ) -> HashSet<String> {
+        if let Some(v) = memo.get(ty) {
+            return v.clone();
+        }
+        if !visiting.insert(ty.to_string()) {
+            return HashSet::new();
+        }
+        let mut acc: HashSet<String> = own.get(ty).cloned().unwrap_or_default();
+        if let Some(ps) = parents.get(ty) {
+            for p in ps {
+                for n in visible(p, own, parents, memo, visiting) {
+                    acc.insert(n);
+                }
+            }
+        }
+        visiting.remove(ty);
+        memo.insert(ty.to_string(), acc.clone());
+        acc
+    }
+    let mut memo: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+    let names: Vec<String> = own.keys().cloned().collect();
+    for n in names {
+        let _ = visible(&n, &own, &parents, &mut memo, &mut visiting);
+    }
+    memo
+}
+
 fn collect_default_uses(e: &Expr, vars: &mut Vec<String>, calls: &mut Vec<String>) {
     match e {
         Expr::Var(n) => vars.push(n.clone()),
@@ -3395,9 +3634,47 @@ fn collect_local_func_names(stmts: &[Stmt], out: &mut HashSet<String>) {
             | Stmt::For { body, .. }
             | Stmt::Loop { body }
             | Stmt::UnsafeBlock { body } => collect_local_func_names(body, out),
+            Stmt::Expr(e)
+            | Stmt::Return(Some(e))
+            | Stmt::Let { value: e, .. }
+            | Stmt::Var { value: e, .. }
+            | Stmt::Const { value: e, .. }
+            | Stmt::Assign { value: e, .. } => collect_local_func_names_in_expr(e, out),
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                collect_local_func_names_in_expr(left, out);
+                collect_local_func_names_in_expr(right, out);
+            }
             _ => {}
         }
     }
+}
+
+/// 在表达式中查找嵌套块 / lambda 体内声明的局部函数。
+fn collect_local_func_names_in_expr(e: &Expr, out: &mut HashSet<String>) {
+    super::walk_expr(e, &mut |x| match x {
+        Expr::Block(stmts, _) => collect_local_func_names(&stmts[..], out),
+        Expr::Lambda { body, .. } => {
+            if let Expr::Block(stmts, _) = body.as_ref() {
+                collect_local_func_names(&stmts[..], out);
+            }
+        }
+        Expr::TryBlock {
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            collect_local_func_names(body, out);
+            collect_local_func_names(catch_body, out);
+            if let Some(fb) = finally_body {
+                collect_local_func_names(fb, out);
+            }
+        }
+        Expr::Spawn { body } | Expr::Synchronized { body, .. } => {
+            collect_local_func_names(body, out)
+        }
+        _ => {}
+    });
 }
 
 fn collect_named_call_sigs(program: &Program) -> HashMap<String, Vec<Vec<(bool, bool)>>> {
@@ -4110,6 +4387,18 @@ impl<'a> Checker<'a> {
         match stmt {
             Stmt::Let { pattern, ty, value } => {
                 let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                // 解析器可能把下一行前导运算符并入本行初始化式，形成对自身名字的
+                // “伪引用”（`let x = 1.0` 换行 `-x`）。仅当初始化式不是裸同名变量
+                // 时压制该名字的未定义判定；`let x = x` 仍按自引用报错。
+                let suppress_self = match pattern {
+                    Pattern::Binding(n) if !matches!(value, Expr::Var(v) if v == n) => {
+                        Some(n.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(n) = &suppress_self {
+                    self.self_init_ok.push(n.clone());
+                }
                 // 带类型标注的 `if` 初始化：按上下文逐分支检查（4.3(16)）。
                 let value_ty = match ann_ty.as_ref() {
                     Some(ann)
@@ -4125,6 +4414,9 @@ impl<'a> Checker<'a> {
                     }
                     _ => self.check_expr(value),
                 };
+                if suppress_self.is_some() {
+                    self.self_init_ok.pop();
+                }
                 // `let x: T` 无初始化式时解析器会合成类型默认值，此时属于
                 // “延迟赋值”声明，允许之后的第一次赋值。
                 let deferred = ty.as_ref().map_or(false, |t| is_default_value(t, value));
@@ -4166,6 +4458,15 @@ impl<'a> Checker<'a> {
             }
             Stmt::Var { pattern, ty, value } => {
                 let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                let suppress_self = match pattern {
+                    Pattern::Binding(n) if !matches!(value, Expr::Var(v) if v == n) => {
+                        Some(n.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(n) = &suppress_self {
+                    self.self_init_ok.push(n.clone());
+                }
                 let value_ty = match ann_ty.as_ref() {
                     Some(ann)
                         if matches!(
@@ -4180,6 +4481,9 @@ impl<'a> Checker<'a> {
                     }
                     _ => self.check_expr(value),
                 };
+                if suppress_self.is_some() {
+                    self.self_init_ok.pop();
+                }
                 // `var x: T` 无初始化式时解析器同样合成类型默认值，需跳过可赋值性检查。
                 let deferred = ty.as_ref().map_or(false, |t| is_default_value(t, value));
                 if ann_ty.is_none() && !deferred {
@@ -4309,9 +4613,11 @@ impl<'a> Checker<'a> {
                 );
                 self.scopes.push(scope);
                 self.cond_depth += 1;
+                self.loop_depth += 1;
                 for s in body {
                     self.check_stmt(s);
                 }
+                self.loop_depth -= 1;
                 self.cond_depth -= 1;
                 self.scopes.pop();
             }
@@ -4359,15 +4665,41 @@ impl<'a> Checker<'a> {
         if !is_deferred {
             return;
         }
-        if self.deferred_state.get(name).copied() != Some(0) {
+        let Some(state) = self.deferred_state.get(name).copied() else {
+            return;
+        };
+        let interp = self.interp_depth > 0;
+        let same_depth = self.deferred_owner.get(name).copied() == Some(self.defer_fn_depth);
+        if interp {
+            // 插值内读取“从未赋值”的变量一律报错（1.3.6(4)）；可能已赋值保持放行。
+            if state == 0 {
+                self.err(format!("变量 '{}' 在初值赋值前被读取（未初始化）", name));
+            }
             return;
         }
-        let interp = self.interp_depth > 0;
-        let same_depth_let = !interp
-            && !self.deferred_var.contains(name)
-            && self.deferred_owner.get(name).copied() == Some(self.defer_fn_depth);
-        if interp || same_depth_let {
+        if !same_depth {
+            return;
+        }
+        let is_var = self.deferred_var.contains(name);
+        if is_var {
+            // 延迟 `var` 读取类型默认值是项目方言（std 依赖），state==0 保持放行；
+            // 仅在严格（无 import 单文件）程序上收紧“条件分支内可能已赋值”。
+            if state == 1 && self.strict_scope {
+                self.err(format!(
+                    "变量 '{}' 可能未初始化即被读取（3.2.3.2(4)）",
+                    name
+                ));
+            }
+            return;
+        }
+        if state == 0 {
             self.err(format!("变量 '{}' 在初值赋值前被读取（未初始化）", name));
+        } else if state == 1 && self.strict_scope {
+            // 仅在部分分支 / 循环内赋值，直线读取时可能仍未初始化。
+            self.err(format!(
+                "变量 '{}' 可能未初始化即被读取（3.2.3.2(4)）",
+                name
+            ));
         }
     }
 
@@ -4421,7 +4753,9 @@ impl<'a> Checker<'a> {
     /// 延迟 `let` 赋值只记为“可能已赋值”，避免把逐分支初始化误判为重赋值。
     fn check_conditional_body(&mut self, body: &[Stmt]) {
         self.cond_depth += 1;
+        self.loop_depth += 1;
         self.check_nested_body(body);
+        self.loop_depth -= 1;
         self.cond_depth -= 1;
     }
 
@@ -5025,12 +5359,27 @@ impl<'a> Checker<'a> {
             AssignTarget::Var(name) => {
                 if let Some(info) = self.lookup(name).cloned() {
                     if info.uninit_let {
+                        // 4.2(5)：延迟赋值 `let` 只能在直线代码中恰好赋一次初值；
+                        // 循环体可能执行 0 次或多次，不能保证唯一一次赋值。
+                        if self.loop_depth > 0
+                            && !self.deferred_var.contains(name)
+                            && self.strict_scope
+                        {
+                            self.err(format!(
+                                "延迟赋值的不可变变量 '{}' 不能在循环体内赋值（4.2(5)）",
+                                name
+                            ));
+                        }
                         // 4.2(5)：延迟赋值 `let` 允许且仅允许一次初值赋值。
                         // 条件分支（if/catch/循环体）内的赋值只记为“可能已赋值”，
                         // 便于 if/else 逐分支初始化；直线代码中的再次赋值才报错。
                         let state = self.deferred_state.get(name).copied().unwrap_or(0);
                         if self.cond_depth > 0 {
-                            if state == 0 {
+                            if self.loop_depth == 0 {
+                                // if / match 分支内的直线赋值：相对该分支为“确定已赋”，
+                                // 供 if 分支合并判定（循环体内的赋值不保证执行）。
+                                self.deferred_state.insert(name.clone(), 2);
+                            } else if state == 0 {
                                 self.deferred_state.insert(name.clone(), 1);
                             }
                         } else if state >= 1 {
@@ -5054,15 +5403,31 @@ impl<'a> Checker<'a> {
                         "函数 '{}' 是函数类型的值，不能被重新赋值（2.1.9(1)）",
                         name
                     ));
+                } else if self.strict_scope && !self.strict_allow_assign_name(name) {
+                    // 3.2.3.2：赋值目标本身也不是可见的标识符。
+                    self.err(format!("未定义的标识符 '{}'（3.2.3.2）", name));
                 }
                 self.clear_const(name);
             }
             // 静态字段 / enum 构造值：`C.x = v`、`E.v = x`
             AssignTarget::Field { object, field } => {
+                // 3.2.3.2：字段赋值的基础对象必须是可见标识符或类型名。
+                if self.strict_scope
+                    && self.lookup(object).is_none()
+                    && !self.strict_allow_assign_name(object)
+                {
+                    self.err(format!("未定义的标识符 '{}'（3.2.3.2）", object));
+                }
                 self.check_field_target(object, field);
                 self.check_instance_field_target(object, field);
             }
             AssignTarget::FieldPath { base, fields } => {
+                if self.strict_scope
+                    && self.lookup(base).is_none()
+                    && !self.strict_allow_assign_name(base)
+                {
+                    self.err(format!("未定义的标识符 '{}'（3.2.3.2）", base));
+                }
                 if fields.len() == 1 {
                     self.check_field_target(base, &fields[0]);
                     self.check_instance_field_target(base, &fields[0]);
@@ -6038,6 +6403,129 @@ impl<'a> Checker<'a> {
     /// 用于插值内“未声明函数调用”检查的守卫：类体内裸名调用自身的 private
     /// 成员方法（隐式 this）是合法的，不能判为未定义（如 std 的
     /// `getBackendIndependentMangledName`）。
+    /// 严格作用域检查：名字是否可被放行（类型 / 预置 / 枚举变体 / 本类型成员等）。
+    /// 仅在 `strict_scope` 开启时使用。`lookup` 未命中后才调用。
+    fn strict_allow_name(&self, name: &str) -> bool {
+        if name.is_empty() || name.contains('.') || name.contains("::") {
+            return true;
+        }
+        if name.starts_with('_') || name.starts_with('$') {
+            return true;
+        }
+        if super::is_prelude_identifier(name) {
+            return true;
+        }
+        if let Some(ch) = name.chars().next() {
+            if ch.is_uppercase() && !matches!(name.to_lowercase().as_str(), "true" | "false") {
+                return true;
+            }
+        }
+        if self.type_names.contains(name)
+            || self.enum_variants.contains(name)
+            || self.known_funcs.contains(name)
+            || self.local_func_names.contains(name)
+            || self.alias_types.contains_key(name)
+        {
+            return true;
+        }
+        // 内建数组/C 互操作 / std 数学与工具自由函数（方言示例无 import 直接调用）。
+        if matches!(
+            name,
+            "acquireArrayRawData"
+                | "releaseArrayRawData"
+                | "acquireCStringRawPtr"
+                | "readCString"
+                | "sqrt" | "floor" | "ceil" | "trunc" | "nearest" | "abs" | "copysign"
+                | "neg" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "exp"
+                | "log" | "ln" | "log2" | "log10" | "pow" | "fmin" | "fmax" | "cbrt"
+                | "collectArray" | "println" | "print" | "panic" | "toString" | "sort"
+                | "now" | "exit" | "sleep" | "random" | "randomInt64" | "randomFloat64"
+                | "line" | "exp2" | "expm1" | "log1p" | "lgamma" | "tgamma" | "gamma"
+                | "erf" | "erfc" | "atan2" | "hypot" | "fmod" | "remainder" | "ldexp"
+                | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "min"
+                | "max" | "clamp"
+                // std.core / std.unittest 隐式可见的 API（LLT 用例直接调用）。
+                | "readln" | "readLine" | "ifSome" | "ifNone" | "refEq"
+                | "fail" | "failExpect" | "defaultConfiguration" | "success"
+                | "misconfigurationFailure" | "invalidMatchersForCalledMacro"
+                | "assertCaughtUnexpectedE" | "expectCaughtUnexpectedE"
+        ) {
+            return true;
+        }
+        let owner_hit = |o: &Option<String>| {
+            o.as_ref()
+                .map_or(false, |t| self.owner_members.get(t).map_or(false, |s| s.contains(name)))
+        };
+        if owner_hit(&self.cur_owner) || owner_hit(&self.cur_class) || owner_hit(&self.cur_struct) {
+            return true;
+        }
+        if let Some(i) = &self.cur_interface {
+            if self
+                .interface_members
+                .get(i)
+                .map_or(false, |s| s.contains(name))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 严格作用域下“赋值目标变量”的放行规则：比普通引用更严格——大写首字母
+    /// 不能仅凭约定放行（枚举变体 / 类型名需实际存在），以免漏判未声明的大写
+    /// 赋值目标（如 `Branch = ...`）。
+    fn strict_allow_assign_name(&self, name: &str) -> bool {
+        if name.is_empty() || name.contains('.') || name.contains("::") {
+            return true;
+        }
+        if name.starts_with('_') || name.starts_with('$') {
+            return true;
+        }
+        if super::is_prelude_identifier(name) {
+            return true;
+        }
+        self.type_names.contains(name)
+            || self.enum_variants.contains(name)
+            || self.known_funcs.contains(name)
+            || self.local_func_names.contains(name)
+            || self.alias_types.contains_key(name)
+            || {
+                // 本类型成员（字段 / 属性 / 方法）可作为赋值目标（`a = 1`）。
+                let owner_hit = |o: &Option<String>| {
+                    o.as_ref().map_or(false, |t| {
+                        self.owner_members.get(t).map_or(false, |s| s.contains(name))
+                    })
+                };
+                owner_hit(&self.cur_owner)
+                    || owner_hit(&self.cur_class)
+                    || owner_hit(&self.cur_struct)
+                    || self.cur_interface.as_ref().map_or(false, |i| {
+                        self.interface_members
+                            .get(i)
+                            .map_or(false, |s| s.contains(name))
+                    })
+            }
+    }
+
+    /// 3.2.3.2：严格作用域下的裸变量引用未解析 → 未定义标识符。
+    fn check_strict_var(&mut self, name: &str) {
+        if !self.strict_scope || self.lookup(name).is_some() || self.strict_allow_name(name) {
+            return;
+        }
+        if self.self_init_ok.iter().any(|n| n == name) {
+            return;
+        }
+        self.err(format!("未定义的标识符 '{}'（3.2.3.2）", name));
+    }
+
+    /// 3.2.3.2：严格作用域下无资格函数调用名未解析 → 未声明函数。
+    fn check_strict_call(&mut self, name: &str) {
+        if !self.strict_scope || self.lookup(name).is_some() || self.strict_allow_name(name) {
+            return;
+        }
+        self.err(format!("未声明的函数 '{}'（3.2.3.2）", name));
+    }
+
     fn is_known_member_name(&self, name: &str) -> bool {
         // 成员/方法名在表中可能以限定形态（`S.double`）或裸名（`double`）存储
         // （扩展方法、类方法两者皆有），两种形态都匹配。
@@ -6440,6 +6928,8 @@ impl<'a> Checker<'a> {
                 self.check_iface_foreign_member_ref(name);
                 // 1.3.6(4) 插值内 / 3.2.3.2(4) 同函数直线代码：读取未初始化变量。
                 self.check_deferred_read(name);
+                // 3.2.3.2：无 import 单文件程序中的未定义标识符。
+                self.check_strict_var(name);
                 self.lookup(name)
                     .map(|v| v.ty.clone())
                     .unwrap_or(Ty::Unknown)
@@ -6587,6 +7077,8 @@ impl<'a> Checker<'a> {
                         name
                     ));
                 }
+                // 3.2.3.2：无 import 单文件程序中的未声明函数调用名。
+                self.check_strict_call(name);
                 let mut arg_tys: Vec<Ty> = Vec::with_capacity(args.len());
                 for a in args {
                     arg_tys.push(self.check_expr(a));
@@ -6795,14 +7287,20 @@ impl<'a> Checker<'a> {
                 else_branch,
             } => {
                 self.check_expr(cond);
+                // 延迟赋值状态按分支合并：仅当所有分支都确定赋值才保持“确定已赋”。
+                let before = self.deferred_state.clone();
                 // if 分支属于“条件执行”，其内的延迟 let 赋值记为可能赋值。
                 self.cond_depth += 1;
                 let t = self.check_expr(then_branch);
                 self.cond_depth -= 1;
+                let after_then = self.deferred_state.clone();
+                self.deferred_state = before.clone();
                 if let Some(eb) = else_branch {
                     self.cond_depth += 1;
                     let e = self.check_expr(eb);
                     self.cond_depth -= 1;
+                    let after_else = self.deferred_state.clone();
+                    self.deferred_state = merge_deferred_state(&before, &after_then, &after_else);
                     if t == Ty::Unknown {
                         return e;
                     }
@@ -6819,6 +7317,8 @@ impl<'a> Checker<'a> {
                     }
                     t
                 } else {
+                    // 无 else 分支：else 路径等价于 before。
+                    self.deferred_state = merge_deferred_state(&before, &after_then, &before);
                     // 无 else 分支的 if 表达式类型为 Unit（2.1.4 / 4.2）。
                     Ty::Unit
                 }
@@ -6890,9 +7390,14 @@ impl<'a> Checker<'a> {
             }
 
             Expr::Macro { args: elems, .. } => {
+                // 宏实参由宏展开决定语义（如 `@UnittestOption[Int64](opt)` 里 opt
+                // 是宏参数而非普通变量引用），严格作用域检查一律不进入宏实参。
+                let saved_strict = self.strict_scope;
+                self.strict_scope = false;
                 for e in elems {
                     self.check_expr(e);
                 }
+                self.strict_scope = saved_strict;
                 Ty::Unknown
             }
 
@@ -7568,8 +8073,10 @@ impl<'a> Checker<'a> {
                 ..
             } => {
                 self.scopes.push(HashMap::new());
-                for (_, e) in resources {
-                    self.check_expr(e);
+                for (n, e) in resources {
+                    let ty = self.check_expr(e);
+                    // try-with-resources 资源变量在其 try 体内可见（catch/finally 不可见）。
+                    self.bind_name(n, ty, true, None, false, false);
                 }
                 // try/catch 体可能因异常而不执行，按条件分支记录延迟 let 赋值。
                 self.cond_depth += 1;
@@ -9249,7 +9756,8 @@ mod tests {
 
     #[test]
     fn test_unknown_operands_are_not_reported() {
-        assert_ok("main() { let a = unknownFn(); let b = a + 1 }");
+        // 大写名按约定视为类型/隐式导入构造，其返回类型未知时不应产生二元运算错误。
+        assert_ok("main() { let a = UnknownFn(); let b = a + 1 }");
     }
 
 
@@ -9270,8 +9778,8 @@ mod tests {
             "不能为负数",
         );
         assert_ok("main() { let v1: Int64 = 1; let v2: UInt32 = 63; let v3 = v1 << v2 }");
-        // 右操作数非常量时不检查。
-        assert_ok("main() { let v1: Int64 = 1; let v2 = f(); let v3 = v1 << v2 }");
+        // 右操作数非常量时不检查（未知返回类型按大写构造名视为隐式导入）。
+        assert_ok("main() { let v1: Int64 = 1; let v2 = UnknownF(); let v3 = v1 << v2 }");
     }
 
 
@@ -11565,8 +12073,13 @@ mod tests {
     fn test_w19c_uninit_read_assigned_ok() {
         // 先赋值后读取合法。
         assert_ok("main() {\n let x: Int64\n x = 1\n var vv = x\n}");
-        // 条件分支内可能已赋值（state 1）读取保守放行，避免误伤逐分支初始化。
-        assert_ok("main() {\n let x: Int64\n if (true) { x = 1 }\n var vv = x\n}");
+        // 仅部分分支赋值（state 1）后直线读取：严格程序上按未初始化报错（3.2.3.2(4)）。
+        assert_err(
+            "main() {\n let x: Int64\n if (true) { x = 1 }\n var vv = x\n}",
+            "可能未初始化",
+        );
+        // 两个分支都赋值后读取合法（分支合并为确定已赋）。
+        assert_ok("main() {\n let x: Int64\n if (true) { x = 1 } else { x = 2 }\n var vv = x\n}");
         // 跨函数读取（声明在外层、读取在内层函数体）保守放行，避免调用时序误判。
         assert_ok("main() {\n let x: String\n func f() { var vv = x }\n x = \"\"\n f()\n}");
         // 延迟 `var` 读取类型默认值属项目方言，非插值上下文保持放行。
@@ -11597,5 +12110,50 @@ mod tests {
         );
         // 非私有实例字段经实例赋值合法。
         assert_ok("class A { var p: Int64 = 1 }\nmain() { A().p = 0 }");
+    }
+
+    // ─── w20c：严格作用域解析（未定义标识符）与 definite-assignment 分支合并 ───
+
+    #[test]
+    fn test_w20c_strict_undefined_local_rejected() {
+        // 3.2.3.2：嵌套局部函数不能访问另一函数的局部变量。
+        assert_err(
+            "main() {\n func foo1() { let v1 = 2023 }\n func foo2() { let v2: Int32 = v1 }\n}",
+            "未定义",
+        );
+        // 赋值目标也不是可见标识符。
+        assert_err("main() { someNotDeclared = 1 }", "未定义");
+        // 初始化式自引用（`let z = z`）解析不到任何可见名字。
+        assert_err("func g() { let z = z }\nmain() {}", "未定义");
+        // 自由函数不能无资格访问类型成员（`let test = test`）。
+        assert_err(
+            "class Test { let test: String = \"T\" }\nmain() { let test: String = test }",
+            "未定义",
+        );
+    }
+
+    #[test]
+    fn test_w20c_inherited_interface_members_allowed() {
+        // 实现接口（含默认实现）的类型可通过裸名调用接口成员。
+        assert_ok(
+            "interface I { func f(): Int64 { 1 } static func s(): Int64 { 2 } }\nclass C <: I { func g() { f(); s() } }\nmain() { C().g() }",
+        );
+        assert_ok(
+            "interface I { func f(): Int64 { 1 } }\nstruct S <: I { func g() { f() } }\nmain() { S().g() }",
+        );
+        assert_ok(
+            "interface I { func f(): Int64 { 1 } }\nenum E <: I { A | B\n func g() { f() } }\nmain() { E.A.g() }",
+        );
+    }
+
+    #[test]
+    fn test_w20c_delayed_let_in_loop_rejected() {
+        // 4.2(5)：延迟赋值的 let 不能在循环体内赋值。
+        assert_err(
+            "main() { let x: Int64\n while (false) { x = 1 } }",
+            "循环体内赋值",
+        );
+        // 直线代码中的唯一一次赋值合法。
+        assert_ok("main() { let x: Int64\n x = 1\n let y = x }");
     }
 }
