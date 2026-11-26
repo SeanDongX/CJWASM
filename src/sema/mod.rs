@@ -695,6 +695,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_local_func_name_lvalue(program, &mut errors);
     // 6.1.2.1(44)：可选参数不参与重载，去掉后签名相同即冲突。
     check_ctor_overload_conflict(program, &mut errors);
+    // 6.1.2.7(2)/(4)：构造调用在本地可枚举构造器集上的重载歧义（保守子集）。
+    check_ctor_overload_ambiguity(program, &index, &mut errors);
+    // 5.3.2(5)/(6)：函数/方法调用返回类型与上下文标注类型不兼容（保守子集）。
+    check_call_return_context(program, &index, &mut errors);
     // w21c：泛型类在显式具体类型实参下实例化时，构造函数签名 / 实现的接口重复。
     check_generic_instantiation_signature_collision(program, &index, &mut errors);
     // 6.1.1.1(12)：子类以值返回却未实现父类型 Unit 抽象方法。
@@ -25096,6 +25100,31 @@ fn check_overload_candidate_types(program: &Program, errors: &mut Vec<SemanticEr
     for (n, _) in &program.type_aliases {
         alias_names.insert(n.clone());
     }
+    // w23a：别名目标（用于把局部变量/全局变量标注的别名类型归一到实际类型，
+    // 使 `var x: Alias = 1i64` 参与重载实参判定；仅影响原始标量实参判定）。
+    let alias_targets: HashMap<String, Type> = program
+        .type_aliases
+        .iter()
+        .map(|(n, t)| (n.clone(), t.clone()))
+        .collect();
+    fn resolve_alias_vars(vars: &mut HashMap<String, Type>, alias_targets: &HashMap<String, Type>) {
+        for v in vars.values_mut() {
+            let mut depth = 0;
+            while depth < 16 {
+                if let Type::Struct(n, args) = v {
+                    if args.is_empty() {
+                        if let Some(t) = alias_targets.get(n.as_str()) {
+                            *v = t.clone();
+                            depth += 1;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
 
     // 父类型关系（仅本地类型；非本地父类型由 collect_chain_sigs 检出并放行）。
     let mut parents: HashMap<String, Vec<String>> = HashMap::new();
@@ -25237,6 +25266,8 @@ fn check_overload_candidate_types(program: &Program, errors: &mut Vec<SemanticEr
                 vars.insert(n.clone(), t.clone());
             }
         }
+        resolve_alias_vars(&mut vars, &alias_targets);
+        w23_augment_ctor_call_vars(body, &mut vars, &type_names);
         // 宏实参与 `@Assert/@Expect` 的操作数由宏自行解释，不作为普通调用检查。
         let mut skip: HashSet<usize> = HashSet::new();
         let mut macro_roots: Vec<&Expr> = Vec::new();
@@ -26203,6 +26234,747 @@ fn check_ctor_overload_conflict(program: &Program, errors: &mut Vec<SemanticErro
                 break;
             }
             seen.push(key);
+        }
+    }
+}
+
+// ─── w23a：构造调用重载歧义（06 章 6.1.2.7(2)/(4) 保守子集） ──────────────────
+
+/// 去掉类型名上的泛型实参部分（`Base<Int64>` → `Base`）。
+fn w23_strip_generic(name: &str) -> String {
+    name.split('<').next().unwrap_or(name).trim().to_string()
+}
+
+/// 本地类型祖先闭包（含自身）。链上出现非本地类型（无法判定其父关系）时返回 None。
+fn w23_local_ancestors(
+    name: &str,
+    parents: &HashMap<String, Vec<String>>,
+) -> Option<HashSet<String>> {
+    let mut acc: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = vec![name.to_string()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        // 非本地类型（std/导入）无父关系表，无法安全判定子类型。
+        if !parents.contains_key(&n) {
+            return None;
+        }
+        acc.insert(n.clone());
+        if let Some(ps) = parents.get(&n) {
+            for p in ps {
+                stack.push(p.clone());
+            }
+        }
+    }
+    Some(acc)
+}
+
+/// 名义子类型判定（仅本地类型 + 原始标量）。无法判定时返回 None（保守放行）。
+fn w23_subtype(a: &Type, b: &Type, parents: &HashMap<String, Vec<String>>) -> Option<bool> {
+    if a == b {
+        return Some(true);
+    }
+    let sa = is_scalar_scalar_ty(a);
+    let sb = is_scalar_scalar_ty(b);
+    if sa && sb {
+        return Some(false);
+    }
+    if sa || sb {
+        return None;
+    }
+    let (na, aa) = match a {
+        Type::Struct(n, args) => (n, args),
+        _ => return None,
+    };
+    let (nb, ab) = match b {
+        Type::Struct(n, args) => (n, args),
+        _ => return None,
+    };
+    // 仅处理无泛型实参的名义类型（含泛型实参的关系无法保守判定）。
+    if !aa.is_empty() || !ab.is_empty() {
+        return None;
+    }
+    // 目标类型也须为本地且祖先链可判定，避免“参数本身 extends std”时误判。
+    w23_local_ancestors(nb, parents)?;
+    let anc = w23_local_ancestors(na, parents)?;
+    Some(anc.contains(nb))
+}
+
+/// 解析裸类型别名链（`type X = Y`），用于将局部变量标注的类型归一。
+fn w23_resolve_alias_ty<'a>(index: &ProgramIndex<'a>, t: &Type) -> Type {
+    let mut cur = t.clone();
+    let mut depth = 0;
+    while depth < 16 {
+        if let Type::Struct(n, args) = &cur {
+            if args.is_empty() {
+                if let Some(target) = index.aliases.get(n.as_str()) {
+                    cur = (*target).clone();
+                    depth += 1;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    cur
+}
+
+/// w23a：小写类名的无参构造 `var x = name()` 被解析为 `Call`（首字母大写才判为
+/// ConstructorCall）。当 name 是本地类型名时补记 x 的类型，供接收者/返回类型判定。
+fn w23_augment_ctor_call_vars(
+    stmts: &[Stmt],
+    vars: &mut HashMap<String, Type>,
+    type_names: &HashSet<String>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::Let {
+                pattern: Pattern::Binding(n),
+                ty: None,
+                value: e,
+            }
+            | Stmt::Var {
+                pattern: Pattern::Binding(n),
+                ty: None,
+                value: e,
+            } => {
+                if let Expr::Call { name, .. } = e {
+                    let base = name.split('<').next().unwrap_or(name).trim();
+                    if type_names.contains(base) && !vars.contains_key(n) {
+                        vars.insert(n.clone(), Type::Struct(base.to_string(), vec![]));
+                    }
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::WhileLet { body, .. }
+            | Stmt::For { body, .. } => w23_augment_ctor_call_vars(body, vars, type_names),
+            Stmt::Expr(Expr::Block(body, _)) => w23_augment_ctor_call_vars(body, vars, type_names),
+            _ => {}
+        }
+    }
+}
+
+/// 实参的静态可判定类型（保守：可适配字面量/未知表达式返回 None）。
+fn w23_static_arg_ty(    e: &Expr,
+    vars: &HashMap<String, Type>,
+    index: &ProgramIndex<'_>,
+) -> Option<Type> {
+    // `1` / `3.14` 等无后缀字面量类型可适配，无法唯一确定。
+    match e {
+        Expr::Integer(_) | Expr::Float(_) => return None,
+        _ => {}
+    }
+    let t = static_expr_type(e, vars)?;
+    Some(w23_resolve_alias_ty(index, &t))
+}
+
+/// 统计局部重载集合中与期望函数类型兼容的候选个数。无法判定时返回 None。
+/// 兼容：逆变形参（期望形参 <: 实际形参）+ 协变返回（实际返回 <: 期望返回）。
+fn w23_fn_overload_match_count(
+    ovs: &[&Function],
+    exp_params: &[Type],
+    exp_ret: Option<&Type>,
+    parents: &HashMap<String, Vec<String>>,
+) -> Option<usize> {
+    let mut count = 0usize;
+    for f in ovs {
+        if !f.type_params.is_empty() || f.extern_import.is_some() {
+            return None;
+        }
+        let ps = strip_self_params(&f.params);
+        if ps
+            .iter()
+            .any(|p| p.variadic || p.is_named || p.default.is_some() || is_receiver_param(&p.name))
+        {
+            return None;
+        }
+        if ps.len() != exp_params.len() {
+            continue;
+        }
+        let mut ok = true;
+        for (ep, ap) in exp_params.iter().zip(ps.iter()) {
+            match w23_subtype(ep, &ap.ty, parents) {
+                Some(true) => {}
+                Some(false) => {
+                    ok = false;
+                    break;
+                }
+                None => return None,
+            }
+        }
+        if !ok {
+            continue;
+        }
+        if let (Some(ar), Some(er)) = (f.return_type.as_ref(), exp_ret) {
+            match w23_subtype(ar, er, parents) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => return None,
+            }
+        }
+        count += 1;
+    }
+    Some(count)
+}
+
+/// 候选 i 的形参逐位是候选 j 形参的子类型（i 更具体，支配 j）。
+fn w23_params_dominate(
+    pi: &[Param],
+    pj: &[Param],
+    parents: &HashMap<String, Vec<String>>,
+) -> bool {
+    if pi.len() != pj.len() {
+        return false;
+    }
+    for (a, b) in pi.iter().zip(pj.iter()) {
+        match w23_subtype(&a.ty, &b.ty, parents) {
+            Some(true) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// 6.1.2.7(2)/(4)：构造调用在**本地可完整枚举**的构造器集上无法唯一确定构造器时判错。
+///
+/// 保守子集（守正测试红线）：
+///   * 类为本地类；泛型类须显式给出与声明等量的类型实参，且形参不含未替换类型参数；
+///   * 全部构造器（`inits`）个数与实参个数一致，且无变长/命名/默认形参；
+///   * 所有实参类型均可静态确定（可适配字面量/未知表达式一律放行）；
+///   * 涉及的类/接口均为本地（无 std/导入父类型，否则无法判定子类型）。
+/// 触发条件：
+///   (A) 某候选的**函数类型形参**可同时匹配 >=2 个本地重载 → 重载函数值歧义；
+///   (B) 适用候选 >=2 且不存在唯一的“逐位最具体”候选 → 构造器重载歧义。
+fn check_ctor_overload_ambiguity(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 本地类型父关系（class: extends+implements；interface: parents；struct/enum: 无）。
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &program.classes {
+        let mut ps: Vec<String> = Vec::new();
+        if let Some(p) = &c.extends {
+            ps.push(w23_strip_generic(p));
+        }
+        for p in &c.implements {
+            ps.push(w23_strip_generic(p));
+        }
+        parents.insert(c.name.clone(), ps);
+    }
+    for i in &program.interfaces {
+        parents.insert(
+            i.name.clone(),
+            i.parents.iter().map(|p| w23_strip_generic(p)).collect(),
+        );
+    }
+    for s in &program.structs {
+        parents.insert(s.name.clone(), Vec::new());
+    }
+    for e in &program.enums {
+        parents.insert(e.name.clone(), Vec::new());
+    }
+
+    // 顶层自由函数重载集合。
+    let mut free_overloads: HashMap<&str, Vec<&Function>> = HashMap::new();
+    for f in &program.functions {
+        if !f.name.contains('.') && f.extern_import.is_none() {
+            free_overloads.entry(f.name.as_str()).or_default().push(f);
+        }
+    }
+
+    let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let vars = local_var_types_full(params, body);
+        walk_stmts(body, &mut |e| {
+            let Expr::ConstructorCall {
+                name,
+                type_args,
+                args,
+                named_args,
+            } = e
+            else {
+                return;
+            };
+            if !named_args.is_empty() {
+                return;
+            }
+            let has_generic_args = type_args.is_some() || name.contains('<');
+            let base = w23_strip_generic(name);
+            let Some(class) = index.classes.get(base.as_str()) else {
+                return;
+            };
+            // 泛型门：泛型类须显式给出等量类型实参；非泛型类不得携带类型实参。
+            if !class.type_params.is_empty() {
+                match type_args {
+                    Some(ta) if ta.len() == class.type_params.len() => {}
+                    _ => return,
+                }
+            } else if has_generic_args {
+                return;
+            }
+            if class.inits.is_empty() {
+                return;
+            }
+            // 候选完整性门。
+            for init in &class.inits {
+                if init.params.len() != args.len() {
+                    return;
+                }
+                for p in &init.params {
+                    if p.variadic || p.is_named || p.default.is_some() {
+                        return;
+                    }
+                    for tp in &class.type_params {
+                        if type_mentions_param(&p.ty, tp) {
+                            return;
+                        }
+                    }
+                }
+            }
+            let arg_tys: Vec<Option<Type>> = args
+                .iter()
+                .map(|a| w23_static_arg_ty(a, &vars, index))
+                .collect();
+
+            // (A) 重载函数值歧义。
+            for init in &class.inits {
+                for (arg, p) in args.iter().zip(init.params.iter()) {
+                    if let Type::Function {
+                        params: eps,
+                        ret,
+                    } = &p.ty
+                    {
+                        if let Expr::Var(fname) = arg {
+                            if !vars.contains_key(fname.as_str()) {
+                                if let Some(ovs) = free_overloads.get(fname.as_str()) {
+                                    if let Some(n) =
+                                        w23_fn_overload_match_count(ovs, eps, (**ret).as_ref(), &parents)
+                                    {
+                                        if n >= 2 {
+                                            errors.push(SemanticError {
+                                                message: format!(
+                                                    "构造调用 '{}' 的实参 '{}' 为重载函数，无法唯一确定函数类型（重载歧义，6.1.2.7(2)/(4)）",
+                                                    base, fname
+                                                ),
+                                            });
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // (B) 逐候选三值判定：Some(true)=适用 / Some(false)=不适用 / None=无法判定。
+            let mut results: Vec<Option<bool>> = Vec::with_capacity(class.inits.len());
+            for init in &class.inits {
+                let mut ok = true;
+                let mut det = true;
+                for (ai, (arg, p)) in args.iter().zip(init.params.iter()).enumerate() {
+                    if let Type::Function {
+                        params: eps,
+                        ret,
+                    } = &p.ty
+                    {
+                        if let Expr::Var(fname) = arg {
+                            if !vars.contains_key(fname.as_str()) {
+                                if let Some(ovs) = free_overloads.get(fname.as_str()) {
+                                    match w23_fn_overload_match_count(
+                                        ovs,
+                                        eps,
+                                        (**ret).as_ref(),
+                                        &parents,
+                                    ) {
+                                        Some(0) => ok = false,
+                                        Some(_) => {}
+                                        None => det = false,
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    match &arg_tys[ai] {
+                        None => det = false,
+                        Some(at) => match w23_subtype(at, &p.ty, &parents) {
+                            Some(true) => {}
+                            Some(false) => ok = false,
+                            None => det = false,
+                        },
+                    }
+                }
+                results.push(if det { Some(ok) } else { None });
+            }
+            if results.iter().any(|r| r.is_none()) {
+                return;
+            }
+            let applicable: Vec<usize> = results
+                .iter()
+                .enumerate()
+                .filter_map(|(i, r)| if matches!(r, Some(true)) { Some(i) } else { None })
+                .collect();
+            if applicable.len() < 2 {
+                return;
+            }
+            // 唯一最具体候选：其形参逐位是所有其它适用候选形参的子类型。
+            let mut winners = 0usize;
+            for &i in &applicable {
+                let mut dominates_all = true;
+                for &j in &applicable {
+                    if i == j {
+                        continue;
+                    }
+                    if !w23_params_dominate(&class.inits[i].params, &class.inits[j].params, &parents)
+                    {
+                        dominates_all = false;
+                        break;
+                    }
+                }
+                if dominates_all {
+                    winners += 1;
+                }
+            }
+            if winners != 1 {
+                errors.push(SemanticError {
+                    message: format!(
+                        "构造调用 '{}' 无法在 {} 个重载构造函数间唯一确定（重载歧义，6.1.2.7(2)/(4)）",
+                        base,
+                        applicable.len()
+                    ),
+                });
+            }
+        });
+    };
+
+    for f in &program.functions {
+        scan(&f.params, &f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, errors);
+        }
+    }
+}
+
+// ─── w23a：返回值上下文类型不匹配（05 章 5.3.2 保守子集） ──────────────────────
+
+/// 从一组本地函数候选中按实参类型选出**唯一适用**者，返回其显式标注的返回类型。
+/// 仅当候选集完整可枚举（非泛型、无默认/命名/变长形参、计数一致、形参全为原始标量）
+/// 且实参类型全部可判定、恰好一个候选适用时返回 Some；否则返回 None（保守放行）。
+fn w23_unique_return(
+    fns: &[&Function],
+    args: &[Expr],
+    vars: &HashMap<String, Type>,
+) -> Option<Type> {
+    if fns.is_empty() {
+        return None;
+    }
+    for f in fns {
+        if !f.type_params.is_empty() || f.extern_import.is_some() {
+            return None;
+        }
+        let ps = strip_self_params(&f.params);
+        if ps.len() != args.len() {
+            return None;
+        }
+        for p in ps {
+            if p.variadic || p.is_named || p.default.is_some() || !is_scalar_scalar_ty(&p.ty) {
+                return None;
+            }
+        }
+        if f.return_type.is_none() {
+            return None;
+        }
+    }
+    let mut kinds: Vec<ArgClass> = Vec::with_capacity(args.len());
+    for a in args {
+        let k = classify_arg(a, vars);
+        if matches!(k, ArgClass::Unknown) {
+            return None;
+        }
+        kinds.push(k);
+    }
+    let mut applicable: Vec<&Function> = Vec::new();
+    for f in fns {
+        let ps = strip_self_params(&f.params);
+        if kinds.iter().zip(ps.iter()).all(|(k, p)| arg_param_ok(k, &p.ty)) {
+            applicable.push(f);
+        }
+    }
+    if applicable.len() != 1 {
+        return None;
+    }
+    applicable[0].return_type.clone()
+}
+
+/// 方法接收者类型名（在 receiver_type_name 基础上补充 `Type.Variant.m()` 形态）。
+fn w23_receiver(
+    object: &Expr,
+    vars: &HashMap<String, Type>,
+    type_names: &HashSet<String>,
+) -> Option<String> {
+    if let Some(r) = receiver_type_name(object, vars, type_names) {
+        return Some(r);
+    }
+    if let Expr::Field { object: o, .. } = object {
+        if let Expr::Var(v) = o.as_ref() {
+            if type_names.contains(v.as_str()) {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
+}
+
+/// 5.3.2(5)/(6)：函数/方法调用的返回类型与上下文（变量/赋值标注类型）不兼容判错。
+///
+/// 保守子集（守正测试红线）：
+///   * 上下文期望类型来自局部变量/赋值的显式标注，且可归一到原始标量或本地类型；
+///   * 被调函数/方法为本地声明、非泛型、无默认/命名/变长形参、形参全为原始标量、
+///     实参类型可判定且恰好唯一适用；
+///   * 返回类型取自该唯一候选的显式标注；无法判定（含 std 类型）一律放行。
+fn check_call_return_context(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 本地类型父关系（同构造歧义检查）。
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &program.classes {
+        let mut ps: Vec<String> = Vec::new();
+        if let Some(p) = &c.extends {
+            ps.push(w23_strip_generic(p));
+        }
+        for p in &c.implements {
+            ps.push(w23_strip_generic(p));
+        }
+        parents.insert(c.name.clone(), ps);
+    }
+    for i in &program.interfaces {
+        parents.insert(
+            i.name.clone(),
+            i.parents.iter().map(|p| w23_strip_generic(p)).collect(),
+        );
+    }
+    for s in &program.structs {
+        parents.insert(s.name.clone(), Vec::new());
+    }
+    for e in &program.enums {
+        parents.insert(e.name.clone(), Vec::new());
+    }
+
+    let mut type_names: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        type_names.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        type_names.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        type_names.insert(e.name.clone());
+    }
+    for i in &program.interfaces {
+        type_names.insert(i.name.clone());
+    }
+
+    // 顶层变量/常量类型（可判定者）。
+    let mut global_ty: HashMap<String, Type> = HashMap::new();
+    for c in &program.constants {
+        let t = if c.ty != Type::Int64 {
+            Some(c.ty.clone())
+        } else {
+            match &c.init {
+                Expr::Integer(_) | Expr::IntegerSuffixed(..) => Some(Type::Int64),
+                Expr::Float(_) => Some(Type::Float64),
+                Expr::Float32(_) => Some(Type::Float32),
+                Expr::Bool(_) => Some(Type::Bool),
+                Expr::Rune(_) => Some(Type::Rune),
+                Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
+                _ => None,
+            }
+        };
+        if let Some(t) = t {
+            global_ty.insert(c.name.clone(), t);
+        }
+    }
+
+    // 自由函数与方法签名（含返回类型）。
+    let mut free_fns: HashMap<&str, Vec<&Function>> = HashMap::new();
+    let mut owner_fns: HashMap<&str, HashMap<&str, Vec<&Function>>> = HashMap::new();
+    for f in &program.functions {
+        if let Some((owner, short)) = f.name.rsplit_once('.') {
+            owner_fns
+                .entry(owner)
+                .or_default()
+                .entry(short)
+                .or_default()
+                .push(f);
+        } else {
+            free_fns.entry(f.name.as_str()).or_default().push(f);
+        }
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            let short = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+            owner_fns
+                .entry(c.name.as_str())
+                .or_default()
+                .entry(short)
+                .or_default()
+                .push(&m.func);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            let short = m.name.rsplit('.').next().unwrap_or(&m.name);
+            owner_fns
+                .entry(ext.target_type.as_str())
+                .or_default()
+                .entry(short)
+                .or_default()
+                .push(m);
+        }
+    }
+
+    // 解析表达式（Call/MethodCall）的返回类型；无法保守判定时返回 None。
+    let call_return = |e: &Expr, vars: &HashMap<String, Type>| -> Option<Type> {
+        match e {
+            Expr::Call { name, args, named_args, .. } => {
+                if !named_args.is_empty() {
+                    return None;
+                }
+                let base = name.split('<').next().unwrap_or(name).trim();
+                // 类型名作为构造调用（小写类名 `var x = cls()`）不在此处理。
+                if type_names.contains(base) {
+                    return None;
+                }
+                let fns = free_fns.get(base)?;
+                w23_unique_return(fns, args, vars)
+            }
+            Expr::MethodCall { object, method, args, named_args, .. } => {
+                if !named_args.is_empty() {
+                    return None;
+                }
+                let rt = w23_receiver(object, vars, &type_names)?;
+                let fns = owner_fns.get(rt.as_str())?.get(method.as_str())?;
+                w23_unique_return(fns, args, vars)
+            }
+            _ => None,
+        }
+    };
+
+    let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let mut vars = local_var_types_full(params, body);
+        let mut local_defs: HashSet<String> = HashSet::new();
+        collect_local_def_names(body, &mut local_defs);
+        for p in params {
+            local_defs.insert(p.name.clone());
+        }
+        for (n, t) in &global_ty {
+            if !local_defs.contains(n) && !vars.contains_key(n) {
+                vars.insert(n.clone(), t.clone());
+            }
+        }
+        // 归一等价别名 + 小写类名无参构造变量。
+        for v in vars.values_mut() {
+            *v = w23_resolve_alias_ty(index, v);
+        }
+        w23_augment_ctor_call_vars(body, &mut vars, &type_names);
+        // 判定一次绑定/赋值：期望类型 exp 与调用返回类型是否兼容。
+        let mut check_bind = |expected: &Type, value: &Expr, errors: &mut Vec<SemanticError>| {
+            let exp = w23_resolve_alias_ty(index, expected);
+            let Some(r) = call_return(value, &vars) else {
+                return;
+            };
+            let r = w23_resolve_alias_ty(index, &r);
+            if matches!(w23_subtype(&r, &exp, &parents), Some(false)) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "调用返回类型与上下文标注类型不兼容（5.3.2(5)/(6)）"
+                    ),
+                });
+            }
+        };
+        fn visit(
+            stmts: &[Stmt],
+            vars: &HashMap<String, Type>,
+            check_bind: &mut dyn FnMut(&Type, &Expr, &mut Vec<SemanticError>),
+            errors: &mut Vec<SemanticError>,
+        ) {
+            for s in stmts {
+                match s {
+                    Stmt::Let {
+                        pattern: Pattern::Binding(_),
+                        ty: Some(t),
+                        value,
+                    }
+                    | Stmt::Var {
+                        pattern: Pattern::Binding(_),
+                        ty: Some(t),
+                        value,
+                    } => check_bind(t, value, errors),
+                    Stmt::Assign {
+                        target: crate::ast::AssignTarget::Var(n),
+                        value,
+                    } => {
+                        if let Some(t) = vars.get(n.as_str()) {
+                            check_bind(&t.clone(), value, errors);
+                        }
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::Loop { body }
+                    | Stmt::UnsafeBlock { body }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::WhileLet { body, .. }
+                    | Stmt::For { body, .. } => visit(body, vars, check_bind, errors),
+                    Stmt::Expr(Expr::Block(body, _)) => visit(body, vars, check_bind, errors),
+                    Stmt::LocalFunc(f) => visit(&f.body, vars, check_bind, errors),
+                    _ => {}
+                }
+            }
+        }
+        visit(body, &vars, &mut check_bind, errors);
+    };
+
+    for f in &program.functions {
+        scan(&f.params, &f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, errors);
         }
     }
 }
@@ -33075,4 +33847,195 @@ main() {}"#,
         );
     }
 
+    // ─── w23a：构造调用重载歧义（6.1.2.7(2)/(4) 保守子集） ──────────────────────
+
+    #[test]
+    fn test_w23a_ctor_ambiguous_equidistant_interfaces() {
+        // C 同时实现 I1、I2，两个单参构造器等距 → 歧义。
+        assert_invalid(
+            "interface I1 {}\n\
+             interface I2 {}\n\
+             class C <: I1 & I2 {}\n\
+             class A {\n\
+             \x20   init(x: I1) {}\n\
+             \x20   init(x: I2) {}\n\
+             }\n\
+             main() {\n\
+             \x20   A(C())\n\
+             \x20   0\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23a_ctor_ambiguous_class_and_interface() {
+        // 一个类父、一个接口父等距 → 歧义。
+        assert_invalid(
+            "interface I {}\n\
+             open class B {}\n\
+             class C <: B & I {}\n\
+             class A {\n\
+             \x20   init(x: I) {}\n\
+             \x20   init(x: B) {}\n\
+             }\n\
+             main() {\n\
+             \x20   A(C())\n\
+             \x20   0\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23a_ctor_ambiguous_multiarg_non_dominating() {
+        // 两个候选各在某一位置更具体，互不支配 → 歧义。
+        assert_invalid(
+            "open class Parent1 {}\n\
+             class Child1 <: Parent1 {}\n\
+             open class Parent2 {}\n\
+             class Child2 <: Parent2 {}\n\
+             class A {\n\
+             \x20   init(x: Parent1, y: Child2) {}\n\
+             \x20   init(x: Child1, y: Parent2) {}\n\
+             }\n\
+             main() {\n\
+             \x20   A(Child1(), Child2())\n\
+             \x20   0\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23a_ctor_unique_most_specific_ok() {
+        // Child 比 Parent 更具体 → 唯一最简候选，放行。
+        assert_valid(
+            "open class P {}\n\
+             class Ch <: P {}\n\
+             class A {\n\
+             \x20   init(x: P) {}\n\
+             \x20   init(x: Ch) {}\n\
+             }\n\
+             main() {\n\
+             \x20   A(Ch())\n\
+             \x20   0\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23a_ctor_ambiguous_generic_explicit_args() {
+        // 泛型类显式类型实参下的构造歧义。
+        assert_invalid(
+            "interface I1 {}\n\
+             interface I2 {}\n\
+             class C <: I1 & I2 {}\n\
+             class A<T> {\n\
+             \x20   init(x: I1) {}\n\
+             \x20   init(x: I2) {}\n\
+             }\n\
+             main() {\n\
+             \x20   A<Unit>(C())\n\
+             \x20   0\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23a_ctor_ambiguous_overloaded_fn_value() {
+        // 传入重载函数名，函数类型形参可同时匹配两个重载 → 歧义。
+        assert_invalid(
+            "open class Parent {}\n\
+             class Child <: Parent {}\n\
+             func f(x: Child) {}\n\
+             func f(x: Parent) {}\n\
+             class A {\n\
+             \x20   init(x: (Child) -> Unit) {}\n\
+             }\n\
+             main() {\n\
+             \x20   A(f)\n\
+             \x20   0\n\
+             }\n",
+        );
+    }
+
+    // ─── w23a：返回值上下文类型不匹配（5.3.2 保守子集） ────────────────────────
+
+    #[test]
+    fn test_w23a_return_context_mismatch_assignment() {
+        // 函数返回 Int32，赋值给 Int64 标注变量 → 错。
+        assert_invalid(
+            "type myInt64 = Int64\n\
+             class myClass {\n\
+             \x20   func f0(a: Int32, b: Int32): Int32 { a + b }\n\
+             }\n\
+             main() {\n\
+             \x20   var v: myInt64\n\
+             \x20   var w: Int32 = 12\n\
+             \x20   var c = myClass()\n\
+             \x20   v = c.f0(w, w)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23a_return_context_overload_arg_determined() {
+        // 重载按实参 Int64 唯一确定为返回 Int64，与 Int32 上下文不符 → 错。
+        assert_invalid(
+            "class myClass {\n\
+             \x20   func myFunc(a: Int64): Int64 { a - 1 }\n\
+             \x20   func myFunc(a: Int32): Int32 { a + 1 }\n\
+             }\n\
+             main() {\n\
+             \x20   var g: Int64 = 12\n\
+             \x20   var c = myClass()\n\
+             \x20   var r: Int32 = c.myFunc(g)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23a_return_context_compatible_ok() {
+        // 返回类型与标注一致 → 放行。
+        assert_valid(
+            "class myClass {\n\
+             \x20   func f0(a: Int32): Int32 { a }\n\
+             }\n\
+             main() {\n\
+             \x20   var c = myClass()\n\
+             \x20   var r: Int32 = c.f0(12)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23a_alias_arg_mismatch() {
+        // 别名变量实参类型（Int64）与形参 Int32 不匹配（唯一候选全不匹配）→ 错。
+        assert_invalid(
+            "type I64 = Int64\n\
+             class myClass {\n\
+             \x20   func f0(a: Int32, b: Int32): Int32 { a + b }\n\
+             }\n\
+             main() {\n\
+             \x20   var mv: I64 = 12\n\
+             \x20   var i: Int32 = 12\n\
+             \x20   var c = myClass()\n\
+             \x20   c.f0(i, mv)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23a_alias_arg_compatible_ok() {
+        // 别名归一后与形参一致 → 放行。
+        assert_valid(
+            "type I32 = Int32\n\
+             class myClass {\n\
+             \x20   func f0(a: Int32): Int32 { a }\n\
+             }\n\
+             main() {\n\
+             \x20   var mv: I32 = 12\n\
+             \x20   var c = myClass()\n\
+             \x20   c.f0(mv)\n\
+             }\n",
+        );
+    }
 }
