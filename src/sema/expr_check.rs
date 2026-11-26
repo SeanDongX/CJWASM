@@ -758,6 +758,9 @@ struct VarInfo {
     /// 是否为“延迟赋值的 `let`”（`let x: T` 无初始化式）且尚未完成唯一一次
     /// 初值赋值。首次赋值后置 false；再次赋值按不可变变量处理（4.2(5)）。
     uninit_let: bool,
+    /// 是否为 `const` 声明绑定（仅 `Stmt::Const` / 顶层 `const`；形参/`this`/字段
+    /// 虽为不可变绑定但此处为 false）。用于 16.1(14) 深度 const 左值判定。
+    const_decl: bool,
 }
 
 /// 单趟表达式类型检查器。
@@ -1190,6 +1193,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 const_int: literal_int(&c.init),
                 explicit_bool: matches!(c.ty, Type::Bool),
                 uninit_let: false,
+                const_decl: false,
             },
         );
     }
@@ -1836,6 +1840,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         const_int: None,
                         explicit_bool: false,
                         uninit_let: false,
+                        const_decl: false,
                     },
                 )
             })
@@ -1882,6 +1887,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         const_int: None,
                         explicit_bool: false,
                         uninit_let: false,
+                        const_decl: false,
                     },
                 )
             })
@@ -1902,6 +1908,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         const_int: None,
                         explicit_bool: false,
                         uninit_let: false,
+                        const_decl: false,
                     },
                 )
             })
@@ -1923,6 +1930,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         const_int: None,
                     explicit_bool: false,
                     uninit_let: false,
+                    const_decl: false,
                     },
                 )
             })
@@ -1982,6 +1990,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                         const_int: None,
                     explicit_bool: false,
                     uninit_let: false,
+                    const_decl: false,
                     },
                 );
             }
@@ -4072,8 +4081,11 @@ impl<'a> Checker<'a> {
                     ty,
                     mutable,
                     const_int: None,
-                    explicit_bool: false,
+                    // 形参声明处的 `Bool` 类型标注是可靠来源（非解析器换行合并产物），
+                    // 用于把 `boolParam + boolParam` 这类真实 Bool 算术判为非法（10.2(2)）。
+                    explicit_bool: matches!(p.ty, Type::Bool),
                     uninit_let: false,
+                    const_decl: false,
                 },
             );
         }
@@ -4090,6 +4102,7 @@ impl<'a> Checker<'a> {
                     const_int: None,
                     explicit_bool: false,
                     uninit_let: false,
+                    const_decl: false,
                 });
             }
         }
@@ -4305,6 +4318,7 @@ impl<'a> Checker<'a> {
                         const_int: None,
                     explicit_bool: false,
                     uninit_let: false,
+                    const_decl: false,
                     },
                 );
                 self.scopes.push(scope);
@@ -4839,6 +4853,7 @@ impl<'a> Checker<'a> {
             const_int,
             explicit_bool: false,
             uninit_let,
+            const_decl: is_const,
         };
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.to_string(), info);
@@ -5068,8 +5083,25 @@ impl<'a> Checker<'a> {
                     self.check_instance_field_target(base, &fields[0]);
                 }
             }
+            // 16.1(14)：const 实例的所有成员（含成员数组/值数组的元素）均为 const，
+            // 不能作为赋值左值（深度 const）。
+            AssignTarget::IndexPath { base, .. } => {
+                if self.lookup(base).map_or(false, |v| v.const_decl) {
+                    self.err(format!(
+                        "const 实例 '{}' 的成员元素不能作为赋值左值（16.1(14)）",
+                        base
+                    ));
+                }
+            }
             // 4.23(15)：元组元素 / 缺少 set 形态 [] 的用户类型索引不可赋值。
             AssignTarget::Index { array, .. } => {
+                // 16.1(14)：const 绑定的元素不可赋值。
+                if self.lookup(array).map_or(false, |v| v.const_decl) {
+                    self.err(format!(
+                        "const 绑定 '{}' 的元素不能作为赋值左值（16.1(14)）",
+                        array
+                    ));
+                }
                 self.check_index_assign_target(array);
                 // 2.2.1(2)：数组元素赋值要求值类型可赋给元素类型。
                 if let Some(info) = self.lookup(array).cloned() {
@@ -5551,7 +5583,12 @@ impl<'a> Checker<'a> {
         if let Some((recv_ty, via_type)) = self.receiver_user(object) {
             self.check_class_member_access(&recv_ty, via_type, field);
         }
-        let recv = strip_option_ty(self.deq_ty(object));
+        let recv = match object {
+            // `C().field = v`：构造调用/结构体字面量的静态类型即其类型名。
+            crate::ast::Expr::ConstructorCall { name, .. }
+            | crate::ast::Expr::StructInit { name, .. } => Ty::User(name.clone()),
+            other => strip_option_ty(self.deq_ty(other)),
+        };
         let Ty::User(name) = recv else {
             return;
         };
@@ -7455,6 +7492,7 @@ impl<'a> Checker<'a> {
                             const_int: None,
                     explicit_bool: false,
                     uninit_let: false,
+                    const_decl: false,
                         },
                     );
                 }
@@ -8890,6 +8928,7 @@ fn bind_pattern_unknown_mut(
                     const_int: None,
                     explicit_bool: false,
                     uninit_let: false,
+                    const_decl: false,
                 },
             );
         }
@@ -8916,6 +8955,7 @@ fn bind_pattern_unknown_mut(
                     const_int: None,
                     explicit_bool: false,
                     uninit_let: false,
+                    const_decl: false,
                 },
             );
         }

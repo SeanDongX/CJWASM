@@ -177,10 +177,11 @@ impl Parser {
                 }
                 None => return self.bail(ParseError::UnexpectedEof),
             };
-            if !self.check(&Token::Colon) && !self.check(&Token::SubType) {
+            // 9.2(11)：where 子句的约束必须使用 `<:`，`:` 不是合法写法（方言亦不接受）。
+            if !self.check(&Token::SubType) {
                 return self.bail(ParseError::UnexpectedToken(
                     self.peek().cloned().unwrap_or(Token::Colon),
-                    "`:` 或 `<:`".to_string(),
+                    "`<:`".to_string(),
                 ));
             }
             self.advance();

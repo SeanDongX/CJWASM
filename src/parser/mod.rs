@@ -1077,7 +1077,7 @@ mod tests {
     #[test]
     fn test_parse_enum_with_where() {
         let source = r#"
-            enum Container<T> where T: Comparable {
+            enum Container<T> where T <: Comparable {
                 Full(T)
                 Empty
             }
@@ -1162,7 +1162,7 @@ mod tests {
     #[test]
     fn test_parse_where_clause_function() {
         let source = r#"
-            func compare<T>(a: T, b: T): Int64 where T: Comparable {
+            func compare<T>(a: T, b: T): Int64 where T <: Comparable {
                 return 0
             }
         "#;
