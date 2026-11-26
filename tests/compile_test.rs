@@ -4314,7 +4314,7 @@ fn test_parse_string_interpolation() {
     let source = r#"
         func main() : Int64 {
             let x = 42
-            let s = `value: ${x}`
+            let s = "value: ${x}"
             return x
         }
     "#;
