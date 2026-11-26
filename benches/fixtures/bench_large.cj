@@ -203,7 +203,7 @@ func handleOption(opt: Option<Int64>): Int64 {
 func tryCatchExample(a: Int64, b: Int64): Int64 {
     try {
         if (b == 0) {
-            throw 0
+            throw Exception("Division by zero")
         }
         return a / b
     } catch(e) {
