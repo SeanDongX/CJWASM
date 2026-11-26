@@ -377,6 +377,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_top_level_initializer_scope(program, &mut errors);
     // 3.2.3.2(14)/3.2.3.3(2)：类型参数只能在引入它的声明作用域内使用。
     check_type_param_scope(program, &mut errors);
+    // 3.1(2)：import 路径段不能是保留关键字（`import from.pkg.xxx`）。
+    check_import_keyword_segments(program, &mut errors);
+    // 3.4.1.2(1)：扩展中的 private 成员函数不能在扩展体外（如 main 中）调用。
+    check_private_extension_member_call(program, &mut errors);
     // 5.3.4(7)：元组不能作为算术/位运算/比较运算符的操作数（运算符重载不支持
     // 变长实参语法糖）。
     check_binary_tuple_operand(program, &mut errors);
@@ -2753,12 +2757,29 @@ fn walk_stmt_for_dups(
             walk_expr_for_dups(expr, scopes, errors);
             let mut names = Vec::new();
             pattern_binding_names(pattern, &mut names);
+            // 3.2.3.2(22)：循环条件引入的名字与循环体处于同一作用域级，
+            // 循环体同层再声明同名即重复声明。故不额外为循环体压入新作用域。
             scopes.push(HashSet::new());
             declare_local_names(&names, scopes, errors);
-            walk_block_for_dups(body, scopes, errors);
+            for s in body {
+                walk_stmt_for_dups(s, scopes, errors);
+            }
             scopes.pop();
         }
         Stmt::LocalFunc(f) => {
+            // 3.1(3)：同一作用域内变量/常量与局部函数共享命名空间。
+            // `let x = ...` 后又 `func x() {}` 构成重复声明（函数重载另由
+            // check_local_function_redefinitions 处理，故仅与变量类声明冲突时才报）。
+            if let Some(scope) = scopes.last() {
+                if scope.contains(&f.name) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "同一作用域内 '{}' 既已声明为变量又被声明为函数（3.1(3)）",
+                            f.name
+                        ),
+                    });
+                }
+            }
             let params = param_names(&f.params);
             walk_body_for_dups(&f.body, &params, errors)
         }
@@ -11073,18 +11094,17 @@ fn check_private_parent_access(
         .chain(program.constants.iter().map(|c| c.name.clone()))
         .chain(program.classes.iter().map(|c| c.name.clone()))
         .collect();
-    for m in &cls.methods {
-        let sig = sig_of_class_method(m, &cls.type_params);
-        if is_synthetic_member(&sig.name) || !m.has_body {
-            continue;
-        }
+    // 检查一个函数体 / 构造函数体：收集对父类 private 成员的无资格访问。
+    // 除表达式位置（`Expr::Var` / 无资格调用 / `this.m`）外，赋值的左值
+    // （`privateVar = ...`）同样是“访问父类私有成员”，需一并判定。
+    let mut check_body = |params: &[Param], body: &[Stmt], what: &str| {
         let mut locals: HashSet<String> = HashSet::new();
-        for p in &m.func.params {
+        for p in params {
             locals.insert(p.name.clone());
         }
-        collect_bindings_stmts(&m.func.body, &mut locals);
+        collect_bindings_stmts(body, &mut locals);
         let mut hits: Vec<String> = Vec::new();
-        walk_stmts(&m.func.body, &mut |e| {
+        walk_stmts(body, &mut |e| {
             let name = match e {
                 Expr::Var(n) => n,
                 Expr::Call { name, .. } => name,
@@ -11113,16 +11133,45 @@ fn check_private_parent_access(
                 hits.push(name.clone());
             }
         });
+        // 赋值左值：`x = ...` 中 `x` 指向父类私有字段同样非法。
+        let mut target_vars: Vec<String> = Vec::new();
+        collect_assign_target_vars_in_stmts(body, &mut target_vars);
+        for name in target_vars {
+            if name.contains('.') {
+                continue;
+            }
+            if private_names.contains(&name)
+                && !locals.contains(&name)
+                && !own_names.contains(&name)
+                && !globals.contains(&name)
+            {
+                hits.push(name);
+            }
+        }
         hits.sort();
         hits.dedup();
         for name in hits {
             errors.push(SemanticError {
                 message: format!(
-                    "类 '{}' 的成员函数 '{}' 不能访问父类的 private 成员 '{}'（6.1.1.2(13)）",
-                    cls.name, m.func.name, name
+                    "类 '{}' 的成员 '{}' 不能访问父类的 private 成员 '{}'（6.1.1.2(13)）",
+                    cls.name, what, name
                 ),
             });
         }
+    };
+    for m in &cls.methods {
+        let sig = sig_of_class_method(m, &cls.type_params);
+        if is_synthetic_member(&sig.name) || !m.has_body {
+            continue;
+        }
+        check_body(&m.func.params, &m.func.body, &m.func.name);
+    }
+    // 构造函数体同样不得访问父类 private 成员（`str1()` / `privateVar = 0`）。
+    for init in &cls.inits {
+        check_body(&init.params, &init.body, &format!("{}.init", cls.name));
+    }
+    if let Some(si) = &cls.static_init {
+        check_body(&[], si, &format!("{}.__static_init", cls.name));
     }
 }
 
@@ -17591,6 +17640,8 @@ fn collect_local_func_names_expr(e: &Expr, out: &mut HashSet<String>) {
                 collect_local_func_names_expr(&a.body, out);
             }
         }
+        // lambda 体内同样可声明局部函数（`{ => func f() {}; f() }`）。
+        Expr::Lambda { body, .. } => collect_local_func_names_expr(body, out),
         _ => {}
     }
 }
@@ -18232,6 +18283,61 @@ fn check_param_list(
     }
 }
 
+/// 3.2.3.2(13)：局部函数形参的默认值作用域规则与普通函数一致
+/// （`func foo(arg1!: Int32 = arg1) {}` 非法）。`check_param_list` 只覆盖
+/// 顶层/成员函数，此处补齐函数体内的局部函数。
+fn check_local_func_param_rules(program: &Program, errors: &mut Vec<SemanticError>) {
+    let globals = collect_top_level_names(program);
+    let mut bodies: Vec<&[Stmt]> = Vec::new();
+    for f in &program.functions {
+        bodies.push(&f.body);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            bodies.push(&m.func.body);
+        }
+        for init in &cls.inits {
+            bodies.push(&init.body);
+        }
+        if let Some(si) = &cls.static_init {
+            bodies.push(si);
+        }
+        if let Some(d) = &cls.deinit {
+            bodies.push(d);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            bodies.push(&init.body);
+        }
+    }
+    for i in &program.interfaces {
+        for m in &i.methods {
+            if let Some(b) = &m.default_body {
+                bodies.push(b);
+            }
+        }
+    }
+    for x in &program.extends {
+        for m in &x.methods {
+            bodies.push(&m.body);
+        }
+    }
+    for body in bodies {
+        let mut lfs: Vec<&Function> = Vec::new();
+        collect_local_funcs(body, &mut lfs);
+        for lf in lfs {
+            check_param_list(
+                &lf.params,
+                &format!("局部函数 '{}'", lf.name),
+                &globals,
+                true,
+                errors,
+            );
+        }
+    }
+}
+
 /// 5.1.2.2(1)/(5)/(6)：可选（默认值）参数在若干上下文中非法。
 fn check_optional_param_contexts(program: &Program, errors: &mut Vec<SemanticError>) {
     // 接口成员函数（抽象或默认实现）不能有可选参数。
@@ -18562,6 +18668,7 @@ fn check_function_param_rules(program: &Program, errors: &mut Vec<SemanticError>
         }
     }
     check_optional_param_contexts(program, errors);
+    check_local_func_param_rules(program, errors);
     // 5.3.1：调用处命名实参 / 位置实参检查。
     check_call_arguments(program, errors);
 }
@@ -19889,25 +19996,61 @@ fn check_top_level_initializer_scope(program: &Program, errors: &mut Vec<Semanti
     }
 }
 
-/// 收集程序中声明的全部类型参数名（类/结构体/接口/枚举/函数/方法级）。
+/// 收集函数体内局部函数（含嵌套）声明的类型参数名。
+fn collect_local_func_type_params_in(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::LocalFunc(f) => {
+                out.extend(f.type_params.iter().cloned());
+                collect_local_func_type_params_in(&f.body, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body }
+            | Stmt::For { body, .. }
+            | Stmt::WhileLet { body, .. } => collect_local_func_type_params_in(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// 收集程序中声明的全部类型参数名（类/结构体/接口/枚举/函数/方法级，含局部函数）。
 fn collect_declared_type_param_names(program: &Program) -> HashSet<String> {
     let mut tps: HashSet<String> = HashSet::new();
     for f in &program.functions {
         tps.extend(f.type_params.iter().cloned());
+        collect_local_func_type_params_in(&f.body, &mut tps);
     }
     for c in &program.classes {
         tps.extend(c.type_params.iter().cloned());
         for m in &c.methods {
             tps.extend(m.func.type_params.iter().cloned());
+            collect_local_func_type_params_in(&m.func.body, &mut tps);
+        }
+        for init in &c.inits {
+            collect_local_func_type_params_in(&init.body, &mut tps);
+        }
+        if let Some(si) = &c.static_init {
+            collect_local_func_type_params_in(si, &mut tps);
+        }
+        if let Some(d) = &c.deinit {
+            collect_local_func_type_params_in(d, &mut tps);
         }
     }
     for s in &program.structs {
         tps.extend(s.type_params.iter().cloned());
+        for init in &s.inits {
+            collect_local_func_type_params_in(&init.body, &mut tps);
+        }
     }
     for i in &program.interfaces {
         tps.extend(i.type_params.iter().cloned());
         for m in &i.methods {
             tps.extend(m.type_params.iter().cloned());
+            if let Some(body) = &m.default_body {
+                collect_local_func_type_params_in(body, &mut tps);
+            }
         }
     }
     for e in &program.enums {
@@ -19916,6 +20059,7 @@ fn collect_declared_type_param_names(program: &Program) -> HashSet<String> {
     for x in &program.extends {
         for m in &x.methods {
             tps.extend(m.type_params.iter().cloned());
+            collect_local_func_type_params_in(&m.body, &mut tps);
         }
     }
     tps
@@ -20200,6 +20344,34 @@ fn check_type_param_scope(program: &Program, errors: &mut Vec<SemanticError>) {
             }
         }
     }
+    // extend 体：作用域包含 `extend Foo<T>` 的泛型实参名、被扩展类型自身声明的
+    // 类型参数（`extend Foo` 省略实参时仍可用其参数）以及各方法自身的类型参数。
+    for x in &program.extends {
+        let mut base: HashSet<String> = HashSet::new();
+        let mut collect_arg = |ty: &Type, out: &mut HashSet<String>| {
+            if let Type::Struct(n, _) = ty {
+                out.insert(n.clone());
+            }
+        };
+        for ty in &x.type_args {
+            collect_arg(ty, &mut base);
+        }
+        for ty in &x.interface_args {
+            collect_arg(ty, &mut base);
+        }
+        if let Some(c) = program.classes.iter().find(|c| c.name == x.target_type) {
+            base.extend(c.type_params.iter().cloned());
+        }
+        if let Some(s) = program.structs.iter().find(|s| s.name == x.target_type) {
+            base.extend(s.type_params.iter().cloned());
+        }
+        if let Some(e) = program.enums.iter().find(|e| e.name == x.target_type) {
+            base.extend(e.type_params.iter().cloned());
+        }
+        for m in &x.methods {
+            ctx.func(m, &base);
+        }
+    }
     let mut reported: HashSet<String> = HashSet::new();
     for name in ctx.bad {
         if reported.insert(name.clone()) {
@@ -20213,6 +20385,97 @@ fn check_type_param_scope(program: &Program, errors: &mut Vec<SemanticError>) {
     }
 }
 
+
+/// 3.4.1.2(1)：扩展中的 `private` 成员函数只在该扩展（及其目标类型）内可见，
+/// 不能在扩展体外的自由函数中调用（官方 03_04_01_02 a01_05/a01_10：对
+/// `extend Foo { private func f1() {} }` 在 main 中调用 `x.f1()`）。
+///
+/// 仅当该名字**只**作为唯一扩展的 private 成员出现、且在别处没有任何同名
+/// 公开函数/方法时才报错，避免与同名重载混淆（保守）。
+fn check_private_extension_member_call(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut priv_ext: HashMap<String, usize> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    let mut public_names: HashSet<String> = HashSet::new();
+    for (i, x) in program.extends.iter().enumerate() {
+        for m in &x.methods {
+            let base = last_name_segment(&m.name);
+            if m.visibility == Visibility::Private {
+                if priv_ext.contains_key(&base) {
+                    ambiguous.insert(base);
+                } else {
+                    priv_ext.insert(base, i);
+                }
+            } else {
+                public_names.insert(base);
+            }
+        }
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            if m.func.visibility != Visibility::Private {
+                public_names.insert(last_name_segment(&m.func.name));
+            }
+        }
+    }
+    for f in &program.functions {
+        if !f.name.contains('.') && !f.name.contains("::") {
+            public_names.insert(f.name.clone());
+        }
+    }
+    let private_names: HashSet<&String> = priv_ext
+        .keys()
+        .filter(|n| !ambiguous.contains(*n) && !public_names.contains(*n))
+        .collect();
+    if private_names.is_empty() {
+        return;
+    }
+    let mut reported: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") || f.body.is_empty() {
+            continue;
+        }
+        walk_stmts(&f.body, &mut |e| {
+            let name = match e {
+                Expr::Call { name, .. } => name,
+                Expr::MethodCall { method, .. } => method,
+                _ => return,
+            };
+            if private_names.contains(name) && reported.insert(name.clone()) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "扩展的 private 成员函数 '{}' 不能在扩展体外调用（3.4.1.2(1)）",
+                        name
+                    ),
+                });
+            }
+        });
+    }
+}
+
+/// 3.1(2)：import 路径段不能是保留关键字（`import from.pkg.xxx` 中 `from` 与
+/// 关键字同命名空间，必然非法）。
+fn check_import_keyword_segments(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 仅列入“绝不可能出现在包路径中”的语法关键字；访问修饰符（internal /
+    // public 等）在 std 包路径中被实际使用（如 std.unittest.internal），必须放行。
+    const KEYWORDS: &[&str] = &[
+        "from", "import", "package", "func", "class", "struct", "interface", "enum",
+        "let", "var", "const", "if", "else", "while", "for", "match", "case", "return",
+        "where", "is", "as", "extend", "this", "super", "init", "operator", "unsafe",
+        "try", "catch", "finally", "throw", "spawn", "synchronized", "macro", "quote",
+    ];
+    for imp in &program.imports {
+        for seg in &imp.module_path {
+            if KEYWORDS.contains(&seg.as_str()) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "import 路径段 '{}' 是保留关键字，不能用作包名（3.1(2)）",
+                        seg
+                    ),
+                });
+            }
+        }
+    }
+}
 
 /// 5.3.4(7)：其它运算符重载不支持变长实参 / 元组实参语法糖。
 ///
@@ -21172,12 +21435,15 @@ fn check_cross_type_field_init_refs(program: &Program, errors: &mut Vec<Semantic
             if own.contains(&r) || globals.contains(&r) || is_prelude_identifier(&r) {
                 continue;
             }
-            if r.chars().next().map_or(false, |ch| ch.is_uppercase()) {
-                continue;
-            }
             let is_other_field = type_fields
                 .iter()
                 .any(|(t, fs)| t != owner && fs.contains(&r));
+            // 首字母大写的名字按约定多为类型/隐式导入符号而放行；但若它确实是
+            // 其它类型的成员名（且非顶层/类型/枚举变体名，已在上方排除），
+            // 仍属跨类型无资格引用（官方 03_02_03_03 a01_17 的静态常量名）。
+            if !is_other_field && r.chars().next().map_or(false, |ch| ch.is_uppercase()) {
+                continue;
+            }
             if is_other_field && reported.insert(r.clone()) {
                 errors.push(SemanticError {
                     message: format!(
@@ -28518,6 +28784,33 @@ main() {}"#,
     }
 
     #[test]
+    // ─── w20c：import 关键字路径段 / private 扩展成员 / 局部函数与变量同名 ───
+
+    #[test]
+    fn test_w20c_import_keyword_segment_rejected() {
+        // 3.1(2)：包路径段与关键字同命名空间（官方 03_01_02 a02_594）。
+        assert_invalid("import from.pkg.xxx\nmain() {}\n");
+        // 访问修饰符作为路径段在 std 中实际使用，必须放行。
+        assert_valid("import std.unittest.internal\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_w20c_private_extension_member_call_rejected() {
+        // 3.4.1.2(1)：扩展中的 private 函数不能在扩展体外调用。
+        assert_invalid(
+            "extend Foo { private func f1() {} }\nclass T {}\nmain() { T().f1() }\n",
+        );
+        // 在同一扩展内的其它成员中调用合法。
+        assert_valid(
+            "class T {}\nextend T { private func f() {} func g() { f() } }\nmain() {}\n",
+        );
+        // 同名 public 扩展函数调用合法（不受 private 判定影响）。
+        assert_valid(
+            "class T {}\nextend T { public func g() {} }\nmain() { T().g() }\n",
+        );
+    }
+
+    #[test]
     fn test_w20b_static_init_order() {
         // 6.1.2.2：static 初始化器读取后声明类型的静态成员。
         assert_invalid(
@@ -28662,4 +28955,9 @@ main() {}"#,
         );
     }
 
+    #[test]
+    fn test_w20c_local_func_var_same_scope_rejected() {
+        // 3.1(3)：同一作用域内变量与局部函数共享命名空间。
+        assert_invalid("main() { let x = 1\n func x() {} }\n");
+    }
 }

@@ -196,7 +196,7 @@ pub fn build(opts: &BuildOptions) -> Result<BuildResult, String> {
         visited.insert(canonical);
 
         let path_str = file.to_string_lossy().to_string();
-        let (prog, _source) = crate::pipeline::parse_file(&path_str)?;
+        let (prog, _source) = crate::pipeline::parse_file_ast(&path_str)?;
         programs.push(prog);
     }
 
@@ -216,7 +216,7 @@ pub fn build(opts: &BuildOptions) -> Result<BuildResult, String> {
 
     while let Some(import_file) = import_queue.pop() {
         let path_str = import_file.to_string_lossy().to_string();
-        let (prog, _source) = crate::pipeline::parse_file(&path_str)?;
+        let (prog, _source) = crate::pipeline::parse_file_ast(&path_str)?;
         let new_imports = crate::pipeline::collect_import_files(
             &prog,
             &base_refs,
@@ -238,6 +238,12 @@ pub fn build(opts: &BuildOptions) -> Result<BuildResult, String> {
         }
         crate::pipeline::merge_programs(programs)
     };
+
+    // 合并后统一语义校验（同包多文件的顶层名此时可见；逐文件校验会误判未定义）。
+    crate::sema::validate_program(&program).map_err(|errs| {
+        let msgs: Vec<String> = errs.iter().map(|e| e.message.clone()).collect();
+        format!("语义错误: {}", msgs.join("; "))
+    })?;
 
     // 优化 + 单态化
     crate::optimizer::optimize_program(&mut program);

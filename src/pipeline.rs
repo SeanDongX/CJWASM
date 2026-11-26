@@ -268,8 +268,11 @@ fn separate_hex_range(source: &str) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
-/// 解析源代码字符串为 Program AST
-pub fn parse_source(source: &str) -> Result<Program, String> {
+/// 解析源代码字符串为 Program AST（仅词法 + 语法，**不做语义校验**）。
+///
+/// 供多文件编译：逐文件弦解析后再合并、对合并结果统一校验，避免把同包其它
+/// 文件里的顶层名误判为未定义。
+pub fn parse_source_ast(source: &str) -> Result<Program, String> {
     let source = strip_block_comments(source);
     let source = strip_quote_contents(&source);
     let source = separate_hex_range(&source);
@@ -278,9 +281,14 @@ pub fn parse_source(source: &str) -> Result<Program, String> {
     let tokens = tokens.map_err(|e| format!("词法错误: {}", e))?;
 
     let mut parser = Parser::new(tokens).with_source(&source);
-    let program = parser
+    parser
         .parse_program()
-        .map_err(|e| format!("语法错误: {}", e))?;
+        .map_err(|e| format!("语法错误: {}", e))
+}
+
+/// 解析源代码字符串为 Program AST
+pub fn parse_source(source: &str) -> Result<Program, String> {
+    let program = parse_source_ast(source)?;
 
     // 语义校验：重定义 / static+实例同名重载 / override 签名 / 接口实现完整性。
     crate::sema::validate_program(&program).map_err(|errs| {
@@ -289,6 +297,14 @@ pub fn parse_source(source: &str) -> Result<Program, String> {
     })?;
 
     Ok(program)
+}
+
+/// 解析文件为 Program AST（仅词法 + 语法，不做语义校验），返回 (program, source)。
+pub fn parse_file_ast(path: &str) -> Result<(Program, String), String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| format!("无法读取文件 '{}': {}", path, e))?;
+    let program = parse_source_ast(&source).map_err(|e| format!("{}: {}", path, e))?;
+    Ok((program, source))
 }
 
 /// 解析文件为 Program AST，返回 (program, source)
@@ -476,9 +492,19 @@ pub fn compile_source_to_wasm(source: &str) -> Result<Vec<u8>, String> {
 /// 多文件编译流水线
 pub fn compile_files_to_wasm(files: &[&str]) -> Result<Vec<u8>, String> {
     let mut programs = Vec::new();
-    for file in files {
-        let (prog, _source) = parse_file(file)?;
-        programs.push(prog);
+    if files.len() <= 1 {
+        for file in files {
+            let (prog, _source) = parse_file(file)?;
+            programs.push(prog);
+        }
+    } else {
+        // 多文件：先仅解析，合并后统一做语义校验（同包其它文件的顶层名可见）。
+        for file in files {
+            let source = std::fs::read_to_string(file)
+                .map_err(|e| format!("无法读取文件 '{}': {}", file, e))?;
+            let prog = parse_source_ast(&source).map_err(|e| format!("{}: {}", file, e))?;
+            programs.push(prog);
+        }
     }
 
     let mut program = if programs.len() == 1 {
@@ -486,6 +512,13 @@ pub fn compile_files_to_wasm(files: &[&str]) -> Result<Vec<u8>, String> {
     } else {
         merge_programs(programs)
     };
+
+    if files.len() > 1 {
+        crate::sema::validate_program(&program).map_err(|errs| {
+            let msgs: Vec<String> = errs.iter().map(|e| e.message.clone()).collect();
+            format!("语义错误: {}", msgs.join("; "))
+        })?;
+    }
 
     crate::optimizer::optimize_program(&mut program);
     crate::monomorph::monomorphize_program(&mut program);
