@@ -4497,6 +4497,7 @@ impl<'a> Checker<'a> {
                 if !deferred {
                     if let Some(ann) = ann_ty.as_ref() {
                         self.check_assignable(ann, &value_ty, "变量初始化");
+                        self.check_array_literal_elems(ann, value);
                         self.check_literal_range(ann, value);
                         self.check_literal_annotation(ann, value);
                     }
@@ -4569,6 +4570,7 @@ impl<'a> Checker<'a> {
                 if !deferred {
                     if let Some(ann) = ann_ty.as_ref() {
                         self.check_assignable(ann, &value_ty, "变量初始化");
+                        self.check_array_literal_elems(ann, value);
                         self.check_literal_range(ann, value);
                         self.check_literal_annotation(ann, value);
                     }
@@ -5442,6 +5444,21 @@ impl<'a> Checker<'a> {
             return;
         }
         if !ret.is_concrete() || !value.is_definite() {
+            return;
+        }
+        // 2(1)：返回值为用户类型时须与声明返回类型同型或为其子类型（与可赋值性
+        // 一致）。此前 `compatible` 对所有用户类型一律放行，导致 `func f(): C
+        // { return s }`（s 为无关 struct S）被误放行。`Any`/`Nothing` 维持宽松。
+        if let (Ty::User(tn), Ty::User(vn)) = (&ret, value) {
+            let related = is_same_or_subtype_name(vn, tn, &self.user_parents)
+                || tn == "Any"
+                || vn == "Nothing";
+            if !related {
+                self.err(format!(
+                    "返回类型不匹配: 函数声明返回 {}，实际返回 {}",
+                    tn, vn
+                ));
+            }
             return;
         }
         if !compatible(&ret, value) {
@@ -6905,6 +6922,32 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 2.2.1.1(2)：数组字面量的每个元素类型须与声明的元素类型兼容。
+    ///
+    /// 仅在声明元素类型为内建具体类型、且元素静态类型可确定（字面量/后缀字面量
+    /// 等）时判定；用户类型元素、调用结果、未知类型一律保守放行，避免误伤。
+    fn check_array_literal_elems(&mut self, ann: &Ty, value: &Expr) {
+        let Ty::Array(t) = ann else {
+            return;
+        };
+        if !t.is_prim() {
+            return;
+        }
+        let Expr::Array(elems) = value else {
+            return;
+        };
+        for e in elems {
+            let vt = static_expr_ty(e);
+            if vt.is_definite() && vt.is_prim() && !compatible(t, &vt) {
+                self.err(format!(
+                    "数组字面量元素类型 {} 与声明元素类型 {} 不匹配（2.2.1.1(2)）",
+                    vt.name(),
+                    t.name()
+                ));
+            }
+        }
+    }
+
     /// 10.2.3(15) / 4.23(27)：复合赋值 `a op= b` 脱糖为 `a = a op b`。
     /// 当 `op` 为用户/扩展重载运算符时，其返回类型必须是左操作数类型
     /// 的同类型或子类型；否则报类型不匹配。
@@ -7195,6 +7238,19 @@ impl<'a> Checker<'a> {
                 if let Some(pl) = payload.as_deref() {
                     self.check_enum_pattern_arity(pl);
                 }
+            }
+            // 4.4.1.6(3)：带参枚举构造器的模式必须以 `(…)` 给出实参。解析器把
+            // 裸大写名（`case EE =>`）当作绑定模式，但其名称若恰为带参构造器且
+            // 当前无同名变量遮蔽，则实为缺少实参的构造器模式，属非法。
+            Pattern::Binding(n)
+                if self.lookup(n).is_none()
+                    && self.enum_variant_arity.get(n.as_str()).map_or(false, |&a| a > 0) =>
+            {
+                let decl = self.enum_variant_arity[n.as_str()];
+                self.err(format!(
+                    "枚举构造器 '{}' 需要 {} 个实参，模式中未提供（4.4.1.6(3)）",
+                    n, decl
+                ));
             }
             Pattern::Tuple(ps) | Pattern::Or(ps) => {
                 for x in ps {
@@ -7957,6 +8013,14 @@ impl<'a> Checker<'a> {
                         callee_ty.name()
                     ));
                 }
+                // 2.1.4(2)：Unit 类型未定义 () 调用运算符。`u1 ~> u2` 会被
+                // 脱糖为 `{ x => u2(u1(x)) }`，其中被调用者 `u1` 是静态类型
+                // 确定为 Unit 的变量；Unit 恒不是函数值，直接判定非法。
+                if matches!(&**callee, Expr::Var(_)) && callee_ty == Ty::Unit {
+                    self.err(
+                        "Unit 类型未定义 () 调用运算符（2.1.4(2)）".to_string(),
+                    );
+                }
                 // 2.1.11.1(6)：无参枚举构造器是枚举值而非函数，`B()` 非法。
                 if let Expr::Var(n) = &**callee {
                     if args.is_empty()
@@ -8349,7 +8413,19 @@ impl<'a> Checker<'a> {
                     }
                     self.scopes.push(scope);
                     if let Some(g) = &arm.guard {
-                        self.check_expr(g);
+                        // 4.4.3(3)：模式守卫必须是 Bool 表达式。仅在静态类型
+                        // 确定为内建非 Bool 类型时报错，用户类型/函数类型/未知
+                        // 保守放行，避免误伤返回 Bool 的调用。
+                        let gt = self.check_expr(g);
+                        if gt.is_definite()
+                            && gt.is_prim()
+                            && gt != Ty::Bool
+                        {
+                            self.err(format!(
+                                "模式守卫必须为 Bool 类型，实际为 {}（4.4.3(3)）",
+                                gt.name()
+                            ));
+                        }
                     }
                     let t = self.check_expr(&arm.body);
                     self.scopes.pop();
@@ -12842,6 +12918,68 @@ mod tests {
         assert_ok(
             "interface I { prop p: Int64 { get() { 1 } } }\nclass C <: I {}\nmain() { let c = C()\n let v = c.p }",
         );
+    }
+
+    #[test]
+    fn test_w22a_enum_binding_pattern_requires_args() {
+        // 4.4.1.6(3)：带参枚举构造器的模式缺少实参（`case EE =>`）非法。
+        assert_err(
+            "enum E { | EE(Int64, Int64) }\nmain() { match(EE(1, 2)) { case EE => true\n case _ => false } }",
+            "模式中未提供",
+        );
+        // 正确带实参的模式合法。
+        assert_ok(
+            "enum E { | EE(Int64, Int64) }\nmain() { match(EE(1, 2)) { case EE(a, b) => a\n case _ => 0 } }",
+        );
+    }
+
+    #[test]
+    fn test_w22a_pattern_guard_must_be_bool() {
+        // 4.4.3(3)：模式守卫必须是 Bool 类型，整数变量非法。
+        assert_err(
+            "main() { let n = 0\n match (0) { case _ where n => 1\n case _ => 2 } }",
+            "模式守卫必须为 Bool",
+        );
+        // Bool 守卫合法。
+        assert_ok("main() { let n = 0\n match (0) { case _ where n > 0 => 1\n case _ => 2 } }");
+    }
+
+    #[test]
+    fn test_w22a_unit_operand_composition_rejected() {
+        // 2.1.4(2)：`u1 ~> u2` 脱糖为 `u2(u1(x))`，Unit 值不可调用。
+        assert_err(
+            "func foo(): Unit { }\nmain() { let u1 = foo()\n let u2 = foo()\n u1 ~> u2 }",
+            "Unit 类型未定义",
+        );
+        // 函数值组合合法。
+        assert_ok(
+            "func f(x: Int64): Int64 { x }\nfunc g(x: Int64): Int64 { x }\nmain() { let h = f ~> g\n let v = h(1) }",
+        );
+    }
+
+    #[test]
+    fn test_w22a_return_type_user_mismatch() {
+        // 2(1)：返回无关用户类型（struct S 声明为返回 class C）非法。
+        assert_err(
+            "struct S { let x: Int64 = 0 }\nclass C { let x: Int64 = 0 }\nfunc f(): C { let r = S()\n return r }\nmain() { }",
+            "返回类型不匹配",
+        );
+        // 子类型作为父/接口类型返回合法。
+        assert_ok(
+            "interface I { }\nclass D <: I { }\nfunc f(): I { let d = D()\n return d }\nmain() { }",
+        );
+    }
+
+    #[test]
+    fn test_w22a_array_literal_elem_type_mismatch() {
+        // 2.2.1.1(2)：数组字面量中混入与声明元素类型不符的确定类型元素。
+        assert_err(
+            "main() { let a: Array<String> = [\"x\", 189658i32] }",
+            "数组字面量元素类型",
+        );
+        // 同类型/字面量可适配的元素合法。
+        assert_ok("main() { let a: Array<Int64> = [1, 2, 3] }");
+        assert_ok("main() { let a: Array<Float64> = [1, 2.5] }");
     }
 
 }
