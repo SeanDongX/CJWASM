@@ -562,6 +562,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_extension_private_member_outside_access(program, &index, &mut errors);
     // 8(1)：接口类型不能被 extend。
     check_extension_target_not_interface(program, &index, &mut errors);
+    // 8.1(2)/8.3(1)(3)：扩展泛型类型时必须提供与声明一致的泛型实参。
+    check_extend_generic_target_args(program, &index, &mut errors);
     // 8.5(3)：子类不得覆写/重定义父类扩展新增的成员。
     check_extension_member_redefined_in_subclass(program, &index, &mut errors);
 
@@ -11750,14 +11752,13 @@ fn check_extension_interface_rules(
             }
             continue;
         }
-        // 泛型接口的实参无法从 AST 还原，保守跳过重复实现检查。
+        // 泛型接口：8.1.2(12) 若被扩展类型已以“完全相同的接口实参”直接实现该接口，
+        // 则扩展重复实现非法（如 `class Goo<T> <: I2<Int32>` 后再 `extend Goo<T> <: I2<Int32>`）。
+        // 仅在实参可结构比较且类声明中确有同名接口标注时判定；`I2<T>` 等不同实例化保守放行。
         let iface_generic = index
             .interfaces
             .get(iface_base)
             .map_or(true, |idef| !idef.type_params.is_empty());
-        if iface_generic {
-            continue;
-        }
         let target_base = ext
             .target_type
             .split('<')
@@ -11765,6 +11766,25 @@ fn check_extension_interface_rules(
             .unwrap_or(&ext.target_type)
             .trim()
             .to_string();
+        if iface_generic {
+            if let Some(cls) = index.classes.get(target_base.as_str()) {
+                let same_instantiation = cls.supertype_args.iter().any(|(n, args)| {
+                    n == iface_base
+                        && !args.is_empty()
+                        && !ext.interface_args.is_empty()
+                        && args == &ext.interface_args
+                });
+                if same_instantiation {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类型 '{}' 已以相同泛型实参实现接口 '{}'，不能通过扩展重复实现（8.1.2(12)）",
+                            target_base, iface_base
+                        ),
+                    });
+                }
+            }
+            continue;
+        }
         // 类型自身已直接实现该接口。
         let type_already = index.classes.get(target_base.as_str()).map_or(false, |cls| {
             cls.implements.iter().any(|i| i.split('<').next().unwrap_or(i).trim() == iface_base)
@@ -12147,6 +12167,67 @@ fn check_extension_target_not_interface(
         if index.interfaces.contains_key(base) {
             errors.push(SemanticError {
                 message: format!("接口类型 '{}' 不能被 extend（8(1)）", base),
+            });
+        }
+    }
+}
+
+/// 内建泛型类型名 → 类型参数个数。仅覆盖确定的内建泛型，未列出者返回 None（保守跳过）。
+/// 用于 8.1(2)/8.3(1)(3) 中“扩展泛型类型必须提供匹配实参”的判定。
+fn builtin_generic_arity(name: &str) -> Option<usize> {
+    match name {
+        "Option" | "Array" | "Range" | "Slice" => Some(1),
+        "VArray" | "Map" | "Result" => Some(2),
+        _ => None,
+    }
+}
+
+/// 判定扩展目标的“声明泛型参数个数”：
+/// - 本地可解析的 class/struct/enum：取其 type_params 长度（非泛型为 0）；
+/// - 内建泛型（Option/Array/...）：取 builtin_generic_arity；
+/// - 其它（跨文件/外部类型、接口、别名、Tuple 等）：None，保守跳过。
+fn extend_target_declared_arity(name: &str, index: &ProgramIndex<'_>) -> Option<usize> {
+    if let Some(tps) = index.type_params.get(name) {
+        return Some(tps.len());
+    }
+    // 别名：若解析为另一个基类型，递归取其参数个数。
+    if let Some(Type::Struct(inner, _)) = index.aliases.get(name) {
+        return extend_target_declared_arity(inner, index);
+    }
+    builtin_generic_arity(name)
+}
+
+/// 8.1(2)/8.3(1)(3)：当被扩展类型是泛型类型时，扩展必须提供与类型声明一致的泛型实参；
+/// 缺少实参或个数不匹配均为错误。跨文件/外部类型一律放行（保守）。
+fn check_extend_generic_target_args(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for ext in &program.extends {
+        let target = ext.target_type.trim();
+        let base = target.split('<').next().unwrap_or(target).trim();
+        let Some(arity) = extend_target_declared_arity(base, index) else {
+            continue;
+        };
+        if arity == 0 {
+            continue;
+        }
+        if ext.type_args.is_empty() {
+            errors.push(SemanticError {
+                message: format!(
+                    "扩展泛型类型 '{}' 必须提供泛型实参（期望 {} 个）（8.1(2)/8.3(1)）",
+                    base, arity
+                ),
+            });
+        } else if ext.type_args.len() != arity {
+            errors.push(SemanticError {
+                message: format!(
+                    "扩展泛型类型 '{}' 的泛型实参个数不匹配：期望 {}，实际 {}（8.3(3)）",
+                    base,
+                    arity,
+                    ext.type_args.len()
+                ),
             });
         }
     }
@@ -21855,6 +21936,45 @@ main() {}"#,
         );
         // 接口上界保守放行（不据此判定递归）。
         assert_valid("interface I<T> {}\nclass G<T> where T <: I<T> {}\nmain() {}");
+    }
+
+
+    // ─── w18b：08.1(2)/8.3(1)(3) 扩展泛型类型实参 + 8.1.2(12) 泛型接口重复实现 ───
+
+    #[test]
+    fn test_w18b_extend_generic_args() {
+        // 8.1(2)/8.3(1)：扩展泛型类型必须提供与声明一致的泛型实参。
+        assert_invalid("class MyClass<T> {}\nextend MyClass {}\nmain() {}");
+        // 内建泛型 Option 缺少实参。
+        assert_invalid("extend Option {}\nmain() {}");
+        // 8.3(3)：泛型实参个数不匹配。
+        assert_invalid("class Pair<A, B> {}\nextend Pair<Int64> {}\nmain() {}");
+        // 正例：提供匹配实参。
+        assert_valid("class MyClass<T> {}\nextend MyClass<T> {}\nmain() {}");
+        assert_valid("class Pair<A, B> {}\nextend Pair<A, B> {}\nmain() {}");
+        assert_valid("extend Option<T> {}\nmain() {}");
+        // 跨文件/未知类型保守放行（无法解析其泛型参数个数）。
+        assert_valid("extend ExternalType {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w18b_generic_iface_dup_and_free_func_arity() {
+        // 8.1.2(12)：类已以相同泛型实参实现接口，扩展重复实现非法。
+        assert_invalid(
+            "interface I2<T> {}\nclass Goo<T> <: I2<Int32> {}\nextend Goo<T> <: I2<Int32> {}\nmain() {}",
+        );
+        // 正例：不同实例化（I2<T>）放行。
+        assert_valid(
+            "interface I2<T> {}\nclass Goo<T> <: I2<Int32> {}\nextend Goo<T> <: I2<T> {}\nmain() {}",
+        );
+        // 10.1.2.1：重载集完整时位置实参个数无法匹配任一重载则报错。
+        let errs = assert_invalid(
+            "func f(x: Int64) {}\nfunc f(x: Int64, y: Int64) {}\nmain() { f(1, 2, 3) }",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("重载均不接受")));
+        // 正例：匹配任一重载；变长（Array）形参吸收任意个数。
+        assert_valid("func f(x: Int64) {}\nfunc f(x: Int64, y: Int64) {}\nmain() { f(1, 2) }");
+        assert_valid("func f(arr: Array<Int64>) {}\nmain() { f(1, 2, 3) }");
     }
 
 }

@@ -8305,7 +8305,9 @@ is_c: false,
             enums: vec![],
             extends: vec![crate::ast::ExtendDef {
                 target_type: "Point".to_string(),
+                type_args: vec![],
                 interface: Some("Printable".to_string()),
+                interface_args: vec![],
                 assoc_type_bindings: vec![],
                 methods: vec![FuncDef {
                     is_const: false,

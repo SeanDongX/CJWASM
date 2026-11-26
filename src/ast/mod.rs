@@ -639,8 +639,14 @@ pub struct InterfaceDef {
 pub struct ExtendDef {
     /// 被扩展的类型名
     pub target_type: String,
+    /// 被扩展类型的泛型实参（如 `extend Foo<T>` 的 `<T>`；无实参时为空）。
+    /// 8.1(2)/8.3(1)(3)：扩展泛型类型必须提供与声明一致的泛型参数。
+    pub type_args: Vec<Type>,
     /// 实现的接口（可选）
     pub interface: Option<String>,
+    /// 实现接口的泛型实参（如 `extend Foo<T> <: I<T>` 的 `[T]`；无实参为空）。
+    /// 8.1.2(12)：用于判定对泛型接口的重复实现。
+    pub interface_args: Vec<Type>,
     /// 关联类型绑定（如 type Element = Int64）
     pub assoc_type_bindings: Vec<(String, Type)>,
     /// 扩展的方法
