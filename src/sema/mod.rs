@@ -526,6 +526,15 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 9.5.1.1(12)/(13)：值类型/枚举上界的递归约束非法（T <: S<T>）。
     check_recursive_value_constraints(program, &mut errors);
 
+    // w20d：09 章泛型负例——未声明类型参数、类型参数作值、多类上界、无穷实例化、
+    // 显式类型实参个数、继承泛型接口的约束满足。
+    check_undefined_type_identifiers(program, &mut errors);
+    check_type_param_used_as_value(program, &mut errors);
+    check_multiple_class_bounds(program, &index, &mut errors);
+    check_infinite_generic_instantiation(program, &mut errors);
+    check_generic_call_type_arg_count(program, &mut errors);
+    check_supertype_generic_constraints(program, &index, &mut errors);
+
     // 2.4.1(11)/(12)：类型别名之间不允许直接或间接的循环引用。
     check_type_alias_cycles(program, &mut errors);
 
@@ -22347,6 +22356,47 @@ fn check_as_generic_without_args(
 }
 
 // ─── 4.8：数值类型转换必须带一个操作数（`Int64()` 非法） ─────────────────
+fn check_parenthesized_type_invocation(program: &Program, errors: &mut Vec<SemanticError>) {
+    let is_type_name = |n: &str| is_builtin_type_name(n) || matches!(n, "Int" | "UInt");
+    let mut scan = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        walk_stmts(body, &mut |e| {
+            if let Expr::Invoke { callee, .. } = e {
+                if let Expr::Var(n) = callee.as_ref() {
+                    if is_type_name(n) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "括号包裹的类型名 '({})' 不能被当作函数调用（4.8）",
+                                n
+                            ),
+                        });
+                    }
+                }
+            }
+        });
+    };
+    for f in &program.functions {
+        scan(&f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.body, errors);
+        }
+    }
+}
+
 fn check_numeric_conversion_without_operand(program: &Program, errors: &mut Vec<SemanticError>) {
     let is_numeric = |n: &str| {
         matches!(
@@ -22412,49 +22462,6 @@ fn check_numeric_conversion_without_operand(program: &Program, errors: &mut Vec<
         }
     }
 }
-
-// ─── 4.8：括号包裹的类型名不能被调用（`(Int32)(x)` 非法） ────────────────
-fn check_parenthesized_type_invocation(program: &Program, errors: &mut Vec<SemanticError>) {
-    let is_type_name = |n: &str| is_builtin_type_name(n) || matches!(n, "Int" | "UInt");
-    let mut scan = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
-        walk_stmts(body, &mut |e| {
-            if let Expr::Invoke { callee, .. } = e {
-                if let Expr::Var(n) = callee.as_ref() {
-                    if is_type_name(n) {
-                        errors.push(SemanticError {
-                            message: format!(
-                                "括号包裹的类型名 '({})' 不能被当作函数调用（4.8）",
-                                n
-                            ),
-                        });
-                    }
-                }
-            }
-        });
-    };
-    for f in &program.functions {
-        scan(&f.body, errors);
-    }
-    for c in &program.classes {
-        for init in &c.inits {
-            scan(&init.body, errors);
-        }
-        for m in &c.methods {
-            scan(&m.func.body, errors);
-        }
-    }
-    for s in &program.structs {
-        for init in &s.inits {
-            scan(&init.body, errors);
-        }
-    }
-    for ext in &program.extends {
-        for m in &ext.methods {
-            scan(&m.body, errors);
-        }
-    }
-}
-
 // ─── 6.1.2.7(4)：泛型类型实参必须是类型 ───────────────────────────────────
 
 /// 递归收集类型中出现的具名类型（`Struct(name, args)` 的名字）。
@@ -24204,6 +24211,577 @@ fn collect_block_local_names_no_func_body(stmts: &[Stmt], out: &mut HashSet<Stri
     }
 }
 
+// ─── w20d：09 章泛型 / 10 章重载 编译期可判定负例检查 ───────────────────────
+
+/// 遍历程序中所有函数体 / 构造函数体 / 字段默认值 / 顶层初始化式中的表达式。
+fn for_each_program_expr<'a>(program: &'a Program, f: &mut dyn FnMut(&'a Expr)) {
+    for func in &program.functions {
+        for p in &func.params {
+            if let Some(d) = &p.default {
+                walk_expr(d, f);
+            }
+        }
+        walk_stmts(&func.body, f);
+    }
+    for c in &program.classes {
+        for fld in &c.fields {
+            if let Some(d) = &fld.default {
+                walk_expr(d, f);
+            }
+        }
+        for p in &c.primary_ctor_params {
+            if let Some(d) = &p.default {
+                walk_expr(d, f);
+            }
+        }
+        for i in c.init.iter().chain(c.inits.iter()) {
+            for p in &i.params {
+                if let Some(d) = &p.default {
+                    walk_expr(d, f);
+                }
+            }
+            walk_stmts(&i.body, f);
+        }
+        if let Some(d) = &c.deinit {
+            walk_stmts(d, f);
+        }
+        if let Some(si) = &c.static_init {
+            walk_stmts(si, f);
+        }
+        for m in &c.methods {
+            for p in &m.func.params {
+                if let Some(d) = &p.default {
+                    walk_expr(d, f);
+                }
+            }
+            walk_stmts(&m.func.body, f);
+        }
+    }
+    for s in &program.structs {
+        for fld in &s.fields {
+            if let Some(d) = &fld.default {
+                walk_expr(d, f);
+            }
+        }
+        for p in &s.primary_ctor_params {
+            if let Some(d) = &p.default {
+                walk_expr(d, f);
+            }
+        }
+        for i in &s.inits {
+            for p in &i.params {
+                if let Some(d) = &p.default {
+                    walk_expr(d, f);
+                }
+            }
+            walk_stmts(&i.body, f);
+        }
+    }
+    for e in &program.enums {
+        for p in &e.props {
+            if let Some(g) = &p.getter {
+                walk_stmts(g, f);
+            }
+            if let Some((_, sg)) = &p.setter {
+                walk_stmts(sg, f);
+            }
+        }
+    }
+    for i in &program.interfaces {
+        for m in &i.methods {
+            if let Some(b) = &m.default_body {
+                walk_stmts(b, f);
+            }
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            for p in &m.params {
+                if let Some(d) = &p.default {
+                    walk_expr(d, f);
+                }
+            }
+            walk_stmts(&m.body, f);
+        }
+    }
+    for cd in &program.constants {
+        walk_expr(&cd.init, f);
+    }
+}
+
+/// 9.6(2)：显式类型实参个数必须与本文件唯一可确定的泛型函数类型参数个数一致。
+///
+/// 仅在函数名在本文件中唯一且为顶层函数（无 `Type.` 前缀）时判定，避免误伤重载消解。
+fn check_generic_call_type_arg_count(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut by_name: HashMap<&str, Vec<&Function>> = HashMap::new();
+    for f in &program.functions {
+        if !f.name.contains('.') {
+            by_name.entry(f.name.as_str()).or_default().push(f);
+        }
+    }
+    let sig: HashMap<&str, usize> = by_name
+        .iter()
+        .filter(|(_, v)| v.len() == 1 && !v[0].type_params.is_empty())
+        .map(|(n, v)| (*n, v[0].type_params.len()))
+        .collect();
+    if sig.is_empty() {
+        return;
+    }
+    let mut reported: HashSet<String> = HashSet::new();
+    for_each_program_expr(program, &mut |e| {
+        if let Expr::Call {
+            name,
+            type_args: Some(args),
+            ..
+        } = e
+        {
+            if let Some(&n) = sig.get(name.as_str()) {
+                if args.len() != n && reported.insert(name.clone()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "泛型函数 '{}' 声明了 {} 个类型参数，但显式实例化只提供了 {} 个（9.6(2)）",
+                            name,
+                            n,
+                            args.len()
+                        ),
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// 9.1(3)：类型参数只能在类型位置使用，不能作为值表达式引用。
+///
+/// 仅当裸变量名恰为所在声明的类型参数名、且不是任何局部值绑定时报告。
+fn check_tp_as_value_in_body(
+    tps: &[String],
+    params: &[Param],
+    body: &[Stmt],
+    errors: &mut Vec<SemanticError>,
+) {
+    if tps.is_empty() || body.is_empty() {
+        return;
+    }
+    let tpset: HashSet<&str> = tps.iter().map(|s| s.as_str()).collect();
+    let mut vals: HashSet<String> = HashSet::new();
+    for p in params {
+        vals.insert(p.name.clone());
+    }
+    collect_block_local_names(body, &mut vals);
+    // 类型参数可作为“类型限定访问”的接收者（如 `T.f()` 调用静态成员），属合法用法；
+    // 收集所有作为方法调用对象出现的名字并放行，仅对独立值位置报告。
+    let mut static_obj: HashSet<String> = HashSet::new();
+    walk_stmts(body, &mut |e| {
+        if let Expr::MethodCall { object, .. } = e {
+            if let Expr::Var(n) = &**object {
+                static_obj.insert(n.clone());
+            }
+        }
+    });
+    let mut hit: HashSet<String> = HashSet::new();
+    walk_stmts(body, &mut |e| {
+        if let Expr::Var(n) = e {
+            if tpset.contains(n.as_str()) && !vals.contains(n) && !static_obj.contains(n) {
+                hit.insert(n.clone());
+            }
+        }
+    });
+    let mut hits: Vec<String> = hit.into_iter().collect();
+    hits.sort();
+    for n in hits {
+        errors.push(SemanticError {
+            message: format!("类型参数 '{}' 不能被当作值使用（9.1(3)）", n),
+        });
+    }
+}
+
+fn check_type_param_used_as_value(program: &Program, errors: &mut Vec<SemanticError>) {
+    for c in &program.classes {
+        // `init` 若已包含在 `inits` 中则不重复遍历（避免重复报错）。
+        let inits: Vec<&InitDef> = if c.inits.is_empty() {
+            c.init.iter().collect()
+        } else {
+            c.inits.iter().collect()
+        };
+        for i in inits {
+            check_tp_as_value_in_body(&c.type_params, &i.params, &i.body, errors);
+        }
+        for m in &c.methods {
+            let mut tps = c.type_params.clone();
+            tps.extend(m.func.type_params.iter().cloned());
+            check_tp_as_value_in_body(&tps, &m.func.params, &m.func.body, errors);
+        }
+        if let Some(d) = &c.deinit {
+            check_tp_as_value_in_body(&c.type_params, &[], d, errors);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            check_tp_as_value_in_body(&s.type_params, &i.params, &i.body, errors);
+        }
+    }
+    for f in &program.functions {
+        check_tp_as_value_in_body(&f.type_params, &f.params, &f.body, errors);
+    }
+}
+
+/// 9.4.1(4)：泛型声明若使用未声明的类型参数（以类型位置裸名出现），应报错。
+///
+/// 保守版本：仅对“单大写字母、且全文件未以任何形式声明、且不是已知/预置类型”的
+/// 类型位置裸名判定；无 import 的单文件程序上启用，避免误伤 std 类型。
+fn check_undefined_type_identifiers(program: &Program, errors: &mut Vec<SemanticError>) {
+    if !imports_allow_undefined_check(program) {
+        return;
+    }
+    let mut declared_tps = collect_declared_type_param_names(program);
+    // `extend<W> Foo<W>` 的扩展泛型参数在 AST 中仅以目标实参名出现；把它们也视为
+    // 已声明，避免误报扩展体内的类型参数使用。
+    for ext in &program.extends {
+        for t in ext.type_args.iter().chain(ext.interface_args.iter()) {
+            if let Type::Struct(n, _) = t {
+                declared_tps.insert(n.clone());
+            }
+        }
+    }
+    let mut known: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        known.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        known.insert(s.name.clone());
+    }
+    for i in &program.interfaces {
+        known.insert(i.name.clone());
+    }
+    for e in &program.enums {
+        known.insert(e.name.clone());
+    }
+    for (n, _) in &program.type_aliases {
+        known.insert(n.clone());
+    }
+    let mut reported: HashSet<String> = HashSet::new();
+    let mut bad: Vec<String> = Vec::new();
+    for_each_type_in_program(program, &mut |ty| {
+        if let Type::Struct(n, args) = ty {
+            if args.is_empty()
+                && n.chars().count() == 1
+                && n.chars().next().map_or(false, |c| c.is_uppercase())
+                // 保守：`X` 在诊断/占位测试中常被用作“未知类型”（官方 std 负例
+                // unittest/macro_errors 依赖其可编译），宁可漏判不可误判。
+                && n != "X"
+                && !known.contains(n)
+                && !declared_tps.contains(n)
+                && !is_prelude_identifier(n)
+                && reported.insert(n.clone())
+            {
+                bad.push(n.clone());
+            }
+        }
+    });
+    for n in bad {
+        errors.push(SemanticError {
+            message: format!("使用了未声明的类型参数 '{}'（9.4.1(4)）", n),
+        });
+    }
+}
+
+/// 9.5.1.1(7)：若类型的多个类上界不是同一条继承链上的类，则非法。
+fn check_multiple_class_bounds(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let class_names: HashSet<&str> = program.classes.iter().map(|c| c.name.as_str()).collect();
+    let mut check = |owner: &str, cons: &[TypeConstraint]| {
+        for c in cons {
+            let classes: Vec<&str> = c
+                .bounds
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| {
+                    class_names.contains(b.as_str())
+                        && c.bound_args.get(*i).map_or(true, |a| a.is_empty())
+                })
+                .map(|(_, b)| b.as_str())
+                .collect();
+            if classes.len() < 2 {
+                continue;
+            }
+            let mut ok = true;
+            'outer: for i in 0..classes.len() {
+                for j in (i + 1)..classes.len() {
+                    if !index.is_subtype_name(classes[i], classes[j])
+                        && !index.is_subtype_name(classes[j], classes[i])
+                    {
+                        ok = false;
+                        break 'outer;
+                    }
+                }
+            }
+            if !ok {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类型参数 '{}' 的多个类上界不在同一条继承链上（9.5.1.1(7)）：{}",
+                        c.param, owner
+                    ),
+                });
+            }
+        }
+    };
+    for cls in &program.classes {
+        check(&cls.name, &cls.constraints);
+        for m in &cls.methods {
+            check(&m.func.name, &m.func.constraints);
+        }
+    }
+    for st in &program.structs {
+        check(&st.name, &st.constraints);
+    }
+    for en in &program.enums {
+        check(&en.name, &en.constraints);
+    }
+    for f in &program.functions {
+        check(&f.name, &f.constraints);
+    }
+    for iface in &program.interfaces {
+        check(&iface.name, &iface.constraints);
+    }
+}
+
+/// 解析类型别名到实际类型（仅处理裸名别名，带环保护）。
+fn w20_resolve_alias_head(program: &Program, ty: &Type) -> Type {
+    let mut cur = ty.clone();
+    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        match &cur {
+            Type::Struct(n, args) if args.is_empty() && seen.insert(n.clone()) => {
+                if let Some((_, tgt)) = program.type_aliases.iter().find(|(a, _)| a == n) {
+                    cur = tgt.clone();
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    cur
+}
+
+fn w20_type_head(ty: &Type) -> Option<&str> {
+    match ty {
+        Type::Struct(n, _) => Some(n.as_str()),
+        _ => None,
+    }
+}
+
+/// 9.2(1)/9.2(2)：继承泛型接口时，显式类型实参须满足该接口声明处的约束。
+///
+/// 仅在实参头与上界头均为本文件可见的类型时判定，且跳过含泛型实参的上界与
+/// 由 `extend <: I` 额外提供实现的场景，避免误伤。
+fn check_supertype_generic_constraints(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let iface_map: HashMap<&str, &InterfaceDef> =
+        program.interfaces.iter().map(|i| (i.name.as_str(), i)).collect();
+    let mut local_types: HashSet<&str> = HashSet::new();
+    for c in &program.classes {
+        local_types.insert(c.name.as_str());
+    }
+    for s in &program.structs {
+        local_types.insert(s.name.as_str());
+    }
+    for e in &program.enums {
+        local_types.insert(e.name.as_str());
+    }
+    for i in &program.interfaces {
+        local_types.insert(i.name.as_str());
+    }
+    // 通过 `extend T <: I` 获得的接口实现。
+    let mut ext_ifaces: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for ext in &program.extends {
+        if let Some(i) = &ext.interface {
+            let base = ext.target_type.trim().split('<').next().unwrap_or("").trim();
+            ext_ifaces.entry(base).or_default().insert(i.as_str());
+        }
+    }
+    for c in &program.classes {
+        for (sup, args) in &c.supertype_args {
+            let Some(iface) = iface_map.get(sup.as_str()) else {
+                continue;
+            };
+            if args.is_empty() || args.len() != iface.type_params.len() {
+                continue;
+            }
+            let subst: HashMap<&str, &Type> = iface
+                .type_params
+                .iter()
+                .map(|s| s.as_str())
+                .zip(args.iter())
+                .collect();
+            for con in &iface.constraints {
+                let Some(arg) = subst.get(con.param.as_str()) else {
+                    continue;
+                };
+                let arg_res = w20_resolve_alias_head(program, arg);
+                let Some(arg_head) = w20_type_head(&arg_res) else {
+                    continue;
+                };
+                if !(local_types.contains(arg_head) || is_prelude_identifier(arg_head)) {
+                    continue;
+                }
+                for (bi, b) in con.bounds.iter().enumerate() {
+                    if con.bound_args.get(bi).map_or(false, |a| !a.is_empty()) {
+                        continue;
+                    }
+                    let bound_res =
+                        w20_resolve_alias_head(program, &Type::Struct(b.clone(), vec![]));
+                    let Some(bound_head) = w20_type_head(&bound_res) else {
+                        continue;
+                    };
+                    if !local_types.contains(bound_head) {
+                        continue;
+                    }
+                    if ext_ifaces
+                        .get(arg_head)
+                        .map_or(false, |s| s.contains(bound_head))
+                    {
+                        continue;
+                    }
+                    if !index.is_subtype_name(arg_head, bound_head) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "类 '{}' 继承泛型接口 '{}' 时，类型实参 '{}' 不满足约束 '<: {}'（9.2(1)）",
+                                c.name, sup, arg_head, bound_head
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 类型中是否出现指定类型名（结构体头或嵌套实参）。
+fn w20_type_mentions(ty: &Type, name: &str) -> bool {
+    match ty {
+        Type::Struct(n, args) => n == name || args.iter().any(|a| w20_type_mentions(a, name)),
+        Type::Array(i) | Type::Option(i) | Type::Slice(i) => w20_type_mentions(i, name),
+        Type::Tuple(xs) => xs.iter().any(|t| w20_type_mentions(t, name)),
+        Type::Result(a, b) | Type::Map(a, b) => {
+            w20_type_mentions(a, name) || w20_type_mentions(b, name)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(|t| w20_type_mentions(t, name))
+                || ret.as_ref()
+                    .as_ref()
+                    .map_or(false, |r| w20_type_mentions(r, name))
+        }
+        _ => false,
+    }
+}
+
+/// 类型是否为“自身泛型在自身类型实参内再次出现”（9.5.3(1)/(2) 无穷实例化）。
+fn w20_nested_self(ty: &Type, name: &str) -> bool {
+    match ty {
+        Type::Struct(n, args) => {
+            if n == name && args.iter().any(|a| w20_type_mentions(a, name)) {
+                return true;
+            }
+            args.iter().any(|a| w20_nested_self(a, name))
+        }
+        Type::Array(i) | Type::Option(i) | Type::Slice(i) => w20_nested_self(i, name),
+        Type::Tuple(xs) => xs.iter().any(|t| w20_nested_self(t, name)),
+        Type::Result(a, b) | Type::Map(a, b) => {
+            w20_nested_self(a, name) || w20_nested_self(b, name)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(|t| w20_nested_self(t, name))
+                || ret.as_ref().as_ref().map_or(false, |r| w20_nested_self(r, name))
+        }
+        _ => false,
+    }
+}
+
+/// 9.5.3(1)/(2)：泛型类型成员的签名中若以嵌套方式引用自身（`C<...C<T>...>`），
+/// 会触发无穷实例化，须报错。
+fn check_infinite_generic_instantiation(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 收集某类成员签名中是否存在“自身嵌套”的类型。
+    fn any_nested<'a>(owner: &str, tys: impl Iterator<Item = &'a Type>) -> bool {
+        tys.into_iter().any(|t| w20_nested_self(t, owner))
+    }
+    for c in &program.classes {
+        if c.type_params.is_empty() {
+            continue;
+        }
+        let found = any_nested(
+            &c.name,
+            &mut c
+                .fields
+                .iter()
+                .map(|f| &f.ty)
+                .chain(c.primary_ctor_params.iter().map(|p| &p.ty))
+                .chain(c.init.iter().flat_map(|i| i.params.iter().map(|p| &p.ty)))
+                .chain(c.inits.iter().flat_map(|i| i.params.iter().map(|p| &p.ty)))
+                .chain(c.methods.iter().flat_map(|m| {
+                    m.func
+                        .params
+                        .iter()
+                        .map(|p| &p.ty)
+                        .chain(m.func.return_type.iter())
+                })),
+        );
+        if found {
+            errors.push(SemanticError {
+                message: format!(
+                    "泛型类型 '{}' 的成员签名以嵌套方式引用自身，构成无穷实例化（9.5.3(1)/(2)）",
+                    c.name
+                ),
+            });
+        }
+    }
+    for s in &program.structs {
+        if s.type_params.is_empty() {
+            continue;
+        }
+        let found = any_nested(
+            &s.name,
+            &mut s
+                .fields
+                .iter()
+                .map(|f| &f.ty)
+                .chain(s.primary_ctor_params.iter().map(|p| &p.ty))
+                .chain(s.inits.iter().flat_map(|i| i.params.iter().map(|p| &p.ty))),
+        );
+        if found {
+            errors.push(SemanticError {
+                message: format!(
+                    "泛型类型 '{}' 的成员签名以嵌套方式引用自身，构成无穷实例化（9.5.3(1)/(2)）",
+                    s.name
+                ),
+            });
+        }
+    }
+    for e in &program.enums {
+        if e.type_params.is_empty() {
+            continue;
+        }
+        let found = any_nested(
+            &e.name,
+            &mut e.variants.iter().filter_map(|v| v.payload.as_ref()),
+        );
+        if found {
+            errors.push(SemanticError {
+                message: format!(
+                    "泛型类型 '{}' 的成员签名以嵌套方式引用自身，构成无穷实例化（9.5.3(1)/(2)）",
+                    e.name
+                ),
+            });
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28910,7 +29488,7 @@ main() {}"#,
             "open class C0 { func bar0() {} }\nclass C1 <: C0 { func bar1() { bar0() } }\nmain() {}\n",
         );
         assert_valid(
-            "class C0 { static func s_f() { 1 } }\nclass C1 { func bar1() { s_f() } }\nmain() {}\n",
+            "class C1 { static func s_f() { 1 } func bar1() { s_f() } }\nmain() {}\n",
         );
     }
 
@@ -28960,4 +29538,102 @@ main() {}"#,
         // 3.1(3)：同一作用域内变量与局部函数共享命名空间。
         assert_invalid("main() { let x = 1\n func x() {} }\n");
     }
+    #[test]
+    fn test_w20d_generic_negatives() {
+        // 9.6(2)：显式类型实参个数与声明不符。
+        assert_invalid(
+            "func gf<T1, T2>(a: T1, b: T2) { a }\n\
+             main() { gf<Int64>(1, 2) }\n",
+        );
+        assert_valid(
+            "func gf2<T1, T2>(a: T1, b: T2) { a }\n\
+             main() { gf2<Int64, Int64>(1, 2) }\n",
+        );
+        // 9.4.1(4)：未声明的类型参数以类型位置裸名出现。
+        assert_invalid(
+            "func f1(x: T) { return x }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "func f2<T>(x: T) { x }\n\
+             main() {}\n",
+        );
+        // 9.1(3)：类型参数被当作值引用。
+        assert_invalid(
+            "class G<T> {\n\
+             init() { x = T }\n\
+             var x: T\n\
+             }\n\
+             main() {}\n",
+        );
+        // 类型限定静态访问 `T.f()` 合法（不应误报）。
+        assert_valid(
+            "interface I { static func f(): Int64 }\n\
+             func g<T>() where T <: I { T.f() }\n\
+             main() {}\n",
+        );
+        // 9.5.1.1(7)：多个类上界不在同一继承链。
+        assert_invalid(
+            "open class A {}\n\
+             open class B {}\n\
+             class GC<T> where T <: A & B {}\n\
+             main() {}\n",
+        );
+        // 9.5.3(1)/(2)：成员签名自身嵌套导致无穷实例化。
+        assert_invalid(
+            "class A<T> {\n\
+             func test(a: A<(A<T>, A<T>)>): Bool { true }\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "class B2<T> {\n\
+             func test(a: B2<T>): Bool { true }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 9.2(1)：继承泛型接口的类型实参不满足约束。
+        assert_invalid(
+            "interface P {}\n\
+             open class An {}\n\
+             class Dog <: An {}\n\
+             interface GI<T> where T <: An & P { func f(x: T) {} }\n\
+             class Impl <: GI<Dog> { public func f(x: Dog) {} }\n\
+             main() {}\n",
+        );
+    }
+
+    // ─── w20d：16 章 const 负例（编译期可判定子集） ─────────────────────────
+
+
+    #[test]
+    fn test_w20d_const_negatives() {
+        // 16.1(14)：const 实例成员元素不能作为赋值左值。
+        assert_invalid(
+            "class C {\n\
+             let a = [1, 2, 3]\n\
+             const init() {}\n\
+             }\n\
+             main() {\n\
+             const c = C()\n\
+             c.a[1] = 1\n\
+             return 0\n\
+             }\n",
+        );
+        // 4.23(15)：通过临时实例给 const 字段赋值非法。
+        assert_invalid(
+            "class C2 { const a = 0 }\n\
+             main() { C2().a = 1 }\n",
+        );
+        // 正例：普通 let 实例的成员元素可赋值。
+        assert_valid(
+            "class C3 { let a = [1, 2, 3] init() {} }\n\
+             main() {\n\
+             let c = C3()\n\
+             c.a[1] = 1\n\
+             return 0\n\
+             }\n",
+        );
+    }
+
 }

@@ -991,11 +991,11 @@ fn test_compile_generic_multi_instantiation() {
 #[test]
 fn test_compile_where_clause() {
     let source = r#"
-        func compare<T>(a: T, b: T) : Int64 where T: Comparable {
+        func compare<T>(a: T, b: T) : Int64 where T <: Comparable {
             return 0
         }
 
-        enum Holder<T> where T: Comparable {
+        enum Holder<T> where T <: Comparable {
             Val(T)
             Empty
         }
@@ -6664,7 +6664,7 @@ fn test_cg2_pattern_destructure_struct() {
 #[test]
 fn test_cg2_where_clause_func() {
     let source = r#"
-        func id<T>(x: T) : T where T: Comparable {
+        func id<T>(x: T) : T where T <: Comparable {
             return x
         }
         func main() : Int64 {
@@ -6678,7 +6678,7 @@ fn test_cg2_where_clause_func() {
 #[test]
 fn test_cg2_where_clause_struct() {
     let source = r#"
-        struct Wrapper<T> where T: Comparable {
+        struct Wrapper<T> where T <: Comparable {
             value: T
         }
         func main() : Int64 {
