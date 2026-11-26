@@ -627,6 +627,24 @@ fn simple_operand(e: &Expr) -> bool {
     }
 }
 
+/// “原子操作数”：字面量或裸变量。与 `simple_operand` 不同，不带任何运算符/
+/// 调用/转换外壳。用于判定用户类型的确定非法运算形态：`b ** 2` 中 `b` 是原子，
+/// 而 `(!b) ** 2` 中的 `!b` 可能是重载运算符的结果（静态类型按保守值处理），
+/// 不作为用户类型非法的依据。
+fn atom_operand(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Integer(_)
+            | Expr::IntegerSuffixed(_, _)
+            | Expr::Float(_)
+            | Expr::Float32(_)
+            | Expr::Bool(_)
+            | Expr::Rune(_)
+            | Expr::String(_)
+            | Expr::Var(_)
+    )
+}
+
 /// 操作数是否具有“可静态确定的类型”，用于算术/移位/位/幂/逻辑运算的操作数
 /// 合法性检查。在 `simple_operand` 之外，额外承认两类结果类型恒定的表达式：
 /// 比较/相等（`e1 < e2` 等结果为 Bool）与 `is` 类型测试（结果为 Bool），
@@ -778,6 +796,8 @@ struct Checker<'a> {
     type_names: HashSet<String>,
     /// enum 类型名（enum 构造值不可赋值）
     enum_names: HashSet<String>,
+    /// 枚举构造器名 → 实参个数（跨枚举重名者不登记，避免歧义）。
+    enum_variant_arity: HashMap<String, usize>,
     /// class 名 → 字段名 → 是否可变
     class_fields: HashMap<String, HashMap<String, bool>>,
     /// class 名 → 成员名 → 静态性/可见性/定义类（6.1.2(4)、6.1.2.4(14)、6.1.2.4(28)）。
@@ -1571,6 +1591,25 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             enum_variants.insert(v.name.clone());
         }
     }
+    // 枚举构造器名 → 实参个数。跨枚举重名的构造器不登记（用法有歧义，
+    // 无法确定目标构造器，保守跳过）。
+    let mut enum_variant_arity: HashMap<String, usize> = HashMap::new();
+    let mut dup_variants: HashSet<String> = HashSet::new();
+    for e in &program.enums {
+        for v in &e.variants {
+            let arity = match &v.payload {
+                None => 0,
+                Some(Type::Tuple(ts)) => ts.len(),
+                Some(_) => 1,
+            };
+            if enum_variant_arity.insert(v.name.clone(), arity).is_some() {
+                dup_variants.insert(v.name.clone());
+            }
+        }
+    }
+    for d in &dup_variants {
+        enum_variant_arity.remove(d);
+    }
     let mut qualified_methods: HashSet<String> = HashSet::new();
     for f in &program.functions {
         if f.name.contains('.') {
@@ -1753,6 +1792,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         scopes: Vec::new(),
         type_names,
         enum_names,
+        enum_variant_arity,
         class_fields,
         class_members,
         type_kinds,
@@ -2750,6 +2790,13 @@ fn collect_operator_overloads(program: &Program, out: &mut HashSet<String>) {
     for ext in &program.extends {
         for f in &ext.methods {
             record_overload(&f.name, out);
+        }
+    }
+    // 接口可声明运算符重载（6.2(3)），实现该接口的类型据此获得运算符能力，
+    // 故接口中的运算符声明同样计入“本程序存在该运算符重载”集合。
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            record_overload(&m.name, out);
         }
     }
 }
@@ -5104,6 +5151,10 @@ impl<'a> Checker<'a> {
             }
             // 多元赋值 `(a, b) = expr`：逐元素检查左值合法性（4.23(30)）。
             AssignTarget::Tuple(targets) => {
+                // 空元组 `()` 是值构造而非左值，不能作为赋值目标（4.23(29)）。
+                if targets.is_empty() {
+                    self.err("空元组 '()' 不能作为赋值目标（4.23(29)）".to_string());
+                }
                 for t in targets {
                     self.check_assign_target(t, &Ty::Unknown);
                 }
@@ -5951,6 +6002,23 @@ impl<'a> Checker<'a> {
     /// 访问）、6.1.2.4(28)（私有成员仅在定义类内可见）。
     fn check_class_member_access(&mut self, recv_ty: &str, via_type: bool, member: &str) {
         let Some(info) = self.lookup_class_member(recv_ty, member) else {
+            // `class_members` 不含接口成员；回退到“可达接口成员”表判定访问方向
+            //（6.1.2(4) 实例成员不可经类型名访问 / 6.1.2.4(14) 静态成员不可经
+            // 实例访问）。接口成员的存在性本身由 `check_interface_member_exists`
+            // 负责，这里只在其可被正向识别时才报告方向错误，避免误伤未知成员。
+            if let Some(is_static) = self.lookup_iface_member_reachable(recv_ty, member) {
+                if via_type && !is_static {
+                    self.err(format!(
+                        "实例成员 '{}' 不能通过类型名 '{}' 访问（6.1.2(4)）",
+                        member, recv_ty
+                    ));
+                } else if !via_type && is_static {
+                    self.err(format!(
+                        "静态成员 '{}' 不能通过实例访问（6.1.2.4(14)）",
+                        member
+                    ));
+                }
+            }
             return;
         };
         if via_type && !info.is_static {
@@ -5975,6 +6043,35 @@ impl<'a> Checker<'a> {
                 info.owner, member
             ));
         }
+    }
+
+    /// 沿 `recv_ty` 的可达接口（含继承链）判定成员是否为静态接口成员。
+    /// 返回 `Some(true)` 表示静态成员、`Some(false)` 表示实例成员，未找到为 `None`。
+    fn lookup_iface_member_reachable(&self, recv_ty: &str, member: &str) -> Option<bool> {
+        let mut stack: Vec<&str> = vec![recv_ty];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if self
+                .interface_members
+                .get(t)
+                .map_or(false, |s| s.contains(member))
+            {
+                let is_static = !self
+                    .interface_instance_members
+                    .get(t)
+                    .map_or(false, |s| s.contains(member));
+                return Some(is_static);
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        None
     }
 
     /// 6.2.2.1(8)：无函数体的静态接口函数不能通过接口类型直接调用。
@@ -6395,7 +6492,126 @@ impl<'a> Checker<'a> {
         None
     }
 
+    /// 按运算符成员名（如 `op_not` / `op_sub`）查询用户类型（含继承链）上
+    /// 重载运算符的返回类型。用于一元运算符的结果类型推断。
+    fn user_operator_return(&self, receiver: &Ty, member: &str) -> Option<Ty> {
+        let Ty::User(name) = receiver else {
+            return None;
+        };
+        let mut stack: Vec<&str> = vec![name.as_str()];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if let Some(rt) = self
+                .operator_returns
+                .get(&(t.to_string(), member.to_string()))
+            {
+                return Some(rt.clone());
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        None
+    }
+
     // ─── 表达式 ──────────────────────────────────────────────────────────
+
+    /// 类型（含继承链/扩展实现）是否实现 prelude 的 `ToString` 接口。
+    fn implements_to_string(&self, name: &str) -> bool {
+        let mut stack: Vec<&str> = vec![name];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if t == "ToString" {
+                return true;
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        false
+    }
+
+    /// 1.3.6(4)：字符串插值 `${e}` 要求 e 的静态类型实现 `ToString` 接口。
+    ///
+    /// 保守约束：仅对程序内**自定义 class/struct** 判定；内建类型、枚举、
+    /// Option/容器/函数类型及未知类型一律放行，避免误伤 std 与方言正例。
+    fn check_interp_to_string(&mut self, t: &Ty) {
+        let Ty::User(name) = t else {
+            return;
+        };
+        if !self.type_names.contains(name) {
+            return;
+        }
+        if !matches!(
+            self.type_kinds.get(name),
+            Some(TypeKind::Class) | Some(TypeKind::Struct)
+        ) {
+            return;
+        }
+        if !self.implements_to_string(name) {
+            self.err(format!(
+                "字符串插值要求类型 '{}' 实现 ToString 接口（1.3.6(4)）",
+                name
+            ));
+        }
+    }
+
+    /// 4.4.1.6(3)：枚举模式提供的实参个数须与构造器声明的关联值个数一致。
+    ///
+    /// 仅在构造器名唯一可确定时判定；单个元组实参（`V(t)` 绑定整个元组）
+    /// 与多参数形态存在解析歧义，故只对“多参数 vs 多参数”的确定不一致报告。
+    fn check_enum_pattern_arity(&mut self, p: &Pattern) {
+        match p {
+            Pattern::Variant {
+                variant_name,
+                payload,
+                ..
+            } => {
+                if let Some(&decl) = self.enum_variant_arity.get(variant_name.as_str()) {
+                    match payload.as_deref() {
+                        None => {
+                            if decl > 0 {
+                                self.err(format!(
+                                    "枚举构造器 '{}' 需要 {} 个实参，模式中未提供（4.4.1.6(3)）",
+                                    variant_name, decl
+                                ));
+                            }
+                        }
+                        Some(Pattern::Tuple(ps))
+                            if ps.len() >= 2 && decl >= 2 && ps.len() != decl =>
+                        {
+                            self.err(format!(
+                                "枚举模式 '{}' 的实参个数（{}）与构造器（{}）不一致（4.4.1.6(3)）",
+                                variant_name,
+                                ps.len(),
+                                decl
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(pl) = payload.as_deref() {
+                    self.check_enum_pattern_arity(pl);
+                }
+            }
+            Pattern::Tuple(ps) | Pattern::Or(ps) => {
+                for x in ps {
+                    self.check_enum_pattern_arity(x);
+                }
+            }
+            _ => {}
+        }
+    }
 
     fn check_expr(&mut self, expr: &Expr) -> Ty {
         match expr {
@@ -6419,7 +6635,9 @@ impl<'a> Checker<'a> {
                 self.interp_depth += 1;
                 for p in parts {
                     if let crate::ast::InterpolatePart::Expr(e) = p {
-                        self.check_expr(e);
+                        let t = self.check_expr(e);
+                        // 1.3.6(4)：插值项的静态类型须实现 ToString 接口。
+                        self.check_interp_to_string(&t);
                     }
                 }
                 self.interp_depth -= 1;
@@ -6440,6 +6658,18 @@ impl<'a> Checker<'a> {
                 self.check_iface_foreign_member_ref(name);
                 // 1.3.6(4) 插值内 / 3.2.3.2(4) 同函数直线代码：读取未初始化变量。
                 self.check_deferred_read(name);
+                // 4.1.1(7)/2.1.11.1：参数化枚举构造器不能单独作为值（缺少实参）。
+                // 仅当名字未被局部/全局变量/函数/类型遮蔽时判定。
+                if self.lookup(name).is_none()
+                    && !self.type_names.contains(name)
+                    && !self.known_funcs.contains(name)
+                    && self.enum_variant_arity.get(name).map_or(false, |&a| a > 0)
+                {
+                    self.err(format!(
+                        "参数化枚举构造器 '{}' 必须带实参，不能单独作为值使用（4.1.1(7)）",
+                        name
+                    ));
+                }
                 self.lookup(name)
                     .map(|v| v.ty.clone())
                     .unwrap_or(Ty::Unknown)
@@ -7405,6 +7635,8 @@ impl<'a> Checker<'a> {
                     }
                     // 4.4.1.1(2)：常量模式字面量类型须与选择子类型一致。
                     self.check_literal_pattern(&arm.pattern, &sel_ty);
+                    // 4.4.1.6(3)：枚举模式的实参个数须与构造器一致。
+                    self.check_enum_pattern_arity(&arm.pattern);
                     let mut scope = HashMap::new();
                     // 4.4.1.3(4)：绑定模式引入的变量不可变。
                     bind_pattern_unknown_mut(&arm.pattern, &mut scope, false);
@@ -7695,6 +7927,20 @@ impl<'a> Checker<'a> {
                 if t.is_prim() && !t.is_numeric() && *t != Ty::Bool {
                     self.err(format!("一元运算符 '-' 不能作用于类型 {}", t.name()));
                 }
+                // 4.15(4)：一元 `-` 只作用于数值类型。用户类型仅在定义了
+                // `operator func -`（记录为 op_sub）时合法；若程序中没有任何
+                // op_sub 重载，则用户类型不可能支持一元负号，判为非法。
+                if matches!(t, Ty::User(_)) {
+                    if !self.overloaded_ops.contains("op_sub") {
+                        self.err(format!(
+                            "一元运算符 '-' 不能作用于类型 {}（未定义 operator func -）",
+                            t.name()
+                        ));
+                    } else if let Some(rt) = self.user_operator_return(t, "op_sub") {
+                        // 重载一元负号的真实返回类型（用于外层运算符类型判定）。
+                        return rt;
+                    }
+                }
                 if t.is_prim() {
                     t.clone()
                 } else {
@@ -7711,7 +7957,11 @@ impl<'a> Checker<'a> {
                 if *t == Ty::Bool {
                     Ty::Bool
                 } else if over {
-                    t.clone()
+                    // 返回重载运算符的真实返回类型（若可知），使外层 `**` 等
+                    // 运算能正确判定结果类型（如 `!b ** 2` 中 `!b` 为 Int64）。
+                    self.user_operator_return(t, "op_not")
+                        .or_else(|| self.user_operator_return(t, "op_bitnot"))
+                        .unwrap_or_else(|| t.clone())
                 } else if t.is_prim() && !t.is_int() {
                     self.err(format!(
                         "一元运算符 '!' 只能作用于 Bool 或整数类型，实际为 {}（4.18(2)）",
@@ -7721,8 +7971,14 @@ impl<'a> Checker<'a> {
                 } else if t.is_prim() {
                     t.clone()
                 } else if matches!(t, Ty::User(_)) {
-                    // 用户类型可能通过 extend 重载 `!`，此处保守不报错（既有正例依赖）；
-                    // 但将结果类型保留为自身，使外层逻辑运算符据 4.20(2) 判定
+                    // 4.18(2)：`!` 只作用于 Bool/整数。用户类型仅当定义了
+                    // `operator func !` / `~`（op_not/op_bitnot）时合法；上面已
+                    // 判定 `!over`，故此处用户类型不可能支持该运算，判为非法。
+                    self.err(format!(
+                        "一元运算符 '!' 不能作用于类型 {}（未定义 operator func ! / ~）",
+                        t.name()
+                    ));
+                    // 结果类型保留为自身，使外层逻辑运算符据 4.20(2) 判定
                     // “非 Bool 操作数” 非法（如 `!v || true`，v 为用户类型）。
                     t.clone()
                 } else {
@@ -8162,6 +8418,28 @@ impl<'a> Checker<'a> {
         // 在编译期检测算术溢出（默认策略与 @OverflowThrowing 一致）。
         self.check_const_arith_overflow(op, left, right);
 
+        // 4.15(4)/4.18(2)/4.28(11)：幂/位/取模运算只作用于整数/数值类型。
+        // 用户类型（class/struct/enum）不可能具备这些内建运算，除非程序定义了
+        // 对应 operator func 重载（此时 check_binary 入口已整体跳过）。仅对
+        // “原子操作数”（字面量/裸变量）判定，复合表达式可能是重载运算的结果，
+        // 静态类型不可靠，保守跳过（见 `atom_operand`）。
+        if matches!(
+            op,
+            BinOp::Pow | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Mod
+        ) {
+            let bad = (matches!(lt, Ty::User(_)) && atom_operand(left))
+                || (matches!(rt, Ty::User(_)) && atom_operand(right));
+            if bad {
+                self.err(format!(
+                    "运算符 '{}' 的操作数不能为用户类型: {} 与 {}（未定义对应 operator func）",
+                    bin_symbol(op),
+                    lt.name(),
+                    rt.name()
+                ));
+                return Ty::Unknown;
+            }
+        }
+
         // Bool 极少是算术/幂运算的合法操作数；出现 Bool 通常意味着
         // 解析器把换行后的语句并入了上一表达式（官方语法正例中存在此形态），
         // 此时 AST 已不可靠，保守跳过。位运算/移位仍按 4.18(2)/(7) 判定
@@ -8516,7 +8794,8 @@ impl<'a> Checker<'a> {
 
     /// `**`：底数 Int64 → 指数 UInt64；底数 Float64 → 指数 Int64/Float64。
     fn check_pow(&mut self, lt: &Ty, rt: &Ty) -> Ty {
-        // 用户类型 / Option 可能重载 `**`，保守跳过。
+        // 用户类型 / Option 可能重载 `**`，保守跳过（用户类型的确定非法形态
+        // 由 check_binary 在“原子操作数”层面判定，见 `atom_operand`）。
         if matches!(lt, Ty::User(_) | Ty::Option(_)) || matches!(rt, Ty::User(_) | Ty::Option(_)) {
             return Ty::Unknown;
         }
@@ -10025,8 +10304,15 @@ mod tests {
         // Bool 与整数的 `!` 合法。
         assert_ok("main() { let b = !true }");
         assert_ok("main() { var x: Int64 = 1\n let y = !x }");
-        // 用户类型可能重载 `!`，保守放行。
-        assert_ok("class C {}\nmain() { var v: C = C()\n let x = !v }");
+        // 4.18(2)：w20a 收紧——用户类型在没有 `operator func !` 时 `!` 非法。
+        assert_err(
+            "class C {}\nmain() { var v: C = C()\n let x = !v }",
+            "不能作用于类型 C",
+        );
+        // 定义了 `operator func !` 的用户类型，`!` 合法。
+        assert_ok(
+            "class C { operator func !(): Bool { true } }\nmain() { var v: C = C()\n let x = !v }",
+        );
     }
 
 
@@ -11597,5 +11883,83 @@ mod tests {
         );
         // 非私有实例字段经实例赋值合法。
         assert_ok("class A { var p: Int64 = 1 }\nmain() { A().p = 0 }");
+    }
+
+    // ─── w20a：用户类型运算符 / 接口成员方向 / 插值 ToString / 枚举构造器 ──
+
+    #[test]
+    fn test_w20a_user_type_unary_operator_rejected() {
+        // 4.15(4)：一元 `-` 不能作用于无 operator func 的用户类型。
+        assert_err(
+            "class C {}\nmain() { var v: C = C(); let x = -v }",
+            "一元运算符 '-'",
+        );
+        assert_err(
+            "struct S {}\nmain() { var v: S = S(); let x = -v }",
+            "一元运算符 '-'",
+        );
+        // 4.18(2)：`!` 不能作用于无 operator func 的用户类型。
+        assert_err(
+            "class C {}\nmain() { var v: C = C(); let x = !v }",
+            "一元运算符 '!'",
+        );
+    }
+
+    #[test]
+    fn test_w20a_user_type_binary_operator_rejected() {
+        // 4.18(2)：位运算的用户类型操作数非法。
+        assert_err(
+            "class C {}\nmain() { var a: Int64 = 1; var c: C = C(); let x = a | c }",
+            "操作数不能为用户类型",
+        );
+        // 4.28(11)：`**` 的用户类型底数非法。
+        assert_err(
+            "class C {}\nmain() { var c: C = C(); let x = c ** 2 }",
+            "运算符 '**'",
+        );
+        // 内建整数位运算合法（守住正例）。
+        assert_ok("main() { var a: Int64 = 1; var b: Int64 = 2; let x = a | b }");
+    }
+
+    #[test]
+    fn test_w20a_interface_member_access_direction() {
+        // 6.1.2.4(14)：静态接口成员不能经实例访问。
+        assert_err(
+            "interface I { static func foo() {} }\nclass C <: I {}\nmain() { var c: C = C(); c.foo }",
+            "静态成员",
+        );
+        // 6.1.2(4)：实例接口成员不能经类型名访问。
+        assert_err("interface I { func foo() {} }\nmain() { I.foo }", "实例成员");
+    }
+
+    #[test]
+    fn test_w20a_interpolation_to_string_required() {
+        // 1.3.6(4)：插值项的用户类型须实现 ToString。
+        assert_err(
+            "class Foo {}\nmain() { var f = Foo(); let s = \"${f}\" }",
+            "ToString",
+        );
+        // 内建类型插值合法。
+        assert_ok("main() { var n: Int64 = 1; let s = \"${n}\" }");
+    }
+
+    #[test]
+    fn test_w20a_empty_tuple_assign_target_rejected() {
+        // 4.23(29)：`()` 是值构造而非左值。
+        assert_err("main() { var v: Unit = (); () = v }", "空元组");
+    }
+
+    #[test]
+    fn test_w20a_enum_ctor_arity() {
+        // 4.1.1(7)：参数化枚举构造器不能单独作为值。
+        assert_err(
+            "enum E { | B(Bool) }\nlet b = B\nmain() {}",
+            "参数化枚举构造器",
+        );
+        // 4.4.1.6(3)：枚举模式实参个数须与构造器一致。
+        assert_err(
+            "enum E { | EE(Int64, Int64, Int64) }\nmain() { match (EE(1, 2, 3)) { case EE(1, x) => true case _ => false } }",
+            "枚举模式",
+        );
     }
 }
