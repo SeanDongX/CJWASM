@@ -676,6 +676,12 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_local_func_name_lvalue(program, &mut errors);
     // 6.1.2.1(44)：可选参数不参与重载，去掉后签名相同即冲突。
     check_ctor_overload_conflict(program, &mut errors);
+    // w21c：泛型类在显式具体类型实参下实例化时，构造函数签名 / 实现的接口重复。
+    check_generic_instantiation_signature_collision(program, &index, &mut errors);
+    // 6.1.1.1(12)：子类以值返回却未实现父类型 Unit 抽象方法。
+    check_abstract_unit_method_value_return(program, &index, &mut errors);
+    // 5.1.6(4)：子类同名同参数函数返回类型不兼容父类型，不构成重定义。
+    check_subclass_incompatible_return(program, &index, &mut errors);
     // 3.2.3.3：类成员函数不能无资格调用其它类的成员函数。
     check_unqualified_foreign_method_call(program, &index, &mut errors);
 
@@ -23772,6 +23778,320 @@ fn check_ctor_overload_conflict(program: &Program, errors: &mut Vec<SemanticErro
     }
 }
 
+// ─── w21c：05/06 章泛型实例化 / 抽象方法实现补充负例 ──────────────────────────
+
+/// 类型的（空替换表）规范键，用于替换后比较构造函数/接口签名。
+fn w21_type_key(ty: &Type) -> String {
+    let mut map = HashMap::new();
+    canon_type(ty, &[], &mut map)
+}
+
+/// 解析裸类型别名链（`type X = Y`），用于返回类型兼容性比较。
+fn w21_resolve_alias(index: &ProgramIndex<'_>, ty: &Type) -> Type {
+    let mut cur = ty.clone();
+    let mut depth = 0;
+    while depth < 16 {
+        if let Type::Struct(name, args) = &cur {
+            if args.is_empty() {
+                if let Some(target) = index.aliases.get(name.as_str()) {
+                    cur = (*target).clone();
+                    depth += 1;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    cur
+}
+
+/// 6.1.2.1(33)/(44)、6.1.1.3(11)：泛型类在显式具体类型实参下实例化时，
+/// 构造函数签名或所实现的接口可能因类型替换而退化为重复。
+///
+/// 仅当全部类型实参均为本地可严格比较的具体类型时才判定，避免误伤泛型传递。
+fn check_generic_instantiation_signature_collision(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 收集所有显式泛型实参的类型引用站点：构造调用 + 父类型声明。
+    let mut sites: Vec<(String, Vec<Type>)> = Vec::new();
+    for_each_program_expr(program, &mut |e| {
+        if let Expr::ConstructorCall {
+            name,
+            type_args: Some(args),
+            ..
+        } = e
+        {
+            let base = name.split('<').next().unwrap_or(name).trim().to_string();
+            sites.push((base, args.clone()));
+        }
+    });
+    for c in &program.classes {
+        for (name, args) in &c.supertype_args {
+            if !args.is_empty() {
+                sites.push((name.clone(), args.clone()));
+            }
+        }
+    }
+    let mut reported_ctor: HashSet<String> = HashSet::new();
+    let mut reported_iface: HashSet<String> = HashSet::new();
+    let mut reported_method: HashSet<String> = HashSet::new();
+    for (name, args) in sites {
+        let Some(cls) = index.classes.get(name.as_str()) else {
+            continue;
+        };
+        if cls.type_params.is_empty() || cls.type_params.len() != args.len() {
+            continue;
+        }
+        if !args.iter().all(|a| type_is_comparable(a, index)) {
+            continue;
+        }
+        let subst: HashMap<String, Type> = cls
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        let args_disp = args
+            .iter()
+            .map(|t| type_display(&w21_resolve_alias(index, t)))
+            .collect::<Vec<_>>()
+            .join(",");
+        // (a) 构造函数签名重复。
+        let mut seen: HashSet<String> = HashSet::new();
+        for init in &cls.inits {
+            let key = init
+                .params
+                .iter()
+                .map(|p| {
+                    let t = subst_type(&p.ty, &subst);
+                    format!("{}{}", if p.is_named { "!" } else { "" }, w21_type_key(&t))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            if key.is_empty() {
+                continue;
+            }
+            if !seen.insert(key) {
+                if reported_ctor.insert(name.clone()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "泛型类 '{}' 实例化为 '{}<{}>' 时存在签名相同的多个构造函数（6.1.2.1(33)/(44)）",
+                            name, name, args_disp
+                        ),
+                    });
+                }
+                break;
+            }
+        }
+        // (c) 成员函数签名在类型替换后重复（6.4.1(1)）。
+        let mut method_seen: HashSet<String> = HashSet::new();
+        for m in &cls.methods {
+            if is_synthetic_member(&m.func.name) {
+                continue;
+            }
+            let name_base = m
+                .func
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&m.func.name)
+                .to_string();
+            let param_key = m
+                .func
+                .params
+                .iter()
+                .filter(|p| p.name != "this" && p.name != "self")
+                .map(|p| {
+                    let t = subst_type(&p.ty, &subst);
+                    format!("{}{}", if p.is_named { "!" } else { "" }, w21_type_key(&t))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            if param_key.is_empty() {
+                continue;
+            }
+            let key = format!(
+                "{}|{}|{}|{}",
+                name_base,
+                m.is_static,
+                m.func.type_params.len(),
+                param_key
+            );
+            if !method_seen.insert(key) {
+                if reported_method.insert(name.clone()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "泛型类 '{}' 实例化为 '{}<{}>' 时存在签名相同的多个成员函数（6.4.1(1)）",
+                            name, name, args_disp
+                        ),
+                    });
+                }
+                break;
+            }
+        }
+        // (b) 实现的接口在类型替换后重复。
+        let mut iface_seen: HashSet<String> = HashSet::new();
+        for (iname, iargs) in &cls.supertype_args {
+            let Some(iface) = index.interfaces.get(iname.as_str()) else {
+                continue;
+            };
+            if !iface.type_params.is_empty() && iface.type_params.len() != iargs.len() {
+                continue;
+            }
+            let resolved: Vec<Type> = iargs.iter().map(|a| subst_type(a, &subst)).collect();
+            if !resolved.iter().all(|a| type_is_comparable(a, index)) {
+                continue;
+            }
+            let key = if resolved.is_empty() {
+                iname.clone()
+            } else {
+                format!(
+                    "{}<{}>",
+                    iname,
+                    resolved
+                        .iter()
+                        .map(w21_type_key)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            if !iface_seen.insert(key) {
+                if reported_iface.insert(name.clone()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "泛型类 '{}' 实例化为 '{}<{}>' 后所实现的接口出现重复（6.1.1.3(11)）",
+                            name, name, args_disp
+                        ),
+                    });
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// 函数体是否以“值字面量”返回（用于判定未标注返回类型的方法实际返回非 Unit）。
+fn w21_body_returns_value_literal(body: &[Stmt]) -> bool {
+    let mut rets: Vec<&Expr> = Vec::new();
+    gather_fn_returns(body, &mut rets);
+    if rets.iter().any(|e| literal_category(e).is_some()) {
+        return true;
+    }
+    matches!(body.last(), Some(Stmt::Expr(e)) if literal_category(e).is_some())
+}
+
+/// 6.1.1.1(12)：非抽象子类必须实现父类型的抽象方法。若某父类型抽象方法显式声明
+/// 以 `Unit` 为返回类型，而子类同名同参数的成员函数（未标注返回类型）以值字面量
+/// 返回，则该函数实际返回非 Unit，不构成实现。
+fn check_abstract_unit_method_value_return(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for cls in &program.classes {
+        if cls.is_abstract {
+            continue;
+        }
+        let Some(parents) = collect_parent_methods(cls, index) else {
+            continue;
+        };
+        if !parents
+            .iter()
+            .any(|p| p.abstract_ && matches!(p.sig.ret, Some(Type::Unit)))
+        {
+            continue;
+        }
+        for m in &cls.methods {
+            if !m.has_body || m.func.return_type.is_some() || is_synthetic_member(&m.func.name) {
+                continue;
+            }
+            let sig = sig_of_class_method(m, &cls.type_params);
+            let matched = parents.iter().any(|p| {
+                p.abstract_
+                    && matches!(p.sig.ret, Some(Type::Unit))
+                    && p.sig.name == sig.name
+                    && p.sig.params.len() == sig.params.len()
+                    && p.sig.is_static == sig.is_static
+                    && canon_params(&sig) == canon_params(&p.sig)
+            });
+            if matched && w21_body_returns_value_literal(&m.func.body) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的成员函数 '{}' 未实现父类型中以 Unit 为返回类型的抽象方法（函数体返回了值，6.1.1.1(12)）",
+                        cls.name, m.func.name
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 5.1.6(4)：子类中与父类同名且参数类型完全相同的函数，若返回类型不是父类版本的
+/// 子类型，则不构成覆写/重定义。仅当两侧返回类型均可本地严格比较、且均非 Unit /
+/// Object 等宽容边界时判定，保守避免误伤。
+fn check_subclass_incompatible_return(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let skip_boundary = |t: &Type| {
+        matches!(t, Type::Unit | Type::This | Type::Nothing)
+            || matches!(t, Type::Struct(n, a) if a.is_empty() && (n == "Object" || n == "Any"))
+    };
+    for cls in &program.classes {
+        let Some(parents) = collect_parent_methods(cls, index) else {
+            continue;
+        };
+        for m in &cls.methods {
+            if m.override_ || !m.has_body || is_synthetic_member(&m.func.name) {
+                continue;
+            }
+            let sig = sig_of_class_method(m, &cls.type_params);
+            let Some(own_ret_raw) = sig.ret.clone() else {
+                continue;
+            };
+            let own_ret = w21_resolve_alias(index, &own_ret_raw);
+            if !type_is_comparable(&own_ret, index) || skip_boundary(&own_ret) {
+                continue;
+            }
+            for p in &parents {
+                if p.is_interface || p.abstract_ {
+                    continue;
+                }
+                if let Some(Visibility::Private) = p.sig.vis {
+                    continue;
+                }
+                if p.sig.name != sig.name
+                    || p.sig.is_static != sig.is_static
+                    || p.sig.params.len() != sig.params.len()
+                    || p.sig.named != sig.named
+                    || canon_params(&sig) != canon_params(&p.sig)
+                {
+                    continue;
+                }
+                let Some(parent_ret_raw) = p.sig.ret.clone() else {
+                    continue;
+                };
+                let parent_ret = w21_resolve_alias(index, &parent_ret_raw);
+                if !type_is_comparable(&parent_ret, index) || skip_boundary(&parent_ret) {
+                    continue;
+                }
+                if !return_compatible(&own_ret, &parent_ret, index) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "类 '{}' 的成员函数 '{}' 与父类型同名同参数的函数返回类型不兼容，不能构成重定义（5.1.6(4)）",
+                            cls.name, m.func.name
+                        ),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// 5.4/3.2.3.3：类实例成员函数中不能无资格调用其它类的成员函数。
 ///
 /// 保守条件：调用名为方法末段名、该名字在文件中恰好只属于某一个其它类，
@@ -29633,6 +29953,120 @@ main() {}"#,
              c.a[1] = 1\n\
              return 0\n\
              }\n",
+        );
+    }
+
+    // ─── w21c：泛型实例化签名重复 / 抽象方法实现 / 子类返回类型（06、05 章） ──
+
+    #[test]
+    fn test_w21c_generic_ctor_signature_collision() {
+        // T 实例化为 Int64 后两个构造函数签名相同 → 非法。
+        assert_invalid(
+            "class A<T> {\n\
+             \x20   A(x: Int64) {}\n\
+             \x20   init(x: T) {}\n\
+             }\n\
+             main() {\n\
+             A<Int64>(1)\n\
+             0\n\
+             }\n",
+        );
+        // 实例化为 String 后构造函数签名不同 → 合法。
+        assert_valid(
+            "class A<T> {\n\
+             \x20   A(x: Int64) {}\n\
+             \x20   init(x: T) {}\n\
+             }\n\
+             main() {\n\
+             A<String>(\"x\")\n\
+             0\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w21c_generic_interface_collision() {
+        // C3<Int32> 实现 I1<Int32> & I1<Int32> 重复 → 非法。
+        assert_invalid(
+            "interface I1<T> {}\n\
+             open class C3<T> <: I1<T> & I1<Int32> {}\n\
+             main() {\n\
+             let b = C3<Int32>()\n\
+             }\n",
+        );
+        // C3<Int64> 实现 I1<Int64> & I1<Int32> 不同 → 合法。
+        assert_valid(
+            "interface I1<T> {}\n\
+             open class C3<T> <: I1<T> & I1<Int32> {}\n\
+             main() {\n\
+             let b = C3<Int64>()\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w21c_generic_method_signature_collision() {
+        // C1<Int32> 的 c1(Int32) 与 c1(T) 退化为同一签名 → 非法。
+        assert_invalid(
+            "open class C1<T> {\n\
+             \x20   public func c1(a: Int32) {}\n\
+             \x20   public func c1(a: T) {}\n\
+             }\n\
+             main() {\n\
+             let a = C1<Int32>()\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w21c_abstract_unit_method_value_return() {
+        // 父类型抽象方法返回 Unit，子类同名同参函数以值返回 → 未实现 → 非法。
+        assert_invalid(
+            "abstract class A {\n\
+             \x20   public func foo(x: Int64): Unit\n\
+             }\n\
+             class B <: A {\n\
+             \x20   public func foo(x: Int64) { return 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 子类正确以 Unit 实现 → 合法。
+        assert_valid(
+            "abstract class A {\n\
+             \x20   public func foo(x: Int64): Unit\n\
+             }\n\
+             class B <: A {\n\
+             \x20   public func foo(x: Int64): Unit {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w21c_subclass_incompatible_return() {
+        // 子类同签名函数返回与父类型不相关类型 → 非法。
+        assert_invalid(
+            "open class P {}\n\
+             class Q {}\n\
+             open class A {\n\
+             \x20   public open func f(a: Int32): P { P() }\n\
+             }\n\
+             class B <: A {\n\
+             \x20   public func f(a: Int32): Q { Q() }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 子类返回父类型返回值的子类型（协变覆写）→ 合法。
+        assert_valid(
+            "open class P {}\n\
+             class Q <: P {}\n\
+             open class A {\n\
+             \x20   public open func f(a: Int32): P { P() }\n\
+             }\n\
+             class B <: A {\n\
+             \x20   public func f(a: Int32): Q { Q() }\n\
+             }\n\
+             main() {}\n",
         );
     }
 
