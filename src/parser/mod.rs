@@ -40,6 +40,10 @@ pub struct Parser {
     pending_c_decl: bool,
     /// 是否刚跳过了 `@attribute`（供类声明保守豁免 ctor 签名重复等检查）。
     pending_decl_attr: bool,
+    /// 上一次 `skip_optional_attributes` 是否跳过了 `@Annotation`（17.1(5)）。
+    last_attr_annotation: bool,
+    /// 顶层类声明是否带 `@Annotation`（由属性跳过逻辑置位，供类声明分派消费）。
+    pending_annotation_attr: bool,
     /// 本文件中带 `@C` 的结构体名（用于字段 CType 约束校验）。
     c_structs: std::collections::HashSet<String>,
     /// `@C` 结构体中显式书写 `Array<T>` 的字段 `(结构体名, 字段名)`。
@@ -74,6 +78,8 @@ impl Parser {
             last_attr_c: false,
             pending_c_decl: false,
             pending_decl_attr: false,
+            last_attr_annotation: false,
+            pending_annotation_attr: false,
             c_structs: std::collections::HashSet::new(),
             c_struct_explicit_array_fields: Vec::new(),
             in_extern_params: false,
@@ -538,6 +544,7 @@ impl Parser {
         use crate::lexer::StringOrInterpolated;
         let mut should_skip_next = false;
         self.last_attr_c = false;
+        self.last_attr_annotation = false;
         if self.check(&Token::At) {
             self.pending_decl_attr = true;
         }
@@ -550,6 +557,10 @@ impl Parser {
             // 记录 `@C`：其合法目标有限（13.1.2.1(3)），由各声明上下文校验。
             if attr_name == "C" || attr_name == "c" {
                 self.last_attr_c = true;
+            }
+            // 记录 `@Annotation`：其修饰的类必须提供 const init（17.1(5)）。
+            if attr_name == "Annotation" {
+                self.last_attr_annotation = true;
             }
             if self.check(&Token::LBracket) {
                 self.advance();
@@ -4639,6 +4650,26 @@ mod tests {
         assert!(parse_or_err("func foo() {}\nimport std.core.*\nmain() {}"));
         assert!(parse_or_err("main() { }\nimport std.core.*"));
         assert!(!parse_or_err("import std.core.*\nfunc foo() {}\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w23c_public_typealias_internal_rejected() {
+        // 11.2(7)-(12)：public 类型别名不得引用 internal（默认可见性）类型。
+        assert!(parse_or_err("class C1 {}\npublic type T1 = C1\nmain() {}"));
+        assert!(parse_or_err("open class A {}\npublic type B = A\nmain() {}"));
+        // 合法：internal 别名引用 internal 类型。
+        assert!(!parse_or_err("class C1 {}\ntype T1 = C1\nmain() {}"));
+    }
+
+    #[test]
+    fn test_w23c_annotation_class_requires_const_init() {
+        // 17.1(5)：@Annotation 类必须提供至少一个 const init。
+        assert!(parse_or_err(
+            "@Annotation\npublic class A { public var id: Int64 = 0 }\nmain() {}"
+        ));
+        assert!(!parse_or_err(
+            "@Annotation\npublic class A { public var id: Int64 = 0\n public const init() {} }\nmain() {}"
+        ));
     }
 
 }

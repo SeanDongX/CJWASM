@@ -1387,6 +1387,25 @@ fn scan_struct_field_assign(
                 });
             }
         }
+        // `field++` / `--field` 等自增减表达式同样修改字段，等价于一次赋值。
+        Stmt::Expr(Expr::PostfixIncr(inner)
+        | Expr::PostfixDecr(inner)
+        | Expr::PrefixIncr(inner)
+        | Expr::PrefixDecr(inner)) => {
+            let is_field = match &**inner {
+                Expr::Var(n) => fields.contains(n.as_str()) && !locals.contains(n.as_str()),
+                Expr::Field { object, field } => {
+                    matches!(object.as_ref(), Expr::Var(b) if b == "this" || b == "self")
+                        && fields.contains(field.as_str())
+                }
+                _ => false,
+            };
+            if is_field {
+                errors.push(SemanticError {
+                    message: "struct 的非 mut 实例成员函数不能修改自身字段（5.8(2)）".to_string(),
+                });
+            }
+        }
         Stmt::While { body, .. }
         | Stmt::DoWhile { body, .. }
         | Stmt::Loop { body }
@@ -3449,6 +3468,44 @@ fn check_public_internal_exposure(program: &Program, errors: &mut Vec<SemanticEr
             }
         }
     }
+    // 11.2(7)-(12)：顶层 public 变量/常量不得引用 internal 类型（含由初始化式
+    // 推断出的构造类型；元组解构声明逐元素判定）。
+    fn init_internal_ctor(e: &Expr, internal: &HashSet<&str>) -> Option<String> {
+        let base_of = |name: &str| name.split('<').next().unwrap_or(name).trim().to_string();
+        match e {
+            Expr::ConstructorCall { name, .. } | Expr::Call { name, .. } => {
+                let b = base_of(name);
+                internal.contains(b.as_str()).then_some(b)
+            }
+            Expr::StructInit { name, .. } => {
+                let b = base_of(name);
+                internal.contains(b.as_str()).then_some(b)
+            }
+            Expr::TupleIndex { object, .. } => init_internal_ctor(object, internal),
+            Expr::Tuple(es) => es.iter().find_map(|x| init_internal_ctor(x, internal)),
+            _ => None,
+        }
+    }
+    for c in &program.constants {
+        if c.visibility != Visibility::Public {
+            continue;
+        }
+        let mut used = Vec::new();
+        collect_named(&c.ty, &internal, &mut used);
+        if let Some(n) = init_internal_ctor(&c.init, &internal) {
+            used.push(n);
+        }
+        used.sort();
+        used.dedup();
+        for ty in used {
+            errors.push(SemanticError {
+                message: format!(
+                    "public 声明 '{}' 引用了 internal 类型 '{}'（11.2(7)-(12)）",
+                    c.name, ty
+                ),
+            });
+        }
+    }
 }
 
 // ─── 3.1(3)：同一作用域内重复绑定局部变量 ─────────────────────────────────
@@ -4172,6 +4229,28 @@ fn check_undefined_identifiers(program: &Program, errors: &mut Vec<SemanticError
                 }
                 // 首字母大写：约定为类型 / 隐式导入符号，保守放行；但大小写变体的
                 // 布尔字面量（`True`/`False`）仍属未定义标识符。
+                if r.chars().next().map_or(false, |c| c.is_uppercase())
+                    && !matches!(r.to_lowercase().as_str(), "true" | "false")
+                {
+                    continue;
+                }
+                if reported.insert(r.clone()) {
+                    errors.push(SemanticError {
+                        message: format!("未定义的标识符 '{}'（3.2.3.2）", r),
+                    });
+                }
+            }
+        }
+        // 5.1.2.2(8)：形参默认值表达式同样只能引用静态作用域内的名字；对裸变量
+        // 引用做与函数体一致的未定义检查（保守：形参/顶层名/成员/prelude 放行）。
+        for p in &f.params {
+            let Some(d) = &p.default else { continue };
+            let mut refs = Vec::new();
+            collect_bare_var_refs_expr(d, &mut refs);
+            for r in refs {
+                if declared.contains(&r) || members.contains(&r) || is_prelude_identifier(&r) {
+                    continue;
+                }
                 if r.chars().next().map_or(false, |c| c.is_uppercase())
                     && !matches!(r.to_lowercase().as_str(), "true" | "false")
                 {
@@ -33073,6 +33152,65 @@ main() {}"#,
              \x20   wfirst((WB1(), WB2()))\n\
              }\n",
         );
+    }
+
+    #[test]
+    fn test_w23c_setter_returning_value_accepted() {
+        // 7.3(3)/7.3(5) 官方用例自相矛盾：07_03_a03_03（正例）明确 setter 尾值
+        // 可为非 Unit（编译器补 return unit），而 07_03_a05_03（负例）要求报错。
+        // 遵守正测试 100% 红线，按正例放行。
+        assert_valid(
+            "class A {\n\
+             \x20   static public var str: String = \"\"\n\
+             \x20   mut prop val: String {\n\
+             \x20       get() { str += \"g\"\n \"\" }\n\
+             \x20       set(v) { str += \"s\"\n \"\" }\n\
+             \x20   }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w23c_struct_nonmut_field_incr_rejected() {
+        // 5.8(2)：struct 非 mut 扩展成员函数不能通过 ++/-- 修改字段。
+        assert_invalid(
+            "struct S { var value = 7 }\n\
+             extend S {\n\
+             \x20   func foo1(): Int64 {\n\
+             \x20       value++\n\
+             \x20       value\n\
+             \x20   }\n\
+             }\n\
+             main() {}\n",
+        );
+        // 合法：mut 扩展函数可修改字段。
+        assert_valid(
+            "struct S { var value = 7 }\n\
+             extend S {\n\
+             \x20   mut func foo1(): Int64 {\n\
+             \x20       value++\n\
+             \x20       value\n\
+             \x20   }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w23c_public_toplevel_internal_type_rejected() {
+        // 11.2(7)-(12)：顶层 public 变量不得引用 internal（默认可见性）类型。
+        assert_invalid("class C1<T> {}\npublic var v = C1<Int64>()\nmain() {}\n");
+        // 合法：internal 变量引用 internal 类型。
+        assert_valid("class C1<T> {}\nvar v = C1<Int64>()\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_w23c_undefined_identifier_in_default_value() {
+        // 5.1.2.2(8)：形参默认值引用未定义标识符。
+        assert_invalid("func f(s!: String = undefinedName): String { s }\nmain() {}\n");
+        // 合法：默认值引用已声明的顶层变量。
+        assert_valid("let g = \"x\"\nfunc f(s!: String = g): String { s }\nmain() {}\n");
     }
 
 }
