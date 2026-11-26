@@ -682,6 +682,12 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 5.3.1/5.3.4：方法调用的实参形态匹配。
     check_method_call_arguments(program, &mut errors);
 
+    // 10.1.2.1/10.1.2.2：可确定的重载实参类型不匹配（保守版）。
+    check_overload_candidate_types(program, &mut errors);
+
+    // 9.3.3/9.3.4：函数/元组/类值实参的名义子类型匹配（保守版）。
+    check_structured_arg_subtypes(program, &mut errors);
+
     // 5.1(13)：局部函数名不能作为赋值目标（嵌套局部函数内赋值外层局部函数名）。
     check_local_func_name_lvalue(program, &mut errors);
     // 6.1.2.1(44)：可选参数不参与重载，去掉后签名相同即冲突。
@@ -24543,6 +24549,1034 @@ fn check_return_literal_types(program: &Program, errors: &mut Vec<SemanticError>
     }
 }
 
+/// 一次调用候选的形参签名（已剥离 `this`/`self` 接收者）。
+#[derive(Clone, Copy)]
+struct CallArgSig<'a> {
+    params: &'a [Param],
+    /// 是否含方法/函数级泛型参数（含泛型即无法安全判定，整体跳过）。
+    generic: bool,
+}
+
+/// 实参的静态类型类别（保守推断）。
+#[derive(Clone)]
+enum ArgClass {
+    /// 无后缀整数字面量：可适配任意整型（并保守纳入浮点，避免误伤 `var x: Float = 0`）。
+    IntLit,
+    /// 浮点字面量（含后缀）：仅适配浮点类型。
+    FloatLit,
+    /// 具体原始标量类型。
+    Scalar(Type),
+    /// 不可确定。
+    Unknown,
+}
+
+fn is_int_scalar_ty(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::IntNative
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::UIntNative
+    )
+}
+
+fn is_float_scalar_ty(t: &Type) -> bool {
+    matches!(t, Type::Float16 | Type::Float32 | Type::Float64)
+}
+
+/// 可作为重载实参类型判定依据的原始标量类型（排除 Unit/Nothing/泛型/用户类型）。
+fn is_scalar_scalar_ty(t: &Type) -> bool {
+    is_int_scalar_ty(t)
+        || is_float_scalar_ty(t)
+        || matches!(t, Type::Bool | Type::Rune | Type::String)
+}
+
+/// 内建基础类型名 → 类型（用于识别 `IntNative(0)` 这类转换调用的结果类型）。
+fn primitive_ty_by_name(name: &str) -> Option<Type> {
+    Some(match name {
+        "Int8" => Type::Int8,
+        "Int16" => Type::Int16,
+        "Int32" => Type::Int32,
+        "Int64" => Type::Int64,
+        "IntNative" => Type::IntNative,
+        "UInt8" => Type::UInt8,
+        "UInt16" => Type::UInt16,
+        "UInt32" => Type::UInt32,
+        "UInt64" => Type::UInt64,
+        "UIntNative" => Type::UIntNative,
+        "Float16" => Type::Float16,
+        "Float32" => Type::Float32,
+        "Float64" => Type::Float64,
+        "Bool" => Type::Bool,
+        "Rune" => Type::Rune,
+        "String" => Type::String,
+        // 2.1.1(19)：别名按底层类型处理。
+        "Int" => Type::Int64,
+        "UInt" => Type::UInt64,
+        "Byte" => Type::UInt8,
+        _ => return None,
+    })
+}
+
+fn strip_self_params(ps: &[Param]) -> &[Param] {
+    if ps.first().map_or(false, |p| is_receiver_param(&p.name)) {
+        &ps[1..]
+    } else {
+        ps
+    }
+}
+
+/// 保守推断实参的静态类型类别；无法精确判定时返回 `Unknown`（放行）。
+fn classify_arg(e: &Expr, vars: &HashMap<String, Type>) -> ArgClass {
+    match e {
+        Expr::Integer(_) => ArgClass::IntLit,
+        Expr::IntegerSuffixed(_, s) => ArgClass::Scalar(s.ty()),
+        // 后缀浮点字面量（f16/f32/f64）统一按“任意浮点”处理，避免位宽假设。
+        Expr::Float(_) | Expr::Float32(_) => ArgClass::FloatLit,
+        Expr::Bool(_) => ArgClass::Scalar(Type::Bool),
+        Expr::Rune(_) => ArgClass::Scalar(Type::Rune),
+        Expr::String(_) | Expr::Interpolate(_) => ArgClass::Scalar(Type::String),
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } => classify_arg(expr, vars),
+        Expr::Call { name, .. } => match primitive_ty_by_name(name) {
+            Some(t) => ArgClass::Scalar(t),
+            None => ArgClass::Unknown,
+        },
+        // `IntNative(0)` 之类基础类型转换也可能被解析为 ConstructorCall。
+        Expr::ConstructorCall { name, .. } | Expr::StructInit { name, .. } => {
+            match primitive_ty_by_name(name) {
+                Some(t) => ArgClass::Scalar(t),
+                None => ArgClass::Unknown,
+            }
+        }
+        _ => match static_expr_type(e, vars) {
+            Some(t) if is_scalar_scalar_ty(&t) => ArgClass::Scalar(t),
+            _ => ArgClass::Unknown,
+        },
+    }
+}
+
+fn arg_param_ok(k: &ArgClass, p: &Type) -> bool {
+    match k {
+        ArgClass::IntLit => is_int_scalar_ty(p) || is_float_scalar_ty(p),
+        ArgClass::FloatLit => is_float_scalar_ty(p),
+        ArgClass::Scalar(t) => t == p,
+        ArgClass::Unknown => true,
+    }
+}
+
+/// 沿父类型闭包收集某方法的全部候选签名。遇到非本地父类型（可能引入文件外重载）时
+/// 返回 false，调用方据此放弃判定。
+fn collect_chain_sigs<'a>(
+    start: &str,
+    parents: &HashMap<String, Vec<String>>,
+    type_names: &HashSet<String>,
+    method_sigs: &HashMap<String, HashMap<String, Vec<CallArgSig<'a>>>>,
+    method: &str,
+    out: &mut Vec<CallArgSig<'a>>,
+) -> bool {
+    let mut stack: Vec<String> = vec![start.to_string()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t.clone()) {
+            continue;
+        }
+        if let Some(m) = method_sigs.get(&t) {
+            if let Some(v) = m.get(method) {
+                out.extend(v.iter().copied());
+            }
+        }
+        if let Some(ps) = parents.get(&t) {
+            for p in ps {
+                if !type_names.contains(p) {
+                    return false;
+                }
+                stack.push(p.clone());
+            }
+        }
+    }
+    true
+}
+
+/// 校验一组重载候选能否接受实参类型；条件不充分时保守放行。
+fn verify_call_arg_types(
+    display: &str,
+    args: &[Expr],
+    sigs: &[CallArgSig],
+    vars: &HashMap<String, Type>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if sigs.is_empty() {
+        return;
+    }
+    // 完整性/可判定性门槛：任一候选含泛型、默认值、命名/变长形参、非标量形参，
+    // 或位置形参个数与实参个数不一致，都无法安全判定“无候选可匹配”，直接放行。
+    for s in sigs {
+        if s.generic {
+            return;
+        }
+        if s.params.len() != args.len() {
+            return;
+        }
+        for p in s.params {
+            if p.variadic || p.is_named || p.default.is_some() {
+                return;
+            }
+            if !is_scalar_scalar_ty(&p.ty) {
+                return;
+            }
+        }
+    }
+    let mut kinds: Vec<ArgClass> = Vec::with_capacity(args.len());
+    for a in args {
+        let k = classify_arg(a, vars);
+        if matches!(k, ArgClass::Unknown) {
+            return;
+        }
+        kinds.push(k);
+    }
+    let any_ok = sigs.iter().any(|s| {
+        kinds
+            .iter()
+            .zip(s.params.iter())
+            .all(|(k, p)| arg_param_ok(k, &p.ty))
+    });
+    if !any_ok {
+        errors.push(SemanticError {
+            message: format!(
+                "调用 '{}' 的实参类型与任何重载的形参类型都不匹配（10.1.2.1/10.1.2.2）",
+                display
+            ),
+        });
+    }
+}
+
+/// 接收者表达式的本地类型名（仅当可确定且为本地类型时返回）。
+fn receiver_type_name(
+    object: &Expr,
+    vars: &HashMap<String, Type>,
+    type_names: &HashSet<String>,
+) -> Option<String> {
+    match object {
+        Expr::Var(v) => {
+            if let Some(t) = vars.get(v) {
+                if let Type::Struct(n, _) = t {
+                    return Some(n.clone());
+                }
+                return None;
+            }
+            // 经类型名调用静态成员。
+            if type_names.contains(v.as_str()) {
+                return Some(v.clone());
+            }
+            None
+        }
+        Expr::ConstructorCall { name, .. } | Expr::StructInit { name, .. } => {
+            Some(name.split('<').next().unwrap_or(name).trim().to_string())
+        }
+        Expr::VariantConst { enum_name, .. } => Some(enum_name.clone()),
+        _ => None,
+    }
+}
+
+/// 收集局部定义名（let/var/const 绑定与局部函数名），用于避免将被局部名字
+/// 遮蔽的调用误判为顶层函数重载。
+fn collect_local_def_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+                let mut v = Vec::new();
+                pattern_binding_names(pattern, &mut v);
+                out.extend(v);
+            }
+            Stmt::Const { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stmt::LocalFunc(f) => {
+                out.insert(f.name.rsplit('.').next().unwrap_or(&f.name).to_string());
+                collect_local_def_names(&f.body, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::WhileLet { body, .. } => collect_local_def_names(body, out),
+            Stmt::Expr(Expr::Block(body, _)) => collect_local_def_names(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// 10.1.2.1/10.1.2.2：可确定的重载实参类型不匹配检查。
+///
+/// 保守策略：仅当候选集完整、所有形参与实参类型均可精确判定为原始标量时才判定为
+/// 错误；泛型 / 默认值 / 命名 / 变长 / 非本地父类型 / 非标量形参等一律放行，
+/// 避免误伤 std 重载、继承重载与合法隐式转换。覆盖：
+///   * 顶层自由函数调用 `f(args)`；
+///   * 本地类型实例/类型名上的方法调用 `recv.f(args)`（含其本地父类型）；
+///   * 本地类型值上的 `()` 运算符调用 `v(args)`（脱糖名 `op_call`）。
+fn check_overload_candidate_types(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut type_names: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        type_names.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        type_names.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        type_names.insert(e.name.clone());
+    }
+    for i in &program.interfaces {
+        type_names.insert(i.name.clone());
+    }
+    let mut global_names: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        global_names.insert(c.name.clone());
+    }
+    // 顶层常量/变量的可判定类型（用于推断以全局名作为实参的类型）。未标注时解析器
+    // 以 Int64 占位，此处按初始化式细化；仍无法判定者不入表（保守放行）。
+    let mut global_ty: HashMap<String, Type> = HashMap::new();
+    for c in &program.constants {
+        let t = if c.ty != Type::Int64 {
+            Some(c.ty.clone())
+        } else {
+            match &c.init {
+                Expr::Integer(_) | Expr::IntegerSuffixed(..) => Some(Type::Int64),
+                Expr::Float(_) => Some(Type::Float64),
+                Expr::Float32(_) => Some(Type::Float32),
+                Expr::Bool(_) => Some(Type::Bool),
+                Expr::Rune(_) => Some(Type::Rune),
+                Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
+                Expr::Call { name, .. } => primitive_ty_by_name(name),
+                _ => None,
+            }
+        };
+        if let Some(t) = t {
+            global_ty.insert(c.name.clone(), t);
+        }
+    }
+    let mut alias_names: HashSet<String> = HashSet::new();
+    for (n, _) in &program.type_aliases {
+        alias_names.insert(n.clone());
+    }
+
+    // 父类型关系（仅本地类型；非本地父类型由 collect_chain_sigs 检出并放行）。
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &program.classes {
+        let mut ps: Vec<String> = Vec::new();
+        if let Some(p) = &c.extends {
+            ps.push(p.clone());
+        }
+        ps.extend(c.implements.iter().cloned());
+        parents.insert(c.name.clone(), ps);
+    }
+    for i in &program.interfaces {
+        parents.insert(i.name.clone(), i.parents.clone());
+    }
+    for s in &program.structs {
+        parents.insert(s.name.clone(), Vec::new());
+    }
+    for e in &program.enums {
+        parents.insert(e.name.clone(), Vec::new());
+    }
+
+    // 方法签名索引：owner → 短名 → 形参签名。
+    let mut method_sigs: HashMap<String, HashMap<String, Vec<CallArgSig>>> = HashMap::new();
+    // 顶层自由函数签名索引。
+    let mut free_sigs: HashMap<String, Vec<CallArgSig>> = HashMap::new();
+    for f in &program.functions {
+        match f.name.rsplit_once('.') {
+            Some((owner, short)) => {
+                if short.starts_with("__") {
+                    continue;
+                }
+                method_sigs
+                    .entry(owner.to_string())
+                    .or_default()
+                    .entry(short.to_string())
+                    .or_default()
+                    .push(CallArgSig {
+                        params: strip_self_params(&f.params),
+                        generic: !f.type_params.is_empty(),
+                    });
+            }
+            None => {
+                free_sigs
+                    .entry(f.name.clone())
+                    .or_default()
+                    .push(CallArgSig {
+                        params: &f.params,
+                        generic: !f.type_params.is_empty(),
+                    });
+            }
+        }
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            let short = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+            if short.starts_with("__") {
+                continue;
+            }
+            method_sigs
+                .entry(c.name.clone())
+                .or_default()
+                .entry(short.to_string())
+                .or_default()
+                .push(CallArgSig {
+                    params: strip_self_params(&m.func.params),
+                    generic: !m.func.type_params.is_empty(),
+                });
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            let short = m.name.rsplit('.').next().unwrap_or(&m.name);
+            if short.starts_with("__") {
+                continue;
+            }
+            method_sigs
+                .entry(ext.target_type.clone())
+                .or_default()
+                .entry(short.to_string())
+                .or_default()
+                .push(CallArgSig {
+                    params: strip_self_params(&m.params),
+                    generic: !m.type_params.is_empty(),
+                });
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            let short = m.name.rsplit('.').next().unwrap_or(&m.name);
+            if short.starts_with("__") {
+                continue;
+            }
+            method_sigs
+                .entry(iface.name.clone())
+                .or_default()
+                .entry(short.to_string())
+                .or_default()
+                .push(CallArgSig {
+                    params: &m.params,
+                    generic: !m.type_params.is_empty(),
+                });
+        }
+    }
+
+    // 局部定义名（跨整个程序收集，任一被遮蔽即跳过该名字的顶层自由函数检查）。
+    let mut local_names: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        collect_local_def_names(&f.body, &mut local_names);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            collect_local_def_names(&init.body, &mut local_names);
+        }
+        for m in &c.methods {
+            collect_local_def_names(&m.func.body, &mut local_names);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            collect_local_def_names(&init.body, &mut local_names);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            collect_local_def_names(&m.body, &mut local_names);
+        }
+    }
+
+    let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let mut vars = local_var_types_full(params, body);
+        // 未被局部定义遮蔽的顶层常量/变量也参与实参类型推断（如以全局 i8/f64 作实参）。
+        let mut local_defs: HashSet<String> = HashSet::new();
+        collect_local_def_names(body, &mut local_defs);
+        for p in params {
+            local_defs.insert(p.name.clone());
+        }
+        for (n, t) in &global_ty {
+            if !local_defs.contains(n) && !vars.contains_key(n) {
+                vars.insert(n.clone(), t.clone());
+            }
+        }
+        // 宏实参与 `@Assert/@Expect` 的操作数由宏自行解释，不作为普通调用检查。
+        let mut skip: HashSet<usize> = HashSet::new();
+        let mut macro_roots: Vec<&Expr> = Vec::new();
+        walk_stmts(body, &mut |e| {
+            if let Expr::Macro { args, .. } = e {
+                for a in args {
+                    macro_roots.push(a);
+                }
+            }
+        });
+        fn collect_assert_roots<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Expr>) {
+            for s in stmts {
+                match s {
+                    Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                        out.push(left);
+                        out.push(right);
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::Loop { body }
+                    | Stmt::UnsafeBlock { body }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::WhileLet { body, .. }
+                    | Stmt::For { body, .. } => collect_assert_roots(body, out),
+                    Stmt::Expr(Expr::Block(b, _)) => collect_assert_roots(b, out),
+                    _ => {}
+                }
+            }
+        }
+        collect_assert_roots(body, &mut macro_roots);
+        for root in &macro_roots {
+            walk_expr(root, &mut |x| {
+                skip.insert(x as *const Expr as usize);
+            });
+        }
+        walk_stmts(body, &mut |e| {
+            if skip.contains(&(e as *const Expr as usize)) {
+                return;
+            }
+            match e {
+                Expr::Call {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } => {
+                    if !named_args.is_empty() {
+                        return;
+                    }
+                    // 局部变量持有用户类型值时的 `v(args)`：解析为 Call，实为 `op_call` 运算符调用。
+                    if let Some(Type::Struct(tyname, _)) = vars.get(name.as_str()) {
+                        if type_names.contains(tyname.as_str()) {
+                            let mut cands: Vec<CallArgSig> = Vec::new();
+                            if collect_chain_sigs(
+                                tyname,
+                                &parents,
+                                &type_names,
+                                &method_sigs,
+                                "op_call",
+                                &mut cands,
+                            ) {
+                                verify_call_arg_types("()", args, &cands, &vars, errors);
+                            }
+                        }
+                        return;
+                    }
+                    if name.contains('.') {
+                        return;
+                    }
+                    let Some(sigs) = free_sigs.get(name.as_str()) else {
+                        return;
+                    };
+                    if type_names.contains(name.as_str())
+                        || global_names.contains(name.as_str())
+                        || alias_names.contains(name.as_str())
+                        || local_names.contains(name.as_str())
+                    {
+                        return;
+                    }
+                    verify_call_arg_types(name, args, sigs, &vars, errors);
+                }
+                Expr::MethodCall {
+                    object,
+                    method,
+                    args,
+                    named_args,
+                    ..
+                } => {
+                    if !named_args.is_empty() {
+                        return;
+                    }
+                    let Some(rt) = receiver_type_name(object, &vars, &type_names) else {
+                        return;
+                    };
+                    if !type_names.contains(rt.as_str()) {
+                        return;
+                    }
+                    let mut cands: Vec<CallArgSig> = Vec::new();
+                    if !collect_chain_sigs(
+                        &rt,
+                        &parents,
+                        &type_names,
+                        &method_sigs,
+                        method,
+                        &mut cands,
+                    ) {
+                        return;
+                    }
+                    verify_call_arg_types(method, args, &cands, &vars, errors);
+                }
+                Expr::Invoke {
+                    callee,
+                    args,
+                    named_args,
+                } => {
+                    if !named_args.is_empty() {
+                        return;
+                    }
+                    let Expr::Var(v) = callee.as_ref() else {
+                        return;
+                    };
+                    if v == "this" || v == "super" {
+                        return;
+                    }
+                    let Some(Type::Struct(name, _)) = vars.get(v) else {
+                        return;
+                    };
+                    if !type_names.contains(name.as_str()) {
+                        return;
+                    }
+                    let mut cands: Vec<CallArgSig> = Vec::new();
+                    if !collect_chain_sigs(
+                        name,
+                        &parents,
+                        &type_names,
+                        &method_sigs,
+                        "op_call",
+                        &mut cands,
+                    ) {
+                        return;
+                    }
+                    verify_call_arg_types("()", args, &cands, &vars, errors);
+                }
+                _ => {}
+            }
+        });
+    };
+
+    for f in &program.functions {
+        scan(&f.params, &f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, errors);
+        }
+    }
+}
+
+/// 结构化实参精确类型（用户类/元组元素等）；无法确定时返回 None。
+fn concrete_type_of_expr(
+    e: &Expr,
+    vars: &HashMap<String, Type>,
+    type_names: &HashSet<String>,
+) -> Option<Type> {
+    match e {
+        Expr::IntegerSuffixed(_, s) => Some(s.ty()),
+        Expr::Integer(_) => Some(Type::Int64),
+        Expr::Float(_) => Some(Type::Float64),
+        Expr::Float32(_) => Some(Type::Float32),
+        Expr::Bool(_) => Some(Type::Bool),
+        Expr::Rune(_) => Some(Type::Rune),
+        Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
+        Expr::Var(v) => vars.get(v).cloned(),
+        Expr::ConstructorCall { name, .. } | Expr::StructInit { name, .. } => {
+            if let Some(t) = primitive_ty_by_name(name) {
+                Some(t)
+            } else if type_names.contains(name.as_str()) {
+                Some(Type::Struct(name.clone(), vec![]))
+            } else {
+                None
+            }
+        }
+        Expr::Call { name, .. } => primitive_ty_by_name(name),
+        _ => None,
+    }
+}
+
+/// 本地类的祖先闭包（含自身）。若链上出现非本地类（或该名字不是本地类）返回 None。
+fn local_class_ancestors(
+    name: &str,
+    class_parent: &HashMap<String, String>,
+    class_set: &HashSet<String>,
+    class_bad: &HashSet<String>,
+    memo: &mut HashMap<String, Option<HashSet<String>>>,
+    visiting: &mut HashSet<String>,
+) -> Option<HashSet<String>> {
+    if let Some(v) = memo.get(name) {
+        return v.clone();
+    }
+    if !class_set.contains(name) || class_bad.contains(name) {
+        return None;
+    }
+    if !visiting.insert(name.to_string()) {
+        return None;
+    }
+    let mut acc: HashSet<String> = HashSet::new();
+    acc.insert(name.to_string());
+    let res = if let Some(p) = class_parent.get(name) {
+        match local_class_ancestors(p, class_parent, class_set, class_bad, memo, visiting) {
+            Some(ps) => {
+                acc.extend(ps);
+                Some(acc)
+            }
+            None => None,
+        }
+    } else {
+        Some(acc)
+    };
+    visiting.remove(name);
+    memo.insert(name.to_string(), res.clone());
+    res
+}
+
+/// 名义子类型判定（仅原始标量 / 本地类）；无法判定时返回 None。
+fn type_nominal_subtype(
+    a: &Type,
+    b: &Type,
+    class_parent: &HashMap<String, String>,
+    class_set: &HashSet<String>,
+    class_bad: &HashSet<String>,
+    memo: &mut HashMap<String, Option<HashSet<String>>>,
+) -> Option<bool> {
+    if a == b {
+        return Some(true);
+    }
+    let pa = is_scalar_scalar_ty(a);
+    let pb = is_scalar_scalar_ty(b);
+    if pa && pb {
+        return Some(false);
+    }
+    // 原始标量与用户类型之间不做判定（保守）。
+    if pa || pb {
+        return None;
+    }
+    let (na, nb) = match (a, b) {
+        (Type::Struct(na, aa), Type::Struct(nb, ab)) if aa.is_empty() && ab.is_empty() => (na, nb),
+        _ => return None,
+    };
+    let anc = local_class_ancestors(na, class_parent, class_set, class_bad, memo, &mut HashSet::new())?;
+    // 目标也必须是本地类，否则无法确认关系。
+    local_class_ancestors(nb, class_parent, class_set, class_bad, memo, &mut HashSet::new())?;
+    Some(anc.contains(nb))
+}
+
+/// 函数类型子类型判定（9.3.3(2)：形参逆变、返回协变）。
+fn fn_type_subtype(
+    actual_params: &[Param],
+    actual_ret: &Type,
+    exp_params: &[Type],
+    exp_ret: &Type,
+    class_parent: &HashMap<String, String>,
+    class_set: &HashSet<String>,
+    class_bad: &HashSet<String>,
+) -> Option<bool> {
+    if actual_params.len() != exp_params.len() {
+        return Some(false);
+    }
+    // 逆变：期望形参 <: 实际形参。
+    for (ap, ep) in actual_params.iter().zip(exp_params.iter()) {
+        match type_nominal_subtype(ep, &ap.ty, class_parent, class_set, class_bad, &mut HashMap::new()) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => return None,
+        }
+    }
+    // 协变：实际返回 <: 期望返回。
+    type_nominal_subtype(actual_ret, exp_ret, class_parent, class_set, class_bad, &mut HashMap::new())
+}
+
+/// 判定一个候选中所有实参与形参的结构化匹配：Some(true) 匹配 / Some(false) 确定不匹配 /
+/// None 无法判定。标量形参沿用字面量可适配规则；用户类 / 函数 / 元组形参做子类型判定。
+fn structured_candidate_ok(
+    args: &[Expr],
+    params: &[Param],
+    vars: &HashMap<String, Type>,
+    type_names: &HashSet<String>,
+    local_defs: &HashSet<String>,
+    top_fn: &HashMap<String, &Function>,
+    class_parent: &HashMap<String, String>,
+    class_set: &HashSet<String>,
+    class_bad: &HashSet<String>,
+) -> Option<bool> {
+    for (arg, p) in args.iter().zip(params.iter()) {
+        let r = match &p.ty {
+            Type::Function { params: eps, ret } => {
+                let Some(er) = ret.as_ref() else {
+                    return None;
+                };
+                let Expr::Var(fname) = arg else {
+                    return None;
+                };
+                if local_defs.contains(fname) || vars.contains_key(fname) {
+                    return None;
+                }
+                let Some(f) = top_fn.get(fname) else {
+                    return None;
+                };
+                if !f.type_params.is_empty() || f.extern_import.is_some() {
+                    return None;
+                }
+                if f.params
+                    .iter()
+                    .any(|q| q.variadic || q.is_named || q.default.is_some() || is_receiver_param(&q.name))
+                {
+                    return None;
+                }
+                let Some(ar) = f.return_type.as_ref() else {
+                    return None;
+                };
+                fn_type_subtype(
+                    &f.params,
+                    ar,
+                    eps,
+                    er,
+                    class_parent,
+                    class_set,
+                    class_bad,
+                )
+            }
+            Type::Tuple(eps) => {
+                let Expr::Tuple(items) = arg else {
+                    return None;
+                };
+                if items.len() != eps.len() {
+                    Some(false)
+                } else {
+                    let mut out = Some(true);
+                    for (it, et) in items.iter().zip(eps.iter()) {
+                        let Some(at) = concrete_type_of_expr(it, vars, type_names) else {
+                            return None;
+                        };
+                        match type_nominal_subtype(&at, et, class_parent, class_set, class_bad, &mut HashMap::new()) {
+                            Some(true) => {}
+                            Some(false) => {
+                                out = Some(false);
+                            }
+                            None => return None,
+                        }
+                    }
+                    out
+                }
+            }
+            other if is_scalar_scalar_ty(other) => {
+                let k = classify_arg(arg, vars);
+                if matches!(k, ArgClass::Unknown) {
+                    return None;
+                }
+                if arg_param_ok(&k, other) {
+                    Some(true)
+                } else {
+                    Some(false)
+                }
+            }
+            other => {
+                let Some(at) = concrete_type_of_expr(arg, vars, type_names) else {
+                    return None;
+                };
+                type_nominal_subtype(&at, other, class_parent, class_set, class_bad, &mut HashMap::new())
+            }
+        };
+        match r {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => return None,
+        }
+    }
+    Some(true)
+}
+
+/// 9.3.3/9.3.4：函数/元组/类值作为实参时的名义子类型检查。
+///
+/// 仅在自由函数候选集完整（无泛型/默认值/命名/变长、位置个数一致）且涉及的类全部为
+/// 本地类（无 std/接口/泛型父类型）时判定；无法判定即放行，守正测试红线。
+fn check_structured_arg_subtypes(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 本地类集合与 extends 链（仅 class → class；非本地父类标记不可用）。
+    let mut class_set: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        class_set.insert(c.name.clone());
+    }
+    let mut class_parent: HashMap<String, String> = HashMap::new();
+    for c in &program.classes {
+        if let Some(p) = &c.extends {
+            let base = p.split('<').next().unwrap_or(p).trim().to_string();
+            class_parent.insert(c.name.clone(), base);
+        }
+    }
+    let mut class_bad: HashSet<String> = HashSet::new();
+    for (child, parent) in &class_parent {
+        if !class_set.contains(parent) {
+            class_bad.insert(child.clone());
+        }
+    }
+
+    let mut type_names: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        type_names.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        type_names.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        type_names.insert(e.name.clone());
+    }
+    for i in &program.interfaces {
+        type_names.insert(i.name.clone());
+    }
+    let mut global_names: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        global_names.insert(c.name.clone());
+    }
+    let mut alias_names: HashSet<String> = HashSet::new();
+    for (n, _) in &program.type_aliases {
+        alias_names.insert(n.clone());
+    }
+
+    // 顶层自由函数（无点号名）。
+    let mut free_by_name: HashMap<String, Vec<&Function>> = HashMap::new();
+    for f in &program.functions {
+        if !f.name.contains('.') {
+            free_by_name.entry(f.name.clone()).or_default().push(f);
+        }
+    }
+    // 唯一、非泛型、带显式返回类型的顶层函数（作为函数值实参时的签名来源）。
+    let mut top_fn: HashMap<String, &Function> = HashMap::new();
+    for (name, fs) in &free_by_name {
+        if fs.len() == 1 && fs[0].type_params.is_empty() {
+            top_fn.insert(name.clone(), fs[0]);
+        }
+    }
+
+    let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let mut vars = local_var_types_full(params, body);
+        let mut local_defs: HashSet<String> = HashSet::new();
+        collect_local_def_names(body, &mut local_defs);
+        for p in params {
+            local_defs.insert(p.name.clone());
+        }
+        for c in &program.constants {
+            if !local_defs.contains(&c.name) && !vars.contains_key(&c.name) && c.ty != Type::Int64 {
+                vars.insert(c.name.clone(), c.ty.clone());
+            }
+        }
+        walk_stmts(body, &mut |e| {
+            let Expr::Call {
+                name,
+                args,
+                named_args,
+                ..
+            } = e
+            else {
+                return;
+            };
+            if !named_args.is_empty() || name.contains('.') {
+                return;
+            }
+            let Some(cands) = free_by_name.get(name.as_str()) else {
+                return;
+            };
+            if type_names.contains(name.as_str())
+                || global_names.contains(name.as_str())
+                || alias_names.contains(name.as_str())
+                || local_defs.contains(name.as_str())
+            {
+                return;
+            }
+            // 门：候选完整、位置个数一致、无泛型/默认/命名/变长；
+            // 且至少一个形参为非标量（否则交给标量检查，避免重复）。
+            let mut any_nonscalar = false;
+            for f in cands {
+                if !f.type_params.is_empty() {
+                    return;
+                }
+                let ps = strip_self_params(&f.params);
+                if ps.iter().any(|p| p.variadic || p.is_named || p.default.is_some()) {
+                    return;
+                }
+                if ps.len() != args.len() {
+                    return;
+                }
+                if ps.iter().any(|p| !is_scalar_scalar_ty(&p.ty)) {
+                    any_nonscalar = true;
+                }
+            }
+            if !any_nonscalar {
+                return;
+            }
+            let mut any_ok = false;
+            let mut all_false = true;
+            for f in cands {
+                let ps = strip_self_params(&f.params);
+                match structured_candidate_ok(
+                    args,
+                    ps,
+                    &vars,
+                    &type_names,
+                    &local_defs,
+                    &top_fn,
+                    &class_parent,
+                    &class_set,
+                    &class_bad,
+                ) {
+                    Some(true) => {
+                        any_ok = true;
+                        break;
+                    }
+                    Some(false) => {}
+                    None => {
+                        all_false = false;
+                        break;
+                    }
+                }
+            }
+            if !any_ok && all_false {
+                errors.push(SemanticError {
+                    message: format!(
+                        "调用 '{}' 的实参类型无法通过子类型匹配任何重载形参（9.3.3/9.3.4）",
+                        name
+                    ),
+                });
+            }
+        });
+    };
+
+    for f in &program.functions {
+        scan(&f.params, &f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, errors);
+        }
+    }
+}
+
 /// 5.3.1/(4)+5.3.4：方法调用的位置/命名实参必须与目标方法的形参列表匹配。
 /// 仅当方法名在文件中按签名去重后唯一时启用（避免重载/重定义歧义误判）。
 fn check_method_call_arguments(program: &Program, errors: &mut Vec<SemanticError>) {
@@ -31548,6 +32582,151 @@ main() {}"#,
         assert_valid("main() {\n let f = LibC.free\n}\n");
         // 正例：已知类型构造调用放行。
         assert_valid("struct Point { var x: Int64 = 0 }\nmain() {\n let p = Point()\n}\n");
+    }
+
+    // ─── w22c: 可确定的重载实参类型不匹配 ─────────────────────────────────
+
+    #[test]
+    fn test_w22c_method_overload_arg_type_mismatch() {
+        // 方法重载全为标量形参、实参类型可判定且不匹配任一候选 → 拒绝。
+        assert_invalid(
+            "struct SS {\n\
+             \x20   func Check(arg: Int8) {}\n\
+             \x20   func Check(arg: Int16) {}\n\
+             }\n\
+             main() {\n\
+             \x20   let i32: Int32 = 0\n\
+             \x20   var s: SS = SS()\n\
+             \x20   s.Check(i32)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w22c_method_overload_arg_type_ok() {
+        // 实参类型命中某个候选 → 放行。
+        assert_valid(
+            "struct SS {\n\
+             \x20   func Check(arg: Int8) {}\n\
+             \x20   func Check(arg: Int16) {}\n\
+             }\n\
+             main() {\n\
+             \x20   var s: SS = SS()\n\
+             \x20   s.Check(1i16)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w22c_free_overload_arg_type_mismatch() {
+        // 顶层自由函数重载全为整型形参，浮点字面量实参不匹配 → 拒绝。
+        assert_invalid(
+            "func wcG(x: Int8) {}\n\
+             func wcG(x: Int16) {}\n\
+             main() {\n\
+             \x20   wcG(1.5)\n\
+             }\n",
+        );
+        // 命中候选则放行。
+        assert_valid(
+            "func wcG(x: Int8) {}\n\
+             func wcG(x: Int16) {}\n\
+             main() {\n\
+             \x20   wcG(1i8)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w22c_op_call_arg_type_mismatch() {
+        // 枚举值 `()` 运算符重载（op_call）的实参类型不匹配 → 拒绝。
+        assert_invalid(
+            "let wcF: Float64 = 1.0\n\
+             enum WcE {\n\
+             \x20   A\n\
+             \x20   operator func ()(x: Int8) {}\n\
+             }\n\
+             main() {\n\
+             \x20   var e: WcE = A\n\
+             \x20   e(wcF)\n\
+             }\n",
+        );
+        assert_valid(
+            "enum WcE {\n\
+             \x20   A\n\
+             \x20   operator func ()(x: Int8) {}\n\
+             }\n\
+             main() {\n\
+             \x20   var e: WcE = A\n\
+             \x20   e(1i8)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w22c_generic_overload_not_rejected() {
+        // 候选含泛型 → 无法安全判定，放行（保守）。
+        assert_valid(
+            "func wcH<T>(x: T, y: Int64) {}\n\
+             func wcH<T>(x: Int64, y: T) {}\n\
+             main() {\n\
+             \x20   wcH(1, 2)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w22c_fn_variance_arg_mismatch() {
+        // 9.3.3(2)：把 (Derived)->A 传给形参 (A)->A，形参逆变不满足 → 拒绝。
+        assert_invalid(
+            "open class WA {}\n\
+             open class WDerived <: WA {}\n\
+             func wconv(x: WDerived): WA { return WA() }\n\
+             func wuse(x: WA, fn: (WA) -> WA): WA { return fn(x) }\n\
+             main() {\n\
+             \x20   wuse(WA(), wconv)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w22c_fn_variance_arg_ok() {
+        // 把 (WA)->WA 传给形参 (WDerived)->WA：逆变/协变均满足 → 放行。
+        assert_valid(
+            "open class WA {}\n\
+             open class WDerived <: WA {}\n\
+             func wconv(x: WA): WA { return WA() }\n\
+             func wuse(x: WDerived, fn: (WDerived) -> WA): WA { return fn(x) }\n\
+             main() {\n\
+             \x20   wuse(WDerived(), wconv)\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w22c_tuple_variance_arg() {
+        // 9.3.4(2)：元组逐元素子类型；(WA, WB) 不能传给 (WB1, WB)（WA 非 WB1 子类）。
+        assert_invalid(
+            "open class WA1 {}\n\
+             open class WA2 {}\n\
+             open class WB1 <: WA1 {}\n\
+             open class WB2 <: WA2 {}\n\
+             func wfirst(x: (WB1, WB2)): WB1 { return x[0] }\n\
+             main() {\n\
+             \x20   wfirst((WA1(), WB2()))\n\
+             }\n",
+        );
+        // (WB1, WB2) 传给 (WA1, WA2) 逐元素满足子类型 → 放行。
+        assert_valid(
+            "open class WA1 {}\n\
+             open class WA2 {}\n\
+             open class WB1 <: WA1 {}\n\
+             open class WB2 <: WA2 {}\n\
+             func wfirst(x: (WA1, WA2)): WA1 { return x[0] }\n\
+             main() {\n\
+             \x20   wfirst((WB1(), WB2()))\n\
+             }\n",
+        );
     }
 
 }
