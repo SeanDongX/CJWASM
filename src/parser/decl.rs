@@ -2757,6 +2757,8 @@ impl Parser {
         }
         self.expect(Token::LBrace)?;
         let mut methods = Vec::new();
+        // 静态成员函数在 methods 中的下标（10.1.1(3)/(6)：静态性与实例性需在语义阶段区分）。
+        let mut static_method_indices: Vec<usize> = Vec::new();
         let mut assoc_type_bindings = Vec::new();
         while !self.check(&Token::RBrace) {
             // 容忍成员声明后的多余分号
@@ -2958,6 +2960,10 @@ impl Parser {
             } else {
                 format!("{}.{}", target_type, func.name)
             };
+            // 记录 static 修饰的扩展成员（10.1.1(3)/(6)）。
+            if mods.is_static {
+                static_method_indices.push(methods.len());
+            }
             methods.push(Function {
                 is_const: func.is_const,
                 name: method_name,
@@ -2972,6 +2978,7 @@ impl Parser {
             interface_args,
             assoc_type_bindings,
             methods,
+            static_method_indices,
         })
     }
 

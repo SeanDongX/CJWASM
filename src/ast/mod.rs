@@ -215,6 +215,10 @@ pub enum Expr {
         catch_var: Option<String>,
         /// P2: 异常类型模式 catch (e: ExceptionType)
         catch_type: Option<Type>,
+        /// 多异常类型模式 `catch (e: E1 | E2 | ...)` 的全部类型（按声明顺序）。
+        /// 当只有一个类型时与 `catch_type` 相同；无类型模式时为空。
+        /// 12.1.1(20)/(22)：捕获变量的静态类型为这些类型的最小公共超类型。
+        catch_types: Vec<Type>,
         catch_body: Vec<Stmt>,
         /// finally 块（无论是否异常都执行）
         finally_body: Option<Vec<Stmt>>,
@@ -656,6 +660,10 @@ pub struct ExtendDef {
     pub assoc_type_bindings: Vec<(String, Type)>,
     /// 扩展的方法
     pub methods: Vec<Function>,
+    /// `static func` 成员在 `methods` 中的下标。解析器为实例成员插入隐式
+    /// `this` 接收者，静态成员同样保留该参数以兼容既有代码生成，且同名重载
+    /// 共享同一个全名，故静态性需按声明顺序的下标单独记录（10.1.1(3)/(6)）。
+    pub static_method_indices: Vec<usize>,
 }
 
 /// 类定义（支持继承、init、override、super、abstract、sealed）

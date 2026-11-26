@@ -4225,6 +4225,7 @@ mod tests {
             body: vec![Stmt::Expr(Expr::Integer(1))],
             catch_var: None,
             catch_type: None,
+            catch_types: vec![],
             catch_body: vec![],
             finally_body: Some(vec![Stmt::Expr(Expr::Integer(2))]),
         };

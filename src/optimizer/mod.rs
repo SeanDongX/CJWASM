@@ -320,6 +320,7 @@ fn fold_expr(expr: Expr) -> Expr {
             body,
             catch_var,
             catch_type,
+            catch_types,
             catch_body,
             finally_body,
         } => {
@@ -351,6 +352,7 @@ fn fold_expr(expr: Expr) -> Expr {
                 body,
                 catch_var,
                 catch_type,
+                catch_types,
                 catch_body,
                 finally_body,
             }
@@ -681,6 +683,7 @@ mod tests {
             })],
             catch_var: None,
             catch_type: None,
+            catch_types: vec![],
             catch_body: vec![],
             finally_body: Some(vec![Stmt::Expr(Expr::Binary {
                 op: BinOp::Mul,
