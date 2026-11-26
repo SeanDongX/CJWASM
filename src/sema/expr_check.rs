@@ -870,6 +870,15 @@ struct Checker<'a> {
     /// 延迟赋值 `let` 的初值赋值状态：0=尚未赋值，1=可能已赋值（条件分支内），
     /// 2=确定已赋值（直线代码）。再次的直线赋值视为非法重赋值。
     deferred_state: HashMap<String, u8>,
+    /// 延迟赋值 `var`（`var x: T;` 无初始化式）的名字集合：与延迟 let 共用
+    /// deferred_state 的状态机，但重复赋值合法（var 可变），报错分支需区分二者。
+    deferred_var: HashSet<String>,
+    /// 程序内所有函数体局部函数（`Stmt::LocalFunc`，含嵌套）的名字集合。
+    /// 插值内“未声明函数调用”检查的守卫：局部函数在插值处可见（含前向引用），
+    /// 不能判为未定义。
+    local_func_names: HashSet<String>,
+    /// 本次插值块登记进 local_func_names 的新增名字（restore 时按栈序移除）。
+    interp_local_func_added: Vec<String>,
     /// 当前嵌套的字符串插值深度（>0 表示正在检查 `${...}` 内的表达式）。
     ///
     /// 插值内容由 lexer 抽出的表达式文本独立解析，不存在“解析器跨行合并语句”
@@ -1593,6 +1602,29 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     for f in &program.functions {
         known_funcs.insert(f.name.clone());
     }
+    // 程序内所有函数体局部函数的名字（含嵌套、含类方法/接口默认体/扩展体内）。
+    // 插值内“未声明函数调用”检查的守卫：局部函数在插值处可见（含前向引用）。
+    let mut local_func_names: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        collect_local_func_names(&f.body, &mut local_func_names);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            collect_local_func_names(&m.func.body, &mut local_func_names);
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            collect_local_func_names(&f.body, &mut local_func_names);
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(b) = &m.default_body {
+                collect_local_func_names(b, &mut local_func_names);
+            }
+        }
+    }
     for c in &program.classes {
         for m in &c.methods {
             let bare = m
@@ -1688,6 +1720,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         known_funcs,
         cond_depth: 0,
         deferred_state: HashMap::new(),
+        deferred_var: HashSet::new(),
+        local_func_names: local_func_names,
+        interp_local_func_added: Vec::new(),
         interp_depth: 0,
     };
 
@@ -3261,6 +3296,25 @@ fn collect_interface_members(
 /// 收集顶层函数与接口函数的签名（仅记录每个形参是否为命名参数）。
 ///
 /// 用于 6.2.2.1(3)：命名参数必须以 `名字:` 形式传入，不能按位置传入。
+/// 递归收集语句体（含嵌套块与局部函数体）内全部 `Stmt::LocalFunc` 的函数名。
+fn collect_local_func_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::LocalFunc(f) => {
+                out.insert(f.name.clone());
+                collect_local_func_names(&f.body, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::WhileLet { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => collect_local_func_names(body, out),
+            _ => {}
+        }
+    }
+}
+
 fn collect_named_call_sigs(program: &Program) -> HashMap<String, Vec<Vec<(bool, bool)>>> {
     let mut map: HashMap<String, Vec<Vec<(bool, bool)>>> = HashMap::new();
     {
@@ -3586,15 +3640,23 @@ impl<'a> Checker<'a> {
     /// - 无标注但函数体是单一 `return <形参名>` 时，取该形参的声明类型
     ///   （覆盖 `func getU8(p:UInt8) { return p; }` 这类插值内定义）。
     /// 其余情形不登记，调用结果保持未知（保守放行）。
-    fn register_interp_local_funcs(&mut self, stmts: &[Stmt]) -> Vec<(String, Option<Ty>)> {
+    fn register_interp_local_funcs(&mut self, stmts: &[Stmt]) -> (Vec<(String, Option<Ty>)>, usize) {
+        let mark = self.interp_local_func_added.len();
         let mut saved: Vec<(String, Option<Ty>)> = Vec::new();
         if self.interp_depth == 0 {
-            return saved;
+            return (saved, mark);
         }
         // 先收集（不可变借用），再写入（可变借用），避免借用冲突。
         let mut entries: Vec<(String, Ty)> = Vec::new();
         for s in stmts {
             if let Stmt::LocalFunc(f) = s {
+                // 无论返回类型是否可推断，块内局部函数的名字都登记进守卫集合
+                // （“未声明函数调用”检查据此放行；此前已存在的名字记 false，
+                // restore 时不误删外层条目）。
+                if !self.local_func_names.contains(&f.name) {
+                    self.local_func_names.insert(f.name.clone());
+                    self.interp_local_func_added.push(f.name.clone());
+                }
                 if let Some(rt) = &f.return_type {
                     entries.push((f.name.clone(), self.ty_of_ann(rt)));
                     continue;
@@ -3611,11 +3673,14 @@ impl<'a> Checker<'a> {
             let old = self.funcs.insert(name.clone(), ty);
             saved.push((name, old));
         }
-        saved
+        (saved, mark)
     }
 
     /// 还原 [`Self::register_interp_local_funcs`] 对 `self.funcs` 的临时修改。
-    fn restore_interp_local_funcs(&mut self, saved: Vec<(String, Option<Ty>)>) {
+    ///
+    /// `mark` 为登记前 `interp_local_func_added` 的栈深：restore 只弹回该标记，
+    /// 不动外层插值块登记的名字（嵌套插值块的 restore 不能误删外层注册）。
+    fn restore_interp_local_funcs(&mut self, saved: Vec<(String, Option<Ty>)>, mark: usize) {
         for (name, old) in saved.into_iter().rev() {
             match old {
                 Some(t) => {
@@ -3624,6 +3689,11 @@ impl<'a> Checker<'a> {
                 None => {
                     self.funcs.remove(&name);
                 }
+            }
+        }
+        while self.interp_local_func_added.len() > mark {
+            if let Some(name) = self.interp_local_func_added.pop() {
+                self.local_func_names.remove(&name);
             }
         }
     }
@@ -3830,9 +3900,13 @@ impl<'a> Checker<'a> {
                 // 记录延迟赋值 `let` 的初值赋值状态（4.2(5)），并处理同名遮蔽。
                 if let Pattern::Binding(name) = pattern {
                     if deferred {
+                        // 延迟 let：登记初值赋值状态；同时若此前同名 var 是
+                        // 延迟 var，其“可重复赋值”标记对 let 不再适用。
                         self.deferred_state.insert(name.clone(), 0);
+                        self.deferred_var.remove(name);
                     } else {
                         self.deferred_state.remove(name);
+                        self.deferred_var.remove(name);
                     }
                 }
                 self.bind_pattern_const(pattern, bind_ty, deferred, cinit, false, deferred);
@@ -3872,9 +3946,19 @@ impl<'a> Checker<'a> {
                 let cinit = if deferred { None } else { literal_int(value) };
                 self.check_irrefutable_pattern(pattern);
                 if let Pattern::Binding(name) = pattern {
-                    self.deferred_state.remove(name);
+                    if deferred {
+                        // 官方 1.3.6(4)/3.3：`var x: T;`（无初始化式）同样是“声明
+                        // 未初始化”，读取前必须先赋值；与延迟 let 一致追踪赋值状态
+                        // （deferred_state: 0=未赋值 / 1=条件分支内可能已赋 / 2=直线已赋）。
+                        // var 可重复赋值，由 deferred_var 集合与 let 的报错分支区分。
+                        self.deferred_state.insert(name.clone(), 0);
+                        self.deferred_var.insert(name.clone());
+                    } else {
+                        self.deferred_state.remove(name);
+                        self.deferred_var.remove(name);
+                    }
                 }
-                self.bind_pattern_const(pattern, bind_ty, true, cinit, false, false);
+                self.bind_pattern_const(pattern, bind_ty, true, cinit, false, deferred);
                 if matches!(ty.as_ref(), Some(Type::Bool)) {
                     self.mark_explicit_bool(pattern);
                 }
@@ -4671,7 +4755,10 @@ impl<'a> Checker<'a> {
                                 self.deferred_state.insert(name.clone(), 1);
                             }
                         } else if state >= 1 {
-                            self.err(format!("不可变变量 '{}' 不能被重新赋值", name));
+                            // 延迟 let 的再次赋值非法（4.2(5)）；延迟 var 可重复赋值。
+                            if !self.deferred_var.contains(name) {
+                                self.err(format!("不可变变量 '{}' 不能被重新赋值", name));
+                            }
                         } else {
                             self.deferred_state.insert(name.clone(), 2);
                         }
@@ -5642,6 +5729,39 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 名字是否为程序中任意 class/interface 的成员（方法/属性）。
+    ///
+    /// 用于插值内“未声明函数调用”检查的守卫：类体内裸名调用自身的 private
+    /// 成员方法（隐式 this）是合法的，不能判为未定义（如 std 的
+    /// `getBackendIndependentMangledName`）。
+    fn is_known_member_name(&self, name: &str) -> bool {
+        // 成员/方法名在表中可能以限定形态（`S.double`）或裸名（`double`）存储
+        // （扩展方法、类方法两者皆有），两种形态都匹配。
+        let name_set_hit = |s: &HashSet<String>| {
+            s.iter().any(|q| q == name || member_name(q) == name)
+        };
+        if name_set_hit(&self.qualified_methods) {
+            return true;
+        }
+        if self
+            .class_members
+            .values()
+            .any(|m| m.contains_key(name))
+        {
+            return true;
+        }
+        if self
+            .interface_members
+            .values()
+            .any(|s| s.contains(name))
+        {
+            return true;
+        }
+        self.interface_instance_members
+            .values()
+            .any(|s| s.contains(name))
+    }
+
     /// 6.2.2.2(5)：interface 的 static 成员体中不能直接引用该接口的实例成员。
     fn check_static_iface_member_ref(&mut self, name: &str) {
         if !self.cur_iface_static {
@@ -6012,8 +6132,22 @@ impl<'a> Checker<'a> {
                 }
                 // 6.2.2.2(5)：interface static 成员体不能直接引用实例成员。
                 self.check_static_iface_member_ref(name);
-                // 6.2.2(1)：interface 默认函数体不能裸名引用其它接口成员。
+                // 6.2.2.2(1)：interface 默认函数体不能裸名引用其它接口成员。
                 self.check_iface_foreign_member_ref(name);
+                // 官方 1.3.6(4)：插值内引用延迟赋值声明（`let/var x: T;` 无初始化式）
+                // 且尚未赋值的变量非法。仅插值上下文判定——插值外 `var x: T;` 读取
+                // 类型默认值属项目方言（std 大量依赖），必须原样放行。
+                // deferred_state==0 表示从未赋值；条件分支内初始化（state==1）后
+                // 读取合法，不报。
+                let uninit_read = self.interp_depth > 0
+                    && self
+                        .lookup(name)
+                        .map(|v| v.uninit_let)
+                        .unwrap_or(false)
+                    && self.deferred_state.get(name).copied() == Some(0);
+                if uninit_read {
+                    self.err(format!("变量 '{}' 在初值赋值前被读取（未初始化）", name));
+                }
                 self.lookup(name)
                     .map(|v| v.ty.clone())
                     .unwrap_or(Ty::Unknown)
@@ -6123,6 +6257,44 @@ impl<'a> Checker<'a> {
                 named_args,
                 ..
             } => {
+                // 1.3.6(4)：插值内调用未声明的自由函数名非法（局部函数已由
+                // register_interp_local_funcs 登记）。仅插值上下文判定：
+                // 非插值处的未知调用涉及跨文件/内建方法集，保守放行。
+                // 内建白名单（原始类型构造 + math 内建 + 常见内建自由函数）：
+                // std 内的合法插值大量调用这些无声明内建（如 sqrt(x)、Float64(x)、
+                // collectArray(...)），必须放行。
+                const INTERP_BUILTIN_CALLS: &[&str] = &[
+                    "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32",
+                    "UInt64", "Float16", "Float32", "Float64", "Bool", "Rune", "String",
+                    "Unit", "BigInt", "BigDecimal", "sqrt", "floor", "ceil", "trunc",
+                    "nearest", "abs", "copysign", "neg", "sin", "cos", "tan", "asin",
+                    "acos", "atan", "exp", "log", "ln", "log2", "log10", "pow", "fmin",
+                    "fmax", "cbrt", "collectArray", "println", "print", "panic",
+                    "toString", "sort", "now", "exit", "sleep", "random", "line",
+                    "exp2", "expm1", "log1p", "log2", "lgamma", "tgamma", "gamma",
+                    "erf",
+                    "erfc", "atan2", "hypot", "fmod", "remainder", "ldexp",
+                    "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "min",
+                    "max", "clamp",
+                ];
+                if self.interp_depth > 0
+                    && !name.contains('.')
+                    && type_args.as_ref().map_or(true, |v| v.is_empty())
+                    && !INTERP_BUILTIN_CALLS.contains(&name.as_str())
+                    && !self.is_known_member_name(name)
+                    && !self.local_func_names.contains(name)
+                    && self.lookup(name).is_none()
+                    && !self.funcs.contains_key(name)
+                    && !self.globals.contains_key(name)
+                    && !self.known_funcs.contains(name)
+                    && !self.type_names.contains(name)
+                    && !self.enum_names.contains(name)
+                {
+                    self.err(format!(
+                        "插值内调用了未声明的函数 '{}'（1.3.6(4)）",
+                        name
+                    ));
+                }
                 let mut arg_tys: Vec<Ty> = Vec::with_capacity(args.len());
                 for a in args {
                     arg_tys.push(self.check_expr(a));
@@ -6383,7 +6555,7 @@ impl<'a> Checker<'a> {
                 // 插值内的块（`${ func f():T {...}; ...; expr }`）可能声明局部函数，
                 // 其返回类型可用于推断后续表达式中的调用结果。仅插值上下文登记，
                 // 非插值处的局部函数登记会改变其它章节的行为，故不启用。
-                let saved_local_funcs = self.register_interp_local_funcs(stmts);
+                let (saved_local_funcs, interp_mark) = self.register_interp_local_funcs(stmts);
                 for s in stmts {
                     self.check_stmt(s);
                 }
@@ -6391,7 +6563,7 @@ impl<'a> Checker<'a> {
                     Some(e) => self.check_expr(e),
                     None => Ty::Unknown,
                 };
-                self.restore_interp_local_funcs(saved_local_funcs);
+                self.restore_interp_local_funcs(saved_local_funcs, interp_mark);
                 self.scopes.pop();
                 t
             }
@@ -8108,14 +8280,20 @@ fn default_literal(value: &Ty) -> Ty {
 
 /// 判断表达式的值是否为 `default_value_for_type` 合成的默认值，
 /// 从而识别 `let x: T`（无初始化式，延迟赋值）的声明形态。
+///
+/// 解析器把合成默认值包装为 `Block([], Some(默认值))`；显式写出默认值
+/// （如 `let x: Int32 = 0`）没有这层包装，因此不会被误判为延迟赋值。
 fn is_default_value(ty: &Type, value: &Expr) -> bool {
+    let Expr::Block(_, Some(inner)) = value else {
+        return false;
+    };
     match ty {
-        Type::Bool => matches!(value, Expr::Bool(false)),
-        Type::String => matches!(value, Expr::String(s) if s.is_empty()),
-        Type::Rune => matches!(value, Expr::Rune(c) if *c == '\0'),
-        Type::Float64 => matches!(value, Expr::Float(f) if *f == 0.0),
+        Type::Bool => matches!(**inner, Expr::Bool(false)),
+        Type::String => matches!(&**inner, Expr::String(s) if s.is_empty()),
+        Type::Rune => matches!(**inner, Expr::Rune(c) if c == '\0'),
+        Type::Float64 => matches!(**inner, Expr::Float(f) if f == 0.0),
         Type::Float16 | Type::Float32 => {
-            matches!(value, Expr::Float32(f) if *f == 0.0) || matches!(value, Expr::Integer(0))
+            matches!(**inner, Expr::Float32(f) if f == 0.0) || matches!(**inner, Expr::Integer(0))
         }
         Type::Int8
         | Type::Int16
@@ -8126,9 +8304,9 @@ fn is_default_value(ty: &Type, value: &Expr) -> bool {
         | Type::UInt16
         | Type::UInt32
         | Type::UInt64
-        | Type::UIntNative => matches!(value, Expr::Integer(0)),
+        | Type::UIntNative => matches!(**inner, Expr::Integer(0)),
         // 结构体/类/数组等其它类型：解析器统一合成 Integer(0)。
-        _ => matches!(value, Expr::Integer(0)),
+        _ => matches!(**inner, Expr::Integer(0)),
     }
 }
 
@@ -10818,4 +10996,68 @@ mod tests {
             "main() { let r = \"${func gi(p: Int8) { return p }; gi(1) + gi(2)}\" }",
         );
     }
+
+    // ─── w17 直修：插值内未初始化读取 / 未声明调用 / 延迟 var 语义 ──────────
+
+    #[test]
+    fn test_w17_interp_uninit_var_read_rejected() {
+        // 1.3.6(4)：插值内读取声明后从未赋值的 var/let。
+        assert_err(
+            "main() { var x: String; let s = \"${x}\"; return }",
+            "未初始化",
+        );
+        assert_err(
+            "main() { let s = \"${var y: Int64; y + 1}\"; return }",
+            "未初始化",
+        );
+        // 赋值后读取合法；条件分支内赋值后读取也合法（保守不报）。
+        assert_ok("main() { var x: String; x = \"a\"; let s = \"${x}\"; return }");
+        assert_ok("main() { let x: Int64; if (true) { x = 1 }; let s = \"${x}\"; return }");
+        // 插值外读取无初始化 var（方言默认值语义）不受影响。
+        assert_ok("main() { var x: Int64; let y = x + 1; return }");
+    }
+
+    #[test]
+    fn test_w17_interp_undefined_call_rejected() {
+        // 1.3.6(4)：插值内调用未声明的自由函数名。
+        assert_err(
+            "main() { let s = \"${func getU32(p: UInt32) { return p }; getUInt32(1)}\"; return }",
+            "未声明的函数",
+        );
+        // 调用块内声明的局部函数（返回类型可推断与否都放行）。
+        assert_ok(
+            "main() { let s = \"${func f() {1}; f() + 1}\"; return }",
+        );
+        assert_ok(
+            "main() { let s = \"${func g(p: Int64) { return p }; g(2)}\"; return }",
+        );
+        // 调用外层函数体声明的局部函数（前向引用）。
+        assert_ok(
+            "main() { func h(): Int64 { return 3 }; let s = \"${h()}\"; return }",
+        );
+        // 内建（math/类型构造）放行。
+        assert_ok("main() { let s = \"${sqrt(4.0)}\"; return }");
+        assert_ok("main() { let s = \"${Float64(3)}\"; return }");
+        // 类/扩展成员裸名调用（隐式 this）放行。
+        assert_ok(
+            "class A { private func m(): Int64 { return 1 }\n func info(): String { \"${m()}\" } }\nmain() { return }",
+        );
+    }
+
+    #[test]
+    fn test_w17_explicit_default_init_not_deferred() {
+        // 显式初始化为类型默认值（= 0/false/""）不再误判为延迟赋值：
+        // let 不可重新赋值（官方语义）。
+        assert_err(
+            "main() { let x: Int64 = 0; x = 1; return }",
+            "不可变变量",
+        );
+        // 真正的延迟 let 仍允许恰好一次赋值。
+        assert_ok("main() { let x: Int64; x = 1; return }");
+        // 延迟 var 允许多次赋值。
+        assert_ok("main() { var x: Int64; x = 1; x = 2; return }");
+        // 延迟 let 的两次赋值仍非法（4.2(5)）。
+        assert_err("main() { let x: Int64; x = 1; x = 2; return }", "不可变变量");
+    }
+
 }

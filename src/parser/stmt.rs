@@ -1007,7 +1007,11 @@ impl Parser {
 
     /// 为类型生成默认值表达式
     fn default_value_for_type(&self, ty: &Type) -> Expr {
-        match ty {
+        // 合成的默认值包一层空语句 + 尾表达式 Block：语义透明（codegen/chir 把
+        // 带尾值的 Block 编译为其尾值），但让 sema 能区分“无初始化式（合成默认
+        // 值）”与“显式初始化为默认值”（如 `let x: Int32 = 0`），避免后者被
+        // 误判为延迟赋值声明（is_default_value 只认 Block 包装形态）。
+        let raw = match ty {
             Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8 | Type::IntNative => {
                 Expr::Integer(0)
             }
@@ -1020,7 +1024,8 @@ impl Parser {
             Type::String => Expr::String(String::new()),
             Type::Rune => Expr::Rune('\0'),
             _ => Expr::Integer(0), // 其他类型默认为0
-        }
+        };
+        Expr::Block(Vec::new(), Some(Box::new(raw)))
     }
 }
 
