@@ -62,7 +62,9 @@ impl Parser {
             if self.check(&Token::Dollar) {
                 self.advance();
                 let len = match self.advance() {
-                    Some(Token::Integer(n)) | Some(Token::IntegerSuffixed((n, _))) => n,
+                    Some(Token::Integer(n))
+                    | Some(Token::IntegerRadix(n))
+                    | Some(Token::IntegerSuffixed((n, _))) => n,
                     Some(tok) => {
                         return self.bail(ParseError::UnexpectedToken(
                             tok,
@@ -262,7 +264,9 @@ impl Parser {
         if self.check(&Token::Minus)
             && matches!(
                 self.peek_next(),
-                Some(Token::Integer(_)) | Some(Token::IntegerSuffixed(_))
+                Some(Token::Integer(_))
+                    | Some(Token::IntegerRadix(_))
+                    | Some(Token::IntegerSuffixed(_))
             )
         {
             return self.bail(ParseError::UnexpectedToken(
@@ -271,8 +275,9 @@ impl Parser {
             ));
         }
         // 仅当恰好是一个整数字面量时才记录长度值
-        if let Some(Token::Integer(n)) | Some(Token::IntegerSuffixed((n, _))) =
-            self.peek().cloned()
+        if let Some(Token::Integer(n))
+        | Some(Token::IntegerRadix(n))
+        | Some(Token::IntegerSuffixed((n, _))) = self.peek().cloned()
         {
             let is_single_literal = matches!(
                 self.peek_at(1),

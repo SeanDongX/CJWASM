@@ -1136,6 +1136,12 @@ impl Parser {
                 // 此处不再向后窥探并吞掉同名标识符（否则会跨行吞掉变量名）。
                 self.finish_int_primary(Expr::Integer(n))
             }
+            Some(Token::IntegerRadix(n)) => {
+                // 进制前缀整数（0x/0o/0b）：AST 形态与 Integer 相同；
+                // “进制字面量不能初始化 Float 注解”的检查在 stmt.rs 声明处
+                // 以 token 形态完成（AST 不保留进制信息）。
+                self.finish_int_primary(Expr::Integer(n))
+            }
             Some(Token::IntegerSuffixed((n, suf))) => {
                 self.finish_int_primary(Expr::IntegerSuffixed(n, suf))
             }
@@ -2535,7 +2541,7 @@ impl Parser {
         // 只解析简单表达式: 变量、字面量、函数调用、字段访问等
         // 不解析结构体初始化 (因为 { 会被误认为 match body)
         let mut expr = match self.advance() {
-            Some(Token::Integer(n)) => Expr::Integer(n),
+            Some(Token::Integer(n)) | Some(Token::IntegerRadix(n)) => Expr::Integer(n),
             Some(Token::IntegerSuffixed((n, suf))) => Expr::IntegerSuffixed(n, suf),
             Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Expr::Float(f),
             Some(Token::Float32(f)) => Expr::Float32(f),

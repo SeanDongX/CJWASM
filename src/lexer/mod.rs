@@ -176,6 +176,17 @@ fn leading_dot_malformed(lex: &logos::Lexer<Token>) -> bool {
     )
 }
 
+/// 浮点字面量后紧跟 `.` + 数字（如 `1e0.0`、`0x0p0.0` 的小数点跟在指数后）
+/// 视为非法字面量（规范 1.3.2 负样例），返回 true 让词法器报错。
+/// 仅当紧跟的是 `.` 后接数字时报错；`.toString()` 等 `.标识符` 后缀不受影响。
+fn trailing_dot_malformed(lex: &logos::Lexer<Token>) -> bool {
+    let mut chars = lex.remainder().chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('.'), Some(c)) if c.is_ascii_digit()
+    )
+}
+
 /// 跳过（并消耗）一个仓颉块注释，支持任意层嵌套（规范 1.5(2)）。
 ///
 /// `/*` 已由 token 匹配消耗，remainder() 为注释正文起点。返回 Skip 时
@@ -811,8 +822,8 @@ pub enum Token {
     TypeMap,
 
     // Float64：小数、科学计数法（无后缀）、前导点小数或十六进制浮点（规范 1.3）
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*|0[xX][0-9a-fA-F_]*(\.[0-9a-fA-F_]*)?[pP][+-]?[0-9][0-9_]*", |lex| {
-        if leading_dot_malformed(lex) {
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE]-?[0-9][0-9_]*)?|[0-9][0-9_]*[eE]-?[0-9][0-9_]*|0[xX]([0-9a-fA-F][0-9a-fA-F_]*(\.[0-9a-fA-F][0-9a-fA-F_]*)?|\.[0-9a-fA-F][0-9a-fA-F_]*)[pP]-?[0-9][0-9_]*", |lex| {
+        if leading_dot_malformed(lex) || trailing_dot_malformed(lex) {
             return None;
         }
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
@@ -828,8 +839,8 @@ pub enum Token {
     Float(f64),
 
     // Float64 带 f64 后缀
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f64|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f64|[0-9][0-9_]*f64", priority = 4, callback = |lex| {
-        if leading_dot_malformed(lex) {
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f64|[0-9][0-9_]*[eE]-?[0-9][0-9_]*f64|[0-9][0-9_]*f64", priority = 4, callback = |lex| {
+        if leading_dot_malformed(lex) || trailing_dot_malformed(lex) {
             return None;
         }
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
@@ -842,8 +853,8 @@ pub enum Token {
     Float64Suffix(f64),
 
     // Float32：f、f32 或 f16 后缀（Float16 在 WASM 层同为 f32，值按 f32 解析）
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f32|f16)|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
-        if leading_dot_malformed(lex) {
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?(f32|f16)|[0-9][0-9_]*[eE]-?[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*(f32|f16)|[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?f|[0-9][0-9_]*[eE]-?[0-9][0-9_]*f|[0-9][0-9_]*f", priority = 3, callback = |lex| {
+        if leading_dot_malformed(lex) || trailing_dot_malformed(lex) {
             return None;
         }
         let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
@@ -865,6 +876,18 @@ pub enum Token {
         parse_integer_literal(&s)
     })]
     Integer(i64),
+
+    /// 进制前缀整数字面量（0x/0o/0b）：值与 `Integer` 相同，但携带“进制前缀”
+    /// 信息——十进制整数字面量可经字面量协调赋给 Float 注解，进制前缀形式
+    /// 不可以（官方负例 a06_47 / 2.1.11 a11_02/03/04）。
+    #[regex(r"(0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[oO][0-7][0-7_]*|0[bB][01][01_]*)", priority = 6, callback = |lex| {
+        let s: String = lex.slice().chars().filter(|c| *c != '_').collect();
+        if leading_zero_invalid(lex, &s) {
+            return None;
+        }
+        parse_integer_literal(&s)
+    })]
+    IntegerRadix(i64),
 
     // 整数字面量带 Cangjie 类型后缀（i8/i16/i32/i64/u8/u16/u32/u64）。
     // 保留后缀类型供语义分析判定字面量的具体整型；代码生成与 `Integer` 等价。
@@ -1679,9 +1702,9 @@ mod tests {
         let source = "0xFF 0x0F 0xABCD";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(tokens[0], Token::Integer(255));
-        assert_eq!(tokens[1], Token::Integer(15));
-        assert_eq!(tokens[2], Token::Integer(0xABCD));
+        assert_eq!(tokens[0], Token::IntegerRadix(255));
+        assert_eq!(tokens[1], Token::IntegerRadix(15));
+        assert_eq!(tokens[2], Token::IntegerRadix(0xABCD));
     }
 
     #[test]
@@ -1690,8 +1713,8 @@ mod tests {
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         assert_eq!(tokens[0], Token::Integer(u64::MAX as i64));
-        assert_eq!(tokens[1], Token::Integer(u64::MAX as i64));
-        assert_eq!(tokens[2], Token::Integer(0x8000000000000000u64 as i64));
+        assert_eq!(tokens[1], Token::IntegerRadix(u64::MAX as i64));
+        assert_eq!(tokens[2], Token::IntegerRadix(0x8000000000000000u64 as i64));
     }
 
     #[test]
@@ -1807,7 +1830,7 @@ mod tests {
     #[test]
     fn test_hex_float_uppercase_and_negative_exp() {
         // 0xA.BP-10 = (10 + 11/16) * 2^-10
-        let source = "0xA.BP-10 0X1P+4";
+        let source = "0xA.BP-10 0X1P4";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
         match tokens[0] {
@@ -1834,10 +1857,10 @@ mod tests {
         let source = "0x1F 0xABCD 0o17 0b1010";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(tokens[0], Token::Integer(0x1F));
-        assert_eq!(tokens[1], Token::Integer(0xABCD));
-        assert_eq!(tokens[2], Token::Integer(0o17));
-        assert_eq!(tokens[3], Token::Integer(0b1010));
+        assert_eq!(tokens[0], Token::IntegerRadix(0x1F));
+        assert_eq!(tokens[1], Token::IntegerRadix(0xABCD));
+        assert_eq!(tokens[2], Token::IntegerRadix(0o17));
+        assert_eq!(tokens[3], Token::IntegerRadix(0b1010));
     }
 
     #[test]
@@ -1950,9 +1973,27 @@ mod tests {
         let source = "0O17 0B1010 0XFF";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(tokens[0], Token::Integer(15));
-        assert_eq!(tokens[1], Token::Integer(10));
-        assert_eq!(tokens[2], Token::Integer(255));
+        assert_eq!(tokens[0], Token::IntegerRadix(15));
+        assert_eq!(tokens[1], Token::IntegerRadix(10));
+        assert_eq!(tokens[2], Token::IntegerRadix(255));
+    }
+
+    #[test]
+    fn test_float_exp_sign_only_minus_and_radix_forms() {
+        // 官方：指数符号只允许 -（a06_42/fpl_2 负例拒绝 e+/p+）；
+        // 进制前缀整数不能初始化 Float 注解（a06_47 由 parser 检查）。
+        let source = "1e-1 1E-1 1e1 0x0p-1";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        assert_eq!(tokens[0], Token::Float(0.1));
+        assert_eq!(tokens[1], Token::Float(0.1));
+        assert_eq!(tokens[2], Token::Float(10.0));
+        assert_eq!(tokens[3], Token::Float(0.0)); // 0x0p-1 = 0 * 2^-1 = 0
+        // 0x_0p0（前缀后下划线）、1e+1 / 0xA.BP+10（指数 + 号）、1e0.0
+        //（小数点跟在指数后）均为非法字面量：lexer 对其产生 Err。
+        let bad_src = "0x_0p0 1e+1 0xA.BP+10 1e0.0";
+        let n_err = Lexer::new(bad_src).filter(|r| r.is_err()).count();
+        assert!(n_err >= 3, "非法浮点形态未被拒绝, err={}", n_err);
     }
 
     #[test]

@@ -297,6 +297,7 @@ impl Parser {
                     }
                 };
                 self.check_unannotated_lambda_binding(&ty, &value, value_start)?;
+                self.reject_radix_int_float_init(ty.as_ref(), value_start, &value)?;
                 Ok(Stmt::Let { pattern, ty, value })
             }
             Some(Token::Var) => {
@@ -350,6 +351,7 @@ impl Parser {
                     }
                 };
                 self.check_unannotated_lambda_binding(&ty, &value, value_start)?;
+                self.reject_radix_int_float_init(ty.as_ref(), value_start, &value)?;
                 Ok(Stmt::Var { pattern, ty, value })
             }
             Some(Token::Return) => {
@@ -1006,6 +1008,39 @@ impl Parser {
     }
 
     /// 为类型生成默认值表达式
+    /// 官方语义：进制前缀整数字面量（0x/0o/0b）不能初始化 Float 类型注解
+    ///（十进制整数字面量可经字面量协调转换，a06_47 / 2.1.11 a11_02/03/04 负例）。
+    /// AST 不保留进制信息，故在 token 层判定：初始化式首个 token 为
+    /// `IntegerRadix` 且整体为裸整数表达式时拒绝。
+    fn reject_radix_int_float_init(
+        &self,
+        ty: Option<&Type>,
+        value_start: usize,
+        value: &Expr,
+    ) -> Result<(), ParseErrorAt> {
+        if !matches!(
+            ty,
+            Some(Type::Float16) | Some(Type::Float32) | Some(Type::Float64)
+        ) {
+            return Ok(());
+        }
+        if matches!(self.tokens.get(value_start), Some((_, Token::IntegerRadix(_), _)))
+            && matches!(value, Expr::Integer(_))
+        {
+            let at = (
+                self.tokens.get(value_start).map(|t| t.0).unwrap_or(0),
+                self.tokens.get(value_start).map(|t| t.2).unwrap_or(0),
+            );
+            return self.bail_at(
+                ParseError::UnknownType(
+                    "进制前缀（0x/0o/0b）整数字面量不能初始化 Float 类型注解".to_string(),
+                ),
+                at,
+            );
+        }
+        Ok(())
+    }
+
     fn default_value_for_type(&self, ty: &Type) -> Expr {
         // 合成的默认值包一层空语句 + 尾表达式 Block：语义透明（codegen/chir 把
         // 带尾值的 Block 编译为其尾值），但让 sema 能区分“无初始化式（合成默认
