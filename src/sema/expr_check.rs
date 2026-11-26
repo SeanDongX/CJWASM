@@ -829,6 +829,10 @@ struct Checker<'a> {
     /// 是否启用“未定义标识符”严格检查：仅对无（复杂）import 的单文件程序开启，
     /// 避免把导入符号误判为未定义。
     strict_scope: bool,
+    /// 正在检查“成员访问接收者”（`X.f` / `X.m()` 中的 X）时的深度计数。
+    /// 该上下文下大写首字母名可能是命名空间/类型限定（如 `LibC.mallocCString`），
+    /// 不能仅凭“未知大写名”判为未定义，故在 `strict_allow_name` 中放行。
+    strict_member_obj_depth: usize,
     /// 用户类型名 → 在该类型方法体内可不带资格引用的成员名集合
     /// （自身全部成员 + 传递父类型的成员）。
     owner_members: HashMap<String, HashSet<String>>,
@@ -1845,6 +1849,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         cur_interface: None,
         cur_owner: None,
         strict_scope,
+        strict_member_obj_depth: 0,
         owner_members,
         self_init_ok: Vec::new(),
         cur_iface_static: false,
@@ -6601,7 +6606,19 @@ impl<'a> Checker<'a> {
         }
         if let Some(ch) = name.chars().next() {
             if ch.is_uppercase() && !matches!(name.to_lowercase().as_str(), "true" | "false") {
-                return true;
+                // 成员访问接收者位置（`X.f` / `X.m()`）：大写名可能是命名空间或类型
+                // 限定（如 std.core 隐式可见的 `LibC`），保守放行。
+                if self.strict_member_obj_depth > 0 {
+                    return true;
+                }
+                // 大写首字母约定本身不足以放行：值引用/调用位置上的未知大写名
+                // 可能是拼错的类型名（如 `FileInputStream`）或未定义标识符（如 `E`），
+                // 只有在确为已知类型/枚举变体/函数/别名时才视为合法。
+                return self.type_names.contains(name)
+                    || self.enum_variants.contains(name)
+                    || self.known_funcs.contains(name)
+                    || self.local_func_names.contains(name)
+                    || self.alias_types.contains_key(name);
             }
         }
         if self.type_names.contains(name)
@@ -7455,7 +7472,9 @@ impl<'a> Checker<'a> {
                 named_args,
                 type_args,
             } => {
+                self.strict_member_obj_depth += 1;
                 self.check_expr(object);
+                self.strict_member_obj_depth -= 1;
                 // 2.1.11.2：枚举构造值上调用构造器（`A(0).B(..)`）非法。
                 self.check_enum_ctor_member(object, method);
                 // 2.1.4(2)：Unit 类型未定义成员访问运算符 '.'。
@@ -7763,7 +7782,9 @@ impl<'a> Checker<'a> {
             }
 
             Expr::Field { object, field } => {
+                self.strict_member_obj_depth += 1;
                 self.check_expr(object);
+                self.strict_member_obj_depth -= 1;
                 // 2.1.11.2：枚举构造值上访问构造器（`A(0).B`）非法。
                 self.check_enum_ctor_member(object, field);
                 // 2.1.4(2)：Unit 类型未定义成员访问运算符 '.'。
@@ -12804,4 +12825,23 @@ mod tests {
         assert_err("main() { var b: bool }", "Bool");
         assert_ok("main() { var b: Bool = true }");
     }
+    #[test]
+    fn test_w21d_strict_uppercase_identifier() {
+        // 3.2.3.2：无 import 单文件中的未知大写值引用/调用名判为未定义。
+        assert_err("main() { let v = A92 }", "未定义的标识符");
+        assert_err("main() { let v = Years }", "未定义的标识符");
+        // 成员访问接收者位置的大写名（命名空间/类型限定）放行。
+        assert_ok("main() { let f = LibC.free }");
+        // 已知类型名放行。
+        assert_ok("struct P { var x: Int64 = 0 }\nmain() { let p = P() }");
+    }
+
+    #[test]
+    fn test_w21d_class_interface_prop_member() {
+        // 6.1.2(1)：接口属性的脱糖 getter 名不应导致“成员不存在”。
+        assert_ok(
+            "interface I { prop p: Int64 { get() { 1 } } }\nclass C <: I {}\nmain() { let c = C()\n let v = c.p }",
+        );
+    }
+
 }

@@ -570,6 +570,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_ctor_cycles(program, &index, &mut errors);
     // 6.1.2(1)：本地类实例/类型上访问不存在的成员。
     check_local_class_member_existence(program, &index, &mut errors);
+    // 2.1.10.4/6.1.2(1)：封闭程序内结构体实例访问不存在的成员。
+    check_struct_member_existence(program, &index, &mut errors);
+    // 2.1.10.4/6.1.2(1)：以值类型字段名做函数调用。
+    check_call_on_value_field(program, &index, &mut errors);
 
     // 10.2.4(12)：数值/Bool/Unit/Nothing/Rune/String/Range 等类型不支持带赋值形态的
     // 下标运算符重载；函数/元组类型亦不允许被 extend。
@@ -14768,6 +14772,8 @@ fn check_local_class_member_existence(
         let iface = index.interfaces.get(base)?;
         for m in &iface.methods {
             out.insert(m.name.clone());
+            // 接口属性脱糖为 `__get_p` / `__set_p` 方法；成员访问名是基础名 p。
+            out.insert(member_base_name(&m.name).to_string());
         }
         for p in &iface.parents {
             let pb = p.split('<').next().unwrap_or(p).trim();
@@ -14822,6 +14828,12 @@ fn check_local_class_member_existence(
             match &cur.extends {
                 Some(parent) => {
                     let base = parent.split('<').next().unwrap_or(parent).trim();
+                    // `class C <: I {}` 中 I 可能是接口（解析器统一放入 extends）。
+                    // 此时按接口成员合并，且不再有父类可继续展开。
+                    if index.interfaces.contains_key(base) {
+                        iface_members(base, index, &mut out, &mut iface_visited)?;
+                        break;
+                    }
                     cur = index.classes.get(base)?;
                 }
                 None => break,
@@ -14927,7 +14939,191 @@ fn check_local_class_member_existence(
     for_each_fn_body(program, &mut |params, body, _| scan_body(params, body));
 }
 
-/// 10.2.4(12)：数值、Bool、Unit、Nothing、Rune、String、Range、函数、枚举、元组
+/// 2.1.10.4 / 6.1.2(1)：在**封闭**程序（无 import、无 extend）中，顶层结构体实例
+/// 访问不存在的成员（字段/方法/属性）非法。
+///
+/// 仅在成员集可完整本地确定时判定（结构体无泛型参数、无接口约束、程序无 extend），
+/// 无法确定时放行，避免误判。
+fn check_struct_member_existence(
+    program: &Program,
+    _index: &ProgramIndex,
+    errors: &mut Vec<SemanticError>,
+) {
+    if !program.imports.is_empty() || !program.extends.is_empty() {
+        return;
+    }
+    const ANY_MEMBERS: &[&str] = &[
+        "toString", "hashCode", "equals", "compare", "order", "toHashCode", "getType",
+        "getClass",
+    ];
+    let mut members: HashMap<String, HashSet<String>> = HashMap::new();
+    for s in &program.structs {
+        if !s.type_params.is_empty() || !s.constraints.is_empty() {
+            continue;
+        }
+        let mut set: HashSet<String> = ANY_MEMBERS.iter().map(|m| m.to_string()).collect();
+        for f in &s.fields {
+            set.insert(f.name.clone());
+        }
+        for (i, p) in s.primary_ctor_params.iter().enumerate() {
+            if s.primary_ctor_member_flags.get(i).copied().unwrap_or(false) {
+                set.insert(p.name.clone());
+            }
+        }
+        for init in &s.inits {
+            for (i, p) in init.params.iter().enumerate() {
+                if init.member_param_flags.get(i).copied().unwrap_or(false) {
+                    set.insert(p.name.clone());
+                }
+            }
+        }
+        members.insert(s.name.clone(), set);
+    }
+    // 结构体成员函数/属性脱糖后的方法名以 "Struct.method" 形式存在于顶层 functions。
+    for f in &program.functions {
+        if let Some(owner) = owner_name(&f.name) {
+            if let Some(set) = members.get_mut(owner) {
+                let seg = last_name_segment(&f.name);
+                set.insert(member_base_name(&seg).to_string());
+                set.insert(seg);
+            }
+        }
+    }
+    if members.is_empty() {
+        return;
+    }
+    let mut reported: HashSet<String> = HashSet::new();
+    let mut scan_body = |params: &[Param], body: &[Stmt]| {
+        let var_types = local_var_types_full(params, body);
+        let mut report = |msg: String| {
+            if reported.insert(msg.clone()) {
+                errors.push(SemanticError { message: msg });
+            }
+        };
+        walk_stmts(body, &mut |e| match e {
+            Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+                let Expr::Var(v) = &**object else { return };
+                if v == "this" || v == "super" {
+                    return;
+                }
+                let Some(Type::Struct(name, targs)) = var_types.get(v) else {
+                    return;
+                };
+                if !targs.is_empty() {
+                    return;
+                }
+                if let Some(set) = members.get(name) {
+                    if !set.contains(field) {
+                        report(format!(
+                            "结构体 '{}' 不存在成员 '{}'（2.1.10.4/6.1.2(1)）",
+                            name, field
+                        ));
+                    }
+                }
+            }
+            Expr::MethodCall { object, method, .. } => {
+                let Expr::Var(v) = &**object else { return };
+                if v == "this" || v == "super" {
+                    return;
+                }
+                let Some(Type::Struct(name, targs)) = var_types.get(v) else {
+                    return;
+                };
+                if !targs.is_empty() {
+                    return;
+                }
+                if let Some(set) = members.get(name) {
+                    let base = member_base_name(method);
+                    if !set.contains(method.as_str()) && !set.contains(base) {
+                        report(format!(
+                            "结构体 '{}' 不存在成员函数 '{}'（2.1.10.4/6.1.2(1)）",
+                            name, method
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        });
+    };
+    for_each_fn_body(program, &mut |params, body, _| scan_body(params, body));
+}
+
+/// 2.1.10.4 / 6.1.2(1)：以值类型（数值/Bool/Rune）字段名做函数调用是非法的
+/// （`s.count()` 而 count 是 Int64 字段）。值类型字段名不可能被扩展为同名方法。
+fn check_call_on_value_field(
+    program: &Program,
+    _index: &ProgramIndex,
+    errors: &mut Vec<SemanticError>,
+) {
+    fn is_value_kind(t: &Type) -> bool {
+        matches!(
+            t,
+            Type::Int8
+                | Type::Int16
+                | Type::Int32
+                | Type::Int64
+                | Type::IntNative
+                | Type::UInt8
+                | Type::UInt16
+                | Type::UInt32
+                | Type::UInt64
+                | Type::UIntNative
+                | Type::Float16
+                | Type::Float32
+                | Type::Float64
+                | Type::Bool
+                | Type::Rune
+        )
+    }
+    let mut value_fields: HashSet<(String, String)> = HashSet::new();
+    for s in &program.structs {
+        for f in &s.fields {
+            if is_value_kind(&f.ty) {
+                value_fields.insert((s.name.clone(), f.name.clone()));
+            }
+        }
+    }
+    for c in &program.classes {
+        for f in &c.fields {
+            if is_value_kind(&f.ty) {
+                value_fields.insert((c.name.clone(), f.name.clone()));
+            }
+        }
+    }
+    if value_fields.is_empty() {
+        return;
+    }
+    let mut reported: HashSet<String> = HashSet::new();
+    let mut scan_body = |params: &[Param], body: &[Stmt]| {
+        let var_types = local_var_types_full(params, body);
+        let mut report = |msg: String| {
+            if reported.insert(msg.clone()) {
+                errors.push(SemanticError { message: msg });
+            }
+        };
+        walk_stmts(body, &mut |e| {
+            let Expr::MethodCall { object, method, .. } = e else {
+                return;
+            };
+            let Expr::Var(v) = &**object else { return };
+            let Some(Type::Struct(name, targs)) = var_types.get(v) else {
+                return;
+            };
+            if !targs.is_empty() {
+                return;
+            }
+            if value_fields.contains(&(name.clone(), method.clone())) {
+                report(format!(
+                    "值类型字段 '{}' 不是函数，不能以 '{}()' 形式调用（2.1.10.4/6.1.2(1)）",
+                    method, method
+                ));
+            }
+        });
+    };
+    for_each_fn_body(program, &mut |params, body, _| scan_body(params, body));
+}
+
+
 /// 类型不支持带赋值形态（set 形态，含命名参数）的下标运算符重载；函数/元组类型
 /// 本身也不允许被 extend。
 fn check_index_operator_extensions(program: &Program, errors: &mut Vec<SemanticError>) {
@@ -28796,8 +28992,10 @@ main() {}"#,
     fn test_w11b_undefined_check_skipped_with_imports() {
         // 存在 import 时不判定未定义（导入依赖无法静态确定），避免 std/正测试误伤。
         assert_valid("import std.math.*\nmain() {\n let x = PI\n}");
-        // 首字母大写的裸名按类型/隐式导入符号放行。
-        assert_valid("main() {\n let v = KeyOpt\n}");
+        // w21d 收紧：无 import 单文件中大写裸名也须为已知符号
+        //（官方 3.2.3.2 负例；成员访问接收者位置 X.f/X.m() 仍放行）。
+        let errs = assert_invalid("main() {\n let v = KeyOpt\n}");
+        assert!(errs.iter().any(|e| e.message.contains("未定义")), "{:?}", errs);
     }
 
 
@@ -31253,5 +31451,103 @@ main() {}"#,
         );
     }
 
+
+    #[test]
+    fn test_w21d_struct_member_existence() {
+        // 2.1.10.4/6.1.2(1)：封闭程序中访问结构体不存在的字段/方法非法。
+        assert_invalid(
+            "struct Rect {\n\
+             \x20   var wid: Int32 = 10\n\
+             \x20   var len: Int32 = 20\n\
+             }\n\
+             main() {\n\
+             \x20   var sv: Rect = Rect()\n\
+             \x20   sv.wid = sv.wid1\n\
+             }\n",
+        );
+        assert_invalid(
+            "struct Rect2 {\n\
+             \x20   var wid: Int32 = 10\n\
+             }\n\
+             main() {\n\
+             \x20   var sv: Rect2 = Rect2()\n\
+             \x20   let y = sv.nope()\n\
+             }\n",
+        );
+        // 正例：访问存在的字段与方法合法。
+        assert_valid(
+            "struct Rect3 {\n\
+             \x20   var wid: Int32 = 10\n\
+             \x20   func area(): Int32 { 1 }\n\
+             }\n\
+             main() {\n\
+             \x20   var sv: Rect3 = Rect3()\n\
+             \x20   sv.wid = 1\n\
+             \x20   let y = sv.area()\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w21d_call_on_value_field() {
+        // 2.1.10.4：以数值字段名做函数调用非法（`sv.len()` 而 len 是 Int32）。
+        assert_invalid(
+            "struct Rect4 {\n\
+             \x20   var len: Int32 = 20\n\
+             }\n\
+             main() {\n\
+             \x20   var sv: Rect4 = Rect4()\n\
+             \x20   let z = sv.len()\n\
+             }\n",
+        );
+        // 正例：普通数值字段可读取。
+        assert_valid(
+            "struct Holder {\n\
+             \x20   var n: Int32 = 0\n\
+             }\n\
+             main() {\n\
+             \x20   let h = Holder()\n\
+             \x20   let z = h.n\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w21d_class_interface_parent_members() {
+        // 6.1.2(1)：`class C <: I` 中经接口继承的成员（含接口属性）是 C 的成员。
+        assert_valid(
+            "interface I1 {\n\
+             \x20   func callSayHW(): String { \"hi\" }\n\
+             \x20   prop p1: Int64 { get() { 1 } }\n\
+             }\n\
+             class C1 <: I1 {}\n\
+             main() {\n\
+             \x20   let c = C1()\n\
+             \x20   let s = c.callSayHW()\n\
+             \x20   let p = c.p1\n\
+             }\n",
+        );
+        // 反之，未实现的接口成员不可经实例访问。
+        assert_invalid(
+            "interface I2 {}\n\
+             interface IOther { func extra(): String { \"x\" } }\n\
+             class C2 <: I2 {}\n\
+             main() {\n\
+             \x20   let c = C2()\n\
+             \x20   let s = c.extra()\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w21d_strict_uppercase_undefined() {
+        // 3.2.3.2：无 import 单文件中的未知大写标识符/调用名应判为未定义。
+        assert_invalid("main() {\n let val = A92\n}\n");
+        assert_invalid("main() {\n let val = Years\n}\n");
+        // 正例：大写名作为成员访问接收者（命名空间/类型限定）放行。
+        assert_valid("main() {\n let f = LibC.free\n}\n");
+        // 正例：已知类型构造调用放行。
+        assert_valid("struct Point { var x: Int64 = 0 }\nmain() {\n let p = Point()\n}\n");
+    }
 
 }

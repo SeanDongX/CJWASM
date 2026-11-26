@@ -2,6 +2,10 @@
 //
 // 测试: print/println/eprint/eprintln + sqrt/floor/ceil/trunc/sin/cos/exp/log/pow + 常数
 
+// 数学常数（官方语义下裸名 PI/E 需有定义，不再依赖隐式内建）
+const PI: Float64 = 3.14159265358979
+const E: Float64 = 2.71828182845905
+
 func main(): Int64 {
     // ── 1. print (无换行) 与 println (有换行) ──
     print("Hello ")
