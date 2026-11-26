@@ -1642,6 +1642,7 @@ impl Parser {
                         body,
                         catch_var: None,
                         catch_type: None,
+                        catch_types: vec![],
                         catch_body: vec![],
                         finally_body: Some(vec![]),
                     });
@@ -1657,12 +1658,13 @@ impl Parser {
                         body,
                         catch_var: None,
                         catch_type: None,
+                        catch_types: vec![],
                         catch_body: vec![],
                         finally_body: Some(finally_stmts),
                     });
                 }
                 self.expect(Token::Catch)?;
-                let (catch_var, catch_type) = if self.check(&Token::LParen) {
+                let (catch_var, catch_type, catch_types) = if self.check(&Token::LParen) {
                     self.advance();
                     let var = match self.advance() {
                         Some(Token::Ident(v)) => Some(v),
@@ -1670,22 +1672,25 @@ impl Parser {
                         _ => return self.bail(ParseError::UnexpectedEof),
                     };
                     // P2: catch (e: Exception) 或 catch (e: E1 | E2) 异常类型模式
+                    let mut catch_types: Vec<crate::ast::Type> = Vec::new();
                     let catch_type = if self.check(&Token::Colon) {
                         self.advance();
                         let ty = self.parse_type()?;
-                        // 跳过额外的 | Type（多异常类型 catch，取第一个类型）
+                        catch_types.push(ty.clone());
+                        // 保留多异常类型的全部类型（12.1.1(20)/(22)）。
                         while self.check(&Token::Pipe) {
                             self.advance();
-                            self.parse_type()?;
+                            let extra = self.parse_type()?;
+                            catch_types.push(extra);
                         }
                         Some(ty)
                     } else {
                         None
                     };
                     self.expect(Token::RParen)?;
-                    (var, catch_type)
+                    (var, catch_type, catch_types)
                 } else {
-                    (None, None)
+                    (None, None, Vec::new())
                 };
                 self.expect(Token::LBrace)?;
                 let mut catch_body = self.parse_stmts()?;
@@ -1716,6 +1721,7 @@ impl Parser {
                     body,
                     catch_var,
                     catch_type,
+                    catch_types,
                     catch_body,
                     finally_body,
                 })

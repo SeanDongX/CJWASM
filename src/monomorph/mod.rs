@@ -351,6 +351,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
             body,
             catch_var,
             catch_type,
+            catch_types,
             catch_body,
             finally_body,
         } => TryBlock {
@@ -364,6 +365,10 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .collect(),
             catch_var,
             catch_type: catch_type.map(|t| substitute_type(&t, subst)),
+            catch_types: catch_types
+                .into_iter()
+                .map(|t| substitute_type(&t, subst))
+                .collect(),
             catch_body: catch_body
                 .into_iter()
                 .map(|s| substitute_stmt(s, subst, rewrites))

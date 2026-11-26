@@ -645,6 +645,7 @@ impl CodeGen {
                 catch_body,
                 catch_var,
                 catch_type,
+                catch_types: _,
                 finally_body,
             } => {
                 // P6: try-with-resources — 注册资源变量为局部变量
@@ -8120,6 +8121,7 @@ impl CodeGen {
                 body,
                 catch_var,
                 catch_type,
+                catch_types: _,
                 catch_body,
                 finally_body,
             } => {

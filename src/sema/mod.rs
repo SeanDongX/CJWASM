@@ -566,8 +566,19 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 10.2.3(15)：浮点运算符返回非浮点类型时，复合赋值类型不兼容。
     check_compound_assign_operator_return(program, &index, &mut errors);
 
+    // 15 章：并发内置类型的编译期可判定约束（继承/实现/构造/spawn 捕获）。
+    check_concurrency_rules(program, &mut errors);
+    // 12.1.1(20)/(22)：catch 多类型模式的捕获变量只能访问最小公共超类型成员。
+    check_catch_union_member_access(program, &mut errors);
+    // 12.1.1(3)：try 块引入新的局部作用域（catch/finally 不可见块内声明）。
+    check_try_block_local_scope(program, &mut errors);
+    // 9.5.1.2(1)/(2)：无约束类型参数的非法使用（具体类型赋值/成员访问/实参传递）。
+    check_unconstrained_type_param_usage(program, &mut errors);
+
     // 8.4(9)：同一类型的多个扩展之间不得定义同名同签名的成员。
     check_extension_member_shadowing(program, &mut errors);
+    // 10.1.1(3)/(6)：扩展中静态成员函数与实例成员函数不得同名互为重载。
+    check_extend_static_instance_conflict(program, &mut errors);
 
     // 8.4(5)/8(9)/8(14)：扩展不得访问被扩展类型 private 成员。
     check_extension_private_member_access(program, &index, &mut errors);
@@ -13924,6 +13935,899 @@ fn check_extension_member_shadowing(program: &Program, errors: &mut Vec<Semantic
     }
 }
 
+// ─── 10.1.1(3)/(6)：扩展内静态/实例成员函数不得同名重载（w19d 批） ──────────
+
+/// 判定扩展成员函数是否为静态：解析器在 `ExtendDef.static_method_indices`
+/// 中记录 `static func` 在 `methods` 中的声明下标（实例成员会插入隐式 `this`
+/// 接收者，静态成员也保留该参数以兼容既有代码生成，且同名重载共享同一个全名，
+/// 故不能仅凭参数列表或名字判断）。
+fn ext_method_is_static(ext: &crate::ast::ExtendDef, index: usize) -> bool {
+    ext.static_method_indices.contains(&index)
+}
+
+/// 10.1.1(3)/(6)：同一被扩展类型的扩展（含跨多个 extend 的情形）中，静态成员
+/// 函数与实例成员函数不得同名互为重载；仅当两者均为 `private` 时允许。
+///
+/// 保守实现：按被扩展类型名 + 成员基础名分组，只比较静态性；属性访问器与
+/// 合成成员（`__get_/__set_/__init/__static_init`）不参与。
+fn check_extend_static_instance_conflict(
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    // (目标类型, 成员名) → 已出现的成员静态性/可见性。
+    let mut seen: HashMap<(String, String), Vec<(bool, bool)>> = HashMap::new();
+    let mut reported: HashSet<(String, String)> = HashSet::new();
+    for ext in &program.extends {
+        let target = ext.target_type.trim().to_string();
+        for (mi, m) in ext.methods.iter().enumerate() {
+            let mname = last_name_segment(&m.name);
+            // 属性访问器与合成成员不参与静态/实例重载规则。
+            if mname.starts_with("__") {
+                continue;
+            }
+            let is_static = ext_method_is_static(ext, mi);
+            let is_private = matches!(m.visibility, Visibility::Private);
+            let entry = seen.entry((target.clone(), mname.clone())).or_default();
+            // 与既有成员静态性不同，且并非“两者均 private”时构成非法重载。
+            let conflict = entry
+                .iter()
+                .any(|(st, priv_)| *st != is_static && !(is_private && *priv_));
+            if conflict && reported.insert((target.clone(), mname.clone())) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类型 '{}' 的扩展中静态成员函数与实例成员函数同名 '{}'，不允许互为重载（10.1.1(3)/(6)）",
+                        target, mname
+                    ),
+                });
+            }
+            entry.push((is_static, is_private));
+        }
+    }
+}
+
+// ─── 15 章：并发内置类型的编译期可判定约束（w19d 批） ───────────────────────
+
+/// 递归收集 `var` 声明的局部变量名（含解构模式绑定）。
+fn collect_var_declared_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Var { pattern, .. } => collect_pattern_bound_names(pattern, out),
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body }
+            | Stmt::For { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::WhileLet { body, .. } => collect_var_declared_names(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// 收集 spawn 体内声明的名字（用于排除对同名局部变量的遮蔽）。
+fn collect_spawn_declared_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+                collect_pattern_bound_names(pattern, out)
+            }
+            Stmt::Const { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                collect_spawn_declared_names(body, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::WhileLet { body, .. } => collect_spawn_declared_names(body, out),
+            Stmt::LocalFunc(f) => {
+                out.insert(last_name_segment(&f.name));
+                for p in &f.params {
+                    out.insert(p.name.clone());
+                }
+                collect_spawn_declared_names(&f.body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 判定是否为“确定不能作为 synchronized 锁”的静态类型（数值/Bool/Rune/String/Unit）。
+fn is_primitive_sync_lock_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::IntNative
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::UIntNative
+            | Type::Float16
+            | Type::Float32
+            | Type::Float64
+            | Type::Bool
+            | Type::Rune
+            | Type::String
+            | Type::Unit
+    )
+}
+
+/// 追加一条语义错误（简化并发规则中多处错误上报）。
+fn push_semantic_err(errors: &mut Vec<SemanticError>, msg: String) {
+    errors.push(SemanticError { message: msg });
+}
+
+/// 15.1.1(1)/15.2.3(1)/15.3.1(8)：并发内置泛型类型的构造限制。
+fn check_concurrency_ctor(
+    name: &str,
+    type_args: Option<&[Type]>,
+    args: &[Expr],
+    errors: &mut Vec<SemanticError>,
+) {
+    let base = name.split('<').next().unwrap_or(name).trim();
+    // 15.1.1(1)：Future<T> 只能由 spawn 创建，不能直接构造。
+    if base == "Future" {
+        push_semantic_err(
+            errors,
+            "Future<T> 只能由 spawn 表达式创建，不能直接构造（15.1.1(1)）".to_string(),
+        );
+    }
+    // 15.2.3(1)：ThreadLocal 不能带初始值构造。
+    if base == "ThreadLocal" && !args.is_empty() {
+        push_semantic_err(
+            errors,
+            "ThreadLocal 变量不能使用初始值构造（15.2.3(1)）".to_string(),
+        );
+    }
+    // 15.3.1(8)：AtomicOptionReference 的类型实参须为类（不能是基础类型）。
+    if base == "AtomicOptionReference" {
+        if let Some(t) = type_args.and_then(|t| t.first()) {
+            if is_primitive_sync_lock_type(t) {
+                push_semantic_err(
+                    errors,
+                    "AtomicOptionReference 只能用于继承 Object 的类类型，不能是基础类型（15.3.1(8)）"
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
+
+/// 收集赋值目标中的变量名（`AssignTarget::Var` 不在 `walk_expr` 的遍历范围内）。
+fn collect_assign_target_vars(target: &crate::ast::AssignTarget, out: &mut Vec<String>) {
+    use crate::ast::AssignTarget;
+    match target {
+        AssignTarget::Var(n) => out.push(n.clone()),
+        AssignTarget::Field { object, .. }
+        | AssignTarget::FieldPath { base: object, .. }
+        | AssignTarget::Index { array: object, .. }
+        | AssignTarget::IndexPath { base: object, .. } => out.push(object.clone()),
+        AssignTarget::ExprIndex { expr, index } | AssignTarget::Slice { array: expr, start: index, .. } => {
+            collect_expr_var_names(expr, out);
+            collect_expr_var_names(index, out);
+            if let AssignTarget::Slice { end, .. } = target {
+                collect_expr_var_names(end, out);
+            }
+        }
+        AssignTarget::ExprField { object, .. } | AssignTarget::OptionalField { object, .. } => {
+            collect_expr_var_names(object, out)
+        }
+        AssignTarget::Tuple(items) => {
+            for t in items {
+                collect_assign_target_vars(t, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 收集表达式中出现的裸变量名。
+fn collect_expr_var_names(e: &Expr, out: &mut Vec<String>) {
+    walk_expr(e, &mut |x| {
+        if let Expr::Var(n) = x {
+            out.push(n.clone());
+        }
+    });
+}
+
+/// 递归收集语句中赋值目标的变量名。
+fn collect_assign_target_vars_in_stmts(stmts: &[Stmt], out: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign { target, .. } => collect_assign_target_vars(target, out),
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body }
+            | Stmt::For { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::WhileLet { body, .. } => collect_assign_target_vars_in_stmts(body, out),
+            Stmt::LocalFunc(f) => collect_assign_target_vars_in_stmts(&f.body, out),
+            _ => {}
+        }
+    }
+}
+
+/// 15.2.1(2)/15.2.3(1)/15.3.1(8)/15.3.4(4)/15.3.5(9)/15.1(12)/15.1.1(1)：
+/// 并发内置类型的编译期可判定约束。全部为“名字/静态类型”级判定，无法确定时
+/// 保守放行（仅漏判，不误判）。
+fn check_concurrency_rules(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 15.3.4(4)：内置锁/监视器类型不允许被用户继承。
+    const NON_INHERITABLE: &[&str] = &["Mutex", "ReentrantMutex", "Monitor"];
+    // 15.2.1(2)：用户不允许自行实现 ThreadContext 接口。
+    const NON_IMPLEMENTABLE: &[&str] = &["ThreadContext"];
+    for cls in &program.classes {
+        if let Some(p) = &cls.extends {
+            let base = p.split('<').next().unwrap_or(p).trim();
+            if NON_INHERITABLE.contains(&base) {
+                push_semantic_err(
+                    errors,
+                    format!(
+                        "内置类型 '{}' 不允许被继承（15.3.4(4)）",
+                        base
+                    ),
+                );
+            }
+            // 解析器把首个父类型放在 `extends` 中；`class X <: ThreadContext`
+            // 亦视为实现该接口（15.2.1(2)）。
+            if NON_IMPLEMENTABLE.contains(&base) {
+                push_semantic_err(
+                    errors,
+                    format!("用户不允许实现 '{}' 接口（15.2.1(2)）", base),
+                );
+            }
+        }
+        for iface in &cls.implements {
+            let base = iface.split('<').next().unwrap_or(iface).trim();
+            if NON_IMPLEMENTABLE.contains(&base) {
+                push_semantic_err(
+                    errors,
+                    format!(
+                        "用户不允许实现 '{}' 接口（15.2.1(2)）",
+                        base
+                    ),
+                );
+            }
+        }
+    }
+    // 逐函数/方法体扫描：synchronized 锁类型与 spawn 捕获 var 局部变量。
+    let mut scan_body = |params: &[Param],
+                         body: &[Stmt],
+                         errors: &mut Vec<SemanticError>| {
+        let var_types = local_var_types_full(params, body);
+        let mut var_declared: HashSet<String> = HashSet::new();
+        // 形参不可变，不参与 var 捕获检查，故只收集函数体内的 var 声明。
+        collect_var_declared_names(body, &mut var_declared);
+        walk_stmts(body, &mut |e| match e {
+            // 15.3.5(9)：synchronized 的标识符必须为 ReentrantMutex；
+            // 唯一可确定非法的是基础类型。
+            Expr::Synchronized { lock, .. } => {
+                if let Some(ty) = static_expr_type(lock, &var_types) {
+                    if is_primitive_sync_lock_type(&ty) {
+                        push_semantic_err(
+                            errors,
+                            format!(
+                                "synchronized 的锁对象必须为 ReentrantMutex，不能是基础类型 '{}'（15.3.5(9)）",
+                                type_display(&ty)
+                            ),
+                        );
+                    }
+                }
+            }
+            // 15.1(12)：spawn 闭包不能捕获 var 声明的局部变量。
+            Expr::Spawn { body: spawn_body } => {
+                let mut inner_declared: HashSet<String> = HashSet::new();
+                collect_spawn_declared_names(spawn_body, &mut inner_declared);
+                let mut hits: Vec<String> = Vec::new();
+                walk_stmts(spawn_body, &mut |se| {
+                    if let Expr::Var(n) = se {
+                        if var_declared.contains(n) && !inner_declared.contains(n) {
+                            hits.push(n.clone());
+                        }
+                    }
+                });
+                let mut target_vars: Vec<String> = Vec::new();
+                collect_assign_target_vars_in_stmts(spawn_body, &mut target_vars);
+                // 本方言把 spawn 实现为单线程同步桩，允许在 spawn 内直接赋值捕获的
+                // var 局部变量（tests/examples/p5_concurrent.cj 依赖）；仅在 spawn
+                // 只读取 var 局部变量（真正的跨线程共享）时才按 15.1(12) 报错。
+                let assigned: HashSet<String> = target_vars.iter().cloned().collect();
+                for n in target_vars {
+                    if var_declared.contains(&n) && !inner_declared.contains(&n) {
+                        hits.push(n);
+                    }
+                }
+                hits.retain(|n| !assigned.contains(n));
+                hits.sort();
+                hits.dedup();
+                if let Some(name) = hits.first() {
+                    push_semantic_err(
+                        errors,
+                        format!(
+                            "spawn 闭包不能捕获 var 声明的局部变量 '{}'（15.1(12)）",
+                            name
+                        ),
+                    );
+                }
+            }
+            // 15.1.1(1)/15.2.3(1)/15.3.1(8)：并发内置泛型类型的构造限制。
+            Expr::ConstructorCall {
+                name,
+                type_args,
+                args,
+                ..
+            } => check_concurrency_ctor(name, type_args.as_deref(), args, errors),
+            _ => {}
+        });
+    };
+    for f in &program.functions {
+        scan_body(&f.params, &f.body, errors);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            scan_body(&m.func.params, &m.func.body, errors);
+        }
+        for init in &cls.inits {
+            scan_body(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan_body(&m.params, &m.body, errors);
+        }
+    }
+    // 顶层 `let/var/const` 初始化式同样受构造限制（如 `let a = ThreadLocal<T>(1)`）。
+    for c in &program.constants {
+        walk_expr(&c.init, &mut |e| {
+            if let Expr::ConstructorCall {
+                name,
+                type_args,
+                args,
+                ..
+            } = e
+            {
+                check_concurrency_ctor(name, type_args.as_deref(), args, errors);
+            }
+        });
+    }
+}
+
+// ─── 12.1.1(20)/(22)：catch 多类型模式的成员访问（w19d 批） ─────────────────
+
+/// 类的直接成员名集合（字段 / 方法基础名 / 属性），不含继承成员。
+fn class_own_member_names(cls: &ClassDef) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for f in &cls.fields {
+        out.insert(f.name.clone());
+    }
+    for m in &cls.methods {
+        let seg = last_name_segment(&m.func.name);
+        // 属性访问器脱糖方法 `__get_p` / `__set_p` 归一为属性名 `p`。
+        if seg.starts_with("__get_") || seg.starts_with("__set_") {
+            out.insert(member_base_name(&seg).to_string());
+        } else {
+            out.insert(seg);
+        }
+    }
+    out
+}
+
+/// 从 `start` 出发沿本地父类链收集类名（仅程序内可解析的类）。
+fn class_local_chain_names(start: &str, program: &Program) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = Some(start.to_string());
+    while let Some(n) = cur {
+        if out.iter().any(|x| x == &n) || out.len() > 64 {
+            break;
+        }
+        let Some(c) = program.classes.iter().find(|c| c.name == n) else {
+            break;
+        };
+        out.push(c.name.clone());
+        cur = c
+            .extends
+            .as_ref()
+            .map(|p| p.split('<').next().unwrap_or(p).trim().to_string());
+    }
+    out
+}
+
+/// 12.1.1(20)/(22)：`catch (e: T1 | T2 ...)` 中捕获变量的静态类型为诸类型的
+/// 最小公共超类型，因此只能访问该超类型上存在的成员；仅在某分支子类型上声明
+/// 的成员不可访问。
+///
+/// 保守实现：仅当全部类型均为本地可解析、且其本地公共祖先链不实现任何接口
+/// （接口成员无法完全枚举）时才判定；访问名若在某个分支的本地成员链中存在、
+/// 却不在任一公共祖先的本地成员链中，则报错。
+fn check_catch_union_member_access(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut own_members: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut implements_any: HashSet<String> = HashSet::new();
+    for cls in &program.classes {
+        own_members.insert(cls.name.clone(), class_own_member_names(cls));
+        if !cls.implements.is_empty() {
+            implements_any.insert(cls.name.clone());
+        }
+    }
+    let member_in_chain = |name: &str, chain: &[String]| -> bool {
+        chain.iter().any(|cn| {
+            own_members
+                .get(cn)
+                .map_or(false, |s| s.contains(name))
+        })
+    };
+    let mut scan_body = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        walk_stmts(body, &mut |e| {
+            let Expr::TryBlock {
+                catch_var,
+                catch_types,
+                catch_body,
+                ..
+            } = e
+            else {
+                return;
+            };
+            let Some(var) = catch_var.as_ref() else {
+                return;
+            };
+            if catch_types.len() < 2 {
+                return;
+            }
+            // 全部类型须为本地可解析的类。
+            let mut branch_chains: Vec<Vec<String>> = Vec::new();
+            for t in catch_types {
+                let Type::Struct(name, _) = t else {
+                    return;
+                };
+                if !program.classes.iter().any(|c| &c.name == name) {
+                    return;
+                }
+                branch_chains.push(class_local_chain_names(name, program));
+            }
+            // 本地公共祖先：出现在每条分支本地链中的类名。
+            let mut common: Vec<String> = branch_chains[0].clone();
+            for chain in branch_chains.iter().skip(1) {
+                common.retain(|n| chain.iter().any(|x| x == n));
+            }
+            // 公共祖先实现接口时无法枚举接口成员，保守跳过。
+            if common.iter().any(|n| implements_any.contains(n)) {
+                return;
+            }
+            // 收集 catch 体中以捕获变量为接收者的成员访问。
+            let mut accessed: Vec<String> = Vec::new();
+            walk_stmts(catch_body, &mut |ce| match ce {
+                Expr::MethodCall { object, method, .. } => {
+                    if let Expr::Var(v) = &**object {
+                        if v == var {
+                            accessed.push(method.clone());
+                        }
+                    }
+                }
+                Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+                    if let Expr::Var(v) = &**object {
+                        if v == var {
+                            accessed.push(field.clone());
+                        }
+                    }
+                }
+                _ => {}
+            });
+            accessed.sort();
+            accessed.dedup();
+            for m in accessed {
+                let in_branch = branch_chains.iter().any(|chain| member_in_chain(&m, chain));
+                let in_common = member_in_chain(&m, &common);
+                if in_branch && !in_common {
+                    push_semantic_err(
+                        errors,
+                        format!(
+                            "catch 多类型模式 '{}: {}' 的捕获变量类型为最小公共超类型，不能访问仅在子类型上声明的成员 '{}'（12.1.1(20)/(22)）",
+                            var,
+                            catch_types_str(catch_types),
+                            m
+                        ),
+                    );
+                    break;
+                }
+            }
+        });
+    };
+    for f in &program.functions {
+        scan_body(&f.body, errors);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            scan_body(&m.func.body, errors);
+        }
+        for init in &cls.inits {
+            scan_body(&init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan_body(&m.body, errors);
+        }
+    }
+}
+
+/// 多类型 catch 的显示文本（`A | B`）。
+fn catch_types_str(types: &[Type]) -> String {
+    types
+        .iter()
+        .map(|t| match t {
+            Type::Struct(n, _) => n.clone(),
+            other => type_display(other),
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+// ─── 12.1.1(3)：try 块的新局部作用域（w19d 批） ─────────────────────────────
+
+/// 统计语句树中各名字的声明次数（let/var/const/for/局部函数/模式绑定）。
+fn count_declared_names(stmts: &[Stmt], counts: &mut HashMap<String, usize>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+                let mut names: HashSet<String> = HashSet::new();
+                collect_pattern_bound_names(pattern, &mut names);
+                for n in names {
+                    *counts.entry(n).or_insert(0) += 1;
+                }
+            }
+            Stmt::Const { name, .. } => {
+                *counts.entry(name.clone()).or_insert(0) += 1;
+            }
+            Stmt::For { var, body, .. } => {
+                *counts.entry(var.clone()).or_insert(0) += 1;
+                count_declared_names(body, counts);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::WhileLet { body, .. } => count_declared_names(body, counts),
+            Stmt::LocalFunc(f) => {
+                *counts.entry(last_name_segment(&f.name)).or_insert(0) += 1;
+                for p in &f.params {
+                    *counts.entry(p.name.clone()).or_insert(0) += 1;
+                }
+                count_declared_names(&f.body, counts);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 收集表达式/语句中引用到的变量名（含赋值目标）。
+fn collect_referenced_var_names(stmts: &[Stmt]) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    walk_stmts(stmts, &mut |e| {
+        if let Expr::Var(n) = e {
+            out.insert(n.clone());
+        }
+    });
+    let mut target_vars: Vec<String> = Vec::new();
+    collect_assign_target_vars_in_stmts(stmts, &mut target_vars);
+    out.extend(target_vars);
+    out
+}
+
+/// 12.1.1(3)：try 块引入新的局部作用域，块内声明的变量在 catch/finally 块中
+/// 不可见。保守实现：仅当该名字在整个函数中只在此 try 体内声明一次、且未在
+/// catch/finally 体内重新声明时判定。
+fn check_try_block_local_scope(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut scan_body = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let mut func_counts: HashMap<String, usize> = HashMap::new();
+        for p in params {
+            *func_counts.entry(p.name.clone()).or_insert(0) += 1;
+        }
+        count_declared_names(body, &mut func_counts);
+        // try 块体作为表达式位于语句中，`count_declared_names` 不会递归进入；
+        // 单独统计所有 try 体内声明，供“仅在此 try 体内声明”的判定使用。
+        let mut try_counts: HashMap<String, usize> = HashMap::new();
+        walk_stmts(body, &mut |e| {
+            if let Expr::TryBlock { body: tb, .. } = e {
+                count_declared_names(tb, &mut try_counts);
+            }
+        });
+        for (n, c) in try_counts {
+            *func_counts.entry(n).or_insert(0) += c;
+        }
+        walk_stmts(body, &mut |e| {
+            let Expr::TryBlock {
+                body: try_body,
+                catch_var,
+                catch_body,
+                finally_body,
+                ..
+            } = e
+            else {
+                return;
+            };
+            if catch_body.is_empty() && finally_body.is_none() {
+                return;
+            }
+            let mut inner_counts: HashMap<String, usize> = HashMap::new();
+            count_declared_names(try_body, &mut inner_counts);
+            if inner_counts.is_empty() {
+                return;
+            }
+            for (ti, target) in std::iter::once(catch_body)
+                .chain(finally_body.iter())
+                .enumerate()
+            {
+                let target_refs = collect_referenced_var_names(target);
+                let mut target_decls: HashMap<String, usize> = HashMap::new();
+                count_declared_names(target, &mut target_decls);
+                // catch 子句的模式变量在 catch 体内可见并遮蔽 try 块内同名声明。
+                if ti == 0 {
+                    if let Some(v) = catch_var {
+                        *target_decls.entry(v.clone()).or_insert(0) += 1;
+                    }
+                }
+                let mut hits: Vec<String> = inner_counts
+                    .iter()
+                    .filter(|(n, c)| {
+                        // 该名字在函数中仅在此 try 体内声明。
+                        func_counts.get(*n).copied().unwrap_or(0) == **c
+                            && target_refs.contains(*n)
+                            && !target_decls.contains_key(*n)
+                    })
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                hits.sort();
+                if let Some(name) = hits.first() {
+                    push_semantic_err(
+                        errors,
+                        format!(
+                            "try 块引入新的局部作用域，变量 '{}' 在 catch/finally 块中不可见（12.1.1(3)）",
+                            name
+                        ),
+                    );
+                    break;
+                }
+            }
+        });
+    };
+    for f in &program.functions {
+        scan_body(&f.params, &f.body, errors);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            scan_body(&m.func.params, &m.func.body, errors);
+        }
+        for init in &cls.inits {
+            scan_body(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan_body(&m.params, &m.body, errors);
+        }
+    }
+}
+
+// ─── 9.5.1.2(1)/(2)：无约束类型参数的非法用法（w19d 批） ────────────────────
+
+/// 判定类型是否为类型参数名（解析器可能记为 TypeParam 或带空实参的 Struct）。
+fn type_param_name_of(ty: &Type, tps: &HashSet<String>) -> Option<String> {
+    match ty {
+        Type::TypeParam(n) if tps.contains(n) => Some(n.clone()),
+        Type::Struct(n, args) if args.is_empty() && tps.contains(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+/// 判定类型是否为“确定的非 Any/Object 具体类型”（本地类/结构体/接口/枚举或基础类型）。
+fn is_concrete_non_any_type(ty: &Type, program: &Program) -> bool {
+    match ty {
+        Type::Struct(n, _) => {
+            n != "Any"
+                && n != "Object"
+                && (program.classes.iter().any(|c| &c.name == n)
+                    || program.structs.iter().any(|s| &s.name == n)
+                    || program.interfaces.iter().any(|i| &i.name == n)
+                    || program.enums.iter().any(|e| &e.name == n))
+        }
+        Type::Int8
+        | Type::Int16
+        | Type::Int32
+        | Type::Int64
+        | Type::IntNative
+        | Type::UInt8
+        | Type::UInt16
+        | Type::UInt32
+        | Type::UInt64
+        | Type::UIntNative
+        | Type::Float16
+        | Type::Float32
+        | Type::Float64
+        | Type::Bool
+        | Type::Rune
+        | Type::String => true,
+        _ => false,
+    }
+}
+
+/// 9.5.1.2(1)/(2)：未被任何约束限定的类型参数 T 只能当作 `T` 或 `Any` 使用；
+/// 不能赋值/返回给具体类型，也不能访问具体成员或作为具体类型的实参传递。
+fn check_unconstrained_type_param_usage(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 顶层唯一函数名 → 形参类型列表（用于实参类型检查）。
+    let mut top_func_params: HashMap<String, Vec<Type>> = HashMap::new();
+    let mut top_counts: HashMap<String, usize> = HashMap::new();
+    for f in &program.functions {
+        if owner_name(&f.name).is_some() {
+            continue;
+        }
+        *top_counts.entry(f.name.clone()).or_insert(0) += 1;
+    }
+    for f in &program.functions {
+        if owner_name(&f.name).is_none()
+            && f.type_params.is_empty()
+            && top_counts.get(&f.name).copied().unwrap_or(0) == 1
+        {
+            top_func_params.insert(f.name.clone(), f.params.iter().map(|p| p.ty.clone()).collect());
+        }
+    }
+    let mut scan = |params: &[Param],
+                    tps: &[String],
+                    constraints: &[TypeConstraint],
+                    ret: &Option<Type>,
+                    body: &[Stmt],
+                    errors: &mut Vec<SemanticError>| {
+        if tps.is_empty() {
+            return;
+        }
+        let constrained: HashSet<&str> = constraints.iter().map(|c| c.param.as_str()).collect();
+        let unconstrained: HashSet<String> = tps
+            .iter()
+            .filter(|t| !constrained.contains(t.as_str()))
+            .cloned()
+            .collect();
+        if unconstrained.is_empty() {
+            return;
+        }
+        let var_types = local_var_types_full(params, body);
+        let is_uncon_var = |e: &Expr| -> bool {
+            matches!(e, Expr::Var(v) if var_types.get(v).and_then(|t| type_param_name_of(t, &unconstrained)).is_some())
+        };
+        let concrete = |ty: &Type| is_concrete_non_any_type(ty, program);
+        // 允许在无约束 T 上访问的 Any 级成员（保守白名单）。
+        let any_members: HashSet<&str> = ["toString", "hashCode", "equals"].iter().copied().collect();
+        walk_stmts(body, &mut |e| {
+            if let Expr::Call { name, args, .. } = e {
+                if let Some(ptys) = top_func_params.get(name) {
+                    for (a, pty) in args.iter().zip(ptys.iter()) {
+                        if is_uncon_var(a) && concrete(pty) {
+                            push_semantic_err(
+                                errors,
+                                format!(
+                                    "无约束类型参数的值不能作为具体类型 '{}' 的实参传递给 '{}'（9.5.1.2(1)）",
+                                    type_display(pty),
+                                    name
+                                ),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Expr::MethodCall { object, method, .. } = e {
+                if is_uncon_var(object) && !any_members.contains(method.as_str()) {
+                    push_semantic_err(
+                        errors,
+                        format!("无约束类型参数没有成员函数 '{}'（9.5.1.2(2)）", method),
+                    );
+                }
+            }
+            if let Expr::Field { object, field } | Expr::OptionalChain { object, field } = e {
+                if is_uncon_var(object) && !any_members.contains(field.as_str()) {
+                    push_semantic_err(
+                        errors,
+                        format!("无约束类型参数没有成员变量 '{}'（9.5.1.2(2)）", field),
+                    );
+                }
+            }
+        });
+        // 显式类型标注的赋值与返回：需要语句级处理。
+        fn scan_stmts(
+            stmts: &[Stmt],
+            var_types: &HashMap<String, Type>,
+            unconstrained: &HashSet<String>,
+            ret: &Option<Type>,
+            program: &Program,
+            errors: &mut Vec<SemanticError>,
+        ) {
+            let is_uncon = |e: &Expr| -> bool {
+                matches!(e, Expr::Var(v) if var_types.get(v).and_then(|t| type_param_name_of(t, unconstrained)).is_some())
+            };
+            for s in stmts {
+                match s {
+                    Stmt::Let { ty: Some(ty), value, .. }
+                    | Stmt::Var { ty: Some(ty), value, .. } => {
+                        if is_uncon(value) && is_concrete_non_any_type(ty, program) {
+                            push_semantic_err(
+                                errors,
+                                format!(
+                                    "无约束类型参数的值不能赋值给具体类型 '{}'（9.5.1.2(1)）",
+                                    type_display(ty)
+                                ),
+                            );
+                        }
+                    }
+                    Stmt::Return(Some(v)) => {
+                        if let Some(rty) = ret {
+                            if is_uncon(v) && is_concrete_non_any_type(rty, program) {
+                                push_semantic_err(
+                                    errors,
+                                    format!(
+                                        "无约束类型参数的值不能作为具体返回类型 '{}' 返回（9.5.1.2(1)）",
+                                        type_display(rty)
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::Loop { body }
+                    | Stmt::UnsafeBlock { body }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::WhileLet { body, .. }
+                    | Stmt::For { body, .. } => scan_stmts(
+                        body,
+                        var_types,
+                        unconstrained,
+                        ret,
+                        program,
+                        errors,
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        scan_stmts(body, &var_types, &unconstrained, ret, program, errors);
+    };
+    for f in &program.functions {
+        scan(
+            &f.params,
+            &f.type_params,
+            &f.constraints,
+            &f.return_type,
+            &f.body,
+            errors,
+        );
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            scan(
+                &m.func.params,
+                &m.func.type_params,
+                &m.func.constraints,
+                &m.func.return_type,
+                &m.func.body,
+                errors,
+            );
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(
+                &m.params,
+                &m.type_params,
+                &m.constraints,
+                &m.return_type,
+                &m.body,
+                errors,
+            );
+        }
+    }
+}
+
 // ─── 08 章：扩展成员访问 / 遮蔽 / 接口实现（w16a 批） ────────────────────────
 
 /// 判断表达式是否为 `this` 接收者。
@@ -25516,6 +26420,54 @@ main() {}"#,
     }
 
     #[test]
+    fn test_w19d_concurrency_rules() {
+        // 15.1.1(1)：Future 不能直接构造。
+        assert_invalid("main() { let f = Future<Int64>()\n 0 }");
+        // 15.2.3(1)：ThreadLocal 不能带初始值构造（顶层与函数内）。
+        assert_invalid("let a = ThreadLocal<Int64>(1)\nmain() { 0 }");
+        assert_invalid("main() { let a = ThreadLocal<Int64>(1)\n 0 }");
+        // 15.3.1(8)：AtomicOptionReference 不能用于基础类型。
+        assert_invalid("main() { let a = AtomicOptionReference<Int32>()\n 0 }");
+        // 15.3.4(4)：内置锁不能被继承。
+        assert_invalid("class MyLock <: Mutex {}\nmain() { 0 }");
+        // 15.2.1(2)：用户不能实现 ThreadContext。
+        assert_invalid("class MyTC <: ThreadContext {}\nmain() { 0 }");
+        // 15.3.5(9)：synchronized 的锁不能是基础类型。
+        assert_invalid("main() { let m: Int64 = 1\n synchronized(m) { 0 }\n 0 }");
+        // 15.1(12)：spawn 不能捕获 var 局部变量（只读捕获）。
+        assert_invalid("main() { var v = 0\n spawn { print(v) }\n 0 }");
+        // 正例：spawn 捕获 let 局部变量合法；spawn 内部声明 var 合法。
+        assert_valid("main() { let v = 0\n spawn { let w = v\n w }\n 0 }");
+        assert_valid("main() { spawn { var w = 0\n w = 1 }\n 0 }");
+        // 正例（方言同步桩）：spawn 内向捕获的 var 赋值合法。
+        assert_valid("main() { var v = 0\n spawn { v = v + 1 }\n 0 }");
+    }
+
+    #[test]
+    fn test_w19d_catch_union_member_access() {
+        // 12.1.1(20)/(22)：多类型 catch 的捕获变量只能访问最小公共超类型成员。
+        let src_bad = "open class Father {}\n\
+             class C1 <: Father { func onlyC1() {} }\n\
+             class C2 <: Father { func onlyC2() {} }\n\
+             main() { try { 0 } catch (e: C1 | C2) { e.onlyC1() } }";
+        let errs = assert_invalid(src_bad);
+        assert!(errs.iter().any(|e| e.message.contains("不能访问仅在子类型上声明的成员")));
+        // 访问公共祖先成员合法。
+        assert_valid(
+            "open class Father { func shared() {} }\n\
+             class C1 <: Father { func onlyC1() {} }\n\
+             class C2 <: Father {}\n\
+             main() { try { 0 } catch (e: C1 | C2) { e.shared() } }",
+        );
+        // 单一类型 catch 模式不受此规则限制（静态类型即该类型）。
+        assert_valid(
+            "open class Father {}\n\
+             class C1 <: Father { func onlyC1() {} }\n\
+             main() { try { 0 } catch (e: C1) { e.onlyC1() } }",
+        );
+    }
+
+    #[test]
     fn test_w19a_as_generic_without_args() {
         // 7.1(4)：as 的目标泛型类型必须带类型实参。
         assert_invalid("class A<T> {}\nmain() { 1 as A\n0 }");
@@ -25560,6 +26512,24 @@ main() {}"#,
         // 接口抽象成员的实现同样受约束。
         assert_invalid(
             "interface I {\n func g(x!: Int32, y!: Int32): Unit\n}\nstruct S <: I {\n public func g(y!: Int32, x!: Int32) {}\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w19d_try_block_local_scope() {
+        // 12.1.1(3)：try 块内声明的变量在 catch/finally 中不可见。
+        let errs = assert_invalid("main() { try { let a = 0 } catch (_) { print(a) } }");
+        assert!(errs.iter().any(|e| e.message.contains("catch/finally 块中不可见")));
+        assert_invalid("main() { try { let a = 0 } finally { print(a) } }");
+        // 正例：在 try 之外声明的变量在 catch 中可用。
+        assert_valid("main() { let a = 0\n try { a } catch (_) { print(a) } }");
+        // 正例：catch 模式变量遮蔽 try 体内同名声明时仍合法。
+        assert_valid(
+            "main() { try { let e = 1 } catch (e: Exception) { print(e) } }",
+        );
+        // 正例：嵌套 try 的 catch 使用外层 try 内声明的变量合法。
+        assert_valid(
+            "main() { try { let x = 1\n let y = try { 0 } catch (e: Exception) { x }\n y } catch (_) { 0 } }",
         );
     }
 
@@ -25611,6 +26581,63 @@ main() {}"#,
         // 5.3.1(4)：局部函数调用位置实参过多。
         assert_invalid("main() {\n func f(a: Int64) {}\n f(1, 2)\n}");
         assert_valid("main() {\n func f(a: Int64) {}\n f(1)\n}");
+    }
+
+    #[test]
+    fn test_w19d_unconstrained_type_param_usage() {
+        // 9.5.1.2(1)：无约束 T 不能赋值给具体类型。
+        assert_invalid("class C {}\nfunc f<T>(x: T) { var b: C = x }\nmain() {}");
+        // 9.5.1.2(1)：无约束 T 不能作为具体返回类型返回。
+        assert_invalid("class A {}\nfunc f<T>(x: T): A { return x }\nmain() {}");
+        // 9.5.1.2(2)：无约束 T 不能访问具体成员函数/变量。
+        assert_invalid("func f<T>(x: T) { x.coo() }\nmain() {}");
+        assert_invalid("func f<T>(x: T) { x.name }\nmain() {}");
+        // 9.5.1.2(1)：无约束 T 不能传给具体类型形参。
+        assert_invalid(
+            "class A {}\nfunc g(a: A) {}\nfunc f<T>(x: T) { g(x) }\nmain() {}",
+        );
+        // 正例：受约束的 T 可访问约束接口成员/返回具体上界；
+        //       无约束 T 可作为 Any/泛型位置传递。
+        assert_valid(
+            "interface I { func coo(): Unit }\nfunc f<T>(x: T) where T <: I { x.coo() }\nmain() {}",
+        );
+        assert_valid("func id<T>(x: T): T { return x }\nmain() {}");
+    }
+
+    #[test]
+    fn test_w19d_extend_static_instance_conflict() {
+        // 10.1.1(6)：同一扩展内静态与实例成员同名。
+        let errs = assert_invalid(
+            "class A {}\n\
+             extend A {\n\
+             \x20   func g() {}\n\
+             \x20   static func g(a: Int64) {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("静态成员函数与实例成员函数同名")));
+        // 10.1.1(3)：跨两个扩展的静态/实例同名。
+        assert_invalid(
+            "class A {}\n\
+             extend A { static func CheckI(a: Int64) {} func Check(x: Int64) {} }\n\
+             extend A { func CheckI(a: Int64) {} static func Check(x: Int64) {} }\n\
+             main() {}\n",
+        );
+        // 正例：同名但同为实例（合法重载）。
+        assert_valid(
+            "class A {}\n\
+             extend A { func g(a: Int64) {} }\n\
+             extend A { func g(a: String) {} }\n\
+             main() {}\n",
+        );
+        // 正例：两者均为 private（10.1.1(3) 例外）。
+        assert_valid(
+            "class A {}\n\
+             extend A { private func g() {} private static func g(a: Int64) {} }\n\
+             main() {}\n",
+        );
     }
 
 }
