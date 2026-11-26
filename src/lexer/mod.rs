@@ -187,6 +187,27 @@ fn trailing_dot_malformed(lex: &logos::Lexer<Token>) -> bool {
     )
 }
 
+/// 整数字面量后紧跟 `.e<数字>` / `.E<数字>`（可带负号）视为非法的浮点形式
+/// （规范 1.3.2 负例：`1.e2`、`123.e2`、`4142.e-5`——小数点后缺少数位）。
+///
+/// 只匹配 `.` + e/E + 可选 `-` + 数字，`42.toString`、`1.5` 等不受影响。
+fn dot_exponent_malformed(lex: &logos::Lexer<Token>) -> bool {
+    let mut it = lex.remainder().chars();
+    if it.next() != Some('.') {
+        return false;
+    }
+    match it.next() {
+        Some('e') | Some('E') => {
+            let mut rest = it;
+            if rest.clone().next() == Some('-') {
+                rest.next();
+            }
+            matches!(rest.next(), Some(c) if c.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
 /// 跳过（并消耗）一个仓颉块注释，支持任意层嵌套（规范 1.5(2)）。
 ///
 /// `/*` 已由 token 匹配消耗，remainder() 为注释正文起点。返回 Skip 时
@@ -422,6 +443,11 @@ fn lex_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, Vec<String
             let mut brace_depth = 1;
             let expr_start = pos;
             while pos < bytes.len() && brace_depth > 0 {
+                // 规范 2.1.6.2(5)：单行字符串的插值表达式内不允许换行
+                // （多行字符串 """...""" 的同类表达式由 lex_multiline_string 处理）。
+                if bytes[pos] == b'\n' || bytes[pos] == b'\r' {
+                    return None;
+                }
                 match bytes[pos] {
                     b'{' => brace_depth += 1,
                     b'}' => brace_depth -= 1,
@@ -873,6 +899,9 @@ pub enum Token {
         if leading_zero_invalid(lex, &s) {
             return None; // 前导零非法（`01`）
         }
+        if dot_exponent_malformed(lex) {
+            return None; // `.e2` / `.E-5` 等小数点后缺少数位（`1.e2`）
+        }
         parse_integer_literal(&s)
     })]
     Integer(i64),
@@ -908,6 +937,9 @@ pub enum Token {
                 let body = &s[..s.len() - suf.len()];
                 if leading_zero_invalid(lex, body) {
                     return None; // 前导零非法（`01u8`）
+                }
+                if dot_exponent_malformed(lex) {
+                    return None; // `1u8.e2` 小数点后缺少数位
                 }
                 if let Some(v) = parse_integer_literal(body) {
                     return Some((v, ty));
@@ -2200,5 +2232,27 @@ mod batch04_tests {
         assert_eq!(err_count("let a = 0"), 0);
         assert_eq!(err_count("let a = 0.5"), 0);
         assert_eq!(err_count("let a = 0O177"), 0);
+    }
+
+    #[test]
+    fn test_w19a_dot_exponent_without_fraction() {
+        let err_count = |s: &str| Lexer::new(s).filter(|r| r.is_err()).count();
+        // 规范 1.3.2 负例：小数点后直接接指数。
+        assert!(err_count("let a = 1.e2") > 0);
+        assert!(err_count("let a = 123.e2") > 0);
+        assert!(err_count("let a = 4142.e-5") > 0);
+        // 正例：正常浮点与成员访问不影响。
+        assert_eq!(err_count("let a = 1.5"), 0);
+        assert_eq!(err_count("let a = 1.5e2"), 0);
+        assert_eq!(err_count("let a = 42.toString") , 0);
+    }
+
+    #[test]
+    fn test_w19a_single_line_interpolation_no_newline() {
+        let err_count = |s: &str| Lexer::new(s).filter(|r| r.is_err()).count();
+        // 2.1.6.2(5)：单行字符串的插值表达式内不允许换行。
+        assert!(err_count("let a = \"x${\n1 + 2\n}\"") > 0);
+        // 正例：同一行插值。
+        assert_eq!(err_count("let a = \"x${1 + 2}\""), 0);
     }
 }

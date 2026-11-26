@@ -497,6 +497,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     }
     for en in &program.enums {
         check_enum_variants(en, &mut errors);
+        // 2.1.11(9)：enum 不能被枚举继承（`enum B <: A`，A 为 enum 或预声明 Option）。
+        check_enum_inheritance(en, &index, &mut errors);
         check_enum_interfaces(en, program, &index, &mut errors);
         // 6.3.3(1)：enum 成员不得遮蔽父接口同名成员。
         check_enum_member_shadowing(en, program, &index, &mut errors);
@@ -594,6 +596,27 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 4.5.4(6)/4.7(6)/(7)/(10)：break/continue 必须在（同一函数的）循环体内，
     // return 必须在函数体内（不能出现在字段默认值 / 顶层初始化式 / 嵌套函数外）。
     check_control_transfer_placement(program, &mut errors);
+
+    // 4.5.1(3)：for-in 迭代模式必须不可反驳。
+    check_for_in_iteration_patterns(program, &mut errors);
+
+    // 2.4.1(2)：类型别名右侧引用的类型必须可见（无 import 的单文件程序）。
+    check_type_alias_targets(program, &mut errors);
+
+    // 2.1.1(6)：整数除法/取模的除数为字面量 0。
+    check_div_mod_literal_zero(program, &mut errors);
+
+    // 4.13.1：不能通过 super 访问父类的静态成员。
+    check_super_static_member(program, &index, &mut errors);
+
+    // 7.1(4)：as 的目标泛型类型必须带类型实参。
+    check_as_generic_without_args(program, &index, &mut errors);
+
+    // 4.8：数值类型转换必须带操作数。
+    check_numeric_conversion_without_operand(program, &mut errors);
+
+    // 4.8：括号包裹的类型名不能被调用。
+    check_parenthesized_type_invocation(program, &mut errors);
 
     // 10.2.3(4)-(14)：运算符重载函数的参数个数须与运算符元数一致；
     // `&&` / `||` 不支持重载。
@@ -6640,7 +6663,7 @@ fn check_class_supertypes(
 fn check_supertype_declaration_kinds(
     cls: &ClassDef,
     program: &Program,
-    _index: &ProgramIndex<'_>,
+    index: &ProgramIndex<'_>,
     errors: &mut Vec<SemanticError>,
 ) {
     let is_global_value_name = |n: &str| -> bool {
@@ -6656,6 +6679,14 @@ fn check_supertype_declaration_kinds(
                 message: format!(
                     "类 '{}' 不能以范围类型作为父类（6.1.1(4)）",
                     cls.name
+                ),
+            });
+        } else if parent == "Option" || index.enums.contains(parent) {
+            // 2.1.11(9)：enum 类型不能被继承（包括预声明 Option 枚举）。
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 不能继承枚举类型 '{}'（2.1.11(9)）",
+                    cls.name, parent
                 ),
             });
         } else if is_global_value_name(parent) {
@@ -8049,8 +8080,37 @@ fn check_interface_inherited_kind_shadowing(
     }
 }
 
+fn check_enum_inheritance(
+    en: &EnumDef,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 解析器把 `enum B <: A` 的父类型记录为以枚举自身为 param 的约束。
+    // 仅当被继承者是枚举（本地 enum 或预声明 Option）时报错；接口实现不受影响。
+    for c in &en.constraints {
+        if c.param != en.name {
+            continue;
+        }
+        for b in &c.bounds {
+            if b == "Option" || index.enums.contains(b.as_str()) {
+                errors.push(SemanticError {
+                    message: format!("枚举 '{}' 不能继承枚举类型 '{}'（2.1.11(9)）", en.name, b),
+                });
+            }
+        }
+    }
+}
+
 fn check_enum_variants(en: &EnumDef, errors: &mut Vec<SemanticError>) {
-    // 同名但载荷类型不同的构造器是合法的重载；仅同名同载荷构成重定义。
+    // 2.1.11(5)：同名构造器必须具有不同的参数个数；同名且参数个数相同构成重定义
+    // （无论参数类型是否相同，如 `F(Rune) | F(String)` 非法）。
+    fn arity(payload: &Option<Type>) -> usize {
+        match payload {
+            None => 0,
+            Some(Type::Tuple(ts)) => ts.len(),
+            Some(_) => 1,
+        }
+    }
     for i in 0..en.variants.len() {
         for j in (i + 1)..en.variants.len() {
             let a = &en.variants[i];
@@ -8058,15 +8118,12 @@ fn check_enum_variants(en: &EnumDef, errors: &mut Vec<SemanticError>) {
             if a.name != b.name {
                 continue;
             }
-            let payload_key = |p: &Option<Type>| -> String {
-                match p {
-                    Some(t) => canon_type(t, &en.type_params, &mut HashMap::new()),
-                    None => "()".to_string(),
-                }
-            };
-            if payload_key(&a.payload) == payload_key(&b.payload) {
+            if arity(&a.payload) == arity(&b.payload) {
                 errors.push(SemanticError {
-                    message: format!("枚举 '{}' 中构造器 '{}' 被重复定义", en.name, a.name),
+                    message: format!(
+                        "枚举 '{}' 中构造器 '{}' 被重复定义（同名构造器参数个数须不同）",
+                        en.name, a.name
+                    ),
                 });
                 break;
             }
@@ -19356,6 +19413,594 @@ fn check_let_field_ctor_reassign(program: &Program, errors: &mut Vec<SemanticErr
     }
 }
 
+// ─── 4.5.1：for-in 的迭代模式必须不可反驳（irrefutable） ──────────────────
+//
+// 解析器把 `for (<复杂模式> in ...)` 解糖为循环体首条 `let <pattern> = __for_pat`。
+// 单构造器枚举的构造器模式是不可反驳的（如 `enum E { Foo(Int64) }` 的 `Foo(x)`），
+// 多构造器枚举（含 Option/Result）的构造器模式可反驳（4.5.1(3)）。
+// 保守实现：仅当枚举构造器个数可确知且 > 1 时报错；未知枚举放行。
+struct EnumCtorIndex {
+    /// 枚举名 → 构造器个数。
+    by_name: HashMap<String, usize>,
+    /// 构造器名 → 唯一所属枚举的构造器个数（多个枚举同名构造器时不记录）。
+    by_variant: HashMap<String, usize>,
+}
+
+impl EnumCtorIndex {
+    fn build(program: &Program) -> Self {
+        let mut by_name: HashMap<String, usize> = HashMap::new();
+        let mut by_variant: HashMap<String, usize> = HashMap::new();
+        let mut ambiguous: HashSet<String> = HashSet::new();
+        for en in &program.enums {
+            by_name.insert(en.name.clone(), en.variants.len());
+            for v in &en.variants {
+                if by_variant.contains_key(&v.name) {
+                    ambiguous.insert(v.name.clone());
+                } else {
+                    by_variant.insert(v.name.clone(), en.variants.len());
+                }
+            }
+        }
+        for a in ambiguous {
+            by_variant.remove(&a);
+        }
+        Self { by_name, by_variant }
+    }
+
+    fn variants_of(&self, enum_name: &str, variant_name: &str) -> Option<usize> {
+        if enum_name == "Option" || enum_name == "Result" {
+            // 预声明枚举 Option/Result 各有两个构造器。
+            return Some(2);
+        }
+        if !enum_name.is_empty() {
+            return self.by_name.get(enum_name).copied();
+        }
+        match variant_name {
+            "Some" | "None" | "Ok" | "Err" => Some(2),
+            _ => self.by_variant.get(variant_name).copied(),
+        }
+    }
+}
+
+fn pattern_refutable_in_iteration(p: &Pattern, ctors: &EnumCtorIndex) -> bool {
+    match p {
+        Pattern::Variant {
+            enum_name,
+            variant_name,
+            payload,
+        } => {
+            let multi = ctors
+                .variants_of(enum_name, variant_name)
+                .map_or(false, |n| n > 1);
+            multi
+                || payload
+                    .as_deref()
+                    .map_or(false, |q| pattern_refutable_in_iteration(q, ctors))
+        }
+        Pattern::Literal(_) | Pattern::Range { .. } | Pattern::Or(_) => true,
+        Pattern::Tuple(ps) => ps.iter().any(|q| pattern_refutable_in_iteration(q, ctors)),
+        Pattern::Struct { fields, .. } => fields
+            .iter()
+            .any(|(_, q)| pattern_refutable_in_iteration(q, ctors)),
+        Pattern::Wildcard | Pattern::Binding(_) | Pattern::TypeTest { .. } | Pattern::Field { .. }
+        | Pattern::Guard(_) => false,
+    }
+}
+
+fn scan_for_in_patterns(
+    stmts: &[Stmt],
+    ctors: &EnumCtorIndex,
+    errors: &mut Vec<SemanticError>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::For { body, .. } => {
+                if let Some(Stmt::Let { pattern, .. }) = body.first() {
+                    if pattern_refutable_in_iteration(pattern, ctors) {
+                        errors.push(SemanticError {
+                            message: "for-in 的迭代模式必须是不可反驳模式（4.5.1(3)）".to_string(),
+                        });
+                    }
+                }
+                scan_for_in_patterns(body, ctors, errors);
+            }
+            Stmt::While { body, .. }
+            | Stmt::WhileLet { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => scan_for_in_patterns(body, ctors, errors),
+            Stmt::Expr(Expr::Block(inner, _)) => scan_for_in_patterns(inner, ctors, errors),
+            _ => {}
+        }
+    }
+}
+
+fn check_for_in_iteration_patterns(program: &Program, errors: &mut Vec<SemanticError>) {
+    let ctors = EnumCtorIndex::build(program);
+    for f in &program.functions {
+        scan_for_in_patterns(&f.body, &ctors, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan_for_in_patterns(&init.body, &ctors, errors);
+        }
+        for m in &c.methods {
+            scan_for_in_patterns(&m.func.body, &ctors, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan_for_in_patterns(&init.body, &ctors, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan_for_in_patterns(&m.body, &ctors, errors);
+        }
+    }
+}
+
+// ─── 2.4.1：类型别名右侧引用的类型必须可见 ────────────────────────────────
+fn is_predeclared_type_name(name: &str) -> bool {
+    is_builtin_type_name(name)
+        || matches!(
+            name,
+            "Int"
+                | "UInt"
+                | "Unit"
+                | "Nothing"
+                | "Any"
+                | "Object"
+                | "Option"
+                | "Result"
+                | "Range"
+                | "Tuple"
+                | "Map"
+                | "Slice"
+                | "Iterable"
+                | "Collection"
+                | "Iterator"
+                | "ToString"
+                | "Equatable"
+                | "Comparable"
+                | "Hashable"
+                | "Ordering"
+                | "Exception"
+                | "Error"
+                | "Duration"
+                | "CPointer"
+                | "CString"
+                | "CType"
+        )
+}
+
+fn check_type_alias_targets(program: &Program, errors: &mut Vec<SemanticError>) {
+    if !imports_allow_undefined_check(program) {
+        return;
+    }
+    let mut known: HashSet<&str> = HashSet::new();
+    for c in &program.classes {
+        known.insert(c.name.as_str());
+    }
+    for s in &program.structs {
+        known.insert(s.name.as_str());
+    }
+    for i in &program.interfaces {
+        known.insert(i.name.as_str());
+    }
+    for e in &program.enums {
+        known.insert(e.name.as_str());
+    }
+    for (n, _) in &program.type_aliases {
+        known.insert(n.as_str());
+    }
+    fn collect_unknown(ty: &Type, known: &HashSet<&str>, out: &mut Vec<String>) {
+        match ty {
+            Type::Struct(n, args) => {
+                if !known.contains(n.as_str()) && !is_predeclared_type_name(n) {
+                    out.push(n.clone());
+                }
+                for a in args {
+                    collect_unknown(a, known, out);
+                }
+            }
+            Type::Array(t) | Type::Option(t) | Type::Slice(t) => collect_unknown(t, known, out),
+            Type::Result(a, b) | Type::Map(a, b) => {
+                collect_unknown(a, known, out);
+                collect_unknown(b, known, out);
+            }
+            Type::Tuple(ts) => {
+                for t in ts {
+                    collect_unknown(t, known, out);
+                }
+            }
+            Type::Function { params, ret } => {
+                for p in params {
+                    collect_unknown(p, known, out);
+                }
+                if let Some(r) = ret.as_ref() {
+                    collect_unknown(r, known, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (name, ty) in &program.type_aliases {
+        let mut unknown = Vec::new();
+        collect_unknown(ty, &known, &mut unknown);
+        if let Some(u) = unknown.first() {
+            errors.push(SemanticError {
+                message: format!(
+                    "类型别名 '{}' 引用了未声明的类型 '{}'（2.4.1(2)）",
+                    name, u
+                ),
+            });
+        }
+    }
+}
+
+// ─── 2.1.1：常量除零 / 取模零 ────────────────────────────────────────────
+fn is_integer_type_name(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::IntNative
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::UIntNative
+    ) || matches!(
+        ty,
+        Type::Struct(n, _)
+            if matches!(n.as_str(), "Int" | "UInt")
+    )
+}
+
+fn is_int_zero_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Integer(0) | Expr::IntegerSuffixed(0, _))
+}
+
+fn expr_static_int(e: &Expr, int_vars: &HashMap<String, bool>) -> bool {
+    use crate::ast::BinOp;
+    match e {
+        Expr::Integer(_) | Expr::IntegerSuffixed(_, _) => true,
+        Expr::Var(n) => int_vars.get(n).copied().unwrap_or(false),
+        Expr::Unary { op, expr } => {
+            matches!(op, crate::ast::UnaryOp::Neg | crate::ast::UnaryOp::BitNot)
+                && expr_static_int(expr, int_vars)
+        }
+        Expr::Binary { op, left, right } => {
+            matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr
+            ) && expr_static_int(left, int_vars)
+                && expr_static_int(right, int_vars)
+        }
+        Expr::Cast { target_ty, .. } => is_integer_type_name(target_ty),
+        _ => false,
+    }
+}
+
+fn int_var_map(stmts: &[Stmt], params: &[Param]) -> HashMap<String, bool> {
+    let mut map: HashMap<String, bool> = HashMap::new();
+    let mut conflicts: HashSet<String> = HashSet::new();
+    for p in params {
+        if is_integer_type_name(&p.ty) {
+            map.insert(p.name.clone(), true);
+        }
+    }
+    fn add(map: &mut HashMap<String, bool>, conflicts: &mut HashSet<String>, n: &str, v: bool) {
+        if let Some(existing) = map.get(n) {
+            if *existing != v {
+                conflicts.insert(n.to_string());
+            }
+        } else {
+            map.insert(n.to_string(), v);
+        }
+    }
+    fn walk(stmts: &[Stmt], map: &mut HashMap<String, bool>, conflicts: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Let {
+                    pattern: Pattern::Binding(n),
+                    ty,
+                    value,
+                    ..
+                }
+                | Stmt::Var {
+                    pattern: Pattern::Binding(n),
+                    ty,
+                    value,
+                    ..
+                } => {
+                    let is_int = match ty {
+                        Some(t) => is_integer_type_name(t),
+                        None => expr_static_int(value, map),
+                    };
+                    add(map, conflicts, n, is_int);
+                }
+                Stmt::For { body, .. }
+                | Stmt::While { body, .. }
+                | Stmt::WhileLet { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body } => walk(body, map, conflicts),
+                Stmt::Expr(Expr::Block(inner, _)) => walk(inner, map, conflicts),
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, &mut map, &mut conflicts);
+    for c in conflicts {
+        map.remove(&c);
+    }
+    map
+}
+
+fn scan_div_zero(stmts: &[Stmt], params: &[Param], errors: &mut Vec<SemanticError>) {
+    let int_vars = int_var_map(stmts, params);
+    walk_stmts(stmts, &mut |e| {
+        if let Expr::Binary { op, left, right } = e {
+            use crate::ast::BinOp;
+            if matches!(op, BinOp::Div | BinOp::Mod)
+                && is_int_zero_literal(right)
+                && expr_static_int(left, &int_vars)
+            {
+                errors.push(SemanticError {
+                    message: "整数除法/取模的除数不能是字面量 0（2.1.1(6)）".to_string(),
+                });
+            }
+        }
+    });
+}
+
+fn check_div_mod_literal_zero(program: &Program, errors: &mut Vec<SemanticError>) {
+    for f in &program.functions {
+        scan_div_zero(&f.body, &f.params, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan_div_zero(&init.body, &init.params, errors);
+        }
+        for m in &c.methods {
+            scan_div_zero(&m.func.body, &m.func.params, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan_div_zero(&init.body, &init.params, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan_div_zero(&m.body, &m.params, errors);
+        }
+    }
+}
+
+// ─── 4.13.1：不能通过 super 访问父类的静态成员 ──────────────────────────
+fn check_super_static_member(program: &Program, index: &ProgramIndex<'_>, errors: &mut Vec<SemanticError>) {
+    for cls in &program.classes {
+        let Some(parent_name) = cls.extends.as_deref() else {
+            continue;
+        };
+        let Some(parent) = index.classes.get(parent_name) else {
+            continue;
+        };
+        let static_fields: HashSet<&str> = parent
+            .fields
+            .iter()
+            .filter(|f| f.is_static)
+            .map(|f| f.name.as_str())
+            .collect();
+        let static_methods: HashSet<String> = parent
+            .methods
+            .iter()
+            .filter(|m| m.is_static)
+            .map(|m| {
+                m.func
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&m.func.name)
+                    .to_string()
+            })
+            .collect();
+        let on_body = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+            walk_stmts(body, &mut |e| {
+                if let Expr::SuperFieldAccess { field } = e {
+                    if static_fields.contains(field.as_str()) || static_methods.contains(field) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "不能通过 super 访问父类 '{}' 的静态成员 '{}'（4.13.1）",
+                                parent_name, field
+                            ),
+                        });
+                    }
+                }
+            });
+        };
+        for init in &cls.inits {
+            on_body(&init.body, errors);
+        }
+        for m in &cls.methods {
+            on_body(&m.func.body, errors);
+        }
+    }
+}
+
+// ─── 2.1.11 / 7.1：as 的目标类型不能省略泛型实参 ─────────────────────────
+fn check_as_generic_without_args(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut scan = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        walk_stmts(body, &mut |e| {
+            if let Expr::Cast { target_ty, .. } = e {
+                if let Type::Struct(name, args) = target_ty {
+                    if args.is_empty()
+                        && index
+                            .type_params
+                            .get(name.as_str())
+                            .map_or(false, |tps| !tps.is_empty())
+                    {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "'as' 的目标泛型类型 '{}' 必须指定类型实参（7.1(4)）",
+                                name
+                            ),
+                        });
+                    }
+                }
+            }
+        });
+    };
+    for f in &program.functions {
+        scan(&f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.body, errors);
+        }
+    }
+}
+
+// ─── 4.8：数值类型转换必须带一个操作数（`Int64()` 非法） ─────────────────
+fn check_numeric_conversion_without_operand(program: &Program, errors: &mut Vec<SemanticError>) {
+    let is_numeric = |n: &str| {
+        matches!(
+            n,
+            "Int8"
+                | "Int16"
+                | "Int32"
+                | "Int64"
+                | "IntNative"
+                | "UInt8"
+                | "UInt16"
+                | "UInt32"
+                | "UInt64"
+                | "UIntNative"
+                | "Float16"
+                | "Float32"
+                | "Float64"
+        )
+    };
+    let mut scan = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        walk_stmts(body, &mut |e| {
+            let (name, args, nargs) = match e {
+                Expr::Call {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } => (name, args, named_args),
+                Expr::ConstructorCall {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } => (name, args, named_args),
+                _ => return,
+            };
+            if args.is_empty() && nargs.is_empty() && is_numeric(name) {
+                errors.push(SemanticError {
+                    message: format!("数值类型转换 '{}()' 缺少操作数（4.8）", name),
+                });
+            }
+        });
+    };
+    for f in &program.functions {
+        scan(&f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.body, errors);
+        }
+    }
+}
+
+// ─── 4.8：括号包裹的类型名不能被调用（`(Int32)(x)` 非法） ────────────────
+fn check_parenthesized_type_invocation(program: &Program, errors: &mut Vec<SemanticError>) {
+    let is_type_name = |n: &str| is_builtin_type_name(n) || matches!(n, "Int" | "UInt");
+    let mut scan = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        walk_stmts(body, &mut |e| {
+            if let Expr::Invoke { callee, .. } = e {
+                if let Expr::Var(n) = callee.as_ref() {
+                    if is_type_name(n) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "括号包裹的类型名 '({})' 不能被当作函数调用（4.8）",
+                                n
+                            ),
+                        });
+                    }
+                }
+            }
+        });
+    };
+    for f in &program.functions {
+        scan(&f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.body, errors);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -23574,6 +24219,87 @@ main() {}"#,
         // 正例：匹配任一重载；变长（Array）形参吸收任意个数。
         assert_valid("func f(x: Int64) {}\nfunc f(x: Int64, y: Int64) {}\nmain() { f(1, 2) }");
         assert_valid("func f(arr: Array<Int64>) {}\nmain() { f(1, 2, 3) }");
+    }
+
+    // ─── w19a：04_expressions / 02_types 第五轮新增校验 ─────────────────────
+
+    #[test]
+    fn test_w19a_enum_variant_arity_duplicate() {
+        // 2.1.11(5)：同名构造器参数个数相同 → 重定义（即便类型不同）。
+        let errs = assert_invalid("enum E {\n | F(Rune) | F(String)\n}\nmain() {}");
+        assert!(errs.iter().any(|e| e.message.contains("重复定义")));
+        // 正例：同名不同参数个数是合法重载。
+        assert_valid("enum E {\n | F | F(Int32) | F(Int32, Rune)\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w19a_enum_cannot_be_inherited() {
+        // 2.1.11(9)：enum 不能被继承。
+        assert_invalid("enum A { A1 }\nenum B <: A { B1 }\nmain() {}");
+        assert_invalid("class C <: Option<String> {}\nmain() {}");
+        // 正例：枚举实现接口不受影响。
+        assert_valid("interface I {}\nenum E <: I { A }\nmain() {}");
+    }
+
+    #[test]
+    fn test_w19a_for_in_irrefutable_pattern() {
+        // 4.5.1(3)：Option 的构造器模式可反驳，不能用作 for-in 迭代模式。
+        assert_invalid("main() { for (Some(x) in [Some(1), Some(1)]) { } }");
+        // 正例：单构造器枚举的构造器模式不可反驳。
+        assert_valid("enum E { Foo(Int64) }\nmain() { for (Foo(x) in [Foo(1)]) { } }");
+        // 正例：普通元组解构。
+        assert_valid("main() { for ((a, b) in [(1, 2)]) { } }");
+    }
+
+    #[test]
+    fn test_w19a_type_alias_target_visibility() {
+        // 2.4.1(2)：别名右侧引用未声明的类型。
+        assert_invalid("type SimpleTypeName = AVeryLongUnintuitiveName\nmain(): Unit {}");
+        // 正例：内建类型与本地类型别名均可。
+        assert_valid("type MyInt = Int64\nmain(): Unit {}");
+        assert_valid("class Base {}\ntype Alias = Base\nmain(): Unit {}");
+    }
+
+    #[test]
+    fn test_w19a_div_mod_literal_zero() {
+        // 2.1.1(6)：整数除零/取模零。
+        assert_invalid("main() { let a: Int64 = 4\nlet b = a / 0 }");
+        assert_invalid("main() { var a = 6i32\nlet b = a % 0 }");
+        // 正例：浮点除零、非零除数。
+        assert_valid("main() { let a = 4.0\nlet b = a / 0.0 }");
+        assert_valid("main() { let a: Int64 = 4\nlet b = a / 2 }");
+    }
+
+    #[test]
+    fn test_w19a_super_static_member() {
+        // 4.13.1：不能通过 super 访问父类静态成员。
+        assert_invalid(
+            "open class C1 { static var x: Int64 = 1 }\nclass C2 <: C1 { func t() { let a = super.x } }\nmain() {}",
+        );
+        assert_invalid(
+            "open class C1 { static func foo() {} }\nclass C2 <: C1 { func t() { let f = super.foo } }\nmain() {}",
+        );
+        // 正例：super 访问实例字段。
+        assert_valid(
+            "open class C1 { var x: Int64 = 1 }\nclass C2 <: C1 { func t() { let a = super.x } }\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w19a_as_generic_without_args() {
+        // 7.1(4)：as 的目标泛型类型必须带类型实参。
+        assert_invalid("class A<T> {}\nmain() { 1 as A\n0 }");
+        // 正例：显式类型实参、非泛型类型。
+        assert_valid("class A<T> {}\nmain() { let x: Int64 = 1\n0 }");
+    }
+
+    #[test]
+    fn test_w19a_numeric_conversion_without_operand() {
+        // 4.8：数值类型转换必须带操作数。
+        assert_invalid("main() { let x = Int64() }");
+        assert_valid("main() { let x = Int64(1) }");
+        // 4.8：括号包裹的类型名不能被调用。
+        assert_invalid("main(): Unit { var a = (Int32)(8_i8) }");
     }
 
 }

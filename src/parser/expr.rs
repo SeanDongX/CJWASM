@@ -356,8 +356,7 @@ impl Parser {
     }
 
     /// 解析一元表达式 (!, -)
-    pub(crate) fn parse_unary(&mut self) -> Result<Expr, ParseErrorAt> {
-        if matches!(self.peek(), Some(Token::Bang)) {
+    pub(crate) fn parse_unary(&mut self) -> Result<Expr, ParseErrorAt> {        if matches!(self.peek(), Some(Token::Bang)) {
             self.advance();
             let expr = self.parse_unary()?;
             return Ok(Expr::Unary {
@@ -403,14 +402,143 @@ impl Parser {
         if matches!(self.peek(), Some(Token::Incr)) {
             self.advance();
             let expr = self.parse_unary()?;
+            if !Self::is_incr_decr_target(&expr) {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Incr,
+                    "'++' 只能作用于后缀表达式形式的左值（4.14(3)）".to_string(),
+                ));
+            }
             return Ok(Expr::PrefixIncr(Box::new(expr)));
         }
         if matches!(self.peek(), Some(Token::Decr)) {
             self.advance();
             let expr = self.parse_unary()?;
+            if !Self::is_incr_decr_target(&expr) {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Decr,
+                    "'--' 只能作用于后缀表达式形式的左值（4.14(4)）".to_string(),
+                ));
+            }
             return Ok(Expr::PrefixDecr(Box::new(expr)));
         }
         self.parse_postfix()
+    }
+
+    /// `++` / `--` 只能作用于后缀表达式形式左值：
+    /// 变量、字段访问、下标访问、元组索引、可选链字段、super 字段（4.14(3)/(4)）。
+    fn is_incr_decr_target(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Var(_)
+                | Expr::Field { .. }
+                | Expr::Index { .. }
+                | Expr::TupleIndex { .. }
+                | Expr::OptionalChain { .. }
+                | Expr::SuperFieldAccess { .. }
+                // 转换调用 / as 转换：交由语义检查给出“自增/自减只能作用于整数变量”诊断。
+                | Expr::Call { .. }
+                | Expr::ConstructorCall { .. }
+                | Expr::Cast { .. }
+        )
+    }
+
+    /// 表达式内（不跨越嵌套 lambda）是否出现 break/continue。
+    /// 用于决定 `{ => body }()` 是否可直接内联：含控制转移时保留 λ 结构。
+    fn expr_has_break_continue(e: &Expr) -> bool {
+        match e {
+            Expr::Break | Expr::Continue => true,
+            Expr::Lambda { .. } => false,
+            Expr::Block(stmts, tail) => {
+                Self::stmts_have_break_continue(stmts)
+                    || tail
+                        .as_deref()
+                        .map_or(false, |t| Self::expr_has_break_continue(t))
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                Self::expr_has_break_continue(cond)
+                    || Self::expr_has_break_continue(then_branch)
+                    || else_branch
+                        .as_deref()
+                        .map_or(false, |e| Self::expr_has_break_continue(e))
+            }
+            Expr::IfLet {
+                expr,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::expr_has_break_continue(expr)
+                    || Self::expr_has_break_continue(then_branch)
+                    || else_branch
+                        .as_deref()
+                        .map_or(false, |e| Self::expr_has_break_continue(e))
+            }
+            Expr::Match { expr, arms } => {
+                Self::expr_has_break_continue(expr)
+                    || arms
+                        .iter()
+                        .any(|a| Self::expr_has_break_continue(&a.body))
+            }
+            Expr::TryBlock {
+                body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                Self::stmts_have_break_continue(body)
+                    || Self::stmts_have_break_continue(catch_body)
+                    || finally_body
+                        .as_ref()
+                        .map_or(false, |f| Self::stmts_have_break_continue(f))
+            }
+            _ => false,
+        }
+    }
+
+    /// 语句块内（不跨越嵌套 lambda/局部函数）是否出现 break/continue。
+    fn stmts_have_break_continue(stmts: &[Stmt]) -> bool {
+        for s in stmts {
+            let hit = match s {
+                Stmt::Break | Stmt::Continue => true,
+                Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Const { value, .. } => {
+                    Self::expr_has_break_continue(value)
+                }
+                Stmt::Assign { value, .. } => Self::expr_has_break_continue(value),
+                Stmt::Expr(e) => Self::expr_has_break_continue(e),
+                Stmt::Return(v) => v
+                    .as_ref()
+                    .map_or(false, |e| Self::expr_has_break_continue(e)),
+                Stmt::While { cond, body } => {
+                    Self::expr_has_break_continue(cond) || Self::stmts_have_break_continue(body)
+                }
+                Stmt::WhileLet { expr, body, .. } => {
+                    Self::expr_has_break_continue(expr) || Self::stmts_have_break_continue(body)
+                }
+                Stmt::DoWhile { body, cond } => {
+                    Self::stmts_have_break_continue(body) || Self::expr_has_break_continue(cond)
+                }
+                Stmt::For {
+                    iterable, body, ..
+                } => {
+                    Self::expr_has_break_continue(iterable)
+                        || Self::stmts_have_break_continue(body)
+                }
+                Stmt::Loop { body } => Self::stmts_have_break_continue(body),
+                Stmt::UnsafeBlock { body } => Self::stmts_have_break_continue(body),
+                Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                    Self::expr_has_break_continue(left) || Self::expr_has_break_continue(right)
+                }
+                Stmt::LocalFunc(_) => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
     }
 
     /// 解析后缀表达式 (数组访问, 字段访问, 方法调用)
@@ -432,6 +560,17 @@ impl Parser {
                             let (args, named_args) = self.parse_args()?;
                             self.expect(Token::RParen)?;
                             if args.is_empty() && named_args.is_empty() {
+                                // 4.5.4(6)/4.7(6)：循环不得跨越 lambda 边界。
+                                // 若 lambda 体内出现 break/continue，保留 λ 调用结构，
+                                // 由语义检查判定其不在同一函数的循环体内。
+                                if Self::expr_has_break_continue(body) {
+                                    expr = Expr::Invoke {
+                                        callee: Box::new(expr),
+                                        args,
+                                        named_args,
+                                    };
+                                    continue;
+                                }
                                 expr = (**body).clone();
                                 continue;
                             }
@@ -719,6 +858,13 @@ impl Parser {
                             "'++' 不满足结合性，不能连续使用".to_string(),
                         ));
                     }
+                    // 4.14(3)：`++` 只能作用于后缀表达式形式的左值（如 `(p+q)++` 非法）。
+                    if !Self::is_incr_decr_target(&expr) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Incr,
+                            "'++' 只能作用于后缀表达式形式的左值（4.14(3)）".to_string(),
+                        ));
+                    }
                     self.advance();
                     expr = Expr::PostfixIncr(Box::new(expr));
                 }
@@ -728,6 +874,13 @@ impl Parser {
                         return self.bail(ParseError::UnexpectedToken(
                             Token::Decr,
                             "'--' 不满足结合性，不能连续使用".to_string(),
+                        ));
+                    }
+                    // 4.14(4)：`--` 只能作用于后缀表达式形式的左值（含 `i--++` 等链式）。
+                    if !Self::is_incr_decr_target(&expr) {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Decr,
+                            "'--' 只能作用于后缀表达式形式的左值（4.14(4)）".to_string(),
                         ));
                     }
                     self.advance();
@@ -3412,5 +3565,67 @@ main() { Test.f<Array<Int64>>(1) }
         parse_ok_only("func f(a: Int32, b!: Int32) { }\nmain() { f(6, b: 12) }");
         // 命名实参重复非法。
         parse_err_only("func f(a!: Int32) { }\nmain() { f(a: 1, a: 2) }");
+    }
+
+    #[test]
+    fn test_w19a_incr_decr_only_on_postfix_lvalue() {
+        // 4.14(3)/(4)：++/-- 只能作用于后缀表达式形式的左值。
+        parse_err_only("main() { var p = 3\nvar q = 4\n(p + q)++ }");
+        parse_err_only("main() { var p = 3\nvar q = 4\n(p + q)-- }");
+        parse_err_only("main() { var i: Int32 = 5\ni--++ }");
+        // 正例：变量与下标/字段左值。
+        parse_ok_only("main() { var x: Int64 = 1\nx++ }");
+        parse_ok_only("main() { var a = [1, 2]\na[0]++ }");
+    }
+
+    #[test]
+    fn test_w19a_lambda_immediate_call_not_inlined_with_break() {
+        use crate::ast::{Expr, Stmt};
+        use crate::lexer::Lexer;
+        use crate::parser::Parser;
+        /// 解析后是否仍保留 `λ(...)` 形式的调用（即未被内联）。
+        fn has_lambda_invocation(src: &str) -> bool {
+            fn in_stmts(stmts: &[Stmt]) -> bool {
+                stmts.iter().any(|s| match s {
+                    Stmt::For { body, .. } | Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+                        in_stmts(body)
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::WhileLet { body, .. }
+                    | Stmt::DoWhile { body, .. } => in_stmts(body),
+                    Stmt::Expr(e)
+                    | Stmt::Let { value: e, .. }
+                    | Stmt::Var { value: e, .. }
+                    | Stmt::Const { value: e, .. } => in_expr(e),
+                    _ => false,
+                })
+            }
+            fn in_expr(e: &Expr) -> bool {
+                match e {
+                    Expr::Invoke { callee, .. } => {
+                        matches!(callee.as_ref(), Expr::Lambda { .. }) || in_expr(callee)
+                    }
+                    Expr::Block(stmts, tail) => {
+                        in_stmts(stmts) || tail.as_deref().map_or(false, in_expr)
+                    }
+                    _ => false,
+                }
+            }
+            let tokens: Result<Vec<_>, _> = Lexer::new(src).collect();
+            let tokens = tokens.expect("lex error");
+            let mut parser = Parser::new(tokens).with_source(src);
+            let program = parser.parse_program().expect("parse ok");
+            program.functions.iter().any(|f| in_stmts(&f.body))
+        }
+        // 含 break/continue 的 `{ => stmt }()` 不内联，保留 lambda 边界。
+        assert!(
+            has_lambda_invocation("main() { for (x in 1..10) { { => break } () } }"),
+            "含 break 的零参 lambda 调用不应被内联为循环体语句"
+        );
+        // 正例：普通零参 lambda 仍按既有规则内联。
+        assert!(
+            !has_lambda_invocation("main() { let a = { => 1 } () }"),
+            "普通零参 lambda 调用应内联"
+        );
     }
 }
