@@ -691,6 +691,12 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 9.3.3/9.3.4：函数/元组/类值实参的名义子类型匹配（保守版）。
     check_structured_arg_subtypes(program, &mut errors);
 
+    // 9.2：泛型枚举变体构造实参的 where 约束满足（保守版）。
+    check_enum_variant_constraint_args(program, &mut errors);
+
+    // 10.1.3.2：泛型函数转发实参类型（本地用户类形参，保守版）。
+    check_generic_forwarding_arg_types(program, &mut errors);
+
     // 5.1(13)：局部函数名不能作为赋值目标（嵌套局部函数内赋值外层局部函数名）。
     check_local_func_name_lvalue(program, &mut errors);
     // 6.1.2.1(44)：可选参数不参与重载，去掉后签名相同即冲突。
@@ -25805,6 +25811,452 @@ fn check_structured_arg_subtypes(program: &Program, errors: &mut Vec<SemanticErr
     }
 }
 
+// ─── w23b: 09.2 泛型枚举变体构造实参约束 / 10.1.3.2 泛型函数转发实参类型 ──
+
+/// 本地类型集合与直接超类型表（class: extends + implements + extend 接口；
+/// interface: parents；struct/enum: 约束中记录的父接口）。仅用于“全部本地可判定”的子类型检查。
+fn w23b_local_supertypes(
+    program: &Program,
+) -> (HashSet<String>, HashMap<String, Vec<String>>) {
+    let mut locals: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        locals.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        locals.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        locals.insert(e.name.clone());
+    }
+    for i in &program.interfaces {
+        locals.insert(i.name.clone());
+    }
+    let base = |n: &str| -> String { n.split('<').next().unwrap_or(n).trim().to_string() };
+    let mut supers: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &program.classes {
+        let mut v: Vec<String> = Vec::new();
+        if let Some(p) = &c.extends {
+            v.push(base(p));
+        }
+        for i in &c.implements {
+            v.push(base(i));
+        }
+        supers.insert(c.name.clone(), v);
+    }
+    for s in &program.structs {
+        let v: Vec<String> = s
+            .constraints
+            .iter()
+            .filter(|c| c.param == s.name)
+            .flat_map(|c| c.bounds.iter().map(|b| base(b)))
+            .collect();
+        supers.insert(s.name.clone(), v);
+    }
+    for e in &program.enums {
+        let v: Vec<String> = e
+            .constraints
+            .iter()
+            .filter(|c| c.param == e.name)
+            .flat_map(|c| c.bounds.iter().map(|b| base(b)))
+            .collect();
+        supers.insert(e.name.clone(), v);
+    }
+    for i in &program.interfaces {
+        supers.insert(i.name.clone(), i.parents.iter().map(|p| base(p)).collect());
+    }
+    for ext in &program.extends {
+        if let Some(i) = &ext.interface {
+            let t = base(&ext.target_type);
+            if !t.is_empty() {
+                supers.entry(t).or_default().push(base(i));
+            }
+        }
+    }
+    (locals, supers)
+}
+
+/// 仅当 a、b 均为本地类型且 a 的父类型闭包全部为本地类型时可判定的名义子类型。
+/// Some(true)=是 / Some(false)=确定不是 / None=无法判定（放行）。
+fn w23b_local_subtype(
+    a: &str,
+    b: &str,
+    locals: &HashSet<String>,
+    supers: &HashMap<String, Vec<String>>,
+    memo: &mut HashMap<(String, String), Option<bool>>,
+    visiting: &mut HashSet<String>,
+) -> Option<bool> {
+    if a == b {
+        return Some(true);
+    }
+    if !locals.contains(a) || !locals.contains(b) {
+        return None;
+    }
+    let key = (a.to_string(), b.to_string());
+    if let Some(v) = memo.get(&key) {
+        return *v;
+    }
+    if !visiting.insert(a.to_string()) {
+        return None;
+    }
+    let ss = match supers.get(a) {
+        Some(v) => v.clone(),
+        None => {
+            visiting.remove(a);
+            return None;
+        }
+    };
+    let mut has_true = false;
+    let mut has_none = false;
+    for s in &ss {
+        if !locals.contains(s) {
+            has_none = true;
+            continue;
+        }
+        match w23b_local_subtype(s, b, locals, supers, memo, visiting) {
+            Some(true) => {
+                has_true = true;
+                break;
+            }
+            Some(false) => {}
+            None => has_none = true,
+        }
+    }
+    visiting.remove(a);
+    let result = if has_true {
+        Some(true)
+    } else if has_none {
+        None
+    } else {
+        Some(false)
+    };
+    memo.insert(key, result);
+    result
+}
+
+/// 9.2：泛型枚举变体构造实参的 where 约束满足（保守版）。仅当变体载荷恰为单一
+/// 类型参数、实参类型可静态确定为本地类、且约束上界为本地类型时可判定；否则放行。
+fn check_enum_variant_constraint_args(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut enum_map: HashMap<&str, &EnumDef> = HashMap::new();
+    for e in &program.enums {
+        if !e.constraints.is_empty() && !e.type_params.is_empty() {
+            enum_map.insert(e.name.as_str(), e);
+        }
+    }
+    if enum_map.is_empty() {
+        return;
+    }
+    let (locals, supers) = w23b_local_supertypes(program);
+    let mut aliases: HashMap<&str, &Type> = HashMap::new();
+    for (n, t) in &program.type_aliases {
+        aliases.insert(n.as_str(), t);
+    }
+    let mut type_names: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        type_names.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        type_names.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        type_names.insert(e.name.clone());
+    }
+    for i in &program.interfaces {
+        type_names.insert(i.name.clone());
+    }
+
+    fn resolve_alias(t: &Type, aliases: &HashMap<&str, &Type>) -> Type {
+        let mut cur = t.clone();
+        for _ in 0..8 {
+            if let Type::Struct(n, _) = &cur {
+                if let Some(next) = aliases.get(n.as_str()) {
+                    cur = (*next).clone();
+                    continue;
+                }
+            }
+            break;
+        }
+        cur
+    }
+    fn arg_struct_ty(
+        e: &Expr,
+        vars: &HashMap<String, Type>,
+        aliases: &HashMap<&str, &Type>,
+        type_names: &HashSet<String>,
+    ) -> Option<Type> {
+        let raw = match e {
+            Expr::Var(v) => vars.get(v.as_str()).cloned(),
+            Expr::ConstructorCall { name, .. } => {
+                if aliases.contains_key(name.as_str()) {
+                    Some(Type::Struct(name.clone(), vec![]))
+                } else if let Some(t) = primitive_ty_by_name(name) {
+                    Some(t)
+                } else if type_names.contains(name.as_str()) {
+                    Some(Type::Struct(name.clone(), vec![]))
+                } else {
+                    None
+                }
+            }
+            Expr::IntegerSuffixed(_, s) => Some(s.ty()),
+            Expr::Integer(_) => Some(Type::Int64),
+            _ => None,
+        }?;
+        Some(resolve_alias(&raw, aliases))
+    }
+    fn conforms(
+        en: &EnumDef,
+        variant: &str,
+        at: &Type,
+        locals: &HashSet<String>,
+        supers: &HashMap<String, Vec<String>>,
+    ) -> Option<bool> {
+        let payload = en.variant_payload(variant)?;
+        let Type::TypeParam(tp) = payload else {
+            return None;
+        };
+        let Type::Struct(tn, _) = at else {
+            return None;
+        };
+        if !locals.contains(tn.as_str()) {
+            return None;
+        }
+        let mut any = false;
+        for c in &en.constraints {
+            if &c.param != tp {
+                continue;
+            }
+            for b in &c.bounds {
+                let base = b.split('<').next().unwrap_or(b).trim();
+                if !locals.contains(base) {
+                    continue;
+                }
+                any = true;
+                let mut memo = HashMap::new();
+                match w23b_local_subtype(tn, base, locals, supers, &mut memo, &mut HashSet::new()) {
+                    Some(true) => {}
+                    Some(false) => return Some(false),
+                    None => {}
+                }
+            }
+        }
+        if any {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let vars = local_var_types_full(params, body);
+        let mut local_defs: HashSet<String> = HashSet::new();
+        collect_local_def_names(body, &mut local_defs);
+        for p in params {
+            local_defs.insert(p.name.clone());
+        }
+        walk_stmts(body, &mut |e| {
+            let (en_name, variant, arg): (&str, &str, &Expr) = match e {
+                Expr::VariantConst {
+                    enum_name,
+                    variant_name,
+                    arg: Some(a),
+                } => (enum_name.as_str(), variant_name.as_str(), a.as_ref()),
+                Expr::MethodCall {
+                    object,
+                    method,
+                    args,
+                    named_args,
+                    ..
+                } if named_args.is_empty() && args.len() == 1 => {
+                    let Expr::Var(n) = object.as_ref() else {
+                        return;
+                    };
+                    if vars.contains_key(n.as_str()) || local_defs.contains(n.as_str()) {
+                        return;
+                    }
+                    (n.as_str(), method.as_str(), &args[0])
+                }
+                _ => return,
+            };
+            let Some(en) = enum_map.get(en_name) else {
+                return;
+            };
+            let Some(at) = arg_struct_ty(arg, &vars, &aliases, &type_names) else {
+                return;
+            };
+            if let Some(false) = conforms(en, variant, &at, &locals, &supers) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "枚举 '{}' 变体 '{}' 的实参类型不满足类型参数约束（9.2）",
+                        en_name, variant
+                    ),
+                });
+            }
+        });
+    };
+
+    for f in &program.functions {
+        scan(&f.params, &f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, errors);
+        }
+    }
+}
+
+/// 10.1.3.2：唯一泛型自由函数以本地用户类为形参、实参类型可静态确定时，校验实参
+/// 到形参的名义子类型。形参含类型参数或实参不可判定时放行（保守）。
+fn check_generic_forwarding_arg_types(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut free: HashMap<&str, Vec<&Function>> = HashMap::new();
+    for f in &program.functions {
+        if !f.name.contains('.') {
+            free.entry(f.name.as_str()).or_default().push(f);
+        }
+    }
+    let mut target: HashMap<&str, &Function> = HashMap::new();
+    for (n, fs) in &free {
+        if fs.len() == 1 && !fs[0].type_params.is_empty() && fs[0].extern_import.is_none() {
+            target.insert(n, fs[0]);
+        }
+    }
+    if target.is_empty() {
+        return;
+    }
+    let (locals, supers) = w23b_local_supertypes(program);
+    let mut type_names: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        type_names.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        type_names.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        type_names.insert(e.name.clone());
+    }
+    for i in &program.interfaces {
+        type_names.insert(i.name.clone());
+    }
+    let mut global_names: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        global_names.insert(c.name.clone());
+    }
+    let mut alias_names: HashSet<String> = HashSet::new();
+    for (n, _) in &program.type_aliases {
+        alias_names.insert(n.clone());
+    }
+
+    let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let vars = local_var_types_full(params, body);
+        let mut local_defs: HashSet<String> = HashSet::new();
+        collect_local_def_names(body, &mut local_defs);
+        for p in params {
+            local_defs.insert(p.name.clone());
+        }
+        walk_stmts(body, &mut |e| {
+            let Expr::Call {
+                name,
+                args,
+                named_args,
+                ..
+            } = e
+            else {
+                return;
+            };
+            if !named_args.is_empty() || name.contains('.') {
+                return;
+            }
+            let Some(f) = target.get(name.as_str()) else {
+                return;
+            };
+            if type_names.contains(name.as_str())
+                || global_names.contains(name.as_str())
+                || alias_names.contains(name.as_str())
+                || local_defs.contains(name.as_str())
+            {
+                return;
+            }
+            let ps = strip_self_params(&f.params);
+            if ps.len() != args.len() {
+                return;
+            }
+            if ps
+                .iter()
+                .any(|p| p.variadic || p.is_named || p.default.is_some())
+            {
+                return;
+            }
+            // 仅校验形参全部为本地用户 Struct 类型（含类型参数的形参一律放行）。
+            if ps.iter().any(|p| !matches!(&p.ty, Type::Struct(_, _))) {
+                return;
+            }
+            let mut ats: Vec<Type> = Vec::with_capacity(args.len());
+            for a in args {
+                match concrete_type_of_expr(a, &vars, &type_names) {
+                    Some(t) => ats.push(t),
+                    None => return,
+                }
+            }
+            let mut mismatch = false;
+            for (at, p) in ats.iter().zip(ps.iter()) {
+                let Type::Struct(tn, _) = at else {
+                    return;
+                };
+                let Type::Struct(pn, _) = &p.ty else {
+                    return;
+                };
+                let mut memo = HashMap::new();
+                match w23b_local_subtype(tn, pn, &locals, &supers, &mut memo, &mut HashSet::new()) {
+                    Some(true) => {}
+                    Some(false) => mismatch = true,
+                    None => return,
+                }
+            }
+            if mismatch {
+                errors.push(SemanticError {
+                    message: format!(
+                        "调用 '{}' 的实参类型与形参类型不匹配（泛型函数，10.1.3.2）",
+                        name
+                    ),
+                });
+            }
+        });
+    };
+
+    for f in &program.functions {
+        scan(&f.params, &f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, errors);
+        }
+    }
+}
+
 /// 5.3.1/(4)+5.3.4：方法调用的位置/命名实参必须与目标方法的形参列表匹配。
 /// 仅当方法名在文件中按签名去重后唯一时启用（避免重载/重定义歧义误判）。
 fn check_method_call_arguments(program: &Program, errors: &mut Vec<SemanticError>) {
@@ -33072,6 +33524,94 @@ main() {}"#,
              main() {\n\
              \x20   wfirst((WB1(), WB2()))\n\
              }\n",
+        );
+    }
+
+    // ─── w23b: 09.2 枚举变体约束满足 / 10.1.3.2 泛型转发实参类型 ────────────
+
+    #[test]
+    fn test_w23b_enum_variant_constraint_arg() {
+        // 9.2：枚举类型参数 T <: Animal，变体载荷为 T，实参 Car 不满足约束 → 拒绝。
+        assert_invalid(
+            "open class Animal {}\n\
+             class Dog <: Animal {}\n\
+             class Car {}\n\
+             enum GenericEnum<T> where T <: Animal { | Data(T) | Code(Int64) }\n\
+             type Ty = Car\n\
+             main() {\n\
+             \x20   var c = Ty()\n\
+             \x20   let v = match (GenericEnum.Data(c)) {\n\
+             \x20       case Data(x) => 1\n\
+             \x20       case Code(x) => 0\n\
+             \x20   }\n\
+             }\n",
+        );
+        // 实参 Dog <: Animal 满足约束 → 放行。
+        assert_valid(
+            "open class Animal {}\n\
+             class Dog <: Animal {}\n\
+             class Car {}\n\
+             enum GenericEnum<T> where T <: Animal { | Data(T) | Code(Int64) }\n\
+             type Ty = Dog\n\
+             main() {\n\
+             \x20   var c = Ty()\n\
+             \x20   let v = match (GenericEnum.Data(c)) {\n\
+             \x20       case Data(x) => 1\n\
+             \x20       case Code(x) => 0\n\
+             \x20   }\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23b_enum_variant_constraint_multi_bound() {
+        // 9.2(7)：多上界 T <: Animal & Printable；Dog 只满足 Animal，不满足 Printable → 拒绝。
+        assert_invalid(
+            "interface Printable {}\n\
+             open class Animal {}\n\
+             class Dog <: Animal {}\n\
+             enum GenericEnum<T> where T <: Animal & Printable { | Data(T) | Code(Int64) }\n\
+             main() {\n\
+             \x20   var a = Dog()\n\
+             \x20   let v = match (GenericEnum<Dog>.Data(a)) {\n\
+             \x20       case Data(x) => 1\n\
+             \x20       case Code(x) => 0\n\
+             \x20   }\n\
+             }\n",
+        );
+        // Good <: Animal & Printable 同时满足两个上界 → 放行。
+        assert_valid(
+            "interface Printable {}\n\
+             open class Animal {}\n\
+             class Good <: Animal & Printable {}\n\
+             enum GenericEnum<T> where T <: Animal & Printable { | Data(T) | Code(Int64) }\n\
+             main() {\n\
+             \x20   var g = Good()\n\
+             \x20   let v = match (GenericEnum.Data(g)) {\n\
+             \x20       case Data(x) => 1\n\
+             \x20       case Code(x) => 0\n\
+             \x20   }\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w23b_generic_forwarding_arg_mismatch() {
+        // 10.1.3.2：唯一泛型自由函数，形参为本地类 A_j1；转发实参 A_i1 不匹配 → 拒绝。
+        assert_invalid(
+            "class A_i1 {}\n\
+             class A_j1 {}\n\
+             func fj<X>(a: A_j1) {}\n\
+             func fi<X>(a: A_i1) { fj<X>(a) }\n\
+             main() {}\n",
+        );
+        // 子类型实参 Ab <: Aa 转发给形参 Aa → 放行。
+        assert_valid(
+            "open class Aa {}\n\
+             class Ab <: Aa {}\n\
+             func fg<X>(a: Aa) {}\n\
+             func fh<X>(a: Ab) { fg<X>(a) }\n\
+             main() {}\n",
         );
     }
 

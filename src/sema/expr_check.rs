@@ -4478,7 +4478,7 @@ impl<'a> Checker<'a> {
                             Expr::If {
                                 else_branch: Some(_),
                                 ..
-                            }
+                            } | Expr::Match { .. }
                         ) =>
                     {
                         self.check_expr_in_expected(value, ann.clone())
@@ -4552,7 +4552,7 @@ impl<'a> Checker<'a> {
                             Expr::If {
                                 else_branch: Some(_),
                                 ..
-                            }
+                            } | Expr::Match { .. }
                         ) =>
                     {
                         self.check_expr_in_expected(value, ann.clone())
@@ -6922,6 +6922,40 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 2.5.3(1)：本地用户类型之间的名义子类型。仅当 child 的父类型闭包全部为
+    /// 本地类型（`user_parents` 的键）时可判定；否则返回 None（保守放行）。
+    fn user_subtype_local(&self, child: &str, parent: &str) -> Option<bool> {
+        if child == parent {
+            return Some(true);
+        }
+        if !self.user_parents.contains_key(child) || !self.user_parents.contains_key(parent) {
+            return None;
+        }
+        let mut stack: Vec<&str> = vec![child];
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            if n == parent {
+                return Some(true);
+            }
+            let ps = self.user_parents.get(n)?;
+            for p in ps {
+                let base = p.split('<').next().unwrap_or(p).trim();
+                if base == parent {
+                    return Some(true);
+                }
+                if !self.user_parents.contains_key(base) {
+                    // 链上出现非本地父类型，无法确认关系。
+                    return None;
+                }
+                stack.push(base);
+            }
+        }
+        Some(false)
+    }
+
     /// 2.2.1.1(2)：数组字面量的每个元素类型须与声明的元素类型兼容。
     ///
     /// 仅在声明元素类型为内建具体类型、且元素静态类型可确定（字面量/后缀字面量
@@ -8340,6 +8374,9 @@ impl<'a> Checker<'a> {
             }
 
             Expr::Match { expr, arms } => {
+                // 2.5.3(1)：带类型标注的 match（`let x: T = match ...`）在值上下文
+                // 下检查各分支是否可赋给期望类型（与 if 分支同规则）。
+                let expected_ctx = self.expected_ty.take();
                 let sel_ty = self.check_expr(expr);
                 // 4.4(6)：match 至少需要一个 case 分支。
                 if arms.is_empty() {
@@ -8428,6 +8465,19 @@ impl<'a> Checker<'a> {
                         }
                     }
                     let t = self.check_expr(&arm.body);
+                    // 2.5.3(1)：带类型标注时，各分支值须可赋给期望类型；仅对本地
+                    // 用户类之间的名义子类型做保守判定（无法确认即放行）。
+                    if let Some(Ty::User(exp_n)) = &expected_ctx {
+                        let bty = self.branch_peek_ty(&arm.body);
+                        if let Ty::User(bn) = &bty {
+                            if self.user_subtype_local(bn, exp_n) == Some(false) {
+                                self.err(format!(
+                                    "match 分支类型不匹配: 声明类型 {} 与值类型 {}（2.5.3(1)）",
+                                    exp_n, bn
+                                ));
+                            }
+                        }
+                    }
                     self.scopes.pop();
                     if result == Ty::Unknown {
                         result = t;
@@ -12980,6 +13030,38 @@ mod tests {
         // 同类型/字面量可适配的元素合法。
         assert_ok("main() { let a: Array<Int64> = [1, 2, 3] }");
         assert_ok("main() { let a: Array<Float64> = [1, 2.5] }");
+    }
+
+    // ─── w23b: 2.5.3(1) 带标注 match 分支须可赋给声明类型 ──────────────────
+
+    #[test]
+    fn test_w23b_match_branch_supertype() {
+        // Other 非 A 的子类型，声明类型 A → 拒绝。
+        assert_err(
+            "open class Base {}\n\
+             class A <: Base {}\n\
+             class Other {}\n\
+             main() {\n\
+             \x20   let m: A = match (true) {\n\
+             \x20       case true => A()\n\
+             \x20       case false => Other()\n\
+             \x20   }\n\
+             }\n",
+            "match 分支类型不匹配",
+        );
+        // 各分支均为 A 的子类 → 放行。
+        assert_ok(
+            "open class Base {}\n\
+             class A <: Base {}\n\
+             class B <: A {}\n\
+             class C <: A {}\n\
+             main() {\n\
+             \x20   let m: A = match (true) {\n\
+             \x20       case true => B()\n\
+             \x20       case false => C()\n\
+             \x20   }\n\
+             }\n",
+        );
     }
 
 }
