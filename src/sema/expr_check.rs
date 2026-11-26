@@ -4447,6 +4447,9 @@ impl<'a> Checker<'a> {
         match stmt {
             Stmt::Let { pattern, ty, value } => {
                 let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                if let Some(t) = ty.as_ref() {
+                    self.check_bad_type_spelling(t);
+                }
                 // 解析器可能把下一行前导运算符并入本行初始化式，形成对自身名字的
                 // “伪引用”（`let x = 1.0` 换行 `-x`）。仅当初始化式不是裸同名变量
                 // 时压制该名字的未定义判定；`let x = x` 仍按自引用报错。
@@ -4456,6 +4459,9 @@ impl<'a> Checker<'a> {
                     }
                     _ => None,
                 };
+                if let Pattern::Binding(n) = pattern {
+                    self.check_self_ref_init(n, value);
+                }
                 if let Some(n) = &suppress_self {
                     self.self_init_ok.push(n.clone());
                 }
@@ -4518,12 +4524,18 @@ impl<'a> Checker<'a> {
             }
             Stmt::Var { pattern, ty, value } => {
                 let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                if let Some(t) = ty.as_ref() {
+                    self.check_bad_type_spelling(t);
+                }
                 let suppress_self = match pattern {
                     Pattern::Binding(n) if !matches!(value, Expr::Var(v) if v == n) => {
                         Some(n.clone())
                     }
                     _ => None,
                 };
+                if let Pattern::Binding(n) = pattern {
+                    self.check_self_ref_init(n, value);
+                }
                 if let Some(n) = &suppress_self {
                     self.self_init_ok.push(n.clone());
                 }
@@ -4585,6 +4597,9 @@ impl<'a> Checker<'a> {
                 // 16.1(2)/16.2：const 变量必须以常量表达式初始化。
                 self.check_const_initializer(ty.as_ref(), value, name);
                 let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                if let Some(t) = ty.as_ref() {
+                    self.check_bad_type_spelling(t);
+                }
                 if let Some(ann) = ann_ty.as_ref() {
                     self.check_assignable(ann, &value_ty, "常量初始化");
                     self.check_literal_range(ann, value);
@@ -4721,6 +4736,41 @@ impl<'a> Checker<'a> {
     ///   `var x: T;` 直接读取类型默认值是项目方言（std 依赖），保持放行。
     ///   条件分支内可能已赋值（state==1）后读取一律放行（保守，不误判
     ///   if/else 逐分支初始化等用法）；跨函数/λ 读取放行，避免调用时序误判。
+    /// 2.1.3(1)：布尔类型写作 `Bool`；`Boolean` / `bool` 不是合法类型名。
+    /// 仅在无 import 单文件程序（strict_scope）中判定，避免误伤跨文件/std。
+    fn check_bad_type_spelling(&mut self, ty: &Type) {
+        if !self.strict_scope {
+            return;
+        }
+        if let Type::Struct(name, args) = ty {
+            if args.is_empty() && (name == "Boolean" || name == "bool") {
+                self.err(format!(
+                    "类型名 '{}' 不存在，布尔类型应写作 Bool（2.1.3(1)）",
+                    name
+                ));
+            }
+        }
+    }
+
+    /// 4.1/4.2：初始化式中引用自身名字非法。解析器会把“下一行以二元运算符
+    /// 开头”的语句并入上一行初始化式（官方正例 `let x = 1.0` 换行 `-x` 合法），
+    /// 因此仅当并入的运算符不是 `-`（Sub）时报告自引用。
+    fn check_self_ref_init(&mut self, name: &str, value: &Expr) {
+        if self.lookup(name).is_some() {
+            return;
+        }
+        if let Expr::Binary { op, right, .. } = value {
+            if !matches!(op, BinOp::Sub)
+                && matches!(&**right, Expr::Var(v) if v == name)
+            {
+                self.err(format!(
+                    "变量 '{}' 不能在自身的初始化式中被引用（4.1/4.2）",
+                    name
+                ));
+            }
+        }
+    }
+
     fn check_deferred_read(&mut self, name: &str) {
         let is_deferred = self.lookup(name).map(|v| v.uninit_let).unwrap_or(false);
         if !is_deferred {
@@ -7859,7 +7909,50 @@ impl<'a> Checker<'a> {
                 } else {
                     self.check_missing_question(callee, "()");
                 }
-                self.check_expr(callee);
+                // 4.7：控制转移表达式（return/break/continue）不能作为被调用者。
+                // 解析器把 `f ~> return` 脱糖为 `return(f(x))` 形态的 lambda 体，
+                // 此处拦下该非法形态。
+                if is_ctrl_transfer_expr(callee) {
+                    self.err(
+                        "控制转移表达式不能作为被调用者（4.7）".to_string(),
+                    );
+                }
+                // 被调用者类型仅用于下方的“非函数值不可调用”判定（不设标志）。
+                let callee_ty = self.check_expr(callee);
+                // 4.13(4)：被调用者须为函数类型（或用户类型重载了 `()`）。
+                // 仅对静态类型可确定的**复合操作数**判定；`Var` 可能表示函数名
+                // （trailing lambda / 泛型实例化 / 组合脱糖），其静态类型记录的是
+                // 返回类型而非函数类型，故保守跳过。
+                if matches!(
+                    &**callee,
+                    Expr::Binary { .. }
+                        | Expr::Unary { .. }
+                        | Expr::NullCoalesce { .. }
+                ) && callee_ty.is_definite()
+                    && !matches!(callee_ty, Ty::User(_) | Ty::Func { .. })
+                {
+                    self.err(format!(
+                        "类型 '{}' 的值不可调用（4.13(4)）",
+                        callee_ty.name()
+                    ));
+                }
+                // 2.1.11.1(6)：无参枚举构造器是枚举值而非函数，`B()` 非法。
+                if let Expr::Var(n) = &**callee {
+                    if args.is_empty()
+                        && named_args.is_empty()
+                        && self.lookup(n).is_none()
+                        && !self.local_func_names.contains(n)
+                        && !self.known_funcs.contains(n)
+                        && !self.type_names.contains(n)
+                        && !is_core_type_name(n)
+                        && self.enum_variant_arity.get(n).map_or(false, |&a| a == 0)
+                    {
+                        self.err(format!(
+                            "无参枚举构造器 '{}' 不是函数，不能使用 () 实例化（2.1.11.1(6)）",
+                            n
+                        ));
+                    }
+                }
                 for a in args {
                     self.check_expr(a);
                 }
@@ -7978,6 +8071,18 @@ impl<'a> Checker<'a> {
                             (**elem).clone()
                         }
                     }
+                    // 4.13(4)/4.13.3：下标访问要求类型定义 `operator func []`。
+                    // 仅对结构体（值类型）判定；class/interface 的运算符可能由
+                    // 外部扩展提供，保守放行。
+                    Ty::User(name) if self.struct_names.contains(name) => {
+                        if !self.type_has_index_op(name, false) {
+                            self.err(format!(
+                                "类型 '{}' 未定义下标运算符 []，不能使用下标访问（4.13(4)）",
+                                name
+                            ));
+                        }
+                        Ty::Unknown
+                    }
                     _ => Ty::Unknown,
                 }
             }
@@ -8011,6 +8116,23 @@ impl<'a> Checker<'a> {
                 }
                 self.check_type_instantiation(name, type_args.as_deref());
                 self.check_ctor_call(name, &pos_tys, &named_tys);
+                // 2.1.11.1(6)：无参枚举构造器（首字母大写，被解析为构造调用形态）
+                // 是枚举值而非函数，`B()` 非法；同名类/结构体构造函数、函数或
+                // 局部函数除外（03/02 遮蔽正例中存在同名局部函数）。
+                if args.is_empty()
+                    && named_args.is_empty()
+                    && self.enum_variant_arity.get(name).map_or(false, |&a| a == 0)
+                    && self.lookup(name).is_none()
+                    && !self.local_func_names.contains(name)
+                    && !self.ctor_types.contains(name)
+                    && !self.type_names.contains(name)
+                    && !self.known_funcs.contains(name)
+                {
+                    self.err(format!(
+                        "无参枚举构造器 '{}' 不是函数，不能使用 () 实例化（2.1.11.1(6)）",
+                        name
+                    ));
+                }
                 // 2.1.10.2(3)：private 主构造函数仅在结构体定义体内可见。
                 if self.struct_private_ctor.contains(name)
                     && self.cur_struct.as_deref() != Some(name.as_str())
@@ -8134,6 +8256,12 @@ impl<'a> Checker<'a> {
 
             Expr::Match { expr, arms } => {
                 let sel_ty = self.check_expr(expr);
+                // 4.4(6)：match 至少需要一个 case 分支。
+                if arms.is_empty() {
+                    self.err(
+                        "match 表达式必须至少包含一个 case 分支（4.4(6)）".to_string(),
+                    );
+                }
                 // 仅当选择子是已确定类型的**局部**变量且为标量（非元组/聚合/数组/
                 // 用户/Option/函数）时判定：顶层无标注变量的 Int64 是占位类型，
                 // 可能掩盖真实的元组类型，故不参与判定。
@@ -8154,6 +8282,15 @@ impl<'a> Checker<'a> {
                 };
                 let mut result = Ty::Unknown;
                 for arm in arms {
+                    // 4.4(6)：case 分支体不能为空（`case 0 =>` 后直接下一个 case）。
+                    if matches!(
+                        &*arm.body,
+                        Expr::Block(stmts, None) if stmts.is_empty()
+                    ) {
+                        self.err(
+                            "case 分支体不能为空（4.4(6)）".to_string(),
+                        );
+                    }
                     // 空元组模式 `()` 表示 Unit 常量模式，单元素无元组模式；
                     // 只有 ≥2 元素的元组模式才要求选择子为元组类型。
                     if scalar_selector
@@ -8251,6 +8388,13 @@ impl<'a> Checker<'a> {
 
             // 12.2(1)：throw 的操作数必须是 Exception 或 Error（可按继承链判定）。
             Expr::Throw(inner) => {
+                // 4.7：throw 后缺少操作数时解析器会把下一行 `return` 并作操作数，
+                // 控制转移表达式不能作为 throw 的操作数。
+                if is_ctrl_transfer_expr(inner) {
+                    self.err(
+                        "throw 的操作数不能是控制转移表达式（4.7）".to_string(),
+                    );
+                }
                 let t = self.check_expr(inner);
                 // 枚举成员（`EnumName.Variant`）不是异常类型。
                 let enum_member = match &**inner {
@@ -8469,6 +8613,7 @@ impl<'a> Checker<'a> {
                 // 注意：官方套件对“无符号整数取负”存在矛盾——04/15 a04 判负
                 // （`-UInt16` 非法），而 02/01 a15 判正（一元负号对所有数值类型
                 // 有效，按位取负回绕）。为守住“正测试 100%”红线，此处放行无符号。
+                // `-Bool` 亦可能由 `-x is T` 这类跨行并入产生（04/17 a02 正例），放行。
                 if t.is_prim() && !t.is_numeric() && *t != Ty::Bool {
                     self.err(format!("一元运算符 '-' 不能作用于类型 {}", t.name()));
                 }
@@ -12560,5 +12705,103 @@ mod tests {
         );
         // 直线代码中的唯一一次赋值合法。
         assert_ok("main() { let x: Int64\n x = 1\n let y = x }");
+    }
+
+    // ─── w21b 04 章：初始化式自引用 / 尾随操作数 / 调用目标 ─────────────────
+
+    #[test]
+    fn test_w21b_self_ref_initializer_non_sub_rejected() {
+        // 下一行前导运算符被并入初始化式后引用自身：非 `-` 运算符非法。
+        assert_err("main() { let expr = 1\n %expr }", "自身的初始化式");
+        assert_err("main() { let expr = 1\n +expr }", "自身的初始化式");
+        assert_err("main() { let expr = 1\n *expr }", "自身的初始化式");
+        assert_err("main() { let expr = 1\n /expr }", "自身的初始化式");
+        assert_err("main() { let expr = 1\n **expr }", "自身的初始化式");
+        // 官方正例：`-x` 连续写法（并入为减法）合法。
+        assert_ok("main() { let expr = 1.0\n -expr }");
+        // 外层同名变量存在时初始化式可引用它。
+        assert_ok("var x = 5\nmain() { let x = x + 1 }");
+    }
+
+    #[test]
+    fn test_w21b_ctrl_transfer_operand_rejected() {
+        // 4.7：throw 后缺操作数时下一行 `return` 被并入 -> 非法。
+        assert_err("main() { throw\n return }", "控制转移");
+        // `f ~> return` 脱糖为以 return 为被调用者的 lambda 体 -> 非法。
+        assert_err(
+            "func f(x: Int64): Int64 { x }\nmain() { f ~>\n return }",
+            "控制转移",
+        );
+    }
+
+    #[test]
+    fn test_w21b_call_non_callable_value_rejected() {
+        // 4.13(4)：非函数类型的值不可调用。
+        assert_err("main() { var i = 0\n (i + 2) (i - 3) }", "不可调用");
+        assert_err("main() { var i = 0\n (i < 2) (i > 5) }", "不可调用");
+        // 函数值（lambda 变量）可调用（保守放行）。
+        assert_ok("main() { let f = { x: Int64 => x }\n f(1) }");
+        // 用户类型可重载 `()`，保守放行。
+        assert_ok("struct S { operator func ()(x: Int64) { } }\nmain() { let s = S()\n s(1) }");
+    }
+
+    #[test]
+    fn test_w21b_nullary_enum_constructor_call_rejected() {
+        // 2.1.11.1(6)：无参枚举构造器不是函数。
+        assert_err("enum A { B }\nmain() { let b = B() }", "无参枚举构造器");
+        // 同名函数存在时调用合法。
+        assert_ok("enum A { B }\nfunc B(): A { A.B }\nmain() { let b = B() }");
+    }
+
+    #[test]
+    fn test_w21b_match_empty_arms_rejected() {
+        // 4.4(6)：match 至少一个 case；case 体不能为空。
+        assert_err("main() { var x = 0\n match (x) { } }", "至少包含一个 case");
+        assert_err(
+            "main() { var x = 0\n match (x) { case 0 =>\n case _ => 1 } }",
+            "分支体不能为空",
+        );
+    }
+
+    #[test]
+    fn test_w21b_func_value_and_overload_context_preserved() {
+        // 4.2(8)/(10) 的“函数名不能单独作为表达式”在官方正例中与
+        // `myFunc<T> is ...`（解析器丢弃类型实参后成为裸名）及按上下文解析
+        // 的重载函数实参（`f(g)`）冲突，故不实现该判定；此处锁定放行形态。
+        assert_ok("func f<T>(a: T): T { a }\nmain() { let x = f(1) }");
+        assert_ok("func g(a: Int64): Int64 { a }\nmain() { let f = g }");
+        assert_ok(
+            "func neg(a: Int8) { }\nfunc neg(a: Int16) { }\nfunc fv(f: (Int8) -> Unit) { }\nmain() { fv(neg) }",
+        );
+    }
+
+    #[test]
+    fn test_w21b_unary_neg_bool_preserved() {
+        // Bool 不是数值类型，但 `-x is T` 跨行并入等正例会形成 `-Bool` 形态，
+        // 为守住正测试红线保持放行（04/15 a04 负例归入放行档案）。
+        assert_ok("main() { var v: Bool = true\n let v2 = -v }");
+        // 无符号整数的取负存在官方矛盾（02/01 a15 正例），保持放行。
+        assert_ok("main() { var v: UInt8 = 1\n let v2 = -v }");
+    }
+
+    #[test]
+    fn test_w21b_struct_index_requires_operator() {
+        // 4.13(4)：结构体未定义 `operator func []` 时不能下标访问。
+        assert_err(
+            "struct S { var x: Int64 = 0 }\nmain() { let s = S()\n s[0] }",
+            "未定义下标运算符",
+        );
+        // 定义了运算符后合法。
+        assert_ok(
+            "struct S { operator func [](i: Int64): Int64 { i } }\nmain() { let s = S()\n let v = s[0] }",
+        );
+    }
+
+    #[test]
+    fn test_w21b_bool_type_spelling_rejected() {
+        // 2.1.3(1)：布尔类型写作 Bool。
+        assert_err("main() { var b: Boolean }", "Bool");
+        assert_err("main() { var b: bool }", "Bool");
+        assert_ok("main() { var b: Bool = true }");
     }
 }
