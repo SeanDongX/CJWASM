@@ -1497,6 +1497,16 @@ impl Parser {
                         "struct 静态成员函数不能声明为 mut（5.8.1(2)）".to_string(),
                     ));
                 }
+                // 5.1/5.6：未实现任何接口的结构体，其成员函数不能使用
+                // open/override/redef 修饰符（struct 不可被继承，无 override 语义）。
+                // 实现接口的结构体允许 override/redef（覆写接口默认实现），故仅当
+                // 无接口约束时才判定（官方 05_01_01_03 a03_05/07/09 负例）。
+                if constraints.is_empty() && (mods.is_open || mods.is_override) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Func,
+                        "结构体成员函数不能使用 open/override/redef 修饰符（5.1）".to_string(),
+                    ));
+                }
                 // 预设 receiver_name 使方法体内 this 可用
                 let prev_receiver = self.receiver_name.clone();
                 self.receiver_name = Some("this".to_string());
@@ -1765,6 +1775,23 @@ impl Parser {
         // 6.1.2.2：static 初始化器的重复/控制流/成员访问/初始化完整性。
         if let Some(msg) = validate_static_init_blocks(&name, &fields, &static_init_bodies) {
             return self.bail(ParseError::UnexpectedToken(Token::Init, msg));
+        }
+        // 3.3.2.2(8)：未提供 static init 块时，struct 的静态成员变量必须在定义处
+        // 立即初始化（官方 03_03 a08_06/a08_07 负例）。存在 static init 时保守放行，
+        // 交由 `validate_static_init_blocks` 判定完整性。
+        if static_init_bodies.is_empty() {
+            if let Some(f) = fields
+                .iter()
+                .find(|f| f.is_static && f.decl_kw && f.default.is_none() && !f.is_const)
+            {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Ident(f.name.clone()),
+                    format!(
+                        "结构体静态成员变量 '{}' 必须立即初始化（3.3.2.2(8)）",
+                        f.name
+                    ),
+                ));
+            }
         }
 
         // 将 struct 内部方法存入 pending_methods，在解析完成后合并到 functions
@@ -2482,6 +2509,15 @@ impl Parser {
                 continue;
             }
             // cjc: 接口方法修饰符可任意顺序（static / public / override / mut / const / operator ...）
+            // 5.2：无父接口的接口成员函数不能使用 override/redef 修饰符
+            // （无被覆写目标；官方 05_01_01_03 a02_05/a02_06 负例）。有父接口时
+            // override/redef 用于覆写继承的默认实现，属合法（06_02 a08_03 正例）。
+            if parents.is_empty() && (mods.has_override_kw || mods.has_redef_kw) {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Func,
+                    "接口成员函数不能使用 override/redef 修饰符（5.2）".to_string(),
+                ));
+            }
             self.expect(Token::Func)?;
             let m_name = if mods.is_operator {
                 self.parse_operator_name()?.to_string()
@@ -2850,6 +2886,21 @@ impl Parser {
                 continue;
             }
             // cjc 兼容: extend 内方法修饰符（static / override / operator 等）已由 parse_member_modifiers 收集
+            // 5.8.1(2)：扩展中的静态成员函数不能声明为 mut（官方 05_08 a01_03 负例）。
+            if mods.is_mut && mods.is_static {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Mut,
+                    "扩展中的静态成员函数不能声明为 mut（5.8.1(2)）".to_string(),
+                ));
+            }
+            // 5.8.1：类型别名扩展中的成员函数不能声明为 mut（无实际成员可修改；
+            // 官方 05_08 a01_05 负例）。
+            if mods.is_mut && self.type_aliases.contains_key(&target_type) {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Mut,
+                    "类型别名扩展中的成员函数不能声明为 mut（5.8.1）".to_string(),
+                ));
+            }
             if mods.is_operator {
                 self.parsing_operator_func = true;
             }
@@ -3787,6 +3838,14 @@ impl Parser {
                         "类成员函数不能声明为 mut（5.8.1(1)）".to_string(),
                     ));
                 }
+                // 6.1.2.4：sealed 仅用于类型声明，不能修饰成员函数
+                // （官方 03_04 a10_11 负例）。
+                if mods.is_sealed {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Func,
+                        "成员函数不能使用 sealed 修饰符（6.1.2.4）".to_string(),
+                    ));
+                }
                 self.expect(Token::Func)?;
                 let (m_name, type_params) = if is_operator {
                     // 运算符方法名：解析运算符 token，转为 __op_xxx
@@ -3915,6 +3974,14 @@ impl Parser {
                     stmts
                 };
                 let has_body = !no_body;
+                // 5.1：无函数体的函数声明（抽象类中的抽象函数）必须显式标注返回类型
+                // （无法从函数体推断；官方 05_01_05 a01_10/a01_11 负例）。
+                if !has_body && return_type.is_none() {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::Func,
+                        "无函数体的函数声明必须显式标注返回类型（5.1）".to_string(),
+                    ));
+                }
                 self.receiver_name = None;
                 self.current_type_params = prev_params;
                 methods.push(crate::ast::ClassMethod {
@@ -5716,5 +5783,53 @@ main() {}
     fn test_w15a_ctor_signature_attr_class_exempt() {
         // 带属性的类（unittest 宏）不参与 ctor 签名重复的严格检查。
         ok("@Test\nclass Foo {\n @TestCase\n Foo() {}\n @Bench\n init() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w18d_struct_static_field_requires_init() {
+        // 3.3.2.2(8)：无 static init 块时静态成员变量必须立即初始化。
+        err("struct S {\n static var x: Int64\n}\nmain() { }");
+        err("struct S {\n static let x: Int64\n}\nmain() { }");
+        ok("struct S {\n static var x: Int64 = 0\n}\nmain() { }");
+        ok("struct S {\n static var x: Int64\n static init() { x = 0 }\n}\nmain() { }");
+    }
+
+    #[test]
+    fn test_w18d_struct_member_func_modifier_rejected() {
+        // 5.1：未实现接口的结构体成员函数不能使用 open/override/redef。
+        err("struct S {\n open func f() { }\n}\nmain() { }");
+        err("struct S {\n override func f() { }\n}\nmain() { }");
+        err("struct S {\n redef func f() { }\n}\nmain() { }");
+        ok("struct S {\n func f() { }\n}\nmain() { }");
+    }
+
+    #[test]
+    fn test_w18d_class_sealed_func_rejected() {
+        // 6.1.2.4：sealed 不能修饰成员函数。
+        err("class C {\n sealed func f() { }\n}\nmain() { }");
+        ok("open class C { }\nmain() { }");
+    }
+
+    #[test]
+    fn test_w18d_interface_override_without_parent_rejected() {
+        // 5.2：无父接口的接口成员函数不能使用 override/redef。
+        err("interface I {\n redef func f() { }\n}\nmain() { }");
+        err("interface I {\n static override func f() { }\n}\nmain() { }");
+        ok("interface P {\n func f() { }\n}\ninterface I <: P {\n override func f() { }\n}\nmain() { }");
+    }
+
+    #[test]
+    fn test_w18d_bodyless_func_requires_return_type() {
+        // 5.1：无函数体的函数声明必须显式标注返回类型。
+        err("abstract class A {\n public func f()\n}\nmain() { }");
+        ok("abstract class A {\n public func f(): Unit\n}\nmain() { }");
+    }
+
+    #[test]
+    fn test_w18d_extend_mut_static_and_alias_rejected() {
+        // 5.8.1(2)：扩展中的静态成员函数不能声明为 mut。
+        err("struct S { }\nextend S {\n static mut func f() { }\n}\nmain() { }");
+        // 5.8.1：类型别名扩展中的成员函数不能声明为 mut。
+        err("type T = Int64\nextend T {\n mut func f(): T { this }\n}\nmain() { }");
     }
 }

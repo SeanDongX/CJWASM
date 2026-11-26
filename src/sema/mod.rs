@@ -20191,6 +20191,14 @@ main() {}"#,
         );
     }
 
+    #[test]
+    fn test_w18d_local_func_unnamed_param_after_named_rejected() {
+        // 5.1.2.1(2)：局部函数的非命名形参同样不能位于命名形参之后
+        // （官方 03_02 a10_02 负例）。
+        assert_invalid("main() {\n func foo(arg1!: Int32 = 1, arg2: Int64) {}\n}");
+        assert_valid("main() {\n func foo(arg1: Int64, arg2!: Int32 = 1) {}\n}");
+    }
+
 
     #[test]
     fn test_default_param_must_be_named() {

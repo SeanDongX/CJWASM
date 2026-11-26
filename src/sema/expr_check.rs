@@ -3778,6 +3778,28 @@ impl<'a> Checker<'a> {
         self.check_params_body_extra(&func.params, &func.body, None, ret);
     }
 
+    /// 5.1.2.1(2)：局部函数形参中的非命名形参必须位于命名形参之前。
+    ///
+    /// 顶层/成员函数的同一规则由 `sema::check_param_list` 校验；此处补齐局部函数
+    /// （官方 03_02 a10_02 负例：`main() { func foo(arg1!: Int32 = arg2, arg2: Int64) {} }`）。
+    fn check_local_func_param_order(&mut self, func: &Function) {
+        let mut seen_named = false;
+        for p in &func.params {
+            if p.variadic {
+                continue;
+            }
+            if p.is_named {
+                seen_named = true;
+            } else if seen_named {
+                self.err(format!(
+                    "局部函数 '{}' 的非命名形参位于命名形参之后（5.1.2.1(2)）",
+                    func.name
+                ));
+                return;
+            }
+        }
+    }
+
     /// 7.3(2)/(5)：属性访问器尾表达式的类型必须与访问器返回类型一致。
     ///
     /// 仅检查函数体最后一个语句为表达式语句的情形；返回值/控制流形态保守跳过。
@@ -4084,6 +4106,7 @@ impl<'a> Checker<'a> {
                 self.check_expr(right);
             }
             Stmt::LocalFunc(f) => {
+                self.check_local_func_param_order(f);
                 self.check_function(f);
             }
             Stmt::Break | Stmt::Continue => {}
