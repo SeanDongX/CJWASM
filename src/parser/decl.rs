@@ -1797,7 +1797,7 @@ impl Parser {
         self.current_type_params = prev_params;
 
         // 6.1.2.2：static 初始化器的重复/控制流/成员访问/初始化完整性。
-        if let Some(msg) = validate_static_init_blocks(&name, &fields, &static_init_bodies) {
+        if let Some(msg) = validate_static_init_blocks(&name, &fields, &static_init_bodies, true) {
             return self.bail(ParseError::UnexpectedToken(Token::Init, msg));
         }
         // 3.3.2.2(8)：未提供 static init 块时，struct 的静态成员变量必须在定义处
@@ -4300,6 +4300,7 @@ impl Parser {
             &class_def.name,
             &class_def.fields,
             &static_init_bodies,
+            false,
         ) {
             return self.bail(ParseError::UnexpectedToken(Token::Init, msg));
         }
@@ -5095,6 +5096,7 @@ fn validate_static_init_blocks(
     type_name: &str,
     fields: &[crate::ast::FieldDef],
     bodies: &[Vec<Stmt>],
+    is_struct: bool,
 ) -> Option<String> {
     if bodies.is_empty() {
         return None;
@@ -5190,8 +5192,16 @@ fn validate_static_init_blocks(
                             ));
                         }
                     } else if !f.is_mut {
-                        // 注：不可变静态成员“已有直接初始值又在 static init 中赋值”的
-                        // 6.1.2.2(19) 判定保留给语义阶段（类）处理，此处只拒绝重复赋值。
+                        // 6.1.2.2(19)：不可变静态成员不能既在声明处初始化，又在
+                        // static 初始化器中赋值。结构体的 static init 体不进入
+                        // AST，须在此判定；类的同规则由语义阶段判（避免改变
+                        // 既有 parse_source 测试期望的错误阶段）。
+                        if is_struct && f.default.is_some() {
+                            return Some(format!(
+                                "类型 '{}' 的不可变静态成员 '{}' 既在声明处初始化又在 static 初始化器中赋值（6.1.2.2(19)）",
+                                type_name, n
+                            ));
+                        }
                         let c = immutable_assigns.entry(f.name.as_str()).or_insert(0);
                         *c += 1;
                         if *c > 1 {
@@ -5962,5 +5972,16 @@ main() {}
         err("struct S {\n init(x: Int64) {}\n S(x: Int64) {}\n}\nmain() { }");
         ok("class A {\n init(x: Int64) {}\n init(y: Bool) {}\n}\nmain() { }");
         ok("class A {\n init(x: Int64) {}\n A(y: Bool) {}\n}\nmain() { }");
+    }
+
+    #[test]
+    fn test_w20b_static_let_double_init() {
+        // 6.1.2.2(19)：不可变静态成员不能既在声明处初始化又在 static init 中赋值。
+        err("class C {\n static let v = 0\n static init() { v = 0 }\n}\nmain() { }");
+        err("struct S {\n static let v = 0\n static init() { v = 0 }\n}\nmain() { }");
+        // 正例：声明处无初始值、在 static init 中赋值；或可变静态成员。
+        ok("class C {\n static let v: Int64\n static init() { v = 0 }\n}\nmain() { }");
+        ok("struct S {\n static let v: Int64\n static init() { v = 0 }\n}\nmain() { }");
+        ok("class C {\n static var v = 0\n static init() { v = 1 }\n}\nmain() { }");
     }
 }
