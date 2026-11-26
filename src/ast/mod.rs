@@ -479,6 +479,8 @@ pub struct ConstDef {
     pub name: String,
     pub ty: Type,
     pub init: Expr,
+    /// 顶层绑定的可见性（`public`/`internal`/…，11.2(7)-(12)）。
+    pub visibility: Visibility,
     /// 顶层绑定是否可变（`var` 为 true，`let`/`const` 为 false）。
     pub is_mut: bool,
     /// 是否为顶层 `const`（其初始化式须为常量表达式，16.1(2)）。

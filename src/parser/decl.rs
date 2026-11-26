@@ -163,6 +163,9 @@ impl Parser {
         let mut enums = Vec::new();
         let mut extends = Vec::new();
         let mut type_aliases: Vec<(String, Type)> = Vec::new();
+        // 11.2(7)-(12)：`public type X = <internal 类型>` 为非法。type_aliases 的
+        // AST 形态不保留可见性，故在解析期单独记录 public 别名，收尾时校验。
+        let mut public_type_aliases: Vec<(String, Type)> = Vec::new();
         let mut constants = Vec::new();
 
         // 解析可选的 package 声明（cjc: package prefix.path，支持点分路径）
@@ -326,6 +329,11 @@ impl Parser {
                         }
                         self.pending_c_decl = true;
                     }
+                    // 17.1(5)：`@Annotation` 修饰的类必须提供 const init，记录标记
+                    // 供下一轮类声明分派校验（`@When` 跳过声明的场景不记录）。
+                    if self.last_attr_annotation && !skip_next {
+                        self.pending_annotation_attr = true;
+                    }
                     continue;
                 }
             } else if self.check(&Token::Protected) {
@@ -360,6 +368,8 @@ impl Parser {
             let c_attr = std::mem::take(&mut self.pending_c_decl);
 
             if self.check(&Token::Foreign) {
+                // `@Annotation` 只能修饰类；foreign 声明不消费该标记，此处清除避免泄漏。
+                self.pending_annotation_attr = false;
                 self.advance();
                 // cjc: foreign { func ... } 块语法（多个 FFI 函数）
                 if self.check(&Token::LBrace) {
@@ -387,6 +397,8 @@ impl Parser {
             } else {
                 // 本声明的属性标记（`@When`/`@Test` 等），供类声明保守豁免使用。
                 let decl_attr = std::mem::take(&mut self.pending_decl_attr);
+                // 17.1(5)：`@Annotation` 修饰的类必须提供 const init。
+                let ann_attr = std::mem::take(&mut self.pending_annotation_attr);
                 match self.peek() {
                     Some(Token::Struct) => {
                         let sd = self.parse_struct_with_visibility(visibility, c_attr)?;
@@ -448,6 +460,17 @@ impl Parser {
                                 is_open,
                             )?;
                             self.pending_decl_attr = false;
+                            // 17.1(5)：声明为注解类的 `@Annotation` 类必须至少提供
+                            // 一个 const init 函数。
+                            if ann_attr && !cls.inits.iter().any(|i| i.is_const) {
+                                return self.bail(ParseError::UnexpectedToken(
+                                    Token::Class,
+                                    format!(
+                                        "@Annotation 修饰的类 '{}' 必须提供至少一个 const init 函数（17.1(5)）",
+                                        cls.name
+                                    ),
+                                ));
+                            }
                             classes.push(cls);
                         }
                     }
@@ -491,6 +514,10 @@ impl Parser {
                         }
                         self.type_aliases
                             .insert(alias_name.clone(), target_ty.clone());
+                        // 11.2(7)-(12)：记录 public 别名，收尾时校验其是否引用 internal 类型。
+                        if matches!(visibility, Visibility::Public) {
+                            public_type_aliases.push((alias_name.clone(), target_ty.clone()));
+                        }
                         type_aliases.push((alias_name, target_ty));
                     }
                     Some(Token::Func) => {
@@ -578,7 +605,7 @@ impl Parser {
                     }
                     // cjc: 顶层常量 let/var/const name: Type = expr
                     Some(Token::Let) | Some(Token::Var) | Some(Token::Const) => {
-                        constants.extend(self.parse_top_level_const()?);
+                        constants.extend(self.parse_top_level_const(visibility.clone())?);
                     }
                     // cjc: public/internal import ... — 带可见性的导入语句。
                     Some(Token::Import) => {
@@ -728,6 +755,43 @@ impl Parser {
                         format!(
                             "类型 '{}' 不能定义 mut 属性（7.1(4)）",
                             ext.target_type
+                        ),
+                    ));
+                }
+            }
+        }
+        // 11.2(7)-(12)：public 类型别名不得引用本文件 internal（默认可见性）类型。
+        // 仅在无 import 的单文件程序上启用（外部包类型可见性不可判定）。
+        if imports.is_empty() && !public_type_aliases.is_empty() {
+            let mut internal_types: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for c in &classes {
+                if c.visibility == Visibility::Internal {
+                    internal_types.insert(c.name.clone());
+                }
+            }
+            for s in &structs {
+                if s.visibility == Visibility::Internal {
+                    internal_types.insert(s.name.clone());
+                }
+            }
+            for e in &enums {
+                if e.visibility == Visibility::Internal {
+                    internal_types.insert(e.name.clone());
+                }
+            }
+            for i in &interfaces {
+                if i.visibility == Visibility::Internal {
+                    internal_types.insert(i.name.clone());
+                }
+            }
+            for (alias, ty) in &public_type_aliases {
+                if let Some(n) = type_mentions_c_struct(ty, &internal_types, 0) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::TypeAlias,
+                        format!(
+                            "public 类型别名 '{}' 引用了 internal 类型 '{}'（11.2(7)-(12)）",
+                            alias, n
                         ),
                     ));
                 }
@@ -944,7 +1008,10 @@ impl Parser {
 
     /// 解析顶层常量 (let/var/const name [: Type] = expr)
     /// 支持元组解构：public let (a, b): (T1, T2) = expr
-    pub(crate) fn parse_top_level_const(&mut self) -> Result<Vec<ConstDef>, ParseErrorAt> {
+    pub(crate) fn parse_top_level_const(
+        &mut self,
+        visibility: Visibility,
+    ) -> Result<Vec<ConstDef>, ParseErrorAt> {
         let is_mut = matches!(self.peek(), Some(Token::Var)); // w4b: 可变性跟踪
         let is_const = matches!(self.peek(), Some(Token::Const));
         self.advance(); // consume let/var/const
@@ -984,6 +1051,7 @@ impl Parser {
                         object: Box::new(init.clone()),
                         index: i as u32,
                     },
+                    visibility: visibility.clone(),
                     is_mut,
                     is_const,
                 })
@@ -1012,6 +1080,7 @@ impl Parser {
             name,
             ty,
             init,
+            visibility,
             is_mut,
             is_const,
         }])
