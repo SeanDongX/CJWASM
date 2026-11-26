@@ -895,6 +895,12 @@ struct Checker<'a> {
     /// 延迟赋值 `var`（`var x: T;` 无初始化式）的名字集合：与延迟 let 共用
     /// deferred_state 的状态机，但重复赋值合法（var 可变），报错分支需区分二者。
     deferred_var: HashSet<String>,
+    /// 延迟赋值变量的声明所在“函数/λ嵌套深度”。仅在同深度读取时做“未初始化
+    /// 读取”判定；跨函数/λ 的读取（声明在外层、读取在内层函数体）保守放行，
+    /// 因为内层函数可能在声明变量赋值之后才被调用，按源码顺序判定会误伤。
+    deferred_owner: HashMap<String, usize>,
+    /// 当前函数体 / lambda body 的嵌套深度（各自 +1）。用于 deferred_owner 比较。
+    defer_fn_depth: usize,
     /// 程序内所有函数体局部函数（`Stmt::LocalFunc`，含嵌套）的名字集合。
     /// 插值内“未声明函数调用”检查的守卫：局部函数在插值处可见（含前向引用），
     /// 不能判为未定义。
@@ -1798,6 +1804,8 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         cond_depth: 0,
         deferred_state: HashMap::new(),
         deferred_var: HashSet::new(),
+        deferred_owner: HashMap::new(),
+        defer_fn_depth: 0,
         local_func_names: local_func_names,
         interp_local_func_added: Vec::new(),
         interp_depth: 0,
@@ -4086,9 +4094,12 @@ impl<'a> Checker<'a> {
             }
         }
         self.scopes.push(scope);
+        // 进入函数体：延迟赋值变量在此深度声明；跨函数读取不做未初始化判定。
+        self.defer_fn_depth += 1;
         for stmt in body {
             self.check_stmt(stmt);
         }
+        self.defer_fn_depth -= 1;
         self.scopes.pop();
         self.ret_ty = saved_ret;
     }
@@ -4141,9 +4152,11 @@ impl<'a> Checker<'a> {
                         // 延迟 var，其“可重复赋值”标记对 let 不再适用。
                         self.deferred_state.insert(name.clone(), 0);
                         self.deferred_var.remove(name);
+                        self.deferred_owner.insert(name.clone(), self.defer_fn_depth);
                     } else {
                         self.deferred_state.remove(name);
                         self.deferred_var.remove(name);
+                        self.deferred_owner.remove(name);
                     }
                 }
                 self.bind_pattern_const(pattern, bind_ty, deferred, cinit, false, deferred);
@@ -4190,9 +4203,11 @@ impl<'a> Checker<'a> {
                         // var 可重复赋值，由 deferred_var 集合与 let 的报错分支区分。
                         self.deferred_state.insert(name.clone(), 0);
                         self.deferred_var.insert(name.clone());
+                        self.deferred_owner.insert(name.clone(), self.defer_fn_depth);
                     } else {
                         self.deferred_state.remove(name);
                         self.deferred_var.remove(name);
+                        self.deferred_owner.remove(name);
                     }
                 }
                 self.bind_pattern_const(pattern, bind_ty, true, cinit, false, deferred);
@@ -4327,6 +4342,32 @@ impl<'a> Checker<'a> {
             Stmt::Break | Stmt::Continue => {}
             // 4.7.3(9)：return 无返回值要求所在函数返回类型为 Unit。
             Stmt::Return(None) => self.check_bare_return(),
+        }
+    }
+
+    /// 1.3.6(4) / 3.2.3.2(4)：读取未初始化（延迟赋值）变量。
+    ///
+    /// - 插值上下文：`deferred_state == 0`（从未赋值）即报错（官方 1.3.6(4)），
+    ///   `let` 与 `var` 一视同仁；
+    /// - 非插值上下文：仅对**延迟 `let`**（不可变、必须唯一一次初值赋值）且
+    ///   `deferred_state == 0`、读取与声明处于同一函数/λ 深度时报错。延迟
+    ///   `var x: T;` 直接读取类型默认值是项目方言（std 依赖），保持放行。
+    ///   条件分支内可能已赋值（state==1）后读取一律放行（保守，不误判
+    ///   if/else 逐分支初始化等用法）；跨函数/λ 读取放行，避免调用时序误判。
+    fn check_deferred_read(&mut self, name: &str) {
+        let is_deferred = self.lookup(name).map(|v| v.uninit_let).unwrap_or(false);
+        if !is_deferred {
+            return;
+        }
+        if self.deferred_state.get(name).copied() != Some(0) {
+            return;
+        }
+        let interp = self.interp_depth > 0;
+        let same_depth_let = !interp
+            && !self.deferred_var.contains(name)
+            && self.deferred_owner.get(name).copied() == Some(self.defer_fn_depth);
+        if interp || same_depth_let {
+            self.err(format!("变量 '{}' 在初值赋值前被读取（未初始化）", name));
         }
     }
 
@@ -5504,6 +5545,12 @@ impl<'a> Checker<'a> {
     /// 复杂基础对象的字段赋值目标（`obj.method().x = v`）：解析基础类型后检查
     /// 末端成员是否为可写字段（4.23(15)）。
     fn check_complex_field_target(&mut self, object: &crate::ast::Expr, field: &str) {
+        // 6.1.2(4)/6.1.2.4(14)/6.1.2.4(28)：复杂基础对象（如 `A().privateVar = 0`）
+        // 的成员赋值同样要校验静态/实例方向与私有可见性（读取路径已检查，赋值
+        // 目标路径此前缺失）。
+        if let Some((recv_ty, via_type)) = self.receiver_user(object) {
+            self.check_class_member_access(&recv_ty, via_type, field);
+        }
         let recv = strip_option_ty(self.deq_ty(object));
         let Ty::User(name) = recv else {
             return;
@@ -5574,6 +5621,18 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 6.1.2(4)/2.1.10.4(10)：`member` 是否为类型 `ty` 的实例（非静态）成员。
+    /// 仅凭已登记成员表判定；无法确定时返回 false（保守放行）。
+    fn type_member_is_instance(&self, ty: &str, member: &str) -> bool {
+        if let Some(info) = self.lookup_class_member(ty, member) {
+            return !info.is_static;
+        }
+        if let Some(m) = self.struct_members.get(ty) {
+            return m.instance.contains(member);
+        }
+        false
+    }
+
     fn check_field_target(&mut self, object: &str, field: &str) {
         // 2.2.1(4)：数组长度固定，`arr.size` 只读。
         if field == "size" {
@@ -5609,6 +5668,13 @@ impl<'a> Checker<'a> {
                 if !is_mut {
                     self.err(format!("不可变字段 '{}.{}' 不能被重新赋值", object, field));
                 }
+            }
+            // 6.1.2(4)/2.1.10.4(10)：实例成员不能经类型名访问（赋值目标路径）。
+            if self.type_member_is_instance(object, field) {
+                self.err(format!(
+                    "实例成员 '{}' 不能通过类型名 '{}' 访问（6.1.2(4)）",
+                    field, object
+                ));
             }
             return;
         }
@@ -6372,20 +6438,8 @@ impl<'a> Checker<'a> {
                 self.check_static_iface_member_ref(name);
                 // 6.2.2.2(1)：interface 默认函数体不能裸名引用其它接口成员。
                 self.check_iface_foreign_member_ref(name);
-                // 官方 1.3.6(4)：插值内引用延迟赋值声明（`let/var x: T;` 无初始化式）
-                // 且尚未赋值的变量非法。仅插值上下文判定——插值外 `var x: T;` 读取
-                // 类型默认值属项目方言（std 大量依赖），必须原样放行。
-                // deferred_state==0 表示从未赋值；条件分支内初始化（state==1）后
-                // 读取合法，不报。
-                let uninit_read = self.interp_depth > 0
-                    && self
-                        .lookup(name)
-                        .map(|v| v.uninit_let)
-                        .unwrap_or(false)
-                    && self.deferred_state.get(name).copied() == Some(0);
-                if uninit_read {
-                    self.err(format!("变量 '{}' 在初值赋值前被读取（未初始化）", name));
-                }
+                // 1.3.6(4) 插值内 / 3.2.3.2(4) 同函数直线代码：读取未初始化变量。
+                self.check_deferred_read(name);
                 self.lookup(name)
                     .map(|v| v.ty.clone())
                     .unwrap_or(Ty::Unknown)
@@ -7407,7 +7461,9 @@ impl<'a> Checker<'a> {
                 self.scopes.push(scope);
                 // lambda 内的 return 属于 lambda 自身，不使用外层函数返回类型。
                 let saved_ret = self.ret_ty.take();
+                self.defer_fn_depth += 1;
                 self.check_expr(body);
+                self.defer_fn_depth -= 1;
                 self.ret_ty = saved_ret;
                 self.scopes.pop();
                 Ty::Unknown
@@ -11491,5 +11547,55 @@ mod tests {
             "main() {\n match ((1, 2)) { case (1) => true case _ => false }\n return\n}",
             "元组模式",
         );
+    }
+
+    // ─── w19c：未初始化读取（3.2.3.2(4)）/ 类型名访问实例成员 / 私有成员赋值 ──
+
+    #[test]
+    fn test_w19c_uninit_read_straightline_rejected() {
+        // 延迟 `let` 声明后未赋值即读取（直线代码）非法。
+        assert_err("main() {\n let x: Int64\n var vv = x\n}", "未初始化");
+        assert_err("main() {\n let x: String\n var vv = x\n}", "未初始化");
+        // 循环条件中读取未初始化 let 同样非法。
+        assert_err("main() {\n let x: Int32\n while (x < 1) { }\n}", "未初始化");
+        assert_err("main() {\n let x: Int32\n do { } while (x < 1)\n}", "未初始化");
+    }
+
+    #[test]
+    fn test_w19c_uninit_read_assigned_ok() {
+        // 先赋值后读取合法。
+        assert_ok("main() {\n let x: Int64\n x = 1\n var vv = x\n}");
+        // 条件分支内可能已赋值（state 1）读取保守放行，避免误伤逐分支初始化。
+        assert_ok("main() {\n let x: Int64\n if (true) { x = 1 }\n var vv = x\n}");
+        // 跨函数读取（声明在外层、读取在内层函数体）保守放行，避免调用时序误判。
+        assert_ok("main() {\n let x: String\n func f() { var vv = x }\n x = \"\"\n f()\n}");
+        // 延迟 `var` 读取类型默认值属项目方言，非插值上下文保持放行。
+        assert_ok("main() { var x: Int64; let y = x + 1; return }");
+    }
+
+    #[test]
+    fn test_w19c_instance_member_via_type_rejected() {
+        // 6.1.2(4)：实例成员不能经类型名赋值。
+        assert_err(
+            "class Test { var sInt: Int32 = 0 }\nmain() { Test.sInt = 5 }",
+            "实例成员",
+        );
+        assert_err(
+            "struct Test { var sInt: Int32 = 0 }\nmain() { Test.sInt = 5 }",
+            "实例成员",
+        );
+        // 静态成员经类型名赋值合法。
+        assert_ok("class Test { static var s: Int32 = 0 }\nmain() { Test.s = 5 }");
+    }
+
+    #[test]
+    fn test_w19c_private_member_assign_rejected() {
+        // 6.1.2.4(28)：私有成员不能经实例赋值（复杂基础对象路径）。
+        assert_err(
+            "class A { private var p = 1 }\nmain() { A().p = 0 }",
+            "私有成员",
+        );
+        // 非私有实例字段经实例赋值合法。
+        assert_ok("class A { var p: Int64 = 1 }\nmain() { A().p = 0 }");
     }
 }
