@@ -782,6 +782,7 @@ mod tests {
             is_abstract: false,
             is_sealed: false,
             is_open: false,
+            has_decl_attr: false,
             extends: None,
             implements: vec![],
             supertype_args: vec![],

@@ -3137,6 +3137,9 @@ impl Parser {
         is_sealed: bool,
         is_open: bool,
     ) -> Result<crate::ast::ClassDef, ParseErrorAt> {
+        // 类声明前的宏属性注解（`@Test`/`@TestTemplate` 等）在进入类体之前捕获，
+        // 类体内部成员注解会改写 pending_decl_attr，故此处尽早记录。
+        let has_decl_attr = self.pending_decl_attr;
         self.expect(Token::Class)?;
         let name = match self.advance_decl_name() {
             Some(n) => n,
@@ -4340,6 +4343,7 @@ impl Parser {
             is_abstract,
             is_sealed,
             is_open,
+            has_decl_attr,
             extends,
             implements,
             supertype_args,
@@ -5331,11 +5335,23 @@ fn validate_static_init_blocks(
 #[cfg(test)]
 mod decl_tests {
     use crate::pipeline::parse_source;
+    use crate::pipeline::parse_source_ast;
 
     fn ok(src: &str) {
         if let Err(e) = parse_source(src) {
             panic!("parse failed: {}\nsource:\n{}", e, src);
         }
+    }
+
+    #[test]
+    fn test_w24d_class_has_decl_attr_flag() {
+        // 类声明前的宏属性注解需记录到 ClassDef.has_decl_attr，供语义检查保守豁免。
+        let prog = parse_source_ast("@Test\nclass Foo {}\nmain() {}\n").expect("parse ok");
+        let foo = prog.classes.iter().find(|c| c.name == "Foo").expect("Foo");
+        assert!(foo.has_decl_attr, "带 @Test 的类应记录 has_decl_attr");
+        let prog2 = parse_source_ast("class Bar {}\nmain() {}\n").expect("parse ok");
+        let bar = prog2.classes.iter().find(|c| c.name == "Bar").expect("Bar");
+        assert!(!bar.has_decl_attr, "无注解的类不应记录 has_decl_attr");
     }
 
     #[test]
