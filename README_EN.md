@@ -8,13 +8,13 @@ CJWasm compiles Cangjie source code into WASM bytecode: sources are parsed into 
 
 ## Project Status
 
-- ✅ **Official Conformance Suite**: overall **93.7%** (positive tests 5,132/5,132 = **100%**, negative tests 18,477/20,069 = **92.1%**)
-- ✅ **std API Suite**: **99.4%** (1,414/1,441; L1 **100%** / L2 99.3%, 99.8% excluding @Unittest cases)
-- ✅ **Tests**: 1,867 tests passing (1,222 unit + 631 integration + 14 stdlib)
+- ✅ **Official Conformance Suite**: overall **97.0%** (positive tests 5,132/5,132 = **100%**, negative tests 19,314/20,069 = **96.2%**)
+- ✅ **std API Suite**: **99.3%** (1,413/1,441; L1 **100%** / L2 99.3%, 99.8% excluding @Unittest cases; the 28 non-passing split into 10 official negatives that are correctly rejected + 18 structural skips)
+- ✅ **Tests**: 2,014 tests passing (1,369 unit + 631 integration + 14 stdlib)
 - ✅ **Examples**: 40/40 system tests passing (100%), 0 WASM validation errors
-- ✅ **Code Size**: ~87,100 lines of Rust including tests
+- ✅ **Code Size**: ~100,400 lines of Rust including tests
 - ✅ **AST Nodes**: 144 nodes (Expr: 68, Stmt: 19, Pattern: 15, Type: 42)
-- ✅ **CHIR Optimizer**: small-function inlining + redundant local elimination; 1.22x on wasmtime / ~1.7x on an interpreter for the heavy benchmark
+- ✅ **CHIR Optimizer**: small-function inlining + redundant local elimination; 1.44x on wasmtime for the heavy benchmark (measured 2026-11-26)
 
 ## Official Test Suite Compatibility
 
@@ -22,19 +22,21 @@ Compatibility is measured against the official Cangjie test suite (`third_party/
 
 | Suite | Scale | Pass criteria | Current |
 |------|------|----------|----------|
-| **Conformance compiler suite** | 29,705 test files across 17 spec chapters (25,201 executed after skipping 4,504 multi-file structural cases) | positive tests must compile; negative tests (`@Negative: yes`) must fail compilation | **93.7%** (positive **100%** / negative 92.1%) |
-| **std API suite** | 1,441 test files across 33 std modules (L1 + L2) | source files must be accepted by the compiler | **99.4%** (L1 **100%** / L2 99.3%) |
+| **Conformance compiler suite** | 29,705 test files across 17 spec chapters (25,201 executed after skipping 4,504 multi-file structural cases) | positive tests must compile; negative tests (`@Negative: yes`) must fail compilation | **97.0%** (positive **100%** / negative 96.2%) |
+| **std API suite** | 1,441 test files across 33 std modules (L1 + L2) | source files must be accepted by the compiler | **99.3%** (L1 **100%** / L2 99.3%) |
 
 During the full-compatibility sprint started on 2026-11-24, overall compatibility rose from a **49.1%** baseline (positive 60.1% / negative 46.3%) batch by batch:
 
 ```
-49.1% ──▶ 65.1% ──▶ 79.3% ──▶ 91.2% ──▶ 92.6% ──▶ 93.7%
-baseline  batch 4   batch 7   batch 12  batch 13  batch 14
+49.1% ──▶ 65.1% ──▶ 79.3% ──▶ 91.2% ──▶ 93.7% ──▶ 95.3% ──▶ 96.0% ──▶ 96.5% ──▶ 97.0%
+baseline  batch4   batch7   batch12  batch14  batch15  batch16  batch18  batch19
 ```
 
-Red lines enforced on every merged batch: positive tests stay at 100%, std suite shows zero regression, all 1,867 cargo tests pass, and system tests stay at 40/40. The sprint runs a 4-agent parallel workflow (git-worktree isolated) implementing semantic checks in batches, with 30-minute heartbeat measurements.
+Red lines enforced on every merged batch: positive tests stay at 100%, std suite shows zero regression, all 2,014 cargo tests pass, and system tests stay at 40/40. The sprint runs a 4-agent parallel workflow (git-worktree isolated) implementing semantic checks in batches, with 30-minute heartbeat measurements.
 
-The remaining failing negative tests (1,592/20,069 ≈ 7.9%) fall into: contradiction groups inside the official suite itself (e.g. the 144-file chapter-13 pointer group whose positive and negative cases share identical sources, `String <<|` returning `Rune` yet annotated `@Negative: no`), interop cases requiring runtime C linking (ch. 13), metaprogramming/annotation cases requiring macro expansion (ch. 14/17), cases requiring cross-file package structure (ch. 11), and string-interpolation diagnostics requiring stronger intra-interpolation type inference (ch. 01).
+The remaining 755 failing negative tests (755/20,069 ≈ 3.8%) break down into: 152 in the chapter-13 pointer contradiction group (the "X" cases where the official suite's own positive and negative cases share identical sources and contradict themselves), plus about 600 at the tail of each chapter — dominated by R (runtime, needs C linking), L (needs major infrastructure), and C (cross-file package structure) categories — which a single-file compilation frontend cannot decide.
+
+Of the std suite's 1,441 files, the 28 non-passing split into two parts: 10 are official negative cases (macro_errors / invalid_syntax / foreignclass / strategy_wrong_target / out-of-range random integers, …) that the compiler **correctly rejects**, and 18 are structural skips (deriving / argOpt) because the corresponding cross-file/derived structure is absent.
 
 To reproduce the measurement: `git submodule update --init third_party/cangjie_test`, then compile every suite file with `target/release/cjwasm` — positive tests must succeed, negative tests must fail (non-zero exit).
 
@@ -58,6 +60,18 @@ To reproduce the measurement: `git submodule update --init third_party/cangjie_t
 - **Optional chaining**: `obj?.method()?.field`
 - **Conditional compilation**: `@When[os == "Windows"]`
 - **@C interoperability**: `@C` structs/foreign functions, `CFunc`/`CType` cross-language type rules (compile-time-checkable subset of ch. 13)
+
+### Sprint additions: compile-time diagnostics and rules (batches 15–19)
+- **Raw identifiers** — backtick identifiers (e.g. `` `type` ``) with reserved-word conflict handling
+- **unsafe context checking** — `@C` / `foreign` / `CFunc` calls must occur inside an `unsafe` context, otherwise compilation fails
+- **@C/CFunc/CType compile-time rules** — struct layout and cross-language parameter/return type constraints decidable at compile time
+- **extend generic-argument validation** — arity and bound checks on `extend` declarations
+- **Constructor member-parameter visibility and mutability** — `let` / `private` member parameters, named-parameter consistency, mutability rules
+- **Mutable closure capture is not a first-class value** — closures capturing mutable variables may not escape as first-class values
+- **String-interpolation type diagnostics** — type errors and undeclared calls inside interpolation expressions
+- **Concurrency built-in type constraints** — compile-time constraints for Future / spawn / ThreadLocal / Atomic families
+- **Enum semantics** — enums cannot be inherited; duplicate constructor-name detection
+- **Literal details** — radix prefixes cannot initialize a `Float` annotation; float literal exponents allow only a negative sign
 
 ### Memory and Runtime
 - **Memory management**: free-list allocator + reference counting + mark-sweep GC
@@ -270,20 +284,20 @@ Total line coverage is **80.15%** and region coverage is **89.93%**.
 ./scripts/coverage.sh --html
 ```
 
-### Unit and Integration Tests (1,867 Passing)
+### Unit and Integration Tests (2,014 Passing)
 
 ```bash
 cargo test
-# 1,222 passed (unit) + 631 passed (integration) + 14 passed (stdlib)
+# 1,369 passed (unit) + 631 passed (integration) + 14 passed (stdlib)
 ```
 
 | Category | Count | Notes |
 |------|--------|------|
-| **Semantic analysis** | 384 | class/interface/member/constructor rules (230) + expression typing and operator rules (154) — the bulk of the compatibility sprint |
-| **Parsing** | 356 | declarations, statements, expressions, patterns (incl. property syntax, modifiers, @C retention) |
+| **Semantic analysis** | 492 | class/interface/member/constructor rules (312) + expression typing and operator rules (180) — the bulk of the compatibility sprint |
+| **Parsing** | 392 | declarations, statements, expressions, patterns (incl. property syntax, modifiers, @C retention) |
 | **CHIR lowering** | 161 | AST → CHIR expressions/statements, CHIR-level type inference |
 | **Code generation** | 91 | WASM generation, CHIR codegen, macro compilation |
-| **Lexing** | 74 | tokens, integer suffixes, hex floats, nested comments |
+| **Lexing** | 77 | tokens, integer suffixes, hex floats, nested comments, raw identifiers |
 | **Pipeline** | 57 | end-to-end compilation, cjpm project parsing |
 | **Optimizer/monomorph** | 41 | constant folding, DCE, generic instantiation |
 | **Metadata** | 31 | stdlib type metadata |
@@ -295,15 +309,15 @@ cargo test
 
 `third_party/cangjie_test` (git submodule) provides two official suites:
 
-- **Conformance compiler suite** (29,705 files / 17 spec chapters): positive tests (5,132) must compile, negative tests (20,069) must fail compilation — currently **93.7%** (positive **100%**)
-- **std API suite** (1,441 files / 33 std modules): L1+L2 compile validation — currently **99.4%** (L1 **100%**)
+- **Conformance compiler suite** (29,705 files / 17 spec chapters): positive tests (5,132) must compile, negative tests (20,069) must fail compilation — currently **97.0%** (positive **100%** / negative 96.2%)
+- **std API suite** (1,441 files / 33 std modules): L1+L2 compile validation — currently **99.3%** (L1 **100%**)
 
 See the "Official Test Suite Compatibility" section above for methodology and sprint progress.
 
 ### Known Limitations
 
-1. **Official-suite contradictions and boundary categories** — about 340 of the remaining 1,592 negative tests belong to contradiction groups inside the official suite itself (the 144-file chapter-13 pointer group with identical positive/negative sources, the `String <<|` annotation contradiction), or require runtime C linking (ch. 13), macro expansion (ch. 14/17), or cross-file package structure (ch. 11) — not decidable by a single-file compilation frontend
-2. **String-interpolation deep diagnostics** — type errors inside interpolation expressions need stronger intra-interpolation inference (ch. 01, ~122 negative tests)
+1. **Remaining negative-test makeup** — of the 755 failing negative tests, 152 belong to the chapter-13 pointer contradiction group (the "X" cases where the official suite's own positive and negative cases share identical sources and contradict themselves); the other ~600 sit at the tail of each chapter, dominated by R (runtime, needs C linking), L (needs major infrastructure), and C (cross-file package structure) categories — not decidable by a single-file compilation frontend
+2. **std suite accounting** — 1,413/1,441 pass (99.3%); of the 28 non-passing, 10 are official negatives that are correctly rejected and 18 are structural skips (deriving / argOpt), not compiler defects
 3. **`std/` package WASM validation**: large packages with 97 stdlib files compile, but the generated WASM still has type mismatch issues during validation for complex nested generic types such as `Map<K, Tuple<Array<...>>>`.
 4. **Generic monomorphization**: some generic methods still use stubs instead of complete monomorphization.
 5. **Macro system**: macro expansion is still limited.
@@ -392,6 +406,15 @@ Cangjie source (.cj)
 | **Testing** | `@Assert`, `@Expect`, single-argument boolean form, automatic type coercion | ✅ |
 | **External interfaces** | `extern func` + `@import("module", "name")` | ✅ |
 | **C interop** | `@C` structs/classes, foreign functions, `CFunc`/`CType` type rules, `@C` constructor rules (compile-time subset of ch. 13) | ✅ |
+| **Raw identifiers** | backtick identifiers (e.g. `` `type` ``) with reserved-word conflict handling | ✅ |
+| **unsafe context** | `@C` / `foreign` / `CFunc` calls must be inside `unsafe`, otherwise a compile-time error | ✅ |
+| **extend validation** | arity and bound checks on `extend` declarations | ✅ |
+| **Constructor parameters** | member-parameter visibility/mutability (`let` / `private`), named-parameter consistency | ✅ |
+| **Closure capture** | closures capturing mutable variables cannot escape as first-class values | ✅ |
+| **Interpolation diagnostics** | type errors and undeclared calls inside string interpolation | ✅ |
+| **Concurrency type constraints** | compile-time type constraints for Future / spawn / ThreadLocal / Atomic | ✅ |
+| **Enum semantics** | enums cannot be inherited; duplicate constructor-name detection | ✅ |
+| **Literal details** | radix prefixes cannot initialize a `Float` annotation; float exponents allow only a negative sign | ✅ |
 
 For the full grammar, see [`docs/spec.md`](docs/spec.md).
 
@@ -401,12 +424,13 @@ Comparison against the native Cangjie compiler (`cjc`):
 
 | Metric | cjwasm | cjc | Ratio |
 |------|--------|-----|------|
-| Compile speed (small) | ~1ms | ~700ms | **~36x faster** |
-| Compile speed (medium) | ~2ms | ~900ms | **~7x faster** |
-| Output size (small) | 1.2 KB | 1020 KB | **845x smaller** |
-| Output size (medium) | 1.9 KB | 1021 KB | **543x smaller** |
+| Compile speed (small) | ~5.4ms | ~184ms | **~34x faster** |
+| Compile speed (medium) | ~6.4ms | ~189ms | **~29x faster** |
+| Output size (small) | 8.2 KB | 1034 KB | **~126x smaller** |
+| Output size (medium) | 9.2 KB | 1036 KB | **~113x smaller** |
 
 > CJWasm is a lightweight frontend that only emits WASM bytecode. `cjc` is a full native compiler that produces executables bundled with the standard library. The two tools have different goals.
+> Measured 2026-11-26 (Apple Silicon / Darwin 27, cjc 1.0.5, macOS 14.4 SDK sysroot); end-to-end process-time basis.
 
 ### CHIR Optimization Impact
 
@@ -414,22 +438,22 @@ Measured on `bench_heavy.cj` (100,000 dense small-function calls: identity / dou
 
 | Build | wasmtime time | WASM size |
 |------|---------------|-----------|
-| CHIR + optimization (default) | 28.17 ms | 9012 B |
-| CHIR without optimization (`NO_CHIR_OPT=1`) | 34.49 ms | 9028 B |
+| CHIR + optimization (default) | 13.84 ms | 9116 B |
+| CHIR without optimization (`NO_CHIR_OPT=1`) | 19.92 ms | 9132 B |
 
-- **1.22x faster under wasmtime (JIT)** — the JIT optimizes both builds, partially masking the difference
-- **~1.7x faster in interpreter mode (wasm-interp, no JIT)** — a better reflection of the instruction-level gains
+- **1.44x faster under wasmtime (JIT)** — the JIT optimizes both builds, partially masking the difference
+- Interpreter mode (wasm-interp, no JIT) reflects the instruction-level gain more directly, but the local wasm-interp build lacks WASI support, so the WASI-importing `bench_heavy` could not be re-measured
 
 ### Runtime Performance (wasmtime vs cjc native)
 
 | Workload | wasmtime | cjc native | Ratio |
 |------|----------|------------|------|
-| Small (27 lines) | 24.19 ms | 37.02 ms | wasm 1.5x faster |
-| Medium (100 lines) | 23.61 ms | 37.30 ms | wasm 1.6x faster |
-| Large (311 lines) | 24.20 ms | 37.00 ms | wasm 1.5x faster |
-| Heavy (89 lines) | 28.13 ms | 83.35 ms | wasm 3.0x faster |
+| Small (27 lines) | 8.04 ms | 22.43 ms | wasm 2.8x faster |
+| Medium (109 lines) | 8.23 ms | 22.21 ms | wasm 2.7x faster |
+| Large (124 lines) | 8.37 ms | 22.46 ms | wasm 2.7x faster |
+| Heavy (89 lines) | 13.76 ms | 73.95 ms | wasm 5.4x faster |
 
-> End-to-end process time; wasmtime figures include JIT compilation, native figures include process startup.
+> Measured 2026-11-26 (Apple Silicon / Darwin 27, cjc 1.0.5, macOS 14.4 SDK sysroot); end-to-end process time: wasmtime figures include JIT compilation, native figures include process startup.
 
 ```bash
 # Full comparison (compile speed + size + runtime + CHIR optimization)
@@ -466,7 +490,7 @@ Outputs:
 
 ```bash
 cargo build --release
-cargo test                       # 1,867 tests
+cargo test                       # 2,014 tests
 ./scripts/run_test.sh
 ./scripts/coverage.sh
 ./scripts/coverage.sh --html
