@@ -21,8 +21,8 @@
 
 use super::SemanticError;
 use crate::ast::{
-    BinOp, Expr, Function, IntSuffix, Pattern, Program, Stmt, Type, TypeConstraint, UnaryOp,
-    Visibility,
+    BinOp, Expr, Function, IntSuffix, Literal, Pattern, Program, Stmt, Type, TypeConstraint,
+    UnaryOp, Visibility,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -402,6 +402,18 @@ fn static_expr_ty(e: &Expr) -> Ty {
                 .unwrap_or(Ty::Unknown),
         )),
         _ => Ty::Unknown,
+    }
+}
+
+/// 复合模式中对字面量模式的静态类型（用于与选择子类型比对，4.4.1.1(2)）。
+/// 整数字面量按可适配的 `IntLit` 处理，浮点按 `FloatLit`。
+fn pattern_literal_ty(l: &Literal) -> Ty {
+    match l {
+        Literal::Integer(_) => Ty::IntLit,
+        Literal::Float(_) => Ty::FloatLit,
+        Literal::Bool(_) => Ty::Bool,
+        Literal::String(_) => Ty::String,
+        Literal::Rune(_) => Ty::Rune,
     }
 }
 
@@ -6558,6 +6570,8 @@ impl<'a> Checker<'a> {
                 type_args,
             } => {
                 self.check_expr(object);
+                // 2.1.11.2：枚举构造值上调用构造器（`A(0).B(..)`）非法。
+                self.check_enum_ctor_member(object, method);
                 // 2.1.4(2)：Unit 类型未定义成员访问运算符 '.'。
                 // `(e as T)` 结果为 Option<T>（4.17.2），排除 Cast 形态。
                 if !matches!(&**object, Expr::Cast { .. })
@@ -6851,6 +6865,8 @@ impl<'a> Checker<'a> {
 
             Expr::Field { object, field } => {
                 self.check_expr(object);
+                // 2.1.11.2：枚举构造值上访问构造器（`A(0).B`）非法。
+                self.check_enum_ctor_member(object, field);
                 // 2.1.4(2)：Unit 类型未定义成员访问运算符 '.'。
                 // `(e as T)` 的结果为 Option<T>（4.17.2），其 peek 类型为 T，
                 // 若 T=Unit 不能据此判定接收者为 Unit，故排除 Cast 形态。
@@ -7298,6 +7314,20 @@ impl<'a> Checker<'a> {
                             "元组模式只能用于匹配元组类型的选择子（4.4.1.4(1)）".to_string(),
                         );
                     }
+                    // 4.4.1.4(4)：元组模式元素个数须与选择子元组维度一致。
+                    if let Ty::Tuple(elems) = &sel_ty {
+                        if let Pattern::Tuple(ps) = &arm.pattern {
+                            if ps.len() != elems.len() {
+                                self.err(format!(
+                                    "元组模式的元素个数（{}）与选择子元组维度（{}）不一致（4.4.1.4(4)）",
+                                    ps.len(),
+                                    elems.len()
+                                ));
+                            }
+                        }
+                    }
+                    // 4.4.1.1(2)：常量模式字面量类型须与选择子类型一致。
+                    self.check_literal_pattern(&arm.pattern, &sel_ty);
                     let mut scope = HashMap::new();
                     // 4.4.1.3(4)：绑定模式引入的变量不可变。
                     bind_pattern_unknown_mut(&arm.pattern, &mut scope, false);
@@ -7952,6 +7982,97 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 表达式是否确定为“枚举构造值”（枚举实例），用于判断在其上访问构造器
+    /// 的非法形态（`A(0).B`，2.1.11.2）。返回 false 时保守放行。
+    fn expr_is_enum_value(&self, e: &Expr) -> bool {
+        match e {
+            Expr::VariantConst { .. } => true,
+            // 枚举构造器调用 `A(0)` 在解析器中为 ConstructorCall/ Call；名字为
+            // 枚举变体即枚举构造值。
+            Expr::ConstructorCall { name, .. } if self.enum_variants.contains(name) => true,
+            Expr::Call { name, .. } if self.enum_variants.contains(name) => true,
+            Expr::Invoke { callee, .. } => match &**callee {
+                Expr::Var(n) => self.enum_variants.contains(n),
+                _ => false,
+            },
+            Expr::Var(n) => self.lookup(n).map_or(false, |v| {
+                matches!(&v.ty, Ty::User(t) if self.enum_names.contains(t))
+            }),
+            _ => matches!(
+                self.check_expr_ty_peek(e),
+                Ty::User(ref t) if self.enum_names.contains(t)
+            ),
+        }
+    }
+
+    /// 2.1.11.2：枚举构造器只能通过枚举类型名 `E.B` 访问，不能在枚举构造值上
+    /// 访问（如 `A(0).B`）。经类型名访问（`E.B`）合法；内建 Option 的 Some/None
+    /// 与同名成员方法一并跳过（避免误伤合法的成员方法调用）。
+    fn check_enum_ctor_member(&mut self, object: &Expr, member: &str) {
+        if !self.enum_variants.contains(member) {
+            return;
+        }
+        if member == "Some" || member == "None" {
+            return;
+        }
+        if self.has_any_method_named(member) {
+            return;
+        }
+        if let Expr::Var(n) = object {
+            if self.enum_names.contains(n) {
+                return;
+            }
+        }
+        if self.expr_is_enum_value(object) {
+            self.err(format!(
+                "枚举构造器 '{}' 只能通过枚举类型名访问，不能在其构造值上访问（2.1.11.2）",
+                member
+            ));
+        }
+    }
+
+    /// 4.4.1.1(2)：match 常量模式的字面量类型须与选择子类型一致。
+    /// 仅当选择子为可确定的非用户/Option 类型时判定；字面量可适配对应类别
+    /// （整型字面量适配任意整数类型等），跨类别（如 String/Rune 匹配整数）报错。
+    fn check_literal_pattern(&mut self, pat: &Pattern, sel: &Ty) {
+        if !sel.is_definite() || matches!(sel, Ty::User(_) | Ty::Option(_)) {
+            return;
+        }
+        match pat {
+            Pattern::Literal(lit) => {
+                let lt = pattern_literal_ty(lit);
+                if !compatible(sel, &lt) {
+                    self.err(format!(
+                        "常量模式的字面量类型 {} 与选择子类型 {} 不一致（4.4.1.1(2)）",
+                        lt.name(),
+                        sel.name()
+                    ));
+                }
+            }
+            Pattern::Or(ps) => {
+                for p in ps {
+                    self.check_literal_pattern(p, sel);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 操作数是否为 Bool 字面量或静态类型确定为 Bool 的变量。返回 `Some(strong)`：
+    /// `strong` 表示这是“强可靠”的 Bool 来源（Bool 字面量或显式 `: Bool` 标注的
+    /// 变量）。解析器跨行合并可能把 `is Bool` 表达式并入 `let`，使普通变量的类型
+    /// 错误地呈现为 Bool；此时该变量既非字面量也非显式标注（`strong=false`）。
+    fn bool_operand_kind(&self, e: &Expr, t: &Ty) -> Option<bool> {
+        if *t != Ty::Bool {
+            return None;
+        }
+        match e {
+            Expr::Bool(_) => Some(true),
+            Expr::Var(n) => self.lookup(n).map(|v| v.explicit_bool),
+            _ => None,
+        }
+    }
+
     fn check_binary(&mut self, op: &BinOp, left: &Expr, lt: &Ty, rt: &Ty, right: &Expr) -> Ty {
         // 定义了该运算符重载时关闭对应规则，避免误伤合法重载。
         if self.overloaded_ops.contains(overload_name(op)) {
@@ -7970,6 +8091,29 @@ impl<'a> Checker<'a> {
             op,
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
         ) && (*lt == Ty::Bool || *rt == Ty::Bool);
+        // 两侧均为确定 Bool 的算术/幂运算：这是真实的 Bool 算术（如
+        // `boolA + boolB`），Bool 仅支持逻辑/相等运算，非法（2(2) 强类型）。
+        // 仅当两个操作数都是“可靠的 Bool 来源”（Bool 字面量或 Bool 类型变量）
+        // 时判定：解析器跨行合并会把 `is Bool` 等表达式结果错误地当作算术操作数
+        // （官方正例 4.17 中存在此形态），此类非变量/非字面量形态一律保守放行。
+        // 两侧均为 Bool 字面量/Bool 类型变量，且至少一侧为“强可靠”来源
+        // （字面量或显式 `: Bool` 标注）时，判为真实 Bool 算术并报错。
+        // 解析器跨行合并会制造伪 Bool 变量（非字面量/非显式标注），此时
+        // 两侧都不可靠，保守放行（官方正例 4.17 存在此形态）。
+        let bool_arith_reliable = match (
+            self.bool_operand_kind(left, lt),
+            self.bool_operand_kind(right, rt),
+        ) {
+            (Some(lok), Some(rok)) => lok || rok,
+            _ => false,
+        };
+        if bool_in_numeric_op && bool_arith_reliable {
+            self.err(format!(
+                "运算符 '{}' 的操作数不能为 Bool（Bool 仅支持逻辑与相等运算）",
+                bin_symbol(op)
+            ));
+            return Ty::Unknown;
+        }
         // 非插值上下文：Bool 参与算术通常源于解析器跨行合并（语法正例），保守跳过。
         // 插值上下文：表达式独立解析，无此歧义，继续走下方规则报出非法类型
         // （如 `boolVar + uint16Var`、`charVar + boolVar`）。
@@ -11265,4 +11409,64 @@ mod tests {
         assert_err("main() { let x: Int64; x = 1; x = 2; return }", "不可变变量");
     }
 
+    #[test]
+    fn test_w18c_bool_arith_rejected() {
+        // 两侧均为确定 Bool 的算术运算非法（2(2) 强类型；Bool 仅支持逻辑/相等）。
+        assert_err(
+            "main() { let a: Bool = false; var b = true; var c: Bool = a + b; return }",
+            "不能为 Bool",
+        );
+        assert_err("main() { var a: Bool = true; var b: Bool = false; var c = a * b }", "不能为 Bool");
+        // 单侧 Bool（可能为解析器跨行合并所致）保守放行，不误报。
+        assert_ok("main() { var a = true; return }");
+    }
+
+    #[test]
+    fn test_w18c_enum_ctor_on_value_rejected() {
+        // 枚举构造器不能在构造值上访问（`A(0).B`），只能经类型名 `E.B`（2.1.11.2）。
+        assert_err(
+            "enum E { |A(Int64) | B(Rune)} main() { var e = A(0).B('a') }",
+            "枚举构造器",
+        );
+        // 合法的枚举实例成员函数调用（非构造器名）放行。
+        assert_ok(
+            "enum E { |A(Int64) | B(Rune) public func desc(): Int64 { return 1 } } main() { let e = A(0); let x = e.desc() }",
+        );
+    }
+
+    #[test]
+    fn test_w18c_tuple_pattern_arity() {
+        // 元组模式元素个数须与选择子元组维度一致（4.4.1.4(4)）。
+        assert_err(
+            "main() {\n var v1 = (1, 2)\n match (v1) { case (1, 2, z) => true case _ => false }\n return\n}",
+            "元组模式",
+        );
+        assert_err(
+            "main() {\n var v1 = (1, 2, 3)\n match (v1) { case (1, 2) => true case _ => false }\n return\n}",
+            "元组模式",
+        );
+        assert_ok(
+            "main() {\n var v1 = (1, 2)\n match (v1) { case (a, b) => true case _ => false }\n return\n}",
+        );
+    }
+
+    #[test]
+    fn test_w18c_constant_pattern_type() {
+        // 常量模式字面量类型须与选择子类型一致（4.4.1.1(2)）。
+        assert_err(
+            "var v = 1\nmain() {\n match (v) { case \"a\" => 1 case _ => 2 }\n return\n}",
+            "常量模式",
+        );
+        assert_err(
+            "var v = 1\nmain() {\n match (v) { case 'a' | 5 => 1 case _ => 2 }\n return\n}",
+            "常量模式",
+        );
+        // 同类别整数字面量可适配。
+        assert_ok("var v = 1\nmain() {\n match (v) { case 1 => 1 case _ => 2 }\n return\n}");
+        // 元组选择子被单元素元组模式匹配（维度不符）非法，覆盖 a06_06。
+        assert_err(
+            "main() {\n match ((1, 2)) { case (1) => true case _ => false }\n return\n}",
+            "元组模式",
+        );
+    }
 }
