@@ -523,7 +523,7 @@ fn test_compile_stdlib_min_max_abs() {
 fn test_compile_extern_import() {
     let source = r#"
         @import("env", "print")
-        foreign func hostPrint(ptr: Int32, len: Int32)
+        foreign func hostPrint(ptr: Int32, len: Int32): Unit
         func main() : Int64 {
             return 0
         }
@@ -4314,7 +4314,7 @@ fn test_parse_string_interpolation() {
     let source = r#"
         func main() : Int64 {
             let x = 42
-            let s = `value: ${x}`
+            let s = "value: ${x}"
             return x
         }
     "#;

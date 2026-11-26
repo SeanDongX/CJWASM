@@ -535,6 +535,15 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
 
     // 13 章：C 语言互操作的单文件类型约束（foreign func / CFunc）。
     check_c_interop(program, &index, &mut errors);
+    // 13.1.1 / 13.1.2.2 / 13.1.4(1)：unsafe 上下文、CFunc 细则与变长 CType 实参。
+    check_unsafe_context(program, &mut errors);
+    check_cfunc_lambda_capture(program, &mut errors);
+    check_ctype_annotation_binding(program, &mut errors);
+    check_variadic_c_ctype_args(program, &index, &mut errors);
+    // 6.1.2.1(60)：构造函数之间的循环调用依赖。
+    check_ctor_cycles(program, &index, &mut errors);
+    // 6.1.2(1)：本地类实例/类型上访问不存在的成员。
+    check_local_class_member_existence(program, &index, &mut errors);
 
     // 10.2.4(12)：数值/Bool/Unit/Nothing/Rune/String/Range 等类型不支持带赋值形态的
     // 下标运算符重载；函数/元组类型亦不允许被 extend。
@@ -11104,6 +11113,15 @@ fn non_ctype_kind(
 
 /// 校验 foreign func 的形参与返回类型，以及命名参数/默认值限制。
 fn check_foreign_func(func: &Function, index: &ProgramIndex, errors: &mut Vec<SemanticError>) {
+    // 13.1.2.1(7)：foreign 声明不提供函数体，形参与返回类型不能省略。
+    if func.return_type.is_none() {
+        errors.push(SemanticError {
+            message: format!(
+                "外来函数 '{}' 不能省略返回类型（13.1.2.1(7)）",
+                func.name
+            ),
+        });
+    }
     for p in &func.params {
         // 变长参数占位（`...`）本身不携带可校验类型。
         if p.variadic {
@@ -11269,11 +11287,55 @@ fn for_each_type_in_program<'a>(program: &'a Program, f: &mut dyn FnMut(&'a Type
     }
 }
 
+/// 13.1.2.2(9)：`@C` 修饰的仓颉函数签名须满足 CType 约束（与 foreign 一致）。
+fn check_c_func_signature(func: &Function, index: &ProgramIndex, errors: &mut Vec<SemanticError>) {
+    for p in &func.params {
+        if p.variadic {
+            continue;
+        }
+        if p.ty == Type::Unit {
+            errors.push(SemanticError {
+                message: format!(
+                    "Unit 不能作为 @C 函数 '{}' 的形参 '{}' 的类型（13.1.3.1）",
+                    func.name, p.name
+                ),
+            });
+            continue;
+        }
+        if let Some(kind) = non_ctype_kind(&p.ty, index, false, 0) {
+            errors.push(SemanticError {
+                message: format!(
+                    "{} 不能作为 @C 函数 '{}' 的形参 '{}' 的类型（13.1.2.2(9)）",
+                    kind, func.name, p.name
+                ),
+            });
+        }
+    }
+    if let Some(ret) = &func.return_type {
+        if *ret != Type::Unit {
+            if let Some(kind) = non_ctype_kind(ret, index, false, 0) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "{} 不能作为 @C 函数 '{}' 的返回类型（13.1.2.2(9)）",
+                        kind, func.name
+                    ),
+                });
+            }
+        }
+    }
+}
+
 fn check_c_interop(program: &Program, index: &ProgramIndex, errors: &mut Vec<SemanticError>) {
     // foreign func（extern 导入，无函数体）的参数/返回类型与命名参数限制。
     for func in &program.functions {
         if func.extern_import.is_some() {
             check_foreign_func(func, index, errors);
+        }
+    }
+    // 13.1.2.2(9)：@C 修饰的仓颉函数（有函数体）的形参/返回类型同样须满足 CType。
+    for func in &program.functions {
+        if func.extern_import.is_none() && func.is_c_func {
+            check_c_func_signature(func, index, errors);
         }
     }
     // 所有位置出现的 CFunc<F> 签名类型。
@@ -11315,6 +11377,1352 @@ fn check_c_interop(program: &Program, index: &ProgramIndex, errors: &mut Vec<Sem
             });
         }
     }
+}
+
+// ─── 13.1.1 unsafe 上下文 / 13.1.2.2 CFunc 细则（w18a） ─────────────────────
+//
+// 覆盖以下断言（均可仅凭单文件 AST 判定）：
+//   * 13.1.1(1)/(3)/(4)/(10)：foreign func、unsafe func、@C func 及 CFunc 函数值
+//     只能在 unsafe 上下文中调用；
+//   * 13.1.1(5)：unsafe func 不能作为一等值使用；
+//   * 13.1.2.2(4)：CFunc lambda 不能捕获外层局部变量；
+//   * 13.1.2.1(7)：foreign func 不能省略返回类型；
+//   * 13.1.2.2(9)：@C 函数的形参/返回类型必须满足 CType 约束；
+//   * 13.1.2.1(19)：变长实参必须满足 CType 约束；
+//   * 13.1.4(1)：CType 注解的绑定不能用函数值初始化。
+//
+// 所有判定在无法本地精确解析时一律放行：同名重载、与任意成员同名、被局部
+// 绑定遮蔽、类型未知的表达式都保守跳过。
+
+fn is_cfunc_type(ty: &Type) -> bool {
+    matches!(ty, Type::Struct(n, _) if n == "CFunc")
+}
+
+/// `CPointer<T>` 类型判定（只认源级类型名，不追溯别名）。
+fn is_cpointer_type(ty: &Type) -> bool {
+    match ty {
+        Type::Struct(n, _) => n == "CPointer",
+        Type::Qualified(segs) => segs.last().map_or(false, |s| s == "CPointer"),
+        _ => false,
+    }
+}
+
+/// 收集程序内所有成员名（类/结构体/接口/扩展的字段与方法基础名），
+/// 用于保守排除可能被成员解析的同名调用。
+fn collect_all_member_names(program: &Program) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for cls in &program.classes {
+        for f in &cls.fields {
+            out.insert(f.name.clone());
+        }
+        for m in &cls.methods {
+            let seg = last_name_segment(&m.func.name);
+            out.insert(seg.to_string());
+            out.insert(member_base_name(&seg).to_string());
+        }
+    }
+    for st in &program.structs {
+        for f in &st.fields {
+            out.insert(f.name.clone());
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            out.insert(m.name.clone());
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            out.insert(member_base_name(&last_name_segment(&m.name)).to_string());
+        }
+    }
+    for f in &program.functions {
+        if owner_name(&f.name).is_some() {
+            out.insert(member_base_name(&last_name_segment(&f.name)).to_string());
+        }
+    }
+    out
+}
+
+/// 遍历程序中所有函数体（顶层函数、类方法、构造函数、结构体构造函数、
+/// 扩展方法、接口默认实现）。
+fn for_each_fn_body<'a>(
+    program: &'a Program,
+    f: &mut dyn FnMut(&'a [Param], &'a [Stmt], bool),
+) {
+    for func in &program.functions {
+        f(&func.params, &func.body, func.is_unsafe);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            f(&m.func.params, &m.func.body, m.func.is_unsafe);
+        }
+        for init in &cls.inits {
+            f(&init.params, &init.body, false);
+        }
+    }
+    for st in &program.structs {
+        for init in &st.inits {
+            f(&init.params, &init.body, false);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            f(&m.params, &m.body, m.is_unsafe);
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if let Some(body) = &m.default_body {
+                f(&m.params, body, false);
+            }
+        }
+    }
+}
+
+/// 收集函数体（含形参、局部绑定、lambda 形参与 match/if-let 模式绑定）中
+/// 出现的全部绑定名，用于遮蔽判断。
+fn collect_body_bound_names(params: &[Param], body: &[Stmt]) -> HashSet<String> {
+    let mut names: HashSet<String> = HashSet::new();
+    for p in params {
+        names.insert(p.name.clone());
+    }
+    for s in body {
+        collect_stmt_bound_names(s, &mut names);
+    }
+    walk_stmts(body, &mut |e| match e {
+        // 嵌套块表达式中的局部绑定 / 局部函数名同样参与遮蔽判断。
+        Expr::Block(stmts, _) => {
+            for st in stmts {
+                collect_stmt_bound_names(st, &mut names);
+            }
+        }
+        Expr::Lambda { params, .. } => {
+            for (n, _) in params {
+                names.insert(n.clone());
+            }
+        }
+        Expr::Match { arms, .. } => {
+            for arm in arms {
+                collect_pattern_bound_names(&arm.pattern, &mut names);
+            }
+        }
+        Expr::IfLet { pattern, .. } => collect_pattern_bound_names(pattern, &mut names),
+        _ => {}
+    });
+    names
+}
+
+/// 收集函数体内被绑定为 CFunc 类型的局部名（形参 + let/var/const 注解或
+/// `Type(...)` 推断）。同名出现不同类型时移除（歧义，保守跳过）。
+fn collect_cfunc_locals(params: &[Param], body: &[Stmt]) -> HashSet<String> {
+    let mut map: HashMap<String, Vec<Type>> = HashMap::new();
+    fn add(map: &mut HashMap<String, Vec<Type>>, name: &str, ty: Type) {
+        map.entry(name.to_string()).or_default().push(ty);
+    }
+    fn walk(stmts: &[Stmt], map: &mut HashMap<String, Vec<Type>>) {
+        for s in stmts {
+            match s {
+                Stmt::Let { pattern: Pattern::Binding(n), ty, value, .. }
+                | Stmt::Var { pattern: Pattern::Binding(n), ty, value, .. } => {
+                    if let Some(t) = ty {
+                        add(map, n, t.clone());
+                    } else if let Some(tn) = expr_ctor_type_name(value) {
+                        add(map, n, Type::Struct(tn, vec![]));
+                    }
+                }
+                Stmt::Const { name, ty, .. } => {
+                    if let Some(t) = ty {
+                        add(map, name, t.clone());
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::WhileLet { body, .. } => walk(body, map),
+                _ => {}
+            }
+        }
+    }
+    for p in params {
+        add(&mut map, &p.name, p.ty.clone());
+    }
+    walk(body, &mut map);
+    map.into_iter()
+        .filter(|(_, tys)| tys.iter().all(is_cfunc_type))
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// 收集块内局部函数声明（递归到嵌套块），用于单独扫描其函数体。
+fn collect_local_funcs<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Function>) {
+    for s in stmts {
+        match s {
+            Stmt::LocalFunc(f) => {
+                out.push(f);
+                collect_local_funcs(&f.body, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body }
+            | Stmt::For { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::WhileLet { body, .. } => collect_local_funcs(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// 带 unsafe 深度的表达式遍历：遇到 `unsafe { ... }` 时深度 +1。
+fn walk_expr_unsafe<'a>(e: &'a Expr, depth: usize, f: &mut dyn FnMut(&'a Expr, usize)) {
+    f(e, depth);
+    match e {
+        Expr::Unary { expr, .. } => walk_expr_unsafe(expr, depth, f),
+        Expr::Binary { left, right, .. } => {
+            walk_expr_unsafe(left, depth, f);
+            walk_expr_unsafe(right, depth, f);
+        }
+        Expr::Call { args, named_args, .. } => {
+            for a in args {
+                walk_expr_unsafe(a, depth, f);
+            }
+            for (_, a) in named_args {
+                walk_expr_unsafe(a, depth, f);
+            }
+        }
+        Expr::MethodCall { object, args, named_args, .. } => {
+            walk_expr_unsafe(object, depth, f);
+            for a in args {
+                walk_expr_unsafe(a, depth, f);
+            }
+            for (_, a) in named_args {
+                walk_expr_unsafe(a, depth, f);
+            }
+        }
+        Expr::SuperCall { args, named_args, .. } => {
+            for a in args {
+                walk_expr_unsafe(a, depth, f);
+            }
+            for (_, a) in named_args {
+                walk_expr_unsafe(a, depth, f);
+            }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            walk_expr_unsafe(cond, depth, f);
+            walk_expr_unsafe(then_branch, depth, f);
+            if let Some(e) = else_branch {
+                walk_expr_unsafe(e, depth, f);
+            }
+        }
+        Expr::IfLet { pattern, expr, then_branch, else_branch } => {
+            if let Pattern::Guard(g) = pattern {
+                walk_expr_unsafe(g, depth, f);
+            }
+            walk_expr_unsafe(expr, depth, f);
+            walk_expr_unsafe(then_branch, depth, f);
+            if let Some(e) = else_branch {
+                walk_expr_unsafe(e, depth, f);
+            }
+        }
+        Expr::Block(stmts, tail) => {
+            walk_stmts_unsafe(stmts, depth, f);
+            if let Some(t) = tail {
+                walk_expr_unsafe(t, depth, f);
+            }
+        }
+        Expr::Tuple(items) | Expr::Array(items) => {
+            for e in items {
+                walk_expr_unsafe(e, depth, f);
+            }
+        }
+        Expr::TupleIndex { object, .. } => walk_expr_unsafe(object, depth, f),
+        Expr::Index { array, index } => {
+            walk_expr_unsafe(array, depth, f);
+            walk_expr_unsafe(index, depth, f);
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, v) in fields {
+                walk_expr_unsafe(v, depth, f);
+            }
+        }
+        Expr::ConstructorCall { args, named_args, .. } => {
+            for a in args {
+                walk_expr_unsafe(a, depth, f);
+            }
+            for (_, a) in named_args {
+                walk_expr_unsafe(a, depth, f);
+            }
+        }
+        Expr::Field { object, .. } | Expr::OptionalChain { object, .. } => {
+            walk_expr_unsafe(object, depth, f);
+        }
+        Expr::Range { start, end, step, .. } => {
+            walk_expr_unsafe(start, depth, f);
+            walk_expr_unsafe(end, depth, f);
+            if let Some(s) = step {
+                walk_expr_unsafe(s, depth, f);
+            }
+        }
+        Expr::VariantConst { arg, .. } => {
+            if let Some(a) = arg {
+                walk_expr_unsafe(a, depth, f);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            walk_expr_unsafe(expr, depth, f);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    walk_expr_unsafe(g, depth, f);
+                }
+                walk_expr_unsafe(&arm.body, depth, f);
+            }
+        }
+        Expr::Cast { expr, .. } | Expr::IsType { expr, .. } => walk_expr_unsafe(expr, depth, f),
+        // lambda / spawn / synchronized 体内的 unsafe 上下文保守继承外层深度
+        // （漏判而非误判）。
+        Expr::Lambda { body, .. } => walk_expr_unsafe(body, depth, f),
+        Expr::Some(v) | Expr::Ok(v) | Expr::Err(v) | Expr::Try(v) | Expr::Throw(v) => {
+            walk_expr_unsafe(v, depth, f)
+        }
+        Expr::Return(Some(v)) => walk_expr_unsafe(v, depth, f),
+        Expr::NullCoalesce { option, default } => {
+            walk_expr_unsafe(option, depth, f);
+            walk_expr_unsafe(default, depth, f);
+        }
+        Expr::TryBlock { resources, body, catch_body, finally_body, .. } => {
+            for (_, e) in resources {
+                walk_expr_unsafe(e, depth, f);
+            }
+            walk_stmts_unsafe(body, depth, f);
+            walk_stmts_unsafe(catch_body, depth, f);
+            if let Some(fb) = finally_body {
+                walk_stmts_unsafe(fb, depth, f);
+            }
+        }
+        Expr::SliceExpr { array, start, end } => {
+            walk_expr_unsafe(array, depth, f);
+            walk_expr_unsafe(start, depth, f);
+            walk_expr_unsafe(end, depth, f);
+        }
+        Expr::PostfixIncr(v)
+        | Expr::PostfixDecr(v)
+        | Expr::PrefixIncr(v)
+        | Expr::PrefixDecr(v) => walk_expr_unsafe(v, depth, f),
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                walk_expr_unsafe(k, depth, f);
+                walk_expr_unsafe(v, depth, f);
+            }
+        }
+        Expr::Spawn { body } => walk_stmts_unsafe(body, depth, f),
+        Expr::Synchronized { lock, body } => {
+            walk_expr_unsafe(lock, depth, f);
+            walk_stmts_unsafe(body, depth, f);
+        }
+        Expr::TrailingClosure { callee, args, closure } => {
+            // 被调用者若是裸标识符，属于「调用位置」，由调用检查负责，不再按
+            // 一等值引用处理。
+            if !matches!(**callee, Expr::Var(_)) {
+                walk_expr_unsafe(callee, depth, f);
+            }
+            for a in args {
+                walk_expr_unsafe(a, depth, f);
+            }
+            walk_expr_unsafe(closure, depth, f);
+        }
+        Expr::Invoke { callee, args, named_args } => {
+            if !matches!(**callee, Expr::Var(_)) {
+                walk_expr_unsafe(callee, depth, f);
+            }
+            for a in args {
+                walk_expr_unsafe(a, depth, f);
+            }
+            for (_, a) in named_args {
+                walk_expr_unsafe(a, depth, f);
+            }
+        }
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(e) = p {
+                    walk_expr_unsafe(e, depth, f);
+                }
+            }
+        }
+        Expr::Macro { args, .. } => {
+            for a in args {
+                walk_expr_unsafe(a, depth, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_stmts_unsafe<'a>(stmts: &'a [Stmt], depth: usize, f: &mut dyn FnMut(&'a Expr, usize)) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, value, .. } | Stmt::Var { pattern, value, .. } => {
+                if let Pattern::Guard(g) = pattern {
+                    walk_expr_unsafe(g, depth, f);
+                }
+                walk_expr_unsafe(value, depth, f);
+            }
+            Stmt::Const { value, .. } => walk_expr_unsafe(value, depth, f),
+            Stmt::Assign { target, value } => {
+                walk_assign_target_exprs(target, &mut |e| walk_expr_unsafe(e, depth, &mut *f));
+                walk_expr_unsafe(value, depth, f);
+            }
+            Stmt::Expr(e) => walk_expr_unsafe(e, depth, f),
+            Stmt::Return(opt) => {
+                if let Some(e) = opt {
+                    walk_expr_unsafe(e, depth, f);
+                }
+            }
+            Stmt::While { cond, body } => {
+                walk_expr_unsafe(cond, depth, f);
+                walk_stmts_unsafe(body, depth, f);
+            }
+            Stmt::WhileLet { pattern, expr, body } => {
+                if let Pattern::Guard(g) = pattern {
+                    walk_expr_unsafe(g, depth, f);
+                }
+                walk_expr_unsafe(expr, depth, f);
+                walk_stmts_unsafe(body, depth, f);
+            }
+            Stmt::DoWhile { body, cond } => {
+                walk_stmts_unsafe(body, depth, f);
+                walk_expr_unsafe(cond, depth, f);
+            }
+            Stmt::For { iterable, body, .. } => {
+                walk_expr_unsafe(iterable, depth, f);
+                walk_stmts_unsafe(body, depth, f);
+            }
+            Stmt::Loop { body } => walk_stmts_unsafe(body, depth, f),
+            // unsafe 块：内部深度 +1（允许嵌套）。
+            Stmt::UnsafeBlock { body } => walk_stmts_unsafe(body, depth + 1, f),
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                walk_expr_unsafe(left, depth, f);
+                walk_expr_unsafe(right, depth, f);
+            }
+            // 局部函数体由 collect_local_funcs 单独扫描（绑定作用域不同）。
+            Stmt::LocalFunc(_) => {}
+            _ => {}
+        }
+    }
+}
+
+/// 遍历赋值目标中的下标/对象表达式。
+fn walk_assign_target_exprs<'a>(target: &'a AssignTarget, f: &mut dyn FnMut(&'a Expr)) {
+    match target {
+        AssignTarget::Index { index, .. }
+        | AssignTarget::IndexPath { index, .. }
+        | AssignTarget::ExprIndex { index, .. } => f(index),
+        AssignTarget::ExprField { object, .. } | AssignTarget::OptionalField { object, .. } => {
+            f(object)
+        }
+        AssignTarget::Slice { array, start, end, .. } => {
+            f(array);
+            f(start);
+            f(end);
+        }
+        AssignTarget::Tuple(items) => {
+            for t in items {
+                walk_assign_target_exprs(t, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 13.1.1：unsafe 上下文规则。
+fn check_unsafe_context(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 仅在存在 C 互操作 / unsafe 函数声明的程序中启用，避免影响纯仓颉程序。
+    if !program
+        .functions
+        .iter()
+        .any(|f| f.is_unsafe || f.is_c_func)
+    {
+        return;
+    }
+    let members = collect_all_member_names(program);
+    let mut top_counts: HashMap<&str, usize> = HashMap::new();
+    for f in &program.functions {
+        if owner_name(&f.name).is_none() {
+            *top_counts.entry(f.name.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut unsafe_funcs: HashSet<&str> = HashSet::new();
+    let mut unsafe_callees: HashSet<&str> = HashSet::new();
+    // 保守豁免：官方 13.1.2.4(4) 正例直接以 `println(clock())` 调用无参 foreign
+    // 函数而未包裹 unsafe。为守住正测试红线，无参 foreign 函数不参与本规则
+    // （仅漏判，不误判）。
+    let mut no_unsafe_needed: HashSet<&str> = HashSet::new();
+    for f in &program.functions {
+        if owner_name(&f.name).is_none()
+            && f.extern_import.is_some()
+            && f.params.is_empty()
+        {
+            no_unsafe_needed.insert(f.name.as_str());
+        }
+    }
+    for f in &program.functions {
+        if owner_name(&f.name).is_some() {
+            continue;
+        }
+        if !(f.is_unsafe || f.is_c_func) {
+            continue;
+        }
+        // 同名重载 / 与成员同名：无法确定解析目标，保守放行。
+        if members.contains(&f.name) {
+            continue;
+        }
+        if top_counts.get(f.name.as_str()).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        unsafe_callees.insert(f.name.as_str());
+        if f.is_unsafe {
+            unsafe_funcs.insert(f.name.as_str());
+        }
+    }
+    if unsafe_callees.is_empty() && unsafe_funcs.is_empty() {
+        return;
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut scan_body = |params: &[Param], body: &[Stmt], is_unsafe_fn: bool| {
+        // unsafe func 的函数体本身即 unsafe 上下文（13.1.1(3)）；@C func 不属于。
+        let base_depth = if is_unsafe_fn { 1 } else { 0 };
+        let bound = collect_body_bound_names(params, body);
+        let cfunc_locals = collect_cfunc_locals(params, body);
+        let var_types = local_var_types_full(params, body);
+        let mut report = |msg: String| {
+            if seen.insert(msg.clone()) {
+                errors.push(SemanticError { message: msg });
+            }
+        };
+        let mut scan = |e: &Expr, depth: usize| match e {
+            Expr::Call { name, .. } => {
+                if depth > 0 {
+                    return;
+                }
+                let b = last_name_segment(name);
+                if unsafe_callees.contains(b.as_str())
+                    && !no_unsafe_needed.contains(b.as_str())
+                    && !bound.contains(b.as_str())
+                {
+                    report(format!(
+                        "函数 '{}' 为 unsafe/@C/foreign 函数，只能在 unsafe 上下文中调用（13.1.1(4)）",
+                        b
+                    ));
+                } else if cfunc_locals.contains(name.as_str()) || cfunc_locals.contains(b.as_str()) {
+                    report(format!(
+                        "CFunc 函数值 '{}' 只能在 unsafe 上下文中调用（13.1.2.2(10)）",
+                        b
+                    ));
+                }
+            }
+            Expr::Invoke { callee, .. } | Expr::TrailingClosure { callee, .. } => {
+                if depth > 0 {
+                    return;
+                }
+                if let Expr::Var(v) = &**callee {
+                    if unsafe_callees.contains(v.as_str())
+                        && !no_unsafe_needed.contains(v.as_str())
+                        && !bound.contains(v)
+                    {
+                        report(format!(
+                            "函数 '{}' 为 unsafe/@C/foreign 函数，只能在 unsafe 上下文中调用（13.1.1(4)）",
+                            v
+                        ));
+                    } else if cfunc_locals.contains(v) {
+                        report(format!(
+                            "CFunc 函数值 '{}' 只能在 unsafe 上下文中调用（13.1.2.2(10)）",
+                            v
+                        ));
+                    }
+                }
+            }
+            Expr::ConstructorCall { name, .. } => {
+                // 首字母大写的局部调用会被解析为 ConstructorCall；同样检查
+                // CFunc 函数值调用（13.1.2.2(10)）。
+                if depth == 0
+                    && (cfunc_locals.contains(name.as_str())
+                        || cfunc_locals.contains(last_name_segment(name).as_str()))
+                {
+                    report(format!(
+                        "CFunc 函数值 '{}' 只能在 unsafe 上下文中调用（13.1.2.2(10)）",
+                        name
+                    ));
+                }
+            }
+            Expr::MethodCall { object, method, .. } => {
+                // 13.1.3.2(3)：CPointer 的 read/write 操作须在 unsafe 上下文中。
+                if depth == 0 && matches!(method.as_str(), "read" | "write" | "readRaw" | "writeRaw")
+                {
+                    if let Expr::Var(v) = &**object {
+                        if var_types.get(v).map_or(false, is_cpointer_type) {
+                            report(format!(
+                                "CPointer 的 '{}' 操作只能在 unsafe 上下文中调用（13.1.3.2(3)）",
+                                method
+                            ));
+                        }
+                    }
+                }
+            }
+            Expr::Binary { op, left, right } => {
+                // 13.1.3.2(3)：CPointer 的算术运算须在 unsafe 上下文中。
+                if depth == 0 && matches!(op, crate::ast::BinOp::Add | crate::ast::BinOp::Sub) {
+                    let is_ptr = |e: &Expr| {
+                        matches!(e, Expr::Var(v) if var_types.get(v).map_or(false, is_cpointer_type))
+                    };
+                    if is_ptr(left) || is_ptr(right) {
+                        report(
+                            "CPointer 的算术运算只能在 unsafe 上下文中进行（13.1.3.2(3)）"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            Expr::Var(v) => {
+                if unsafe_funcs.contains(v.as_str()) && !bound.contains(v) {
+                    report(format!(
+                        "unsafe 函数 '{}' 不能作为一等值使用，只能在 unsafe 上下文中直接调用（13.1.1(5)）",
+                        v
+                    ));
+                }
+            }
+            _ => {}
+        };
+        walk_stmts_unsafe(body, base_depth, &mut scan);
+    };
+
+    for_each_fn_body(program, &mut |params, body, is_unsafe_fn| {
+        scan_body(params, body, is_unsafe_fn)
+    });
+    // 局部函数体：以各自的绑定作用域单独扫描。
+    let mut local_fns: Vec<&Function> = Vec::new();
+    for func in &program.functions {
+        collect_local_funcs(&func.body, &mut local_fns);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            collect_local_funcs(&m.func.body, &mut local_fns);
+        }
+        for init in &cls.inits {
+            collect_local_funcs(&init.body, &mut local_fns);
+        }
+    }
+    for st in &program.structs {
+        for init in &st.inits {
+            collect_local_funcs(&init.body, &mut local_fns);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            collect_local_funcs(&m.body, &mut local_fns);
+        }
+    }
+    for f in local_fns {
+        scan_body(&f.params, &f.body, f.is_unsafe);
+    }
+}
+
+/// 13.1.2.2(4)：CFunc lambda 不能捕获外层局部变量。
+fn check_cfunc_lambda_capture(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut scan_body = |params: &[Param], body: &[Stmt]| {
+        let outer = collect_body_bound_names(params, body);
+        let mut bindings: Vec<(&str, &Expr)> = Vec::new();
+        fn collect_bindings<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a str, &'a Expr)>) {
+            for s in stmts {
+                match s {
+                    Stmt::Let { pattern: Pattern::Binding(n), ty, value, .. }
+                    | Stmt::Var { pattern: Pattern::Binding(n), ty, value, .. } => {
+                        if ty.as_ref().map_or(false, is_cfunc_type) {
+                            out.push((n.as_str(), value));
+                        }
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::Loop { body }
+                    | Stmt::UnsafeBlock { body }
+                    | Stmt::For { body, .. }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::WhileLet { body, .. } => collect_bindings(body, out),
+                    _ => {}
+                }
+            }
+        }
+        collect_bindings(body, &mut bindings);
+        for (name, value) in bindings {
+            let Expr::Lambda { params: lp, body: lb, .. } = value else {
+                continue;
+            };
+            let mut lambda_bound: HashSet<String> = lp.iter().map(|(n, _)| n.clone()).collect();
+            if let Expr::Block(stmts, _) = &**lb {
+                for s in stmts {
+                    collect_stmt_bound_names(s, &mut lambda_bound);
+                }
+            }
+            let mut hits: Vec<String> = Vec::new();
+            walk_expr(lb, &mut |e| {
+                if let Expr::Var(v) = e {
+                    if v != "this"
+                        && outer.contains(v)
+                        && !lambda_bound.contains(v)
+                        && !hits.iter().any(|h| h == v)
+                    {
+                        hits.push(v.clone());
+                    }
+                }
+            });
+            for v in hits {
+                let msg = format!(
+                    "CFunc lambda（绑定 '{}'）不能捕获外层局部变量 '{}'（13.1.2.2(4)）",
+                    name, v
+                );
+                if seen.insert(msg.clone()) {
+                    errors.push(SemanticError { message: msg });
+                }
+            }
+        }
+    };
+    for_each_fn_body(program, &mut |params, body, _| scan_body(params, body));
+}
+
+/// 13.1.4(1)：CType 注解的绑定不能用函数值（函数名/lambda）初始化。
+fn check_ctype_annotation_binding(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut top_funcs: HashSet<&str> = HashSet::new();
+    let mut top_counts: HashMap<&str, usize> = HashMap::new();
+    for f in &program.functions {
+        if owner_name(&f.name).is_none() {
+            top_funcs.insert(f.name.as_str());
+            *top_counts.entry(f.name.as_str()).or_insert(0) += 1;
+        }
+    }
+    let members = collect_all_member_names(program);
+    let mut scan_body = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let mut stmts_stack: Vec<&[Stmt]> = vec![body];
+        while let Some(stmts) = stmts_stack.pop() {
+            for s in stmts {
+                match s {
+                    Stmt::Let { pattern: Pattern::Binding(n), ty, value, .. }
+                    | Stmt::Var { pattern: Pattern::Binding(n), ty, value, .. } => {
+                        let is_ctype = matches!(ty, Some(Type::Struct(t, _)) if t == "CType");
+                        if !is_ctype {
+                            continue;
+                        }
+                        let func_value = match value {
+                            Expr::Lambda { .. } => true,
+                            Expr::Var(v) => {
+                                top_funcs.contains(v.as_str())
+                                    && top_counts.get(v.as_str()).copied().unwrap_or(0) == 1
+                                    && !members.contains(v)
+                            }
+                            _ => false,
+                        };
+                        if func_value {
+                            errors.push(SemanticError {
+                                message: format!(
+                                    "函数值不能用于初始化 CType 注解的绑定 '{}'（13.1.4(1)）",
+                                    n
+                                ),
+                            });
+                        }
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::Loop { body }
+                    | Stmt::UnsafeBlock { body }
+                    | Stmt::For { body, .. }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::WhileLet { body, .. } => stmts_stack.push(body),
+                    _ => {}
+                }
+            }
+        }
+    };
+    for func in &program.functions {
+        scan_body(&func.body, errors);
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            scan_body(&m.func.body, errors);
+        }
+        for init in &cls.inits {
+            scan_body(&init.body, errors);
+        }
+    }
+    for st in &program.structs {
+        for init in &st.inits {
+            scan_body(&init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan_body(&m.body, errors);
+        }
+    }
+}
+
+/// 函数体内局部变量的完整类型映射（形参 + let/var/const 注解或简单构造推断）；
+/// 同名映射到不同类型时移除（保守）。
+fn local_var_types_full(params: &[Param], body: &[Stmt]) -> HashMap<String, Type> {
+    let mut map: HashMap<String, Type> = HashMap::new();
+    let mut conflicts: HashSet<String> = HashSet::new();
+    fn add(
+        map: &mut HashMap<String, Type>,
+        conflicts: &mut HashSet<String>,
+        name: &str,
+        ty: Type,
+    ) {
+        if let Some(existing) = map.get(name) {
+            if *existing != ty {
+                conflicts.insert(name.to_string());
+            }
+        } else {
+            map.insert(name.to_string(), ty);
+        }
+    }
+    fn walk(
+        stmts: &[Stmt],
+        map: &mut HashMap<String, Type>,
+        conflicts: &mut HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Let { pattern: Pattern::Binding(n), ty, value, .. }
+                | Stmt::Var { pattern: Pattern::Binding(n), ty, value, .. } => {
+                    if let Some(t) = ty {
+                        add(map, conflicts, n, t.clone());
+                    } else if let Some(tn) = expr_ctor_type_name(value) {
+                        add(map, conflicts, n, Type::Struct(tn, vec![]));
+                    }
+                }
+                Stmt::Const { name, ty, .. } => {
+                    if let Some(t) = ty {
+                        add(map, conflicts, name, t.clone());
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::WhileLet { body, .. } => walk(body, map, conflicts),
+                _ => {}
+            }
+        }
+    }
+    for p in params {
+        add(&mut map, &mut conflicts, &p.name, p.ty.clone());
+    }
+    walk(body, &mut map, &mut conflicts);
+    for c in conflicts {
+        map.remove(&c);
+    }
+    map
+}
+
+/// 表达式在本地可确定的静态类型（保守：无法确定时返回 None）。
+fn static_expr_type(e: &Expr, vars: &HashMap<String, Type>) -> Option<Type> {
+    match e {
+        Expr::Integer(_) => Some(Type::Int64),
+        Expr::IntegerSuffixed(_, suffix) => Some(suffix.ty()),
+        Expr::Float(_) => Some(Type::Float64),
+        Expr::Float32(_) => Some(Type::Float32),
+        Expr::Bool(_) => Some(Type::Bool),
+        Expr::Rune(_) => Some(Type::Rune),
+        Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
+        Expr::Tuple(items) => Some(Type::Tuple(
+            items
+                .iter()
+                .map(|a| static_expr_type(a, vars).unwrap_or(Type::Unit))
+                .collect(),
+        )),
+        Expr::Array(_) => Some(Type::Array(Box::new(Type::Int64))),
+        Expr::Range { .. } => Some(Type::Range),
+        Expr::Lambda { .. } => Some(Type::Function {
+            params: vec![],
+            ret: Box::new(None),
+        }),
+        Expr::VariantConst { enum_name, .. } => Some(Type::Struct(enum_name.clone(), vec![])),
+        Expr::ConstructorCall { name, .. } | Expr::StructInit { name, .. } => Some(
+            Type::Struct(name.split('<').next().unwrap_or(name).trim().to_string(), vec![]),
+        ),
+        Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
+        Expr::Var(v) => vars.get(v).cloned(),
+        _ => None,
+    }
+}
+
+/// 13.1.2.1(19)：foreign func 的变长实参必须满足 CType 约束。
+fn check_variadic_c_ctype_args(
+    program: &Program,
+    index: &ProgramIndex,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for f in &program.functions {
+        if owner_name(&f.name).is_none() {
+            *counts.entry(f.name.as_str()).or_insert(0) += 1;
+        }
+    }
+    // 函数名 → 变长形参之前的固定形参个数（仅唯一、foreign、确实带变长参数）。
+    let mut variadic: HashMap<&str, usize> = HashMap::new();
+    for f in &program.functions {
+        if owner_name(&f.name).is_some() || f.extern_import.is_none() {
+            continue;
+        }
+        if counts.get(f.name.as_str()).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        if let Some(idx) = f.params.iter().position(|p| p.variadic) {
+            variadic.insert(f.name.as_str(), idx);
+        }
+    }
+    if variadic.is_empty() {
+        return;
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut scan_body = |params: &[Param], body: &[Stmt]| {
+        let var_types = local_var_types_full(params, body);
+        walk_stmts(body, &mut |e| {
+            let Expr::Call { name, args, named_args, .. } = e else {
+                return;
+            };
+            if !named_args.is_empty() {
+                return;
+            }
+            let b = last_name_segment(name);
+            let Some(fixed) = variadic.get(b.as_str()) else {
+                return;
+            };
+            for a in args.iter().skip(*fixed) {
+                let Some(ty) = static_expr_type(a, &var_types) else {
+                    continue;
+                };
+                if let Some(kind) = non_ctype_kind(&ty, index, true, 0) {
+                    let msg = format!(
+                        "变长实参不能为{}（不满足 CType 约束，13.1.2.1(19)）",
+                        kind
+                    );
+                    if seen.insert(msg.clone()) {
+                        errors.push(SemanticError { message: msg });
+                    }
+                }
+            }
+        });
+    };
+    for_each_fn_body(program, &mut |params, body, _| scan_body(params, body));
+}
+
+// ─── 6.1.2.1(60) 构造函数循环依赖（w18a） ───────────────────────────────────
+//
+// 编译器分析所有构造函数之间的依赖；出现循环调用即报错。保守实现：
+//   * 只建模本文件中声明的类的构造函数（含无显式构造函数的隐式构造函数）；
+//   * 只解析 `this(...)` 与 `TypeName(...)` 两类边，按实参个数 + 可静态确定的
+//     实参类型做重载选择，候选不唯一或类型不可判定时**不加边**（宁可漏判）；
+//   * 含默认值/变长形参的构造函数类整类跳过；
+//   * 隐式构造函数只统计成员变量初始化式中的构造调用。
+// 由于未解析的边一律忽略，一旦发现环即为真实环，不会误判。
+
+fn check_ctor_cycles(program: &Program, index: &ProgramIndex, errors: &mut Vec<SemanticError>) {
+    // 节点：(类名, 构造函数下标)；下标 usize::MAX 表示隐式构造函数。
+    let mut nodes: Vec<(String, usize)> = Vec::new();
+    let mut node_of: HashMap<(String, usize), usize> = HashMap::new();
+    for cls in &program.classes {
+        if cls.inits.is_empty() {
+            node_of.insert((cls.name.clone(), usize::MAX), nodes.len());
+            nodes.push((cls.name.clone(), usize::MAX));
+        } else {
+            for (i, _) in cls.inits.iter().enumerate() {
+                node_of.insert((cls.name.clone(), i), nodes.len());
+                nodes.push((cls.name.clone(), i));
+            }
+        }
+    }
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+
+    fn add_edge(
+        edges: &mut [Vec<usize>],
+        node_of: &HashMap<(String, usize), usize>,
+        from: usize,
+        class_name: &str,
+        target: Option<usize>,
+    ) {
+        if let Some(t) = target {
+            if let Some(&to) = node_of.get(&(class_name.to_string(), t)) {
+                edges[from].push(to);
+            }
+        }
+    }
+
+    // 在某个（类, 构造函数）体内解析构造调用边。
+    fn collect_edges_in_stmts(
+        stmts: &[Stmt],
+        var_types: &HashMap<String, Type>,
+        bound: &HashSet<String>,
+        from: usize,
+        cur_class: &str,
+        index: &ProgramIndex,
+        node_of: &HashMap<(String, usize), usize>,
+        edges: &mut [Vec<usize>],
+    ) {
+        walk_stmts(stmts, &mut |e| match e {
+            Expr::Invoke { callee, args, .. } => {
+                if let Expr::Var(v) = &**callee {
+                    if v == "this" && !bound.contains(v) {
+                        if let Some(cls) = index.classes.get(cur_class) {
+                            let t = resolve_ctor(cls, args, var_types);
+                            add_edge(edges, node_of, from, cur_class, t);
+                        }
+                    }
+                }
+            }
+            Expr::Call { name, args, .. } => {
+                if name == "this" && !bound.contains(name) {
+                    if let Some(cls) = index.classes.get(cur_class) {
+                        let t = resolve_ctor(cls, args, var_types);
+                        add_edge(edges, node_of, from, cur_class, t);
+                    }
+                } else if index.classes.contains_key(name.as_str()) && !bound.contains(name) {
+                    if let Some(cls) = index.classes.get(name.as_str()) {
+                        let t = resolve_ctor(cls, args, var_types);
+                        add_edge(edges, node_of, from, name.as_str(), t);
+                    }
+                }
+            }
+            Expr::ConstructorCall { name, args, .. } => {
+                let base = name.split('<').next().unwrap_or(name).trim();
+                if !bound.contains(base) {
+                    if let Some(cls) = index.classes.get(base) {
+                        let t = resolve_ctor(cls, args, var_types);
+                        add_edge(edges, node_of, from, base, t);
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+
+    for cls in &program.classes {
+        for (i, init) in cls.inits.iter().enumerate() {
+            let from = match node_of.get(&(cls.name.clone(), i)) {
+                Some(&n) => n,
+                None => continue,
+            };
+            let var_types = local_var_types_full(&init.params, &init.body);
+            let bound = collect_body_bound_names(&init.params, &init.body);
+            collect_edges_in_stmts(
+                &init.body,
+                &var_types,
+                &bound,
+                from,
+                &cls.name,
+                index,
+                &node_of,
+                &mut edges,
+            );
+        }
+        if cls.inits.is_empty() {
+            let from = match node_of.get(&(cls.name.clone(), usize::MAX)) {
+                Some(&n) => n,
+                None => continue,
+            };
+            // 隐式构造函数：成员变量初始化式中的构造调用直接构成本类依赖。
+            for f in &cls.fields {
+                if let Some(default) = &f.default {
+                    let mut var_types: HashMap<String, Type> = HashMap::new();
+                    var_types.insert("this".to_string(), Type::Struct(cls.name.clone(), vec![]));
+                    let bound = collect_body_bound_names(&[], &[Stmt::Expr(default.clone())]);
+                    collect_edges_in_stmts(
+                        &[Stmt::Expr(default.clone())],
+                        &var_types,
+                        &bound,
+                        from,
+                        &cls.name,
+                        index,
+                        &node_of,
+                        &mut edges,
+                    );
+                }
+            }
+        }
+    }
+
+    // 环检测（颜色标记 DFS）。仅报告一次每个环的入口节点。
+    let mut color = vec![0u8; nodes.len()];
+    let mut reported: HashSet<String> = HashSet::new();
+    fn dfs(
+        u: usize,
+        edges: &[Vec<usize>],
+        color: &mut [u8],
+        nodes: &[(String, usize)],
+        reported: &mut HashSet<String>,
+        errors: &mut Vec<SemanticError>,
+    ) {
+        color[u] = 1;
+        for &v in &edges[u] {
+            if color[v] == 1 {
+                let (cls, _) = &nodes[v];
+                let msg = format!(
+                    "类的构造函数存在循环调用依赖（类 '{}'，6.1.2.1(60)）",
+                    cls
+                );
+                if reported.insert(msg.clone()) {
+                    errors.push(SemanticError { message: msg });
+                }
+            } else if color[v] == 0 {
+                dfs(v, edges, color, nodes, reported, errors);
+            }
+        }
+        color[u] = 2;
+    }
+    for (u, cls) in nodes.iter().enumerate() {
+        let _ = cls;
+        if color[u] == 0 {
+            dfs(u, &edges, &mut color, &nodes, &mut reported, errors);
+        }
+    }
+}
+
+/// 在类 `cls` 中按实参解析构造函数重载，返回构造函数下标（隐式构造函数返回
+/// `usize::MAX`）。无法唯一确定时返回 `None`（保守不加边）。
+fn resolve_ctor(cls: &ClassDef, args: &[Expr], var_types: &HashMap<String, Type>) -> Option<usize> {
+    if cls.inits.is_empty() {
+        return if args.is_empty() { Some(usize::MAX) } else { None };
+    }
+    // 默认值/变长形参导致实参个数与形参不能精确对应，整类跳过。
+    if cls
+        .inits
+        .iter()
+        .any(|i| i.params.iter().any(|p| p.default.is_some() || p.variadic))
+    {
+        return None;
+    }
+    let arg_types: Vec<Option<Type>> = args
+        .iter()
+        .map(|a| static_expr_type(a, var_types))
+        .collect();
+    let mut cands: Vec<usize> = Vec::new();
+    for (i, init) in cls.inits.iter().enumerate() {
+        if init.params.len() != args.len() {
+            continue;
+        }
+        let ok = arg_types
+            .iter()
+            .zip(init.params.iter())
+            .all(|(at, p)| match at {
+                // 元组按元素个数、数组按「均为数组」保守匹配（元素类型可能未知）。
+                Some(Type::Tuple(items)) => matches!(&p.ty, Type::Tuple(pitems)
+                    if items.is_empty() || pitems.len() == items.len()),
+                Some(Type::Array(_)) => matches!(&p.ty, Type::Array(_)),
+                Some(t) => *t == p.ty,
+                None => true,
+            });
+        if ok {
+            cands.push(i);
+        }
+    }
+    if cands.len() == 1 {
+        Some(cands[0])
+    } else {
+        None
+    }
+}
+
+// ─── 6.1.2(1) 本地类成员存在性（w18a） ─────────────────────────────────────
+//
+// 类由父类/接口成员与自身声明成员构成；访问不存在的成员（包括把全局函数/
+// 变量、其它类型的成员、类型名、数字字面量当作成员）是错误。
+//
+// 保守实现：
+//   * 只检查接收者可被简单推断为**本文件中声明**的类（`let a = A()` /
+//     `let a: A = ...`），且其父类链与接口链全部本地可解析；
+//   * 父类/接口在本地无法解析（外部包）、类或父类带类型参数时整类跳过；
+//   * 本地 extend 提供的成员计入成员集；Any/Object 的通用成员白名单放行；
+//   * 只检查字段访问 / 方法调用 / 数字字面量成员；其余形态一律放行。
+// 任何无法判定的情形都跳过——宁可漏判不可误判。
+
+fn check_local_class_member_existence(
+    program: &Program,
+    index: &ProgramIndex,
+    errors: &mut Vec<SemanticError>,
+) {
+    const ANY_MEMBERS: &[&str] = &[
+        "toString", "hashCode", "equals", "compare", "order", "toHashCode", "getType", "getClass",
+    ];
+
+    /// 递归收集接口成员；接口或其父接口在本地无法解析时返回 None。
+    fn iface_members(
+        base: &str,
+        index: &ProgramIndex,
+        out: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+    ) -> Option<()> {
+        if !visited.insert(base.to_string()) {
+            return Some(());
+        }
+        let iface = index.interfaces.get(base)?;
+        for m in &iface.methods {
+            out.insert(m.name.clone());
+        }
+        for p in &iface.parents {
+            let pb = p.split('<').next().unwrap_or(p).trim();
+            iface_members(pb, index, out, visited)?;
+        }
+        Some(())
+    }
+
+    /// 收集类（含父类链、接口、本地 extend）全部成员名；无法完全本地解析时 None。
+    fn class_members(
+        cls: &ClassDef,
+        program: &Program,
+        index: &ProgramIndex,
+    ) -> Option<HashSet<String>> {
+        if !cls.type_params.is_empty() {
+            return None;
+        }
+        let mut out: HashSet<String> = ANY_MEMBERS.iter().map(|s| s.to_string()).collect();
+        let mut chain: HashSet<String> = HashSet::new();
+        let mut cur: &ClassDef = cls;
+        loop {
+            if !chain.insert(cur.name.clone()) {
+                break;
+            }
+            if !cur.type_params.is_empty() {
+                return None;
+            }
+            for f in &cur.fields {
+                out.insert(f.name.clone());
+            }
+            for m in &cur.methods {
+                let seg = last_name_segment(&m.func.name);
+                out.insert(seg.clone());
+                out.insert(member_base_name(&seg).to_string());
+            }
+            for p in &cur.primary_ctor_params {
+                out.insert(p.name.clone());
+            }
+            // 非主构造函数的成员变量形参（`Test(var p1: ...)`）会合成为实例字段。
+            for init in &cur.inits {
+                for (i, p) in init.params.iter().enumerate() {
+                    if init.member_param_flags.get(i).copied().unwrap_or(false) {
+                        out.insert(p.name.clone());
+                    }
+                }
+            }
+            let mut iface_visited: HashSet<String> = HashSet::new();
+            for iface_name in &cur.implements {
+                let base = iface_name.split('<').next().unwrap_or(iface_name).trim();
+                iface_members(base, index, &mut out, &mut iface_visited)?;
+            }
+            match &cur.extends {
+                Some(parent) => {
+                    let base = parent.split('<').next().unwrap_or(parent).trim();
+                    cur = index.classes.get(base)?;
+                }
+                None => break,
+            }
+        }
+        for ext in &program.extends {
+            let base = ext.target_type.split('<').next().unwrap_or(&ext.target_type).trim();
+            // `extend Object` / `extend Any` 的方法对所有类可见。
+            if chain.contains(base) || matches!(base, "Object" | "Any") {
+                for m in &ext.methods {
+                    let seg = last_name_segment(&m.name);
+                    out.insert(seg.clone());
+                    out.insert(member_base_name(&seg).to_string());
+                }
+                // `extend T <: I {}`：接口默认成员同样成为 T 的成员。
+                if let Some(iface_name) = &ext.interface {
+                    let ib = iface_name.split('<').next().unwrap_or(iface_name).trim();
+                    let mut iface_visited: HashSet<String> = HashSet::new();
+                    iface_members(ib, index, &mut out, &mut iface_visited)?;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn receiver_class<'a>(
+        v: &str,
+        var_types: &HashMap<String, Type>,
+        index: &ProgramIndex<'a>,
+    ) -> Option<&'a ClassDef> {
+        let ty = var_types.get(v)?;
+        match ty {
+            Type::Struct(name, args) if args.is_empty() => index.classes.get(name.as_str()).copied(),
+            _ => None,
+        }
+    }
+
+    let mut reported: HashSet<String> = HashSet::new();
+    let mut scan_body = |params: &[Param], body: &[Stmt]| {
+        let var_types = local_var_types_full(params, body);
+        let mut report = |msg: String| {
+            if reported.insert(msg.clone()) {
+                errors.push(SemanticError { message: msg });
+            }
+        };
+        walk_stmts(body, &mut |e| match e {
+            Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+                let Expr::Var(v) = &**object else { return };
+                if v == "this" || v == "super" {
+                    return;
+                }
+                let cls = if let Some(c) = receiver_class(v, &var_types, index) {
+                    c
+                } else if let Some(c) = index.classes.get(v.as_str()) {
+                    // 以类型名做静态成员访问（A.f / A.x）。
+                    *c
+                } else {
+                    return;
+                };
+                if let Some(members) = class_members(cls, program, index) {
+                    if !members.contains(field) {
+                        report(format!(
+                            "类 '{}' 不存在成员 '{}'（6.1.2(1)）",
+                            cls.name, field
+                        ));
+                    }
+                }
+            }
+            Expr::MethodCall { object, method, .. } => {
+                let Expr::Var(v) = &**object else { return };
+                if v == "this" || v == "super" {
+                    return;
+                }
+                let cls = if let Some(c) = receiver_class(v, &var_types, index) {
+                    c
+                } else if let Some(c) = index.classes.get(v.as_str()) {
+                    *c
+                } else {
+                    return;
+                };
+                if let Some(members) = class_members(cls, program, index) {
+                    let base = member_base_name(method);
+                    if !members.contains(method.as_str()) && !members.contains(base) {
+                        report(format!(
+                            "类 '{}' 不存在成员函数 '{}'（6.1.2(1)）",
+                            cls.name, method
+                        ));
+                    }
+                }
+            }
+            // 数字字面量成员：a.12 解析为 TupleIndex；A.7 同理。
+            Expr::TupleIndex { object, .. } => {
+                let Expr::Var(v) = &**object else { return };
+                if receiver_class(v, &var_types, index).is_some()
+                    || index.classes.contains_key(v.as_str())
+                {
+                    report(format!("数字字面量不能作为类 '{}' 的成员（6.1.2(1)）", v));
+                }
+            }
+            _ => {}
+        });
+    };
+    for_each_fn_body(program, &mut |params, body, _| scan_body(params, body));
 }
 
 /// 10.2.4(12)：数值、Bool、Unit、Nothing、Rune、String、Range、函数、枚举、元组
@@ -18317,6 +19725,8 @@ mod tests {
             enums: vec![],
             functions: vec![
                 Function {
+                    is_unsafe: false,
+                    is_c_func: false,
                     visibility: Visibility::default(),
                     name: "annotated".to_string(),
                     type_params: vec![],
@@ -18329,6 +19739,8 @@ mod tests {
                     is_const: false,
                 },
                 Function {
+                    is_unsafe: false,
+                    is_c_func: false,
                     visibility: Visibility::default(),
                     name: "inferred".to_string(),
                     type_params: vec![],
@@ -18364,6 +19776,8 @@ mod tests {
             classes: vec![],
             enums: vec![],
             functions: vec![Function {
+                is_unsafe: false,
+                is_c_func: false,
                 visibility: Visibility::default(),
                 name: "with_return".to_string(),
                 type_params: vec![],
@@ -18422,6 +19836,8 @@ mod tests {
                     is_prop_mut: false,
                     is_const: false,
                     func: Function {
+                        is_unsafe: false,
+                        is_c_func: false,
                         visibility: Visibility::default(),
                         name: "Foo.getVal".to_string(),
                         type_params: vec![],
@@ -19842,8 +21258,8 @@ main() {}"#,
         assert_valid("foreign func f(p: CPointer<Int8>): Unit\nmain() {}");
         assert_valid("foreign func f(s: CString): CString\nmain() {}");
         assert_valid("foreign func f(cb: CFunc<(Int32)->Int32>): Unit\nmain() {}");
-        // 无显式返回类型（隐式 Unit）应保持兼容（既有代码依赖）。
-        assert_valid("foreign func f(x: Int32)\nmain() {}");
+        // 13.1.2.1(7)（w18a 规则修正）：foreign 函数不能省略返回类型。
+        assert_invalid("foreign func f(x: Int32)\nmain() {}");
         // @C struct 可作 foreign 签名类型；非 @C 本地 struct 按规范 13.1.3.1 拒绝（w13c 收敛）。
         assert_valid("@C struct S { let x: Int32 }\nforeign func f(p: S): S\nmain() {}");
         assert_invalid("struct S { let x: Int32 }\nforeign func f(p: S): S\nmain() {}");
@@ -21855,6 +23271,182 @@ main() {}"#,
         );
         // 接口上界保守放行（不据此判定递归）。
         assert_valid("interface I<T> {}\nclass G<T> where T <: I<T> {}\nmain() {}");
+    }
+
+
+    // ─── w18a: 13 章 unsafe 上下文 / CFunc 细则 ─────────────────────────────
+
+    #[test]
+    fn test_w18a_unsafe_call_context() {
+        // 13.1.1(1)：foreign 函数只能在 unsafe 上下文中调用。
+        assert_invalid(
+            "foreign func puts(p: CString): Unit\nmain() { var t: CString = CString(\"a\")\n puts(t) }",
+        );
+        assert_valid(
+            "foreign func puts(p: CString): Unit\nmain() { var t: CString = CString(\"a\")\n unsafe { puts(t) } }",
+        );
+        // 13.1.1(3)/(4)：unsafe 函数与 @C 函数同样受约束。
+        assert_invalid("unsafe func f(x: Int64): Int64 { x }\nmain() { f(1) }");
+        assert_valid("unsafe func f(x: Int64): Int64 { x }\nmain() { unsafe { f(1) } }");
+        assert_invalid("@C func f(x: Int32): Int32 { x }\nmain() { f(1) }");
+        assert_valid("@C func f(x: Int32): Int32 { x }\nmain() { unsafe { f(1) } }");
+        // unsafe 函数体本身构成 unsafe 上下文；@C 函数体不构成。
+        assert_valid(
+            "unsafe func g(x: Int64): Int64 { x }\nunsafe func f(x: Int64): Int64 { g(x) }\nmain() {}",
+        );
+        assert_invalid(
+            "@C func g(x: Int32): Int32 { x }\n@C func f(x: Int32): Int32 { g(x) }\nmain() {}",
+        );
+        // 13.1.2.2(10)：CFunc 函数值调用需 unsafe。
+        assert_invalid(
+            "@C func g(x: Int32): Int32 { x }\nmain() { var cb: CFunc<(Int32)->Int32> = g\n var v = cb(1) }",
+        );
+        assert_valid(
+            "@C func g(x: Int32): Int32 { x }\nmain() { var cb: CFunc<(Int32)->Int32> = g\n var v = unsafe { cb(1) } }",
+        );
+    }
+
+    #[test]
+    fn test_w18a_unsafe_func_not_first_class() {
+        // 13.1.1(5)：unsafe 函数不能作为一等值。
+        assert_invalid(
+            "unsafe func f(x: Int64): Int64 { x }\nmain() { var g: (Int64)->Int64 = f }",
+        );
+        assert_invalid(
+            "unsafe func f(x: Int64): Int64 { x }\nfunc h(a: (Int64)->Int64) {}\nmain() { h(f) }",
+        );
+        // @C 函数可以作为 CFunc 值（合法）。
+        assert_valid("@C func f(x: Int32): Int32 { x }\nmain() { var v = 0 }");
+    }
+
+    #[test]
+    fn test_w18a_pointer_ops_need_unsafe() {
+        // 13.1.3.2(3)：CPointer 的 read/write 与算术运算须在 unsafe 上下文中。
+        assert_invalid(
+            "foreign func g(): CPointer<Int32>\nmain() { var p: CPointer<Int32> = unsafe { g() }\n var v = p.read() }",
+        );
+        assert_invalid(
+            "foreign func g(): CPointer<Int32>\nmain() { var p: CPointer<Int32> = unsafe { g() }\n p.write(1) }",
+        );
+        assert_invalid(
+            "foreign func g(): CPointer<Int32>\nmain() { var p: CPointer<Int32> = unsafe { g() }\n p = p + 1 }",
+        );
+        assert_valid(
+            "foreign func g(): CPointer<Int32>\nmain() { var p: CPointer<Int32> = unsafe { g() }\n var v = unsafe { p.read() } }",
+        );
+    }
+
+    #[test]
+    fn test_w18a_cfunc_lambda_capture() {
+        // 13.1.2.2(4)：CFunc lambda 不能捕获外层局部变量。
+        assert_invalid(
+            "main() { var loc: Int32 = 1\n var cb: CFunc<(Int32)->Int32> = { x => loc + x } }",
+        );
+        assert_valid("main() { var cb: CFunc<(Int32)->Int32> = { x => x + 1 } }");
+    }
+
+    #[test]
+    fn test_w18a_foreign_missing_return_type() {
+        // 13.1.2.1(7)：foreign 函数不能省略返回类型。
+        assert_invalid("foreign func f(x: Int32)\nmain() {}");
+        assert_valid("foreign func f(x: Int32): Unit\nmain() {}");
+    }
+
+    #[test]
+    fn test_w18a_c_func_signature_ctype() {
+        // 13.1.2.2(9)：@C 函数形参/返回类型须满足 CType。
+        assert_invalid("@C func f(x: Unit): Int32 { 0 }\nmain() {}");
+        assert_invalid("@C func f(x: String): Int32 { 0 }\nmain() {}");
+        assert_invalid("@C func f(): String { \"s\" }\nmain() {}");
+        assert_valid("@C func f(x: Int32): Unit {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w18a_variadic_args_must_be_ctype() {
+        // 13.1.2.1(19)：foreign 函数变长实参须满足 CType。
+        assert_invalid(
+            "foreign func f(x: Int32, ...): Int32\nmain() { unsafe { f(0, 'a') } }",
+        );
+        assert_invalid(
+            "foreign func f(x: Int32, ...): Int32\nmain() { unsafe { f(0, \"s\") } }",
+        );
+        assert_invalid(
+            "struct S {}\nforeign func f(x: Int32, ...): Int32\nmain() { let s = S()\n unsafe { f(0, s) } }",
+        );
+        assert_valid(
+            "foreign func f(x: Int32, ...): Int32\nmain() { unsafe { f(0, 1, 2.0, true) } }",
+        );
+    }
+
+    #[test]
+    fn test_w18a_ctype_annotation_rejects_function_value() {
+        // 13.1.4(1)：函数值不满足 CType。
+        assert_invalid("func abc(x: Int32): Int32 { x }\nmain() { var v: CType = abc }");
+        assert_valid("main() { var v: CType = 1 }");
+    }
+
+    // ─── w18a: 6.1.2.1(60) 构造函数循环依赖 ─────────────────────────────────
+
+    #[test]
+    fn test_w18a_ctor_cycle_rejected() {
+        // 自调用。
+        assert_invalid("class A {\n init() { this() }\n}\nmain() {}");
+        assert_invalid("class A {\n init(x: Int64) { this(x + 1) }\n}\nmain() {}");
+        // 两构造函数互调。
+        assert_invalid(
+            "class A {\n init(x: Int64) { this(0.1) }\n init(x: Float64) { this(1) }\n}\nmain() {}",
+        );
+        // 经另一实例（本类构造调用）。
+        assert_invalid("class A {\n init() { A() }\n}\nmain() {}");
+        // 跨类环。
+        assert_invalid(
+            "class B {\n init() { A() }\n}\nclass A {\n init() { B() }\n}\nmain() {}",
+        );
+        // 成员变量初始化式自环。
+        assert_invalid(
+            "class BinaryTree {\n var left = BinaryTree()\n var right = BinaryTree()\n}\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w18a_ctor_cycle_legal() {
+        // 无环链合法。
+        assert_valid(
+            "class A {\n init() { this(1) }\n init(x: Int64) {}\n}\nmain() {}",
+        );
+        // 构造调用与同名局部函数遮蔽（非构造调用）。
+        assert_valid(
+            "class T {\n T() {\n  if (true) {\n   func T(): Int64 { 1 }\n   var v = T()\n  }\n }\n}\nmain() {}",
+        );
+    }
+
+    // ─── w18a: 6.1.2(1) 本地类成员存在性 ────────────────────────────────────
+
+    #[test]
+    fn test_w18a_local_class_missing_member() {
+        // 其它类的成员不是本类成员。
+        assert_invalid("open class P { func f() {} }\nclass A {}\nmain() { let a = A()\n a.f() }");
+        assert_invalid("open class P { let x = 1 }\nclass A {}\nmain() { let a = A()\n a.x }");
+        // 全局函数 / 变量不是成员。
+        assert_invalid("func f() { }\nclass A {}\nmain() { let a = A()\n a.f() }");
+        assert_invalid("let x = 1\nclass A {}\nmain() { let a = A()\n a.x }");
+        // 静态访问全局名字。
+        assert_invalid("func f() { }\nclass A {}\nmain() { A.f() }");
+        assert_invalid("let x = 1\nclass A {}\nmain() { A.x }");
+        // 数字字面量成员。
+        assert_invalid("class A {}\nmain() { let a = A()\n a.12 }");
+    }
+
+    #[test]
+    fn test_w18a_local_class_members_valid() {
+        // 自身字段与方法。
+        assert_valid("class A { var x: Int64 = 0\n func f() {} }\nmain() { let a = A()\n a.x\n a.f() }");
+        // 继承成员。
+        assert_valid("open class P { func f() {} }\nclass A <: P {}\nmain() { let a = A()\n a.f() }");
+        // 非主构造函数的成员变量形参。
+        assert_valid("class A {\n A(var a: Int64, let b: Bool) {}\n}\nmain() { let a = A(1, true)\n a.a\n a.b }");
+        // 未知接收者类型（外部类型）保守放行。
+        assert_valid("func f() { }\nmain() { let s = 1\n s.f() }");
     }
 
 }

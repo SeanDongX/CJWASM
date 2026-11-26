@@ -280,6 +280,8 @@ impl CodeGen {
         let body = init_def.body.clone();
 
         FuncDef {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility: Visibility::Public,
             name: func_name,
@@ -311,6 +313,8 @@ impl CodeGen {
         params.extend(init_def.params.iter().cloned());
 
         FuncDef {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility: Visibility::Public,
             name: func_name,
@@ -330,6 +334,8 @@ impl CodeGen {
         let func_name = format!("__{}_deinit", class_name);
 
         FuncDef {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility: Visibility::Public,
             name: func_name,

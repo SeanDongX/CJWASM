@@ -494,11 +494,12 @@ impl Parser {
                         type_aliases.push((alias_name, target_ty));
                     }
                     Some(Token::Func) => {
-                        let f = self.parse_function_with_visibility(visibility)?;
+                        let mut f = self.parse_function_with_visibility(visibility)?;
                         if c_attr {
                             if let Some(msg) = self.validate_c_func(&f) {
                                 return self.bail(ParseError::UnexpectedToken(Token::Func, msg));
                             }
+                            f.is_c_func = true;
                         }
                         functions.push(f)
                     }
@@ -506,12 +507,16 @@ impl Parser {
                     Some(Token::Unsafe) => {
                         self.advance(); // consume unsafe
                         if self.check(&Token::Func) {
-                            let f = self.parse_function_with_visibility(visibility)?;
+                            let mut f = self.parse_function_with_visibility(visibility)?;
                             if c_attr {
                                 if let Some(msg) = self.validate_c_func(&f) {
                                     return self.bail(ParseError::UnexpectedToken(Token::Func, msg));
                                 }
+                                f.is_c_func = true;
                             }
+                            // 13.1.1(3)-(5)：unsafe 函数只能在 unsafe 上下文外调用，
+                            // 且不得作为一等值使用。
+                            f.is_unsafe = true;
                             functions.push(f)
                         } else {
                             let tok = self.advance().unwrap_or(Token::Semicolon);
@@ -1092,6 +1097,9 @@ impl Parser {
             })
         });
         Ok(Function {
+            is_unsafe: false,
+            // 13.1.2.2(10)：外来函数只能在 unsafe 上下文外调用。
+            is_c_func: true,
             is_const: false,
             visibility,
             name,
@@ -1508,6 +1516,7 @@ impl Parser {
                     // 时由语义检查拒绝，如 6.3.5(3)）。
                     mods.visibility.clone().unwrap_or(Visibility::Internal),
                 )?;
+                func.is_unsafe = mods.is_unsafe;
                 self.receiver_name = prev_receiver;
                 // 重命名为 StructName.methodName
                 if !func.name.contains('.') {
@@ -1575,6 +1584,8 @@ impl Parser {
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
                             methods.push(crate::ast::Function {
+                                is_unsafe: false,
+                                is_c_func: false,
                                 is_const: false,
                                 // 保留属性声明的可见性（private 属性仅在定义体内可见，
                                 // 2.1.10.4(6)）；未标注时维持 public，避免影响既有代码生成。
@@ -1619,6 +1630,8 @@ impl Parser {
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
                             methods.push(crate::ast::Function {
+                                is_unsafe: false,
+                                is_c_func: false,
                                 is_const: false,
                                 visibility: mods
                                     .visibility
@@ -1963,6 +1976,8 @@ impl Parser {
                     is_inout: false,
                 };
                 let mk_getter = |body: Vec<Stmt>| crate::ast::Function {
+                    is_unsafe: false,
+                    is_c_func: false,
                     is_const: false,
                     visibility: member_vis.clone(),
                     name: format!("{}.__get_{}", name, prop_name),
@@ -1979,6 +1994,8 @@ impl Parser {
                     extern_import: None,
                 };
                 let mk_setter = |val_name: String, body: Vec<Stmt>| crate::ast::Function {
+                    is_unsafe: false,
+                    is_c_func: false,
                     is_const: false,
                     visibility: member_vis.clone(),
                     name: format!("{}.__set_{}", name, prop_name),
@@ -2091,6 +2108,7 @@ impl Parser {
                     // 成员默认可见性为 internal。
                     mods.visibility.clone().unwrap_or(Visibility::Internal),
                 )?;
+                func.is_unsafe = mods.is_unsafe;
                 self.receiver_name = prev_receiver;
                 if !func.name.contains('.') {
                     func.name = format!("{}.{}", name, func.name);
@@ -2772,6 +2790,8 @@ impl Parser {
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
                             methods.push(Function {
+                                is_unsafe: false,
+                                is_c_func: false,
                                 is_const: false,
                                 visibility: member_vis.clone(),
                                 name: format!("{}.__get_{}", target_type, prop_name),
@@ -2811,6 +2831,8 @@ impl Parser {
                             self.expect(Token::RBrace)?;
                             self.receiver_name = None;
                             methods.push(Function {
+                                is_unsafe: false,
+                                is_c_func: false,
                                 is_const: false,
                                 visibility: member_vis.clone(),
                                 name: format!("{}.__set_{}", target_type, prop_name),
@@ -2857,6 +2879,7 @@ impl Parser {
             self.receiver_name = Some("this".to_string());
             let mut func = self.parse_function_with_visibility(member_vis)?;
             func.is_const = mods.is_const;
+            func.is_unsafe = mods.is_unsafe;
             self.receiver_name = prev_receiver;
             // P3: 添加隐式 this 参数（如同 struct/class 方法）
             let has_self = func
@@ -3213,6 +3236,8 @@ impl Parser {
                     methods.push(crate::ast::ClassMethod {
                         is_const: false,
                         func: Function {
+                            is_unsafe: false,
+                            is_c_func: false,
                             is_const: false,
                             visibility: member_vis.clone(),
                             name: format!("{}.__static_init", name),
@@ -3419,6 +3444,8 @@ impl Parser {
                         is_prop_mut: mods.is_mut,
                         is_const: false,
                         func: crate::ast::Function {
+                            is_unsafe: false,
+                            is_c_func: false,
                             is_const: false,
                             visibility: member_vis.clone(),
                             name: format!("{}.__get_{}", name, prop_name),
@@ -3452,6 +3479,8 @@ impl Parser {
                             is_prop_mut: mods.is_mut,
                             is_const: false,
                             func: crate::ast::Function {
+                                is_unsafe: false,
+                                is_c_func: false,
                                 is_const: false,
                                 visibility: member_vis.clone(),
                                 name: format!("{}.__set_{}", name, prop_name),
@@ -3498,6 +3527,8 @@ impl Parser {
                                 is_prop_mut: mods.is_mut,
                                 is_const: false,
                                 func: crate::ast::Function {
+                                    is_unsafe: false,
+                                    is_c_func: false,
                                     is_const: false,
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__get_{}", name, prop_name),
@@ -3549,6 +3580,8 @@ impl Parser {
                                 is_prop_mut: mods.is_mut,
                                 is_const: false,
                                 func: crate::ast::Function {
+                                    is_unsafe: false,
+                                    is_c_func: false,
                                     is_const: false,
                                     visibility: member_vis.clone(),
                                     name: format!("{}.__set_{}", name, prop_name),
@@ -3927,6 +3960,9 @@ impl Parser {
                     is_prop_mut: false,
                     is_const: mods.is_const,
                     func: crate::ast::Function {
+                        // 5.8 / 13.1.1(3)：成员函数可声明 unsafe，函数体即 unsafe 上下文。
+                        is_unsafe: mods.is_unsafe,
+                        is_c_func: false,
                         is_const: false,
                         visibility: member_vis,
                         name: m_name,
@@ -4292,6 +4328,8 @@ impl Parser {
         self.current_type_params = prev_params;
 
         Ok(Function {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility,
             name,
@@ -4325,6 +4363,8 @@ impl Parser {
         self.expect(Token::RBrace)?;
 
         Ok(Function {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility,
             name: "main".to_string(),
@@ -5716,5 +5756,21 @@ main() {}
     fn test_w15a_ctor_signature_attr_class_exempt() {
         // 带属性的类（unittest 宏）不参与 ctor 签名重复的严格检查。
         ok("@Test\nclass Foo {\n @TestCase\n Foo() {}\n @Bench\n init() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w18a_unsafe_and_c_func_markers() {
+        // 13.1.1(3)：顶层 unsafe func 标记进入 AST。
+        let p = parse_only("unsafe func f(x: Int64): Int64 { x }\nmain() {}").expect("parse ok");
+        let f = p.functions.iter().find(|f| f.name == "f").expect("f");
+        assert!(f.is_unsafe);
+        assert!(!f.is_c_func);
+        // 13.1.2.2：@C func 与 foreign func 标记为 C 函数。
+        let p = parse_only("@C func g(): Int32 { 0 }\nmain() {}").expect("parse ok");
+        let g = p.functions.iter().find(|f| f.name == "g").expect("g");
+        assert!(g.is_c_func && !g.is_unsafe);
+        let p = parse_only("foreign func h(x: Int32): Int32\nmain() {}").expect("parse ok");
+        let h = p.functions.iter().find(|f| f.name == "h").expect("h");
+        assert!(h.is_c_func && !h.is_unsafe);
     }
 }

@@ -593,6 +593,8 @@ mod tests {
         let global = empty_global(&frwt, &structs, &classes, &gvt);
         // func f() { let x = 42; }
         let func = FuncDef {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,
             name: "f".to_string(),
@@ -620,6 +622,8 @@ mod tests {
         let gvt = HashMap::new();
         let global = empty_global(&frwt, &structs, &classes, &gvt);
         let func = FuncDef {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,
             name: "f".to_string(),
@@ -648,6 +652,8 @@ mod tests {
         gvt.insert("g".to_string(), Type::Int64);
         let global = empty_global(&frwt, &structs, &classes, &gvt);
         let func = FuncDef {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,
             name: "f".to_string(),
@@ -682,6 +688,8 @@ mod tests {
         let gvt = HashMap::new();
         let global = empty_global(&frwt, &structs, &classes, &gvt);
         let func = FuncDef {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,
             name: "f".to_string(),
@@ -713,6 +721,8 @@ mod tests {
         let gvt = HashMap::new();
         let global = empty_global(&frwt, &structs, &classes, &gvt);
         let func = FuncDef {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,
             name: "f".to_string(),

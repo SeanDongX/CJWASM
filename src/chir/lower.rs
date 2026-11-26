@@ -146,6 +146,8 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         .filter_map(|c| {
             c.init.as_ref().map(|init_def| {
                 Function {
+                    is_unsafe: false,
+                    is_c_func: false,
                     is_const: false,
                     visibility: crate::ast::Visibility::Public,
                     name: format!("__{}_init", c.name),
@@ -521,6 +523,8 @@ fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &m
             });
             let body_stmt = vec![crate::ast::Stmt::Return(Some(*body.clone()))];
             out.push(Function {
+                is_unsafe: false,
+                is_c_func: false,
                 is_const: false,
                 visibility: Visibility::Public,
                 name: lambda_name,
@@ -575,6 +579,8 @@ mod tests {
 
     fn make_func(name: &str, params: Vec<Param>, body: Vec<Stmt>) -> Function {
         Function {
+            is_unsafe: false,
+            is_c_func: false,
             is_const: false,
             name: name.to_string(),
             type_params: vec![],

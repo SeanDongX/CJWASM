@@ -146,6 +146,8 @@ mod tests {
             type_aliases: vec![],
             constants: vec![],
             functions: vec![Function {
+                is_unsafe: false,
+                is_c_func: false,
                 is_const: false,
                 visibility: Visibility::default(),
                 name: "main".to_string(),

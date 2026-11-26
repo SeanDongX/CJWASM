@@ -574,6 +574,11 @@ pub struct Function {
     pub extern_import: Option<ExternImport>,
     /// 是否为 const 函数（`const func`）：可用于常量表达式/常量初始化（16.2(6)）。
     pub is_const: bool,
+    /// `unsafe func` 修饰符（13.1.1(3)-(5)）：只能在 unsafe 上下文中调用，
+    /// 且不得作为一等值使用。
+    pub is_unsafe: bool,
+    /// `@C` 修饰的函数或 `foreign func`（13.1.2.2(10)）：只能在 unsafe 上下文外调用。
+    pub is_c_func: bool,
 }
 
 /// 枚举变体（可选关联类型）
