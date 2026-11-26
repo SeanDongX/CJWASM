@@ -1204,6 +1204,15 @@ impl<'a> Iterator for Lexer<'a> {
                 {
                     return Some(Ok((span.start, Token::Ident(s.clone()), span.end)));
                 }
+                // 规范 1.3.4：反引号仅用于原始标识符（内容必须是合法标识符或关键字，
+                // 语法 `'_'* Letter (Letter|'_'|Digit)*`）。内容不合法（如 `a--`、
+                // `type A=Int64`、`_`、带插值）即为词法错误，不得回退为字符串字面量。
+                Ok(Token::BacktickStringLit(_)) => {
+                    return Some(Err(format!(
+                        "反引号内不是合法的原始标识符: '{}'",
+                        &self.inner.source()[span.start..span.end]
+                    )));
+                }
                 Ok(tok) => {
                     // 数字字面量不能直接紧贴标识符字符：
                     // `0a12345`（非法十进制前缀）、`654f32`/`0f16`（纯整数加浮点后缀）
@@ -1253,15 +1262,19 @@ impl<'a> Iterator for Lexer<'a> {
 }
 
 /// 判断反引号内的文本是否构成一个原始标识符
-/// （语法：`'_'* Letter (Letter|'_'|Digit)*`，必须包含至少一个字母）。
+///（标识符字符集：字母/数字/下划线，首字符非数字；关键字合法。
+/// 官方正例 a01_11/a01_14 使用 `__`（纯下划线合法），负例 a06_10 `a--`、
+/// a06_24 `type A=Int64` 含运算符/空格/等号非法——不要求“含字母”。
+/// 唯一例外：`_`（单个下划线）是通配符模式，不能作为原始标识符
+///（官方负例 a05_42 `var \`_\`: Int32 = 1`）。
 fn is_raw_identifier(s: &str) -> bool {
+    if s == "_" {
+        return false;
+    }
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c == '_' || c.is_alphabetic() => {}
         _ => return false,
-    }
-    if !s.chars().any(|c| c.is_alphabetic()) {
-        return false;
     }
     s.chars().all(|c| c == '_' || c.is_alphanumeric())
 }
@@ -1946,14 +1959,13 @@ mod tests {
 
     #[test]
     fn test_raw_identifier_underscore_only_not_ident() {
-        // `_` 不是原始标识符（语法要求至少一个字母），保持为反引号字符串
-        let source = "`_`";
-        let lexer = Lexer::new(source);
-        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
-        assert_eq!(
-            tokens[0],
-            Token::BacktickStringLit(StringOrInterpolated::Plain("_".to_string()))
-        );
+        // 反引号内容必须是合法标识符字符集（官方正例 `__` 合法；
+        // 运算符/空格/等号内容为词法错误，负例 a06_10/a06_24）。
+        let source = "`__` `_` `a--` `type A=Int64`";
+        let toks: Vec<_> = Lexer::new(source).filter_map(|r| r.ok()).collect();
+        assert_eq!(toks.len(), 1, "仅 `__` 应成为标识符；`_` 是通配符不能作原始标识符");
+        let n_err = Lexer::new(source).filter(|r| r.is_err()).count();
+        assert_eq!(n_err, 3, "`_`/运算符/空格内容应产生词法错误");
     }
 
     #[test]
