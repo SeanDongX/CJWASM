@@ -654,6 +654,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 7.1(4)：as 的目标泛型类型必须带类型实参。
     check_as_generic_without_args(program, &index, &mut errors);
 
+    // A.2.4(8)：局部变量类型标注中的用户泛型类型必须带类型实参（`var v: Class2`）。
+    check_declared_generic_type_args(program, &index, &mut errors);
+
     // 4.8：数值类型转换必须带操作数。
     check_numeric_conversion_without_operand(program, &mut errors);
 
@@ -1209,6 +1212,18 @@ fn mut_var_types(
                                     n.clone(),
                                     Type::Struct(ty_name.to_string(), vec![]),
                                 );
+                            }
+                        }
+                    }
+                    walk_expr_blocks(value, map, type_names);
+                }
+                // 16.1(12)：`const s = S()` 的构造类型推断（用于 const 变量不可调用
+                // mut 成员函数的检查）。与 let/var 同构，仅当无显式类型标注时推断。
+                Stmt::Const { name: n, ty: None, value } => {
+                    if !map.contains_key(n) {
+                        if let Some(ty_name) = expr_ctor_type_name(value) {
+                            if type_names.contains(ty_name.as_str()) {
+                                map.insert(n.clone(), Type::Struct(ty_name, vec![]));
                             }
                         }
                     }
@@ -23528,7 +23543,95 @@ fn check_as_generic_without_args(
     }
 }
 
-// ─── 4.8：数值类型转换必须带一个操作数（`Int64()` 非法） ─────────────────
+// ─── A.2.4(8)：局部变量类型标注不得省略用户泛型类型的类型实参 ─────────────
+// `open class Class2<T> { }` 后写 `var v: Class2` 缺少 `<...>`，官方拒绝。
+// 仅检查局部 let/var/const 的显式类型标注（保守；参数/返回/字段位置暂不涉及）。
+fn check_declared_generic_type_args(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    fn check_ty(ty: &Type, index: &ProgramIndex<'_>, errors: &mut Vec<SemanticError>) {
+        match ty {
+            Type::Struct(name, args) => {
+                if args.is_empty()
+                    && index
+                        .type_params
+                        .get(name.as_str())
+                        .map_or(false, |tps| !tps.is_empty())
+                {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "泛型类型 '{}' 用作类型标注时必须指定类型实参（A.2.4(8)）",
+                            name
+                        ),
+                    });
+                }
+                for a in args {
+                    check_ty(a, index, errors);
+                }
+            }
+            Type::Array(t) | Type::Option(t) | Type::Slice(t) => check_ty(t, index, errors),
+            Type::Result(a, b) | Type::Map(a, b) => {
+                check_ty(a, index, errors);
+                check_ty(b, index, errors);
+            }
+            Type::Tuple(ts) => {
+                for t in ts {
+                    check_ty(t, index, errors);
+                }
+            }
+            Type::Function { params, ret } => {
+                for p in params {
+                    check_ty(p, index, errors);
+                }
+                if let Some(r) = ret.as_ref() {
+                    check_ty(r, index, errors);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk(stmts: &[Stmt], index: &ProgramIndex<'_>, errors: &mut Vec<SemanticError>) {
+        for s in stmts {
+            match s {
+                Stmt::Let { ty: Some(t), .. }
+                | Stmt::Var { ty: Some(t), .. }
+                | Stmt::Const { ty: Some(t), .. } => check_ty(t, index, errors),
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::WhileLet { body, .. } => walk(body, index, errors),
+                _ => {}
+            }
+        }
+    }
+    for f in &program.functions {
+        walk(&f.body, index, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            walk(&init.body, index, errors);
+        }
+        for m in &c.methods {
+            walk(&m.func.body, index, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            walk(&init.body, index, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            walk(&m.body, index, errors);
+        }
+    }
+}
+
+
 fn check_parenthesized_type_invocation(program: &Program, errors: &mut Vec<SemanticError>) {
     let is_type_name = |n: &str| is_builtin_type_name(n) || matches!(n, "Int" | "UInt");
     let mut scan = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
@@ -31175,6 +31278,54 @@ main() {}"#,
              main() {\n\
              var s = S()\n\
              s.f()\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w22_const_var_cannot_call_mut_method() {
+        // 16.1(12)：const 变量可调用非 mut 成员函数，但不可调用 mut 成员函数。
+        let errs = assert_invalid(
+            "struct S {\n\
+             \x20   mut func f() { }\n\
+             \x20   const init() { }\n\
+             }\n\
+             main() {\n\
+             const s = S()\n\
+             s.f()\n\
+             }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8.3(1)")));
+        // const 变量调用非 mut 成员函数应放行。
+        assert_valid(
+            "struct S {\n\
+             \x20   func g() { }\n\
+             \x20   const init() { }\n\
+             }\n\
+             main() {\n\
+             const s = S()\n\
+             s.g()\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w22_declared_generic_type_requires_args() {
+        // A.2.4(8)：局部变量类型标注使用用户泛型类型时必须带类型实参。
+        let errs = assert_invalid(
+            "open class Class2<T> { }\n\
+             main() {\n\
+             var v2: Class2\n\
+             }\n",
+        );
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("必须指定类型实参")));
+        // 带类型实参则应放行。
+        assert_valid(
+            "open class Class2<T> { }\n\
+             main() {\n\
+             var v2: Class2<Int64>\n\
              }\n",
         );
     }
