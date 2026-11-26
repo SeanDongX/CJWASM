@@ -358,6 +358,13 @@ impl Parser {
     /// 解析一元表达式 (!, -)
     pub(crate) fn parse_unary(&mut self) -> Result<Expr, ParseErrorAt> {        if matches!(self.peek(), Some(Token::Bang)) {
             self.advance();
+            // 1.2(8)：一元运算符与其操作数之间不能用换行分隔。
+            if self.newline_before_current() {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Bang,
+                    "一元运算符 '!' 与其操作数之间不能用换行分隔（1.2(8)）".to_string(),
+                ));
+            }
             let expr = self.parse_unary()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
@@ -366,6 +373,13 @@ impl Parser {
         }
         if matches!(self.peek(), Some(Token::Minus)) {
             self.advance();
+            // 1.2(8)：一元运算符与其操作数之间不能用换行分隔。
+            if self.newline_before_current() {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Minus,
+                    "一元运算符 '-' 与其操作数之间不能用换行分隔（1.2(8)）".to_string(),
+                ));
+            }
             let expr = self.parse_unary()?;
             // `-a..b`：负号作用于范围起点而非整个范围
             if let Expr::Range {
@@ -392,6 +406,13 @@ impl Parser {
         }
         if matches!(self.peek(), Some(Token::Tilde)) {
             self.advance();
+            // 1.2(8)：一元运算符与其操作数之间不能用换行分隔。
+            if self.newline_before_current() {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Tilde,
+                    "一元运算符 '~' 与其操作数之间不能用换行分隔（1.2(8)）".to_string(),
+                ));
+            }
             let expr = self.parse_unary()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::BitNot,
@@ -401,6 +422,13 @@ impl Parser {
         // 前缀自增/自减
         if matches!(self.peek(), Some(Token::Incr)) {
             self.advance();
+            // 1.2(8)：一元运算符与其操作数之间不能用换行分隔。
+            if self.newline_before_current() {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Incr,
+                    "一元运算符 '++' 与其操作数之间不能用换行分隔（1.2(8)）".to_string(),
+                ));
+            }
             let expr = self.parse_unary()?;
             if !Self::is_incr_decr_target(&expr) {
                 return self.bail(ParseError::UnexpectedToken(
@@ -412,6 +440,13 @@ impl Parser {
         }
         if matches!(self.peek(), Some(Token::Decr)) {
             self.advance();
+            // 1.2(8)：一元运算符与其操作数之间不能用换行分隔。
+            if self.newline_before_current() {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Decr,
+                    "一元运算符 '--' 与其操作数之间不能用换行分隔（1.2(8)）".to_string(),
+                ));
+            }
             let expr = self.parse_unary()?;
             if !Self::is_incr_decr_target(&expr) {
                 return self.bail(ParseError::UnexpectedToken(
@@ -865,6 +900,13 @@ impl Parser {
                             "'++' 只能作用于后缀表达式形式的左值（4.14(3)）".to_string(),
                         ));
                     }
+                    // 1.2(8)：后缀一元运算符不能与操作数被换行分隔。
+                    if self.newline_before_current() {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Incr,
+                            "后缀运算符 '++' 与其操作数之间不能用换行分隔（1.2(8)）".to_string(),
+                        ));
+                    }
                     self.advance();
                     expr = Expr::PostfixIncr(Box::new(expr));
                 }
@@ -881,6 +923,13 @@ impl Parser {
                         return self.bail(ParseError::UnexpectedToken(
                             Token::Decr,
                             "'--' 只能作用于后缀表达式形式的左值（4.14(4)）".to_string(),
+                        ));
+                    }
+                    // 1.2(8)：后缀一元运算符不能与操作数被换行分隔。
+                    if self.newline_before_current() {
+                        return self.bail(ParseError::UnexpectedToken(
+                            Token::Decr,
+                            "后缀运算符 '--' 与其操作数之间不能用换行分隔（1.2(8)）".to_string(),
                         ));
                     }
                     self.advance();
@@ -1745,8 +1794,12 @@ impl Parser {
                     return Ok(Expr::Integer(0));
                 }
                 // 不跟 ( 时，当作普通标识符
-                self.pushback = Some(Token::Ident("quote".to_string()));
-                return self.parse_primary();
+                // 14(3)：quote 表达式必须以 `quote(...)` 形式书写——`quote`、
+                // `quote{...}`、`quote[...]` 均为语法错误。
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Ident("quote".to_string()),
+                    "quote 表达式必须写成 quote(...)（14(3)）".to_string(),
+                ));
             }
             Some(Token::Ident(name)) => {
                 // 仅当首字母大写时解析为枚举变体 (Color.Red)，否则 . 后续为字段/方法
@@ -3633,5 +3686,25 @@ main() { Test.f<Array<Int64>>(1) }
             !has_lambda_invocation("main() { let a = { => 1 } () }"),
             "普通零参 lambda 调用应内联"
         );
+    }
+
+    #[test]
+    fn test_w21d_unary_newline_separation() {
+        // 1.2(8)：一元运算符与其操作数之间不能用换行分隔。
+        parse_err_only("main() {\n let a: Int64 = -\n 8\n}");
+        parse_err_only("main() {\n let b: Bool = !\n true\n}");
+        parse_err_only("main() {\n var i: Int64 = 0\n i\n ++\n}");
+        // 同一行的一元运算仍合法。
+        parse_ok_only("main() { let a: Int64 = -8\n let b: Bool = !true }");
+        parse_ok_only("main() { var i: Int64 = 0; ++i; i++ }");
+    }
+
+    #[test]
+    fn test_w21d_quote_requires_parens() {
+        // 14(3)：quote 表达式必须以 quote(...) 形式书写。
+        parse_err_only("import std.ast.*\nmain() { let t = quote }");
+        parse_err_only("import std.ast.*\nmain() { let t = quote{expr} }");
+        parse_err_only("import std.ast.*\nmain() { let t = quote[expr] }");
+        parse_ok_only("import std.ast.*\nmain() { let t = quote(x + 2) }");
     }
 }

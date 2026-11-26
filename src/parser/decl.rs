@@ -4548,6 +4548,8 @@ impl Parser {
             };
             let name = match self.advance() {
                 Some(Token::Ident(name)) => name,
+                // 方言兼容：显式 `this: T` 接收者形参（cjc-style struct 方法）合法，
+                // 由成员函数解析阶段识别为接收者。
                 Some(Token::This) => "this".to_string(),
                 Some(Token::Underscore) => "_".to_string(),
                 Some(Token::BacktickStringLit(StringOrInterpolated::Plain(name)))
