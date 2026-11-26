@@ -583,6 +583,9 @@ pub struct Function {
     pub is_unsafe: bool,
     /// `@C` 修饰的函数或 `foreign func`（13.1.2.2(10)）：只能在 unsafe 上下文外调用。
     pub is_c_func: bool,
+    /// `mut func` 修饰符（5.8）：仅可修饰 struct / 接口的实例成员函数
+    /// （以及 struct 扩展成员），表示允许修改 `this` 的字段。
+    pub is_mut: bool,
 }
 
 /// 枚举变体（可选关联类型）
@@ -614,6 +617,9 @@ pub struct InterfaceMethod {
     pub is_const: bool,
     /// 是否由 `mut prop` 脱糖出的访问器（用于接口属性 mut 规则，7.1(6)）。
     pub is_prop_mut: bool,
+    /// 是否为 `mut func` 声明的接口成员函数（5.8.2：实现方 struct 必须同样
+    /// 声明 mut，class 无需）。
+    pub is_mut: bool,
 }
 
 /// 接口关联类型定义（如 type Element）

@@ -689,6 +689,7 @@ mod tests {
     fn make_function(name: &str, params: Vec<Param>, return_type: Option<Type>, body: Vec<Stmt>) -> Function {
         Function {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility: Visibility::Public,

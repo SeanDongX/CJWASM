@@ -1098,6 +1098,7 @@ impl Parser {
         });
         Ok(Function {
             is_unsafe: false,
+            is_mut: false,
             // 13.1.2.2(10)：外来函数只能在 unsafe 上下文外调用。
             is_c_func: true,
             is_const: false,
@@ -1568,6 +1569,8 @@ impl Parser {
                     );
                 }
                 func.is_const = mods.is_const;
+                // 5.8：struct 实例成员函数的 mut 修饰符进入 AST（后续语义检查使用）。
+                func.is_mut = mods.is_mut;
                 methods.push(func);
                 continue;
             }
@@ -1606,6 +1609,7 @@ impl Parser {
                             self.receiver_name = None;
                             methods.push(crate::ast::Function {
                                 is_unsafe: false,
+                                is_mut: false,
                                 is_c_func: false,
                                 is_const: false,
                                 // 保留属性声明的可见性（private 属性仅在定义体内可见，
@@ -1652,6 +1656,7 @@ impl Parser {
                             self.receiver_name = None;
                             methods.push(crate::ast::Function {
                                 is_unsafe: false,
+                                is_mut: false,
                                 is_c_func: false,
                                 is_const: false,
                                 visibility: mods
@@ -2015,6 +2020,7 @@ impl Parser {
                 };
                 let mk_getter = |body: Vec<Stmt>| crate::ast::Function {
                     is_unsafe: false,
+                    is_mut: false,
                     is_c_func: false,
                     is_const: false,
                     visibility: member_vis.clone(),
@@ -2033,6 +2039,7 @@ impl Parser {
                 };
                 let mk_setter = |val_name: String, body: Vec<Stmt>| crate::ast::Function {
                     is_unsafe: false,
+                    is_mut: false,
                     is_c_func: false,
                     is_const: false,
                     visibility: member_vis.clone(),
@@ -2380,6 +2387,7 @@ impl Parser {
                         constraints: vec![],
                         is_const: false,
                         is_prop_mut: prop_is_mut_decl,
+                        is_mut: false,
                     });
                     if prop_is_mut_decl {
                         methods.push(crate::ast::InterfaceMethod {
@@ -2400,6 +2408,7 @@ impl Parser {
                             constraints: vec![],
                             is_const: false,
                             is_prop_mut: prop_is_mut_decl,
+                            is_mut: false,
                         });
                     }
                     continue;
@@ -2439,6 +2448,7 @@ impl Parser {
                                 constraints: vec![],
                                 is_const: false,
                                 is_prop_mut: prop_is_mut_decl,
+                                is_mut: false,
                             });
                         } else if kw == "set" {
                             self.advance();
@@ -2487,6 +2497,7 @@ impl Parser {
                                 constraints: vec![],
                                 is_const: false,
                                 is_prop_mut: prop_is_mut_decl,
+                                is_mut: false,
                             });
                         } else {
                             break;
@@ -2533,6 +2544,7 @@ impl Parser {
                         constraints: vec![],
                         is_const: false,
                         is_prop_mut: true,
+                        is_mut: false,
                     });
                 }
                 continue;
@@ -2635,6 +2647,7 @@ impl Parser {
                 constraints: method_constraints,
                 is_const: mods.is_const,
                 is_prop_mut: false,
+                is_mut: mods.is_mut,
             });
         }
         self.expect(Token::RBrace)?;
@@ -2842,6 +2855,7 @@ impl Parser {
                             self.receiver_name = None;
                             methods.push(Function {
                                 is_unsafe: false,
+                                is_mut: false,
                                 is_c_func: false,
                                 is_const: false,
                                 visibility: member_vis.clone(),
@@ -2883,6 +2897,7 @@ impl Parser {
                             self.receiver_name = None;
                             methods.push(Function {
                                 is_unsafe: false,
+                                is_mut: false,
                                 is_c_func: false,
                                 is_const: false,
                                 visibility: member_vis.clone(),
@@ -2946,6 +2961,8 @@ impl Parser {
             let mut func = self.parse_function_with_visibility(member_vis)?;
             func.is_const = mods.is_const;
             func.is_unsafe = mods.is_unsafe;
+            // 5.8：struct 扩展中 mut 实例成员函数（static / 类型别名扩展已在上面拒绝）。
+            func.is_mut = mods.is_mut;
             self.receiver_name = prev_receiver;
             // P3: 添加隐式 this 参数（如同 struct/class 方法）
             let has_self = func
@@ -3310,6 +3327,7 @@ impl Parser {
                         is_const: false,
                         func: Function {
                             is_unsafe: false,
+                            is_mut: false,
                             is_c_func: false,
                             is_const: false,
                             visibility: member_vis.clone(),
@@ -3520,6 +3538,7 @@ impl Parser {
                         is_const: false,
                         func: crate::ast::Function {
                             is_unsafe: false,
+                            is_mut: false,
                             is_c_func: false,
                             is_const: false,
                             visibility: member_vis.clone(),
@@ -3555,6 +3574,7 @@ impl Parser {
                             is_const: false,
                             func: crate::ast::Function {
                                 is_unsafe: false,
+                                is_mut: false,
                                 is_c_func: false,
                                 is_const: false,
                                 visibility: member_vis.clone(),
@@ -3603,6 +3623,7 @@ impl Parser {
                                 is_const: false,
                                 func: crate::ast::Function {
                                     is_unsafe: false,
+                                    is_mut: false,
                                     is_c_func: false,
                                     is_const: false,
                                     visibility: member_vis.clone(),
@@ -3656,6 +3677,7 @@ impl Parser {
                                 is_const: false,
                                 func: crate::ast::Function {
                                     is_unsafe: false,
+                                    is_mut: false,
                                     is_c_func: false,
                                     is_const: false,
                                     visibility: member_vis.clone(),
@@ -4090,6 +4112,7 @@ impl Parser {
                     func: crate::ast::Function {
                         // 5.8 / 13.1.1(3)：成员函数可声明 unsafe，函数体即 unsafe 上下文。
                         is_unsafe: mods.is_unsafe,
+                        is_mut: false,
                         is_c_func: false,
                         is_const: false,
                         visibility: member_vis,
@@ -4462,6 +4485,7 @@ impl Parser {
 
         Ok(Function {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility,
@@ -4497,6 +4521,7 @@ impl Parser {
 
         Ok(Function {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility,
@@ -5983,5 +6008,41 @@ main() {}
         ok("class C {\n static let v: Int64\n static init() { v = 0 }\n}\nmain() { }");
         ok("struct S {\n static let v: Int64\n static init() { v = 0 }\n}\nmain() { }");
         ok("class C {\n static var v = 0\n static init() { v = 1 }\n}\nmain() { }");
+    }
+
+    #[test]
+    fn test_mut_func_modifier_into_ast() {
+        // 5.8：mut func 声明须作为 is_mut 进入 AST（struct / 扩展 / 接口）。
+        let program = crate::pipeline::parse_source_ast(
+            r#"
+struct S {
+    var x = 0
+    public mut func f(): Unit { x = 1 }
+    public func g(): Unit {}
+}
+interface I { mut func h(): Unit }
+main() {}
+"#,
+        )
+        .expect("parse ok");
+        let f = program
+            .functions
+            .iter()
+            .find(|f| f.name == "S.f")
+            .expect("S.f");
+        assert!(f.is_mut, "mut func 应记录 is_mut=true");
+        let g = program
+            .functions
+            .iter()
+            .find(|f| f.name == "S.g")
+            .expect("S.g");
+        assert!(!g.is_mut, "普通 func 应为 is_mut=false");
+        let h = program
+            .interfaces
+            .iter()
+            .find(|i| i.name == "I")
+            .and_then(|i| i.methods.iter().find(|m| m.name == "h"))
+            .expect("I.h");
+        assert!(h.is_mut, "接口 mut func 应记录 is_mut=true");
     }
 }

@@ -594,6 +594,7 @@ mod tests {
         // func f() { let x = 42; }
         let func = FuncDef {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,
@@ -623,6 +624,7 @@ mod tests {
         let global = empty_global(&frwt, &structs, &classes, &gvt);
         let func = FuncDef {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,
@@ -653,6 +655,7 @@ mod tests {
         let global = empty_global(&frwt, &structs, &classes, &gvt);
         let func = FuncDef {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,
@@ -689,6 +692,7 @@ mod tests {
         let global = empty_global(&frwt, &structs, &classes, &gvt);
         let func = FuncDef {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,
@@ -722,6 +726,7 @@ mod tests {
         let global = empty_global(&frwt, &structs, &classes, &gvt);
         let func = FuncDef {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility: crate::ast::Visibility::Private,

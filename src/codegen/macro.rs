@@ -147,6 +147,7 @@ mod tests {
             constants: vec![],
             functions: vec![Function {
                 is_unsafe: false,
+                is_mut: false,
                 is_c_func: false,
                 is_const: false,
                 visibility: Visibility::default(),

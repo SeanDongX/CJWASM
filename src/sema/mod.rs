@@ -622,6 +622,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 16.4：const 函数体只能包含声明、常量表达式与 return。
     check_const_function_bodies(program, &mut errors);
 
+    // 5.8 mut 函数规则：this 捕获/表达式使用、接收者可变性、接口 mut 一致性。
+    check_mut_functions(program, &mut errors);
+
     // 表达式/赋值类型检查：运算符操作数类型、可赋值性、不可变绑定等。
     expr_check::check_program(program, &mut errors);
 
@@ -697,6 +700,933 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+// ─── 5.8 mut 函数规则（05_function/08_mut_functions）─────────────────────────
+
+/// 当前函数体所属类型类别。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MutOwnerKind {
+    Struct,
+    Class,
+    Interface,
+    None,
+}
+
+/// 5.8 mut 函数规则的只读符号表。
+struct MutFnTables<'a> {
+    struct_names: HashSet<&'a str>,
+    class_names: HashSet<&'a str>,
+    iface_names: HashSet<&'a str>,
+    /// struct 名 → 字段名集合。
+    struct_fields: HashMap<&'a str, HashSet<&'a str>>,
+    /// 类型名（struct / extend 目标）→ mut 成员函数名集合。
+    mut_methods: HashMap<String, HashSet<String>>,
+    /// 接口名 → mut 成员函数名集合（直接声明）。
+    iface_mut_methods: HashMap<String, HashSet<String>>,
+}
+
+/// 5.8 / 5.8.1 / 5.8.2 / 5.8.3：mut 函数相关的静态检查。
+///
+/// 覆盖官方负例：
+/// - 5.8(2)：struct 的不可变（非 mut）实例函数不能修改自身字段；
+/// - 5.8.1(5)：mut 函数中 `this` 不能作为表达式使用，也不能被闭包捕获；
+/// - 5.8.2(1)(3)：struct 实现接口函数时 mut 修饰符须与接口声明一致（class 不受限）；
+/// - 5.8.3(1)-(6)：struct（或类型参数可能为 struct）调用 mut 函数要求接收者
+///   可变；mut 函数不能作为一等值；不可变实例函数不能访问 mut 函数。
+fn check_mut_functions(program: &Program, errors: &mut Vec<SemanticError>) {
+    let struct_names: HashSet<&str> = program.structs.iter().map(|s| s.name.as_str()).collect();
+    let class_names: HashSet<&str> = program.classes.iter().map(|c| c.name.as_str()).collect();
+    let iface_names: HashSet<&str> = program.interfaces.iter().map(|i| i.name.as_str()).collect();
+    let mut struct_fields: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for s in &program.structs {
+        struct_fields.insert(
+            s.name.as_str(),
+            s.fields.iter().map(|f| f.name.as_str()).collect(),
+        );
+    }
+    let mut mut_methods: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in &program.functions {
+        if !f.is_mut || f.name.starts_with("__") {
+            continue;
+        }
+        if let Some(owner) = owner_name(&f.name) {
+            mut_methods
+                .entry(owner.to_string())
+                .or_default()
+                .insert(last_name_segment(&f.name));
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            if m.is_mut && !m.name.starts_with("__") {
+                mut_methods
+                    .entry(ext.target_type.clone())
+                    .or_default()
+                    .insert(last_name_segment(&m.name));
+            }
+        }
+    }
+    let mut iface_mut_methods: HashMap<String, HashSet<String>> = HashMap::new();
+    for i in &program.interfaces {
+        for m in &i.methods {
+            if m.is_mut && !m.name.starts_with("__") {
+                iface_mut_methods
+                    .entry(i.name.clone())
+                    .or_default()
+                    .insert(m.name.clone());
+            }
+        }
+    }
+    let tables = MutFnTables {
+        struct_names,
+        class_names,
+        iface_names,
+        struct_fields,
+        mut_methods,
+        iface_mut_methods,
+    };
+
+    // 5.8.2(1)(3)：struct 实现接口成员时的 mut 修饰符一致性。
+    check_struct_mut_impl_consistency(program, errors);
+
+    // struct 名 → 声明层泛型约束（方法体中的类型参数约束可能需要）。
+    let struct_constraints: HashMap<&str, &[TypeConstraint]> = program
+        .structs
+        .iter()
+        .map(|s| (s.name.as_str(), s.constraints.as_slice()))
+        .collect();
+
+    // 结构体 / 类 / 接口的成员函数（脱糖为 `Type.method` 顶层函数）以及顶层自由函数。
+    for f in &program.functions {
+        let (owner, kind, owner_constraints): (&str, MutOwnerKind, &[TypeConstraint]) =
+            match owner_name(&f.name) {
+                Some(o) if tables.struct_names.contains(o) => (
+                    o,
+                    MutOwnerKind::Struct,
+                    struct_constraints.get(o).copied().unwrap_or(&[]),
+                ),
+                Some(o) if tables.class_names.contains(o) => (o, MutOwnerKind::Class, &[]),
+                Some(o) if tables.iface_names.contains(o) => (o, MutOwnerKind::Interface, &[]),
+                _ => ("", MutOwnerKind::None, &[]),
+            };
+        let is_member = f
+            .params
+            .first()
+            .map_or(false, |p| p.name == "this" || p.name == "self");
+        let mut constraints = owner_constraints.to_vec();
+        constraints.extend(f.constraints.iter().cloned());
+        check_mut_function_body(
+            &tables,
+            owner,
+            kind,
+            f.is_mut,
+            is_member,
+            &f.name,
+            &f.params,
+            &f.body,
+            &constraints,
+            errors,
+        );
+    }
+
+    // struct 扩展成员函数。
+    for ext in &program.extends {
+        if !tables.struct_names.contains(ext.target_type.as_str()) {
+            continue;
+        }
+        let owner = ext.target_type.as_str();
+        let owner_constraints: &[TypeConstraint] =
+            struct_constraints.get(owner).copied().unwrap_or(&[]);
+        for m in &ext.methods {
+            let is_member = m
+                .params
+                .first()
+                .map_or(false, |p| p.name == "this" || p.name == "self");
+            let mut constraints = owner_constraints.to_vec();
+            constraints.extend(m.constraints.iter().cloned());
+            check_mut_function_body(
+                &tables,
+                owner,
+                MutOwnerKind::Struct,
+                m.is_mut,
+                is_member,
+                &m.name,
+                &m.params,
+                &m.body,
+                &constraints,
+                errors,
+            );
+        }
+    }
+
+    // 接口默认实现体（含 mut 成员函数）。
+    for i in &program.interfaces {
+        let owner = i.name.as_str();
+        for m in &i.methods {
+            let Some(body) = &m.default_body else {
+                continue;
+            };
+            if m.is_static || m.name.starts_with("__") {
+                continue;
+            }
+            let mut constraints = i.constraints.clone();
+            constraints.extend(m.constraints.iter().cloned());
+            check_mut_function_body(
+                &tables,
+                owner,
+                MutOwnerKind::Interface,
+                m.is_mut,
+                true,
+                &m.name,
+                &m.params,
+                body,
+                &constraints,
+                errors,
+            );
+        }
+    }
+}
+
+/// 5.8.2(1)(3)：struct（含其扩展）实现接口成员函数时，mut 修饰符必须与接口声明一致。
+fn check_struct_mut_impl_consistency(
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    for s in &program.structs {
+        // 该 struct 实现/继承的接口名（来自 `<: I` 约束）。
+        let mut supers: Vec<&str> = Vec::new();
+        for c in s.constraints.iter().filter(|c| c.param == s.name) {
+            for b in &c.bounds {
+                supers.push(b.as_str());
+            }
+        }
+        if supers.is_empty() {
+            continue;
+        }
+        // 该 struct 自身的成员函数（含扩展）。
+        let mut own: Vec<&Function> = program
+            .functions
+            .iter()
+            .filter(|f| owner_name(&f.name) == Some(s.name.as_str()))
+            .collect();
+        for ext in &program.extends {
+            if ext.target_type == s.name {
+                own.extend(ext.methods.iter());
+            }
+        }
+        for sup in supers {
+            let Some(iface) = program.interfaces.iter().find(|i| i.name == sup) else {
+                continue;
+            };
+            for im in &iface.methods {
+                if im.name.starts_with("__") {
+                    continue;
+                }
+                let impls: Vec<bool> = own
+                    .iter()
+                    .filter(|f| last_name_segment(&f.name) == im.name)
+                    .map(|f| f.is_mut)
+                    .collect();
+                if impls.is_empty() || impls.contains(&im.is_mut) {
+                    continue;
+                }
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 实现接口 '{}' 的函数 '{}' 时 mut 修饰符不一致（5.8.2(3)）",
+                        s.name, iface.name, im.name
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// 单个函数体上的 mut 规则检查。
+#[allow(clippy::too_many_arguments)]
+fn check_mut_function_body(
+    tables: &MutFnTables<'_>,
+    owner: &str,
+    kind: MutOwnerKind,
+    fn_is_mut: bool,
+    is_member: bool,
+    fn_name: &str,
+    params: &[Param],
+    body: &[Stmt],
+    constraints: &[TypeConstraint],
+    errors: &mut Vec<SemanticError>,
+) {
+    let var_types = local_var_types_full(params, body);
+    // 解析器把 `S(...)` / `S<T>(...)` 里小写或带类型实参的构造调用落为普通 Call，
+    // 这里补充这类局部变量的构造类型推断（仅用户类型名，保守）。
+    let mut type_names: HashSet<&str> = tables.struct_names.clone();
+    type_names.extend(tables.class_names.iter());
+    type_names.extend(tables.iface_names.iter());
+    let var_types = mut_var_types(body, &var_types, &type_names);
+    let var_mut = local_var_mutability(params, body, fn_is_mut && is_member);
+    let field_names: HashSet<&str> = tables
+        .struct_fields
+        .get(owner)
+        .cloned()
+        .unwrap_or_default();
+    // 函数内声明过的局部名字（局部变量 / 局部函数），用于区分字段与同名局部名。
+    let mut locals: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+    collect_block_local_names(body, &mut locals);
+    for p in params {
+        if let Some(d) = &p.default {
+            collect_expr_nested_local_names(d, &mut locals);
+        }
+    }
+
+    // 5.8.1(5)：mut 函数中 this 不可作为表达式，也不可被闭包 / 局部函数捕获。
+    if fn_is_mut && is_member && kind != MutOwnerKind::None {
+        let mut cap_locals = locals.clone();
+        for s in body {
+            scan_mut_capture_stmt(s, &field_names, &mut cap_locals, false, errors);
+        }
+    }
+
+    // 5.8(2)：struct 的不可变实例成员函数不能修改自身字段。
+    // 属性访问器（`__get_`/`__set_`）与 static init 为解析期脱糖产物，不适用。
+    if kind == MutOwnerKind::Struct
+        && is_member
+        && !fn_is_mut
+        && !last_name_segment(fn_name).starts_with("__")
+    {
+        for s in body {
+            scan_struct_field_assign(s, &field_names, &locals, errors);
+        }
+    }
+
+    let owner_mut_methods = |name: &str| -> bool {
+        match kind {
+            MutOwnerKind::Struct => tables
+                .mut_methods
+                .get(owner)
+                .map_or(false, |set| set.contains(name)),
+            MutOwnerKind::Interface => tables
+                .iface_mut_methods
+                .get(owner)
+                .map_or(false, |set| set.contains(name)),
+            _ => false,
+        }
+    };
+
+    walk_stmts(body, &mut |e| match e {
+        Expr::MethodCall { object, method, .. } => {
+            let is_this = matches!(
+                &**object,
+                Expr::Var(n) if n == "this" || n == "self"
+            );
+            if is_this {
+                // 5.8.3(5)/(6)：非 mut 实例函数不能访问 mut 函数（本类型）。
+                if is_member && !fn_is_mut && kind != MutOwnerKind::None {
+                    if owner_mut_methods(method) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "非 mut 成员函数 '{}' 不能调用 mut 函数 '{}'（5.8.3(5)）",
+                                last_name_segment(fn_name),
+                                method
+                            ),
+                        });
+                    }
+                }
+                return;
+            }
+            // 通过变量 / 构造值调用 mut 函数：接收者必须是可变绑定。
+            let Some(recv_ty) = mut_recv_type(object, &var_types, &type_names) else {
+                return;
+            };
+            match recv_ty {
+                Type::Struct(ref ty_name, _) if tables.struct_names.contains(ty_name.as_str()) => {
+                    let is_mut_method = tables
+                        .mut_methods
+                        .get(ty_name.as_str())
+                        .map_or(false, |set| set.contains(method.as_str()));
+                    if !is_mut_method {
+                        return;
+                    }
+                    // 构造值临时量（`S().f()`）官方未约束，保守放行。
+                    let Expr::Var(recv_var) = &**object else {
+                        return;
+                    };
+                    if var_mut.get(recv_var).copied().unwrap_or(true) {
+                        return;
+                    }
+                    errors.push(SemanticError {
+                        message: format!(
+                            "不可变变量 '{}' 不能调用结构体 '{}' 的 mut 函数 '{}'（5.8.3(1)）",
+                            recv_var, ty_name, method
+                        ),
+                    });
+                }
+                Type::TypeParam(ref tp) => {
+                    // 5.8.3(2)：类型参数可能为 struct 时同样受限（有 class 上界则放行）。
+                    if type_param_may_be_struct_with_mut(tp, constraints, tables, method) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "类型参数 '{}' 可能为 struct，不能调用 mut 函数 '{}'（5.8.3(2)）",
+                                tp, method
+                            ),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Expr::Field { object, field } => {
+            // 5.8.3(3)/(4)：mut 函数不能作为一等值（`var f = a.mutMethod`）。
+            if matches!(&**object, Expr::Var(n) if n == "this" || n == "self") {
+                return;
+            }
+            let Some(recv_ty) = mut_recv_type(object, &var_types, &type_names) else {
+                return;
+            };
+            match recv_ty {
+                Type::Struct(ref ty_name, _) if tables.struct_names.contains(ty_name.as_str()) => {
+                    if tables
+                        .mut_methods
+                        .get(ty_name.as_str())
+                        .map_or(false, |set| set.contains(field.as_str()))
+                    {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "结构体 '{}' 的 mut 函数 '{}' 不能作为一等值使用（5.8.3(3)）",
+                                ty_name, field
+                            ),
+                        });
+                    }
+                }
+                Type::TypeParam(ref tp) => {
+                    if type_param_may_be_struct_with_mut(tp, constraints, tables, field) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "类型参数 '{}' 可能为 struct，其 mut 函数 '{}' 不能作为一等值使用（5.8.3(4)）",
+                                tp, field
+                            ),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Expr::Call { name, .. } => {
+            // 5.8.3(5)/(6)：成员函数体内裸名调用本类型 mut 函数。
+            if !is_member
+                || fn_is_mut
+                || kind == MutOwnerKind::None
+                || name.contains('.')
+                || last_name_segment(fn_name).starts_with("__")
+            {
+                return;
+            }
+            if locals.contains(name) {
+                return;
+            }
+            if owner_mut_methods(name) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "非 mut 成员函数 '{}' 不能调用 mut 函数 '{}'（5.8.3(5)）",
+                        last_name_segment(fn_name),
+                        name
+                    ),
+                });
+            }
+        }
+        _ => {}
+    });
+}
+
+/// 类型参数 `tp` 是否“可能为 struct 且经由上界调用 mut 函数 `method`”。
+/// 任一上界为 class（引用类型）时放行（官方 5.8.3 示例 `where T <: Bar & I`）。
+fn type_param_may_be_struct_with_mut(
+    tp: &str,
+    constraints: &[TypeConstraint],
+    tables: &MutFnTables<'_>,
+    method: &str,
+) -> bool {
+    for c in constraints.iter().filter(|c| c.param == tp) {
+        for b in &c.bounds {
+            if tables.class_names.contains(b.as_str()) {
+                return false;
+            }
+        }
+        for b in &c.bounds {
+            if tables
+                .iface_mut_methods
+                .get(b.as_str())
+                .map_or(false, |set| set.contains(method))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 在 `local_var_types_full` 结果上补充构造调用类型推断：解析器把 `S(...)`
+/// （小写类型名）或 `S<T>(...)` 落为普通 `Call`，而非 `ConstructorCall`。
+fn mut_var_types(
+    body: &[Stmt],
+    base: &HashMap<String, Type>,
+    type_names: &HashSet<&str>,
+) -> HashMap<String, Type> {
+    fn ctor_name(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::Call { name, .. } => {
+                Some(name.split('<').next().unwrap_or(name).trim())
+            }
+            _ => None,
+        }
+    }
+    fn walk(
+        stmts: &[Stmt],
+        map: &mut HashMap<String, Type>,
+        type_names: &HashSet<&str>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Let { pattern: crate::ast::Pattern::Binding(n), ty: None, value, .. }
+                | Stmt::Var { pattern: crate::ast::Pattern::Binding(n), ty: None, value, .. } => {
+                    if !map.contains_key(n) {
+                        if let Some(ty_name) = ctor_name(value) {
+                            if type_names.contains(ty_name) {
+                                map.insert(
+                                    n.clone(),
+                                    Type::Struct(ty_name.to_string(), vec![]),
+                                );
+                            }
+                        }
+                    }
+                    walk_expr_blocks(value, map, type_names);
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::WhileLet { body, .. } => walk(body, map, type_names),
+                Stmt::Expr(e) | Stmt::Return(Some(e)) => walk_expr_blocks(e, map, type_names),
+                Stmt::Assign { value, .. } | Stmt::Const { value, .. } => {
+                    walk_expr_blocks(value, map, type_names)
+                }
+                _ => {}
+            }
+        }
+    }
+    fn walk_expr_blocks(
+        e: &Expr,
+        map: &mut HashMap<String, Type>,
+        type_names: &HashSet<&str>,
+    ) {
+        if let Expr::Block(stmts, _) = e {
+            walk(stmts, map, type_names);
+        }
+    }
+    let mut map = base.clone();
+    walk(body, &mut map, type_names);
+    map
+}
+
+/// 方法调用接收者的静态类型（含被解析为普通 `Call` 的用户类型构造）。
+fn mut_recv_type(
+    e: &Expr,
+    vars: &HashMap<String, Type>,
+    type_names: &HashSet<&str>,
+) -> Option<Type> {
+    if let Some(t) = static_expr_type(e, vars) {
+        return Some(t);
+    }
+    if let Expr::Call { name, .. } = e {
+        let base = name.split('<').next().unwrap_or(name).trim();
+        if type_names.contains(base) {
+            return Some(Type::Struct(base.to_string(), vec![]));
+        }
+    }
+    None
+}
+
+/// 局部变量可变性：let/const/形参不可变，var 可变；同名冲突按可变处理（保守）。
+/// `this`/`self` 在 mut 实例函数中视为可变。
+fn local_var_mutability(
+    params: &[Param],
+    body: &[Stmt],
+    this_is_mut: bool,
+) -> HashMap<String, bool> {
+    let mut map: HashMap<String, bool> = HashMap::new();
+    let mut put = |map: &mut HashMap<String, bool>, name: &str, mutable: bool| {
+        match map.get(name) {
+            Some(existing) if *existing != mutable => {
+                map.insert(name.to_string(), true);
+            }
+            Some(_) => {}
+            None => {
+                map.insert(name.to_string(), mutable);
+            }
+        }
+    };
+    for p in params {
+        let mutable = this_is_mut && (p.name == "this" || p.name == "self");
+        put(&mut map, &p.name, mutable);
+    }
+    fn walk(stmts: &[Stmt], map: &mut HashMap<String, bool>) {
+        for s in stmts {
+            match s {
+                Stmt::Let { pattern, .. } => {
+                    let mut names = Vec::new();
+                    pattern_binding_names(pattern, &mut names);
+                    for n in names {
+                        match map.get(&n) {
+                            Some(existing) if *existing => {
+                                map.insert(n, true);
+                            }
+                            Some(_) => {}
+                            None => {
+                                map.insert(n, false);
+                            }
+                        }
+                    }
+                }
+                Stmt::Var { pattern, .. } => {
+                    let mut names = Vec::new();
+                    pattern_binding_names(pattern, &mut names);
+                    for n in names {
+                        map.insert(n, true);
+                    }
+                }
+                Stmt::Const { name, .. } => {
+                    map.entry(name.clone()).or_insert(false);
+                }
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body } => walk(body, map),
+                Stmt::For { var, body, .. } => {
+                    map.entry(var.clone()).or_insert(false);
+                    walk(body, map);
+                }
+                Stmt::WhileLet { pattern, body, .. } => {
+                    let mut names = Vec::new();
+                    pattern_binding_names(pattern, &mut names);
+                    for n in names {
+                        map.entry(n).or_insert(false);
+                    }
+                    walk(body, map);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body, &mut map);
+    map
+}
+
+/// 5.8(2)：在非 mut struct 实例成员函数中查找对自身字段的赋值。
+fn scan_struct_field_assign(
+    s: &Stmt,
+    fields: &HashSet<&str>,
+    locals: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    use crate::ast::AssignTarget;
+    match s {
+        Stmt::Assign { target, .. } => {
+            let is_field = match target {
+                AssignTarget::Var(n) => {
+                    fields.contains(n.as_str()) && !locals.contains(n.as_str())
+                }
+                AssignTarget::Field { object, field } => {
+                    (object == "this" || object == "self") && fields.contains(field.as_str())
+                }
+                AssignTarget::FieldPath { base, fields: path } => {
+                    (base == "this" || base == "self")
+                        && path
+                            .first()
+                            .map_or(false, |f| fields.contains(f.as_str()))
+                }
+                _ => false,
+            };
+            if is_field {
+                errors.push(SemanticError {
+                    message: "struct 的非 mut 实例成员函数不能修改自身字段（5.8(2)）".to_string(),
+                });
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::UnsafeBlock { body }
+        | Stmt::For { body, .. }
+        | Stmt::WhileLet { body, .. } => {
+            for sub in body {
+                scan_struct_field_assign(sub, fields, locals, errors);
+            }
+        }
+        Stmt::LocalFunc(_) => {
+            // 局部函数没有隐式 this，且其形参作用域未在此建模，保守跳过。
+        }
+        _ => {}
+    }
+}
+
+/// 5.8.1(5)：mut 函数体中 `this` / 字段的表达式使用与闭包捕获。
+fn scan_mut_capture_stmt(
+    s: &Stmt,
+    fields: &HashSet<&str>,
+    locals: &mut HashSet<String>,
+    in_lambda: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    match s {
+        Stmt::Let { pattern, value, .. } | Stmt::Var { pattern, value, .. } => {
+            scan_mut_capture_expr(value, fields, locals, in_lambda, false, errors);
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, &mut names);
+            for n in names {
+                locals.insert(n);
+            }
+        }
+        Stmt::Const { name, value, .. } => {
+            scan_mut_capture_expr(value, fields, locals, in_lambda, false, errors);
+            locals.insert(name.clone());
+        }
+        Stmt::Assign { target, value } => {
+            use crate::ast::AssignTarget;
+            if in_lambda {
+                let bad = match target {
+                    AssignTarget::Field { object, .. } => {
+                        object == "this" || object == "self"
+                    }
+                    AssignTarget::FieldPath { base, .. } => base == "this" || base == "self",
+                    AssignTarget::Var(n) => {
+                        fields.contains(n.as_str()) && !locals.contains(n.as_str())
+                    }
+                    _ => false,
+                };
+                if bad {
+                    errors.push(SemanticError {
+                        message: "mut 函数中的 this / 实例字段不能被闭包捕获（5.8.1(5)）"
+                            .to_string(),
+                    });
+                }
+            }
+            scan_mut_capture_expr(value, fields, locals, in_lambda, false, errors);
+        }
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => {
+            scan_mut_capture_expr(e, fields, locals, in_lambda, false, errors)
+        }
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
+        Stmt::While { cond, body } => {
+            scan_mut_capture_expr(cond, fields, locals, in_lambda, false, errors);
+            for sub in body {
+                scan_mut_capture_stmt(sub, fields, locals, in_lambda, errors);
+            }
+        }
+        Stmt::WhileLet {
+            pattern,
+            expr,
+            body,
+        } => {
+            scan_mut_capture_expr(expr, fields, locals, in_lambda, false, errors);
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, &mut names);
+            for n in names {
+                locals.insert(n);
+            }
+            for sub in body {
+                scan_mut_capture_stmt(sub, fields, locals, in_lambda, errors);
+            }
+        }
+        Stmt::DoWhile { body, cond } => {
+            for sub in body {
+                scan_mut_capture_stmt(sub, fields, locals, in_lambda, errors);
+            }
+            scan_mut_capture_expr(cond, fields, locals, in_lambda, false, errors);
+        }
+        Stmt::For {
+            var,
+            iterable,
+            body,
+        } => {
+            scan_mut_capture_expr(iterable, fields, locals, in_lambda, false, errors);
+            locals.insert(var.clone());
+            for sub in body {
+                scan_mut_capture_stmt(sub, fields, locals, in_lambda, errors);
+            }
+        }
+        Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+            for sub in body {
+                scan_mut_capture_stmt(sub, fields, locals, in_lambda, errors);
+            }
+        }
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            scan_mut_capture_expr(left, fields, locals, in_lambda, false, errors);
+            scan_mut_capture_expr(right, fields, locals, in_lambda, false, errors);
+        }
+        Stmt::LocalFunc(f) => {
+            // 局部函数体属于闭包捕获上下文。
+            for sub in &f.body {
+                scan_mut_capture_stmt(sub, fields, locals, true, errors);
+            }
+        }
+    }
+}
+
+/// 在 mut 函数体中递归检查 `this` / 字段的非法使用。
+/// `as_receiver` 表示当前表达式处于成员访问的接收者位置（`this.field` 合法）。
+fn scan_mut_capture_expr(
+    e: &Expr,
+    fields: &HashSet<&str>,
+    locals: &HashSet<String>,
+    in_lambda: bool,
+    as_receiver: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    match e {
+        Expr::Var(n) if n == "this" || n == "self" => {
+            if in_lambda {
+                errors.push(SemanticError {
+                    message: "mut 函数中的 this 不能被闭包捕获（5.8.1(5)）".to_string(),
+                });
+            } else if !as_receiver {
+                errors.push(SemanticError {
+                    message: "mut 函数中的 this 不能作为表达式使用（5.8.1(5)）".to_string(),
+                });
+            }
+        }
+        Expr::Var(n) => {
+            if in_lambda && fields.contains(n.as_str()) && !locals.contains(n.as_str()) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "mut 函数中的实例字段 '{}' 不能被闭包捕获（5.8.1(5)）",
+                        n
+                    ),
+                });
+            }
+        }
+        Expr::Field { object, .. } | Expr::OptionalChain { object, .. } => {
+            scan_mut_capture_expr(object, fields, locals, in_lambda, true, errors);
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            scan_mut_capture_expr(object, fields, locals, in_lambda, true, errors);
+            for a in args {
+                scan_mut_capture_expr(a, fields, locals, in_lambda, false, errors);
+            }
+            for (_, a) in named_args {
+                scan_mut_capture_expr(a, fields, locals, in_lambda, false, errors);
+            }
+        }
+        Expr::Call {
+            args, named_args, ..
+        } => {
+            for a in args {
+                scan_mut_capture_expr(a, fields, locals, in_lambda, false, errors);
+            }
+            for (_, a) in named_args {
+                scan_mut_capture_expr(a, fields, locals, in_lambda, false, errors);
+            }
+        }
+        Expr::Lambda { params, body, .. } => {
+            let mut lambda_locals = locals.clone();
+            for (p, _) in params {
+                lambda_locals.insert(p.clone());
+            }
+            scan_mut_capture_expr(body, fields, &lambda_locals, true, false, errors);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsType { expr, .. }
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::TupleIndex { object: expr, .. } => {
+            scan_mut_capture_expr(expr, fields, locals, in_lambda, false, errors)
+        }
+        Expr::Binary { left, right, .. } => {
+            scan_mut_capture_expr(left, fields, locals, in_lambda, false, errors);
+            scan_mut_capture_expr(right, fields, locals, in_lambda, false, errors);
+        }
+        Expr::NullCoalesce { option, default } => {
+            scan_mut_capture_expr(option, fields, locals, in_lambda, false, errors);
+            scan_mut_capture_expr(default, fields, locals, in_lambda, false, errors);
+        }
+        Expr::Tuple(items) | Expr::Array(items) => {
+            for x in items {
+                scan_mut_capture_expr(x, fields, locals, in_lambda, false, errors);
+            }
+        }
+        Expr::Index { array, index } => {
+            scan_mut_capture_expr(array, fields, locals, in_lambda, false, errors);
+            scan_mut_capture_expr(index, fields, locals, in_lambda, false, errors);
+        }
+        Expr::StructInit { fields: init, .. } => {
+            for (_, x) in init {
+                scan_mut_capture_expr(x, fields, locals, in_lambda, false, errors);
+            }
+        }
+        Expr::ConstructorCall {
+            args, named_args, ..
+        } => {
+            for a in args {
+                scan_mut_capture_expr(a, fields, locals, in_lambda, false, errors);
+            }
+            for (_, a) in named_args {
+                scan_mut_capture_expr(a, fields, locals, in_lambda, false, errors);
+            }
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            scan_mut_capture_expr(cond, fields, locals, in_lambda, false, errors);
+            scan_mut_capture_expr(then_branch, fields, locals, in_lambda, false, errors);
+            if let Some(x) = else_branch {
+                scan_mut_capture_expr(x, fields, locals, in_lambda, false, errors);
+            }
+        }
+        Expr::Block(stmts, tail) => {
+            let mut block_locals = locals.clone();
+            for s in stmts {
+                scan_mut_capture_stmt(s, fields, &mut block_locals, in_lambda, errors);
+            }
+            if let Some(t) = tail {
+                scan_mut_capture_expr(t, fields, &block_locals, in_lambda, false, errors);
+            }
+        }
+        Expr::Return(Some(x)) => {
+            scan_mut_capture_expr(x, fields, locals, in_lambda, false, errors)
+        }
+        Expr::Return(None) | Expr::None => {}
+        Expr::Range {
+            start, end, step, ..
+        } => {
+            scan_mut_capture_expr(start, fields, locals, in_lambda, false, errors);
+            scan_mut_capture_expr(end, fields, locals, in_lambda, false, errors);
+            if let Some(s) = step {
+                scan_mut_capture_expr(s, fields, locals, in_lambda, false, errors);
+            }
+        }
+        Expr::Interpolate(parts) => {
+            for p in parts {
+                if let crate::ast::InterpolatePart::Expr(x) = p {
+                    scan_mut_capture_expr(x, fields, locals, in_lambda, false, errors);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -25233,6 +26163,7 @@ mod tests {
             functions: vec![
                 Function {
                     is_unsafe: false,
+                    is_mut: false,
                     is_c_func: false,
                     visibility: Visibility::default(),
                     name: "annotated".to_string(),
@@ -25247,6 +26178,7 @@ mod tests {
                 },
                 Function {
                     is_unsafe: false,
+                    is_mut: false,
                     is_c_func: false,
                     visibility: Visibility::default(),
                     name: "inferred".to_string(),
@@ -25284,6 +26216,7 @@ mod tests {
             enums: vec![],
             functions: vec![Function {
                 is_unsafe: false,
+                is_mut: false,
                 is_c_func: false,
                 visibility: Visibility::default(),
                 name: "with_return".to_string(),
@@ -25344,6 +26277,7 @@ mod tests {
                     is_const: false,
                     func: Function {
                         is_unsafe: false,
+                        is_mut: false,
                         is_c_func: false,
                         visibility: Visibility::default(),
                         name: "Foo.getVal".to_string(),
@@ -29633,6 +30567,203 @@ main() {}"#,
              c.a[1] = 1\n\
              return 0\n\
              }\n",
+        );
+    }
+
+    // ── 5.8 mut 函数规则（05_function/08_mut_functions）─────────────────
+
+    #[test]
+    fn test_w21_mut_struct_field_assign_requires_mut() {
+        // 5.8(2)：struct 非 mut 实例函数不能修改自身字段。
+        let errs = assert_invalid(
+            "struct S {\n\
+             \x20   var x = 0\n\
+             \x20   public func f(): Unit { x = 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8(2)")));
+        // 声明为 mut 后合法。
+        assert_valid(
+            "struct S {\n\
+             \x20   var x = 0\n\
+             \x20   public mut func f(): Unit { x = 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w21_mut_call_requires_mutable_receiver() {
+        // 5.8.3(1)：let struct 变量不能调用 mut 函数。
+        let errs = assert_invalid(
+            "struct S {\n\
+             \x20   var x = 0\n\
+             \x20   public mut func f(): Unit { x = 1 }\n\
+             }\n\
+             main() {\n\
+             let s = S()\n\
+             s.f()\n\
+             }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8.3(1)")));
+        // var 变量可以调用。
+        assert_valid(
+            "struct S {\n\
+             \x20   var x = 0\n\
+             \x20   public mut func f(): Unit { x = 1 }\n\
+             }\n\
+             main() {\n\
+             var s = S()\n\
+             s.f()\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w21_mut_method_as_value_rejected() {
+        // 5.8.3(3)：struct 的 mut 函数不能作为一等值。
+        let errs = assert_invalid(
+            "struct S {\n\
+             \x20   var x = 0\n\
+             \x20   public mut func f(): Unit { x = 1 }\n\
+             }\n\
+             main() {\n\
+             var s = S()\n\
+             var g = s.f\n\
+             }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8.3(3)")));
+        // 非 mut 函数作为值应放行。
+        assert_valid(
+            "struct S {\n\
+             \x20   var x = 0\n\
+             \x20   public func g(): Int64 { x }\n\
+             }\n\
+             main() {\n\
+             var s = S()\n\
+             var h = s.g\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w21_mut_this_capture_and_expression() {
+        // 5.8.1(5)：mut 函数中 this 不能作为表达式。
+        let errs = assert_invalid(
+            "struct S {\n\
+             \x20   var x = 0\n\
+             \x20   mut func f(): S { this }\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8.1(5)")));
+        // this 不能被闭包捕获。
+        let errs = assert_invalid(
+            "struct S {\n\
+             \x20   var x = 0\n\
+             \x20   mut func f(): Unit {\n\
+             \x20       let g = { => this.x }\n\
+             \x20   }\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8.1(5)")));
+        // 直接访问 / 修改自身字段合法。
+        assert_valid(
+            "struct S {\n\
+             \x20   var x = 0\n\
+             \x20   mut func f(): Unit { this.x = 1 }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w21_struct_impl_interface_mut_consistency() {
+        // 5.8.2(3)：struct 实现接口函数时 mut 修饰符必须一致。
+        let errs = assert_invalid(
+            "interface I {\n\
+             \x20   mut func f(): Unit\n\
+             }\n\
+             struct S <: I {\n\
+             \x20   public func f(): Unit {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8.2(3)")));
+        let errs = assert_invalid(
+            "interface I {\n\
+             \x20   func f(): Unit\n\
+             }\n\
+             struct S <: I {\n\
+             \x20   public mut func f(): Unit {}\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8.2(3)")));
+        // 修饰符一致时合法。
+        assert_valid(
+            "interface I {\n\
+             \x20   mut func f(): Unit\n\
+             }\n\
+             struct S <: I {\n\
+             \x20   public mut func f(): Unit {}\n\
+             }\n\
+             main() {}\n",
+        );
+        // class 实现接口 mut 函数无需 mut 修饰符。
+        assert_valid(
+            "interface I {\n\
+             \x20   mut func f(): Unit\n\
+             }\n\
+             class C <: I {\n\
+             \x20   public func f(): Unit {}\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w21_non_mut_member_cannot_call_mut() {
+        // 5.8.3(5)：非 mut 实例函数不能访问 mut 函数。
+        let errs = assert_invalid(
+            "struct S {\n\
+             \x20   mut func f(): Unit {}\n\
+             \x20   public func h(): Unit { f() }\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8.3(5)")));
+        // mut 函数调用普通函数合法。
+        assert_valid(
+            "struct S {\n\
+             \x20   func g(): Unit {}\n\
+             \x20   public mut func f(): Unit { g() }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w21_generic_bound_mut_call_rejected() {
+        // 5.8.3(2)：类型参数可能为 struct 时不能调用上界的 mut 函数。
+        let errs = assert_invalid(
+            "interface I {\n\
+             \x20   mut func f(): Unit\n\
+             }\n\
+             func g<T>(v: T): Unit where T <: I { v.f() }\n\
+             main() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("5.8.3(2)")));
+        // 同时有 class 上界时放行（T 可能是引用类型）。
+        assert_valid(
+            "interface I {\n\
+             \x20   mut func f(): Unit\n\
+             }\n\
+             open class B {}\n\
+             func g<T>(v: T): Unit where T <: B & I { v.f() }\n\
+             main() {}\n",
         );
     }
 

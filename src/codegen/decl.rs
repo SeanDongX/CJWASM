@@ -281,6 +281,7 @@ impl CodeGen {
 
         FuncDef {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility: Visibility::Public,
@@ -314,6 +315,7 @@ impl CodeGen {
 
         FuncDef {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility: Visibility::Public,
@@ -335,6 +337,7 @@ impl CodeGen {
 
         FuncDef {
             is_unsafe: false,
+            is_mut: false,
             is_c_func: false,
             is_const: false,
             visibility: Visibility::Public,
