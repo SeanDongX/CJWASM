@@ -21,7 +21,7 @@
 
 use super::SemanticError;
 use crate::ast::{
-    BinOp, Expr, Function, IntSuffix, Literal, MatchArm, Pattern, Program, Stmt, Type,
+    BinOp, Expr, FloatSuffix, Function, IntSuffix, Literal, MatchArm, Pattern, Program, Stmt, Type,
     TypeConstraint, UnaryOp, Visibility,
 };
 use std::collections::{HashMap, HashSet};
@@ -515,10 +515,23 @@ fn static_expr_ty(e: &Expr) -> Ty {
             "None" => Ty::Option(Box::new(Ty::Unknown)),
             _ => Ty::Unknown,
         },
-        // `Option<T>.None`（无调用括号，解析为字段访问，类型实参已丢失）。
+        // `Option<T>.None`（无调用括号，解析为字段访问）。
         Expr::Field { object, field } if field == "None" => {
             if matches!(&**object, Expr::Var(n) if n == "Option") {
                 Ty::Option(Box::new(Ty::Unknown))
+            } else if let Expr::Call {
+                name,
+                type_args: Some(tas),
+                args,
+                ..
+            } = &**object
+            {
+                // w37a：`Option<T>.None` 保留的类型实参 T（折叠为 Call{Option,[T],[]}）。
+                if name == "Option" && tas.len() == 1 && args.is_empty() {
+                    Ty::Option(Box::new(ty_of(&tas[0])))
+                } else {
+                    Ty::Unknown
+                }
             } else {
                 Ty::Unknown
             }
@@ -1209,6 +1222,10 @@ struct Checker<'a> {
     /// (类型, 泛型成员方法裸名)：带类型形参的成员方法集合。作为值引用
     /// （无调用括号、无类型实参）时非法（4.13/a04_04）。
     generic_method_names: HashSet<(String, String)>,
+    /// w37a：`extend <内建数值类型> { ... }` 声明的成员名集合（类型名 → 成员名）。
+    /// 仅用于单文件（strict_scope）下“数字字面量成员访问”的窄化判定：字面量上
+    /// 访问不在本表中的成员报错（4.13.1(2)：字面量本身无成员）。
+    builtin_ext_members: HashMap<String, HashSet<String>>,
     /// 正在检查 `?` 后缀形态（Invoke 的 Try 被调用者 / Index 的 Try 数组）。
     /// 可选调用/可选索引糖中的 Try 不是提前返回糖，跳过 ret_ty 判定。
     try_suffix_depth: u32,
@@ -2656,6 +2673,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     let owner_members = collect_owner_members(program);
     let generic_named_types = collect_generic_named_types(program);
 
+    // w37a：收集内建数值类型上的本地 extend 成员名，用于数字字面量成员访问窄化。
+    let builtin_ext_members = collect_builtin_ext_members(program);
+
     // 16.2(12)/(14)：收集每个用户类型的全部成员函数名与属性名，用于 const 上下文
     // 判定“属性访问 / 非 const 成员方法调用”不是常量表达式。
     let (type_methods, type_props) = collect_type_methods_props(program, &type_names);
@@ -2727,6 +2747,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         method_arities,
         method_param_types,
         generic_method_names,
+        builtin_ext_members,
         try_suffix_depth: 0,
         index_op_types,
         index_set_types,
@@ -4177,6 +4198,121 @@ fn collect_operator_overloads(program: &Program, out: &mut HashSet<String>) {
 /// 去掉方法名可能的 `Type.` 前缀，得到成员名。
 fn member_name(name: &str) -> &str {
     name.rsplit_once('.').map(|(_, n)| n).unwrap_or(name)
+}
+
+/// w37a：是否为内建数值类型名（作为 `extend T` 的目标类型时收集其成员）。
+fn is_builtin_numeric_type(name: &str) -> bool {
+    matches!(
+        name,
+        "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "IntNative"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "UIntNative"
+            | "Float16"
+            | "Float32"
+            | "Float64"
+    )
+}
+
+/// w37a：收集 `extend <内建数值类型> { ... }` 声明的成员名（类型名 → 成员名集合）。
+/// 属性访问器（`__get_x`/`__set_x`）归并到裸属性名 `x`。
+fn collect_builtin_ext_members(
+    program: &Program,
+) -> HashMap<String, HashSet<String>> {
+    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    for ext in &program.extends {
+        if !is_builtin_numeric_type(ext.target_type.as_str()) {
+            continue;
+        }
+        let entry = map.entry(ext.target_type.clone()).or_default();
+        for f in &ext.methods {
+            let m = member_name(&f.name);
+            let bare = m
+                .strip_prefix("__get_")
+                .or_else(|| m.strip_prefix("__set_"))
+                .unwrap_or(m);
+            entry.insert(bare.to_string());
+            entry.insert(m.to_string());
+        }
+    }
+    map
+}
+
+/// w37a：数值字面量接收者的类型名（用于其成员访问窄化）。非数值字面量返回 None。
+fn numeric_literal_type_name(e: &Expr) -> Option<&'static str> {
+    match e {
+        Expr::Integer(_) | Expr::IntegerOverflow(..) => Some("Int64"),
+        Expr::IntegerSuffixed(_, s) => Some(match s {
+            IntSuffix::I8 => "Int8",
+            IntSuffix::I16 => "Int16",
+            IntSuffix::I32 => "Int32",
+            IntSuffix::I64 => "Int64",
+            IntSuffix::U8 => "UInt8",
+            IntSuffix::U16 => "UInt16",
+            IntSuffix::U32 => "UInt32",
+            IntSuffix::U64 => "UInt64",
+        }),
+        Expr::Float(_) => Some("Float64"),
+        Expr::Float32(_) => Some("Float32"),
+        Expr::FloatSuffixed(_, FloatSuffix::F16) => Some("Float16"),
+        Expr::FloatSuffixed(_, FloatSuffix::F32) => Some("Float32"),
+        Expr::FloatSuffixed(_, FloatSuffix::F64) => Some("Float64"),
+        _ => None,
+    }
+}
+
+/// 内建数值类型上常见的标准成员（转换/数学），字面量访问时保守放行，避免误伤。
+fn is_builtin_numeric_member(name: &str) -> bool {
+    matches!(
+        name,
+        "asInt8"
+            | "asInt16"
+            | "asInt32"
+            | "asInt64"
+            | "asIntNative"
+            | "asUInt8"
+            | "asUInt16"
+            | "asUInt32"
+            | "asUInt64"
+            | "asUIntNative"
+            | "toInt8"
+            | "toInt16"
+            | "toInt32"
+            | "toInt64"
+            | "toIntNative"
+            | "toUInt8"
+            | "toUInt16"
+            | "toUInt32"
+            | "toUInt64"
+            | "toUIntNative"
+            | "toFloat16"
+            | "toFloat32"
+            | "toFloat64"
+            | "asFloat16"
+            | "asFloat32"
+            | "asFloat64"
+            | "abs"
+            | "pow"
+            | "min"
+            | "max"
+            | "countOneBits"
+            | "leadingZeros"
+            | "trailingZeros"
+            | "rotl"
+            | "rotr"
+            | "isEven"
+            | "isOdd"
+            | "isPositive"
+            | "isNegative"
+            | "isZero"
+            | "format"
+    )
 }
 
 /// 由 AST 类型映射到轻量类型，并把已知用户类型名映射为 `Ty::User`。
@@ -7895,6 +8031,32 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// w37a（4.13.1(2)）：数字字面量本身没有成员。字面量上的成员访问仅当成员在
+    /// 本地 `extend <内建数值类型>` 中声明、或属于通用/内建数值成员时放行。
+    /// 仅在单文件（strict_scope）下判定，避免误伤导入/跨文件扩展。
+    fn check_literal_member(&mut self, object: &crate::ast::Expr, member: &str) {
+        if !self.strict_scope {
+            return;
+        }
+        let Some(ty_name) = numeric_literal_type_name(object) else {
+            return;
+        };
+        if is_universal_method(member) || is_builtin_numeric_member(member) {
+            return;
+        }
+        if self
+            .builtin_ext_members
+            .get(ty_name)
+            .map_or(false, |s| s.contains(member))
+        {
+            return;
+        }
+        self.err(format!(
+            "类型 '{}' 的数字字面量没有成员 '{}'（4.13.1(2)）",
+            ty_name, member
+        ));
+    }
+
     /// `a?[i] = v`：仅当 `a` 为 `Option<引用类型：数组或带 set [] 的类>` 时合法。
     ///
     /// 注意：对 struct（值类型）上的 `a?[i] = v`，官方测试集存在互相矛盾的用例
@@ -10220,6 +10382,8 @@ impl<'a> Checker<'a> {
                 self.strict_member_obj_depth += 1;
                 self.check_expr(object);
                 self.strict_member_obj_depth -= 1;
+                // w37a（4.13.1(2)）：数字字面量上的成员访问窄化。
+                self.check_literal_member(object, field);
                 // 2.1.11.2：枚举构造值上访问构造器（`A(0).B`）非法。
                 self.check_enum_ctor_member(object, field);
                 // 2.1.4(2)：Unit 类型未定义成员访问运算符 '.'。

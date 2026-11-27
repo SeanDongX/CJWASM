@@ -725,6 +725,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_overload_candidate_types(program, &mut errors);
     // 10.1.3.2 / 5.3.2(9) / 5.3.4(11)：可确定的重载决议歧义（保守子集）。
     check_overload_resolution_ambiguity(program, &mut errors);
+    // 4.22.2(1)：组合运算符 `~>` 的左函数返回类型须能作为右函数的形参（a37_07）。
+    check_composition_type_chain(program, &mut errors);
     // 6.1.2.7(4)：泛型类限定访问成员须提供类型实参（w30c）。
     check_generic_class_qualifier_without_args(program, &mut errors);
 
@@ -25971,6 +25973,9 @@ enum ArgClass {
     FloatLit,
     /// 具体原始标量类型。
     Scalar(Type),
+    /// 本地用户名义类型（class/struct/enum 名）：形参匹配用子类型关系判定。
+    /// 仅由 `check_overload_resolution_ambiguity` 的形参分类内部产生（w37b）。
+    Nominal(Type),
     /// 不可确定。
     Unknown,
 }
@@ -26075,7 +26080,45 @@ fn arg_param_ok(k: &ArgClass, p: &Type) -> bool {
         ArgClass::IntLit => is_int_scalar_ty(p) || is_float_scalar_ty(p),
         ArgClass::FloatLit => is_float_scalar_ty(p),
         ArgClass::Scalar(t) => t == p,
+        // 名义类型的子类型匹配需要继承图；共享路径无图时退化为相等判定
+        //（歧义检查内部另用子类型感知的 `analyze_param_ok`）。
+        ArgClass::Nominal(t) => t == p,
         ArgClass::Unknown => true,
+    }
+}
+
+/// 歧义检查专用的形参匹配：名义类型实参走本地继承图子类型判定；无法判定时置
+/// `undecidable`（调用方据此放弃本次调用，避免误报）。
+fn analyze_param_ok(
+    k: &ArgClass,
+    p: &Type,
+    parents: &HashMap<String, Vec<String>>,
+    undecidable: &mut bool,
+) -> bool {
+    match k {
+        ArgClass::Nominal(t) => match w23_subtype(t, p, parents) {
+            Some(r) => r,
+            None => {
+                *undecidable = true;
+                false
+            }
+        },
+        _ => arg_param_ok(k, p),
+    }
+}
+
+/// 把本地可确定的名义类型实参（`var s: Sub = ...` 的变量等）归类为 `Nominal`。
+/// 仅接受无泛型实参的本地类型名；其余返回 `None`（调用方放行）。
+fn nominal_arg_class(
+    e: &Expr,
+    vars: &HashMap<String, Type>,
+    type_names: &HashSet<String>,
+) -> Option<ArgClass> {
+    match static_expr_type(e, vars) {
+        Some(Type::Struct(n, args)) if args.is_empty() && type_names.contains(n.as_str()) => {
+            Some(ArgClass::Nominal(Type::Struct(n, args)))
+        }
+        _ => None,
     }
 }
 
@@ -28152,20 +28195,26 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
             }
         }
         // 实参分类（位置实参在前，命名实参按出现顺序在后）。
+        // 名义类型实参（本地用户类的变量）走子类型感知匹配；其余无法分类即放行。
+        let mut undecidable = false;
         let mut classes: Vec<ArgClass> = Vec::with_capacity(args.len() + named.len());
         for a in args {
-            let k = classify_arg_exact(a, vars);
-            if matches!(k, ArgClass::Unknown) {
-                return;
+            match classify_arg_exact(a, vars) {
+                ArgClass::Unknown => match nominal_arg_class(a, vars, &type_names) {
+                    Some(k) => classes.push(k),
+                    None => return,
+                },
+                k => classes.push(k),
             }
-            classes.push(k);
         }
         for (_, a) in named {
-            let k = classify_arg_exact(a, vars);
-            if matches!(k, ArgClass::Unknown) {
-                return;
+            match classify_arg_exact(a, vars) {
+                ArgClass::Unknown => match nominal_arg_class(a, vars, &type_names) {
+                    Some(k) => classes.push(k),
+                    None => return,
+                },
+                k => classes.push(k),
             }
-            classes.push(k);
         }
 
         // 逐候选判定：bool=是否适用，Vec<Type>=按调用位序绑定的形参类型。
@@ -28238,7 +28287,7 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
             let mut bound: Vec<Type> = Vec::with_capacity(classes.len());
             for (i, k) in classes.iter().enumerate().take(args.len()) {
                 let t = pty(pp[i]);
-                if arg_param_ok(k, &t) {
+                if analyze_param_ok(k, &t, &parents, &mut undecidable) {
                     bound.push(t);
                 } else {
                     ok = false;
@@ -28253,7 +28302,7 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
                     };
                     let k = &classes[args.len() + j];
                     let t = pty(p);
-                    if arg_param_ok(k, &t) {
+                    if analyze_param_ok(k, &t, &parents, &mut undecidable) {
                         bound.push(t);
                     } else {
                         ok = false;
@@ -28293,6 +28342,10 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
             .filter(|(_, (ok, _))| *ok)
             .map(|(i, _)| i)
             .collect();
+        // 名义类型子类型关系无法判定时，整体放弃（避免误报歧义）。
+        if undecidable {
+            return;
+        }
         if applicable.len() < 2 {
             return;
         }
@@ -28325,6 +28378,9 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
                     }
                 }
                 ArgClass::Scalar(_) => Some(4),
+                // 名义类型实参：等级与具体标量等同，特异性交由随后按形参类型做的
+                // 子类型比较（`pos_ge` 中 `w23_subtype`）判定。
+                ArgClass::Nominal(_) => Some(4),
                 ArgClass::Unknown => None,
             }
         };
@@ -28470,6 +28526,216 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
     for ext in &program.extends {
         for m in &ext.methods {
             scan(&m.params, &m.body, errors);
+        }
+    }
+}
+
+// ─── 4.22.2：组合运算符 `~>` 的函数类型链（左函数返回 vs 右函数形参） ──────────
+
+/// 顶层单参自由函数的签名快照（用于组合链检查）：仅接受唯一声明、非泛型、非变长、
+/// 恰有一个位置形参且无必选命名形参的函数，返回该位置形参类型。
+fn compose_unary_param_ty(f: &Function) -> Option<Type> {
+    if !f.type_params.is_empty() {
+        return None;
+    }
+    let pos: Vec<&Param> = f
+        .params
+        .iter()
+        .filter(|p| !p.is_named && !is_receiver_param(&p.name))
+        .collect();
+    if pos.len() != 1 || pos[0].variadic {
+        return None;
+    }
+    // 含必选命名形参时单实参调用本身即非法落空，交由其它检查，组合链不判。
+    if f
+        .params
+        .iter()
+        .any(|p| p.is_named && p.default.is_none() && !is_receiver_param(&p.name))
+    {
+        return None;
+    }
+    Some(pos[0].ty.clone())
+}
+
+/// 判定函数返回类型是否为**函数类型**（可静态确定时）。仅在最可信的形态下返回 true：
+/// 显式标注为 `(...) -> R`，或（无标注时）函数体恰为“返回一个 lambda / 末尾表达式为 lambda”。
+fn compose_returns_function(f: &Function) -> bool {
+    if let Some(rt) = &f.return_type {
+        return matches!(rt, Type::Function { .. });
+    }
+    match f.body.as_slice() {
+        [Stmt::Return(Some(Expr::Lambda { .. }))] => true,
+        [Stmt::Expr(Expr::Lambda { .. })] => true,
+        _ => false,
+    }
+}
+
+/// 4.22.2(1)：组合表达式 `f ~> g` 表示两个单参函数的组合，等价于 `{x => g(f(x))}`。
+/// 故 `f` 的返回类型必须能作为 `g` 的首个（唯一）形参传入。
+///
+/// CJWasm 不做完整返回类型推断，此处只处理可静态判定的窄子集：`f ~> g` 的两个操作数
+/// 均为**裸顶层自由函数名**（唯一声明、非泛型/变长），且 `f` 的返回类型确定是**函数
+/// 类型**、`g` 的唯一位置形参确定是**具体标量**——此时组合必然非法（a37_07：
+/// `3 |> (adder ~> mul2)`，adder 返回 lambda 而 mul2 需要 Int64）。
+///
+/// 组合脱糖后的 lambda 参数为占位 `TypeParam("_")`、参数名 `__compose_arg`、函数体恰为
+/// `right(left(__compose_arg))` 的双层 `Invoke`，据此精确识别而不误伤用户 lambda。
+fn check_composition_type_chain(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 顶层自由函数索引（唯一声明；含 '.' 的方法、extern 跳过）。
+    let mut free_func: HashMap<&str, &Function> = HashMap::new();
+    let mut dup_func: HashSet<&str> = HashSet::new();
+    for f in &program.functions {
+        if f.name.contains('.') || f.extern_import.is_some() {
+            continue;
+        }
+        if free_func.contains_key(f.name.as_str()) {
+            dup_func.insert(f.name.as_str());
+        } else {
+            free_func.insert(f.name.as_str(), f);
+        }
+    }
+    for d in &dup_func {
+        free_func.remove(d);
+    }
+    if free_func.is_empty() {
+        return;
+    }
+
+    // 名称被类型/全局常量/局部绑定遮蔽时保守放行（避免把变量当函数）。
+    let mut shadowed: HashSet<&str> = HashSet::new();
+    for c in &program.classes {
+        shadowed.insert(c.name.as_str());
+    }
+    for s in &program.structs {
+        shadowed.insert(s.name.as_str());
+    }
+    for e in &program.enums {
+        shadowed.insert(e.name.as_str());
+    }
+    for i in &program.interfaces {
+        shadowed.insert(i.name.as_str());
+    }
+    for c in &program.constants {
+        shadowed.insert(c.name.as_str());
+    }
+    let mut local_names: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        collect_local_def_names(&f.body, &mut local_names);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            collect_local_def_names(&m.func.body, &mut local_names);
+        }
+    }
+
+    // 识别脱糖组合 lambda，抽取 (left, right) 两个操作数表达式。
+    fn decompose<'a>(
+        params: &[(String, Type)],
+        body: &'a Expr,
+    ) -> Option<(&'a Expr, &'a Expr)> {
+        if params.len() != 1 {
+            return None;
+        }
+        if params[0].0 != "__compose_arg" || params[0].1 != Type::TypeParam("_".to_string()) {
+            return None;
+        }
+        let Expr::Invoke {
+            callee: right,
+            args: outer_args,
+            named_args: outer_named,
+        } = body
+        else {
+            return None;
+        };
+        if outer_args.len() != 1 || !outer_named.is_empty() {
+            return None;
+        }
+        let Expr::Invoke {
+            callee: left,
+            args: inner_args,
+            named_args: inner_named,
+        } = &outer_args[0]
+        else {
+            return None;
+        };
+        if inner_args.len() != 1 || !inner_named.is_empty() {
+            return None;
+        }
+        if !matches!(&inner_args[0], Expr::Var(n) if n == "__compose_arg") {
+            return None;
+        }
+        Some((&**left, &**right))
+    }
+
+    let mut report = |left: &Expr, right: &Expr, errors: &mut Vec<SemanticError>| {
+        let (Expr::Var(lname), Expr::Var(rname)) = (left, right) else {
+            return;
+        };
+        if shadowed.contains(lname.as_str())
+            || shadowed.contains(rname.as_str())
+            || local_names.contains(lname.as_str())
+            || local_names.contains(rname.as_str())
+        {
+            return;
+        }
+        let Some(lf) = free_func.get(lname.as_str()) else {
+            return;
+        };
+        let Some(rf) = free_func.get(rname.as_str()) else {
+            return;
+        };
+        // 组合要求两侧均为单参函数（4.22.2(1)）；取不到唯一位置形参即放行。
+        if compose_unary_param_ty(lf).is_none() || compose_unary_param_ty(rf).is_none() {
+            return;
+        }
+        if !compose_returns_function(lf) {
+            return;
+        }
+        let Some(rp) = compose_unary_param_ty(rf) else {
+            return;
+        };
+        // 左函数返回函数类型，而右函数需要具体标量 → 组合无法通过类型检查。
+        if is_scalar_scalar_ty(&rp) {
+            errors.push(SemanticError {
+                message: format!(
+                    "组合运算符 '~>'：左函数 '{}' 返回函数类型，与右函数 '{}' 的首个形参类型 {} 不匹配（4.22.2(1)）",
+                    lname,
+                    rname,
+                    type_display(&rp),
+                ),
+            });
+        }
+    };
+
+    let mut scan = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        walk_stmts(body, &mut |e| {
+            if let Expr::Lambda { params, body, .. } = e {
+                if let Some((left, right)) = decompose(params, body) {
+                    report(left, right, errors);
+                }
+            }
+        });
+    };
+
+    for f in &program.functions {
+        scan(&f.body, errors);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            scan(&m.func.body, errors);
+        }
+        for init in &c.inits {
+            scan(&init.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.body, errors);
         }
     }
 }
@@ -29118,6 +29384,9 @@ fn check_ctor_arg_type_mismatch(program: &Program, errors: &mut Vec<SemanticErro
                         ArgClass::IntLit => is_int_scalar_ty(&ty),
                         ArgClass::FloatLit => is_float_scalar_ty(&ty),
                         ArgClass::Scalar(t) => t == &ty,
+                        // 构造器形参分类不产生名义实参（`classify_arg` 对用户类型返回
+                        // Unknown），此臂为穷尽性占位，保守放行。
+                        ArgClass::Nominal(_) => true,
                         ArgClass::Unknown => true,
                     }
                 })
@@ -32721,8 +32990,10 @@ fn check_w28d_option_syntax(program: &Program, errors: &mut Vec<SemanticError>) 
 
 fn is_option_head(e: &Expr) -> bool {
     // 语法层 `Option<T>.Some(...)` 解析为 object=Var("Option")；限定路径取末段。
+    // w37a：`Option<T>.None` 保留类型实参后折叠为 object=Call{name:"Option"}。
     match e {
         Expr::Var(n) => n == "Option",
+        Expr::Call { name, .. } => name == "Option",
         Expr::Field { object, .. } => is_option_head(object),
         _ => false,
     }
@@ -33445,6 +33716,38 @@ mod tests {
     fn test_validate_duplicate_top_level_function() {
         assert_invalid(
             "func f(a: Int64) {}\nfunc f(b: Int64) {}\nmain() {}\n",
+        );
+    }
+
+
+    #[test]
+    fn test_w37b_composition_and_nominal_overload() {
+        // 4.22.2(1)：组合 `adder ~> mul2`（左返回函数类型、右需 Int64）→ 非法（a37_07）。
+        let errs = assert_invalid(
+            "func adder(x: Int64) { return { i: Int64 => i + x } }\n\
+             func mul2(x: Int64) { return x * 2 }\n\
+             main() { 3 |> (adder ~> mul2)\n 0 }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("组合运算符 '~>'")));
+        // 左操作数为调用结果（非裸函数名）时不误判：`(3 |> adder) ~> mul2` 合法（a37_06）。
+        assert_valid(
+            "func adder(x: Int64) { return { i: Int64 => i + x } }\n\
+             func mul2(x: Int64) { return x * 2 }\n\
+             main() { let f = (3 |> adder) ~> mul2\n 0 }\n",
+        );
+        // 10.1.3.2：类层次上的同等匹配（默认形参不参与特异性）→ 歧义（a01_03/a01_04）。
+        let errs = assert_invalid(
+            "open class Base {}\nclass Sub <: Base {}\n\
+             func Check(a: Base) { a }\nfunc Check(a: Sub) { a }\n\
+             func Check(a: Sub, b!: Bool = false) { a }\n\
+             main() { var s: Sub = Sub()\n Check(s)\n 0 }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("重载决议歧义")));
+        // 子类候选严格更匹配时唯一确定，不误判。
+        assert_valid(
+            "open class Base {}\nclass Sub <: Base {}\n\
+             func Check(a: Base) { a }\nfunc Check(a: Sub) { a }\n\
+             main() { var s: Sub = Sub()\n Check(s)\n 0 }\n",
         );
     }
 

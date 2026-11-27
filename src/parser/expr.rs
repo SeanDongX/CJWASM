@@ -2179,6 +2179,28 @@ impl Parser {
                         // 值”，保留原有的折叠为 Var，让后续限定访问 / 尾随闭包逻辑按
                         // 既有方式处理（类型实参由下游另行处理）。仅当后面不是这两种
                         // 后缀附着形态时，才是真正的“泛型函数名作值”。
+                        //
+                        // 特例（w37a）：`Option<T>.None` 必须保留类型实参 T，否则
+                        // Option 的元素类型丢失（如 `Option<(Int64,Int64,Int64)>.None`
+                        // 无法判定 `x?[i] = v` 的元组不可变索引赋值）。折叠为
+                        // `Call{name:"Option", type_args, args:[]}` 作为限定访问的
+                        // object；语义层 `Field "None"` 分支据此得出 `Option<T>`。
+                        // 代码生成对该 object 形态沿用既有的“字段回退”路径，产出
+                        // None（tag=0），与改动前写法一致。
+                        if self.peek() == Some(&Token::Dot)
+                            && name == "Option"
+                            && matches!(self.peek_at(1), Some(Token::None))
+                        {
+                            return Ok(match type_args {
+                                Some(tas) if !tas.is_empty() => Expr::Call {
+                                    name,
+                                    type_args: Some(tas),
+                                    args: Vec::new(),
+                                    named_args: Vec::new(),
+                                },
+                                _ => Expr::Var(name),
+                            });
+                        }
                         if matches!(self.peek(), Some(Token::Dot) | Some(Token::LBrace)) {
                             Ok(Expr::Var(name))
                         } else {
