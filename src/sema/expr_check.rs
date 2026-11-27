@@ -1263,6 +1263,10 @@ struct Checker<'a> {
 struct GenericDef {
     type_params: Vec<String>,
     constraints: Vec<TypeConstraint>,
+    /// 约束是否继承自类型别名（2.4.1(9)）。别名约束要求实参**确实**实现上界
+    /// 接口（对本地 class/enum 按继承闭包判定），而直接泛型实例化对 class 与
+    /// prelude 接口的满足性保守放行（见 test_w6a_generic_instantiation_constraint_ok）。
+    strict_iface: bool,
 }
 
 /// 构造函数形参（用于构造调用实参匹配，6.1.2.1(8)/(9)）。
@@ -1453,14 +1457,50 @@ fn subtype_relation(
         },
         Some(TypeKind::Enum) => Some(false),
         Some(TypeKind::Interface) => {
-            // 所有 prelude 结构体自动实现 ToString。
-            if bound == "ToString" && matches!(ak, Some(TypeKind::Struct)) {
-                return Some(true);
+            // ToString 自动实现规则（w35a 收紧）：
+            //  - 本地用户 struct 自动实现 ToString；
+            //  - prelude 值类型（数值 / Bool / Rune / String）实现 ToString；
+            //  - 元组类型不实现 ToString（5.3.2(5) 实例化约束）。
+            if bound == "ToString" {
+                if kinds.get(arg) == Some(&TypeKind::Struct) {
+                    return Some(true);
+                }
+                if matches!(
+                    arg,
+                    "Int8"
+                        | "Int16"
+                        | "Int32"
+                        | "Int64"
+                        | "IntNative"
+                        | "UInt8"
+                        | "UInt16"
+                        | "UInt32"
+                        | "UInt64"
+                        | "UIntNative"
+                        | "Float16"
+                        | "Float32"
+                        | "Float64"
+                        | "Bool"
+                        | "Rune"
+                        | "String"
+                ) {
+                    return Some(true);
+                }
+                // 元组类型不实现 ToString（5.3.2(5)：元组作类型实参不满足
+                // `<: ToString`）。Array/Slice/Range/Map 等聚合类型保守放行
+                // （std 中存在 `requireEquals<Array<..>>() where T <: ToString` 用法）。
+                if arg == "Tuple" {
+                    return Some(false);
+                }
             }
             // Object 与 Any 不实现任何 prelude 接口。
             if arg == "Object" {
                 return Some(false);
             }
+            // 保守：本地用户 class/enum 与 prelude 接口的满足性不在此判定
+            // （直接实例化 `GenericClass<C>() where T <: ToString` 保持放行，
+            // 见 test_w6a_generic_instantiation_constraint_ok）。更严格的判定仅在
+            // 类型别名继承的约束（strict_iface）路径启用。
             None
         }
         None => None,
@@ -1650,6 +1690,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 GenericDef {
                     type_params: tp.to_vec(),
                     constraints: cons.to_vec(),
+                    strict_iface: false,
                 },
             );
         };
@@ -1664,6 +1705,71 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         }
         for f in &program.functions {
             add(&f.name, &f.type_params, &f.constraints, &mut generic_defs, &mut generic_dup_names);
+        }
+        // 2.4.1(9)：泛型类型别名天然继承原类型的泛型约束。
+        // `type Class1<V> = GenericClassA<V>`——把目标类型 `GenericClassA` 的约束
+        // 按类型实参位置映射到别名的类型参数，使 `Class1<X>()` 实例化时校验。
+        // 仅处理目标为单层 `Struct(target, args)` 且目标已有约束定义的情形；
+        // 目标实参为固定具体类型的约束位置不迁移（其可在目标类型处另行校验）。
+        for (alias, target) in &program.type_aliases {
+            if generic_defs.contains_key(alias) || generic_dup_names.contains(alias) {
+                continue;
+            }
+            let Type::Struct(tn, targs) = target else {
+                continue;
+            };
+            let Some(target_def) = generic_defs.get(tn).cloned() else {
+                continue;
+            };
+            if targs.len() != target_def.type_params.len() {
+                continue;
+            }
+            // 目标类型参数位置 → 别名类型参数名（实参为 TypeParam 时）。
+            let mut alias_param: HashMap<&str, &str> = HashMap::new();
+            let mut alias_params: Vec<String> = Vec::new();
+            for (p, a) in target_def.type_params.iter().zip(targs.iter()) {
+                if let Type::TypeParam(n) = a {
+                    alias_param.insert(p.as_str(), n.as_str());
+                    if !alias_params.iter().any(|x| x == n) {
+                        alias_params.push(n.clone());
+                    }
+                }
+            }
+            if alias_params.is_empty() {
+                continue;
+            }
+            let mut mapped: Vec<TypeConstraint> = Vec::new();
+            for c in &target_def.constraints {
+                let Some(new_param) = alias_param.get(c.param.as_str()) else {
+                    continue;
+                };
+                let new_bounds = c
+                    .bounds
+                    .iter()
+                    .map(|b| {
+                        alias_param
+                            .get(b.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| b.clone())
+                    })
+                    .collect();
+                mapped.push(TypeConstraint {
+                    param: new_param.to_string(),
+                    bounds: new_bounds,
+                    bound_args: c.bound_args.clone(),
+                });
+            }
+            if mapped.is_empty() {
+                continue;
+            }
+            generic_defs.insert(
+                alias.clone(),
+                GenericDef {
+                    type_params: alias_params,
+                    constraints: mapped,
+                    strict_iface: true,
+                },
+            );
         }
     }
     let alias_types: HashMap<String, Type> = program
@@ -4155,7 +4261,7 @@ fn collect_static_method_generics(
             dup.insert(key);
             return;
         }
-        out.insert(key, GenericDef { type_params, constraints });
+        out.insert(key, GenericDef { type_params, constraints, strict_iface: false });
     }
     let mut out: HashMap<(String, String), GenericDef> = HashMap::new();
     let mut dup: HashSet<(String, String)> = HashSet::new();
@@ -4404,6 +4510,34 @@ fn is_same_or_subtype_name(
         }
     }
     false
+}
+
+/// 实参类型 `name` 的祖先闭包是否完全由本地已声明类型构成。
+///
+/// 仅当闭包中每个可达祖先都在 `kinds`（本地类型表）中时返回 true——此时
+/// 程序内即可见其全部接口实现，若闭包不含某接口可确定“未实现”。若出现
+/// prelude/未知祖先（其可能隐含实现额外接口），返回 false 以保守放行。
+fn closure_is_local(
+    name: &str,
+    kinds: &HashMap<String, TypeKind>,
+    parents: &HashMap<String, Vec<String>>,
+) -> bool {
+    let mut stack: Vec<&str> = vec![name];
+    let mut seen: HashSet<&str> = HashSet::new();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        if !kinds.contains_key(t) {
+            return false;
+        }
+        if let Some(ps) = parents.get(t) {
+            for p in ps {
+                stack.push(p.as_str());
+            }
+        }
+    }
+    true
 }
 
 /// 构建用于约束满足判定的继承图（含 extend 实现的接口、enum 的父接口约束）。
@@ -7838,18 +7972,56 @@ impl<'a> Checker<'a> {
                 if def.type_params.iter().any(|p| p == &bound_head) {
                     continue;
                 }
-                if let Some(ok) = subtype_relation(
+                // 9.5.2(5)：接口类型作类型实参时，若上界接口含**无默认实现体**的
+                // 静态成员函数（必须由实现类型提供），则接口自身不满足该约束
+                // （如 `g<I>()` where `T <: I`、I 含 `static func f(): Unit`）。
+                // 若接口的静态函数均有默认实现体（如 `static func f2(): Unit {}`），
+                // 接口类型自身即可满足，作类型实参合法（6.2.3.1(5)）。
+                if self.type_kinds.get(&arg_head) == Some(&TypeKind::Interface)
+                    && self.type_kinds.get(&bound_head) == Some(&TypeKind::Interface)
+                    && arg_head == bound_head
+                    && self
+                        .iface_static_methods
+                        .get(&bound_head)
+                        .map_or(false, |v| v.iter().any(|m| !m.has_body))
+                {
+                    self.err(format!(
+                        "接口类型 '{}' 作为类型实参不满足泛型 '{}' 的类型参数 '{}' 的约束 '<: {}'：须由实现该接口的类型实例化（9.5.2(5)）",
+                        arg_head, name, c.param, bound_head
+                    ));
+                    continue;
+                }
+                let relation = subtype_relation(
                     &arg_head,
                     &bound_head,
                     &self.type_kinds,
                     &self.constraint_parents,
-                ) {
-                    if !ok {
-                        self.err(format!(
-                            "类型 '{}' 不满足泛型 '{}' 的类型参数 '{}' 的约束 '<: {}'（9.2(1)/9.2(2)）",
-                            arg_head, name, c.param, bound_head
-                        ));
+                )
+                // 2.4.1(9)：别名继承的约束要求实参**确实**实现上界接口。
+                // 对本地 class/enum/struct 按继承闭包（含 extend）判定；闭包完全
+                // 由本地已声明类型构成且不含该接口时可确定未实现。
+                .or_else(|| {
+                    let bound_is_iface = self
+                        .type_kinds
+                        .get(&bound_head)
+                        .copied()
+                        .or_else(|| prelude_kind(&bound_head))
+                        == Some(TypeKind::Interface);
+                    if def.strict_iface
+                        && bound_is_iface
+                        && self.type_kinds.contains_key(&arg_head)
+                        && closure_is_local(&arg_head, &self.type_kinds, &self.constraint_parents)
+                    {
+                        Some(false)
+                    } else {
+                        None
                     }
+                });
+                if let Some(false) = relation {
+                    self.err(format!(
+                        "类型 '{}' 不满足泛型 '{}' 的类型参数 '{}' 的约束 '<: {}'（9.2(1)/9.2(2)）",
+                        arg_head, name, c.param, bound_head
+                    ));
                 }
             }
         }
@@ -7901,6 +8073,81 @@ impl<'a> Checker<'a> {
             }
             _ => None,
         }
+    }
+
+    /// 求解显式类型实参对 `def` 约束的满足性，返回违反项描述（不含上下文前缀）。
+    ///
+    /// 复用与 `check_type_instantiation` 相同的判定：实参解析别名后取头名，
+    /// 上界代入后取头名，用 `subtype_relation` 保守判定；包含 w35a 新增的
+    /// 接口作类型实参规则（9.5.2(5)）。不可判定者不报告。
+    fn type_arg_constraint_violations(&self, def: &GenericDef, args: &[Type]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if def.type_params.len() != args.len() {
+            return out;
+        }
+        let subst: HashMap<String, Type> = def
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        for c in &def.constraints {
+            let Some(arg) = subst.get(&c.param) else {
+                continue;
+            };
+            let arg_resolved = self.resolve_alias_type(arg);
+            for b in &c.bounds {
+                if b == "CType" {
+                    if let Some(false) = self.ctype_status(&arg_resolved) {
+                        out.push(format!(
+                            "类型参数 '{}' 的实参不满足 '<: CType'（13.1.3.4(2)）",
+                            c.param
+                        ));
+                    }
+                    continue;
+                }
+                let Some(arg_head) = type_head_name(&arg_resolved) else {
+                    continue;
+                };
+                let bound_ty = match subst.get(b) {
+                    Some(t) => t.clone(),
+                    None => Type::Struct(b.clone(), Vec::new()),
+                };
+                let bound_resolved = self.resolve_alias_type(&bound_ty);
+                let Some(bound_head) = type_head_name(&bound_resolved) else {
+                    continue;
+                };
+                if def.type_params.iter().any(|p| p == &bound_head) {
+                    continue;
+                }
+                if self.type_kinds.get(&arg_head) == Some(&TypeKind::Interface)
+                    && self.type_kinds.get(&bound_head) == Some(&TypeKind::Interface)
+                    && arg_head == bound_head
+                    && self
+                        .iface_static_methods
+                        .get(&bound_head)
+                        .map_or(false, |v| v.iter().any(|m| !m.has_body))
+                {
+                    out.push(format!(
+                        "接口类型 '{}' 不能实例化约束 '<: {}'：须由实现该接口的类型实例化（9.5.2(5)）",
+                        arg_head, bound_head
+                    ));
+                    continue;
+                }
+                if let Some(false) = subtype_relation(
+                    &arg_head,
+                    &bound_head,
+                    &self.type_kinds,
+                    &self.constraint_parents,
+                ) {
+                    out.push(format!(
+                        "类型 '{}' 不满足类型参数 '{}' 的约束 '<: {}'（9.2(1)/9.2(2)）",
+                        arg_head, c.param, bound_head
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// 类型限定静态泛型调用 `T.m<Args>(...)` 的显式类型实参检查（6.1.2.4(24)）：
@@ -9271,6 +9518,26 @@ impl<'a> Checker<'a> {
                 if let (Some(tas), Expr::Var(type_name)) = (type_args.as_deref(), &**object) {
                     if self.type_names.contains(type_name) {
                         self.check_static_type_args(type_name, method, tas);
+                    }
+                }
+                // 5.3.2(5)：实例方法调用的显式类型实参 `obj.m<T>(...)` 须满足
+                // 该成员函数的泛型约束（实例接收者，非类型限定调用）。
+                if let Some(tas) = type_args.as_deref() {
+                    if let Some((recv_ty, via_type)) = self.receiver_user(object) {
+                        if !via_type {
+                            if let Some(def) = self
+                                .static_method_generics
+                                .get(&(recv_ty.clone(), method.clone()))
+                                .cloned()
+                            {
+                                for msg in self.type_arg_constraint_violations(&def, tas) {
+                                    self.err(format!(
+                                        "实例方法 '{}.{}' 的类型实参不满足约束：{}（5.3.2(5)）",
+                                        recv_ty, method, msg
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
                 // 类成员访问方向/可见性（6.1.2(4)、6.1.2.4(14)、6.1.2.4(28)）
@@ -12856,6 +13123,42 @@ mod tests {
              \x20   var x: T\n\
              }\n\
              main() { var g = GenericClass<C>() }",
+        );
+    }
+
+    #[test]
+    fn test_w35a_alias_constraint_inherited() {
+        // 2.4.1(9)：泛型类型别名继承原类型的约束，实例化时校验。
+        assert_err(
+            "class MyCls {}\n\
+             class GenericClassA<V> where V <: ToString {}\n\
+             type Class1<V> = GenericClassA<V>\n\
+             main() { var c = Class1<MyCls>() }",
+            "9.2(1)/9.2(2)",
+        );
+    }
+
+    #[test]
+    fn test_w35a_instance_method_type_args_constraint() {
+        // 5.3.2(5)：实例方法显式类型实参须满足成员函数泛型约束；元组不实现 ToString。
+        assert_err(
+            "type myType = (Int32, Bool)\n\
+             class myClass {\n\
+             \x20   func f0<X>(a: X): X where X <: ToString { a }\n\
+             }\n\
+             main() { let m = myClass(); m.f0<myType>((1, false)) }",
+            "5.3.2(5)",
+        );
+    }
+
+    #[test]
+    fn test_w35a_interface_as_type_argument() {
+        // 9.5.2(5)：接口类型作类型实参不满足“实现该接口”的约束。
+        assert_err(
+            "interface I { static func f(): Unit }\n\
+             func g<T>(): Unit where T <: I {}\n\
+             main() { g<I>() }",
+            "9.5.2(5)",
         );
     }
 

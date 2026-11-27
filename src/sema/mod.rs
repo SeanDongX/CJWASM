@@ -723,6 +723,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
 
     // 10.1.2.1/10.1.2.2：可确定的重载实参类型不匹配（保守版）。
     check_overload_candidate_types(program, &mut errors);
+    // 10.1.3.2 / 5.3.2(9) / 5.3.4(11)：可确定的重载决议歧义（保守子集）。
+    check_overload_resolution_ambiguity(program, &mut errors);
     // 6.1.2.7(4)：泛型类限定访问成员须提供类型实参（w30c）。
     check_generic_class_qualifier_without_args(program, &mut errors);
 
@@ -26077,6 +26079,21 @@ fn arg_param_ok(k: &ArgClass, p: &Type) -> bool {
     }
 }
 
+/// 重载决议歧义检查专用的实参分类：带后缀浮点字面量（f16/f32/f64）类型已确定，
+/// 按精确标量处理；仅无后缀浮点按“可适配任意浮点”处理。其余沿用 `classify_arg`。
+fn classify_arg_exact(e: &Expr, vars: &HashMap<String, Type>) -> ArgClass {
+    match e {
+        Expr::Float32(_) => ArgClass::Scalar(Type::Float32),
+        Expr::FloatSuffixed(_, s) => ArgClass::Scalar(s.ty()),
+        Expr::Float(_) => ArgClass::FloatLit,
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } => classify_arg_exact(expr, vars),
+        _ => classify_arg(e, vars),
+    }
+}
+
 /// 沿父类型闭包收集某方法的全部候选签名。遇到非本地父类型（可能引入文件外重载）时
 /// 返回 false，调用方据此放弃判定。
 fn collect_chain_sigs<'a>(
@@ -27944,6 +27961,515 @@ fn check_local_func_name_lvalue(program: &Program, errors: &mut Vec<SemanticErro
     for ext in &program.extends {
         for m in &ext.methods {
             scan(&m.body, &empty, &empty, errors);
+        }
+    }
+}
+
+/// 10.1.3.2 / 5.3.2(9) / 5.3.4(11)：可确定的重载决议歧义（保守子集）。
+///
+/// 既有 `verify_call_arg_types` 仅在“无任何候选可匹配”时报错，且对默认值/命名/
+/// 变长形参、字面量上下文适配一律放行。本检查补齐“多个候选同等匹配”的歧义判定：
+///   * 默认值形参未显式传入时不参与特异性比较（5.3.2(9)）；
+///   * 两个及以上候选同等匹配、不存在唯一“更匹配”候选时判错（10.1.3.2）；
+///   * 变长/数组语法糖：所有候选均需糖且糖可吸收的候选 >= 2 时判错（5.3.4(11)）。
+///
+/// 门（任一不满足即整体放行，守正测试红线）：候选集完整可枚举（本地类型、无穿透
+/// 非本地父类型）、全部候选非泛型/无变长/无 inout，实参类型均可静态判定
+/// （原始标量或可适配字面量）。类/接口等名义类型实参无法保守判定，直接放行。
+fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut type_names: HashSet<String> = HashSet::new();
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &program.classes {
+        type_names.insert(c.name.clone());
+        let mut ps = Vec::new();
+        if let Some(p) = &c.extends {
+            ps.push(w23_strip_generic(p));
+        }
+        for p in &c.implements {
+            ps.push(w23_strip_generic(p));
+        }
+        parents.insert(c.name.clone(), ps);
+    }
+    for s in &program.structs {
+        type_names.insert(s.name.clone());
+        parents.insert(s.name.clone(), Vec::new());
+    }
+    for e in &program.enums {
+        type_names.insert(e.name.clone());
+        parents.insert(e.name.clone(), Vec::new());
+    }
+    for i in &program.interfaces {
+        type_names.insert(i.name.clone());
+        parents.insert(
+            i.name.clone(),
+            i.parents.iter().map(|p| w23_strip_generic(p)).collect(),
+        );
+    }
+    let mut global_names: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        global_names.insert(c.name.clone());
+    }
+    let mut alias_names: HashSet<String> = HashSet::new();
+    for (n, _) in &program.type_aliases {
+        alias_names.insert(n.clone());
+    }
+
+    fn same_sig(a: &Function, b: &Function) -> bool {
+        let x = strip_self_params(&a.params);
+        let y = strip_self_params(&b.params);
+        if x.len() != y.len() || a.type_params.len() != b.type_params.len() {
+            return false;
+        }
+        // 泛型形参名按声明位置归一，使「接口声明 f<T1> + 类实现 f<K1>」这类同一逻辑
+        // 方法（名字不同但结构相同）被识别为同一候选，避免误判为歧义。
+        let canon = |f: &Function| -> HashMap<String, Type> {
+            f.type_params
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.clone(), Type::TypeParam(format!("#{}", i))))
+                .collect()
+        };
+        let ax = canon(a);
+        let bx = canon(b);
+        x.iter().zip(y.iter()).all(|(p, q)| {
+            subst_type(&p.ty, &ax) == subst_type(&q.ty, &bx)
+                && p.is_named == q.is_named
+                && p.variadic == q.variadic
+                && p.default.is_some() == q.default.is_some()
+        })
+    }
+    fn push_sig<'a>(v: &mut Vec<&'a Function>, f: &'a Function) {
+        if !v.iter().any(|g| same_sig(g, f)) {
+            v.push(f);
+        }
+    }
+
+    // 方法索引：owner → 短名 → 候选。自由函数索引：名 → 候选。
+    let mut method_sigs: HashMap<String, HashMap<String, Vec<&Function>>> = HashMap::new();
+    let mut free_sigs: HashMap<String, Vec<&Function>> = HashMap::new();
+    for f in &program.functions {
+        if f.extern_import.is_some() {
+            continue;
+        }
+        match f.name.rsplit_once('.') {
+            Some((owner, short)) => {
+                if short.starts_with("__") {
+                    continue;
+                }
+                push_sig(
+                    method_sigs
+                        .entry(owner.to_string())
+                        .or_default()
+                        .entry(short.to_string())
+                        .or_default(),
+                    f,
+                );
+            }
+            None => push_sig(free_sigs.entry(f.name.clone()).or_default(), f),
+        }
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            let short = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+            if short.starts_with("__") {
+                continue;
+            }
+            push_sig(
+                method_sigs
+                    .entry(c.name.clone())
+                    .or_default()
+                    .entry(short.to_string())
+                    .or_default(),
+                &m.func,
+            );
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            let short = m.name.rsplit('.').next().unwrap_or(&m.name);
+            if short.starts_with("__") {
+                continue;
+            }
+            push_sig(
+                method_sigs
+                    .entry(ext.target_type.clone())
+                    .or_default()
+                    .entry(short.to_string())
+                    .or_default(),
+                m,
+            );
+        }
+    }
+
+    // 全程序局部定义名（用于自由函数遮蔽判断）。
+    let mut local_names: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        collect_local_def_names(&f.body, &mut local_names);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            collect_local_def_names(&init.body, &mut local_names);
+        }
+        for m in &c.methods {
+            collect_local_def_names(&m.func.body, &mut local_names);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            collect_local_def_names(&init.body, &mut local_names);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            collect_local_def_names(&m.body, &mut local_names);
+        }
+    }
+
+    let analyze = |cands: &[&Function],
+                   args: &[Expr],
+                   named: &[(String, Expr)],
+                   type_args: Option<&[Type]>,
+                   vars: &HashMap<String, Type>,
+                   display: &str,
+                   errors: &mut Vec<SemanticError>| {
+        if cands.len() < 2 {
+            return;
+        }
+        // 门：无外部、无变长、无 inout；泛型候选仅在提供等量显式类型实参时可置换判定。
+        for f in cands {
+            if f.extern_import.is_some() {
+                return;
+            }
+            if !f.type_params.is_empty() {
+                match type_args {
+                    Some(ta) if ta.len() == f.type_params.len() => {}
+                    _ => return,
+                }
+            }
+            let ps = strip_self_params(&f.params);
+            if ps.iter().any(|p| p.variadic || p.is_inout) {
+                return;
+            }
+        }
+        // 实参分类（位置实参在前，命名实参按出现顺序在后）。
+        let mut classes: Vec<ArgClass> = Vec::with_capacity(args.len() + named.len());
+        for a in args {
+            let k = classify_arg_exact(a, vars);
+            if matches!(k, ArgClass::Unknown) {
+                return;
+            }
+            classes.push(k);
+        }
+        for (_, a) in named {
+            let k = classify_arg_exact(a, vars);
+            if matches!(k, ArgClass::Unknown) {
+                return;
+            }
+            classes.push(k);
+        }
+
+        // 逐候选判定：bool=是否适用，Vec<Type>=按调用位序绑定的形参类型。
+        let mut accs: Vec<(bool, Vec<Type>)> = Vec::with_capacity(cands.len());
+        let mut all_need_sugar = true;
+        let mut sugar_capable = 0usize;
+        for f in cands {
+            let ps = strip_self_params(&f.params);
+            let pp: Vec<&Param> = ps.iter().filter(|p| !p.is_named).collect();
+            let np: Vec<&Param> = ps.iter().filter(|p| p.is_named).collect();
+            // 显式类型实参按位置换泛型形参类型（非泛型候选 subst=None）。
+            let subst: Option<HashMap<String, Type>> = if f.type_params.is_empty() {
+                None
+            } else {
+                match type_args {
+                    Some(ta) if ta.len() == f.type_params.len() => Some(
+                        f.type_params
+                            .iter()
+                            .cloned()
+                            .zip(ta.iter().cloned())
+                            .collect(),
+                    ),
+                    _ => None,
+                }
+            };
+            let pty = |p: &Param| -> Type {
+                match &subst {
+                    Some(s) => subst_type(&p.ty, s),
+                    None => p.ty.clone(),
+                }
+            };
+            if args.len() <= pp.len() {
+                all_need_sugar = false;
+            }
+            // 变长/数组语法糖候选：末位置形参为数组且实参多于位置形参，前导位置可绑定，
+            // 且被吸入数组的尾部实参须与元素类型兼容（否则该候选不适用）。
+            if args.len() > pp.len() && !pp.is_empty() {
+                let last_ty = pty(pp[pp.len() - 1]);
+                let elem = match &last_ty {
+                    Type::Array(e) | Type::VArray(e, _) | Type::Slice(e) => Some(&**e),
+                    _ => None,
+                };
+                if let Some(elem) = elem {
+                    let lead = pp.len() - 1;
+                    let lead_ok = classes
+                        .iter()
+                        .take(lead)
+                        .enumerate()
+                        .all(|(i, k)| arg_param_ok(k, &pty(pp[i])));
+                    let tail_ok = classes
+                        .iter()
+                        .skip(lead)
+                        .take(args.len() - lead)
+                        .all(|k| arg_param_ok(k, elem));
+                    if lead_ok && tail_ok {
+                        sugar_capable += 1;
+                    }
+                }
+            }
+            if args.len() > pp.len() {
+                accs.push((false, Vec::new()));
+                continue;
+            }
+            // 缺失的尾随位置形参必须均有默认值。
+            if pp[args.len()..].iter().any(|p| p.default.is_none()) {
+                accs.push((false, Vec::new()));
+                continue;
+            }
+            let mut ok = true;
+            let mut bound: Vec<Type> = Vec::with_capacity(classes.len());
+            for (i, k) in classes.iter().enumerate().take(args.len()) {
+                let t = pty(pp[i]);
+                if arg_param_ok(k, &t) {
+                    bound.push(t);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                for (j, (n, _)) in named.iter().enumerate() {
+                    let Some(p) = np.iter().find(|p| &p.name == n) else {
+                        ok = false;
+                        break;
+                    };
+                    let k = &classes[args.len() + j];
+                    let t = pty(p);
+                    if arg_param_ok(k, &t) {
+                        bound.push(t);
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                // 必选命名形参必须都被显式提供。
+                for p in &np {
+                    if p.default.is_none() && !named.iter().any(|(n, _)| n == &p.name) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && bound.len() != classes.len() {
+                ok = false;
+            }
+            accs.push((ok, if ok { bound } else { Vec::new() }));
+        }
+
+        // 变长/数组语法糖歧义（5.3.4(11)）。
+        if all_need_sugar && named.is_empty() && sugar_capable >= 2 {
+            errors.push(SemanticError {
+                message: format!(
+                    "调用 '{}'：{} 个候选均需变长/数组语法糖，无法唯一确定（5.3.4(11)）",
+                    display, sugar_capable
+                ),
+            });
+            return;
+        }
+
+        let applicable: Vec<usize> = accs
+            .iter()
+            .enumerate()
+            .filter(|(_, (ok, _))| *ok)
+            .map(|(i, _)| i)
+            .collect();
+        if applicable.len() < 2 {
+            return;
+        }
+        // 字面量匹配层级：无后缀字面量默认类型（Int64/Float64，层级 3）优先于同族其它
+        // 宽度（层级 2），再优于跨族适配（整型字面量→浮点，层级 1）；具体标量精确匹配 4。
+        let lit_level = |k: &ArgClass, t: &Type| -> Option<u8> {
+            match k {
+                ArgClass::IntLit => {
+                    if is_int_scalar_ty(t) {
+                        if *t == Type::Int64 {
+                            Some(3)
+                        } else {
+                            Some(2)
+                        }
+                    } else if is_float_scalar_ty(t) {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                }
+                ArgClass::FloatLit => {
+                    if is_float_scalar_ty(t) {
+                        if *t == Type::Float64 {
+                            Some(3)
+                        } else {
+                            Some(2)
+                        }
+                    } else {
+                        None
+                    }
+                }
+                ArgClass::Scalar(_) => Some(4),
+                ArgClass::Unknown => None,
+            }
+        };
+        let pos_ge = |k: &ArgClass, pi: &Type, pj: &Type| -> Option<bool> {
+            let li = lit_level(k, pi)?;
+            let lj = lit_level(k, pj)?;
+            if li > lj {
+                return Some(true);
+            }
+            if li < lj {
+                return Some(false);
+            }
+            if pi == pj {
+                return Some(true);
+            }
+            w23_subtype(pi, pj, &parents)
+        };
+        let strict_dom = |j: usize, i: usize| -> bool {
+            let bj = &accs[j].1;
+            let bi = &accs[i].1;
+            if bj == bi {
+                return false;
+            }
+            for (idx, k) in classes.iter().enumerate() {
+                if pos_ge(k, &bj[idx], &bi[idx]) != Some(true) {
+                    return false;
+                }
+            }
+            true
+        };
+        let maximals = applicable
+            .iter()
+            .filter(|&&i| !applicable.iter().any(|&j| j != i && strict_dom(j, i)))
+            .count();
+        if maximals != 1 {
+            errors.push(SemanticError {
+                message: format!(
+                    "调用 '{}' 无法在 {} 个同等匹配的重载间唯一确定（重载决议歧义，10.1.3.2 / 5.3.2(9)）",
+                    display,
+                    applicable.len()
+                ),
+            });
+        }
+    };
+
+    let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let mut vars = local_var_types_full(params, body);
+        w23_augment_ctor_call_vars(body, &mut vars, &type_names);
+        walk_stmts(body, &mut |e| match e {
+            Expr::Call {
+                name,
+                type_args,
+                args,
+                named_args,
+                ..
+            }
+            | Expr::ConstructorCall {
+                name,
+                type_args,
+                args,
+                named_args,
+                ..
+            } => {
+                if name.contains('.') || vars.contains_key(name.as_str()) {
+                    return;
+                }
+                let Some(sigs) = free_sigs.get(name.as_str()) else {
+                    return;
+                };
+                if type_names.contains(name.as_str())
+                    || global_names.contains(name.as_str())
+                    || alias_names.contains(name.as_str())
+                    || local_names.contains(name.as_str())
+                {
+                    return;
+                }
+                analyze(sigs, args, named_args, type_args.as_deref(), &vars, name, errors);
+            }
+            Expr::MethodCall {
+                object,
+                method,
+                type_args,
+                args,
+                named_args,
+                ..
+            } => {
+                let Some(rt) = receiver_type_name(object, &vars, &type_names) else {
+                    return;
+                };
+                if !type_names.contains(rt.as_str()) {
+                    return;
+                }
+                let mut cands: Vec<&Function> = Vec::new();
+                let mut stack: Vec<String> = vec![rt];
+                let mut seen: HashSet<String> = HashSet::new();
+                while let Some(t) = stack.pop() {
+                    if !seen.insert(t.clone()) {
+                        continue;
+                    }
+                    if let Some(m) = method_sigs.get(&t) {
+                        if let Some(v) = m.get(method.as_str()) {
+                            cands.extend(v.iter().copied());
+                        }
+                    }
+                    if let Some(ps) = parents.get(&t) {
+                        for p in ps {
+                            // 非本地父类型可能引入文件外重载，无法保守判定。
+                            if !type_names.contains(p.as_str()) {
+                                return;
+                            }
+                            stack.push(p.clone());
+                        }
+                    }
+                }
+                let mut uniq: Vec<&Function> = Vec::new();
+                for c in cands {
+                    if !uniq.iter().any(|u| same_sig(u, c)) {
+                        uniq.push(c);
+                    }
+                }
+                analyze(&uniq, args, named_args, type_args.as_deref(), &vars, method, errors);
+            }
+            _ => {}
+        });
+    };
+
+    for f in &program.functions {
+        scan(&f.params, &f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, errors);
         }
     }
 }
