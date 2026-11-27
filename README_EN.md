@@ -8,12 +8,12 @@ CJWasm compiles Cangjie source code into WASM bytecode: sources are parsed into 
 
 ## Project Status
 
-- ✅ **Official Conformance Suite**: overall **97.0%** (positive tests 5,132/5,132 = **100%**, negative tests 19,314/20,069 = **96.2%**)
-- ✅ **std API Suite**: **99.3%** (1,413/1,441; L1 **100%** / L2 99.3%, 99.8% excluding @Unittest cases; the 28 non-passing split into 10 official negatives that are correctly rejected + 18 structural skips)
-- ✅ **Tests**: 2,014 tests passing (1,369 unit + 631 integration + 14 stdlib)
+- ✅ **Official Conformance Suite**: overall **99.1%** (positive tests 5,132/5,132 = **100%**, negative tests 19,832/20,069 = **98.8%**)
+- ✅ **std API Suite**: **99.3%** (1,413/1,441; L1 **100%** / L2 99.2%, 99.8% excluding @Unittest cases; the 28 non-passing split into 10 official negatives that are correctly rejected + 18 structural skips)
+- ✅ **Tests**: 2,188 tests passing (1,543 unit + 631 integration + 14 stdlib)
 - ✅ **Examples**: 40/40 system tests passing (100%), 0 WASM validation errors
-- ✅ **Code Size**: ~100,400 lines of Rust including tests
-- ✅ **AST Nodes**: 144 nodes (Expr: 68, Stmt: 19, Pattern: 15, Type: 42)
+- ✅ **Code Size**: ~130,900 lines of Rust including tests
+- ✅ **AST Nodes**: 117 nodes (Expr: 58, Stmt: 17, Pattern: 11, Type: 31)
 - ✅ **CHIR Optimizer**: small-function inlining + redundant local elimination; 1.44x on wasmtime for the heavy benchmark (measured 2026-11-26)
 
 ## Official Test Suite Compatibility
@@ -22,19 +22,19 @@ Compatibility is measured against the official Cangjie test suite (`third_party/
 
 | Suite | Scale | Pass criteria | Current |
 |------|------|----------|----------|
-| **Conformance compiler suite** | 29,705 test files across 17 spec chapters (25,201 executed after skipping 4,504 multi-file structural cases) | positive tests must compile; negative tests (`@Negative: yes`) must fail compilation | **97.0%** (positive **100%** / negative 96.2%) |
-| **std API suite** | 1,441 test files across 33 std modules (L1 + L2) | source files must be accepted by the compiler | **99.3%** (L1 **100%** / L2 99.3%) |
+| **Conformance compiler suite** | 29,705 test files across 17 spec chapters (25,201 executed after skipping 4,504 multi-file structural cases) | positive tests must compile; negative tests (`@Negative: yes`) must fail compilation | **99.1%** (positive **100%** / negative 98.8%) |
+| **std API suite** | 1,441 test files across 33 std modules (L1 + L2) | source files must be accepted by the compiler | **99.3%** (L1 **100%** / L2 99.2%) |
 
 During the full-compatibility sprint started on 2026-11-24, overall compatibility rose from a **49.1%** baseline (positive 60.1% / negative 46.3%) batch by batch:
 
 ```
-49.1% ──▶ 65.1% ──▶ 79.3% ──▶ 91.2% ──▶ 93.7% ──▶ 95.3% ──▶ 96.0% ──▶ 96.5% ──▶ 97.0%
-baseline  batch4   batch7   batch12  batch14  batch15  batch16  batch18  batch19
+49.1% ──▶ 65.1% ──▶ 79.3% ──▶ 91.2% ──▶ 93.7% ──▶ 95.3% ──▶ 96.0% ──▶ 97.0% ──▶ 98.1% ──▶ 99.1%
+baseline  batch4   batch7   batch12  batch14  batch15  batch16  batch19  batch23  batch35
 ```
 
-Red lines enforced on every merged batch: positive tests stay at 100%, std suite shows zero regression, all 2,014 cargo tests pass, and system tests stay at 40/40. The sprint runs a 4-agent parallel workflow (git-worktree isolated) implementing semantic checks in batches, with 30-minute heartbeat measurements.
+Red lines enforced on every merged batch: positive tests stay at 100%, std suite shows zero regression, all 2,188 cargo tests pass, and system tests stay at 40/40. The sprint runs a 4-agent parallel workflow (git-worktree isolated) implementing semantic checks in batches, with 30-minute heartbeat measurements.
 
-The remaining 755 failing negative tests (755/20,069 ≈ 3.8%) break down into: 152 in the chapter-13 pointer contradiction group (the "X" cases where the official suite's own positive and negative cases share identical sources and contradict themselves), plus about 600 at the tail of each chapter — dominated by R (runtime, needs C linking), L (needs major infrastructure), and C (cross-file package structure) categories — which a single-file compilation frontend cannot decide.
+The remaining 237 failing negative tests (237/20,069 ≈ 1.2%) are all classified: **160 "X" official contradictions** (144 in the chapter-13 CPointer conversion group + 16 metadata contradictions across chapters), **54 "L" type-system-depth items** (overload resolution / branch least-common-supertype / integer-match exhaustiveness / `as` compatibility, …), **8 "G" grammar/macro/name-resolution items**, **4 "R" runtime-mechanism items**, and **11 "W" multi-file package-structure pseudo-negatives**. Positive tests have zero failures; per-item classification and evidence are in `.compat-run/final-report/classification.md`.
 
 Of the std suite's 1,441 files, the 28 non-passing split into two parts: 10 are official negative cases (macro_errors / invalid_syntax / foreignclass / strategy_wrong_target / out-of-range random integers, …) that the compiler **correctly rejects**, and 18 are structural skips (deriving / argOpt) because the corresponding cross-file/derived structure is absent.
 
@@ -73,8 +73,15 @@ To reproduce the measurement: `git submodule update --init third_party/cangjie_t
 - **Enum semantics** — enums cannot be inherited; duplicate constructor-name detection
 - **Literal details** — radix prefixes cannot initialize a `Float` annotation; float literal exponents allow only a negative sign
 
+### Sprint additions: root-cause fixes and check families (batches 20–35)
+- **Generic-constraint instantiation solving** — type-alias inherited constraints, explicit type-argument constraint solving at instance-method call sites, and interfaces used as type arguments must implement their abstract static functions (2.4.1(9) / 5.3.2(5) / 9.5.2(5))
+- **Overload-resolution ambiguity** — multi-candidate equally-matching ambiguity: default-valued parameters excluded from specificity comparison (5.3.2(9)), named-argument literal-adaptation ambiguity (10.1.3.2), variadic-sugar ambiguity (5.3.4(11)), and generic-parameter-name-normalized identical signatures
+- **`--checked` runtime check mode** — inserts integer-overflow / array-bounds / assertion `trap` checks on demand, used for runtime verdicts of `@Mode:run` negatives
+- **AST root-cause variants** — `Type::VArray(elem, len)`, `Expr::FloatSuffixed`, `Expr::IntegerOverflow`, `Expr::GenericFunctionRef`, making four previously undecidable semantics (length consistency / float suffix / i64 overflow / generic function as value) decidable in one shot
+- **Method arity and exhaustiveness check family** — call arity under-supply, selector-less enum-match exhaustiveness, scalar/enum least common supertype, `inout` argument checks
+
 ### Memory and Runtime
-- **Memory management**: free-list allocator + reference counting + mark-sweep GC
+- **Memory management**: heap allocator (bump + free-list); the default CHIR backend is a bump-only allocator that never reclaims, and RC / mark-sweep remain implemented-but-unwired stock code, designed around "one run per WASM instance"; long-running / large-memory programs need reclamation first (see Known Limitations and `.compat-run/gc-research.md`)
 - **Module system**: multi-file compilation, automatic `import` dependency resolution, cjpm project support
 - **Standard library**: math, string operations, formatting, sorting, time/random via WASI
 - **Built-in test assertions**: `@Assert(a, b)` / `@Expect(a, b)`
@@ -189,28 +196,28 @@ struct Pair<T, U> {
     }
 }
 
-// Classes and inheritance
+// Classes and inheritance (an override needs the parent method to be public open)
 open class Animal {
     var name: Int64;
     init(name: Int64) { this.name = name }
-    func speak(): Int64 { return 0 }
+    public open func speak(): Int64 { return 0 }
 }
 
 class Dog <: Animal {
     init(name: Int64) { super(name) }
-    override func speak(): Int64 { return 1 }
+    public override func speak(): Int64 { return 1 }
 }
 
 // Enums and pattern matching
 enum Shape {
     | Circle(Int64)
-    | Rectangle(Int64, Int64)
+    | Square(Int64)
 }
 
 func area(s: Shape): Int64 {
     match (s) {
-        case Shape.Circle(r) => r * r * 3,
-        case Shape.Rectangle(w, h) => w * h
+        case Shape.Circle(r) => r * r * 3
+        case Shape.Square(s) => s * s
     }
 }
 
@@ -220,17 +227,43 @@ func safeDivide(a: Int64, b: Int64): Result<Int64, String> {
     return Ok(a / b)
 }
 
+func unwrapOr(r: Result<Int64, String>, fallback: Int64): Int64 {
+    match (r) {
+        case Ok(v) => v
+        case Err(_) => fallback
+    }
+}
+
+func maybe(b: Bool): Option<Int64> {
+    if (b) { return Some(7) }
+    return None
+}
+
 // Test assertions
 main(): Int64 {
     let fib = fibonacci(10)
     @Assert(fib, 55)
 
-    let result = safeDivide(10, 2) ?? 0
+    let result = unwrapOr(safeDivide(10, 2), 0)
     @Assert(result, 5)
+
+    let opt = maybe(false) ?? 42
+    @Assert(opt, 42)
+
+    let dog = Dog(1)
+    @Assert(dog.speak(), 1)
+
+    let square = area(Shape.Square(4))
+    @Assert(square, 16)
+
+    let pair = Pair<Int64, Int64>(1, 2)
+    @Assert(pair.first + pair.second, 3)
 
     return fib + result
 }
 ```
+
+> This example is verified to compile with `target/release/cjwasm` and run under wasmtime (`main` returns 60, all `@Assert`s pass).
 
 More examples are available under [`tests/examples/`](tests/examples/).
 
@@ -260,7 +293,7 @@ More examples are available under [`tests/examples/`](tests/examples/).
 
 ### Code Coverage
 
-> The figures below were measured on **2026-11-23, before the compatibility sprint** (64.7k lines / 1,320 tests at the time); they have not been re-measured after the sprint added ~22.5k lines of semantic checks (requires the `cargo-llvm-cov` toolchain).
+> The figures below were measured on **2026-11-23, before the compatibility sprint** (64.7k lines / 1,320 tests at the time); they have not been re-measured after the sprint added ~55k lines of semantic checks (requires the `cargo-llvm-cov` toolchain).
 
 Total line coverage is **80.15%** and region coverage is **89.93%**.
 
@@ -284,17 +317,17 @@ Total line coverage is **80.15%** and region coverage is **89.93%**.
 ./scripts/coverage.sh --html
 ```
 
-### Unit and Integration Tests (2,014 Passing)
+### Unit and Integration Tests (2,188 Passing)
 
 ```bash
 cargo test
-# 1,369 passed (unit) + 631 passed (integration) + 14 passed (stdlib)
+# 1,543 passed (unit) + 631 passed (integration) + 14 passed (stdlib)
 ```
 
 | Category | Count | Notes |
 |------|--------|------|
-| **Semantic analysis** | 492 | class/interface/member/constructor rules (312) + expression typing and operator rules (180) — the bulk of the compatibility sprint |
-| **Parsing** | 392 | declarations, statements, expressions, patterns (incl. property syntax, modifiers, @C retention) |
+| **Semantic analysis** | 642 | class/interface/member/constructor rules + expression typing, operator, overload-resolution and generic-constraint rules — the bulk of the compatibility sprint |
+| **Parsing** | 416 | declarations, statements, expressions, patterns (incl. property syntax, modifiers, @C retention) |
 | **CHIR lowering** | 161 | AST → CHIR expressions/statements, CHIR-level type inference |
 | **Code generation** | 91 | WASM generation, CHIR codegen, macro compilation |
 | **Lexing** | 77 | tokens, integer suffixes, hex floats, nested comments, raw identifiers |
@@ -302,6 +335,7 @@ cargo test
 | **Optimizer/monomorph** | 41 | constant folding, DCE, generic instantiation |
 | **Metadata** | 31 | stdlib type metadata |
 | **Type checking** | 12 | symbol resolution, inference |
+| **AST/memory** | 16 | syntax-tree construction, memory allocator |
 | **Integration** | 631 | full source → WASM pipeline |
 | **Stdlib** | 14 | std module compile validation |
 
@@ -309,18 +343,19 @@ cargo test
 
 `third_party/cangjie_test` (git submodule) provides two official suites:
 
-- **Conformance compiler suite** (29,705 files / 17 spec chapters): positive tests (5,132) must compile, negative tests (20,069) must fail compilation — currently **97.0%** (positive **100%** / negative 96.2%)
-- **std API suite** (1,441 files / 33 std modules): L1+L2 compile validation — currently **99.3%** (L1 **100%**)
+- **Conformance compiler suite** (29,705 files / 17 spec chapters): positive tests (5,132) must compile, negative tests (20,069) must fail compilation — currently **99.1%** (positive **100%** / negative 98.8%)
+- **std API suite** (1,441 files / 33 std modules): L1+L2 compile validation — currently **99.3%** (L1 **100%** / L2 99.2%)
 
 See the "Official Test Suite Compatibility" section above for methodology and sprint progress.
 
 ### Known Limitations
 
-1. **Remaining negative-test makeup** — of the 755 failing negative tests, 152 belong to the chapter-13 pointer contradiction group (the "X" cases where the official suite's own positive and negative cases share identical sources and contradict themselves); the other ~600 sit at the tail of each chapter, dominated by R (runtime, needs C linking), L (needs major infrastructure), and C (cross-file package structure) categories — not decidable by a single-file compilation frontend
-2. **std suite accounting** — 1,413/1,441 pass (99.3%); of the 28 non-passing, 10 are official negatives that are correctly rejected and 18 are structural skips (deriving / argOpt), not compiler defects
-3. **`std/` package WASM validation**: large packages with 97 stdlib files compile, but the generated WASM still has type mismatch issues during validation for complex nested generic types such as `Map<K, Tuple<Array<...>>>`.
-4. **Generic monomorphization**: some generic methods still use stubs instead of complete monomorphization.
-5. **Macro system**: macro expansion is still limited.
+1. **Remaining negative-test makeup** — 237 failing negatives (1.2% of 20,069) are all negatives; positive tests are 5,132/5,132 with zero failures. By category: **160 "X" official contradictions + 54 "L" type-system-depth + 8 "G" grammar/macro + 4 "R" runtime + 11 "W" multi-file pseudo-negatives**. Of the std suite's 1,441 files, 1,413 pass (99.3%); the 28 non-passing are 10 official negatives correctly rejected + 18 structural skips (deriving / argOpt), not compiler defects. Per-item classification and evidence are in `.compat-run/final-report/classification.md`
+2. **Official contradictions (160 "X" items, unfixable)** — 144 are the chapter-13 CPointer conversion group: `a04/gen/cvt.cj.tpl` positives and `cvt_neg.cj.tpl` negatives emit byte-identical conversion statements in the same non-`unsafe` context (132 have byte-for-byte positive counterparts + 12 are `Src==Dst` identity conversions), indistinguishable from a frontend; 16 more are cross-chapter metadata contradictions (unsigned/Bool unary minus, `!Bool`, a mislabeled range positive, setter tail values, interface extensions, …). All frozen
+3. **Type-system depth ("L" 54 items)** — needs an overload-resolution engine (candidate set / most-specific matching / named args / defaults / variadic sugar / generic instantiation in one solver), branch least-common-supertype (user types and interface-set intersection), integer match value-range exhaustiveness, `as` type compatibility, lambda parameter-annotation marking with contextual inference, interface default-method this-type, enum bare-name / first-class-constructor ambiguity, etc. — mostly major infrastructure, with low per-rule yield and a high risk of breaking positives
+4. **Grammar/macro/runtime/multi-file (G 8 + R 4 + W 11 = 23 items)** — macro declaration tables, annotation-name resolution, undefined-symbol checks under `import` (G); `throw` executing and trapping during global/field/static initialization as `@Mode:run` semantics (R); and pseudo-negatives whose errors come from `custom.py`/directory-layout-driven multi-file package builds that a single-file harness cannot reproduce (W)
+5. **WASM garbage collection is not wired up** — the default CHIR backend is a bump-only allocator that never reclaims; `src/memory.rs`'s free-list / reference counting / mark-sweep are implemented-but-never-emitted stock code, and the whole project has no `memory.grow`, so a long run traps OOB after ~256 KB of allocation. Because both the 5,132 positive tests and the 1,413 std red lines are "compile-only" verdicts and examples create a fresh instance per run and exit, GC has zero impact on the red lines; for long-lived modules the mid-term recommendation is to evaluate WasmGC (wasmtime 51 fully supports it, wasm-encoder 0.220 can emit it) rather than hand-rolling a linear-memory GC — see `.compat-run/gc-research.md`
+6. **Other engineering boundaries** — the `std/` package (97 stdlib files) compiles, but complex nested generics (e.g. `Map<K, Tuple<Array<...>>>`) still produce WASM validation type mismatches; some generic methods still use stubs instead of complete monomorphization; macro expansion is still limited
 
 ## Project Layout
 
@@ -396,7 +431,7 @@ Cangjie source (.cj)
 | **Pattern matching** | enum destructuring, struct destructuring, guards, nested patterns, type patterns, `is` | ✅ |
 | **Error handling** | try-catch-finally, try-with-resources, throws, Result/Option, `?`, `??` | ✅ |
 | **Modules** | import, multi-file compilation, visibility modifiers | ✅ |
-| **Memory** | heap allocation, RC, mark-sweep GC, free-list allocator | ✅ |
+| **Memory** | heap allocation (bump + free-list), designed for one run per instance; RC/mark-sweep implemented but not wired | ✅ |
 | **Operators** | arithmetic, comparison, logical, bitwise, power `**`, `!in`, interpolation, `as`, `?.`, overloads | ✅ |
 | **Collections** | HashMap, HashSet, ArrayList, LinkedList, ArrayStack | ✅ |
 | **Concurrency stubs** | spawn, synchronized, AtomicInt64/AtomicBool, Mutex/ReentrantMutex | ✅ |
@@ -415,6 +450,11 @@ Cangjie source (.cj)
 | **Concurrency type constraints** | compile-time type constraints for Future / spawn / ThreadLocal / Atomic | ✅ |
 | **Enum semantics** | enums cannot be inherited; duplicate constructor-name detection | ✅ |
 | **Literal details** | radix prefixes cannot initialize a `Float` annotation; float exponents allow only a negative sign | ✅ |
+| **Generic-constraint solving** | type-alias inherited constraints, explicit type-argument constraints on instance methods, interface-as-type-argument static-function implementation checks | ✅ |
+| **Overload resolution** | multi-candidate equally-matching ambiguity (defaults / named args / variadic sugar / generic-parameter normalization) | ✅ |
+| **Runtime checks** | `--checked` integer overflow / array bounds / assertion traps | ✅ |
+| **AST root-cause variants** | VArray length / float suffix / i64 overflow / generic function as value | ✅ |
+| **Exhaustiveness & arity** | selector-less enum-match exhaustiveness, scalar least common supertype, call arity under-supply | ✅ |
 
 For the full grammar, see [`docs/spec.md`](docs/spec.md).
 
@@ -490,7 +530,7 @@ Outputs:
 
 ```bash
 cargo build --release
-cargo test                       # 2,014 tests
+cargo test                       # 2,188 tests
 ./scripts/run_test.sh
 ./scripts/coverage.sh
 ./scripts/coverage.sh --html
