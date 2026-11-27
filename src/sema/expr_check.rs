@@ -1188,6 +1188,41 @@ struct StructMembers {
     private_props: HashSet<String>,
 }
 
+/// 3.3.1(18)：变量声明必须带 `let`/`var`（及可选模式）。struct 的成员变量
+/// 声明同样要求显式 `let`/`var`：`x: T`、`x = v`、`public x = v`、
+/// `static x = v` 等无关键字成员声明非法。跳过 `@C` 结构体（C 互操作字段形态）
+/// 与 `const` 字段（`const x = v` 由 `mods.is_const` 记录）。
+fn check_member_decl_keywords(program: &Program, errors: &mut Vec<SemanticError>) {
+    for s in &program.structs {
+        if s.is_c {
+            continue;
+        }
+        for f in &s.fields {
+            if !f.decl_kw && !f.is_const {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的成员变量 '{}' 缺少 let/var 关键字（3.3.1(18)）",
+                        s.name, f.name
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn check_sealed_open_conflict(program: &Program, errors: &mut Vec<SemanticError>) {
+    for c in &program.classes {
+        if c.is_sealed && c.is_open {
+            errors.push(SemanticError {
+                message: format!(
+                    "类 '{}' 不能同时使用 sealed 与 open 修饰符（3.4.2(10)）",
+                    c.name
+                ),
+            });
+        }
+    }
+}
+
 /// 对整个 Program 做表达式/赋值类型检查，错误追加到 `errors`。
 pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) {
     // 收集用户定义类型名，用于把类型标注中的 `List` / `C` 等解析为 Ty::User。
@@ -1240,6 +1275,14 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             s.fields.iter().map(|f| (f.name.clone(), f.is_mut)).collect(),
         );
     }
+
+    // 3.3.1(18)：变量声明必须有 let/var（及模式）。struct 成员变量同样必须显式
+    // 使用 let/var；`x: T` / `x = v` 这类无关键字成员声明非法。
+    check_member_decl_keywords(program, errors);
+
+    // 3.4.2(10)：`sealed` 表示类只能在本包内被继承，`open` 表示允许被继承，
+    // 二者语义互斥，不得同时修饰同一个类。
+    check_sealed_open_conflict(program, errors);
 
     let mut globals = HashMap::new();
     for c in &program.constants {
@@ -13439,6 +13482,27 @@ mod tests {
              \x20   s?[0] = 9\n\
              }\n",
         );
+    }
+
+    #[test]
+    fn test_w26b_struct_member_requires_decl_kw() {
+        // 3.3.1(18)：struct 成员变量声明必须显式 let/var。
+        assert_err("struct Triangle { myVar = 10 }\nmain() { }", "let/var");
+        assert_err("struct Triangle { public myPublicVar = 'Y' }\nmain() { }", "let/var");
+        assert_err("struct Triangle { static myStaticVar = 10 }\nmain() { }", "let/var");
+        assert_err("struct Point { x: Float64 }\nmain() { }", "let/var");
+        assert_err("struct Point { x:Int32 = 5 }\nmain() { }", "let/var");
+        // 带 let/var（含默认值）/const 字段合法。
+        assert_ok("struct Point { var x: Int64 = 0 }\nmain() { }");
+        assert_ok("struct Point { let x: Int64 = 0 }\nmain() { }");
+    }
+
+    #[test]
+    fn test_w26b_sealed_open_conflict() {
+        // 3.4.2(10)：sealed 与 open 互斥。
+        assert_err("sealed open class C {\n}\nmain() { }", "sealed");
+        assert_ok("sealed class C {\n}\nmain() { }");
+        assert_ok("open class C {\n}\nmain() { }");
     }
 
     #[test]

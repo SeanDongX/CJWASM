@@ -4303,6 +4303,17 @@ mod tests {
     }
 
     #[test]
+    fn test_w26b_multiline_interp_requires_separator() {
+        // 1.3.6(9)：多行字符串插值内的表达式/声明之间必须以换行（end）或 `;` 分隔。
+        parse_should_fail("main() { let s = \"\"\"\n${1 2}\"\"\" }");
+        parse_should_fail("main() { let s = \"\"\"\n${func f() {} func g() {}}\"\"\" }");
+        parse_should_fail("main() { let s = \"\"\"\n${func f() {} f()}\"\"\" }");
+        // `;` 或换行分隔的语句序列合法。
+        parse_ok("main() { let s = \"\"\"\n${let a = 1; a + 1}\"\"\" }");
+        parse_ok("main() { let s = \"\"\"\n${1 + 2}\"\"\" }");
+    }
+
+    #[test]
     fn test_w5c_extra_package_decl_requires_separate_file_marker() {
         // 仅在 SEPARATE-FILE 规格中允许单文件出现多个 package 声明
         parse_should_fail("package a\nfunc f() {}\npackage b\nmain() { }");

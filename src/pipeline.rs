@@ -629,7 +629,7 @@ extend<T> Array<T> <: SortByExtension<T> {
     #[test]
     fn test_merge_programs_structs_classes_enums() {
         let source1 = r#"
-            struct Point { x: Int64, y: Int64 }
+            struct Point { var x: Int64 = 0, var y: Int64 = 0 }
             class Box { var size: Int64; init(s: Int64) { this.size = s } }
         "#;
         let source2 = r#"
@@ -829,7 +829,7 @@ extend<T> Array<T> <: SortByExtension<T> {
     fn test_compile_complex_pipeline() {
         // 测试完整流水线，覆盖多种功能
         let source = r#"
-            struct Point { x: Int64, y: Int64 }
+            struct Point { var x: Int64 = 0, var y: Int64 = 0 }
             
             enum Direction {
                 North
@@ -923,7 +923,7 @@ extend<T> Array<T> <: SortByExtension<T> {
     #[test]
     fn test_compile_interface_and_extend() {
         let source = r#"
-            struct Point { x: Int64, y: Int64 }
+            struct Point { var x: Int64 = 0, var y: Int64 = 0 }
             interface Printable { func print(): Unit; }
             extend Point: Printable {
                 func print(): Unit { }

@@ -3079,8 +3079,7 @@ impl Parser {
 
     /// 解析多行字符串（可能含 ${...} 插值）。
     ///
-    /// 任一插值表达式无法按表达式解析时，整体回退为普通字符串字面量，
-    /// 避免含声明等未支持语法的多行插值导致编译失败。
+    /// 插值内容必须是可解析的表达式（或语句序列）；无法解析时报错，不回退。
     pub(crate) fn parse_multiline_string(
         &mut self,
         s: StringOrInterpolated,
@@ -3089,24 +3088,9 @@ impl Parser {
             StringOrInterpolated::Plain(text) => return Ok(Expr::String(text)),
             StringOrInterpolated::Interpolated(parts) => parts,
         };
-        let parseable = parts.iter().all(|part| match part {
-            StringPart::Interpolation(text) => self.parse_interpolation_expr(text).is_ok(),
-            StringPart::Literal(_) => true,
-        });
-        if !parseable {
-            let mut raw = String::new();
-            for part in &parts {
-                match part {
-                    StringPart::Literal(t) => raw.push_str(t),
-                    StringPart::Interpolation(t) => {
-                        raw.push_str("${");
-                        raw.push_str(t);
-                        raw.push('}');
-                    }
-                }
-            }
-            return Ok(Expr::String(raw));
-        }
+        // 插值内容必须是可解析的表达式（或语句序列）。含插值却无法解析时
+        // 按解析错误处理（1.3.6(9)）：不得静默回退为普通字符串字面量，否则
+        // 形如 `$`{1 2}` 的非法插值会被错误接受。
         self.parse_string_or_interpolated(StringOrInterpolated::Interpolated(parts))
     }
 
@@ -3125,7 +3109,7 @@ impl Parser {
             byte_end: self.at_prev().1,
         })?;
 
-        let mut parser = Parser::new(tokens);
+        let mut parser = Parser::new(tokens).with_source(expr_text);
         // 插值表达式在原上下文中求值：继承 `this` 可用性与当前泛型参数，
         // 避免方法体 `"${this.x}"` 被误判为“this 仅可在方法体内使用”。
         parser.receiver_name = self.receiver_name.clone();
