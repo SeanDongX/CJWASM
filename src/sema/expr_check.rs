@@ -435,6 +435,12 @@ fn ty_of(ty: &Type) -> Ty {
 fn global_const_ty(c: &crate::ast::ConstDef) -> Ty {
     let declared = ty_of(&c.ty);
     if c.ty == Type::Int64 {
+        // 无类型标注的顶层 `let/var` 若以 λ 初始化（如 `var f = { => 1 }`），
+        // 解析器把类型占位为 Int64，但实际是函数值：登记为 Unknown（保守），
+        // 避免把后续合法的 λ 再赋值误判为「Int64 赋函数值」。
+        if matches!(c.init, Expr::Lambda { .. }) {
+            return Ty::Unknown;
+        }
         let init_ty = static_expr_ty(&c.init);
         // 无类型标注的整数常量（占位 Int64，如 `let N = 101u64`）按整数字面量处理，
         // 使其可与任意整数类型共同参与运算，避免把 UInt64*常量 误判为类型不匹配。
@@ -716,6 +722,14 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| compatible(a, b))
         }
         (Ty::Tuple(_), Ty::Agg("tuple")) | (Ty::Agg("tuple"), Ty::Tuple(_)) => true,
+        // 函数类型：形参个数一致且逐形参/返回类型兼容即视为可赋值。
+        // 未注解 λ 形参折叠为 Unknown，对具体声明类型保持兼容（放行合法初始化）；
+        // Unknown 与任何类型比较恒真，因此该臂不会收紧既有行为。
+        (Ty::Func { params: pa, ret: ra }, Ty::Func { params: pb, ret: rb }) => {
+            pa.len() == pb.len()
+                && pa.iter().zip(pb.iter()).all(|(x, y)| compatible(x, y))
+                && compatible(ra, rb)
+        }
         // 数组：元素类型兼容即兼容（2.2.1(2)）。
         (Ty::Array(x), Ty::Array(y)) => compatible(x, y),
         (Ty::Array(_), Ty::Agg("array")) | (Ty::Agg("array"), Ty::Array(_)) => true,
@@ -6534,6 +6548,75 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// λ 体尾表达式的保守返回类型推断（roadmap T 层最小子集，5.5(9)/(10)）。
+    ///
+    /// 仅对**可确定形态**给出类型：字面量、显式转换、已知的确定标量/命名类型
+    /// 变量、构造调用（类/结构体/枚举）、以及块尾表达式/最后 `return` 尾表达式。
+    /// 函数体含 `if`/`match`/普通调用/运算符等复杂形态一律返回 `Unknown`
+    /// （保守放行），避免把不确定的体尾类型误当作确定返回类型而误伤正例。
+    fn lambda_body_tail_ty(&self, body: &Expr) -> Ty {
+        match body {
+            Expr::Block(stmts, trailing) => match trailing {
+                Some(e) => self.lambda_body_tail_ty(e),
+                // 无尾表达式：仅识别「最后一条为 return <expr>」的单值块。
+                None => match stmts.last() {
+                    Some(Stmt::Return(Some(e))) => self.lambda_body_tail_ty(e),
+                    _ => Ty::Unknown,
+                },
+            },
+            Expr::Integer(_) => Ty::IntLit,
+            Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
+            Expr::Float(_) | Expr::Float32(_) => Ty::FloatLit,
+            Expr::Bool(_) => Ty::Bool,
+            Expr::Rune(_) => Ty::Rune,
+            Expr::String(_) => Ty::String,
+            Expr::Cast { target_ty, .. } => ty_of(target_ty),
+            // 已知变量：仅当静态类型为确定标量/命名类型时取用；函数值与未知类型
+            // 保守折叠为 Unknown（避免把 λ 的返回类型登记成另一个不完整函数类型）。
+            Expr::Var(name) => match self.lookup(name).map(|v| v.ty.clone()) {
+                Some(Ty::Func { .. }) | Some(Ty::Unknown) | None => Ty::Unknown,
+                Some(t) => t,
+            },
+            // 构造调用：类/结构体构造 → 该类型；枚举构造器 → 该枚举类型。
+            Expr::ConstructorCall { name, .. } if self.ctor_types.contains(name) => {
+                Ty::User(name.clone())
+            }
+            Expr::ConstructorCall { name, .. }
+                if self.lookup(name).is_none()
+                    && !self.known_funcs.contains(name)
+                    && !self.local_func_names.contains(name)
+                    && !self.type_names.contains(name) =>
+            {
+                self.variant_enum
+                    .get(name)
+                    .map(|e| Ty::User(e.clone()))
+                    .unwrap_or(Ty::Unknown)
+            }
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// 按登记的 `Func{params,ret}` 检查函数值（λ / 函数类型变量）调用的实参：
+    /// 仅当位置实参个数与形参个数一致时逐项比较类型可赋值性（未注解的 λ 形参
+    /// 折叠为 Unknown，自然跳过）。实参个数不一致的情形可能是 5.3.4(6) 的变长
+    /// 实参语法糖（`f(1, 3)` 打包为数组实参）或其它合法形态，故保守放行。
+    fn check_func_value_args(&mut self, what: &str, params: &[Ty], args: &[Expr], arg_tys: &[Ty]) {
+        if params.len() != args.len() {
+            return;
+        }
+        for (i, (p, a)) in params.iter().zip(arg_tys.iter()).enumerate() {
+            if p.is_definite() && a.is_definite() && !compatible(a, p) {
+                self.err(format!(
+                    "函数值 '{}' 调用第 {} 个实参类型 {} 与形参类型 {} 不匹配（5.5）",
+                    what,
+                    i + 1,
+                    a.name(),
+                    p.name()
+                ));
+            }
+        }
+    }
+
     /// 探测 `if` 分支的有效类型：空块（或仅语句、无尾表达式）视为 Unit，
     /// 尾表达式块递归探测其尾表达式，其余走 `check_expr_ty_peek`。
     fn branch_peek_ty(&self, e: &Expr) -> Ty {
@@ -10003,6 +10086,16 @@ impl<'a> Checker<'a> {
                 }
                 // 小写首字母的结构体/类名构造调用会被解析为普通 Call（首字母大写
                 // 启发式），若名称是已知用户类型则结果类型即该类型（2(1)）。
+                // 函数值变量调用 `f(args)`：f 为局部/全局 Func 类型变量时按其类型
+                // 判实参与返回（roadmap T 层最小子集，5.5）。变量遮蔽优先于同名函数。
+                if let Some(info) = self.lookup(name).cloned() {
+                    if let Ty::Func { params, ret } = info.ty {
+                        if named_args.is_empty() {
+                            self.check_func_value_args(name, &params, args, &arg_tys);
+                        }
+                        return *ret;
+                    }
+                }
                 if self.ctor_types.contains(name) {
                     return Ty::User(name.clone());
                 }
@@ -10718,9 +10811,8 @@ impl<'a> Checker<'a> {
                         ));
                     }
                 }
-                for a in args {
-                    self.check_expr(a);
-                }
+                let invoke_arg_tys: Vec<Ty> =
+                    args.iter().map(|a| self.check_expr(a)).collect();
                 for (_, a) in named_args {
                     self.check_expr(a);
                 }
@@ -10785,6 +10877,14 @@ impl<'a> Checker<'a> {
                             }
                         }
                     }
+                }
+                // λ/函数值直接调用：被调用者静态类型为 Func{params,ret} 时，
+                // 按登记的形参/返回类型判实参与结果类型（roadmap T 层最小子集）。
+                if let Ty::Func { params, ret } = &callee_ty {
+                    if named_args.is_empty() {
+                        self.check_func_value_args("λ", params, args, &invoke_arg_tys);
+                    }
+                    return (**ret).clone();
                 }
                 Ty::Unknown
             }
@@ -10946,6 +11046,16 @@ impl<'a> Checker<'a> {
                 // 也按同类型处理，以参与复合赋值返回类型与 throw 判定。
                 if self.ctor_types.contains(name) || is_builtin_class_name(name) {
                     Ty::User(name.clone())
+                } else if self.lookup(name).is_none()
+                    && !self.known_funcs.contains(name)
+                    && !self.local_func_names.contains(name)
+                    && !self.type_names.contains(name)
+                    && self.variant_enum.contains_key(name)
+                {
+                    // 参数化/无参枚举构造器调用 `Variant(args)`（首字母大写被解析为
+                    // 构造调用形态）：结果为该枚举类型（2.1.11.1）。此登记的确定类型
+                    // 使「枚举值赋给函数类型变量」等非法形态可被判定。
+                    Ty::User(self.variant_enum[name].clone())
                 } else {
                     Ty::Unknown
                 }
@@ -11209,10 +11319,11 @@ impl<'a> Checker<'a> {
 
             Expr::Lambda {
                 params,
+                return_type,
                 body,
-                ..
             } => {
                 let mut scope = HashMap::new();
+                let mut param_tys: Vec<Ty> = Vec::with_capacity(params.len());
                 for (name, ty) in params {
                     // 无标注的 lambda 形参在解析器中被填成 Int64/Float64 占位，
                     // 实际类型由上下文函数类型决定，无法在此确定，保守置为未知。
@@ -11220,6 +11331,9 @@ impl<'a> Checker<'a> {
                         Ty::Int64 | Ty::Float64 => Ty::Unknown,
                         other => other,
                     };
+                    // 函数类型中的形参同样采用占位折叠后的类型，避免把未注解形参
+                    // 误当成确定的 Int64/Float64 而误伤合法调用。
+                    param_tys.push(pty.clone());
                     scope.insert(
                         name.clone(),
                         VarInfo {
@@ -11251,7 +11365,20 @@ impl<'a> Checker<'a> {
                 if matches!(ctx_ret, Some(Ty::Unit)) {
                     self.check_unit_lambda_returns(body);
                 }
-                Ty::Unknown
+                // λ 返回类型推断最小引擎（roadmap T 层最小子集）：
+                // (a) 显式 return_type 直接登记；(b) 无标注时按体尾表达式保守推断
+                // （仅字面量/显式转换/已知标量变量/构造调用等可确定形态）；
+                // 结果登记为 Func{params,ret}，供「函数值调用/组合链/赋值」判定。
+                // 形参类型不完整（含未注解占位）时仍登记 Func，ret 未知时保守放行
+                // 后续返回类型比较，但形参个数与确定类型部分可用于调用检查。
+                let ret = match return_type {
+                    Some(rt) => self.ty_of_ann(rt),
+                    None => self.lambda_body_tail_ty(body),
+                };
+                Ty::Func {
+                    params: param_tys,
+                    ret: Box::new(ret),
+                }
             }
 
             // `Some(x)` 的类型为 Option<x>（用于可选链来源推断与条件类型判定）。

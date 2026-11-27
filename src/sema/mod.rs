@@ -412,6 +412,11 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_w29c_float_suffix_and_int_overflow(program, &mut errors);
     // 3.2.3.2(7)：局部函数只能引用其之前声明的局部函数（互递归不支持）。
     check_w28d_local_func_forward_ref(program, &mut errors);
+    // 10.1.3.1(1)：调用点早于同名局部函数声明时不解析到该局部函数，而回退到外层
+    // 同名顶层自由函数；若其重载均不接受实参类型即报错（w39b #43）。
+    check_w39b_call_before_local_func(program, &mut errors);
+    // 9.7(3)：泛型函数重载无法唯一确定类型实参且无匹配候选 → 报错（w39b #38）。
+    check_w39b_generic_overload_no_candidate(program, &mut errors);
     // 5.1.4(9)：无标注函数的 return 表达式须有公共超类型。
     check_w28d_return_common_type(program, &mut errors);
     // 01 章 4.4：Option 函数值调用需 `?`；`?` 不能作用于普通函数值。
@@ -33143,6 +33148,509 @@ fn check_w28d_foreign_call(program: &Program, errors: &mut Vec<SemanticError>) {
     for x in &program.extends {
         for m in &x.methods {
             scan(&m.body, m.is_unsafe, errors);
+        }
+    }
+}
+
+// ─── w39b：10 章 10.1.3.1 局部函数声明仅在其声明点之后对其所在块可见 ──────────
+//
+// 局部函数不是“提升”声明：块内一条调用若出现在同名局部函数声明之前，该调用**不**解析
+// 到该局部函数，而回退到外层可见的同名顶层自由函数（cjc 1.0.5 实测：`SCheck(i8)`
+// 早于嵌套 `SCheck(Int8)` 声明时按外层 `SCheck(Int64)` 判定 → Int8≠Int64 → 报错）。
+// 若外层自由函数的重载均不接受实参类型，即为“无匹配重载”。此检查只覆盖“调用点在
+// 同名局部函数声明之前且存在同名顶层自由函数”的窄形态，其余情形交给既有的
+// `order_body_closed`（未声明）与 `check_w28d_local_func_forward_ref`（局部→局部）。
+fn check_w39b_call_before_local_func<'p>(program: &'p Program, errors: &mut Vec<SemanticError>) {
+    use std::collections::HashMap as Map;
+    // 顶层自由函数签名（name 不含 '.'）。
+    let mut free_sigs: Map<String, Vec<CallArgSig<'p>>> = Map::new();
+    for f in &program.functions {
+        if f.name.rsplit_once('.').is_none() && !f.name.starts_with("__") {
+            free_sigs
+                .entry(f.name.clone())
+                .or_default()
+                .push(CallArgSig {
+                    params: &f.params,
+                    generic: !f.type_params.is_empty(),
+                });
+        }
+    }
+    if free_sigs.is_empty() {
+        return;
+    }
+
+    /// 语句自身表达式中的裸调用（不深入嵌套块 / lambda / 局部函数体——它们各自成域）。
+    fn direct_calls<'e>(s: &'e Stmt, out: &mut Vec<(String, &'e [Expr])>) {
+        fn expr<'e>(e: &'e Expr, out: &mut Vec<(String, &'e [Expr])>) {
+            match e {
+                Expr::Call { name, args, .. }
+                | Expr::ConstructorCall { name, args, .. } => {
+                    out.push((name.clone(), args));
+                    for a in args {
+                        expr(a, out);
+                    }
+                }
+                Expr::MethodCall { object, args, .. } => {
+                    expr(object, out);
+                    for a in args {
+                        expr(a, out);
+                    }
+                }
+                Expr::Unary { expr: x, .. }
+                | Expr::Cast { expr: x, .. }
+                | Expr::Try(x)
+                | Expr::Throw(x)
+                | Expr::Some(x)
+                | Expr::Ok(x)
+                | Expr::Err(x)
+                | Expr::PostfixIncr(x)
+                | Expr::PostfixDecr(x)
+                | Expr::PrefixIncr(x)
+                | Expr::PrefixDecr(x)
+                | Expr::Inout(x) => expr(x, out),
+                Expr::Binary { left, right, .. } => {
+                    expr(left, out);
+                    expr(right, out);
+                }
+                Expr::Index { array, index } => {
+                    expr(array, out);
+                    expr(index, out);
+                }
+                Expr::Field { object, .. } | Expr::TupleIndex { object, .. } => expr(object, out),
+                Expr::Tuple(items) | Expr::Array(items) => {
+                    for i in items {
+                        expr(i, out);
+                    }
+                }
+                // 块 / lambda / 分支体自成作用域，交由 recurse_block_children。
+                Expr::Block(..)
+                | Expr::Lambda { .. }
+                | Expr::If { .. }
+                | Expr::IfLet { .. }
+                | Expr::Match { .. }
+                | Expr::TryBlock { .. } => {}
+                _ => {}
+            }
+        }
+        match s {
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => expr(e, out),
+            Stmt::Let { value, .. }
+            | Stmt::Var { value, .. }
+            | Stmt::Const { value, .. }
+            | Stmt::Assign { value, .. } => expr(value, out),
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                expr(left, out);
+                expr(right, out);
+            }
+            Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } => expr(cond, out),
+            Stmt::WhileLet { expr: e, .. } => expr(e, out),
+            Stmt::For { iterable, .. } => expr(iterable, out),
+            _ => {}
+        }
+    }
+
+    fn walk_block<'s, 'p>(
+        stmts: &'s [Stmt],
+        visible: &HashSet<String>,
+        vars: &HashMap<String, Type>,
+        free_sigs: &Map<String, Vec<CallArgSig<'p>>>,
+        errors: &mut Vec<SemanticError>,
+    ) {
+        // 本块内每个局部函数名首次声明的语句下标。
+        let mut lf_first: Map<&str, usize> = Map::new();
+        for (i, s) in stmts.iter().enumerate() {
+            if let Stmt::LocalFunc(f) = s {
+                lf_first.entry(f.name.as_str()).or_insert(i);
+            }
+        }
+        let mut cur: HashSet<String> = visible.clone();
+        for (i, s) in stmts.iter().enumerate() {
+            let mut calls: Vec<(String, &[Expr])> = Vec::new();
+            direct_calls(s, &mut calls);
+            for (name, args) in calls {
+                if cur.contains(&name) {
+                    continue;
+                }
+                if let Some(&j) = lf_first.get(name.as_str()) {
+                    if j > i {
+                        // 该局部函数声明在调用点之后，调用回退到同名顶层自由函数。
+                        if let Some(sigs) = free_sigs.get(name.as_str()) {
+                            verify_call_arg_types(&name, args, sigs, vars, errors);
+                        }
+                    }
+                }
+            }
+            recurse_block_children(s, &cur, vars, free_sigs, errors);
+            for n in block_decl_names(s) {
+                cur.insert(n);
+            }
+        }
+    }
+
+    fn recurse_block_children<'s, 'p>(
+        s: &'s Stmt,
+        outer: &HashSet<String>,
+        vars: &HashMap<String, Type>,
+        free_sigs: &Map<String, Vec<CallArgSig<'p>>>,
+        errors: &mut Vec<SemanticError>,
+    ) {
+        fn expr_children<'e, 'p>(
+            e: &'e Expr,
+            outer: &HashSet<String>,
+            vars: &HashMap<String, Type>,
+            free_sigs: &Map<String, Vec<CallArgSig<'p>>>,
+            errors: &mut Vec<SemanticError>,
+        ) {
+            match e {
+                Expr::Block(stmts, trail) => {
+                    walk_block(stmts, outer, vars, free_sigs, errors);
+                    if let Some(t) = trail {
+                        expr_children(t, outer, vars, free_sigs, errors);
+                    }
+                }
+                Expr::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    expr_children(then_branch, outer, vars, free_sigs, errors);
+                    if let Some(eb) = else_branch {
+                        expr_children(eb, outer, vars, free_sigs, errors);
+                    }
+                }
+                Expr::IfLet {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    expr_children(then_branch, outer, vars, free_sigs, errors);
+                    if let Some(eb) = else_branch {
+                        expr_children(eb, outer, vars, free_sigs, errors);
+                    }
+                }
+                Expr::Match { arms, .. } => {
+                    for arm in arms {
+                        expr_children(&arm.body, outer, vars, free_sigs, errors);
+                    }
+                }
+                Expr::TryBlock {
+                    body,
+                    catch_body,
+                    finally_body,
+                    ..
+                } => {
+                    walk_block(body, outer, vars, free_sigs, errors);
+                    walk_block(catch_body, outer, vars, free_sigs, errors);
+                    if let Some(fb) = finally_body {
+                        walk_block(fb, outer, vars, free_sigs, errors);
+                    }
+                }
+                Expr::Lambda { body, .. } => expr_children(body, outer, vars, free_sigs, errors),
+                _ => {}
+            }
+        }
+        match s {
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => walk_block(body, outer, vars, free_sigs, errors),
+            Stmt::For { body, .. } | Stmt::WhileLet { body, .. } => {
+                walk_block(body, outer, vars, free_sigs, errors)
+            }
+            Stmt::LocalFunc(f) => {
+                // 局部函数体可见自身（递归）与形参。
+                let mut child = outer.clone();
+                child.insert(f.name.clone());
+                child.extend(f.params.iter().map(|p| p.name.clone()));
+                walk_block(&f.body, &child, vars, free_sigs, errors);
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => {
+                expr_children(e, outer, vars, free_sigs, errors)
+            }
+            Stmt::Let { value, .. }
+            | Stmt::Var { value, .. }
+            | Stmt::Const { value, .. }
+            | Stmt::Assign { value, .. } => expr_children(value, outer, vars, free_sigs, errors),
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                expr_children(left, outer, vars, free_sigs, errors);
+                expr_children(right, outer, vars, free_sigs, errors);
+            }
+            _ => {}
+        }
+    }
+
+    let empty: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        let vars = local_var_types_full(&f.params, &f.body);
+        walk_block(&f.body, &empty, &vars, &free_sigs, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            let vars = local_var_types_full(&init.params, &init.body);
+            walk_block(&init.body, &empty, &vars, &free_sigs, errors);
+        }
+        for m in &c.methods {
+            let vars = local_var_types_full(&m.func.params, &m.func.body);
+            walk_block(&m.func.body, &empty, &vars, &free_sigs, errors);
+        }
+    }
+    for st in &program.structs {
+        for init in &st.inits {
+            let vars = local_var_types_full(&init.params, &init.body);
+            walk_block(&init.body, &empty, &vars, &free_sigs, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            let vars = local_var_types_full(&m.params, &m.body);
+            walk_block(&m.body, &empty, &vars, &free_sigs, errors);
+        }
+    }
+}
+
+// ─── w39b：09 章 9.7(3) 泛型函数重载无法唯一确定类型实参 → 报错 ──────────────
+//
+// cjc 1.0.5 实测语义：
+//   * 无后缀整数字面量不能转换为浮点（`f(0)` 且 `f(x: Float64)` → 报错）；
+//   * `g(1, 2)`（`g<T>(a:T,b:T)`）合法；`g(1, "x")` 报“无法推断泛型实参”。
+// 本检查仅对**顶层自由函数重载**（候选 ≥ 2 且至少一个含类型形参）生效：全部候选
+// 形参可判定（原始标量或裸类型形参）、全部实参可精确分类时，逐候选对类型形参做
+// 简易合一；若每个候选都因实参类型冲突被排除 → 报“无匹配重载”。任何不确定情形
+// 一律放行，确保正例零回归。
+fn check_w39b_generic_overload_no_candidate(program: &Program, errors: &mut Vec<SemanticError>) {
+    use std::collections::HashMap as Map;
+
+    /// 裸类型形参：`Type::TypeParam(name)`（或 `Type::Struct(name, [])`）且
+    /// name ∈ 该函数类型形参集合。
+    fn bare_tparam<'a>(ty: &'a Type, tparams: &[String]) -> Option<&'a str> {
+        let n = match ty {
+            Type::TypeParam(n) => n.as_str(),
+            Type::Struct(n, a) if a.is_empty() => n.as_str(),
+            _ => return None,
+        };
+        if tparams.iter().any(|t| t == n) {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
+    #[derive(Clone, PartialEq)]
+    enum Bind {
+        IntLit,
+        FloatLit,
+        Exact(Type),
+    }
+    /// 合一两个绑定；`None` 表示确定冲突（实参类型不可同时满足）。
+    fn merge(a: &Bind, b: &Bind) -> Option<Bind> {
+        match (a, b) {
+            (Bind::IntLit, Bind::IntLit) => Some(Bind::IntLit),
+            (Bind::FloatLit, Bind::FloatLit) => Some(Bind::FloatLit),
+            (Bind::IntLit, Bind::FloatLit) | (Bind::FloatLit, Bind::IntLit) => None,
+            (Bind::IntLit, Bind::Exact(t)) | (Bind::Exact(t), Bind::IntLit) => {
+                if is_int_scalar_ty(t) {
+                    Some(Bind::Exact(t.clone()))
+                } else {
+                    None
+                }
+            }
+            (Bind::FloatLit, Bind::Exact(t)) | (Bind::Exact(t), Bind::FloatLit) => {
+                if is_float_scalar_ty(t) {
+                    Some(Bind::Exact(t.clone()))
+                } else {
+                    None
+                }
+            }
+            (Bind::Exact(x), Bind::Exact(y)) => {
+                if x == y {
+                    Some(Bind::Exact(x.clone()))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// 单候选求解：`Some(true)`=接受，`Some(false)`=确定排除，`None`=不可判定（放行）。
+    fn sig_accepts(params: &[Param], tparams: &[String], argc: &[ArgClass]) -> Option<bool> {
+        // 形参须全部可判定，否则整候选放行。
+        for p in params {
+            if p.variadic || p.is_named || p.default.is_some() || p.is_inout {
+                return None;
+            }
+            if bare_tparam(&p.ty, tparams).is_none() && !is_scalar_scalar_ty(&p.ty) {
+                return None;
+            }
+        }
+        if params.len() != argc.len() {
+            return Some(false);
+        }
+        let mut bind: Map<&str, Bind> = Map::new();
+        for (p, k) in params.iter().zip(argc.iter()) {
+            if let Some(tp) = bare_tparam(&p.ty, tparams) {
+                let nb = match k {
+                    ArgClass::IntLit => Bind::IntLit,
+                    ArgClass::FloatLit => Bind::FloatLit,
+                    ArgClass::Scalar(t) if is_scalar_scalar_ty(t) => Bind::Exact(t.clone()),
+                    _ => return None,
+                };
+                match bind.get(tp) {
+                    None => {
+                        bind.insert(tp, nb);
+                    }
+                    Some(e) => match merge(e, &nb) {
+                        Some(m) => {
+                            bind.insert(tp, m);
+                        }
+                        None => return Some(false),
+                    },
+                }
+            } else {
+                // 具体原始标量形参。
+                match k {
+                    ArgClass::IntLit => {
+                        if !is_int_scalar_ty(&p.ty) {
+                            return Some(false);
+                        }
+                    }
+                    ArgClass::FloatLit => {
+                        if !is_float_scalar_ty(&p.ty) {
+                            return Some(false);
+                        }
+                    }
+                    ArgClass::Scalar(t) => {
+                        if t != &p.ty {
+                            return Some(false);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        Some(true)
+    }
+
+    // 名称遮蔽集合（与 check_overload_candidate_types 一致口径）。
+    let mut type_names: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        type_names.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        type_names.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        type_names.insert(e.name.clone());
+    }
+    for i in &program.interfaces {
+        type_names.insert(i.name.clone());
+    }
+    let mut global_names: HashSet<String> = HashSet::new();
+    for c in &program.constants {
+        global_names.insert(c.name.clone());
+    }
+    let mut alias_names: HashSet<String> = HashSet::new();
+    for (n, _) in &program.type_aliases {
+        alias_names.insert(n.clone());
+    }
+    let mut local_names: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        collect_local_def_names(&f.body, &mut local_names);
+    }
+
+    let mut free_sigs: Map<String, Vec<(&[Param], &[String])>> = Map::new();
+    for f in &program.functions {
+        if f.name.rsplit_once('.').is_none() && !f.name.starts_with("__") {
+            free_sigs
+                .entry(f.name.clone())
+                .or_default()
+                .push((&f.params, &f.type_params));
+        }
+    }
+    if free_sigs.is_empty() {
+        return;
+    }
+
+    let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let vars = local_var_types_full(params, body);
+        walk_stmts(body, &mut |e| {
+            let (name, args) = match e {
+                Expr::Call {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                }
+                | Expr::ConstructorCall {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } if named_args.is_empty() => (name, args),
+                _ => return,
+            };
+            if name.contains('.') {
+                return;
+            }
+            if type_names.contains(name.as_str())
+                || global_names.contains(name.as_str())
+                || alias_names.contains(name.as_str())
+                || local_names.contains(name.as_str())
+            {
+                return;
+            }
+            let Some(sigs) = free_sigs.get(name.as_str()) else {
+                return;
+            };
+            if sigs.len() < 2 {
+                return;
+            }
+            if !sigs.iter().any(|(_, tp)| !tp.is_empty()) {
+                return;
+            }
+            let argc: Vec<ArgClass> = args.iter().map(|a| classify_arg(a, &vars)).collect();
+            if argc.iter().any(|k| matches!(k, ArgClass::Unknown)) {
+                return;
+            }
+            let mut any_accept = false;
+            for (ps, tp) in sigs {
+                match sig_accepts(ps, tp, &argc) {
+                    None => return, // 任一候选不可判定 → 整体放行
+                    Some(true) => {
+                        any_accept = true;
+                        break;
+                    }
+                    Some(false) => {}
+                }
+            }
+            if !any_accept {
+                errors.push(SemanticError {
+                    message: format!(
+                        "调用 '{}' 无法唯一确定泛型实参，且无匹配的重载（9.7(3)/10.1.2.1）",
+                        name
+                    ),
+                });
+            }
+        });
+    };
+    for f in &program.functions {
+        scan(&f.params, &f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, errors);
         }
     }
 }
