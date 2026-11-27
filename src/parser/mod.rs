@@ -744,7 +744,7 @@ mod tests {
 
     #[test]
     fn test_parse_if_else() {
-        let source = "func test(x: Int64): Int64 { if x > 0 { return 1 } else { return 0 } }";
+        let source = "func test(x: Int64): Int64 { if (x > 0) { return 1 } else { return 0 } }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_parse_while() {
-        let source = "func test(): Int64 { var n: Int64 = 0 while n < 10 { n = n + 1 } return n }";
+        let source = "func test(): Int64 { var n: Int64 = 0 while (n < 10) { n = n + 1 } return n }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn test_parse_logical_ops() {
-        let source = "func test(): Int64 { if true && false || !true { return 0 } return 1 }";
+        let source = "func test(): Int64 { if (true && false || !true) { return 0 } return 1 }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
@@ -1067,7 +1067,7 @@ mod tests {
     fn test_parse_function_with_throw() {
         let source = r#"
             func validate(x: Int64): Int64 {
-                if x < 0 { throw 0 }
+                if (x < 0) { throw 0 }
                 return x
             }
         "#;
@@ -1593,8 +1593,8 @@ mod tests {
                 var i: Int64 = 0
                 loop {
                     i = i + 1
-                    if i > 10 { break }
-                    if i % 2 == 0 { continue }
+                    if (i > 10) { break }
+                    if (i % 2 == 0) { continue }
                 }
                 return i
             }
@@ -2933,7 +2933,7 @@ mod tests {
         let source = r#"
             func main(): Int64 {
                 let x: Int64 = 42
-                if x is Float64 { return 0 }
+                if (x is Float64) { return 0 }
                 return 1
             }
         "#;

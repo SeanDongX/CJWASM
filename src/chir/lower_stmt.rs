@@ -125,6 +125,12 @@ impl<'a> LoweringContext<'a> {
 
             // Return 语句
             Stmt::Return(expr_opt) => {
+                // w31a：`return return e` 的内层 return 先执行，语义等价于
+                // `return e`（4.7(5)）。剥离嵌套 Return，避免内层降低为零值。
+                let mut expr_opt: Option<&crate::ast::Expr> = expr_opt.as_ref();
+                while let Some(crate::ast::Expr::Return(inner)) = expr_opt {
+                    expr_opt = inner.as_deref();
+                }
                 let chir_opt = if let Some(expr) = expr_opt {
                     let mut val = self.lower_expr(expr)?;
                     // 确保返回值类型与函数签名一致

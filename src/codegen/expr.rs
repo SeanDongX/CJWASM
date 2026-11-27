@@ -4942,6 +4942,11 @@ impl CodeGen {
                     }
                 }
             }
+            Expr::GenericFunctionRef { name, .. } => {
+                // 泛型函数名带类型实参作为值：与裸函数名 Var 等价处理（当前函数值
+                // 尚未完整物化，沿用 Var 的占位路径，保证既有正例行为不变）。
+                self.compile_expr(&Expr::Var(name.clone()), locals, func, loop_ctx);
+            }
             Expr::Unary {
                 op: UnaryOp::Not,
                 expr,

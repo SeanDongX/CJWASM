@@ -171,6 +171,17 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         .collect();
     all_funcs.extend(extend_methods_owned.iter());
 
+    // w31a：局部函数（Stmt::LocalFunc）提升为顶级函数，使名字可解析
+    // （原 CHIR 路径完全忽略局部函数，`func foo()` + `foo()` 调用会退化为零值）。
+    let mut local_funcs_owned: Vec<Function> = Vec::new();
+    {
+        let funcs_snapshot: Vec<&Function> = all_funcs.clone();
+        for func in &funcs_snapshot {
+            collect_local_funcs_from_stmts(&func.body, &mut local_funcs_owned);
+        }
+    }
+    all_funcs.extend(local_funcs_owned.iter());
+
     // Lambda 预扫描：收集所有 Lambda 表达式并生成 __lambda_N 函数
     let mut lambda_counter = 0u32;
     let mut lambda_funcs: Vec<Function> = Vec::new();
@@ -214,6 +225,14 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         "__hashset_new", "__hashset_add", "__hashset_contains", "__hashset_size",
         "__pow_i64", "__pow_f64",
         "__str_repeat",
+        // w31a: checked 模式助手（必须与 chir_codegen.rs 的 RT_NAMES 尾部一致）
+        "__checked_add_i32", "__checked_sub_i32", "__checked_mul_i32",
+        "__checked_add_i64", "__checked_sub_i64", "__checked_mul_i64",
+        "__checked_addu_i32", "__checked_subu_i32", "__checked_mulu_i32",
+        "__checked_addu_i64", "__checked_subu_i64", "__checked_mulu_i64",
+        "__checked_str_eq",
+        "__arr_get_i32", "__arr_get_i64", "__arr_get_f64",
+        "__arr_set_i32", "__arr_set_i64", "__arr_set_f64",
     ];
     for (i, name) in rt_names.iter().enumerate() {
         func_indices.insert(name.to_string(), rt_base + i as u32);
@@ -463,6 +482,28 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         enums,
         globals,
     })
+}
+
+/// w31a：递归收集局部函数声明（Stmt::LocalFunc），用于提升为顶级函数。
+fn collect_local_funcs_from_stmts(stmts: &[crate::ast::Stmt], out: &mut Vec<Function>) {
+    use crate::ast::Stmt;
+    for stmt in stmts {
+        match stmt {
+            Stmt::LocalFunc(f) => {
+                out.push(f.clone());
+                collect_local_funcs_from_stmts(&f.body, out);
+            }
+            Stmt::While { body, .. }
+            | Stmt::WhileLet { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => {
+                collect_local_funcs_from_stmts(body, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn collect_lambdas_from_stmt(stmt: &crate::ast::Stmt, counter: &mut u32, out: &mut Vec<Function>) {

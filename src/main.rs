@@ -17,6 +17,7 @@ fn print_usage() {
     eprintln!("选项:");
     eprintln!("  -o <文件>        指定输出文件名");
     eprintln!("  --use-chir       使用 CHIR 中间表示编译（实验性）");
+    eprintln!("  --checked        开启运行时检查（整数溢出/数组越界/断言 trap）");
     eprintln!();
     eprintln!("示例:");
     eprintln!("  cjwasm build                       # 编译 cjpm 工程");
@@ -92,6 +93,11 @@ fn cmd_build(args: &[String]) {
                 use_chir = true;
                 i += 1;
             }
+            "--checked" => {
+                // w31a：运行时检查模式（溢出/越界/断言 trap），默认关闭
+                unsafe { env::set_var("CJWASM_CHECKED", "1") };
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!("用法: cjwasm build [选项]");
                 eprintln!();
@@ -102,6 +108,7 @@ fn cmd_build(args: &[String]) {
                 eprintln!("  -p, --path <目录>      指定项目目录（默认当前目录）");
                 eprintln!("  -v, --verbose          显示详细编译信息");
                 eprintln!("  --no-chir              使用旧版代码生成（不经过 CHIR）");
+                eprintln!("  --checked              开启运行时检查（整数溢出/数组越界/断言 trap）");
                 eprintln!("  -h, --help             显示帮助");
                 std::process::exit(0);
             }
@@ -195,6 +202,10 @@ fn cmd_compile(args: &[String]) {
             i += 1;
         } else if args[i] == "--use-chir" {
             use_chir = true;
+            i += 1;
+        } else if args[i] == "--checked" {
+            // w31a：运行时检查模式（溢出/越界/断言 trap），默认关闭
+            unsafe { env::set_var("CJWASM_CHECKED", "1") };
             i += 1;
         } else if args[i].ends_with(".wasm") && input_files.len() == 1 && output_path.is_none() {
             output_path = Some(args[i].clone());

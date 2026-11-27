@@ -1198,6 +1198,9 @@ struct Checker<'a> {
     in_const_ctx: bool,
     /// 程序中声明过的全部函数名（顶层裸名与 `Type.method` 限定名）。
     known_funcs: HashSet<String>,
+    /// 声明了类型参数的自由函数裸名（`func f<T>(...)` 的 `f`）。用于 4.2(9)：
+    /// 泛型函数名不带类型实参时不是合法表达式，不能作为值引用。
+    generic_funcs: HashSet<String>,
     /// 当前处于第几层“条件分支”（if 分支 / catch 体 / 循环体等）。用于
     /// 延迟赋值 `let` 的“唯一一次初值赋值”近似判定（4.2(5)）：在条件分支内的
     /// 赋值只记为“可能已赋值”，不在该处报错，避免误伤 if/else 逐分支初始化。
@@ -2400,6 +2403,28 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     for f in &program.functions {
         known_funcs.insert(f.name.clone());
     }
+    // 4.2(9)：声明了类型参数的自由函数裸名。泛型函数名只有在给出类型实参时才
+    // 能作为表达式（闭包值）；不带类型实参的裸引用非法。
+    //
+    // 注意：若该名字还存在**非泛型重载**（如 `func g<T>(..)` 与 `func g(Array<..>)`），
+    // 裸名 `g` 可被重载解析到非泛型版本作为合法值（5.3.4(12) 正例），故仅当该名字
+    // 的全部重载都带类型参数时才判定为“必须给类型实参”。
+    let mut bare_generic: HashSet<String> = HashSet::new();
+    let mut bare_nongeneric: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        if f.name.contains('.') {
+            continue;
+        }
+        if f.type_params.is_empty() {
+            bare_nongeneric.insert(f.name.clone());
+        } else {
+            bare_generic.insert(f.name.clone());
+        }
+    }
+    let generic_funcs: HashSet<String> = bare_generic
+        .into_iter()
+        .filter(|n| !bare_nongeneric.contains(n))
+        .collect();
     // 程序内所有函数体局部函数的名字（含嵌套、含类方法/接口默认体/扩展体内）。
     // 插值内“未声明函数调用”检查的守卫：局部函数在插值处可见（含前向引用）。
     let mut local_func_names: HashSet<String> = HashSet::new();
@@ -2566,6 +2591,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         const_init_types,
         in_const_ctx: false,
         known_funcs,
+        generic_funcs,
         cond_depth: 0,
         loop_depth: 0,
         deferred_state: HashMap::new(),
@@ -6268,6 +6294,15 @@ impl<'a> Checker<'a> {
                         && !self.const_funcs.contains(name)),
                 }
             }
+            Expr::GenericFunctionRef { name, .. } => {
+                // 泛型函数名带类型实参作为值：与裸函数名一样，非 const 用户函数
+                // 作值不是常量表达式（16.2(6)/16.4(3)）。
+                match self.lookup(name) {
+                    Some(v) => v.is_const,
+                    None => !(self.known_funcs.contains(name)
+                        && !self.const_funcs.contains(name)),
+                }
+            }
             Expr::Unary { expr, .. } => self.is_const_expr(expr),
             Expr::Binary { left, right, .. } => {
                 self.is_const_expr(left) && self.is_const_expr(right)
@@ -7163,8 +7198,12 @@ impl<'a> Checker<'a> {
         if !self.strict_scope {
             return;
         }
-        let Expr::Var(name) = value else {
-            return;
+        let name = match value {
+            Expr::Var(name) => name,
+            // 4.2(10)/(11)：`f<T>`（泛型函数名带类型实参）在重载场景下作值同样
+            // 有歧义（基线将 `f<T>` 折叠为 Var，此处保持一致）。
+            Expr::GenericFunctionRef { name, .. } => name,
+            _ => return,
         };
         if self.lookup(name).is_some()
             || self.type_names.contains(name)
@@ -8917,9 +8956,29 @@ impl<'a> Checker<'a> {
                 // 以免误伤按上下文消歧的重载函数实参（`fv(neg)`，见 w21b 正例）。
                 // 3.2.3.2：无 import 单文件程序中的未定义标识符。
                 self.check_strict_var(name);
+                // 4.2(9)：泛型函数名不带类型实参时不是合法表达式（闭包值需给全部
+                // 类型实参，如 `identity<Int64>`）。仅当该名字未被局部/全局变量、
+                // 局部函数或类型名遮蔽（`lookup` 已覆盖变量绑定）时判定。
+                if self.lookup(name).is_none()
+                    && self.generic_funcs.contains(name)
+                    && !self.type_names.contains(name)
+                    && !self.local_func_names.contains(name)
+                {
+                    self.err(format!(
+                        "泛型函数 '{}' 需指定类型实参后才能作为值使用（4.2(9)）",
+                        name
+                    ));
+                }
                 self.lookup(name)
                     .map(|v| v.ty.clone())
                     .unwrap_or(Ty::Unknown)
+            }
+
+            Expr::GenericFunctionRef { .. } => {
+                // 4.2(8)：给出类型实参的泛型函数名是合法的函数值表达式。类型实参
+                // 的作用域/是否为类型由独立检查（check_type_param_scope /
+                // check_generic_type_arg_names）负责；此处不推断具体函数类型。
+                Ty::Unknown
             }
 
             Expr::Unary { op, expr } => {

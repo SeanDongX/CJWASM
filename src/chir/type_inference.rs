@@ -62,6 +62,9 @@ pub struct TypeInferenceContext {
 
     /// 全局变量类型
     pub globals: HashMap<String, Type>,
+
+    /// w31a：顶层变量的字面量初值（checked 模式下用于求值全局引用）。
+    pub global_consts: HashMap<String, i64>,
 }
 
 impl TypeInferenceContext {
@@ -75,12 +78,22 @@ impl TypeInferenceContext {
             class_method_returns: HashMap::new(),
             current_return_ty: None,
             globals: HashMap::new(),
+            global_consts: HashMap::new(),
         }
     }
 
     /// 从程序构建上下文
     pub fn from_program(program: &Program) -> Self {
         let mut ctx = Self::new();
+
+        // w31a：顶层变量（program.constants）——记录类型，字面量初值记入
+        // global_consts，供 checked 模式求值全局引用。
+        for c in &program.constants {
+            ctx.globals.insert(c.name.clone(), c.ty.clone());
+            if let crate::ast::Expr::Integer(n) = &c.init {
+                ctx.global_consts.insert(c.name.clone(), *n);
+            }
+        }
 
         // 收集函数签名（支持重载：用 name$arity 修饰名额外注册一份）
         for func in &program.functions {

@@ -81,6 +81,19 @@ pub enum Expr {
     Interpolate(Vec<InterpolatePart>),
     /// 变量引用
     Var(String),
+    /// 泛型函数名带显式类型实参、但**未调用**时作为值引用（如 `let g = identity<Int64>`）。
+    ///
+    /// 4.2(8)/(9)：泛型函数名只有在给出全部类型实参时才可作为表达式（闭包值）；
+    /// 不带类型实参的裸泛型函数名不是合法表达式。解析器原本把该形态折叠为
+    /// [`Expr::Var`]，导致两者无法区分；此变体保留类型实参，使语义分析可以
+    /// (a) 放行带类型实参的函数值引用，(b) 拒绝裸泛型函数名，(c) 对类型实参做
+    /// 作用域检查（如 `generic<T>` 中 `T` 越界）。
+    ///
+    /// 代码生成与 [`Expr::Var`] 等价（当前以函数值占位处理）。
+    GenericFunctionRef {
+        name: String,
+        type_args: Vec<Type>,
+    },
     /// 一元运算 (! 等)
     Unary {
         op: UnaryOp,

@@ -445,12 +445,10 @@ impl Parser {
                         body,
                     })
                 } else {
-                    // 非括号条件后紧跟 `{` 是循环体，禁止尾随 `{` 当作 lambda
-                    let saved_no_lambda = self.no_trailing_lambda;
-                    self.no_trailing_lambda = true;
-                    let cond = self.parse_expr();
-                    self.no_trailing_lambda = saved_no_lambda;
-                    let cond = cond?;
+                    // G 类（4.5.2(1)）：while 条件必须用括号包裹，裸条件 `while cond {` 为编译错误。
+                    self.expect(Token::LParen)?;
+                    let cond = self.parse_expr()?;
+                    self.expect(Token::RParen)?;
                     self.expect(Token::LBrace)?;
                     let body = self.parse_stmts()?;
                     self.expect(Token::RBrace)?;
@@ -618,20 +616,10 @@ impl Parser {
                 let body = self.parse_stmts()?;
                 self.expect(Token::RBrace)?;
                 self.expect(Token::While)?;
-                let has_paren = self.check(&Token::LParen);
-                if has_paren {
-                    self.advance();
-                }
-                let saved_no_lambda = self.no_trailing_lambda;
-                if !has_paren {
-                    self.no_trailing_lambda = true;
-                }
-                let cond = self.parse_expr();
-                self.no_trailing_lambda = saved_no_lambda;
-                let cond = cond?;
-                if has_paren {
-                    self.expect(Token::RParen)?;
-                }
+                // G 类（4.5.3(1)）：do-while 条件必须用括号包裹，`do { } while cond` 为编译错误。
+                self.expect(Token::LParen)?;
+                let cond = self.parse_expr()?;
+                self.expect(Token::RParen)?;
                 Ok(Stmt::DoWhile { body, cond })
             }
             Some(Token::Const) => {

@@ -4,6 +4,22 @@ use super::{ParseError, ParseErrorAt, Parser};
 use crate::ast::*;
 use crate::lexer::{StringOrInterpolated, StringPart, Token};
 
+/// 把“标识符 + 可选显式类型实参、但未调用”的形态折叠为表达式节点。
+///
+/// - 无类型实参：折叠为 [`Expr::Var`]（普通函数/变量值引用）。
+/// - 有类型实参：折叠为 [`Expr::GenericFunctionRef`]，保留类型实参，供语义分析
+///   区分“泛型函数名带类型实参作为值”（合法，4.2(8)/(9)）与裸引用（非法），
+///   并对类型实参做作用域校验。
+fn fold_func_value_ref(name: String, type_args: Option<Vec<Type>>) -> Expr {
+    match type_args {
+        Some(ts) if !ts.is_empty() => Expr::GenericFunctionRef {
+            name,
+            type_args: ts,
+        },
+        _ => Expr::Var(name),
+    }
+}
+
 impl Parser {
     /// 将组合表达式 `a ~> b` 脱糖为单参闭包 `{ x => b(a(x)) }`
     fn desugar_composition(left: Expr, right: Expr) -> Expr {
@@ -691,16 +707,31 @@ impl Parser {
                         } else if let Expr::Range {
                             start,
                             end,
-                            inclusive: _,
-                            step: _,
+                            inclusive,
+                            step,
                         } = first
                         {
                             self.expect(Token::RBracket)?;
-                            expr = Expr::SliceExpr {
-                                array: Box::new(expr),
-                                start,
-                                end,
-                            };
+                            if crate::checked_mode() && step.is_some() {
+                                // w31a：带步长的 Range 用作切片下标在官方语义中
+                                // 是运行期异常（2.1.8.2(1)）。检查模式下保留
+                                // Range 形态为索引表达式，由 CHIR 降低发射 trap。
+                                expr = Expr::Index {
+                                    array: Box::new(expr),
+                                    index: Box::new(Expr::Range {
+                                        start,
+                                        end,
+                                        inclusive,
+                                        step,
+                                    }),
+                                };
+                            } else {
+                                expr = Expr::SliceExpr {
+                                    array: Box::new(expr),
+                                    start,
+                                    end,
+                                };
+                            }
                         } else if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                             self.advance(); // consume .. or ..=
                                             // 支持 arr[start..] 语法（从 start 到结尾）
@@ -2055,7 +2086,19 @@ impl Parser {
                             fields,
                         })
                     }
-                    _ => Ok(Expr::Var(name)),
+                    _ => {
+                        // `Type<T>.member` 是“类型限定访问”（如 `Option<C>.None`），
+                        // `f<T> { ... }` 是“泛型函数的尾随闭包调用”（如
+                        // `argThat<String> { x => ... }`）——两者都不是“泛型函数名作
+                        // 值”，保留原有的折叠为 Var，让后续限定访问 / 尾随闭包逻辑按
+                        // 既有方式处理（类型实参由下游另行处理）。仅当后面不是这两种
+                        // 后缀附着形态时，才是真正的“泛型函数名作值”。
+                        if matches!(self.peek(), Some(Token::Dot) | Some(Token::LBrace)) {
+                            Ok(Expr::Var(name))
+                        } else {
+                            Ok(fold_func_value_ref(name, type_args))
+                        }
+                    }
                 }
             }
             Some(Token::LParen) => {
@@ -2538,21 +2581,10 @@ impl Parser {
                         else_branch,
                     })
                 } else {
-                    // cjc 兼容: if ( cond ) 先消费 (，使 parse_expr 解析完整条件而非仅 ( 内首表达式
-                    let has_paren = self.check(&Token::LParen);
-                    if has_paren {
-                        self.advance();
-                    }
-                    // 非括号条件后紧跟 `{` 是语句块体，禁止把尾随 `{` 当作 lambda
-                    let saved_no_lambda = self.no_trailing_lambda;
-                    if !has_paren {
-                        self.no_trailing_lambda = true;
-                    }
+                    // G 类（4.3(3)）：if 条件必须用括号包裹，裸条件 `if cond {` 为编译错误。
+                    self.expect(Token::LParen)?;
                     let cond = self.parse_expr()?;
-                    self.no_trailing_lambda = saved_no_lambda;
-                    if has_paren {
-                        self.expect(Token::RParen)?;
-                    }
+                    self.expect(Token::RParen)?;
                     self.expect(Token::LBrace)?;
                     let then_stmts = self.parse_stmts()?;
                     // 将 if 块体包装为 Expr::Block，保留所有语句（含 return/let 等）

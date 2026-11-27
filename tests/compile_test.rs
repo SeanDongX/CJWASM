@@ -242,7 +242,7 @@ func main() : Int64 {
     while let x = n {
         sum = sum + x
         n = n - 1
-        if n < 0 { break }
+        if (n < 0) { break }
     }
     return sum
 }
@@ -480,10 +480,10 @@ fn test_compile_break_continue() {
         func main() : Int64 {
             var i: Int64 = 0
             var n: Int64 = 0
-            while true {
+            while (true) {
                 i = i + 1
-                if i > 10 { break }
-                if i % 2 == 0 { continue }
+                if (i > 10) { break }
+                if (i % 2 == 0) { continue }
                 n = n + 1
             }
             return n
@@ -497,7 +497,7 @@ fn test_compile_break_continue() {
 fn test_compile_if_expr() {
     let source = r#"
         func main() : Int64 {
-            let x = if 1 > 0 { 10 } else { 20 }
+            let x = if (1 > 0) { 10 } else { 20 }
             return x
         }
     "#;
@@ -771,7 +771,7 @@ fn test_compile_try_catch_finally_throw() {
             var result: Int64 = 0
             var cleaned: Int64 = 0
             try {
-                if b == 0 {
+                if (b == 0) {
                     throw 0
                 }
                 result = a / b
@@ -785,7 +785,7 @@ fn test_compile_try_catch_finally_throw() {
 
         func tryCatchOnly(x: Int64) : Int64 {
             try {
-                if x < 0 {
+                if (x < 0) {
                     throw 0
                 }
                 return x * 2
@@ -811,7 +811,7 @@ fn test_compile_try_catch_finally_throw() {
 fn test_compile_throws_declaration() {
     let source = r#"
         func validate(x: Int64) : Int64 {
-            if x < 0 {
+            if (x < 0) {
                 throw 0
             }
             return x
@@ -1282,11 +1282,11 @@ fn test_compile_loop_break_continue() {
             var i: Int64 = 0
             var sum: Int64 = 0
             loop {
-                if i >= 10 {
+                if (i >= 10) {
                     break
                 }
                 i = i + 1
-                if i % 2 == 0 {
+                if (i % 2 == 0) {
                     continue
                 }
                 sum = sum + i
@@ -1541,7 +1541,7 @@ fn test_compile_compound_assign_all() {
 fn test_compile_try_operator_result() {
     let source = r#"
         func divide(a: Int64, b: Int64) : Result<Int64, String> {
-            if b == 0 {
+            if (b == 0) {
                 return Err("div by zero")
             }
             return Ok(a / b)
@@ -1658,12 +1658,12 @@ fn test_compile_comparison_ops_types() {
             let l = (1 as UInt32) < (2 as UInt32)
             let m = (1 as UInt64) < (2 as UInt64)
             var result: Int64 = 0
-            if a { result = result + 1 }
-            if c { result = result + 1 }
-            if e { result = result + 1 }
-            if f { result = result + 1 }
-            if g { result = result + 1 }
-            if i { result = result + 1 }
+            if (a) { result = result + 1 }
+            if (c) { result = result + 1 }
+            if (e) { result = result + 1 }
+            if (f) { result = result + 1 }
+            if (g) { result = result + 1 }
+            if (i) { result = result + 1 }
             return result
         }
     "#;
@@ -1681,10 +1681,10 @@ fn test_compile_logical_short_circuit() {
             let c = true && true
             let d = false || false
             var result: Int64 = 0
-            if a { result = result + 1 }
-            if b { result = result + 10 }
-            if c { result = result + 100 }
-            if !d { result = result + 1000 }
+            if (a) { result = result + 1 }
+            if (b) { result = result + 10 }
+            if (c) { result = result + 100 }
+            if (!d) { result = result + 1000 }
             return result
         }
     "#;
@@ -1827,7 +1827,7 @@ fn test_compile_for_in_array_range() {
 fn test_compile_complex_nested_expressions() {
     let source = r#"
         func fib(n: Int64) : Int64 {
-            if n <= 1 {
+            if (n <= 1) {
                 return n
             }
             return fib(n - 1) + fib(n - 2)
@@ -1835,7 +1835,7 @@ fn test_compile_complex_nested_expressions() {
 
         func main() : Int64 {
             let a = fib(10)
-            let b = if a > 50 { a } else { 0 }
+            let b = if (a > 50) { a } else { 0 }
             let c = match b {
                 0 => 0,
                 _ => b * 2
@@ -1934,7 +1934,7 @@ fn test_compile_while_statement() {
         func main() : Int64 {
             var i: Int64 = 0
             var sum: Int64 = 0
-            while i < 10 {
+            while (i < 10) {
                 sum = sum + i
                 i = i + 1
             }
@@ -1950,10 +1950,10 @@ fn test_compile_while_statement() {
 fn test_compile_early_return() {
     let source = r#"
         func check(n: Int64) : Int64 {
-            if n < 0 {
+            if (n < 0) {
                 return -1
             }
-            if n == 0 {
+            if (n == 0) {
                 return 0
             }
             return n * 2
@@ -2055,17 +2055,17 @@ fn test_compile_match_struct_pattern() {
 fn test_compile_nested_if_else() {
     let source = r#"
         func classify(n: Int64) : Int64 {
-            if n < 0 {
-                if n < -100 {
+            if (n < 0) {
+                if (n < -100) {
                     return -2
                 } else {
                     return -1
                 }
             } else {
-                if n > 100 {
+                if (n > 100) {
                     return 2
                 } else {
-                    if n > 0 {
+                    if (n > 0) {
                         return 1
                     } else {
                         return 0
@@ -2300,7 +2300,7 @@ fn test_compile_cast_int32_float32() {
 fn test_compile_recursive_control_flow() {
     let source = r#"
         func gcd(a: Int64, b: Int64) : Int64 {
-            if b == 0 {
+            if (b == 0) {
                 return a
             }
             return gcd(b, a % b)
@@ -2346,7 +2346,7 @@ fn test_compile_while_complex_condition() {
         func main() : Int64 {
             var x: Int64 = 0
             var y: Int64 = 100
-            while x < 10 && y > 0 {
+            while (x < 10 && y > 0) {
                 x = x + 1
                 y = y - 10
             }
@@ -2693,11 +2693,11 @@ fn test_compile_break_continue_in_loop() {
             var sum: Int64 = 0
             var i: Int64 = 0
             loop {
-                if i >= 10 {
+                if (i >= 10) {
                     break
                 }
                 i = i + 1
-                if i % 2 == 0 {
+                if (i % 2 == 0) {
                     continue
                 }
                 sum = sum + i
@@ -2978,7 +2978,7 @@ fn test_compile_void_func_return() {
         }
 
         func earlyReturn(x: Int64) {
-            if x > 10 {
+            if (x > 10) {
                 return
             }
             let y = x + 1
@@ -3018,7 +3018,7 @@ fn test_compile_while_let_struct_pattern() {
 fn test_compile_try_operator_result_infer() {
     let source = r#"
         func risky(x: Int64) : Result<Int64, String> {
-            if x < 0 {
+            if (x < 0) {
                 return Err("negative")
             }
             return Ok(x * 2)
@@ -3114,7 +3114,7 @@ fn test_compile_generic_in_while() {
         func main() : Int64 {
             var sum: Int64 = 0
             var i: Int64 = 0
-            while i < 3 {
+            while (i < 3) {
                 sum = sum + identity<Int64>(i)
                 i = i + 1
             }
@@ -3157,7 +3157,7 @@ fn test_compile_generic_in_loop() {
             var result: Int64 = 0
             var i: Int64 = 0
             loop {
-                if i >= 3 {
+                if (i >= 3) {
                     break
                 }
                 result = result + wrap<Int64>(i)
@@ -3216,7 +3216,7 @@ fn test_compile_generic_in_if_let() {
 fn test_compile_generic_with_constraint_check() {
     let source = r#"
         func compare<T: Comparable>(a: T, b: T): T {
-            if a > b {
+            if (a > b) {
                 return a
             }
             return b
@@ -3533,7 +3533,7 @@ fn test_memory_alloc_in_loop() {
         func main() : Int64 {
             var sum: Int64 = 0
             var i: Int64 = 0
-            while i < 5 {
+            while (i < 5) {
                 let item = Item { value: i * 10 }
                 sum = sum + item.value
                 i = i + 1
@@ -4135,11 +4135,11 @@ fn test_parse_while_loop() {
         func main() : Int64 {
             var i: Int64 = 0
             var count: Int64 = 0
-            while i < 5 {
-                if i == 2 { continue }
+            while (i < 5) {
+                if (i == 2) { continue }
                 count = count + 1
                 i = i + 1
-                if i > 10 { break }
+                if (i > 10) { break }
             }
             return count
         }
@@ -4262,9 +4262,9 @@ fn test_parse_if_let() {
 fn test_parse_nested_if() {
     let source = r#"
         func main() : Int64 {
-            if true {
-                if false { return 0 } else {
-                    if true { return 1 } else { return 2 }
+            if (true) {
+                if (false) { return 0 } else {
+                    if (true) { return 1 } else { return 2 }
                 }
             } else {
                 return 3
@@ -4295,9 +4295,9 @@ fn test_parse_block_expr() {
 fn test_parse_return_early() {
     let source = r#"
         func classify(n: Int64) : Int64 {
-            if n < 0 { return 0 }
-            if n == 0 { return 1 }
-            if n > 100 { return 2 }
+            if (n < 0) { return 0 }
+            if (n == 0) { return 1 }
+            if (n > 100) { return 2 }
             return 3
         }
         func main() : Int64 {
@@ -4505,7 +4505,7 @@ fn test_parse_is_type() {
     let source = r#"
         func main() : Int64 {
             let x: Int64 = 5
-            if x is Int64 { return 1 } else { return 0 }
+            if (x is Int64) { return 1 } else { return 0 }
         }
     "#;
     let result = compile_source_result(source);
@@ -4793,7 +4793,7 @@ fn test_codegen_nested_struct() {
 fn test_codegen_recursion() {
     let source = r#"
         func fib(n: Int64) : Int64 {
-            if n <= 1 { return n }
+            if (n <= 1) { return n }
             return fib(n - 1) + fib(n - 2)
         }
         func main() : Int64 {
@@ -4808,15 +4808,15 @@ fn test_codegen_recursion() {
 fn test_codegen_mutual_recursion() {
     let source = r#"
         func is_even(n: Int64) : Bool {
-            if n == 0 { return true }
+            if (n == 0) { return true }
             return is_odd(n - 1)
         }
         func is_odd(n: Int64) : Bool {
-            if n == 0 { return false }
+            if (n == 0) { return false }
             return is_even(n - 1)
         }
         func main() : Int64 {
-            if is_even(4) { return 1 } else { return 0 }
+            if (is_even(4)) { return 1 } else { return 0 }
         }
     "#;
     let wasm = compile_source(source);
@@ -4933,7 +4933,7 @@ fn test_codegen_nested_control_flow() {
         func main() : Int64 {
             var sum: Int64 = 0
             for i in 0..5 {
-                if i % 2 == 0 {
+                if (i % 2 == 0) {
                     match i {
                         0 => sum = sum + 1,
                         2 => sum = sum + 2,
@@ -10213,7 +10213,7 @@ fn test_cg7_if_in_for() {
         func main() : Int64 {
             var sum: Int64 = 0
             for i in 0..10 {
-                if i % 2 == 0 { sum = sum + i }
+                if (i % 2 == 0) { sum = sum + i }
             }
             return sum
         }
@@ -10229,7 +10229,7 @@ fn test_cg7_break_nested_loop() {
             var outer: Int64 = 0
             for i in 0..5 {
                 for j in 0..5 {
-                    if j == 2 { break }
+                    if (j == 2) { break }
                     outer = outer + 1
                 }
             }
@@ -10289,10 +10289,10 @@ fn test_cg7_rune_to_int() {
 fn test_cg7_multiple_returns() {
     let source = r#"
         func f(x: Int64): Int64 {
-            if x < 0 { return 0 }
-            if x == 0 { return 1 }
-            if x == 1 { return 2 }
-            if x == 2 { return 3 }
+            if (x < 0) { return 0 }
+            if (x == 0) { return 1 }
+            if (x == 1) { return 2 }
+            if (x == 2) { return 3 }
             return 4
         }
         func main() : Int64 {

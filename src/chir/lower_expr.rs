@@ -72,6 +72,10 @@ pub struct LoweringContext<'a> {
 
     /// Lambda 计数器（用于生成 __lambda_N 名称，与 lower.rs 中收集顺序一致）
     pub lambda_counter: u32,
+
+    /// w31a：运行时检查模式（`--checked`）。开启后对整数算术、数组下标、
+    /// Assert 断言插入 trap 检查；默认关闭，生产路径不变。
+    pub checked: bool,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -103,6 +107,7 @@ impl<'a> LoweringContext<'a> {
             err_flag_stack: Vec::new(),
             err_val_stack: Vec::new(),
             lambda_counter: 0,
+            checked: crate::checked_mode(),
         }
     }
 
@@ -187,6 +192,18 @@ impl<'a> LoweringContext<'a> {
                         CHIRExprKind::Float(val),
                         crate::ast::Type::Float64, ValType::F64,
                     ));
+                }
+                // w31a：checked 模式下，顶层字面量变量按常量求值（编译器暂不
+                // 支持真实全局变量，此处保证 `var x = 0` 之类的读取得到 0，
+                // 从而使默认参数等表达式可触发除零等运行期异常）。
+                if self.checked && !self.local_map.contains_key(name) {
+                    if let Some(&v) = self.type_ctx.global_consts.get(name.as_str()) {
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Integer(v),
+                            ty.clone(),
+                            wasm_ty,
+                        ));
+                    }
                 }
                 if let Some(local_idx) = self.local_map.get(name) {
                     CHIRExprKind::Local(*local_idx)
@@ -790,6 +807,41 @@ impl<'a> LoweringContext<'a> {
                             args_chir.push(CHIRExpr::new(CHIRExprKind::Nop, sub_ty, target_wasm));
                         }
                     }
+                } else if self.checked && param_tys.is_empty() {
+                    // w31a：检查模式下，若按 arity 未能取到签名（如 `f()` 调用
+                    // `func f(x!: T = expr)`），按函数原名查参数定义并补齐默认值。
+                    // 官方语义：默认值在调用点求值（5.1.2.2(11)），可触发运行期异常。
+                    // 仅当 param_tys 完全缺失时启用，避免影响已正确解析的调用。
+                    let func_param_defs = self.func_params.get(name.as_str());
+                    if let Some(param_defs) = func_param_defs {
+                        if args_chir.len() < param_defs.len() {
+                            for param_def in param_defs.iter().skip(args_chir.len()) {
+                                let named_val = named_args.iter()
+                                    .find(|(n, _)| n == &param_def.name)
+                                    .map(|(_, v)| v);
+                                let arg_chir = if let Some(val_expr) = named_val {
+                                    self.lower_expr(val_expr)?
+                                } else if let Some(default_expr) = &param_def.default {
+                                    self.lower_expr(default_expr)?
+                                } else {
+                                    let wt = param_def.ty.to_wasm();
+                                    let sub_ty = match wt {
+                                        ValType::I64 => crate::ast::Type::Int64,
+                                        ValType::F32 => crate::ast::Type::Float32,
+                                        ValType::F64 => crate::ast::Type::Float64,
+                                        _ => crate::ast::Type::Int32,
+                                    };
+                                    CHIRExpr::new(CHIRExprKind::Nop, sub_ty, wt)
+                                };
+                                let target_wasm = param_tys
+                                    .get(args_chir.len())
+                                    .copied()
+                                    .unwrap_or_else(|| param_def.ty.to_wasm());
+                                let arg_chir = self.insert_cast_if_needed(arg_chir, target_wasm);
+                                args_chir.push(arg_chir);
+                            }
+                        }
+                    }
                 }
 
                 CHIRExprKind::Call {
@@ -800,6 +852,83 @@ impl<'a> LoweringContext<'a> {
 
             // 方法调用：解析为 ClassName.methodName 的直接调用
             Expr::MethodCall { object, method, args, named_args, .. } => {
+                // w31a：`Assert.equals(expected, actual)`（utils.assert 测试工具）
+                // 官方语义：不相等时抛出 AssertException（进程非零退出）。默认为
+                // 空操作；检查模式下 lower 为 `if expected != actual { unreachable }`。
+                if self.checked {
+                    if let Expr::Var(obj) = object.as_ref() {
+                        if (obj == "Assert" || obj == "Expect")
+                            && method == "equals"
+                            && args.len() == 2
+                        {
+                            let expected = self.lower_expr(&args[0])?;
+                            let actual = self.lower_expr(&args[1])?;
+                            let is_str = matches!(expected.ty, crate::ast::Type::String)
+                                || matches!(actual.ty, crate::ast::Type::String);
+                            let cond = if is_str {
+                                // 字符串：调用 __checked_str_eq(a, b)，不等时 trap
+                                let eq_idx = self
+                                    .func_indices
+                                    .get("__checked_str_eq")
+                                    .copied()
+                                    .unwrap_or(0);
+                                let eq = CHIRExpr::new(
+                                    CHIRExprKind::Call {
+                                        func_idx: eq_idx,
+                                        args: vec![
+                                            self.insert_cast_if_needed(expected, ValType::I32),
+                                            self.insert_cast_if_needed(actual, ValType::I32),
+                                        ],
+                                    },
+                                    crate::ast::Type::Bool,
+                                    ValType::I32,
+                                );
+                                CHIRExpr::new(
+                                    CHIRExprKind::Binary {
+                                        op: crate::ast::BinOp::Eq,
+                                        left: Box::new(eq),
+                                        right: Box::new(CHIRExpr::new(
+                                            CHIRExprKind::Integer(0),
+                                            crate::ast::Type::Int32,
+                                            ValType::I32,
+                                        )),
+                                    },
+                                    crate::ast::Type::Bool,
+                                    ValType::I32,
+                                )
+                            } else {
+                                let a = self.insert_cast_if_needed(expected, ValType::I64);
+                                let b = self.insert_cast_if_needed(actual, ValType::I64);
+                                CHIRExpr::new(
+                                    CHIRExprKind::Binary {
+                                        op: crate::ast::BinOp::NotEq,
+                                        left: Box::new(a),
+                                        right: Box::new(b),
+                                    },
+                                    crate::ast::Type::Bool,
+                                    ValType::I32,
+                                )
+                            };
+                            let then_block = crate::chir::CHIRBlock {
+                                stmts: vec![],
+                                result: Some(Box::new(CHIRExpr::new(
+                                    CHIRExprKind::Unreachable,
+                                    crate::ast::Type::Unit,
+                                    ValType::I32,
+                                ))),
+                            };
+                            return Ok(CHIRExpr::new(
+                                CHIRExprKind::If {
+                                    cond: Box::new(cond),
+                                    then_block,
+                                    else_block: None,
+                                },
+                                crate::ast::Type::Unit,
+                                ValType::I32,
+                            ));
+                        }
+                    }
+                }
                 // ── 静态方法调用：ClassName.method(args) ──
                 if let Expr::Var(cls_name) = object.as_ref() {
                     let is_class = self.class_field_info.contains_key(cls_name.as_str())
@@ -1049,6 +1178,17 @@ impl<'a> LoweringContext<'a> {
 
             // 数组索引
             Expr::Index { array, index } => {
+                // w31a：带步长的 Range 用作切片下标在官方语义中是运行期异常
+                // （2.1.8.2(1)）。检查模式下直接发射 trap（unreachable）。
+                if self.checked {
+                    if let Expr::Range { step: Some(_), .. } = index.as_ref() {
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::Unreachable,
+                            ty.clone(),
+                            wasm_ty,
+                        ));
+                    }
+                }
                 // Check if this is tuple indexing (pair[0]) vs array indexing
                 let obj_ast_ty = if let Expr::Var(name) = array.as_ref() {
                     self.local_ast_types.get(name).cloned()

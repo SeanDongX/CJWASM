@@ -1167,7 +1167,7 @@ extend<T> Array<T> <: SortByExtension<T> {
 
     #[test]
     fn test_compile_if_else() {
-        let source = "func main(): Int64 { let x = 10; return if x > 5 { 1 } else { 0 } }";
+        let source = "func main(): Int64 { let x = 10; return if (x > 5) { 1 } else { 0 } }";
         let result = compile_source_to_wasm(source);
         assert!(result.is_ok());
         assert!(result.unwrap().len() >= 8);
@@ -1178,7 +1178,7 @@ extend<T> Array<T> <: SortByExtension<T> {
         let source = r#"
             func main(): Int64 {
                 var i = 0
-                while i < 5 { i = i + 1 }
+                while (i < 5) { i = i + 1 }
                 return i
             }
         "#;

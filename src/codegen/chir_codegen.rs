@@ -97,6 +97,26 @@ const RT_HASHSET_NEW: &str = "__hashset_new";
 const RT_HASHSET_ADD: &str = "__hashset_add";
 const RT_HASHSET_CONTAINS: &str = "__hashset_contains";
 const RT_HASHSET_SIZE: &str = "__hashset_size";
+// w31a: 检查模式运行时助手（追加在末尾，保持已有助手索引稳定）
+const RT_CHK_ADD_I32: &str = "__checked_add_i32";
+const RT_CHK_SUB_I32: &str = "__checked_sub_i32";
+const RT_CHK_MUL_I32: &str = "__checked_mul_i32";
+const RT_CHK_ADD_I64: &str = "__checked_add_i64";
+const RT_CHK_SUB_I64: &str = "__checked_sub_i64";
+const RT_CHK_MUL_I64: &str = "__checked_mul_i64";
+const RT_CHK_ADDU_I32: &str = "__checked_addu_i32";
+const RT_CHK_SUBU_I32: &str = "__checked_subu_i32";
+const RT_CHK_MULU_I32: &str = "__checked_mulu_i32";
+const RT_CHK_ADDU_I64: &str = "__checked_addu_i64";
+const RT_CHK_SUBU_I64: &str = "__checked_subu_i64";
+const RT_CHK_MULU_I64: &str = "__checked_mulu_i64";
+const RT_CHK_STR_EQ: &str = "__checked_str_eq";
+const RT_CHK_ARR_GET_I32: &str = "__arr_get_i32";
+const RT_CHK_ARR_GET_I64: &str = "__arr_get_i64";
+const RT_CHK_ARR_GET_F64: &str = "__arr_get_f64";
+const RT_CHK_ARR_SET_I32: &str = "__arr_set_i32";
+const RT_CHK_ARR_SET_I64: &str = "__arr_set_i64";
+const RT_CHK_ARR_SET_F64: &str = "__arr_set_f64";
 /// WASI scratch area for clock_time_get / random_get
 const WASI_SCRATCH: i32 = 80;
 const RT_NAMES: &[&str] = &[
@@ -118,6 +138,14 @@ const RT_NAMES: &[&str] = &[
     RT_HASHSET_NEW, RT_HASHSET_ADD, RT_HASHSET_CONTAINS, RT_HASHSET_SIZE,
     RT_POW_I64, RT_POW_F64,
     RT_STR_REPEAT,
+    // w31a: checked 模式助手
+    RT_CHK_ADD_I32, RT_CHK_SUB_I32, RT_CHK_MUL_I32,
+    RT_CHK_ADD_I64, RT_CHK_SUB_I64, RT_CHK_MUL_I64,
+    RT_CHK_ADDU_I32, RT_CHK_SUBU_I32, RT_CHK_MULU_I32,
+    RT_CHK_ADDU_I64, RT_CHK_SUBU_I64, RT_CHK_MULU_I64,
+    RT_CHK_STR_EQ,
+    RT_CHK_ARR_GET_I32, RT_CHK_ARR_GET_I64, RT_CHK_ARR_GET_F64,
+    RT_CHK_ARR_SET_I32, RT_CHK_ARR_SET_I64, RT_CHK_ARR_SET_F64,
 ];
 
 // ─── CHIRCodeGen ──────────────────────────────────────────────────────────────
@@ -151,6 +179,11 @@ pub struct CHIRCodeGen {
     current_local_types: std::cell::RefCell<HashMap<u32, ValType>>,
     /// 函数索引 → 参数 WASM 类型列表（用于 call 指令前的参数类型修正）
     func_param_types: HashMap<u32, Vec<ValType>>,
+
+    /// w31a：运行时检查模式（`--checked`）。开启后整数算术/数组下标经检查
+    /// 版运行时助手（溢出/越界 trap），`_start` 按 main 返回值退出。
+    /// 默认关闭，生产代码生成路径不变。
+    checked: bool,
 }
 
 impl CHIRCodeGen {
@@ -169,6 +202,7 @@ impl CHIRCodeGen {
             func_type_by_sig: std::cell::RefCell::new(HashMap::new()),
             current_local_types: std::cell::RefCell::new(HashMap::new()),
             func_param_types: HashMap::new(),
+            checked: crate::checked_mode(),
         }
     }
 
@@ -495,6 +529,26 @@ impl CHIRCodeGen {
             &[ValType::I64, ValType::I64],            // __pow_i64
             &[ValType::F64, ValType::F64],            // __pow_f64
             &[ValType::I32, ValType::I32],            // __str_repeat (str_ptr, count)
+            // w31a: checked 模式助手（顺序须与 RT_NAMES 一致）
+            &[ValType::I32, ValType::I32],            // __checked_add_i32
+            &[ValType::I32, ValType::I32],            // __checked_sub_i32
+            &[ValType::I32, ValType::I32],            // __checked_mul_i32
+            &[ValType::I64, ValType::I64],            // __checked_add_i64
+            &[ValType::I64, ValType::I64],            // __checked_sub_i64
+            &[ValType::I64, ValType::I64],            // __checked_mul_i64
+            &[ValType::I32, ValType::I32],            // __checked_addu_i32
+            &[ValType::I32, ValType::I32],            // __checked_subu_i32
+            &[ValType::I32, ValType::I32],            // __checked_mulu_i32
+            &[ValType::I64, ValType::I64],            // __checked_addu_i64
+            &[ValType::I64, ValType::I64],            // __checked_subu_i64
+            &[ValType::I64, ValType::I64],            // __checked_mulu_i64
+            &[ValType::I32, ValType::I32],            // __checked_str_eq
+            &[ValType::I32, ValType::I32],            // __arr_get_i32
+            &[ValType::I32, ValType::I32],            // __arr_get_i64
+            &[ValType::I32, ValType::I32],            // __arr_get_f64
+            &[ValType::I32, ValType::I32, ValType::I32], // __arr_set_i32
+            &[ValType::I32, ValType::I32, ValType::I64], // __arr_set_i64
+            &[ValType::I32, ValType::I32, ValType::F64], // __arr_set_f64
         ];
         for (i, name) in RT_NAMES.iter().enumerate() {
             let idx = IMPORT_COUNT + user_count + i as u32;
@@ -568,6 +622,26 @@ impl CHIRCodeGen {
         // 运行时助手函数的类型索引（在用户函数之后添加）
         let rt_type_indices = self.register_rt_func_types(&mut types, &mut functions);
 
+        // w31a：检查模式下生成 WASI `_start` 包装函数——调用 main，然后把
+        // main 的返回值作为进程退出码（仓颉运行期语义：main(): Int64 的返回
+        // 值为退出码；Unit 为 0）。默认模式下沿用 `_start = main` 别名。
+        let checked_start: Option<(u32, u32, ValType, bool)> = {
+            let has_user_start = program.functions.iter().any(|f| f.name == "_start");
+            if self.checked && !has_user_start {
+                program.functions.iter().find(|f| f.name == "main").map(|main_func| {
+                    let ty_start = types.len();
+                    types.ty().function(vec![], vec![]);
+                    functions.function(ty_start);
+                    let start_idx = IMPORT_COUNT + user_count + RT_NAMES.len() as u32;
+                    let main_idx = self.func_indices["main"];
+                    let is_void = matches!(main_func.return_ty, Type::Unit | Type::Nothing);
+                    (main_idx, start_idx, main_func.return_wasm_ty, is_void)
+                })
+            } else {
+                None
+            }
+        };
+
         // ── 4. 内存段 ─────────────────────────────────────────────────
         memories.memory(MemoryType {
             minimum: MEMORY_PAGES_MIN,
@@ -601,7 +675,12 @@ impl CHIRCodeGen {
             }
         }
         // 兼容 WASI: _start = main（仅在用户未定义 _start 时添加）
-        if !exported_names.contains("_start") {
+        if let Some((_, start_idx, _, _)) = checked_start {
+            // w31a：检查模式下的 _start 包装函数（带退出码传播）
+            if exported_names.insert("_start".to_string()) {
+                exports.export("_start", ExportKind::Func, start_idx);
+            }
+        } else if !exported_names.contains("_start") {
             if let Some(&main_idx) = self.func_indices.get("main") {
                 if let Some(main_func) = program.functions.iter().find(|f| f.name == "main") {
                     if main_func.return_ty == Type::Unit {
@@ -624,6 +703,24 @@ impl CHIRCodeGen {
         // 运行时助手函数代码
         self.emit_rt_functions(&rt_type_indices, &mut codes);
 
+        // w31a：检查模式下的 _start 包装函数代码（main 返回值 → proc_exit）
+        if let Some((main_idx, _, ret_wasm, is_void)) = checked_start {
+            let mut f = wasm_encoder::Function::new(vec![]);
+            f.instruction(&Instruction::Call(main_idx));
+            if is_void {
+                f.instruction(&Instruction::I32Const(0));
+            } else {
+                match ret_wasm {
+                    ValType::I64 => { f.instruction(&Instruction::I32WrapI64); }
+                    ValType::F64 => { f.instruction(&Instruction::I32TruncF64S); }
+                    _ => { /* I32 值直接作为退出码 */ }
+                }
+            }
+            f.instruction(&Instruction::Call(IDX_PROC_EXIT));
+            f.instruction(&Instruction::End);
+            codes.function(&f);
+        }
+
         // ── 8. 数据段：字符串常量 ─────────────────────────────────────
         let data_section = if !self.string_data.is_empty() {
             let mut data = wasm_encoder::DataSection::new();
@@ -640,7 +737,8 @@ impl CHIRCodeGen {
 
         // ── 函数表 (Table + Element) ──────────────────────────────────
         // total WASM functions = imports + user funcs + RT funcs
-        let total_funcs = (IMPORT_COUNT + user_count + RT_NAMES.len() as u32) as u64;
+        let total_funcs = (IMPORT_COUNT + user_count + RT_NAMES.len() as u32
+            + if checked_start.is_some() { 1 } else { 0 }) as u64;
         let table_size = if total_funcs > 0 { total_funcs } else { 1 };
         let mut tables = wasm_encoder::TableSection::new();
         tables.table(wasm_encoder::TableType {
@@ -858,6 +956,56 @@ impl CHIRCodeGen {
         // (i32, i32) → i32: __str_repeat
         functions.function(ty_i32i32_i32);
         rt_type_indices.push(ty_i32i32_i32);
+        // ── w31a: checked 模式助手（顺序须与 RT_NAMES 一致）──
+        // 有符号 add/sub/mul i32
+        for _ in 0..3 {
+            functions.function(ty_i32i32_i32);
+            rt_type_indices.push(ty_i32i32_i32);
+        }
+        // 有符号 add/sub/mul i64
+        for _ in 0..3 {
+            functions.function(ty_i64i64_i64);
+            rt_type_indices.push(ty_i64i64_i64);
+        }
+        // 无符号 add/sub/mul i32
+        for _ in 0..3 {
+            functions.function(ty_i32i32_i32);
+            rt_type_indices.push(ty_i32i32_i32);
+        }
+        // 无符号 add/sub/mul i64
+        for _ in 0..3 {
+            functions.function(ty_i64i64_i64);
+            rt_type_indices.push(ty_i64i64_i64);
+        }
+        // __checked_str_eq: (i32, i32) → i32
+        functions.function(ty_i32i32_i32);
+        rt_type_indices.push(ty_i32i32_i32);
+        // __arr_get_i32: (i32, i32) → i32
+        functions.function(ty_i32i32_i32);
+        rt_type_indices.push(ty_i32i32_i32);
+        // __arr_get_i64: (i32, i32) → i64
+        functions.function(ty_i32i32_i64);
+        rt_type_indices.push(ty_i32i32_i64);
+        // __arr_get_f64: (i32, i32) → f64
+        let ty_i32i32_f64 = types.len();
+        types.ty().function(vec![ValType::I32, ValType::I32], vec![ValType::F64]);
+        functions.function(ty_i32i32_f64);
+        rt_type_indices.push(ty_i32i32_f64);
+        // __arr_set_i32: (i32, i32, i32) → ()
+        let ty_i32i32i32_void = types.len();
+        types.ty().function(vec![ValType::I32, ValType::I32, ValType::I32], vec![]);
+        functions.function(ty_i32i32i32_void);
+        rt_type_indices.push(ty_i32i32i32_void);
+        // __arr_set_i64: (i32, i32, i64) → ()
+        let ty_i32i32i64_void = types.len();
+        types.ty().function(vec![ValType::I32, ValType::I32, ValType::I64], vec![]);
+        functions.function(ty_i32i32i64_void);
+        rt_type_indices.push(ty_i32i32i64_void);
+        // __arr_set_f64: (i32, i32, f64) → ()
+        let ty_i32i32f64_void = types.len();
+        types.ty().function(vec![ValType::I32, ValType::I32, ValType::F64], vec![]);
+        functions.function(ty_i32i32f64_void);
+        rt_type_indices.push(ty_i32i32f64_void);
         rt_type_indices
     }
 
@@ -953,6 +1101,295 @@ impl CHIRCodeGen {
         codes.function(&Self::build_rt_math_pow(exp_idx2, log_idx2));
         // __str_repeat (must match RT_NAMES order)
         codes.function(&Self::build_rt_str_repeat(alloc_idx));
+        // ── w31a: checked 模式助手（顺序须与 RT_NAMES 一致）──
+        // 有符号：加/减/乘 i32
+        codes.function(&Self::build_checked_op(BinOp::Add, ValType::I32));
+        codes.function(&Self::build_checked_op(BinOp::Sub, ValType::I32));
+        codes.function(&Self::build_checked_op(BinOp::Mul, ValType::I32));
+        // 有符号：加/减/乘 i64
+        codes.function(&Self::build_checked_op(BinOp::Add, ValType::I64));
+        codes.function(&Self::build_checked_op(BinOp::Sub, ValType::I64));
+        codes.function(&Self::build_checked_op(BinOp::Mul, ValType::I64));
+        // 无符号：加/减/乘 i32
+        codes.function(&Self::build_checked_op_u(BinOp::Add, ValType::I32));
+        codes.function(&Self::build_checked_op_u(BinOp::Sub, ValType::I32));
+        codes.function(&Self::build_checked_op_u(BinOp::Mul, ValType::I32));
+        // 无符号：加/减/乘 i64
+        codes.function(&Self::build_checked_op_u(BinOp::Add, ValType::I64));
+        codes.function(&Self::build_checked_op_u(BinOp::Sub, ValType::I64));
+        codes.function(&Self::build_checked_op_u(BinOp::Mul, ValType::I64));
+        // 字符串相等
+        codes.function(&Self::build_rt_str_eq());
+        // 数组越界检查 + 读写
+        codes.function(&Self::build_checked_arr_get(ValType::I32));
+        codes.function(&Self::build_checked_arr_get(ValType::I64));
+        codes.function(&Self::build_checked_arr_get(ValType::F64));
+        codes.function(&Self::build_checked_arr_set(ValType::I32));
+        codes.function(&Self::build_checked_arr_set(ValType::I64));
+        codes.function(&Self::build_checked_arr_set(ValType::F64));
+    }
+
+    // ── w31a: checked 模式运行时助手 ─────────────────────────────────────
+
+    /// 有符号整数加/减/乘的溢出检查助手：溢出时执行 `unreachable`（trap），
+    /// 否则返回运算结果。
+    fn build_checked_op(op: BinOp, ty: ValType) -> wasm_encoder::Function {
+        use wasm_encoder::Instruction::*;
+        // 参数 0、1；局部 2 = 结果
+        let mut f = wasm_encoder::Function::new(vec![(1, ty)]);
+        let (add, sub, mul, xor, and, lt_s, div_s, ne) = match ty {
+            ValType::I32 => (
+                Instruction::I32Add, Instruction::I32Sub, Instruction::I32Mul,
+                Instruction::I32Xor, Instruction::I32And, Instruction::I32LtS,
+                Instruction::I32DivS, Instruction::I32Ne,
+            ),
+            _ => (
+                Instruction::I64Add, Instruction::I64Sub, Instruction::I64Mul,
+                Instruction::I64Xor, Instruction::I64And, Instruction::I64LtS,
+                Instruction::I64DivS, Instruction::I64Ne,
+            ),
+        };
+        let zero = || match ty {
+            ValType::I32 => Instruction::I32Const(0),
+            _ => Instruction::I64Const(0),
+        };
+        // local2 = a OP b
+        f.instruction(&LocalGet(0));
+        f.instruction(&LocalGet(1));
+        f.instruction(match op { BinOp::Add => &add, BinOp::Sub => &sub, _ => &mul });
+        f.instruction(&LocalSet(2));
+        match op {
+            BinOp::Add => {
+                // 溢出 iff ((a ^ r) & (b ^ r)) <s 0
+                f.instruction(&LocalGet(0));
+                f.instruction(&LocalGet(2));
+                f.instruction(&xor);
+                f.instruction(&LocalGet(1));
+                f.instruction(&LocalGet(2));
+                f.instruction(&xor);
+                f.instruction(&and);
+                f.instruction(&zero());
+                f.instruction(&lt_s);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+            }
+            BinOp::Sub => {
+                // 溢出 iff ((a ^ b) & (a ^ r)) <s 0
+                f.instruction(&LocalGet(0));
+                f.instruction(&LocalGet(1));
+                f.instruction(&xor);
+                f.instruction(&LocalGet(0));
+                f.instruction(&LocalGet(2));
+                f.instruction(&xor);
+                f.instruction(&and);
+                f.instruction(&zero());
+                f.instruction(&lt_s);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+            }
+            _ => {
+                // 溢出 iff a != 0 && r / a != b
+                f.instruction(&LocalGet(0));
+                f.instruction(&zero());
+                f.instruction(&ne);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&LocalGet(2));
+                f.instruction(&LocalGet(0));
+                f.instruction(&div_s);
+                f.instruction(&LocalGet(1));
+                f.instruction(&ne);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::End);
+            }
+        }
+        f.instruction(&LocalGet(2));
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 无符号整数加/减/乘的溢出检查助手。
+    fn build_checked_op_u(op: BinOp, ty: ValType) -> wasm_encoder::Function {
+        use wasm_encoder::Instruction::*;
+        let mut f = wasm_encoder::Function::new(vec![(1, ty)]);
+        let (add, sub, mul, lt_u, div_u, eq, ne, ge_u) = match ty {
+            ValType::I32 => (
+                Instruction::I32Add, Instruction::I32Sub, Instruction::I32Mul,
+                Instruction::I32LtU, Instruction::I32DivU, Instruction::I32Eq,
+                Instruction::I32Ne, Instruction::I32GeU,
+            ),
+            _ => (
+                Instruction::I64Add, Instruction::I64Sub, Instruction::I64Mul,
+                Instruction::I64LtU, Instruction::I64DivU, Instruction::I64Eq,
+                Instruction::I64Ne, Instruction::I64GeU,
+            ),
+        };
+        let zero = || match ty {
+            ValType::I32 => Instruction::I32Const(0),
+            _ => Instruction::I64Const(0),
+        };
+        f.instruction(&LocalGet(0));
+        f.instruction(&LocalGet(1));
+        f.instruction(match op { BinOp::Add => &add, BinOp::Sub => &sub, _ => &mul });
+        f.instruction(&LocalSet(2));
+        match op {
+            BinOp::Add => {
+                // 溢出 iff r <u a
+                f.instruction(&LocalGet(2));
+                f.instruction(&LocalGet(0));
+                f.instruction(&lt_u);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+            }
+            BinOp::Sub => {
+                // 溢出 iff a <u b
+                f.instruction(&LocalGet(0));
+                f.instruction(&LocalGet(1));
+                f.instruction(&lt_u);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+            }
+            _ => {
+                // 溢出 iff a != 0 && r / a != b
+                f.instruction(&LocalGet(0));
+                f.instruction(&zero());
+                f.instruction(&ne);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&LocalGet(2));
+                f.instruction(&LocalGet(0));
+                f.instruction(&div_u);
+                f.instruction(&LocalGet(1));
+                f.instruction(&ne);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::End);
+            }
+        }
+        // silence unused warnings for eq/ge_u (kept for symmetry)
+        let _ = (eq, ge_u);
+        f.instruction(&LocalGet(2));
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 字符串相等：内存布局 [len:i32][bytes...] → 1 相等 / 0 不等。
+    fn build_rt_str_eq() -> wasm_encoder::Function {
+        use wasm_encoder::Instruction::*;
+        // 参数 0、1；本地 2 = i
+        let mut f = wasm_encoder::Function::new(vec![(1, ValType::I32)]);
+        // if len(a) != len(b) → 0
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&LocalGet(1));
+        f.instruction(&I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&I32Ne);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&I32Const(0));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // i = 0
+        f.instruction(&I32Const(0));
+        f.instruction(&LocalSet(2));
+        // while i < len(a)
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&LocalGet(2));
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&I32GeU);
+        f.instruction(&Instruction::BrIf(1));
+        // if a[i] != b[i] → 0
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32Add);
+        f.instruction(&I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }));
+        f.instruction(&LocalGet(1));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32Add);
+        f.instruction(&I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }));
+        f.instruction(&I32Ne);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&I32Const(0));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // i++
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32Const(1));
+        f.instruction(&I32Add);
+        f.instruction(&LocalSet(2));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End); // loop
+        f.instruction(&Instruction::End); // block
+        f.instruction(&I32Const(1));
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 数组读的越界检查 + 取值助手。
+    fn build_checked_arr_get(ty: ValType) -> wasm_encoder::Function {
+        use wasm_encoder::Instruction::*;
+        let size: i32 = match ty { ValType::I64 | ValType::F64 => 8, _ => 4 };
+        let mut f = wasm_encoder::Function::new(vec![]);
+        Self::emit_arr_bounds_check(&mut f);
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(1));
+        f.instruction(&I32Const(size));
+        f.instruction(&I32Mul);
+        f.instruction(&I32Add);
+        match ty {
+            ValType::I64 => f.instruction(&I64Load(MemArg { offset: 0, align: 3, memory_index: 0 })),
+            ValType::F64 => f.instruction(&F64Load(MemArg { offset: 0, align: 3, memory_index: 0 })),
+            _ => f.instruction(&I32Load(MemArg { offset: 0, align: 2, memory_index: 0 })),
+        };
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 数组写的越界检查 + 存值助手。
+    fn build_checked_arr_set(ty: ValType) -> wasm_encoder::Function {
+        use wasm_encoder::Instruction::*;
+        let size: i32 = match ty { ValType::I64 | ValType::F64 => 8, _ => 4 };
+        let mut f = wasm_encoder::Function::new(vec![]);
+        Self::emit_arr_bounds_check(&mut f);
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(1));
+        f.instruction(&I32Const(size));
+        f.instruction(&I32Mul);
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(2));
+        match ty {
+            ValType::I64 => f.instruction(&I64Store(MemArg { offset: 0, align: 3, memory_index: 0 })),
+            ValType::F64 => f.instruction(&F64Store(MemArg { offset: 0, align: 3, memory_index: 0 })),
+            _ => f.instruction(&I32Store(MemArg { offset: 0, align: 2, memory_index: 0 })),
+        };
+        f.instruction(&Instruction::End);
+        f
+    }
+
+    /// 数组边界检查：index >=u len(ptr) → unreachable。
+    fn emit_arr_bounds_check(f: &mut wasm_encoder::Function) {
+        use wasm_encoder::Instruction::*;
+        f.instruction(&LocalGet(1)); // index
+        f.instruction(&LocalGet(0)); // ptr
+        f.instruction(&I32Load(MemArg { offset: 0, align: 2, memory_index: 0 })); // len
+        f.instruction(&I32GeU); // index >=u len
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
     }
 
     /// 生成 I/O 辅助 MemArg
@@ -3751,6 +4188,35 @@ impl CHIRCodeGen {
 
     // ─── 表达式 ────────────────────────────────────────────────────────────
 
+    /// w31a：判断 AST 类型是否为整数（用于 checked 模式溢出检查）。
+    fn is_integer_ty(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 | Type::IntNative
+                | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64
+                | Type::UIntNative | Type::Rune
+        )
+    }
+
+    /// w31a：整数算术对应的检查助手名。
+    fn checked_arith_helper(op: &BinOp, unsigned: bool, ty: ValType) -> &'static str {
+        let i32w = matches!(ty, ValType::I32);
+        match (op, unsigned, i32w) {
+            (BinOp::Add, false, true) => RT_CHK_ADD_I32,
+            (BinOp::Sub, false, true) => RT_CHK_SUB_I32,
+            (BinOp::Mul, false, true) => RT_CHK_MUL_I32,
+            (BinOp::Add, false, false) => RT_CHK_ADD_I64,
+            (BinOp::Sub, false, false) => RT_CHK_SUB_I64,
+            (BinOp::Mul, false, false) => RT_CHK_MUL_I64,
+            (BinOp::Add, true, true) => RT_CHK_ADDU_I32,
+            (BinOp::Sub, true, true) => RT_CHK_SUBU_I32,
+            (BinOp::Mul, true, true) => RT_CHK_MULU_I32,
+            (BinOp::Add, true, false) => RT_CHK_ADDU_I64,
+            (BinOp::Sub, true, false) => RT_CHK_SUBU_I64,
+            _ => RT_CHK_MULU_I64,
+        }
+    }
+
     fn emit_expr(&self, expr: &CHIRExpr, func: &mut wasm_encoder::Function) {
         match &expr.kind {
             CHIRExprKind::Integer(n) => {
@@ -3816,7 +4282,27 @@ impl CHIRCodeGen {
                 } else if right.wasm_ty != operand_ty {
                     self.emit_cast(right.wasm_ty, operand_ty, func);
                 }
-                self.emit_binary_op(op, operand_ty, func);
+                // w31a：检查模式下整数加/减/乘改用溢出检查助手（溢出 trap）。
+                // 仅对整数类型的 Add/Sub/Mul 生效；字符串/浮点运算保持原路径。
+                let checked_arith = self.checked
+                    && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                    && Self::is_integer_ty(&expr.ty)
+                    && matches!(operand_ty, ValType::I32 | ValType::I64);
+                if checked_arith {
+                    let unsigned = matches!(
+                        expr.ty,
+                        Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64
+                            | Type::UIntNative | Type::Rune
+                    );
+                    let hname = Self::checked_arith_helper(op, unsigned, operand_ty);
+                    if let Some(&hidx) = self.func_indices.get(hname) {
+                        func.instruction(&Instruction::Call(hidx));
+                    } else {
+                        self.emit_binary_op(op, operand_ty, func);
+                    }
+                } else {
+                    self.emit_binary_op(op, operand_ty, func);
+                }
                 // Binary op result type: comparisons/logical produce I32, arithmetic produces operand_ty
                 let result_ty = match op {
                     BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq
@@ -4050,6 +4536,33 @@ impl CHIRCodeGen {
             }
 
             CHIRExprKind::ArrayGet { array, index } => {
+                // w31a：检查模式下数组读经越界检查助手（越界 → trap）。
+                let chk_name = match expr.wasm_ty {
+                    ValType::I32 => Some(RT_CHK_ARR_GET_I32),
+                    ValType::I64 => Some(RT_CHK_ARR_GET_I64),
+                    ValType::F64 => Some(RT_CHK_ARR_GET_F64),
+                    _ => None,
+                };
+                if self.checked {
+                    if let Some(hname) = chk_name {
+                        if let Some(&hidx) = self.func_indices.get(hname) {
+                            self.emit_expr(array, func);
+                            if !self.expr_produces_wasm_value_ctx(array) {
+                                emit_zero(ValType::I32, func);
+                            } else if array.wasm_ty == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
+                            self.emit_expr(index, func);
+                            if !self.expr_produces_wasm_value_ctx(index) {
+                                emit_zero(ValType::I32, func);
+                            } else if index.wasm_ty == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
+                            func.instruction(&Instruction::Call(hidx));
+                            return;
+                        }
+                    }
+                }
                 self.emit_expr(array, func);
                 if !self.expr_produces_wasm_value_ctx(array) {
                     emit_zero(ValType::I32, func);
@@ -4394,6 +4907,37 @@ impl CHIRCodeGen {
             }
 
             CHIRExprKind::ArraySet { array, index, value } => {
+                // w31a：检查模式下数组写经越界检查助手（越界 → trap）。
+                let chk_name = match value.wasm_ty {
+                    ValType::I32 => Some(RT_CHK_ARR_SET_I32),
+                    ValType::I64 => Some(RT_CHK_ARR_SET_I64),
+                    ValType::F64 => Some(RT_CHK_ARR_SET_F64),
+                    _ => None,
+                };
+                if self.checked {
+                    if let Some(hname) = chk_name {
+                        if let Some(&hidx) = self.func_indices.get(hname) {
+                            self.emit_expr(array, func);
+                            if !self.expr_produces_wasm_value_ctx(array) {
+                                emit_zero(ValType::I32, func);
+                            } else if array.wasm_ty == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
+                            self.emit_expr(index, func);
+                            if !self.expr_produces_wasm_value_ctx(index) {
+                                emit_zero(ValType::I32, func);
+                            } else if index.wasm_ty == ValType::I64 {
+                                func.instruction(&Instruction::I32WrapI64);
+                            }
+                            self.emit_expr(value, func);
+                            if !self.expr_produces_wasm_value_ctx(value) {
+                                emit_zero(value.wasm_ty, func);
+                            }
+                            func.instruction(&Instruction::Call(hidx));
+                            return;
+                        }
+                    }
+                }
                 self.emit_expr(array, func);
                 if array.wasm_ty == ValType::I64 {
                     func.instruction(&Instruction::I32WrapI64);

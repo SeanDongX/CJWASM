@@ -6934,7 +6934,9 @@ fn use_scan(
 ) -> Option<String> {
     match e {
         Expr::Var(n) if n == "this" || n == "self" => Some("单独的 this 表达式".to_string()),
-        Expr::Var(n) => {
+        // 6.1.2.1(58)/2.1.10.2：`f<T>`（泛型函数名带类型实参作值）与裸 `f` 一样，
+        // 都是对成员函数的引用，在“成员全部初始化前”同样禁止使用。
+        Expr::Var(n) | Expr::GenericFunctionRef { name: n, .. } => {
             if params.contains(n) {
                 None
             } else if methods.contains(n) {
@@ -8923,6 +8925,7 @@ impl<'a, 'i> InstantiationScan<'a, 'i> {
             | Expr::Rune(_)
             | Expr::String(_)
             | Expr::Var(_)
+            | Expr::GenericFunctionRef { .. }
             | Expr::SuperFieldAccess { .. }
             | Expr::None
             | Expr::Return(None)
@@ -12321,6 +12324,9 @@ fn check_static_member_access(
         walk_stmts(&m.func.body, &mut |e| {
             let name = match e {
                 Expr::Var(n) => n,
+                // 6.1.2.4(17)/(41)：`g<T>`（泛型函数名带类型实参）同样是对实例
+                // 成员的引用，静态成员函数体内同样禁止。
+                Expr::GenericFunctionRef { name, .. } => name,
                 Expr::Call { name, .. } => name,
                 _ => return,
             };
@@ -12709,6 +12715,11 @@ fn for_each_expr_type<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Type)) {
                 for ty in args {
                     f(ty);
                 }
+            }
+        }
+        Expr::GenericFunctionRef { type_args, .. } => {
+            for ty in type_args {
+                f(ty);
             }
         }
         Expr::Match { arms, .. } => {
@@ -20783,6 +20794,7 @@ fn scan_ct_expr(
         | Expr::Rune(_)
         | Expr::String(_)
         | Expr::Var(_)
+        | Expr::GenericFunctionRef { .. }
         | Expr::None
         | Expr::SuperFieldAccess { .. } => {}
     }
@@ -24358,6 +24370,7 @@ fn explicit_type_args(e: &Expr) -> Option<&Vec<Type>> {
         | Expr::ConstructorCall { type_args, .. }
         | Expr::MethodCall { type_args, .. }
         | Expr::StructInit { type_args, .. } => type_args.as_ref(),
+        Expr::GenericFunctionRef { type_args, .. } => Some(type_args),
         _ => None,
     }
 }
