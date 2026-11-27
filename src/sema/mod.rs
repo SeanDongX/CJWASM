@@ -713,6 +713,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
 
     // 10.1.2.1/10.1.2.2：可确定的重载实参类型不匹配（保守版）。
     check_overload_candidate_types(program, &mut errors);
+    // 6.1.2.7(4)：泛型类限定访问成员须提供类型实参（w30c）。
+    check_generic_class_qualifier_without_args(program, &mut errors);
 
     // 9.3.3/9.3.4：函数/元组/类值实参的名义子类型匹配（保守版）。
     check_structured_arg_subtypes(program, &mut errors);
@@ -25832,6 +25834,33 @@ fn check_overload_candidate_types(program: &Program, errors: &mut Vec<SemanticEr
                     }
                     verify_call_arg_types(name, args, sigs, &vars, errors);
                 }
+                // 首字母大写的自由函数调用在解析期被归为 ConstructorCall（构造调用）。
+                // 若该名字并非本文件声明的类型而是顶层自由函数，则按自由函数调用
+                // 参与重载实参类型判定（w30c）。
+                Expr::ConstructorCall {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } => {
+                    if !named_args.is_empty() {
+                        return;
+                    }
+                    if name.contains('.') {
+                        return;
+                    }
+                    let Some(sigs) = free_sigs.get(name.as_str()) else {
+                        return;
+                    };
+                    if type_names.contains(name.as_str())
+                        || global_names.contains(name.as_str())
+                        || alias_names.contains(name.as_str())
+                        || local_names.contains(name.as_str())
+                    {
+                        return;
+                    }
+                    verify_call_arg_types(name, args, sigs, &vars, errors);
+                }
                 Expr::MethodCall {
                     object,
                     method,
@@ -25860,6 +25889,40 @@ fn check_overload_candidate_types(program: &Program, errors: &mut Vec<SemanticEr
                         return;
                     }
                     verify_call_arg_types(method, args, &cands, &vars, errors);
+                }
+                // `T.m(args)` / `obj.m(args)` 形态被解析为 VariantConst。若限定名可
+                // 解析为本地类型（静态成员）或持有本地类型值的变量（实例成员），
+                // 按成员调用参与重载实参判定（w30c）。
+                Expr::VariantConst {
+                    enum_name,
+                    variant_name,
+                    arg,
+                } => {
+                    let rt = match vars.get(enum_name.as_str()) {
+                        Some(Type::Struct(n, _)) if type_names.contains(n.as_str()) => n.clone(),
+                        _ if type_names.contains(enum_name.as_str()) => enum_name.clone(),
+                        _ => return,
+                    };
+                    let mut cands: Vec<CallArgSig> = Vec::new();
+                    if !collect_chain_sigs(
+                        &rt,
+                        &parents,
+                        &type_names,
+                        &method_sigs,
+                        variant_name,
+                        &mut cands,
+                    ) {
+                        return;
+                    }
+                    let one: [Expr; 1];
+                    let args: &[Expr] = match arg {
+                        Some(e) => {
+                            one = [(**e).clone()];
+                            &one
+                        }
+                        None => &[],
+                    };
+                    verify_call_arg_types(variant_name, args, &cands, &vars, errors);
                 }
                 Expr::Invoke {
                     callee,
@@ -25918,6 +25981,70 @@ fn check_overload_candidate_types(program: &Program, errors: &mut Vec<SemanticEr
     for ext in &program.extends {
         for m in &ext.methods {
             scan(&m.params, &m.body, errors);
+        }
+    }
+}
+
+/// 6.1.2.7(4)/10.1.2.1：以泛型类类型名限定访问成员时必须提供类型实参。
+///
+/// 解析器把 `Klass.member(args)` 记为 `VariantConst { enum_name, variant_name }`。
+/// 若 `enum_name` 是本文件声明的泛型类（含类型参数）而未写类型实参，则该访问
+/// 非法（无法确定类实例化后的成员集）。仅覆盖本文件可确定的泛型类，保守放行
+/// 其它形态。
+fn check_generic_class_qualifier_without_args(
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    let generic_classes: HashSet<&str> = program
+        .classes
+        .iter()
+        .filter(|c| !c.type_params.is_empty())
+        .map(|c| c.name.as_str())
+        .collect();
+    if generic_classes.is_empty() {
+        return;
+    }
+    let mut reported: HashSet<(String, String)> = HashSet::new();
+    let mut scan_body = |body: &[Stmt]| {
+        walk_stmts(body, &mut |e| {
+            if let Expr::VariantConst {
+                enum_name,
+                variant_name,
+                ..
+            } = e
+            {
+                if generic_classes.contains(enum_name.as_str())
+                    && reported.insert((enum_name.clone(), variant_name.clone()))
+                {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "泛型类 '{}' 的成员 '{}' 访问必须提供类型实参（6.1.2.7(4)）",
+                            enum_name, variant_name
+                        ),
+                    });
+                }
+            }
+        });
+    };
+    for f in &program.functions {
+        scan_body(&f.body);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan_body(&init.body);
+        }
+        for m in &c.methods {
+            scan_body(&m.func.body);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan_body(&init.body);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan_body(&m.body);
         }
     }
 }

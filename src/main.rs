@@ -287,6 +287,15 @@ fn cmd_compile(args: &[String]) {
         pipeline::merge_programs(programs)
     };
 
+    // w30c：跨文件包的 private 成员访问（单文件编译兜底，仅辅助包确有 private 成员时触发）。
+    let cross_errs = pipeline::check_cross_file_private_member_access(&base_dir, &input_files, &program);
+    if !cross_errs.is_empty() {
+        for e in &cross_errs {
+            eprintln!("语义错误: {}", e);
+        }
+        std::process::exit(1);
+    }
+
     cjwasm::optimizer::optimize_program(&mut program);
     cjwasm::monomorph::monomorphize_program(&mut program);
 

@@ -288,13 +288,16 @@ pub fn parse_source_ast(source: &str) -> Result<Program, String> {
 
 /// 解析源代码字符串为 Program AST
 pub fn parse_source(source: &str) -> Result<Program, String> {
-    let program = parse_source_ast(source)?;
+    let mut program = parse_source_ast(source)?;
 
     // 语义校验：重定义 / static+实例同名重载 / override 签名 / 接口实现完整性。
     crate::sema::validate_program(&program).map_err(|errs| {
         let msgs: Vec<String> = errs.iter().map(|e| e.message.clone()).collect();
         format!("语义错误: {}", msgs.join("; "))
     })?;
+
+    // 静态字段“无条件 throw”初始化式接入启动序（6.1.2.2(24)）。
+    inject_static_field_throws(&mut program);
 
     Ok(program)
 }
@@ -465,6 +468,312 @@ pub fn collect_import_files(
         }
     }
     import_files
+}
+
+/// w30c：跨文件包的 private 成员访问检查（单文件编译兜底）。
+///
+/// 当被编译文件通过通配符导入某本地包（与文件同目录的 `.cj` 中 `package X`
+/// 声明），本检查解析该辅助文件，收集其中类的 private 成员函数名；随后在
+/// 主程序 AST 中查找对相应类型的成员调用（`T().m(...)` 或 `T.m(...)`），
+/// 命中 private 成员即报错（6.1.2.4(28)）。仅在辅助包确实声明了匹配的
+/// private 成员时触发，因此不会误伤合法的跨包调用。
+pub fn check_cross_file_private_member_access(
+    base_dir: &Path,
+    inputs: &[String],
+    program: &Program,
+) -> Vec<String> {
+    use crate::ast::{Expr, Stmt};
+    use std::collections::{HashMap, HashSet};
+
+    // 1. 收集需要解析的本地通配符导入包（排除 std 与常见测试工具包）。
+    let mut wanted: HashSet<String> = HashSet::new();
+    for imp in &program.imports {
+        if imp.items.is_some() {
+            continue;
+        }
+        let first = imp
+            .module_path
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if matches!(first, "std" | "utils" | "sys" | "os" | "shutil" | "random") {
+            continue;
+        }
+        if imp.module_path.len() == 1
+            && imp.module_path[0].chars().next().map_or(false, |c| c.is_uppercase())
+        {
+            // 单段大写：更可能是类型/构造器形态，跳过。
+            continue;
+        }
+        wanted.insert(imp.module_path.join("."));
+    }
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. 扫描 base_dir 下的 .cj，找到声明目标包名的辅助文件，收集 private 方法。
+    let input_set: HashSet<PathBuf> = inputs
+        .iter()
+        .map(|f| Path::new(f).canonicalize().unwrap_or_else(|_| PathBuf::from(f)))
+        .collect();
+    // type_name -> (method -> is_static)
+    let mut private_methods: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    if let Ok(rd) = std::fs::read_dir(base_dir) {
+        let mut files: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |e| e == "cj"))
+            .collect();
+        files.sort();
+        for path in files {
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if input_set.contains(&canon) {
+                continue;
+            }
+            let Ok((prog, _src)) = parse_file_ast(&path.to_string_lossy()) else {
+                continue;
+            };
+            let Some(pkg) = &prog.package_name else {
+                continue;
+            };
+            if !wanted.contains(pkg) {
+                continue;
+            }
+            for c in &prog.classes {
+                for m in &c.methods {
+                    if matches!(m.func.visibility, crate::ast::Visibility::Private) {
+                        let short = m
+                            .func
+                            .name
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&m.func.name)
+                            .to_string();
+                        private_methods
+                            .entry(c.name.clone())
+                            .or_default()
+                            .insert(short, m.is_static);
+                    }
+                }
+            }
+        }
+    }
+    if private_methods.is_empty() {
+        return Vec::new();
+    }
+
+    // 3. 遍历主程序函数体，查找到 private 成员的调用。
+    let mut errs: Vec<String> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let check_expr = |e: &Expr, errs: &mut Vec<String>, seen: &mut HashSet<(String, String)>| {
+        if let Expr::MethodCall { object, method, .. } = e {
+            if let Some(tn) = w30c_receiver_type(object) {
+                if let Some(ms) = private_methods.get(&tn) {
+                    if ms.contains_key(method) && seen.insert((tn.clone(), method.clone())) {
+                        errs.push(format!(
+                            "类型 '{}' 的成员函数 '{}' 为 private，不能在包外访问（6.1.2.4(28)）",
+                            tn, method
+                        ));
+                    }
+                }
+            }
+        }
+    };
+    for f in &program.functions {
+        w30c_walk_stmts(&f.body, &mut |e| check_expr(e, &mut errs, &mut seen));
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            w30c_walk_stmts(&init.body, &mut |e| check_expr(e, &mut errs, &mut seen));
+        }
+        for m in &c.methods {
+            w30c_walk_stmts(&m.func.body, &mut |e| check_expr(e, &mut errs, &mut seen));
+        }
+    }
+    // 顶层变量/常量初始化式。
+    for k in &program.constants {
+        w30c_walk_expr(&k.init, &mut |e| check_expr(e, &mut errs, &mut seen));
+    }
+    errs
+}
+
+/// 成员调用的接收者类型名（构造调用 / 裸类型名）。
+fn w30c_receiver_type(e: &crate::ast::Expr) -> Option<String> {
+    use crate::ast::Expr;
+    match e {
+        Expr::ConstructorCall { name, .. } | Expr::StructInit { name, .. } => Some(
+            name.split('<')
+                .next()
+                .unwrap_or(name)
+                .trim()
+                .to_string(),
+        ),
+        Expr::Var(v) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+fn w30c_walk_stmts(stmts: &[crate::ast::Stmt], f: &mut dyn FnMut(&crate::ast::Expr)) {
+    use crate::ast::Stmt;
+    for s in stmts {
+        match s {
+            Stmt::Let { value, .. } | Stmt::Var { value, .. } => w30c_walk_expr(value, f),
+            Stmt::Assign { value, .. } => w30c_walk_expr(value, f),
+            Stmt::Expr(e) => w30c_walk_expr(e, f),
+            Stmt::Return(Some(e)) => w30c_walk_expr(e, f),
+            Stmt::While { cond, body } => {
+                w30c_walk_expr(cond, f);
+                w30c_walk_stmts(body, f);
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                w30c_walk_expr(expr, f);
+                w30c_walk_stmts(body, f);
+            }
+            Stmt::DoWhile { body, cond } => {
+                w30c_walk_stmts(body, f);
+                w30c_walk_expr(cond, f);
+            }
+            Stmt::For { iterable, body, .. } => {
+                w30c_walk_expr(iterable, f);
+                w30c_walk_stmts(body, f);
+            }
+            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => w30c_walk_stmts(body, f),
+            Stmt::Const { value, .. } => w30c_walk_expr(value, f),
+            Stmt::LocalFunc(func) => w30c_walk_stmts(&func.body, f),
+            _ => {}
+        }
+    }
+}
+
+fn w30c_walk_expr(e: &crate::ast::Expr, f: &mut dyn FnMut(&crate::ast::Expr)) {
+    use crate::ast::Expr;
+    f(e);
+    match e {
+        Expr::Unary { expr, .. } => w30c_walk_expr(expr, f),
+        Expr::Binary { left, right, .. } => {
+            w30c_walk_expr(left, f);
+            w30c_walk_expr(right, f);
+        }
+        Expr::Call { args, named_args, .. } => {
+            for a in args {
+                w30c_walk_expr(a, f);
+            }
+            for (_, a) in named_args {
+                w30c_walk_expr(a, f);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            w30c_walk_expr(object, f);
+            for a in args {
+                w30c_walk_expr(a, f);
+            }
+            for (_, a) in named_args {
+                w30c_walk_expr(a, f);
+            }
+        }
+        Expr::SuperCall { args, named_args, .. } => {
+            for a in args {
+                w30c_walk_expr(a, f);
+            }
+            for (_, a) in named_args {
+                w30c_walk_expr(a, f);
+            }
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            w30c_walk_expr(cond, f);
+            w30c_walk_expr(then_branch, f);
+            if let Some(e) = else_branch {
+                w30c_walk_expr(e, f);
+            }
+        }
+        Expr::Block(stmts, tail) => {
+            w30c_walk_stmts(stmts, f);
+            if let Some(e) = tail {
+                w30c_walk_expr(e, f);
+            }
+        }
+        Expr::Tuple(items) => {
+            for x in items {
+                w30c_walk_expr(x, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// w30c：把“静态字段初始化为无条件 throw”的语义接入程序启动。
+///
+/// `class C { static let v = throw X() }`（或 struct 等价形态）在程序启动时应
+/// 求值该初始式并因抛出异常而终止程序（6.1.2.2(24)）。既有代码生成不主动求值
+/// 静态字段默认值，故此处为含“无条件 throw 静态字段”的类型合成一个
+/// `Type.__static_init` 函数（body 为该 throw），由 main 启动序调用以复现语义。
+/// 仅当默认式恰为 `Expr::Throw` 时触发，避免误伤一般静态字段。
+fn inject_static_field_throws(program: &mut Program) {
+    use crate::ast::{Expr, Function, Stmt, Visibility};
+    let existing: HashSet<String> = program
+        .functions
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    let mut pending: Vec<(String, Expr)> = Vec::new();
+    for c in &program.classes {
+        if c.static_init.is_some() {
+            continue;
+        }
+        if let Some(e) = c
+            .fields
+            .iter()
+            .filter(|fld| fld.is_static)
+            .find_map(|fld| match &fld.default {
+                Some(x @ Expr::Throw(_)) => Some(x.clone()),
+                _ => None,
+            })
+        {
+            pending.push((format!("{}.__static_init", c.name), e));
+        }
+    }
+    for s in &program.structs {
+        if let Some(e) = s
+            .fields
+            .iter()
+            .filter(|fld| fld.is_static)
+            .find_map(|fld| match &fld.default {
+                Some(x @ Expr::Throw(_)) => Some(x.clone()),
+                _ => None,
+            })
+        {
+            pending.push((format!("{}.__static_init", s.name), e));
+        }
+    }
+    for (name, e) in pending {
+        if existing.contains(&name) {
+            continue;
+        }
+        program.functions.push(Function {
+            visibility: Visibility::Private,
+            name,
+            type_params: vec![],
+            constraints: vec![],
+            params: vec![],
+            return_type: None,
+            throws: None,
+            body: vec![Stmt::Expr(e)],
+            extern_import: None,
+            is_const: false,
+            is_unsafe: false,
+            is_c_func: false,
+            is_mut: false,
+        });
+    }
 }
 
 /// 完整编译流水线：源代码 -> WASM 字节码

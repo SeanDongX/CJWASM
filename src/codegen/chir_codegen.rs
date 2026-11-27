@@ -3564,6 +3564,23 @@ impl CHIRCodeGen {
             }
         }
 
+        // 全模块静态初始化：程序入口（main）启动时依次调用所有类的
+        // `__static_init` 块（6.1.2.2(24)：static init 在程序启动时执行，
+        // 其中抛出的异常将终止程序）。按函数名排序保证确定性。
+        if func.name == "main" {
+            let mut si: Vec<(String, u32)> = self
+                .func_indices
+                .iter()
+                .filter(|(n, _)| n.ends_with(".__static_init"))
+                .map(|(n, &i)| (n.clone(), i))
+                .collect();
+            si.sort();
+            si.dedup_by_key(|(_, i)| *i);
+            for (_, idx) in si {
+                wasm_func.instruction(&Instruction::Call(idx));
+            }
+        }
+
         let has_result = !wasm_result_tys(&func.return_ty, func.return_wasm_ty).is_empty();
 
         if is_init {
