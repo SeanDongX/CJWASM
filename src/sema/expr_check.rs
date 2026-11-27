@@ -3442,6 +3442,17 @@ fn check_struct_type_rules(
                 continue;
             };
             let target = ty_of_known(&f.ty, type_names);
+            // 5.5(9)/(10)：成员变量初始化式为 λ 且存在未注解形参时，形参类型
+            // 只能由上下文函数类型推断；字段未声明为函数类型即无上下文 → 报错。
+            if !matches!(target, Ty::Func { .. }) && lambda_has_unannotated_params(d) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "结构体 '{}' 的成员变量 '{}' 的 lambda 形参缺少类型注解，且无上下文可推断其类型（5.5(9)/(10)）",
+                        s.name, f.name
+                    ),
+                });
+                continue;
+            }
             let value = static_expr_ty(d);
             if target.is_concrete() && value.is_definite() && !compatible(&target, &value) {
                 errors.push(SemanticError {
@@ -3602,6 +3613,17 @@ fn check_empty_body_explicit_returns(
     }
 }
 
+/// 判断 λ 表达式是否含未写类型注解的形参（形参类型需由上下文推断）。
+/// 5.5(9)/(10)：无上下文时此类 λ 的形参类型无法确定。
+fn lambda_has_unannotated_params(e: &Expr) -> bool {
+    match e {
+        Expr::Lambda {
+            param_annotated, ..
+        } => param_annotated.iter().any(|&a| !a),
+        _ => false,
+    }
+}
+
 fn check_class_field_defaults(
     program: &Program,
     type_names: &HashSet<String>,
@@ -3613,6 +3635,17 @@ fn check_class_field_defaults(
                 continue;
             };
             let target = resolve_ann_ty(&f.ty, type_names);
+            // 5.5(9)/(10)：成员变量初始化式为 λ 且存在未注解形参时，形参类型
+            // 只能由上下文函数类型推断；字段未声明为函数类型即无上下文 → 报错。
+            if !matches!(target, Ty::Func { .. }) && lambda_has_unannotated_params(d) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "类 '{}' 的成员变量 '{}' 的 lambda 形参缺少类型注解，且无上下文可推断其类型（5.5(9)/(10)）",
+                        cls.name, f.name
+                    ),
+                });
+                continue;
+            }
             // 5.5(7)：声明返回 Unit 的函数类型成员变量，其 lambda 初始化式内
             // `return 非Unit表达式` 非法（w26c a07_02）。
             if let (Expr::Lambda { body, .. }, Ty::Func { ret, .. }) = (d, &target) {
@@ -11319,17 +11352,24 @@ impl<'a> Checker<'a> {
 
             Expr::Lambda {
                 params,
+                param_annotated,
                 return_type,
                 body,
             } => {
                 let mut scope = HashMap::new();
                 let mut param_tys: Vec<Ty> = Vec::with_capacity(params.len());
-                for (name, ty) in params {
+                for (i, (name, ty)) in params.iter().enumerate() {
                     // 无标注的 lambda 形参在解析器中被填成 Int64/Float64 占位，
                     // 实际类型由上下文函数类型决定，无法在此确定，保守置为未知。
-                    let pty = match ty_of(ty) {
-                        Ty::Int64 | Ty::Float64 => Ty::Unknown,
-                        other => other,
+                    // 有显式注解的形参类型确定，直接采用（w40a：AST 现可区分两者）。
+                    let annotated = param_annotated.get(i).copied().unwrap_or(false);
+                    let pty = if annotated {
+                        ty_of(ty)
+                    } else {
+                        match ty_of(ty) {
+                            Ty::Int64 | Ty::Float64 => Ty::Unknown,
+                            other => other,
+                        }
                     };
                     // 函数类型中的形参同样采用占位折叠后的类型，避免把未注解形参
                     // 误当成确定的 Int64/Float64 而误伤合法调用。

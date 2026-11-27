@@ -1762,6 +1762,7 @@ impl CodeGen {
                 params,
                 return_type,
                 body,
+                ..
             } => {
                 let lambda_name = format!("__lambda_{}", *counter);
                 *counter += 1;
@@ -8646,6 +8647,7 @@ is_c: false,
                         args: vec![
                             Expr::Lambda {
                                 params: vec![("x".to_string(), Type::Int64)],
+                                param_annotated: vec![true],
                                 return_type: Some(Type::Int64),
                                 body: Box::new(Expr::Binary {
                                     op: BinOp::Mul,

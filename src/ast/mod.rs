@@ -215,6 +215,10 @@ pub enum Expr {
     /// Lambda 表达式 (x: Int64) -> Int64 { x * 2 } 或 { x: Int64 => x * 2 }
     Lambda {
         params: Vec<(String, Type)>,
+        /// 与 `params` 一一对应：`true` 表示该形参在源码中写了类型注解。
+        /// 未注解形参的 `Type` 只是占位（Int64/Float64），实际类型必须由上下文
+        /// 函数类型推断；无上下文的未注解形参在语义分析阶段报错（5.5(9)/(10)）。
+        param_annotated: Vec<bool>,
         return_type: Option<Type>,
         body: Box<Expr>,
     },

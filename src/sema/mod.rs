@@ -561,6 +561,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_generic_call_type_arg_count(program, &mut errors);
     check_supertype_generic_constraints(program, &index, &mut errors);
 
+    // 2.1.8(1)：`Range<T>` 的元素类型须满足 Countable + Comparable（声明期约束校验，w40c）。
+    check_range_element_constraints(program, &mut errors);
+
     // 2.4.1(11)/(12)：类型别名之间不允许直接或间接的循环引用。
     check_type_alias_cycles(program, &mut errors);
 
@@ -9537,6 +9540,213 @@ fn check_interface_inherited_kind_shadowing(
                 ),
             });
         }
+    }
+}
+
+/// w40c（2.1.8(1)）：`Range<T>` 的元素类型 `T` 必须实现 `Countable` 与 `Comparable`。
+///
+/// cjc 在**声明期**即校验显式 `Range<T>` 类型标注：若 `T` 是未带相应约束的类型形参，
+/// 或写出不可计数的具体类型（Float/Bool/String），均报错。此处仅扫描可静态确定的
+/// 声明点（函数/方法/接口方法的形参与返回类型），作用域外或用户类型一律放行，避免误伤。
+fn check_range_element_constraints(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 具名类型声明 → (类型形参, 约束)，供成员方法体内的类级形参约束查找。
+    let mut owner_tps: HashMap<&str, (&[String], &[TypeConstraint])> = HashMap::new();
+    for c in &program.classes {
+        owner_tps.insert(c.name.as_str(), (&c.type_params, &c.constraints));
+    }
+    for s in &program.structs {
+        owner_tps.insert(s.name.as_str(), (&s.type_params, &s.constraints));
+    }
+    for e in &program.enums {
+        owner_tps.insert(e.name.as_str(), (&e.type_params, &e.constraints));
+    }
+    for i in &program.interfaces {
+        owner_tps.insert(i.name.as_str(), (&i.type_params, &i.constraints));
+    }
+
+    // 顶层函数 + 结构体方法（解析器将其并入 program.functions，名字带 `Struct.` 前缀）。
+    for f in &program.functions {
+        scan_range_in_function(f, &owner_tps, owner_name(&f.name), errors);
+    }
+    // 类方法。
+    for c in &program.classes {
+        for m in &c.methods {
+            scan_range_in_function(&m.func, &owner_tps, Some(c.name.as_str()), errors);
+        }
+    }
+    // 扩展方法：`extend<T> Foo<T>` 引入的类型形参在当前实现里不建模约束，视为无约束。
+    for ext in &program.extends {
+        let mut ext_tps: Vec<&str> = Vec::new();
+        for t in &ext.type_args {
+            if let Type::TypeParam(n) = t {
+                ext_tps.push(n.as_str());
+            }
+        }
+        for m in &ext.methods {
+            let mut scope_tps = ext_tps.clone();
+            scope_tps.extend(m.type_params.iter().map(|s| s.as_str()));
+            let cons: Vec<&TypeConstraint> = m.constraints.iter().collect();
+            let mut out = Vec::new();
+            for p in &m.params {
+                check_range_in_type(&p.ty, &scope_tps, &cons, &mut out);
+            }
+            if let Some(r) = &m.return_type {
+                check_range_in_type(r, &scope_tps, &cons, &mut out);
+            }
+            for msg in out {
+                errors.push(SemanticError { message: msg });
+            }
+        }
+    }
+    // 接口方法（签名形态与 Function 不同，单独处理）。
+    for i in &program.interfaces {
+        for m in &i.methods {
+            let mut scope_tps: Vec<&str> = i.type_params.iter().map(|s| s.as_str()).collect();
+            scope_tps.extend(m.type_params.iter().map(|s| s.as_str()));
+            let mut cons: Vec<&TypeConstraint> = i.constraints.iter().collect();
+            cons.extend(m.constraints.iter());
+            let mut out = Vec::new();
+            for p in &m.params {
+                check_range_in_type(&p.ty, &scope_tps, &cons, &mut out);
+            }
+            if let Some(r) = &m.return_type {
+                check_range_in_type(r, &scope_tps, &cons, &mut out);
+            }
+            for msg in out {
+                errors.push(SemanticError { message: msg });
+            }
+        }
+    }
+}
+
+/// 扫描单个函数（形参 + 返回类型）中的 `Range<T>` 约束。
+fn scan_range_in_function(
+    f: &Function,
+    owner_tps: &HashMap<&str, (&[String], &[TypeConstraint])>,
+    owner: Option<&str>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let empty_tps: &[String] = &[];
+    let empty_cons: &[TypeConstraint] = &[];
+    let (otps, ocons) = owner
+        .and_then(|o| owner_tps.get(o).copied())
+        .unwrap_or((empty_tps, empty_cons));
+    let mut scope_tps: Vec<&str> = otps.iter().map(|s| s.as_str()).collect();
+    scope_tps.extend(f.type_params.iter().map(|s| s.as_str()));
+    let mut cons: Vec<&TypeConstraint> = ocons.iter().collect();
+    cons.extend(f.constraints.iter());
+    let mut out: Vec<String> = Vec::new();
+    for p in &f.params {
+        check_range_in_type(&p.ty, &scope_tps, &cons, &mut out);
+    }
+    if let Some(r) = &f.return_type {
+        check_range_in_type(r, &scope_tps, &cons, &mut out);
+    }
+    for msg in out {
+        errors.push(SemanticError { message: msg });
+    }
+}
+
+/// 递归遍历类型语法，对出现的 `Range<EXPR>` 检查元素类型约束。
+fn check_range_in_type(
+    ty: &Type,
+    scope_tps: &[&str],
+    cons: &[&TypeConstraint],
+    out: &mut Vec<String>,
+) {
+    match ty {
+        Type::Struct(name, args) if name == "Range" && args.len() == 1 => {
+            check_range_element(&args[0], scope_tps, cons, out);
+            // 元素类型本身可能再含 Range（保守递归）。
+            check_range_in_type(&args[0], scope_tps, cons, out);
+        }
+        Type::Array(inner) | Type::VArray(inner, _) | Type::Slice(inner) | Type::Option(inner) => {
+            check_range_in_type(inner, scope_tps, cons, out)
+        }
+        Type::Result(a, b) | Type::Map(a, b) => {
+            check_range_in_type(a, scope_tps, cons, out);
+            check_range_in_type(b, scope_tps, cons, out);
+        }
+        Type::Tuple(es) => {
+            for e in es {
+                check_range_in_type(e, scope_tps, cons, out);
+            }
+        }
+        Type::Struct(_, args) => {
+            for a in args {
+                check_range_in_type(a, scope_tps, cons, out);
+            }
+        }
+        Type::Function { params, ret } => {
+            for p in params {
+                check_range_in_type(p, scope_tps, cons, out);
+            }
+            if let Some(r) = ret.as_ref().as_ref() {
+                check_range_in_type(r, scope_tps, cons, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 判定 `Range<elem>` 的元素类型是否满足 `Countable` 与 `Comparable` 约束。
+fn check_range_element(
+    elem: &Type,
+    scope_tps: &[&str],
+    cons: &[&TypeConstraint],
+    out: &mut Vec<String>,
+) {
+    match elem {
+        Type::TypeParam(p) => {
+            // 仅在作用域内已声明的类型形参上判定；其余交给其它规则。
+            if !scope_tps.iter().any(|t| *t == p.as_str()) {
+                return;
+            }
+            let mut has_countable = false;
+            let mut has_comparable = false;
+            for c in cons {
+                if c.param.as_str() == p.as_str() {
+                    for b in &c.bounds {
+                        if b == "Countable" {
+                            has_countable = true;
+                        }
+                        if b == "Comparable" {
+                            has_comparable = true;
+                        }
+                    }
+                }
+            }
+            if !(has_countable && has_comparable) {
+                out.push(format!(
+                    "范围类型 'Range<{}>' 的类型实参 '{}' 必须满足 '<: Countable<{}> & Comparable<{}>'（2.1.8(1)）",
+                    p, p, p, p
+                ));
+            }
+        }
+        // 具体标量类型：Float/Bool/String 不实现 Countable，不能作 Range 元素。
+        Type::Float16 | Type::Float32 | Type::Float64 | Type::Bool | Type::String => {
+            let n = match elem {
+                Type::Float16 => "Float16",
+                Type::Float32 => "Float32",
+                Type::Float64 => "Float64",
+                Type::Bool => "Bool",
+                _ => "String",
+            };
+            out.push(format!(
+                "范围类型 'Range<{}>' 的元素类型 '{}' 不实现 Countable，不能用于范围（2.1.8(1)）",
+                n, n
+            ));
+        }
+        Type::Struct(n, a)
+            if a.is_empty()
+                && matches!(n.as_str(), "Float16" | "Float32" | "Float64" | "Bool" | "String") =>
+        {
+            out.push(format!(
+                "范围类型 'Range<{}>' 的元素类型 '{}' 不实现 Countable，不能用于范围（2.1.8(1)）",
+                n, n
+            ));
+        }
+        _ => {}
     }
 }
 
@@ -31999,6 +32209,27 @@ fn w28_is_float(t: &W28Ty) -> bool {
 fn w28_is_array(t: &W28Ty) -> bool {
     matches!(t, W28Ty::Array(_))
 }
+/// 字面量元素是否为“简单常量字面量”（数字/布尔/Rune/字符串字面量，含一元负号包裹）。
+/// 供 `var` 数组字面量长度追踪的保守门限（w40c：#1）：元素含构造调用/变量引用时
+/// 不据初值长度判定，避免误伤依赖运行期越界捕获的官方 std/unittest 用例。
+fn w28_is_literal_elem(e: &Expr) -> bool {
+    match e {
+        Expr::Integer(_)
+        | Expr::IntegerSuffixed(_, _)
+        | Expr::IntegerOverflow(_, _)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::FloatSuffixed(_, _)
+        | Expr::Bool(_)
+        | Expr::Rune(_)
+        | Expr::String(_) => true,
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } => w28_is_literal_elem(expr),
+        _ => false,
+    }
+}
 fn w28_is_arith_op(op: &BinOp) -> bool {
     matches!(
         op,
@@ -32302,15 +32533,22 @@ fn w28_scan_stmts(
                         .as_ref()
                         .map(w28_ty_of_type)
                         .unwrap_or_else(|| w28_infer_expr(value, env, retmap));
-                    // 仅对不可变（let）或未被整体重赋值的数组绑定记录长度。
-                    // 可变数组的下标可能由运行时逻辑保证（官方 std/unittest 存在
-                    // 普通可编译程序中“常量越界下标由运行时捕获异常”的用例），
-                    // 不据初值长度判定。
+                    // 数组长度追踪：只要该绑定从未被**整体重赋值**（`arr = ...`），
+                    // 其初值字面量 / `Array(size)` 构造的长度即恒定（元素写 `arr[i]=..`
+                    // 不改变长度）。`let` 一律据初值判定；`var` 仅当字面量元素全为
+                    // **简单常量字面量**时判定（w40c：#1 `var arr=[0,2,4]; arr[5]`）。
+                    // var 数组元素含构造调用/变量时保守放行——官方 std/unittest 存在
+                    // `var arr=[A(..),..]; arr[3]` 这类依赖运行期越界捕获的可编译用例。
                     let bound_unassigned = !assigned.contains(name);
-                    let len = match value {
-                        Expr::Array(items) if !is_var && bound_unassigned => {
+                    let literal_array = match value {
+                        Expr::Array(items) if items.iter().all(w28_is_literal_elem) => {
                             Some(items.len())
                         }
+                        _ => None,
+                    };
+                    let len = match value {
+                        Expr::Array(items) if !is_var && bound_unassigned => Some(items.len()),
+                        Expr::Array(_) if bound_unassigned => literal_array,
                         // w38c（#11）：`Array<T>(size){...}` 的 size 跨语句常量传播。
                         _ => w28_ctor_array_len(value, env).filter(|_| bound_unassigned),
                     };
@@ -34384,6 +34622,7 @@ mod tests {
         let known = HashMap::new();
         let expr = Expr::Lambda {
             params: vec![("x".to_string(), Type::Int64)],
+            param_annotated: vec![true],
             return_type: Some(Type::Int64),
             body: Box::new(Expr::Var("x".to_string())),
         };
@@ -34659,6 +34898,69 @@ mod tests {
              main() {}\n",
         );
         assert!(errs.iter().any(|e| e.message.contains("静态成员函数与实例成员函数同名")));
+    }
+
+
+    #[test]
+    fn test_w40c_range_unconstrained_type_param_rejected() {
+        // 2.1.8(1)：泛型函数返回 `Range<T>` 但 T 未带 Countable/Comparable 约束 → 拒绝。
+        let errs = assert_invalid(
+            "func range<T>(a: T, b: T): Range<T> {\n\
+             \x20   a..b\n\
+             }\n\
+             main() { return 0 }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("Range<T>")));
+    }
+
+
+    #[test]
+    fn test_w40c_range_constrained_type_param_ok() {
+        // 2.1.8(1)：T 带 Countable+Comparable 约束时合法。
+        assert_valid(
+            "func range<T>(a: T, b: T): Range<T> where T <: Countable<T> & Comparable<T> {\n\
+             \x20   a..b\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+
+    #[test]
+    fn test_w40c_range_float_element_rejected() {
+        // 2.1.8(1)：Float64 不实现 Countable，不能作 Range 元素。
+        let errs = assert_invalid(
+            "func f(): Range<Float64> { 0.0..1.0 }\nmain() {}\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("Float64")));
+    }
+
+
+    #[test]
+    fn test_w40c_var_literal_array_oob_rejected() {
+        // 1.4(3)：var 绑定且从未整体重赋值的字面量数组，常量下标越界仍非法。
+        let errs = assert_invalid(
+            "main() {\n\
+             \x20   var arr: Array<Int32> = [0, 2, 4]\n\
+             \x20   let x = arr[5]\n\
+             }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("数组下标越界")));
+    }
+
+
+    #[test]
+    fn test_w40c_var_array_nonliteral_elements_len_skipped() {
+        // 保守门限：var 数组元素非简单常量字面量时不据初值长度判定越界。
+        assert_valid(
+            "main() {\n\
+             \x20   let a = 1\n\
+             \x20   let b = 2\n\
+             \x20   let c = 3\n\
+             \x20   var arr: Array<Int64> = [a, b, c]\n\
+             \x20   let x = arr[3]\n\
+             }\n",
+        );
     }
 
 

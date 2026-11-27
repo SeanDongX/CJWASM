@@ -332,6 +332,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
         },
         Lambda {
             params,
+            param_annotated,
             return_type,
             body,
         } => Lambda {
@@ -339,6 +340,7 @@ fn substitute_expr(expr: Expr, subst: &HashMap<String, Type>, rewrites: &Rewrite
                 .into_iter()
                 .map(|(n, t)| (n, substitute_type(&t, subst)))
                 .collect(),
+            param_annotated,
             return_type: return_type.map(|t| substitute_type(&t, subst)),
             body: Box::new(substitute_expr(*body, subst, rewrites)),
         },

@@ -41,6 +41,8 @@ impl Parser {
         };
         Expr::Lambda {
             params: vec![(arg, Type::TypeParam("_".to_string()))],
+            // 组合脱糖产生的形参类型已由脱糖器确定（占位类型形参），视为已注解。
+            param_annotated: vec![true],
             return_type: None,
             body: Box::new(outer),
         }
@@ -951,6 +953,7 @@ impl Parser {
                                 e @ Expr::Lambda { .. } => e,
                                 body => Expr::Lambda {
                                     params: vec![],
+                                    param_annotated: vec![],
                                     return_type: None,
                                     body: Box::new(body),
                                 },
@@ -1102,6 +1105,7 @@ impl Parser {
                             self.advance();
                             Expr::Lambda {
                                 params: vec![],
+                                param_annotated: vec![],
                                 return_type: None,
                                 body: Box::new(Expr::Block(vec![], None)),
                             }
@@ -1111,12 +1115,14 @@ impl Parser {
                             let body = self.parse_lambda_body()?;
                             Expr::Lambda {
                                 params: vec![],
+                                param_annotated: vec![],
                                 return_type: None,
                                 body: Box::new(body),
                             }
                         } else if let Some(Token::Comma) = self.peek_next() {
                             // { a, b, c => body } — 多参无类型 lambda（trailing closure）
                             let mut params = Vec::new();
+                            let mut annotated = Vec::new();
                             loop {
                                 let name = match self.advance() {
                                     Some(Token::Ident(n)) => n,
@@ -1132,8 +1138,10 @@ impl Parser {
                                 // 参数可带类型注解：{ a, b: Int32 => ... }
                                 let ty = if self.check(&Token::Colon) {
                                     self.advance();
+                                    annotated.push(true);
                                     self.parse_type()?
                                 } else {
+                                    annotated.push(false);
                                     Type::Int64 // 默认使用 Int64，避免 TypeParam
                                 };
                                 params.push((name, ty));
@@ -1152,16 +1160,18 @@ impl Parser {
                             let body = self.parse_lambda_body()?;
                             Expr::Lambda {
                                 params,
+                                param_annotated: annotated,
                                 return_type: None,
                                 body: Box::new(body),
                             }
                         } else {
                             // { x: T, y: T => body } — 有参 lambda；body 可为语句块（let/var/for/return 等）
-                            let params = self.parse_lambda_params()?;
+                            let (params, param_annotated) = self.parse_lambda_params()?;
                             self.expect(Token::FatArrow)?;
                             let body = self.parse_lambda_body()?;
                             Expr::Lambda {
                                 params,
+                                param_annotated,
                                 return_type: None,
                                 body: Box::new(body),
                             }
@@ -1174,6 +1184,7 @@ impl Parser {
                             e @ Expr::Lambda { .. } => e,
                             body => Expr::Lambda {
                                 params: vec![],
+                                param_annotated: vec![],
                                 return_type: None,
                                 body: Box::new(body),
                             },
@@ -2216,7 +2227,7 @@ impl Parser {
                     // (): R { body } 或空元组
                     self.advance(); // consume )
                     if self.check(&Token::Colon) {
-                        return self.parse_lambda_rest(vec![]);
+                        return self.parse_lambda_rest(vec![], vec![]);
                     }
                     // () 空元组
                     return Ok(Expr::Tuple(vec![]));
@@ -2226,7 +2237,7 @@ impl Parser {
                 if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Underscore))
                     && matches!(self.peek_at(1), Some(Token::Colon))
                 {
-                    let params = self.parse_lambda_params()?;
+                    let (params, param_annotated) = self.parse_lambda_params()?;
                     if self.check(&Token::FatArrow) {
                         // ( params ) => body — params 后直接 =>，无 )
                         self.advance();
@@ -2234,12 +2245,13 @@ impl Parser {
                         let body = self.parse_lambda_body()?;
                         return Ok(Expr::Lambda {
                             params,
+                            param_annotated,
                             return_type: None,
                             body: Box::new(body),
                         });
                     }
                     self.expect(Token::RParen)?;
-                    return self.parse_lambda_rest(params);
+                    return self.parse_lambda_rest(params, param_annotated);
                 }
                 // 解析第一个表达式（括号内允许 `_` 通配符，用于元组解构赋值 (_, a) = ...）
                 let prev_wildcard = self.allow_wildcard_expr;
@@ -2325,6 +2337,7 @@ impl Parser {
                     let body = self.parse_lambda_body()?;
                     return Ok(Expr::Lambda {
                         params: vec![],
+                        param_annotated: vec![],
                         return_type: None,
                         body: Box::new(body),
                     });
@@ -2342,17 +2355,19 @@ impl Parser {
                 if is_lambda {
                     if matches!(&second, Some(Token::Colon)) {
                         // Lambda { x: T, y: T => body }；{ 已消费，解析参数
-                        let params = self.parse_lambda_params()?;
+                        let (params, param_annotated) = self.parse_lambda_params()?;
                         self.expect(Token::FatArrow)?;
                         let body = self.parse_lambda_body()?;
                         return Ok(Expr::Lambda {
                             params,
+                            param_annotated,
                             return_type: None,
                             body: Box::new(body),
                         });
                     } else if matches!(&second, Some(Token::Comma)) {
                         // 多参无类型 Lambda { a, b, c => body }
                         let mut params = Vec::new();
+                        let mut annotated = Vec::new();
                         loop {
                             let name = match self.advance() {
                                 Some(Token::Ident(n)) => n,
@@ -2368,8 +2383,10 @@ impl Parser {
                             // 参数可带类型注解：{ a, b: Int32 => ... }
                             let ty = if self.check(&Token::Colon) {
                                 self.advance();
+                                annotated.push(true);
                                 self.parse_type()?
                             } else {
+                                annotated.push(false);
                                 Type::Int64 // 默认使用 Int64
                             };
                             params.push((name, ty));
@@ -2388,6 +2405,7 @@ impl Parser {
                         let body = self.parse_lambda_body()?;
                         return Ok(Expr::Lambda {
                             params,
+                            param_annotated: annotated,
                             return_type: None,
                             body: Box::new(body),
                         });
@@ -2398,6 +2416,7 @@ impl Parser {
                         let body = self.parse_lambda_body()?;
                         return Ok(Expr::Lambda {
                             params: vec![(name, Type::Int64)], // 默认使用 Int64
+                            param_annotated: vec![false],
                             return_type: None,
                             body: Box::new(body),
                         });
@@ -2844,8 +2863,11 @@ impl Parser {
     }
 
     /// 解析 Lambda 参数列表: x: T, y: T 或 x: T = default 或 name = expr（类型推断）
-    pub(crate) fn parse_lambda_params(&mut self) -> Result<Vec<(String, Type)>, ParseErrorAt> {
+    pub(crate) fn parse_lambda_params(
+        &mut self,
+    ) -> Result<(Vec<(String, Type)>, Vec<bool>), ParseErrorAt> {
         let mut params = Vec::new();
+        let mut annotated = Vec::new();
 
         loop {
             let name = match self.advance() {
@@ -2858,15 +2880,18 @@ impl Parser {
             };
             let ty = if self.check(&Token::Colon) {
                 self.advance();
+                annotated.push(true);
                 self.parse_type()?
             } else if self.check(&Token::Assign) {
                 // name = default：跳过默认值，类型推断
                 self.advance();
                 let _ = self.parse_expr()?;
+                annotated.push(false);
                 Type::Int64 // 默认使用 Int64
             } else if self.check(&Token::FatArrow) {
                 // 单参无类型 lambda: { name => body }，不消费 =>
                 params.push((name, Type::Int64)); // 默认使用 Int64
+                annotated.push(false);
                 break;
             } else {
                 return self.bail(ParseError::UnexpectedToken(
@@ -2882,7 +2907,7 @@ impl Parser {
             self.advance();
         }
 
-        Ok(params)
+        Ok((params, annotated))
     }
 
     /// 解析 Lambda body（含结束的 `}`）并转为 Expr。
@@ -2907,6 +2932,7 @@ impl Parser {
     pub(crate) fn parse_lambda_rest(
         &mut self,
         params: Vec<(String, Type)>,
+        param_annotated: Vec<bool>,
     ) -> Result<Expr, ParseErrorAt> {
         if self.check(&Token::Colon) {
             self.advance();
@@ -2932,6 +2958,7 @@ impl Parser {
         };
         Ok(Expr::Lambda {
             params,
+            param_annotated,
             return_type,
             body: Box::new(body),
         })

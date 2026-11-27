@@ -1007,6 +1007,7 @@ impl CodeGen {
                 params,
                 return_type,
                 body,
+                ..
             } => {
                 let param_types: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
                 let ret = if return_type.is_some() {
@@ -1803,6 +1804,7 @@ impl CodeGen {
                 params,
                 return_type,
                 body,
+                ..
             } => {
                 let param_types: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
                 let ret = if return_type.is_some() {
@@ -7944,6 +7946,7 @@ impl CodeGen {
                 params,
                 return_type,
                 body,
+                ..
             } => {
                 // P2.3: Lambda 编译：返回 TABLE INDEX（用于 call_indirect）
                 let lambda_idx = self.lambda_counter.get();

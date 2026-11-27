@@ -545,7 +545,7 @@ fn collect_lambdas_from_stmt(stmt: &crate::ast::Stmt, counter: &mut u32, out: &m
 fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &mut Vec<Function>) {
     use crate::ast::{Expr, Param, Visibility};
     match expr {
-        Expr::Lambda { params, return_type, body } => {
+        Expr::Lambda { params, return_type, body, .. } => {
             let idx = *counter;
             *counter += 1;
             let lambda_name = format!("__lambda_{}", idx);

@@ -926,6 +926,39 @@ mod tests {
     // === 覆盖率补充：Parser 单元测试 ===
 
     #[test]
+    fn test_parse_lambda_param_annotation_marker() {
+        // w40a：AST 必须能区分「写了注解」与「未注解」的 λ 形参。
+        let cases = [
+            ("{ a, b => a }", vec![false, false]),
+            ("{ a: Int64, b => b }", vec![true, false]),
+            ("{ a: Int64, b: Int64 => a }", vec![true, true]),
+            ("{ x => x }", vec![false]),
+            ("{ x: Int64 => x }", vec![true]),
+        ];
+        for (lambda_src, expected) in cases {
+            // 用类成员变量初始化式，避免 let/var 绑定的「混合标注」前置检查干扰。
+            let source = format!("class C {{ var f = {} }}", lambda_src);
+            let lexer = Lexer::new(&source);
+            let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+            let mut parser = Parser::new(tokens);
+            let program = parser.parse_program().unwrap();
+            let Some(value) = &program.classes[0].fields[0].default else {
+                panic!("应该有默认值: {}", lambda_src);
+            };
+            let Expr::Lambda {
+                params,
+                param_annotated,
+                ..
+            } = value
+            else {
+                panic!("应该是 lambda: {}", lambda_src);
+            };
+            assert_eq!(params.len(), expected.len(), "{}", lambda_src);
+            assert_eq!(*param_annotated, expected, "{}", lambda_src);
+        }
+    }
+
+    #[test]
     fn test_parse_import_path() {
         let source = "import bar.baz.foo\nfunc main(): Int64 { return 0 }";
         let lexer = Lexer::new(source);
