@@ -76,6 +76,12 @@ pub enum Type {
     String,
     /// 数组类型 Array<T>
     Array(Box<Type>),
+    /// 值类型定长数组 VArray<T, $N>。
+    ///
+    /// 第二个字段为编译期长度（仅能静态识别出的整数字面量；常量名/常量表达式
+    /// 等无法在本地求值时记为 None）。语义分析据此判定 2.1.12 系列规则；
+    /// 代码生成阶段将其视作 [`Type::Array`]（二者 WASM 表示一致）。
+    VArray(Box<Type>, Option<i64>),
     /// 结构体类型 (可选类型实参，如 Point 或 Pair<Int64,String>)
     Struct(String, Vec<Type>),
     /// 元组类型 (T1, T2, ...)
@@ -131,6 +137,7 @@ impl Type {
             Type::Unit => ValType::I32,
             Type::String => ValType::I32,
             Type::Array(_) => ValType::I32,
+            Type::VArray(_, _) => ValType::I32,
             Type::Tuple(_) => ValType::I32,
             Type::Struct(..) => ValType::I32,
             Type::Range => ValType::I32,
@@ -161,6 +168,7 @@ impl Type {
             Type::Unit => 0,
             Type::String => 4,
             Type::Array(_) => 4,
+            Type::VArray(_, _) => 4,
             Type::Tuple(_) => 4,
             Type::Struct(..) => 4,
             Type::Range => 4,

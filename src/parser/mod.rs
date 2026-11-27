@@ -3945,7 +3945,7 @@ mod tests {
     }
     #[test]
     fn test_parse_varray_type_position() {
-        // VArray<T, N> 类型位置：降级为 Array<T>
+        // VArray<T, N> 类型位置：保留 VArray 变体与长度
         let source = "func test() { let a: VArray<Int64, 4> = [] }";
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -3953,10 +3953,13 @@ mod tests {
         let program = parser.parse_program().unwrap();
         match &program.functions[0].body[0] {
             Stmt::Let {
-                ty: Some(Type::Array(inner)),
+                ty: Some(Type::VArray(inner, len)),
                 ..
-            } => assert_eq!(**inner, Type::Int64),
-            other => panic!("期望 VArray 类型降级为 Array，实际: {:?}", other),
+            } => {
+                assert_eq!(**inner, Type::Int64);
+                assert_eq!(*len, Some(4));
+            }
+            other => panic!("期望 VArray 类型保留长度，实际: {:?}", other),
         }
     }
 
@@ -3970,10 +3973,13 @@ mod tests {
         let program = parser.parse_program().unwrap();
         match &program.functions[0].body[0] {
             Stmt::Let {
-                ty: Some(Type::Array(inner)),
+                ty: Some(Type::VArray(inner, len)),
                 ..
-            } => assert_eq!(**inner, Type::Int64),
-            other => panic!("期望 VArray 类型降级为 Array，实际: {:?}", other),
+            } => {
+                assert_eq!(**inner, Type::Int64);
+                assert_eq!(*len, Some(0));
+            }
+            other => panic!("期望 VArray($0) 保留长度 0，实际: {:?}", other),
         }
     }
 
@@ -3988,8 +3994,11 @@ mod tests {
         let ret = program.functions[0].return_type.as_ref().unwrap();
         match ret {
             Type::Array(inner) => match inner.as_ref() {
-                Type::Array(elem) => assert_eq!(**elem, Type::Int64),
-                other => panic!("期望内层降级为 Array，实际: {:?}", other),
+                Type::VArray(elem, len) => {
+                    assert_eq!(**elem, Type::Int64);
+                    assert_eq!(*len, Some(2));
+                }
+                other => panic!("期望内层为 VArray，实际: {:?}", other),
             },
             other => panic!("期望外层为 Array，实际: {:?}", other),
         }

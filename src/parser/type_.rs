@@ -427,7 +427,7 @@ impl Parser {
                 self.expect(Token::Lt)?;
                 let elem_type = self.parse_type()?;
                 self.expect(Token::Comma)?;
-                let _len = self.parse_varray_len()?;
+                let len = self.parse_varray_len()?;
                 if self.check(&Token::Gt) {
                     self.advance();
                 } else if self.check(&Token::Shr) {
@@ -444,7 +444,7 @@ impl Parser {
                         "`>`".to_string(),
                     ));
                 }
-                Ok(Type::Array(Box::new(elem_type)))
+                Ok(Type::VArray(Box::new(elem_type), len))
             }
             Some(Token::TypeTuple) => {
                 // 裸 Tuple 用于类型别名场景：type Tuple = (Int64, Int64)

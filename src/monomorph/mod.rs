@@ -29,6 +29,7 @@ fn type_mangle_suffix(ty: &Type) -> String {
         Type::Unit => "Unit".to_string(),
         Type::String => "String".to_string(),
         Type::Array(inner) => format!("Array_{}", type_mangle_suffix(inner)),
+        Type::VArray(inner, _) => format!("Array_{}", type_mangle_suffix(inner)),
         Type::Tuple(types) => format!(
             "Tuple_{}",
             types

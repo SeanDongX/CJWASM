@@ -348,6 +348,11 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     let mut errors = Vec::new();
     let index = ProgramIndex::new(program);
 
+    // w29b：VArray<T, $N> 长度/元素类型/下标（2.1.12 系列，单文件可判定部分）。
+    check_varray_rules(program, &mut errors);
+    // w29b：数组切片下标必须是 Range<Int64>（2.2.1.4(1)）。
+    check_w29b_range_index(program, &mut errors);
+
     check_function_groups(program, &index, &mut errors);
     // 11.1.5.1(8)：程序入口点 main 的签名。
     check_main_signature(program, &mut errors);
@@ -23447,6 +23452,14 @@ fn check_trailing_closure_last_param(program: &Program, errors: &mut Vec<Semanti
                                         let owner = locals.get(o).cloned().unwrap_or_else(|| o.clone());
                                         methods.get(&(owner, field.clone())).cloned()
                                     }
+                                    // 枚举变体上的成员函数引用 `EnumName.Variant.method`：
+                                    // 以枚举类型名作为 owner 查找方法签名。
+                                    Expr::Field { object: root, .. } => match root.as_ref() {
+                                        Expr::Var(o) => {
+                                            methods.get(&(o.clone(), field.clone())).cloned()
+                                        }
+                                        _ => None,
+                                    },
                                     _ => None,
                                 },
                                 _ => None,
@@ -23478,6 +23491,24 @@ fn check_trailing_closure_last_param(program: &Program, errors: &mut Vec<Semanti
                         });
                     }
                 }
+            }
+            // 5.3.3(1)：parser 把 `f(a){...}` 折叠为带 Lambda 末位实参的 Call /
+            // MethodCall。若被调用者末位形参确凿不是函数类型，则该尾随 lambda 非法
+            // （如函数变量指向 `g(fn, a: Int64)` 时 `v(1){...}`）。
+            match e {
+                Expr::Call { args, .. } | Expr::MethodCall { args, .. } => {
+                    if matches!(args.last(), Some(Expr::Lambda { .. })) {
+                        if let Some(ty) = last_param(e, &locals, &vfuncs) {
+                            if definitely_non_func(&ty) {
+                                errors.push(SemanticError {
+                                    message: "尾随 lambda 只能作为最后一个函数类型形参的实参（5.3.3(1)）"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         };
         walk_stmts(stmts, &mut report);
@@ -29860,6 +29891,7 @@ fn w28_ty_of_type(t: &Type) -> W28Ty {
         Type::String => W28Ty::Str,
         Type::Unit => W28Ty::Unit,
         Type::Array(x) => W28Ty::Array(Box::new(w28_ty_of_type(x))),
+        Type::VArray(x, _) => W28Ty::Array(Box::new(w28_ty_of_type(x))),
         Type::Nothing => W28Ty::Unknown,
         _ => W28Ty::User,
     }
@@ -30183,9 +30215,26 @@ fn w28_scan_stmts(
                 w28_check_expr(e, env, retmap, dups, has_index_op, errors);
                 w28_try_consumed_check(e, env, retmap, errors);
             }
-            Stmt::Assign { value, .. } => {
+            Stmt::Assign { target, value } => {
                 w28_check_expr(value, env, retmap, dups, has_index_op, errors);
                 w28_try_consumed_check(value, env, retmap, errors);
+                // 常量下标写入越界：仅针对长度可确定、且未被重新赋值的数组字面量绑定。
+                if !has_index_op {
+                    if let crate::ast::AssignTarget::Index { array, index } = target {
+                        if let Some((_, Some(l))) = env.get(array) {
+                            if let Some(n) = w28_const_int(index) {
+                                if !dups.contains(array) && (n < 0 || n as u64 >= *l as u64) {
+                                    errors.push(SemanticError {
+                                        message: format!(
+                                            "数组下标越界：常量下标 {} 超出数组长度 {}（1.4(3)/4.12）",
+                                            n, l
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Stmt::While { cond, body } => {
                 w28_check_expr(cond, env, retmap, dups, has_index_op, errors);
@@ -30334,6 +30383,395 @@ fn check_w28d_array_index_and_numeric(program: &Program, errors: &mut Vec<Semant
     for x in &program.extends {
         for m in &x.methods {
             run_body(&m.body, &m.params);
+        }
+    }
+}
+
+// ─── w29b：VArray<T, $N> 长度保留 + 2.1.12 系列可判定规则 ────────────────────
+//
+// 解析阶段保留 VArray 变体与长度（Type::VArray）。此处做单文件可判定的检查：
+//   * 2.1.12(1)：VArray 元素类型不能是引用类型（class）；
+//   * 2.1.12.1(4)/(5)：标注长度 $N 与初始化表达式元素数量必须一致；
+//   * 2.1.12(3)：常量下标越界（下标值可静态确定时）；
+//   * 2.1.12(7)/(8)：长度不同的 VArray 不能相互赋值（经由变量长度追踪）。
+// 仅在长度/元素类型可静态确定时报错，其余一律保守放行以免误伤。
+
+fn varray_resolve_alias<'a>(ty: &'a Type, aliases: &'a HashMap<String, Type>) -> &'a Type {
+    let mut cur = ty;
+    for _ in 0..16 {
+        if let Type::Struct(name, args) = cur {
+            if args.is_empty() {
+                if let Some(next) = aliases.get(name) {
+                    cur = next;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    cur
+}
+
+fn varray_elem_is_class(
+    elem: &Type,
+    aliases: &HashMap<String, Type>,
+    classes: &HashSet<String>,
+) -> Option<String> {
+    match varray_resolve_alias(elem, aliases) {
+        Type::Struct(name, _) if classes.contains(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// 推断初始化表达式作为 VArray 初值时的元素数量。
+/// `Some(Some(n))` 确定为 n 个；`Some(None)` 为 VArray 形态但数量未知；
+/// `None` 表示不是可识别的 VArray 初值（保守放行）。
+fn varray_init_count(e: &Expr, env: &HashMap<String, Option<i64>>) -> Option<Option<i64>> {
+    match e {
+        Expr::Array(items) => Some(Some(items.len() as i64)),
+        Expr::ConstructorCall { name, args, .. } if name == "Array" => match args.first() {
+            Some(Expr::Integer(n)) => Some(Some(*n)),
+            _ => Some(None),
+        },
+        Expr::Var(n) => env.get(n).copied(),
+        _ => None,
+    }
+}
+
+fn varray_report_oob(k: i64, len: i64, errors: &mut Vec<SemanticError>) {
+    if k < 0 || (k as u64) >= (len as u64) {
+        errors.push(SemanticError {
+            message: format!(
+                "VArray 常量下标 {} 超出长度 {}（2.1.12(3)）",
+                k, len
+            ),
+        });
+    }
+}
+
+fn varray_check_index(
+    e: &Expr,
+    env: &HashMap<String, Option<i64>>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if let Expr::Index { array, index } = e {
+        if let Expr::Var(name) = array.as_ref() {
+            if let Some(len) = env.get(name).copied().flatten() {
+                if let Some(k) = w28_const_int(index) {
+                    varray_report_oob(k, len, errors);
+                }
+            }
+        }
+    }
+}
+
+fn varray_check_binding(
+    name: Option<&str>,
+    ty: Option<&Type>,
+    value: &Expr,
+    env: &mut HashMap<String, Option<i64>>,
+    aliases: &HashMap<String, Type>,
+    classes: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if let Some(Type::VArray(elem, len)) = ty {
+        if let Some(cls) = varray_elem_is_class(elem, aliases, classes) {
+            errors.push(SemanticError {
+                message: format!(
+                    "VArray 的元素类型不能是引用类型 class '{}'（2.1.12(1)）",
+                    cls
+                ),
+            });
+        }
+        let init = varray_init_count(value, env);
+        if let (Some(n), Some(Some(m))) = (len, init) {
+            if *n != m {
+                errors.push(SemanticError {
+                    message: format!(
+                        "VArray 标注长度 ${} 与初始化元素数量 {} 不一致（2.1.12.1(4)）",
+                        n, m
+                    ),
+                });
+            }
+        }
+        if let Some(nm) = name {
+            let tracked = match len {
+                Some(n) => Some(*n),
+                None => match init {
+                    Some(Some(m)) => Some(m),
+                    _ => None,
+                },
+            };
+            env.insert(nm.to_string(), tracked);
+        }
+    }
+}
+
+fn varray_scan_stmts(
+    stmts: &[Stmt],
+    env: &mut HashMap<String, Option<i64>>,
+    aliases: &HashMap<String, Type>,
+    classes: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, ty, value } | Stmt::Var { pattern, ty, value } => {
+                walk_expr(value, &mut |sub| varray_check_index(sub, env, errors));
+                let name = if let crate::ast::Pattern::Binding(n) = pattern {
+                    Some(n.as_str())
+                } else {
+                    None
+                };
+                varray_check_binding(name, ty.as_ref(), value, env, aliases, classes, errors);
+            }
+            Stmt::Const { name, ty, value } => {
+                walk_expr(value, &mut |sub| varray_check_index(sub, env, errors));
+                varray_check_binding(
+                    Some(name.as_str()),
+                    ty.as_ref(),
+                    value,
+                    env,
+                    aliases,
+                    classes,
+                    errors,
+                );
+            }
+            Stmt::Assign { target, value } => {
+                walk_expr(value, &mut |sub| varray_check_index(sub, env, errors));
+                if let crate::ast::AssignTarget::Index { array, index } = target {
+                    if let Some(len) = env.get(array).copied().flatten() {
+                        if let Some(k) = w28_const_int(index) {
+                            varray_report_oob(k, len, errors);
+                        }
+                    }
+                }
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => {
+                walk_expr(e, &mut |sub| varray_check_index(sub, env, errors));
+            }
+            Stmt::While { cond, body } => {
+                walk_expr(cond, &mut |sub| varray_check_index(sub, env, errors));
+                let mut inner = env.clone();
+                varray_scan_stmts(body, &mut inner, aliases, classes, errors);
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                walk_expr(expr, &mut |sub| varray_check_index(sub, env, errors));
+                let mut inner = env.clone();
+                varray_scan_stmts(body, &mut inner, aliases, classes, errors);
+            }
+            Stmt::DoWhile { body, cond } => {
+                let mut inner = env.clone();
+                varray_scan_stmts(body, &mut inner, aliases, classes, errors);
+                walk_expr(cond, &mut |sub| varray_check_index(sub, env, errors));
+            }
+            Stmt::For {
+                var,
+                iterable,
+                body,
+            } => {
+                walk_expr(iterable, &mut |sub| varray_check_index(sub, env, errors));
+                let mut inner = env.clone();
+                inner.insert(var.clone(), None);
+                varray_scan_stmts(body, &mut inner, aliases, classes, errors);
+            }
+            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+                let mut inner = env.clone();
+                varray_scan_stmts(body, &mut inner, aliases, classes, errors);
+            }
+            Stmt::LocalFunc(f) => {
+                let mut child = env.clone();
+                for p in &f.params {
+                    if let Type::VArray(_, len) = &p.ty {
+                        child.insert(p.name.clone(), *len);
+                    }
+                }
+                varray_scan_stmts(&f.body, &mut child, aliases, classes, errors);
+            }
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                walk_expr(left, &mut |sub| varray_check_index(sub, env, errors));
+                walk_expr(right, &mut |sub| varray_check_index(sub, env, errors));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_varray_rules(program: &Program, errors: &mut Vec<SemanticError>) {
+    let aliases: HashMap<String, Type> = program.type_aliases.iter().cloned().collect();
+    let classes: HashSet<String> = program.classes.iter().map(|c| c.name.clone()).collect();
+    let run_body = |body: &[Stmt],
+                    params: &[crate::ast::Param],
+                    aliases: &HashMap<String, Type>,
+                    classes: &HashSet<String>,
+                    errors: &mut Vec<SemanticError>| {
+        let mut env: HashMap<String, Option<i64>> = HashMap::new();
+        for p in params {
+            if let Type::VArray(_, len) = &p.ty {
+                env.insert(p.name.clone(), *len);
+            }
+        }
+        varray_scan_stmts(body, &mut env, aliases, classes, errors);
+    };
+    for f in &program.functions {
+        run_body(&f.body, &f.params, &aliases, &classes, errors);
+    }
+    for c in &program.classes {
+        for i in &c.inits {
+            run_body(&i.body, &i.params, &aliases, &classes, errors);
+        }
+        for m in &c.methods {
+            run_body(&m.func.body, &m.func.params, &aliases, &classes, errors);
+        }
+        if let Some(si) = &c.static_init {
+            run_body(si, &[], &aliases, &classes, errors);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            run_body(&i.body, &i.params, &aliases, &classes, errors);
+        }
+    }
+    for x in &program.extends {
+        for m in &x.methods {
+            run_body(&m.body, &m.params, &aliases, &classes, errors);
+        }
+    }
+}
+
+// ─── w29b：数组切片下标必须是 Range<Int64>（2.2.1.4(1)） ──────────────────
+//
+// `Array<T>` 只能用 `Range<Int64>` 作下标截取切片；`Range<Int32>` 等其它整数
+// 实参非法。仅当被下标对象/变量类型可静态确定时判定，存在 `operator func[]`
+// 重载时不判定（保守放行）。
+
+fn w29b_range_elem_is_non_i64(ty: &Type) -> bool {
+    if let Type::Struct(name, args) = ty {
+        if name == "Range" && args.len() == 1 {
+            return args[0] != Type::Int64;
+        }
+    }
+    false
+}
+
+fn w29b_range_scan_expr(e: &Expr, ranges: &HashSet<String>, errors: &mut Vec<SemanticError>) {
+    walk_expr(e, &mut |sub| {
+        if let Expr::Index { index, .. } = sub {
+            if let Expr::Var(name) = index.as_ref() {
+                if ranges.contains(name) {
+                    errors.push(SemanticError {
+                        message: "数组切片下标必须是 Range<Int64>，不能使用其它整数类型的 Range（2.2.1.4(1)）"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    });
+}
+
+fn w29b_range_scan_stmts(
+    stmts: &[Stmt],
+    ranges: &mut HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, ty, value } | Stmt::Var { pattern, ty, value } => {
+                w29b_range_scan_expr(value, ranges, errors);
+                if let (Some(t), crate::ast::Pattern::Binding(n)) = (ty.as_ref(), pattern) {
+                    if w29b_range_elem_is_non_i64(t) {
+                        ranges.insert(n.clone());
+                    }
+                }
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => w29b_range_scan_expr(e, ranges, errors),
+            Stmt::Assign { value, .. } => w29b_range_scan_expr(value, ranges, errors),
+            Stmt::While { cond, body } => {
+                w29b_range_scan_expr(cond, ranges, errors);
+                let mut inner = ranges.clone();
+                w29b_range_scan_stmts(body, &mut inner, errors);
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                w29b_range_scan_expr(expr, ranges, errors);
+                let mut inner = ranges.clone();
+                w29b_range_scan_stmts(body, &mut inner, errors);
+            }
+            Stmt::DoWhile { body, cond } => {
+                let mut inner = ranges.clone();
+                w29b_range_scan_stmts(body, &mut inner, errors);
+                w29b_range_scan_expr(cond, ranges, errors);
+            }
+            Stmt::For { iterable, body, .. } => {
+                w29b_range_scan_expr(iterable, ranges, errors);
+                let mut inner = ranges.clone();
+                w29b_range_scan_stmts(body, &mut inner, errors);
+            }
+            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+                let mut inner = ranges.clone();
+                w29b_range_scan_stmts(body, &mut inner, errors);
+            }
+            Stmt::LocalFunc(f) => {
+                let mut child = ranges.clone();
+                w29b_range_scan_stmts(&f.body, &mut child, errors);
+            }
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                w29b_range_scan_expr(left, ranges, errors);
+                w29b_range_scan_expr(right, ranges, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_w29b_range_index(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 存在 `operator func[]` 重载时不判定（自定义下标可能接受任意 Range 实参）。
+    let has_index_op = {
+        let is_index_op =
+            |member: &str| member.contains("[]") || member.contains("op_index") || member == "index";
+        program.extends.iter().any(|x| {
+            x.methods.iter().any(|m| {
+                let member = m.name.rsplit('.').next().unwrap_or(&m.name);
+                is_index_op(member)
+            })
+        }) || program.classes.iter().any(|c| {
+            c.methods.iter().any(|m| {
+                let member = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+                is_index_op(member)
+            })
+        }) || program.functions.iter().any(|m| {
+            let member = m.name.rsplit('.').next().unwrap_or(&m.name);
+            is_index_op(member)
+        })
+    };
+    if has_index_op {
+        return;
+    }
+    let run_body = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let mut ranges: HashSet<String> = HashSet::new();
+        w29b_range_scan_stmts(body, &mut ranges, errors);
+    };
+    for f in &program.functions {
+        run_body(&f.body, errors);
+    }
+    for c in &program.classes {
+        for i in &c.inits {
+            run_body(&i.body, errors);
+        }
+        for m in &c.methods {
+            run_body(&m.func.body, errors);
+        }
+        if let Some(si) = &c.static_init {
+            run_body(si, errors);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            run_body(&i.body, errors);
+        }
+    }
+    for x in &program.extends {
+        for m in &x.methods {
+            run_body(&m.body, errors);
         }
     }
 }
