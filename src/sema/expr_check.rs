@@ -1374,13 +1374,16 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                     all_default = false;
                 }
             }
-            // 若存在与结构体同名的成员函数（`func StructName(...)`）或同名顶层函数，
-            // 该名字的调用是函数调用而非构造调用，不登记隐式构造函数。
-            let method_prefix = format!("{}.", s.name);
+            // 仅当存在与结构体**同名**的顶层函数或同名成员函数（`func S(...)`
+            // 脱糖为 `S.S`）时，`S(...)` 才是函数调用而非构造调用；运算符等
+            // 普通成员方法（`S.op_index`）不影响隐式构造函数的登记
+            // （4.23/a15_174：struct S 仅有 operator func[] 时 `S(x: 3)` 仍须
+            // 因“不存在名为 'x' 的形参”被拒）。
+            let member_name = format!("{}.{}", s.name, s.name);
             let has_named_func = program
                 .functions
                 .iter()
-                .any(|f| f.name == s.name || f.name.starts_with(&method_prefix));
+                .any(|f| f.name == s.name || f.name == member_name);
             if all_default && !has_named_func {
                 sigs.push(CtorSig { params: vec![] });
             }
@@ -13064,4 +13067,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_w25a_struct_member_method_does_not_hide_implicit_ctor() {
+        // 4.23/a15_174：struct 仅有 operator func[]（脱糖 `S.op_index`）时，
+        // 隐式无参构造函数仍存在，`S(x: 3)` 因“不存在名为 'x' 的形参”被拒。
+        assert_err(
+            "struct S {\n\
+             \x20   operator func[](i: Int64, value!: UIntNative) {}\n\
+             }\n\
+             main() {\n\
+             \x20   var s: ?S = S(x: 3)\n\
+             \x20   s?[0] = 1\n\
+             }\n",
+            "不存在名为 'x' 的形参",
+        );
+        // 显式 init 存在时按其签名匹配（正例 a21_03 形态放行）。
+        assert_ok(
+            "struct S {\n\
+             \x20   S(var x!: Int64) {}\n\
+             \x20   operator func[](i: Int64, value!: Int64) {}\n\
+             }\n\
+             main() {\n\
+             \x20   var s: ?S = S(x: 3)\n\
+             \x20   s?[0] = 9\n\
+             }\n",
+        );
+    }
 }
