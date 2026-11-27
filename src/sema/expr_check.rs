@@ -369,6 +369,10 @@ fn ty_of(ty: &Type) -> Ty {
         Type::Tuple(ts) if ts.is_empty() => Ty::Unit,
         Type::Tuple(ts) => Ty::Tuple(ts.iter().map(ty_of).collect()),
         Type::Array(inner) => Ty::Array(Box::new(ty_of(inner))),
+        // VArray 与 Array 在可赋值性/构造实参与等所有 sema 判定中同语义
+        //（w29b 根治保留了 AST 长度，类型层面仍按数组处理；6.1.2.1(8)
+        // VArray 形参构造调用实参失配依此恢复拒绝——a08_26 等 4 例回转）。
+        Type::VArray(inner, _) => Ty::Array(Box::new(ty_of(inner))),
         Type::Range => Ty::Agg("range"),
         // 函数类型：与元组/数组等聚合类型互不可赋值；lambda 实参推断为 Unknown，
         // 因此不会误伤把 lambda 传给函数形参的合法调用。
