@@ -910,6 +910,15 @@ struct Checker<'a> {
     /// 以 `Type.method` 形式记录的所有成员函数名（class/struct/extend）。
     /// 用于识别 `obj.method = ...` 这类“把方法当变量赋值”的非法目标。
     qualified_methods: HashSet<String>,
+    /// 限定名 `Owner.member` → 各重载的普通位置形参元数。空 Vec 表示该名
+    /// 存在非普通（命名/变长/inout）重载，保守放行不检查。
+    method_arities: HashMap<String, Vec<MethodArity>>,
+    /// (类型, 泛型成员方法裸名)：带类型形参的成员方法集合。作为值引用
+    /// （无调用括号、无类型实参）时非法（4.13/a04_04）。
+    generic_method_names: HashSet<(String, String)>,
+    /// 正在检查 `?` 后缀形态（Invoke 的 Try 被调用者 / Index 的 Try 数组）。
+    /// 可选调用/可选索引糖中的 Try 不是提前返回糖，跳过 ret_ty 判定。
+    try_suffix_depth: u32,
     /// 定义了 `operator func []` 的用户类型（任意形态）。
     index_op_types: HashSet<String>,
     /// 定义了 set 形态 `[]`（索引参数 + 值参数）的用户类型。
@@ -981,6 +990,17 @@ struct CtorParam {
 #[derive(Clone)]
 struct CtorSig {
     params: Vec<CtorParam>,
+}
+
+/// 一个成员方法的“位置实参接受能力”签名（10.1.2.1 方法调用元数判定，
+/// 4.13/a04_06..09：`s.invoke(42)` 缺实参、`s.invoke { λ }` 尾随 λ 绑定后
+/// 个数不足均非法）。仅当全部形参为普通位置形参（无命名/变长/inout）时登记。
+#[derive(Clone)]
+struct MethodArity {
+    /// 位置形参（非 this/self）个数
+    positional: usize,
+    /// 其中必需（无默认值）的个数
+    required: usize,
 }
 
 /// 一个顶层自由函数的“位置实参接受能力”签名（10.1.2.1：可见函数集/重载决议）。
@@ -1653,6 +1673,212 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
             qualified_methods.insert(f.name.clone());
         }
     }
+    // 成员方法元数表（10.1.2.1 方法调用元数判定）。三源合并：
+    // 脱糖顶层函数（struct/enum 成员）、class 成员方法、extend 扩展方法。
+    // 形参剔除 this/self；含命名/变长/inout 形参的重载使整个键置空（保守放行）。
+    let mut method_arities: HashMap<String, Vec<MethodArity>> = HashMap::new();
+    let mut generic_method_names: HashSet<(String, String)> = HashSet::new();
+    {
+        let mut record = |fq: &str, params: &[crate::ast::Param]| {
+            let member = fq.rsplit_once('.').map(|(_, m)| m).unwrap_or("");
+            if member.starts_with("op_")
+                || member.starts_with("__")
+                || member.is_empty()
+            {
+                return;
+            }
+            // 解析器自动插入的接收者形参（名 this 且类型恰为
+            // Struct(owner, 类型实参)，class/struct/extend 三处插入点形态一致）
+            // 不计入调用实参；用户显式声明的 `self`/`this`（本仓两种方言：
+            // class.cj 手动传接收者 vs generic_advanced.cj 自动接收者）调用
+            // 约定不一致，此类方法整体跳过元数判定。
+            let owner = fq.rsplit_once('.').map(|(o, _)| o).unwrap_or("");
+            let auto_receiver = params.first().map_or(false, |p| {
+                p.name == "this"
+                    && matches!(&p.ty, crate::ast::Type::Struct(o, _)
+                        if o == owner)
+            });
+            let has_user_receiver =
+                params.iter().any(|p| p.name == "this" || p.name == "self");
+            if has_user_receiver && !auto_receiver {
+                method_arities.insert(fq.to_string(), Vec::new());
+                return;
+            }
+            let plain: Vec<&crate::ast::Param> = if auto_receiver {
+                params.iter().skip(1).collect()
+            } else {
+                params.iter().collect()
+            };
+            // Array 形参收集糖（05/03 a01：`f0(arr: Array<Int64>)` 可按
+            // f0()/f0(1)/f0(1,2,3) 任意个数展开）与命名/变长/inout 形参
+            // 一样使元数不可静态判定；已标记跳过的键（空 Vec 哨兵）不可
+            // 再被同名的其他重载 push 污染。
+            if plain.iter().any(|p| {
+                p.is_named
+                    || p.variadic
+                    || p.is_inout
+                    || matches!(&p.ty, crate::ast::Type::Array(_))
+                    || matches!(&p.ty, crate::ast::Type::Struct(n, _)
+                        if n == "Array" || n == "VArray")
+            }) {
+                method_arities.insert(fq.to_string(), Vec::new());
+                return;
+            }
+            if let Some(v) = method_arities.get(fq) {
+                if v.is_empty() {
+                    return; // 已有非普通重载标记为跳过
+                }
+            }
+            let positional = plain.len();
+            let required = plain.iter().filter(|p| p.default.is_none()).count();
+            method_arities
+                .entry(fq.to_string())
+                .or_default()
+                .push(MethodArity { positional, required });
+        };
+        for f in &program.functions {
+            if f.name.contains('.') {
+                record(&f.name, &f.params);
+            }
+        }
+        for c in &program.classes {
+            for m in &c.methods {
+                record(&m.func.name, &m.func.params);
+            }
+        }
+        for ext in &program.extends {
+            for f in &ext.methods {
+                record(&f.name, &f.params);
+            }
+        }
+        for itf in &program.interfaces {
+            for m in &itf.methods {
+                record(&format!("{}.{}", itf.name, m.name), &m.params);
+            }
+        }
+        // 4.13/a04_04：泛型成员方法（带类型形参）的 (owner, 裸名) 集合。
+        let mut add_generic = |fq: &str, has_tp: bool| {
+            if !has_tp {
+                return;
+            }
+            if let Some((owner, member)) = fq.rsplit_once('.') {
+                if !member.starts_with("op_") && !member.starts_with("__") {
+                    generic_method_names.insert((owner.to_string(), member.to_string()));
+                }
+            }
+        };
+        for f in &program.functions {
+            if f.name.contains('.') {
+                add_generic(&f.name, !f.type_params.is_empty());
+            }
+        }
+        for c in &program.classes {
+            for m in &c.methods {
+                add_generic(&m.func.name, !m.func.type_params.is_empty());
+            }
+        }
+        for ext in &program.extends {
+            for f in &ext.methods {
+                add_generic(&f.name, !f.type_params.is_empty());
+            }
+        }
+    }
+
+    // 继承闭包展开：父类/父接口的方法元数并入子类键（06/02 a15：`c1.f()`
+    // 的 f 声明在父类/接口时，接收者类型解析为子类）。空 Vec（跳过哨兵）
+    // 不传播；至多 32 轮不动点迭代（含环防御）。
+    {
+        let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+        for c in &program.classes {
+            let mut ps: Vec<String> = c.implements.clone();
+            if let Some(e) = &c.extends {
+                ps.push(e.clone());
+            }
+            edges.insert(c.name.clone(), ps);
+        }
+        for itf in &program.interfaces {
+            edges.insert(itf.name.clone(), itf.parents.clone());
+        }
+        // struct/enum 的 `<: I` 记在 constraints（param == 自身名，形态同枚举，
+        // 见 check_struct_type_rules）。
+        for st in &program.structs {
+            let ps: Vec<String> = st
+                .constraints
+                .iter()
+                .filter(|c| c.param == st.name)
+                .flat_map(|c| c.bounds.iter().cloned())
+                .collect();
+            edges.insert(st.name.clone(), ps);
+        }
+        for en in &program.enums {
+            let ps: Vec<String> = en
+                .constraints
+                .iter()
+                .filter(|c| c.param == en.name)
+                .flat_map(|c| c.bounds.iter().cloned())
+                .collect();
+            edges.insert(en.name.clone(), ps);
+        }
+        for _ in 0..32 {
+            let mut additions: Vec<(String, Option<MethodArity>)> = Vec::new();
+            for (child, parents) in &edges {
+                for p in parents {
+                    let prefix = format!("{}.", p);
+                    for (pk, sigs) in &method_arities {
+                        let Some(member) = pk.strip_prefix(&prefix) else {
+                            continue;
+                        };
+                        if member.contains('.') {
+                            continue;
+                        }
+                        let ck = format!("{}.{}", child, member);
+                        // 父链存在非普通重载（空 Vec 哨兵）时子键同样不可判定
+                        // （03/02 a06_02：Base.g(x!: Bool = true) 命名默认形参
+                        // 才是 0 实参调用的归属），哨兵向下传播。
+                        if sigs.is_empty() {
+                            let child = method_arities.get(&ck);
+                            if child.map_or(true, |v| !v.is_empty()) {
+                                additions.push((ck, None));
+                            }
+                            continue;
+                        }
+                        // 空 Vec 哨兵不可污染；非空子键仍需并入父类重载
+                        // （06/02 a15：`c2.f1()` 命中父类 f1()，子类仅有
+                        // f1(String)），按 (positional, required) 去重防不动点
+                        // 迭代爆炸。
+                        let child_sigs = method_arities.get(&ck);
+                        if child_sigs.map_or(false, |v| v.is_empty()) {
+                            continue;
+                        }
+                        for s in sigs {
+                            let dup = child_sigs.map_or(false, |v| {
+                                v.iter().any(|x| {
+                                    x.positional == s.positional
+                                        && x.required == s.required
+                                })
+                            });
+                            if !dup {
+                                additions.push((ck.clone(), Some(s.clone())));
+                            }
+                        }
+                    }
+                }
+            }
+            if additions.is_empty() {
+                break;
+            }
+            for (ck, s) in additions {
+                match s {
+                    Some(sig) => method_arities.entry(ck).or_default().push(sig),
+                    // 覆盖（含把非空子键转为哨兵——父链上出现任何非普通
+                    // 重载即整体不可判定）。
+                    None => {
+                        method_arities.insert(ck, Vec::new());
+                    }
+                }
+            }
+        }
+    }
     // `operator func []` 的 set 形态带“索引 + 值”共 2 个非 self 参数；
     // get 形态只有索引 1 个。用于判定 `a[i] = v` / `a?[i] = v` 是否合法。
     let mut index_op_types: HashSet<String> = HashSet::new();
@@ -1886,6 +2112,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         cur_struct: None,
         enum_variants,
         qualified_methods,
+        method_arities,
+        generic_method_names,
+        try_suffix_depth: 0,
         index_op_types,
         index_set_types,
         const_funcs,
@@ -4034,6 +4263,43 @@ impl<'a> Checker<'a> {
                 .map(|(_, m)| m == name)
                 .unwrap_or(false)
         })
+    }
+
+    /// 10.1.2.1：方法调用位置实参个数与全部重载均不匹配时报错。
+    /// 仅当该方法全部重载均为普通位置形参（表值为空 Vec 表示存在非普通重载，
+    /// 保守放行）时判定；形参个数介于 required..=positional（含默认值兜底）即可。
+    fn check_method_call_arity(&mut self, recv_ty: &str, method: &str, argc: usize) {
+        let key = format!("{}.{}", recv_ty, method);
+        let Some(sigs) = self.method_arities.get(&key) else {
+            return;
+        };
+        if sigs.is_empty() {
+            return;
+        }
+        // 仅判定“实参不足”（argc < required）。“实参过多”方向放行：官方
+        // std 套件存在依赖宽松元数的正例（unittest/prop_test/coverage 的
+        // `rs.nextUInt8(1)` 对 0 参方法传 1 实参），且集合/接口经父链合并的
+        // 保守界可能导致误报；4.13/a04_06..09 的目标形态均为缺参。
+        if sigs.iter().any(|s| argc >= s.required) {
+            return;
+        }
+        let want: Vec<String> = sigs
+            .iter()
+            .map(|s| {
+                if s.required == s.positional {
+                    s.positional.to_string()
+                } else {
+                    format!("{}..{}", s.required, s.positional)
+                }
+            })
+            .collect();
+        self.err(format!(
+            "方法调用 '{}.{}' 的位置实参个数 {} 与全部重载（{}）均不匹配（10.1.2.1）",
+            recv_ty,
+            method,
+            argc,
+            want.join("/")
+        ));
     }
 
     /// 6.1.2.1(8)/(9)：校验构造调用 `ClassName(args, named: ..)` 与某个构造函数
@@ -7566,7 +7832,7 @@ impl<'a> Checker<'a> {
                 type_args,
             } => {
                 self.strict_member_obj_depth += 1;
-                self.check_expr(object);
+                let obj_ty = self.check_expr(object);
                 self.strict_member_obj_depth -= 1;
                 // 2.1.11.2：枚举构造值上调用构造器（`A(0).B(..)`）非法。
                 self.check_enum_ctor_member(object, method);
@@ -7609,6 +7875,27 @@ impl<'a> Checker<'a> {
                 if let Some((recv_ty, via_type)) = self.receiver_user(object) {
                     self.check_class_member_access(&recv_ty, via_type, method);
                     self.check_interface_member_exists(&recv_ty, method);
+                }
+                // 10.1.2.1（方法调用元数，4.13/a04_06..09）：仅当调用无命名实参、
+                // 接收者静态类型可解析为本地用户类型、且该方法全部重载均为
+                // 普通位置形参时判定。尾随 λ 已由解析器并入 args（绑定 1 个实参）。
+                // `obj.m<T>`（泛型方法引用作为值，无调用括号，4.13 正例 a04_01
+                // `let r = s.genFun<String>`）被解析器折叠为 MethodCall{args:[],
+                // type_args:Some}，与空参调用 `obj.m<T>()` 在 AST 上不可区分，
+                // 保守跳过该形态。
+                if named_args.is_empty()
+                    && !(type_args.is_some() && args.is_empty())
+                {
+                    let recv = match self.receiver_user(object) {
+                        Some((n, _)) => Some(n),
+                        None => match obj_ty {
+                            Ty::User(ref n) => Some(n.clone()),
+                            _ => None,
+                        },
+                    };
+                    if let Some(recv_ty) = recv {
+                        self.check_method_call_arity(&recv_ty, method, args.len());
+                    }
                 }
                 // 2.1.10.4(6)：结构体私有成员函数仅可在定义体内调用。
                 if let Some(ty_name) = self.receiver_struct_ty(object) {
@@ -7898,6 +8185,23 @@ impl<'a> Checker<'a> {
                 if let Some((recv_ty, via_type)) = self.receiver_user(object) {
                     self.check_class_member_access(&recv_ty, via_type, field);
                     self.check_interface_member_exists(&recv_ty, field);
+                    // 4.13/a04_04：泛型方法作为值引用（无调用括号且未提供
+                    // 类型实参）非法——`let f = s.foo`（foo<T>）；正例
+                    // `s.genFun<String>` 由解析器折叠为 MethodCall{type_args}
+                    // 不经过本臂。仅限**实例接收者**：类型名限定的
+                    // `T1.f<Box<Unit>>()`（06/03 a06_05 正例）会被解析成比较
+                    // 链使本臂见到 `T1.f`，via_type 时跳过。非泛型方法引用作
+                    // 值官方判正（a04_01 等），不可扩大化。
+                    if !via_type
+                        && self
+                            .generic_method_names
+                            .contains(&(recv_ty.clone(), field.to_string()))
+                    {
+                        self.err(format!(
+                            "泛型方法 '{}.{}' 作为值使用必须提供类型实参（4.13）",
+                            recv_ty, field
+                        ));
+                    }
                 }
                 // 2.1.10.4(6)：私有实例成员仅可在结构体定义体内访问。
                 if let Some(ty_name) = self.receiver_struct_ty(object) {
@@ -8032,7 +8336,15 @@ impl<'a> Checker<'a> {
                     );
                 }
                 // 被调用者类型仅用于下方的“非函数值不可调用”判定（不设标志）。
+                // `x?(...)` 的 Try 被调用者属可选调用糖：跳过提前返回判定。
+                let is_try_callee = matches!(&**callee, Expr::Try(_));
+                if is_try_callee {
+                    self.try_suffix_depth += 1;
+                }
                 let callee_ty = self.check_expr(callee);
+                if is_try_callee {
+                    self.try_suffix_depth -= 1;
+                }
                 // 4.13(4)：被调用者须为函数类型（或用户类型重载了 `()`）。
                 // 仅对静态类型可确定的**复合操作数**判定；`Var` 可能表示函数名
                 // （trailing lambda / 泛型实例化 / 组合脱糖），其静态类型记录的是
@@ -8158,7 +8470,14 @@ impl<'a> Checker<'a> {
                 } else {
                     self.check_missing_question(array, "[]");
                 }
+                let is_try_arr = matches!(&**array, Expr::Try(_));
+                if is_try_arr {
+                    self.try_suffix_depth += 1;
+                }
                 let base_ty = self.check_expr(array);
+                if is_try_arr {
+                    self.try_suffix_depth -= 1;
+                }
                 let idx_ty = self.check_expr(index);
                 // 2.1.4(2)：Unit 类型未定义下标运算符 []。
                 if base_ty == Ty::Unit {
@@ -8615,7 +8934,27 @@ impl<'a> Checker<'a> {
                 }
             }
 
-            Expr::Try(inner) => self.check_expr(inner),
+            Expr::Try(inner) => {
+                // 4.13/a04_10：`expr?` 提前返回糖要求外围函数返回 Option/Result。
+                // 返回类型已知且非 Option/Result（含无标注函数的隐式 Unit）时非法。
+                // `x?(...)`/`x?[i]`/`x?{}` 的 Try 是可选调用/索引糖（由外层
+                // Invoke/Index 臂提升 try_suffix_depth），不在此判定。
+                let t = self.check_expr(inner);
+                let ok = match &self.ret_ty {
+                    _ if self.try_suffix_depth > 0 => true,
+                    Some(Ty::Option(_)) => true,
+                    Some(Ty::User(n)) => n == "Result",
+                    Some(_) => false,
+                    None => false,
+                };
+                if !ok {
+                    self.err(
+                        "后缀 '?' 提前返回糖只能出现在返回 Option 或 Result 类型的函数中（4.13）"
+                            .to_string(),
+                    );
+                }
+                strip_option_ty(t)
+            }
 
             Expr::Return(Some(e)) => {
                 self.check_expr(e);
@@ -8670,7 +9009,14 @@ impl<'a> Checker<'a> {
                 if matches!(&**start, Expr::Range { .. }) || matches!(&**end, Expr::Range { .. }) {
                     self.err("范围表达式不能嵌套（形如 `a..b..c` 非法）".to_string());
                 }
+                let is_try_arr = matches!(&**array, Expr::Try(_));
+                if is_try_arr {
+                    self.try_suffix_depth += 1;
+                }
                 self.check_expr(array);
+                if is_try_arr {
+                    self.try_suffix_depth -= 1;
+                }
                 self.check_expr(start);
                 self.check_expr(end);
                 Ty::Unknown
@@ -13091,6 +13437,84 @@ mod tests {
              main() {\n\
              \x20   var s: ?S = S(x: 3)\n\
              \x20   s?[0] = 9\n\
+             }\n",
+        );
+    }
+
+    #[test]
+    fn test_w25c_method_call_arity_and_try_sugar() {
+        // 10.1.2.1（a04_08/09）：位置实参个数不足全部重载 → 拒绝。
+        assert_err(
+            "struct S {\n\
+             \x20   func invoke(arg: Int64, fn: (Int64) -> Int64) { fn(arg) }\n\
+             }\n\
+             main() {\n\
+             \x20   let s = S()\n\
+             \x20   let x = s.invoke(42)\n\
+             }\n",
+            "位置实参个数",
+        );
+        // 尾随 λ 绑定后仍缺参 → 拒绝。
+        assert_err(
+            "struct S {\n\
+             \x20   func apply(x: Int64, fn: (Int64) -> Int64) { fn(x) }\n\
+             }\n\
+             main() {\n\
+             \x20   let s = S()\n\
+             \x20   let x = s.apply { i => i * i }\n\
+             }\n",
+            "位置实参个数",
+        );
+        // 实参过多方向放行（std prop_test 依赖宽松元数）。
+        assert_ok(
+            "struct S {\n\
+             \x20   func next() { 0 }\n\
+             }\n\
+             main() {\n\
+             \x20   let s = S()\n\
+             \x20   let x = s.next(1)\n\
+             }\n",
+        );
+        // 4.13/a04_04：泛型方法作为值引用（实例接收者、无类型实参）→ 拒绝。
+        assert_err(
+            "struct S {\n\
+             \x20   func foo<T>(t: T) { t }\n\
+             }\n\
+             main() {\n\
+             \x20   let s = S()\n\
+             \x20   let f = s.foo\n\
+             }\n",
+            "泛型方法",
+        );
+        // 类型名限定形态（可能被解析为比较链）放行（a06_05 正例）。
+        assert_ok(
+            "class T1 {\n\
+             \x20   static func f<T>() {}\n\
+             }\n\
+             main() {\n\
+             \x20   T1.f<T1>()\n\
+             }\n",
+        );
+        // a04_10：裸 ? 提前返回糖在 Unit 返回函数中非法。
+        assert_err(
+            "struct S {\n\
+             \x20   S(var x!: Int64) {}\n\
+             }\n\
+             main() {\n\
+             \x20   let optionS: ?S = S(x: 42)\n\
+             \x20   let k = optionS?\n\
+             }\n",
+            "提前返回糖",
+        );
+        // `a?[i]`/`a?{}` 可选链后缀糖放行（try_suffix_depth）。
+        assert_ok(
+            "struct S {\n\
+             \x20   var x = 1\n\
+             }\n\
+             main() {\n\
+             \x20   let o: ?Array<Int64> = [1, 2]\n\
+             \x20   let v = o?[0]\n\
+             \x20   let q = o?[1..2]\n\
              }\n",
         );
     }

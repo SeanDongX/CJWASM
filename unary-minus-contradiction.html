@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CJWasm 官方套件矛盾档案 — 一元负号</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 880px; margin: 2rem auto; padding: 0 1.2rem;
+    line-height: 1.65;
+  }
+  h1 { font-size: 1.5rem; border-bottom: 2px solid #8884; padding-bottom: .4rem; }
+  h2 { font-size: 1.15rem; margin-top: 2rem; }
+  code, pre {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .86em; background: #8881; padding: .1em .35em; border-radius: 4px;
+  }
+  pre { padding: .8rem 1rem; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid #8884; padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  .neg { color: #b3261e; font-weight: 600; }
+  .pos { color: #146c2e; font-weight: 600; }
+  .warn {
+    border-left: 4px solid #b3261e; background: #b3261e12; padding: .6rem 1rem; margin: 1rem 0;
+  }
+  footer { margin-top: 3rem; font-size: .85rem; color: #888; border-top: 1px solid #8883; padding-top: .6rem; }
+</style>
+</head>
+<body>
+
+<h1>CJWasm 官方 Conformance 套件矛盾档案<br><span style="font-size:.9rem;font-weight:400">一元负号作用于 Bool / 无符号整数（4.15(4) vs 2.1.1.2(2)）</span></h1>
+
+<p><b>记录时间：</b>2026-11-27（batch-25，commit 76fbb3d 存档）<br>
+<b>规则冲突双方：</b>《仓颉语言规范》4.15(4)「一元 <code>-</code> 只作用于数值类型（有符号语义）」 与 2.1.1.2(2)「所有列出的运算符（含一元负号）对全部整数类型（含 UInt 家族）定义」。</p>
+
+<h2>1. 矛盾测试清单</h2>
+
+<table>
+<tr><th>方向</th><th>文件</th><th>关键代码</th><th>判定依据</th></tr>
+<tr>
+  <td class="neg">判负（必须编译失败）</td>
+  <td><code>04_expressions/15_arithmetic_expressions/a04/test_a04_02.cj</code></td>
+  <td><code>let x = -b</code>（b: Bool）</td>
+  <td>4.15(4)：Bool 非数值</td>
+</tr>
+<tr>
+  <td class="neg">判负（×5）</td>
+  <td><code>…/a04/test_a04_06.cj</code> ～ <code>test_a04_10.cj</code></td>
+  <td><code>let x = -u</code>（UInt8 / UInt16 / UInt32 / UInt64 / UIntNative）</td>
+  <td>4.15(4)：无符号类型取负非法</td>
+</tr>
+<tr>
+  <td class="pos">判正（必须编译通过）</td>
+  <td><code>02_types/…/02_operators_supported_by_number_types/a02/test_a02_01.cj</code></td>
+  <td><code>Assert.equals(0, -u64_1)</code>、<code>-u32_1</code>、<code>-u16_1</code>、<code>-u8_1</code>（@Mode: run，L258-433）</td>
+  <td>2.1.1.2(2)：UInt64/32/16/8/Native 全部整数运算符</td>
+</tr>
+<tr>
+  <td class="pos">判正（×2）</td>
+  <td><code>…/a15/test_a15_01.cj</code>、<code>test_a15_02.cj</code></td>
+  <td>同上家族形态（各类型一元负号取值断言）</td>
+  <td>同上</td>
+</tr>
+<tr>
+  <td class="pos">判正</td>
+  <td><code>04_expressions/17_type_check_and_type_cast_expressions/a02/test_a02_01.cj</code></td>
+  <td><code>-(-expr) ** expr ** expr is Bool</code> 等组合（表达式类型经推断产生 <code>-Bool</code> 形态）</td>
+  <td>组合运算正例</td>
+</tr>
+</table>
+
+<h2>2. 事件经过（batch-25 / w25b）</h2>
+<ol>
+  <li>初判：正例搜索使用<b>同行正则</b> <code>(UInt…)= *-[A-Za-z]</code>，未找到无符号取负正例 → 误判“矛盾不存在”。</li>
+  <li>实施收紧（commit <code>085f5d0</code> w25b）：Bool 与 UInt 家族取负一律报错；6 个负例转拒。</li>
+  <li>全量测量：<b>正测试 5,128/5,132（−4）</b>——02/01 a02_01、a15_01/02（<code>Assert.equals(0, -u64_1)</code> 等，声明与使用跨行，同行搜索漏检）与 04/17 a02_01 被破坏。</li>
+  <li>回退（commit <code>76fbb3d</code>）：恢复放行，冲突证据写入 <code>src/sema/expr_check.rs</code> 的 <code>UnaryOp::Neg</code> 臂注释（矛盾档案编号 w25b，勿再重试）。</li>
+</ol>
+
+<h2>3. 裁决与依据</h2>
+<div class="warn">
+  <b>裁决：维持放行（正例优先）。</b><br>
+  正测试 100%（5,132/5,132）是本次全兼容冲刺的红线；无符号取负方向为 <b>3 正例 vs 5 负例</b>，Bool 方向为 <b>1 正例 vs 1 负例</b>——无符号方向按“多数正例”放行证据充分，Bool 方向（04/17 a02_01 组合推断形态）按“存在即放行”保守处理。6 个负例（a04_02、a04_06..10）计入最终报告的 <b>X 类（官方矛盾）</b>，预计无法在不破正例的前提下修复。
+</div>
+
+<h2>4. 可复现实验</h2>
+<pre>// 正例方向（必须编译通过；官方 02/01 a02_01 原文形态）
+main() {
+    var u64_1: UInt64 = 5
+    Assert.equals(0, -u64_1)
+}
+
+// 负例方向（官方 04/15 a04_06 要求编译失败）
+main() {
+    var v: UInt8 = 1
+    let x = -v   // CJWasm 现状：放行（矛盾裁决）
+}</pre>
+
+<h2>5. 相关联的已裁决矛盾</h2>
+<ul>
+  <li><b>4.13 成员方法作为值</b>（batch-25 前段，已回退）：<code>let g = C.foo // OK</code>（closures a14_01）、<code>var mySVar0 = myStructVar0.myFunc</code>（mut a03_01）等正例允许方法引用作值；a04_01 负例的非法点在<b>调用形态</b>（对非函数值 <code>sFun { => 14 }</code>）。其可行子集（泛型方法缺类型实参 a04_04）已在 w25c 单独落地，未扩大到普通方法。</li>
+</ul>
+
+<footer>CJWasm 全兼容冲刺（2026-11-24 → 12-01）· 冲刺状态：<code>.compat-run/state.json</code> · 本档案由 batch-25 直修模式生成</footer>
+</body>
+</html>

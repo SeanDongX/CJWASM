@@ -936,7 +936,9 @@ impl Parser {
                     expr = Expr::PostfixDecr(Box::new(expr));
                 }
                 Some(Token::Question) => {
-                    // ? 运算符：expr? 提前返回 Err/None；
+                    // ? 运算符：expr? 提前返回 Err/None（要求外围函数返回
+                    // Option/Result，由 sema 的 Expr::Try 臂判定——a04_10 负例
+                    // 的 main 返回 Unit，`optionS?` 在该层报错）；
                     // 也支持可选调用尾随块：s?.f?{} / s?.f?{ ... }
                     self.advance();
                     let inner = Expr::Try(Box::new(expr));
