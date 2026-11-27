@@ -159,8 +159,11 @@ pub fn infer_expr(expr: &Expr, known: &HashMap<String, Type>) -> Option<Type> {
         Expr::Integer(_) => Some(Type::Int64),
         // 带后缀整数字面量的类型由后缀决定（如 `1u8` → UInt8）。
         Expr::IntegerSuffixed(_, s) => Some(s.ty()),
+        // 超 i64::MAX 的十进制字面量默认按 Int64 处理（上下文由声明/实参推断）。
+        Expr::IntegerOverflow(_, _) => Some(Type::Int64),
         Expr::Float(_) => Some(Type::Float64),
         Expr::Float32(_) => Some(Type::Float32),
+        Expr::FloatSuffixed(_, s) => Some(s.ty()),
         Expr::Bool(_) => Some(Type::Bool),
         Expr::Rune(_) => Some(Type::Rune),
         Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
@@ -405,6 +408,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_trailing_closure_last_param(program, &mut errors);
     // w28d：01/12 章 数组常量下标越界 / 非数组下标。
     check_w28d_array_index_and_numeric(program, &mut errors);
+    // w29c：浮点字面量后缀互斥（f16/f32/f64）+ 十进制 i64 溢出字面量。
+    check_w29c_float_suffix_and_int_overflow(program, &mut errors);
     // 3.2.3.2(7)：局部函数只能引用其之前声明的局部函数（互递归不支持）。
     check_w28d_local_func_forward_ref(program, &mut errors);
     // 5.1.4(9)：无标注函数的 return 表达式须有公共超类型。
@@ -1792,8 +1797,10 @@ impl ConstDeclCtx {
         match e {
             Expr::Integer(_)
             | Expr::IntegerSuffixed(..)
+            | Expr::IntegerOverflow(..)
             | Expr::Float(_)
             | Expr::Float32(_)
+            | Expr::FloatSuffixed(..)
             | Expr::Bool(_)
             | Expr::Rune(_)
             | Expr::String(_)
@@ -8906,8 +8913,10 @@ impl<'a, 'i> InstantiationScan<'a, 'i> {
             }
             Expr::Integer(_)
             | Expr::IntegerSuffixed(_, _)
+            | Expr::IntegerOverflow(..)
             | Expr::Float(_)
             | Expr::Float32(_)
+            | Expr::FloatSuffixed(..)
             | Expr::Bool(_)
             | Expr::Rune(_)
             | Expr::String(_)
@@ -20764,8 +20773,10 @@ fn scan_ct_expr(
         // 叶子节点。
         Expr::Integer(_)
         | Expr::IntegerSuffixed(_, _)
+        | Expr::IntegerOverflow(..)
         | Expr::Float(_)
         | Expr::Float32(_)
+        | Expr::FloatSuffixed(..)
         | Expr::Bool(_)
         | Expr::Rune(_)
         | Expr::String(_)
@@ -20788,7 +20799,7 @@ enum IndexLitKind {
 fn index_literal_kind(e: &Expr) -> Option<IndexLitKind> {
     match e {
         Expr::Integer(_) | Expr::IntegerSuffixed(..) => Some(IndexLitKind::Int),
-        Expr::Float(_) | Expr::Float32(_) => Some(IndexLitKind::Float),
+        Expr::Float(_) | Expr::Float32(_) | Expr::FloatSuffixed(..) => Some(IndexLitKind::Float),
         Expr::String(_) => Some(IndexLitKind::Str),
         Expr::Bool(_) => Some(IndexLitKind::Bool),
         Expr::Rune(_) => Some(IndexLitKind::Rune),
@@ -20983,7 +20994,7 @@ fn collect_float_literal_vars(stmts: &[Stmt], out: &mut HashSet<String>) {
                 value,
                 ..
             } => {
-                if matches!(value, Expr::Float(_) | Expr::Float32(_)) {
+                if matches!(value, Expr::Float(_) | Expr::Float32(_) | Expr::FloatSuffixed(..)) {
                     out.insert(n.clone());
                 }
             }
@@ -22339,8 +22350,10 @@ fn check_call_array_literal_args(program: &Program, errors: &mut Vec<SemanticErr
         match e {
             Expr::Integer(_)
             | Expr::IntegerSuffixed(_, _)
+            | Expr::IntegerOverflow(..)
             | Expr::Float(_)
             | Expr::Float32(_)
+            | Expr::FloatSuffixed(..)
             | Expr::Bool(_)
             | Expr::Rune(_)
             | Expr::String(_)
@@ -22348,7 +22361,11 @@ fn check_call_array_literal_args(program: &Program, errors: &mut Vec<SemanticErr
             Expr::Tuple(items) => !items.is_empty(),
             Expr::Unary { expr, .. } => matches!(
                 expr.as_ref(),
-                Expr::Integer(_) | Expr::Float(_) | Expr::Float32(_)
+                Expr::Integer(_)
+                    | Expr::IntegerOverflow(..)
+                    | Expr::Float(_)
+                    | Expr::Float32(_)
+                    | Expr::FloatSuffixed(..)
             ),
             _ => false,
         }
@@ -24975,8 +24992,8 @@ fn check_default_value_static_scope(program: &Program, errors: &mut Vec<Semantic
 
 fn literal_category(e: &Expr) -> Option<&'static str> {
     match e {
-        Expr::Integer(_) | Expr::IntegerSuffixed(..) => Some("Int"),
-        Expr::Float(_) | Expr::Float32(_) => Some("Float"),
+        Expr::Integer(_) | Expr::IntegerSuffixed(..) | Expr::IntegerOverflow(..) => Some("Int"),
+        Expr::Float(_) | Expr::Float32(_) | Expr::FloatSuffixed(..) => Some("Float"),
         Expr::Bool(_) => Some("Bool"),
         Expr::Rune(_) => Some("Rune"),
         Expr::String(_) => Some("String"),
@@ -25332,8 +25349,9 @@ fn classify_arg(e: &Expr, vars: &HashMap<String, Type>) -> ArgClass {
     match e {
         Expr::Integer(_) => ArgClass::IntLit,
         Expr::IntegerSuffixed(_, s) => ArgClass::Scalar(s.ty()),
+        Expr::IntegerOverflow(..) => ArgClass::IntLit,
         // 后缀浮点字面量（f16/f32/f64）统一按“任意浮点”处理，避免位宽假设。
-        Expr::Float(_) | Expr::Float32(_) => ArgClass::FloatLit,
+        Expr::Float(_) | Expr::Float32(_) | Expr::FloatSuffixed(..) => ArgClass::FloatLit,
         Expr::Bool(_) => ArgClass::Scalar(Type::Bool),
         Expr::Rune(_) => ArgClass::Scalar(Type::Rune),
         Expr::String(_) | Expr::Interpolate(_) => ArgClass::Scalar(Type::String),
@@ -25545,9 +25563,12 @@ fn check_overload_candidate_types(program: &Program, errors: &mut Vec<SemanticEr
             Some(c.ty.clone())
         } else {
             match &c.init {
-                Expr::Integer(_) | Expr::IntegerSuffixed(..) => Some(Type::Int64),
+                Expr::Integer(_) | Expr::IntegerSuffixed(..) | Expr::IntegerOverflow(..) => {
+                    Some(Type::Int64)
+                }
                 Expr::Float(_) => Some(Type::Float64),
                 Expr::Float32(_) => Some(Type::Float32),
+                Expr::FloatSuffixed(_, s) => Some(s.ty()),
                 Expr::Bool(_) => Some(Type::Bool),
                 Expr::Rune(_) => Some(Type::Rune),
                 Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
@@ -25910,8 +25931,10 @@ fn concrete_type_of_expr(
     match e {
         Expr::IntegerSuffixed(_, s) => Some(s.ty()),
         Expr::Integer(_) => Some(Type::Int64),
+        Expr::IntegerOverflow(..) => Some(Type::Int64),
         Expr::Float(_) => Some(Type::Float64),
         Expr::Float32(_) => Some(Type::Float32),
+        Expr::FloatSuffixed(_, s) => Some(s.ty()),
         Expr::Bool(_) => Some(Type::Bool),
         Expr::Rune(_) => Some(Type::Rune),
         Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
@@ -26486,6 +26509,8 @@ fn check_enum_variant_constraint_args(program: &Program, errors: &mut Vec<Semant
             }
             Expr::IntegerSuffixed(_, s) => Some(s.ty()),
             Expr::Integer(_) => Some(Type::Int64),
+            Expr::IntegerOverflow(..) => Some(Type::Int64),
+            Expr::FloatSuffixed(_, s) => Some(s.ty()),
             _ => None,
         }?;
         Some(resolve_alias(&raw, aliases))
@@ -27275,7 +27300,10 @@ fn w23_static_arg_ty(    e: &Expr,
 ) -> Option<Type> {
     // `1` / `3.14` 等无后缀字面量类型可适配，无法唯一确定。
     match e {
-        Expr::Integer(_) | Expr::Float(_) => return None,
+        Expr::Integer(_)
+        | Expr::IntegerOverflow(..)
+        | Expr::Float(_)
+        | Expr::FloatSuffixed(..) => return None,
         _ => {}
     }
     let t = static_expr_type(e, vars)?;
@@ -27843,9 +27871,12 @@ fn check_call_return_context(
             Some(c.ty.clone())
         } else {
             match &c.init {
-                Expr::Integer(_) | Expr::IntegerSuffixed(..) => Some(Type::Int64),
+                Expr::Integer(_) | Expr::IntegerSuffixed(..) | Expr::IntegerOverflow(..) => {
+                    Some(Type::Int64)
+                }
                 Expr::Float(_) => Some(Type::Float64),
                 Expr::Float32(_) => Some(Type::Float32),
+                Expr::FloatSuffixed(_, s) => Some(s.ty()),
                 Expr::Bool(_) => Some(Type::Bool),
                 Expr::Rune(_) => Some(Type::Rune),
                 Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
@@ -29982,6 +30013,7 @@ fn w28_is_arith_op(op: &BinOp) -> bool {
 fn w28_const_int(e: &Expr) -> Option<i64> {
     match e {
         Expr::Integer(n) | Expr::IntegerSuffixed(n, _) => Some(*n),
+        Expr::IntegerOverflow(v, _) => Some(*v as i64),
         Expr::Unary { op: crate::ast::UnaryOp::Neg, expr } => match expr.as_ref() {
             Expr::Integer(n) => n.checked_neg(),
             _ => None,
@@ -30305,6 +30337,203 @@ fn w28_return_map(program: &Program) -> HashMap<String, W28Ty> {
         }
     }
     map
+}
+
+// ─── w29c：浮点字面量后缀（f16/f32/f64 互斥）+ 十进制 i64 溢出字面量 ───
+//
+// 2.1.1.2(5)：未重载的算术/关系运算符，两个操作数必须同类型。仅当两侧都是
+// *带显式浮点后缀* 的字面量且后缀不同时才判定（f16/f32/f64 互斥）；无后缀
+// 字面量可随上下文推断为另一侧类型（正例 `10.3f32 + 3.145628`），不参与判定。
+// 程序中存在运算符重载时不判定（10.2.3，正例 a18_001 中 `1.0f64 % 1.0f32`）。
+//
+// 2.1.1(9)：十进制整数字面量须落在 i64 范围内。词法层回绕前由解析器保留原始
+// 值（Expr::IntegerOverflow）。仅当可“确凿判定非法”时报错：
+//  - 带显式有符号后缀的十进制超界（任意上下文，`-9223372036854775808i64` 除外）；
+//  - 无后缀、且直接作为可确定的有符号 64 位标注绑定（Int64/Int/IntNative）的
+//    初始化值；
+// 无后缀且上下文不确定的形态一律放行（正例 `UInt64 = 18446744073709551615`、
+// `Assert.equals(18446744073709551615, u)`）。
+
+fn w29c_is_signed64_type(t: &Type) -> bool {
+    match t {
+        Type::Int64 | Type::IntNative => true,
+        // `Int` 别名在解析器中作为普通类型名保留（`type Int = Int64`）。
+        Type::Struct(n, args) if args.is_empty() && n == "Int" => true,
+        _ => false,
+    }
+}
+
+/// 浮点字面量的显式类型后缀（无后缀 → None，可随上下文推断）。
+fn w29c_float_suffix(e: &Expr) -> Option<crate::ast::FloatSuffix> {
+    match e {
+        Expr::Float32(_) => Some(crate::ast::FloatSuffix::F32),
+        Expr::FloatSuffixed(_, s) => Some(*s),
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } => w29c_float_suffix(expr),
+        _ => None,
+    }
+}
+
+fn w29c_op_name_fragment(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// 程序内是否声明了运算符重载（存在时字面量混型可能合法，不判定）。
+fn w29c_has_operator_overload(program: &Program) -> bool {
+    let is_op = |name: &str| w29c_op_name_fragment(name).starts_with("op_");
+    program.functions.iter().any(|f| is_op(&f.name))
+        || program
+            .classes
+            .iter()
+            .any(|c| c.methods.iter().any(|m| is_op(&m.func.name)))
+        || program
+            .interfaces
+            .iter()
+            .any(|i| i.methods.iter().any(|m| is_op(&m.name)))
+        || program
+            .extends
+            .iter()
+            .any(|x| x.methods.iter().any(|m| is_op(&m.name)))
+}
+
+/// 遍历程序中所有函数体（顶层函数、类/结构体 init 与方法、接口默认体、扩展方法）。
+fn w29c_scan_bodies(program: &Program, f: &mut dyn FnMut(&[Stmt])) {
+    for func in &program.functions {
+        f(&func.body);
+    }
+    for c in &program.classes {
+        for i in &c.inits {
+            f(&i.body);
+        }
+        for m in &c.methods {
+            f(&m.func.body);
+        }
+        if let Some(si) = &c.static_init {
+            f(si);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            f(&i.body);
+        }
+    }
+    for i in &program.interfaces {
+        for m in &i.methods {
+            if let Some(b) = &m.default_body {
+                f(b);
+            }
+        }
+    }
+    for x in &program.extends {
+        for m in &x.methods {
+            f(&m.body);
+        }
+    }
+}
+
+/// 2.1.1.2(5)：两个显式后缀不同的浮点字面量参与未重载的运算符。
+fn check_w29c_float_literal_mix(program: &Program, errors: &mut Vec<SemanticError>) {
+    if w29c_has_operator_overload(program) {
+        return;
+    }
+    let mut hits: Vec<String> = Vec::new();
+    {
+        let mut scan = |body: &[Stmt]| {
+            walk_stmts(body, &mut |e| {
+                if let Expr::Binary { op, left, right } = e {
+                    if !w28_is_arith_op(op) {
+                        return;
+                    }
+                    if let (Some(l), Some(r)) =
+                        (w29c_float_suffix(left), w29c_float_suffix(right))
+                    {
+                        if l != r {
+                            hits.push(format!(
+                                "运算符（{:?}）的两个浮点字面量操作数类型不同（{:?} 与 {:?}，2.1.1.2(5)）",
+                                op, l, r
+                            ));
+                        }
+                    }
+                }
+            });
+        };
+        w29c_scan_bodies(program, &mut scan);
+    }
+    for message in hits {
+        errors.push(SemanticError { message });
+    }
+}
+
+/// 十进制整数溢出字面量：仅在可确定非法时报错（2.1.1(9)）。
+fn w29c_check_int_overflow_expr(
+    e: &Expr,
+    annotated: Option<&Type>,
+    negated: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    match e {
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } => w29c_check_int_overflow_expr(expr, annotated, !negated, errors),
+        Expr::IntegerOverflow(v, suf) => {
+            // `-9223372036854775808` / `-2^63` 恰为 i64::MIN，合法。
+            let ok_neg_min = negated && *v == (i64::MAX as u64) + 1;
+            let problem = match suf {
+                Some(s) if !s.is_unsigned() => !ok_neg_min,
+                None => {
+                    annotated.map(w29c_is_signed64_type).unwrap_or(false) && !ok_neg_min
+                }
+                // 无符号后缀由既有范围检查处理。
+                Some(_) => false,
+            };
+            if problem {
+                errors.push(SemanticError {
+                    message: format!(
+                        "整数字面量 {} 超出 Int64 可表示范围（2.1.1(9)：-2^63 ~ 2^63-1）",
+                        v
+                    ),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn w29c_check_int_overflow_stmts(stmts: &[Stmt], errors: &mut Vec<SemanticError>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { ty, value, .. } | Stmt::Var { ty, value, .. } => {
+                w29c_check_int_overflow_expr(value, ty.as_ref(), false, errors);
+            }
+            Stmt::Const { ty, value, .. } => {
+                w29c_check_int_overflow_expr(value, ty.as_ref(), false, errors);
+            }
+            Stmt::Assign { value, .. } | Stmt::Expr(value) | Stmt::Return(Some(value)) => {
+                w29c_check_int_overflow_expr(value, None, false, errors);
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => w29c_check_int_overflow_stmts(body, errors),
+            Stmt::WhileLet { body, .. } => w29c_check_int_overflow_stmts(body, errors),
+            Stmt::For { body, .. } => w29c_check_int_overflow_stmts(body, errors),
+            Stmt::LocalFunc(f) => w29c_check_int_overflow_stmts(&f.body, errors),
+            _ => {}
+        }
+    }
+}
+
+fn check_w29c_float_suffix_and_int_overflow(program: &Program, errors: &mut Vec<SemanticError>) {
+    check_w29c_float_literal_mix(program, errors);
+    {
+        let mut scan = |body: &[Stmt]| {
+            w29c_check_int_overflow_stmts(body, errors);
+        };
+        w29c_scan_bodies(program, &mut scan);
+    }
 }
 
 fn check_w28d_array_index_and_numeric(program: &Program, errors: &mut Vec<SemanticError>) {
@@ -30984,6 +31213,7 @@ fn check_w28d_return_common_type(program: &Program, errors: &mut Vec<SemanticErr
                 e,
                 Expr::Integer(_)
                     | Expr::IntegerSuffixed(_, _)
+                    | Expr::IntegerOverflow(..)
                     | Expr::Unary {
                         op: crate::ast::UnaryOp::Neg,
                         ..

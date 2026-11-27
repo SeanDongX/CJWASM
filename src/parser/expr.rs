@@ -1247,7 +1247,7 @@ impl Parser {
     /// 重建原始字面量文本并解析为浮点数。
     ///
     /// 调用前提：`self.peek()` 为 `Dot`。成功时消费两个 token 并返回数值。
-    pub(crate) fn try_leading_dot_float(&mut self) -> Option<f64> {
+    pub(crate) fn try_leading_dot_float(&mut self) -> Option<(f64, Option<FloatSuffix>)> {
         if !self.check(&Token::Dot) {
             return None;
         }
@@ -1266,9 +1266,20 @@ impl Parser {
         let end = self.tokens.get(tok_idx + 1)?.2;
         let raw = self.source.get(start..end)?.to_string();
         let mut text: String = raw.chars().filter(|c| *c != '_').collect();
-        for suffix in ["f64", "f32", "f16"] {
-            if text.ends_with(suffix) {
-                text.truncate(text.len() - suffix.len());
+        let suffix = if text.ends_with("f64") {
+            Some(FloatSuffix::F64)
+        } else if text.ends_with("f32") {
+            Some(FloatSuffix::F32)
+        } else if text.ends_with("f16") {
+            Some(FloatSuffix::F16)
+        } else if text.ends_with('f') {
+            Some(FloatSuffix::F32)
+        } else {
+            None
+        };
+        for s in ["f64", "f32", "f16"] {
+            if text.ends_with(s) {
+                text.truncate(text.len() - s.len());
                 break;
             }
         }
@@ -1281,7 +1292,79 @@ impl Parser {
         let value = format!("0{}", text).parse::<f64>().ok()?;
         self.advance(); // Dot
         self.advance(); // 数字 token
-        Some(value)
+        Some((value, suffix))
+    }
+
+    /// 当前（刚被 `advance` 消费的）字面量 token 的源码文本。
+    fn prev_token_slice(&self) -> Option<&str> {
+        let idx = self.pos.checked_sub(1)?;
+        let (start, _, end) = self.tokens.get(idx)?;
+        self.source.get(*start..*end)
+    }
+
+    /// 浮点字面量 token 的显式后缀：以源码文本判别 `f16` / `f32` / `f64` / `f`
+    /// 后缀（词法层为把 `f16` 与 `f32` 同化为同一 token，故此处回看原文）。
+    /// 无显式后缀（含十六进制浮点）返回 None。
+    fn prev_float_suffix(&self) -> Option<FloatSuffix> {
+        let text: String = self
+            .prev_token_slice()?
+            .chars()
+            .filter(|c| *c != '_')
+            .collect();
+        if text.ends_with("f64") {
+            Some(FloatSuffix::F64)
+        } else if text.ends_with("f32") || text.ends_with('f') {
+            Some(FloatSuffix::F32)
+        } else if text.ends_with("f16") {
+            Some(FloatSuffix::F16)
+        } else {
+            None
+        }
+    }
+
+    /// 十进制整数字面量的原始数值是否超出 `i64::MAX`（词法层已回绕为负数）。
+    ///
+    /// `suffix` 为已确认的有符号后缀（`i8`/`i16`/`i32`/`i64`）或 None（无后缀）。
+    /// 返回原始 `u64` 值；`0x`/`0o`/`0b` 前缀按位模式处理，不判定溢出。
+    fn prev_integer_overflow(&self, suffix: Option<IntSuffix>) -> Option<u64> {
+        let mut body: String = self
+            .prev_token_slice()?
+            .chars()
+            .filter(|c| *c != '_')
+            .collect();
+        if body.starts_with("0x")
+            || body.starts_with("0X")
+            || body.starts_with("0o")
+            || body.starts_with("0O")
+            || body.starts_with("0b")
+            || body.starts_with("0B")
+        {
+            return None;
+        }
+        if let Some(suf) = suffix {
+            let s = match suf {
+                IntSuffix::I8 => "i8",
+                IntSuffix::I16 => "i16",
+                IntSuffix::I32 => "i32",
+                IntSuffix::I64 => "i64",
+                IntSuffix::U8 => "u8",
+                IntSuffix::U16 => "u16",
+                IntSuffix::U32 => "u32",
+                IntSuffix::U64 => "u64",
+            };
+            if body.ends_with(s) {
+                body.truncate(body.len() - s.len());
+            }
+        }
+        if !body.bytes().all(|b| b.is_ascii_digit()) || body.is_empty() {
+            return None;
+        }
+        let v: u64 = body.parse().ok()?;
+        if v > i64::MAX as u64 {
+            Some(v)
+        } else {
+            None
+        }
     }
 
     /// 整数字面量作为表达式主元，并在其后识别范围表达式（`a..b` / `a..=b`）。
@@ -1342,8 +1425,13 @@ impl Parser {
         }
         // 前置小数点浮点字面量 `.5`：词法层拆成 Dot + 数字
         if self.check(&Token::Dot) {
-            if let Some(value) = self.try_leading_dot_float() {
-                return Ok(Expr::Float(value));
+            if let Some((value, suf)) = self.try_leading_dot_float() {
+                return Ok(match suf {
+                    Some(FloatSuffix::F16) => Expr::FloatSuffixed(value, FloatSuffix::F16),
+                    Some(FloatSuffix::F32) => Expr::Float32(value as f32),
+                    Some(FloatSuffix::F64) => Expr::FloatSuffixed(value, FloatSuffix::F64),
+                    None => Expr::Float(value),
+                });
             }
         }
         match self.advance() {
@@ -1361,6 +1449,13 @@ impl Parser {
             Some(Token::Integer(n)) => {
                 // 整数字面量后缀已在词法层识别为独立 token（`IntegerSuffixed`），
                 // 此处不再向后窥探并吞掉同名标识符（否则会跨行吞掉变量名）。
+                // 十进制超 i64::MAX 的字面量在词法层已回绕为负数：回看原文保留
+                // 原始值，供语义层在确定的有符号上下文报错（2.1.1(9)）。
+                if n < 0 {
+                    if let Some(v) = self.prev_integer_overflow(None) {
+                        return self.finish_int_primary(Expr::IntegerOverflow(v, None));
+                    }
+                }
                 self.finish_int_primary(Expr::Integer(n))
             }
             Some(Token::IntegerRadix(n)) => {
@@ -1370,10 +1465,26 @@ impl Parser {
                 self.finish_int_primary(Expr::Integer(n))
             }
             Some(Token::IntegerSuffixed((n, suf))) => {
+                // 有符号后缀的十进制字面量超界（如 `9223372036854775808i64`）
+                if !suf.is_unsigned() && n < 0 {
+                    if let Some(v) = self.prev_integer_overflow(Some(suf)) {
+                        return self.finish_int_primary(Expr::IntegerOverflow(
+                            v,
+                            Some(suf),
+                        ));
+                    }
+                }
                 self.finish_int_primary(Expr::IntegerSuffixed(n, suf))
             }
-            Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Ok(Expr::Float(f)),
-            Some(Token::Float32(f)) => Ok(Expr::Float32(f)),
+            Some(Token::Float(f)) => Ok(Expr::Float(f)),
+            Some(Token::Float64Suffix(f)) => Ok(Expr::FloatSuffixed(f, FloatSuffix::F64)),
+            Some(Token::Float32(f)) => {
+                if self.prev_float_suffix() == Some(FloatSuffix::F16) {
+                    Ok(Expr::FloatSuffixed(f as f64, FloatSuffix::F16))
+                } else {
+                    Ok(Expr::Float32(f))
+                }
+            }
             Some(Token::This) => match self.receiver_name.clone() {
                 Some(n) => Ok(Expr::Var(n)),
                 None => self.bail_at(
@@ -2804,10 +2915,38 @@ impl Parser {
         // 只解析简单表达式: 变量、字面量、函数调用、字段访问等
         // 不解析结构体初始化 (因为 { 会被误认为 match body)
         let mut expr = match self.advance() {
-            Some(Token::Integer(n)) | Some(Token::IntegerRadix(n)) => Expr::Integer(n),
-            Some(Token::IntegerSuffixed((n, suf))) => Expr::IntegerSuffixed(n, suf),
-            Some(Token::Float(f)) | Some(Token::Float64Suffix(f)) => Expr::Float(f),
-            Some(Token::Float32(f)) => Expr::Float32(f),
+            Some(Token::Integer(n)) => {
+                if n < 0 {
+                    if let Some(v) = self.prev_integer_overflow(None) {
+                        Expr::IntegerOverflow(v, None)
+                    } else {
+                        Expr::Integer(n)
+                    }
+                } else {
+                    Expr::Integer(n)
+                }
+            }
+            Some(Token::IntegerRadix(n)) => Expr::Integer(n),
+            Some(Token::IntegerSuffixed((n, suf))) => {
+                if !suf.is_unsigned() && n < 0 {
+                    if let Some(v) = self.prev_integer_overflow(Some(suf)) {
+                        Expr::IntegerOverflow(v, Some(suf))
+                    } else {
+                        Expr::IntegerSuffixed(n, suf)
+                    }
+                } else {
+                    Expr::IntegerSuffixed(n, suf)
+                }
+            }
+            Some(Token::Float(f)) => Expr::Float(f),
+            Some(Token::Float64Suffix(f)) => Expr::FloatSuffixed(f, FloatSuffix::F64),
+            Some(Token::Float32(f)) => {
+                if self.prev_float_suffix() == Some(FloatSuffix::F16) {
+                    Expr::FloatSuffixed(f as f64, FloatSuffix::F16)
+                } else {
+                    Expr::Float32(f)
+                }
+            }
             Some(Token::This) => match self.receiver_name.clone() {
                 Some(n) => Expr::Var(n),
                 None => Expr::Var("this".to_string()),

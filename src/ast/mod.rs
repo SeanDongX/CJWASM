@@ -1,6 +1,6 @@
 mod type_;
 
-pub use type_::{IntSuffix, Type};
+pub use type_::{FloatSuffix, IntSuffix, Type};
 
 /// 一元运算符
 #[derive(Debug, Clone, PartialEq)]
@@ -55,10 +55,21 @@ pub enum Expr {
     /// 语义分析据此判定字面量的具体整型（用于混合后缀运算检测、窄类型
     /// 声明/返回类型匹配）；代码生成与 [`Expr::Integer`] 完全等价。
     IntegerSuffixed(i64, IntSuffix),
+    /// 十进制整数字面量，其数值超出 `i64` 可表示范围（但不超过 `u64`）。
+    ///
+    /// 词法器在回绕为 `i64` 前保留原始无符号值（`u64`）与显式后缀，供语义
+    /// 分析在“可确定为有符号 64 位上下文”时报错（2.1.1(9)）；若无上下文，
+    /// 按默认 `Int64` 处理。代码生成取回绕位模式（`value as i64`）。
+    IntegerOverflow(u64, Option<IntSuffix>),
     /// 浮点数字面量 (Float64)
     Float(f64),
     /// Float32 字面量 (后缀 f)
     Float32(f32),
+    /// 带显式浮点后缀的字面量（`f16` / `f64`；`f32` 走 [`Expr::Float32`]）。
+    ///
+    /// 保留后缀以便语义分析判定 f16/f32/f64 互斥（2.1.1.2(5)）；代码生成
+    /// 依据后缀发出 f32 或 f64 常量。
+    FloatSuffixed(f64, FloatSuffix),
     /// 布尔字面量
     Bool(bool),
     /// Rune 字面量 (Unicode code point, cjc: Rune)

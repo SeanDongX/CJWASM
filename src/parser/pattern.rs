@@ -63,7 +63,7 @@ impl Parser {
     fn parse_primary_pattern_base(&mut self) -> Result<Pattern, ParseErrorAt> {
         // 前置小数点浮点模式 `.8`（词法层拆成 Dot + 数字）
         if self.check(&Token::Dot) {
-            if let Some(value) = self.try_leading_dot_float() {
+            if let Some((value, _suf)) = self.try_leading_dot_float() {
                 return Ok(Pattern::Literal(Literal::Float(value)));
             }
         }

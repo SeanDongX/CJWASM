@@ -826,8 +826,10 @@ fn simple_operand(e: &Expr) -> bool {
     match e {
         Expr::Integer(_)
         | Expr::IntegerSuffixed(_, _)
+        | Expr::IntegerOverflow(..)
         | Expr::Float(_)
         | Expr::Float32(_)
+        | Expr::FloatSuffixed(..)
         | Expr::Bool(_)
         | Expr::Rune(_)
         | Expr::String(_)
@@ -868,8 +870,10 @@ fn atom_operand(e: &Expr) -> bool {
         e,
         Expr::Integer(_)
             | Expr::IntegerSuffixed(_, _)
+            | Expr::IntegerOverflow(..)
             | Expr::Float(_)
             | Expr::Float32(_)
+            | Expr::FloatSuffixed(..)
             | Expr::Bool(_)
             | Expr::Rune(_)
             | Expr::String(_)
@@ -3691,7 +3695,7 @@ fn infer_default_ty(e: &Expr, type_names: &HashSet<String>) -> Ty {
         }
         Expr::Integer(_) => Ty::Int64,
         Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
-        Expr::Float(_) | Expr::Float32(_) => Ty::Float64,
+        Expr::Float(_) | Expr::Float32(_) | Expr::FloatSuffixed(..) => Ty::Float64,
         Expr::Bool(_) => Ty::Bool,
         Expr::String(_) | Expr::Interpolate(_) => Ty::String,
         Expr::Rune(_) => Ty::Rune,
@@ -3952,6 +3956,10 @@ fn static_expr_to_ty(e: &Expr, type_names: &HashSet<String>) -> Ty {
         Expr::Rune(_) => Ty::Rune,
         Expr::Float32(_) => Ty::Float32,
         Expr::Float(_) => Ty::Float64,
+        Expr::FloatSuffixed(_, s) => match s {
+            crate::ast::FloatSuffix::F64 => Ty::Float64,
+            crate::ast::FloatSuffix::F16 | crate::ast::FloatSuffix::F32 => Ty::Float32,
+        },
         Expr::Tuple(v) if v.is_empty() => Ty::Unit,
         Expr::Cast { target_ty, .. } => ty_of_known(target_ty, type_names),
         Expr::Block(stmts, trailing) => {
@@ -5959,7 +5967,7 @@ impl<'a> Checker<'a> {
         match e {
             Expr::Integer(_) => Ty::IntLit,
             Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
-            Expr::Float(_) | Expr::Float32(_) => Ty::FloatLit,
+            Expr::Float(_) | Expr::Float32(_) | Expr::FloatSuffixed(..) => Ty::FloatLit,
             Expr::Bool(_) => Ty::Bool,
             Expr::Rune(_) => Ty::Rune,
             Expr::String(_) | Expr::Interpolate(_) => Ty::String,
@@ -6192,8 +6200,10 @@ impl<'a> Checker<'a> {
         match e {
             Expr::Integer(_)
             | Expr::IntegerSuffixed(..)
+            | Expr::IntegerOverflow(..)
             | Expr::Float(_)
             | Expr::Float32(_)
+            | Expr::FloatSuffixed(..)
             | Expr::Bool(_)
             | Expr::Rune(_)
             | Expr::String(_)
@@ -6539,7 +6549,7 @@ impl<'a> Checker<'a> {
         {
             v = expr;
         }
-        let is_float_lit = matches!(v, Expr::Float(_) | Expr::Float32(_));
+        let is_float_lit = matches!(v, Expr::Float(_) | Expr::Float32(_) | Expr::FloatSuffixed(..));
         let is_int_lit = matches!(v, Expr::Integer(_) | Expr::IntegerSuffixed(_, _));
         if ann.is_float() && is_int_lit {
             self.err(format!(
@@ -6569,7 +6579,7 @@ impl<'a> Checker<'a> {
         {
             v = expr;
         }
-        let is_float_lit = matches!(v, Expr::Float(_) | Expr::Float32(_));
+        let is_float_lit = matches!(v, Expr::Float(_) | Expr::Float32(_) | Expr::FloatSuffixed(..));
         let is_int_lit = matches!(v, Expr::Integer(_) | Expr::IntegerSuffixed(_, _));
         let is_str_lit = matches!(v, Expr::String(_));
         let is_rune_lit = matches!(v, Expr::Rune(_));
@@ -8704,6 +8714,8 @@ impl<'a> Checker<'a> {
             }
             Expr::Float(_) => Ty::FloatLit,
             Expr::Float32(_) => Ty::FloatLit,
+            Expr::IntegerOverflow(..) => Ty::IntLit,
+            Expr::FloatSuffixed(..) => Ty::FloatLit,
             Expr::Bool(_) => Ty::Bool,
             Expr::Rune(_) => Ty::Rune,
             // 字符串插值 `${expr}` 内的表达式同样要接受运算符、类型与常量溢出
@@ -11291,6 +11303,14 @@ fn const_int_value(e: &Expr) -> Option<(i128, Ty)> {
     }
     match e {
         Expr::IntegerSuffixed(v, s) => Some((raw_lit(*v, *s)?, suffix_ty(*s))),
+        // 十进制超 i64::MAX 的有符号后缀字面量：原始幅度已保留。
+        Expr::IntegerOverflow(v, Some(s)) => {
+            if s.is_unsigned() {
+                None
+            } else {
+                Some((*v as i128, suffix_ty(*s)))
+            }
+        }
         // 1.3.6(4) a04_031：折叠常量整型二元子表达式（同后缀类型的
         // `+`/`-`/`*`），使 `4i8 - 2i8 + 126i8` 这类嵌套常量算术也能在
         // 外层溢出检查中被判定（此前只识别单个字面量，嵌套子式被跳过）。
@@ -11331,6 +11351,12 @@ fn const_int_value(e: &Expr) -> Option<(i128, Ty)> {
                     return None;
                 };
                 Some((-mag, suffix_ty(*s)))
+            }
+            Expr::IntegerOverflow(v, Some(s)) => {
+                if s.is_unsigned() {
+                    return None;
+                }
+                Some((-(*v as i128), suffix_ty(*s)))
             }
             _ => None,
         },

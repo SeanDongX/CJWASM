@@ -52,6 +52,29 @@ impl IntSuffix {
     }
 }
 
+/// 浮点字面量的显式类型后缀（如 `1.5f16`、`2.0f32`、`3.0f64`）。
+///
+/// 词法器在扫描浮点字面量时保留后缀信息，供语义分析判定该字面量的具体
+/// 类型（2.1.1.2(5)：算术运算符操作数须同类型，f16/f32/f64 互斥）；
+/// 无后缀的浮点字面量按可适配任意浮点类型的字面量处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatSuffix {
+    F16,
+    F32,
+    F64,
+}
+
+impl FloatSuffix {
+    /// 后缀对应的仓颉浮点类型。
+    pub fn ty(self) -> Type {
+        match self {
+            FloatSuffix::F16 => Type::Float16,
+            FloatSuffix::F32 => Type::Float32,
+            FloatSuffix::F64 => Type::Float64,
+        }
+    }
+}
+
 /// 仓颉语言类型 (与 cjc release/1.0 对齐)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {

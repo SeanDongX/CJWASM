@@ -773,8 +773,10 @@ impl CodeGen {
         match expr {
             Expr::Integer(_) => Some(Type::Int64),
             Expr::IntegerSuffixed(_, _) => Some(Type::Int64),
+            Expr::IntegerOverflow(_, _) => Some(Type::Int64),
             Expr::Float(_) => Some(Type::Float64),
             Expr::Float32(_) => Some(Type::Float32),
+            Expr::FloatSuffixed(_, s) => Some(s.ty()),
             Expr::Bool(_) => Some(Type::Bool),
             Expr::Rune(_) => Some(Type::Rune),
             Expr::String(_) => Some(Type::String),
@@ -1443,8 +1445,10 @@ impl CodeGen {
             }
             Expr::Integer(_) => Some(Type::Int64),
             Expr::IntegerSuffixed(_, _) => Some(Type::Int64),
+            Expr::IntegerOverflow(_, _) => Some(Type::Int64),
             Expr::Float(_) => Some(Type::Float64),
             Expr::Float32(_) => Some(Type::Float32),
+            Expr::FloatSuffixed(_, s) => Some(s.ty()),
             Expr::Bool(_) => Some(Type::Bool),
             Expr::Rune(_) => Some(Type::Rune),
             Expr::String(_) => Some(Type::String),
@@ -2267,8 +2271,13 @@ impl CodeGen {
         match expr {
             Expr::Integer(_) => ValType::I64,
             Expr::IntegerSuffixed(_, _) => ValType::I64,
+            Expr::IntegerOverflow(_, _) => ValType::I64,
             Expr::Float(_) => ValType::F64,
             Expr::Float32(_) => ValType::F32,
+            Expr::FloatSuffixed(_, s) => match s {
+                crate::ast::FloatSuffix::F64 => ValType::F64,
+                crate::ast::FloatSuffix::F16 | crate::ast::FloatSuffix::F32 => ValType::F32,
+            },
             Expr::Bool(_) => ValType::I32,
             Expr::Rune(_) => ValType::I32,
             Expr::String(_) => ValType::I32,
@@ -4133,6 +4142,7 @@ impl CodeGen {
                         // Integer 字面量始终产生 I64
                         Expr::Integer(_) => Some(ValType::I64),
                         Expr::IntegerSuffixed(_, _) => Some(ValType::I64),
+                        Expr::IntegerOverflow(_, _) => Some(ValType::I64),
                         // Var：用 locals 中的实际 WASM 类型
                         Expr::Var(name) => locals.get_valtype(name),
                         // Bool 始终产生 I32
@@ -4732,11 +4742,23 @@ impl CodeGen {
                 // 后缀只影响语义层类型判定；WASM 侧所有整型统一以 i64 表示。
                 func.instruction(&Instruction::I64Const(*n));
             }
+            Expr::IntegerOverflow(v, _) => {
+                // 十进制超 i64::MAX 的字面量按回绕位模式发出（UInt64/取负 2^63 合法）。
+                func.instruction(&Instruction::I64Const(*v as i64));
+            }
             Expr::Float32(f) => {
                 func.instruction(&Instruction::F32Const(*f));
             }
             Expr::Float(f) => {
                 func.instruction(&Instruction::F64Const(*f));
+            }
+            Expr::FloatSuffixed(f, s) => match s {
+                crate::ast::FloatSuffix::F64 => {
+                    func.instruction(&Instruction::F64Const(*f));
+                }
+                crate::ast::FloatSuffix::F16 | crate::ast::FloatSuffix::F32 => {
+                    func.instruction(&Instruction::F32Const(*f as f32));
+                }
             }
             Expr::Bool(b) => {
                 func.instruction(&Instruction::I32Const(if *b { 1 } else { 0 }));
