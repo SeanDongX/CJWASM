@@ -19884,7 +19884,177 @@ fn check_struct_static_field_access(
     }
 }
 
+/// 收集表达式内所有构造调用名（`Name(...)`），用于构造调用依赖图。
+///
+/// 不进入 Lambda 体：闭包体内的构造调用在构造时并不求值，不构成构造调用环。
+/// 会进入参数、字面量元素、分支等任意子表达式——例如 `Class(Struct1())` 中
+/// 嵌套的 `Struct1()` 同样属于实参求值时发生的构造调用。
+fn collect_ctor_call_names(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::ConstructorCall {
+            name,
+            args,
+            named_args,
+            ..
+        } => {
+            out.push(name.clone());
+            for a in args {
+                collect_ctor_call_names(a, out);
+            }
+            for (_, a) in named_args {
+                collect_ctor_call_names(a, out);
+            }
+        }
+        Expr::Call {
+            args, named_args, ..
+        }
+        | Expr::Invoke {
+            args, named_args, ..
+        } => {
+            for a in args {
+                collect_ctor_call_names(a, out);
+            }
+            for (_, a) in named_args {
+                collect_ctor_call_names(a, out);
+            }
+            if let Expr::Invoke { callee, .. } = e {
+                collect_ctor_call_names(callee, out);
+            }
+        }
+        Expr::MethodCall {
+            object,
+            args,
+            named_args,
+            ..
+        } => {
+            collect_ctor_call_names(object, out);
+            for a in args {
+                collect_ctor_call_names(a, out);
+            }
+            for (_, a) in named_args {
+                collect_ctor_call_names(a, out);
+            }
+        }
+        Expr::SuperCall {
+            args, named_args, ..
+        } => {
+            for a in args {
+                collect_ctor_call_names(a, out);
+            }
+            for (_, a) in named_args {
+                collect_ctor_call_names(a, out);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_ctor_call_names(left, out);
+            collect_ctor_call_names(right, out);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Try(expr)
+        | Expr::Throw(expr)
+        | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr)
+        | Expr::PrefixIncr(expr)
+        | Expr::PrefixDecr(expr)
+        | Expr::Some(expr)
+        | Expr::Ok(expr)
+        | Expr::Err(expr)
+        | Expr::Field { object: expr, .. }
+        | Expr::TupleIndex { object: expr, .. }
+        | Expr::OptionalChain { object: expr, .. } => collect_ctor_call_names(expr, out),
+        Expr::Tuple(es) | Expr::Array(es) | Expr::Macro { args: es, .. } => {
+            for x in es {
+                collect_ctor_call_names(x, out);
+            }
+        }
+        Expr::Index { array, index } => {
+            collect_ctor_call_names(array, out);
+            collect_ctor_call_names(index, out);
+        }
+        Expr::SliceExpr { array, start, end } => {
+            collect_ctor_call_names(array, out);
+            collect_ctor_call_names(start, out);
+            collect_ctor_call_names(end, out);
+        }
+        Expr::Range {
+            start,
+            end,
+            step,
+            ..
+        } => {
+            collect_ctor_call_names(start, out);
+            collect_ctor_call_names(end, out);
+            if let Some(s) = step {
+                collect_ctor_call_names(s, out);
+            }
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_ctor_call_names(cond, out);
+            collect_ctor_call_names(then_branch, out);
+            if let Some(e) = else_branch {
+                collect_ctor_call_names(e, out);
+            }
+        }
+        Expr::IfLet {
+            expr,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_ctor_call_names(expr, out);
+            collect_ctor_call_names(then_branch, out);
+            if let Some(e) = else_branch {
+                collect_ctor_call_names(e, out);
+            }
+        }
+        Expr::NullCoalesce { option, default } => {
+            collect_ctor_call_names(option, out);
+            collect_ctor_call_names(default, out);
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, v) in fields {
+                collect_ctor_call_names(v, out);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            collect_ctor_call_names(expr, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_ctor_call_names(g, out);
+                }
+                collect_ctor_call_names(&arm.body, out);
+            }
+        }
+        Expr::TrailingClosure { callee, args, .. } => {
+            collect_ctor_call_names(callee, out);
+            for a in args {
+                collect_ctor_call_names(a, out);
+            }
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                collect_ctor_call_names(k, out);
+                collect_ctor_call_names(v, out);
+            }
+        }
+        Expr::IsType { expr, .. } => collect_ctor_call_names(expr, out),
+        // 以上之外的形态（含 Lambda/Block 等）不展开：闭包体/块体中的构造调用
+        // 在默认值求值时并非无条件发生，保守放行以免误判。
+        _ => {}
+    }
+}
+
 /// 2.1.10.2(41)：跨结构体构造函数在顶层无条件互相调用形成的循环依赖。
+///
+/// 边来自两类构造调用：显式构造函数体的顶层调用，以及实例成员变量默认值
+/// 表达式中的（含嵌套）构造调用——隐式构造函数会求值这些默认值，因此
+/// `struct S1 { let x: S2 = S2() }` / `struct S2 { let y: Class<S1> = Class(S1()) }`
+/// 这类“经由 class 代理类型的互递归”同样构成构造调用环（2.1.10(10)/(11)）。
 fn check_struct_mutual_ctor_cycles(program: &Program, errors: &mut Vec<SemanticError>) {
     use std::collections::HashSet as Set;
     let n = program.structs.len();
@@ -19897,20 +20067,28 @@ fn check_struct_mutual_ctor_cycles(program: &Program, errors: &mut Vec<SemanticE
     }
     let mut edges: Vec<Set<usize>> = vec![Set::new(); n];
     for (i, s) in program.structs.iter().enumerate() {
+        let mut targets: Vec<String> = Vec::new();
+        // 显式构造函数体中的顶层构造调用。
         for init in &s.inits {
             for stmt in &init.body {
-                if let Stmt::Expr(e) = stmt {
-                    let target = match e {
-                        Expr::ConstructorCall { name, .. } => Some(name.as_str()),
-                        _ => None,
-                    };
-                    if let Some(t) = target {
-                        if t != s.name.as_str() {
-                            if let Some(&j) = index.get(t) {
-                                edges[i].insert(j);
-                            }
-                        }
-                    }
+                if let Stmt::Expr(Expr::ConstructorCall { name, .. }) = stmt {
+                    targets.push(name.clone());
+                }
+            }
+        }
+        // 实例成员变量默认值表达式中的构造调用（递归到任意嵌套子表达式）。
+        for f in &s.fields {
+            if f.is_static {
+                continue;
+            }
+            if let Some(d) = &f.default {
+                collect_ctor_call_names(d, &mut targets);
+            }
+        }
+        for t in targets {
+            if t != s.name.as_str() {
+                if let Some(&j) = index.get(t.as_str()) {
+                    edges[i].insert(j);
                 }
             }
         }
@@ -35785,7 +35963,26 @@ main() {}"#,
     }
 
 
-    // ─── w18a: 13 章 unsafe 上下文 / CFunc 细则 ─────────────────────────────
+    // ─── w33b: 2.1.10(10)/(11) 经由 class 代理类型的构造调用互递归 ───────────
+
+    #[test]
+    fn test_w33b_struct_mutual_ctor_cycle_via_class_proxy() {
+        // Struct1 默认值构造 Struct2；Struct2 默认值经 Class 代理再次构造 Struct1
+        // → 构造调用环（官方 "recursive constructor calling detected"）。
+        assert_invalid(
+            "class Class<T> { var classMember: T\n public Class(par: T) { this.classMember = par } }\nstruct Struct1 { var structMember: Struct2 = Struct2() }\nstruct Struct2 { var structMember: Class<Struct1> = Class(Struct1()) }\nmain() {}",
+        );
+        // 单向默认值构造（无环）合法。
+        assert_valid(
+            "struct B { let x: Int64 = 0 }\nstruct A { let b: B = B() }\nmain() {}",
+        );
+        // 数组中嵌套构造调用同样计入，仍无环则放行。
+        assert_valid(
+            "struct B { let x: Int64 = 0 }\nstruct A { let b: Array<B> = [B()] }\nmain() {}",
+        );
+    }
+
+
 
     #[test]
     fn test_w18a_unsafe_call_context() {

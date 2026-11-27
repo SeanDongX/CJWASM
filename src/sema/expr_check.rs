@@ -463,6 +463,24 @@ fn global_const_ty(c: &crate::ast::ConstDef) -> Ty {
     declared
 }
 
+/// 表达式是否为数字字面量（含一元负号包裹），用于识别
+/// `1 . 2` 这类“以点分隔”的误写（解析器会把 `.2` 解析为元组索引）。
+fn is_numeric_literal_operand(e: &Expr) -> bool {
+    match e {
+        Expr::Integer(_)
+        | Expr::IntegerSuffixed(_, _)
+        | Expr::IntegerOverflow(_, _)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::FloatSuffixed(_, _) => true,
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => is_numeric_literal_operand(expr),
+        _ => false,
+    }
+}
+
 /// 不需要作用域即可推断的静态表达式类型（用于顶层常量初始化）。
 fn static_expr_ty(e: &Expr) -> Ty {
     match e {
@@ -9528,7 +9546,15 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
 
-            Expr::TupleIndex { object, .. } => {
+            Expr::TupleIndex { object, index } => {
+                // 数字字面量（含一元负号）后接 `.数字` 只能是“用点分隔元素”的
+                // 误写（如数组字面量 `[1 . 2]`），数字并非元组，索引非法。
+                if is_numeric_literal_operand(object) {
+                    self.err(format!(
+                        "数字字面量不是元组，不能用 '.{}' 进行元组索引（2.2.1.1(3)）",
+                        index
+                    ));
+                }
                 self.check_expr(object);
                 Ty::Unknown
             }
@@ -13774,6 +13800,16 @@ mod tests {
             "元组类型不支持",
         );
         assert_ok("main() { let t = (1, 2); t == t }");
+    }
+
+    #[test]
+    fn test_w33b_numeric_literal_tuple_index_rejected() {
+        // 2.2.1.1(3)：数组字面量元素不能以 '.' 分隔；`1 . 2` 被解析为对数字
+        // 字面量的元组索引，数字并非元组 → 非法。
+        assert_err("main() { let a = [1 . 2, 3] }", "元组索引");
+        assert_err("main() { let a = [-1 . 2 * 3] }", "元组索引");
+        // 真正的元组索引不受影响。
+        assert_ok("main() { let t = (1, 2); let x = t.1 }");
     }
 
 
