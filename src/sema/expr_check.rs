@@ -4630,6 +4630,38 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 深度折叠整型常量：除字面量/常量变量外，还穿透嵌套的基础类型转换调用
+    /// （如 `Rune(UIntNative(57340))` 中的 `UIntNative(...)`）。仅用于判定
+    /// 转换为 Rune 的编译期常量是否落在 Unicode 标量值范围内。
+    fn const_int_deep(&self, e: &Expr) -> Option<i64> {
+        if let Some(v) = literal_int(e) {
+            return Some(v);
+        }
+        match e {
+            Expr::Var(name) => self.lookup(name).and_then(|v| v.const_int),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+            } => self.const_int_deep(expr).map(|v| -v),
+            Expr::Call {
+                name,
+                args,
+                named_args,
+                type_args,
+                ..
+            } if args.len() == 1
+                && named_args.is_empty()
+                && type_args.as_ref().map_or(true, |v| v.is_empty()) =>
+            {
+                match primitive_ctor_ty(name) {
+                    Some(t) if t.is_int() || t == Ty::Rune => self.const_int_deep(&args[0]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// 变量被重新赋值后，其编译期常量值不再可靠。
     fn clear_const(&mut self, name: &str) {
         for scope in self.scopes.iter_mut().rev() {
@@ -6250,6 +6282,19 @@ impl<'a> Checker<'a> {
             }
         }
         false
+    }
+
+    /// 2.2.1.4(1)：数组切片下标（Range）的边界必须是 Int64。仅对带明确整型
+    /// 后缀且非 Int64 的字面量边界判定（变量/表达式类型不可靠，保守放行）。
+    fn check_slice_bound_ty(&mut self, bound: &Expr) {
+        if let Expr::IntegerSuffixed(_, s) = bound {
+            if *s != IntSuffix::I64 {
+                self.err(format!(
+                    "数组切片下标范围的边界必须为 Int64，当前为 '{}'（2.2.1.4(1)）",
+                    suffix_ty(*s).name()
+                ));
+            }
+        }
     }
 
     /// 2.2.1.2(1)：数组下标必须是 Int64；编译期可确定的负下标非法。
@@ -9060,6 +9105,10 @@ impl<'a> Checker<'a> {
                 if is_try_arr {
                     self.try_suffix_depth -= 1;
                 }
+                // 2.2.1.4(1)：切片下标范围只能由 Int64 构成；带非 Int64 后缀的
+                // 边界（如 `array[..=4u64]`、`array[5u64..]`）非法。
+                self.check_slice_bound_ty(start);
+                self.check_slice_bound_ty(end);
                 self.check_expr(start);
                 self.check_expr(end);
                 Ty::Unknown
@@ -9330,7 +9379,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Ty::Rune => {
-                if let Some(v) = self.const_int_of(&args[0]) {
+                if let Some(v) = self.const_int_deep(&args[0]) {
                     let scalar = (0..=0xD7FF).contains(&v) || (0xE000..=0x10FFFF).contains(&v);
                     if !scalar {
                         self.err(format!(
@@ -13580,6 +13629,45 @@ mod tests {
              \x20   let v = o?[0]\n\
              \x20   let q = o?[1..2]\n\
              }\n",
+        );
+    }
+
+    // w26a：Rune(整型常量) 需穿透嵌套的基础类型转换调用折叠常量，
+    // 判定是否落在 Unicode 标量值范围（2.3.1(5)，官方 a05_06/a05_07）。
+    #[test]
+    fn test_w26a_rune_conversion_const_range() {
+        // 57340 = 0xDFFC 落在代理区 [0xD800,0xDFFF]，非法。
+        assert_err(
+            "main() {\n    let r1 = Rune(UIntNative(57340))\n}\n",
+            "Unicode 标量值范围",
+        );
+        assert_err(
+            "main() {\n    let r1 = Rune(IntNative(57342))\n}\n",
+            "Unicode 标量值范围",
+        );
+        // 合法：0x41 = 'A'；嵌套转换亦合法。
+        assert_ok("main() {\n    let r1 = Rune(UIntNative(0x41))\n}\n");
+        assert_ok("main() {\n    let r1 = Rune(65)\n}\n");
+    }
+
+    // w26a：数组切片下标范围边界必须为 Int64；带非 Int64 后缀的边界非法
+    // （2.2.1.4(1)，官方 a02_03/a02_04）。
+    #[test]
+    fn test_w26a_slice_bound_must_be_int64() {
+        assert_err(
+            "main() {\n    let a = [1, 2, 3, 4]\n    let s = a[..=4u64]\n}\n",
+            "边界必须为 Int64",
+        );
+        assert_err(
+            "main() {\n    let a = [1, 2, 3, 4]\n    let s = a[5u64..]\n}\n",
+            "边界必须为 Int64",
+        );
+        // 合法：无后缀/Int64 后缀边界。
+        assert_ok(
+            "main() {\n    let a = [1, 2, 3, 4]\n    let s = a[1..3]\n}\n",
+        );
+        assert_ok(
+            "main() {\n    let a = [1, 2, 3, 4]\n    let s = a[1i64..3i64]\n}\n",
         );
     }
 }
