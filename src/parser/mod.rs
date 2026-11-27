@@ -61,6 +61,12 @@ pub struct Parser {
     cfunc_array_ctx: u8,
     /// 解析过程中出现的元组类型（用于检查 @C 结构体不能作为元组元素）。
     parsed_tuple_types: Vec<Type>,
+    /// 正在解析的模式元组嵌套深度（顶层元组=1），用于 4.4.1.4(5) 元组模式
+    /// 常量字面量与选择子元素类型的一致性判定（仅在深度 1 记录字面量后缀）。
+    pattern_tuple_depth: usize,
+    /// 当前 match case 顶层元组模式中各元素整数字面量的后缀（无后缀记 None）。
+    /// 由 parse_match_arms 在解析每个 case 前清空、解析后消费。
+    pattern_int_suffixes: Vec<Option<crate::ast::IntSuffix>>,
 }
 
 impl Parser {
@@ -90,6 +96,8 @@ impl Parser {
             in_cfunc_sig: false,
             cfunc_array_ctx: 0,
             parsed_tuple_types: Vec::new(),
+            pattern_tuple_depth: 0,
+            pattern_int_suffixes: Vec::new(),
         }
     }
 
@@ -3692,6 +3700,26 @@ mod tests {
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
         parser.parse_program().is_err()
+    }
+
+    #[test]
+    fn test_w33a_tuple_pattern_literal_and_composition_this() {
+        // 4.4.1.4(5)：元组模式常量字面量类型须与选择子元组对应元素类型一致。
+        assert!(parse_err(
+            "main() { match ((10i8, 10i16)) { case (10u8, 10i16) => true\n case _ => false } }"
+        ));
+        // 正例：后缀一致。
+        assert!(!parse_err(
+            "main() { match ((10i8, 10i16)) { case (10i8, 10i16) => true\n case _ => false } }"
+        ));
+        // 4.22.2(6)：组合运算符 ~> 的操作数不能是 this。
+        assert!(parse_err(
+            "func f(x: Int32): Int64 { Int64(x) }\nclass C { init() { (this ~> f)(1) } }\nmain() {}"
+        ));
+        // 正例：普通函数组合仍可解析。
+        assert!(!parse_err(
+            "func f(x: Int32): Int64 { Int64(x) }\nfunc g(x: Int64): Int64 { x }\nmain() { let h = f ~> g }"
+        ));
     }
 
     #[test]

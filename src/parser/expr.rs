@@ -20,6 +20,11 @@ fn fold_func_value_ref(name: String, type_args: Option<Vec<Type>>) -> Expr {
     }
 }
 
+/// 表达式是否为 `this`/`super` 构造值（`this` 落为 `Expr::Var("this")`）。
+fn is_this_or_super_value(e: &Expr) -> bool {
+    matches!(e, Expr::Var(n) if n == "this" || n == "super" || n == "self")
+}
+
 impl Parser {
     /// 将组合表达式 `a ~> b` 脱糖为单参闭包 `{ x => b(a(x)) }`
     fn desugar_composition(left: Expr, right: Expr) -> Expr {
@@ -48,6 +53,14 @@ impl Parser {
         while self.check(&Token::Composition) {
             self.advance();
             let right = self.parse_pipeline()?;
+            // 4.22.2(6)：组合运算符 `~>` 的两个操作数均不支持 init / super 构造。
+            // `this` 在 AST 中落为 `Expr::Var("this")`；`super` 已在主表达式解析
+            // 阶段因必须跟 `.`/`(` 而报错，此处一并兜底。
+            if is_this_or_super_value(&left) || is_this_or_super_value(&right) {
+                return self.bail(ParseError::Message(
+                    "组合运算符 '~>' 的操作数不能是 this/super 构造（4.22.2(6)）".to_string(),
+                ));
+            }
             left = Self::desugar_composition(left, right);
         }
         // 通用范围表达式 a..b / a..=b（起点不限于整数字面量，如 `a..b`、`x..-1`）。
@@ -2646,7 +2659,7 @@ impl Parser {
                     self.expect(Token::RParen)?;
                 }
                 self.expect(Token::LBrace)?;
-                let arms = self.parse_match_arms()?;
+                let arms = self.parse_match_arms(&expr)?;
                 self.expect(Token::RBrace)?;
                 Ok(Expr::Match { expr, arms })
             }
@@ -3170,7 +3183,13 @@ impl Parser {
     }
 
     /// 解析 match 分支列表
-    pub(crate) fn parse_match_arms(&mut self) -> Result<Vec<MatchArm>, ParseErrorAt> {
+    ///
+    /// `selector` 为 match 选择子表达式，用于 4.4.1.4(5)：元组模式中的常量
+    /// 字面量须与选择子元组对应元素类型一致。
+    pub(crate) fn parse_match_arms(
+        &mut self,
+        selector: &Expr,
+    ) -> Result<Vec<MatchArm>, ParseErrorAt> {
         let mut arms = Vec::new();
 
         while !self.check(&Token::RBrace) && self.peek().is_some() {
@@ -3178,7 +3197,9 @@ impl Parser {
             if matches!(self.peek(), Some(Token::Case)) {
                 self.advance();
             }
+            self.pattern_int_suffixes.clear();
             let pattern = self.parse_pattern()?;
+            self.check_tuple_pattern_literal_types(selector, &pattern)?;
 
             // 可选的守卫条件 (cjc 用 where / == expr，cjwasm 兼容 if)
             let guard = if self.check(&Token::If) {
@@ -3248,6 +3269,57 @@ impl Parser {
         }
 
         Ok(arms)
+    }
+
+    /// 4.4.1.4(5)：元组模式中的常量字面量必须与选择子元组对应元素类型一致。
+    ///
+    /// 解析器已把选择子/模式的元组字面量结构保留下来，且 `pattern_int_suffixes`
+    /// 记录了顶层元组模式各元素的整数字面量后缀。仅在：
+    /// - 选择子为元组字面量 `Expr::Tuple`；
+    /// - 模式为同元数元组 `Pattern::Tuple`，且各元素均为整数字面量；
+    /// - 对应选择子元素带显式整型后缀、模式元素带显式后缀
+    /// 时逐元素比对；其余形态（变量选择子、无后缀字面量、嵌套元组等）保守跳过。
+    fn check_tuple_pattern_literal_types(
+        &mut self,
+        selector: &Expr,
+        pattern: &Pattern,
+    ) -> Result<(), ParseErrorAt> {
+        let (sel_elems, pat_elems) = match (selector, pattern) {
+            (Expr::Tuple(s), Pattern::Tuple(p)) => (s, p),
+            _ => return Ok(()),
+        };
+        if sel_elems.len() != pat_elems.len()
+            || self.pattern_int_suffixes.len() != pat_elems.len()
+        {
+            return Ok(());
+        }
+        for (i, pe) in pat_elems.iter().enumerate() {
+            if !matches!(pe, Pattern::Literal(Literal::Integer(_))) {
+                return Ok(());
+            }
+            let pat_suf = match self.pattern_int_suffixes.get(i).copied().flatten() {
+                Some(s) => s,
+                None => continue,
+            };
+            let sel_suf = match &sel_elems[i] {
+                Expr::IntegerSuffixed(_, s) => *s,
+                _ => continue,
+            };
+            if sel_suf != pat_suf {
+                let (start, end) = self.at_prev();
+                return Err(ParseErrorAt {
+                    error: ParseError::Message(format!(
+                        "元组模式第 {} 个常量字面量类型与选择子元素类型不一致（4.4.1.4(5)）：模式 {:?}，选择子 {:?}",
+                        i + 1,
+                        pat_suf,
+                        sel_suf
+                    )),
+                    byte_start: start,
+                    byte_end: end,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// 解析字符串（普通或插值）

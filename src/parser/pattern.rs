@@ -154,6 +154,10 @@ impl Parser {
             | Some(Token::IntegerRadix(n))
             | Some(Token::IntegerSuffixed((n, _))) => {
                 let n = *n;
+                let suffix = match self.peek() {
+                    Some(Token::IntegerSuffixed((_, s))) => Some(*s),
+                    _ => None,
+                };
                 self.advance();
                 if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
                     let inclusive = self.check(&Token::DotDotEq);
@@ -169,6 +173,11 @@ impl Parser {
                             inclusive,
                         });
                     }
+                }
+                // 4.4.1.4(5)：记录顶层元组模式元素的整数字面量后缀，供
+                // parse_match_arms 与选择子元组元素类型比对。
+                if self.pattern_tuple_depth == 1 {
+                    self.pattern_int_suffixes.push(suffix);
                 }
                 Ok(Pattern::Literal(Literal::Integer(n)))
             }
@@ -354,6 +363,7 @@ impl Parser {
             Some(Token::LParen) => {
                 self.advance();
                 let mut patterns = Vec::new();
+                self.pattern_tuple_depth += 1;
                 if !self.check(&Token::RParen) {
                     loop {
                         patterns.push(self.parse_pattern()?);
@@ -363,6 +373,7 @@ impl Parser {
                         self.advance();
                     }
                 }
+                self.pattern_tuple_depth -= 1;
                 self.expect(Token::RParen)?;
                 Ok(Pattern::Tuple(patterns))
             }

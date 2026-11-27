@@ -12,6 +12,9 @@ pub enum ParseError {
     UnexpectedEof,
     #[error("未知类型: {0}")]
     UnknownType(String),
+    /// 解析期完成的语义性判定（类型不匹配等）的自定义诊断文案。
+    #[error("{0}")]
+    Message(String),
 }
 
 /// 带字节偏移的解析错误，用于报告位置（可转换为行/列）

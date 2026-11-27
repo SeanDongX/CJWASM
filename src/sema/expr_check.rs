@@ -9224,6 +9224,21 @@ impl<'a> Checker<'a> {
                 self.strict_member_obj_depth -= 1;
                 // 2.1.11.2：枚举构造值上调用构造器（`A(0).B(..)`）非法。
                 self.check_enum_ctor_member(object, method);
+                // 4.13.4(6)：`s?.field()` / `s?.field{}` 中若 field 是 **Option 类型
+                // 字段**，对其值调用仍需再写 '?'（合法形态 `s?.field?()` 会被解析为
+                // Invoke{callee: Try(OptionalChain)}，不经过本臂）。仅当接收者为
+                // Option<用户类型>、成员确为字段（非方法）且字段类型为 Option 时
+                // 判定；真实方法调用与非 Option 字段调用均不受影响。
+                if let Ty::Option(inner) = &obj_ty {
+                    if let Ty::User(n) = inner.as_ref() {
+                        if let Some(Ty::Option(_)) = self.user_field_ty(inner, method) {
+                            self.err(format!(
+                                "对 Option 类型成员 '{}.{}' 调用需要可选链 '?'（4.13.4(6)）",
+                                n, method
+                            ));
+                        }
+                    }
+                }
                 // 2.1.4(2)：Unit 类型未定义成员访问运算符 '.'。
                 // `(e as T)` 结果为 Option<T>（4.17.2），排除 Cast 形态。
                 if !matches!(&**object, Expr::Cast { .. })
@@ -9728,6 +9743,49 @@ impl<'a> Checker<'a> {
             }
 
             Expr::Invoke { callee, args, named_args } => {
+                // 4.6(4)：try 表达式的资源规格块之后只能接 catch/finally，不能把
+                // try 结果当作函数调用。解析器会把 `try (...) {...} (e: T) {...}`
+                // 折叠为对 TryBlock 的调用（缺少 catch 关键字）。
+                if matches!(&**callee, Expr::TryBlock { .. }) {
+                    self.err(
+                        "try 表达式的资源规格后必须接 catch/finally，不能作为函数调用（4.6(4)）"
+                            .to_string(),
+                    );
+                }
+                // 4(1)：一个表达式不能由两个管道表达式组成（`(a |> f)(b |> g)`）。
+                if let Expr::Binary {
+                    op: BinOp::Pipeline,
+                    ..
+                } = &**callee
+                {
+                    if args.iter().any(|a| {
+                        matches!(
+                            a,
+                            Expr::Binary {
+                                op: BinOp::Pipeline,
+                                ..
+                            }
+                        )
+                    }) {
+                        self.err("表达式不能由两个管道表达式组成（4(1)）".to_string());
+                    }
+                }
+                // 4(1)：一个表达式不能由两个组合（lambda）表达式组成。
+                // 组合 `a ~> b` 被解析为形参名 `__compose_arg` 的单参闭包；
+                // 若以此闭包为被调用者、且某个实参同样是组合闭包，则非法
+                // （`(f ~> g)(f ~> g)`）。正例 `(a ~> b)(x)` 的实参是普通值。
+                if let Expr::Lambda { params, .. } = &**callee {
+                    if params.len() == 1 && params[0].0 == "__compose_arg" {
+                        if args.iter().any(|a| {
+                            matches!(a, Expr::Lambda { params, .. }
+                                if params.len() == 1 && params[0].0 == "__compose_arg")
+                        }) {
+                            self.err(
+                                "表达式不能由两个组合表达式组成（4(1)）".to_string(),
+                            );
+                        }
+                    }
+                }
                 // 4.13.4 可选调用：`x?(...)` 要求 x 为 Option<函数类型>，
                 // 且 T 可调用（函数类型或定义了 operator func()）。非可选调用
                 // 则要求被调用者不是 Option。
@@ -15573,6 +15631,39 @@ mod tests {
         assert_err(
             "struct S { func apply(x: Int64, fn: (Int64) -> Int64) { return fn(x) } }\nfunc makeS() { return S() }\nmain() { let x = makeS().apply(42) }",
             "位置实参个数",
+        );
+    }
+
+    // w33a：callable 值 / Optional 字段调用负例簇（04_expressions 第 6 轮）。
+    #[test]
+    fn test_w33a_callable_value_negative_clusters() {
+        // 4(1)：表达式不能由两个管道表达式组成。
+        assert_err(
+            "main() { let x: Int64 = 5\n (x |> { x: Int64 => x + 1 }) (x |> { x: Int64 => x * 128 }) }",
+            "两个管道",
+        );
+        // 4(1)：表达式不能由两个组合（lambda）表达式组成。
+        assert_err(
+            "func f(x: Int32): Float32 { Float32(x) }\nfunc g(x: Float32): Int32 { Int32(x) }\nmain() { (f ~> g) (f ~> g) }",
+            "两个组合",
+        );
+        // 正例：组合结果以普通值为实参调用合法。
+        assert_ok(
+            "func f(x: Int32): Float32 { Float32(x) }\nfunc g(x: Float32): Int32 { Int32(x) }\nmain() { let r = (f ~> g)(1) }",
+        );
+        // 4.6(4)：try 资源规格块不能被当作函数调用（缺少 catch）。
+        assert_err(
+            "class R { init() { } }\nmain() { try (r = R()) { } (e: Exception) {} }",
+            "try 表达式",
+        );
+        // 4.13.4(6)：Option 类型字段经可选链调用需再写 '?'。
+        assert_err(
+            "struct F { operator func() () { return 42 } }\nstruct S { var f: ?F = F() }\nmain() { let s: ?S = S()\n let r = s?.f() }",
+            "可选链",
+        );
+        // 合法形态：`s?.f?()`。
+        assert_ok(
+            "struct F { operator func() () { return 42 } }\nstruct S { var f: ?F = F() }\nmain() { let s: ?S = S()\n let r = s?.f?() }",
         );
     }
 }
