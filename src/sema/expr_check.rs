@@ -5554,6 +5554,7 @@ impl<'a> Checker<'a> {
                 let deferred = ty.as_ref().map_or(false, |t| is_default_value(t, value));
                 if ann_ty.is_none() && !deferred {
                     self.check_if_supertype_in_value(value);
+                    self.check_match_supertype_in_value(value);
                 }
                 if !deferred {
                     if let Some(ann) = ann_ty.as_ref() {
@@ -5630,6 +5631,7 @@ impl<'a> Checker<'a> {
                 let deferred = ty.as_ref().map_or(false, |t| is_default_value(t, value));
                 if ann_ty.is_none() && !deferred {
                     self.check_if_supertype_in_value(value);
+                    self.check_match_supertype_in_value(value);
                 }
                 if !deferred {
                     if let Some(ann) = ann_ty.as_ref() {
@@ -7075,6 +7077,27 @@ impl<'a> Checker<'a> {
             return false;
         }
         !compatible(&a, &b) && !compatible(&b, &a)
+    }
+
+    /// 值上下文（无类型标注的绑定初始化）中对 `match` 表达式套用 4.4(26)/4.4(24)：
+    /// 各分支类型须存在最小公共超类型。仅对可确定的标量类型判定（用户类型/容器
+    /// 类型一律跳过，避免误伤合法的共同父类/接口关系与官方矛盾的“正例”用例）。
+    fn check_match_supertype_in_value(&mut self, value: &Expr) {
+        if let Expr::Match { arms, .. } = value {
+            let tys: Vec<Ty> = arms.iter().map(|ar| self.branch_peek_ty(&ar.body)).collect();
+            for i in 0..tys.len() {
+                for j in (i + 1)..tys.len() {
+                    if Self::if_no_common_supertype(&tys[i], &tys[j]) {
+                        self.err(format!(
+                            "match 表达式各分支没有公共超类型：{} 与 {}（4.4(26)）",
+                            tys[i].name(),
+                            tys[j].name()
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// 4.2(10)/(11)：无类型标注的 `let/var x = <重载函数名>` 作值有歧义。

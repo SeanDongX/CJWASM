@@ -1270,7 +1270,8 @@ impl Parser {
                 return self.bail(ParseError::UnexpectedToken(tok, "常量名".to_string()));
             }
         };
-        let ty = if self.check(&Token::Colon) {
+        let had_ann = self.check(&Token::Colon);
+        let ty = if had_ann {
             self.advance();
             self.parse_type()?
         } else {
@@ -1279,6 +1280,21 @@ impl Parser {
         };
         self.expect(Token::Assign)?;
         let init = self.parse_expr()?;
+        // 4.1(1)：整型注解的顶层绑定不得用浮点字面量初始化（无隐式 Float→Int 转换）。
+        // 仅在**显式**注解时判定；且只针对 64 位整型——其余整型注解的跨类字面量
+        // 由 sema 的 check_literal_annotation 处理（其单测经 AST 解析路径验证），
+        // 此处只补 sema 因“Int64 占位不可区分”而无法覆盖的 64 位显式注解场景。
+        if had_ann
+            && matches!(
+                ty,
+                Type::Int64 | Type::IntNative | Type::UInt64 | Type::UIntNative
+            )
+            && matches!(init, Expr::Float(_) | Expr::Float32(_))
+        {
+            return self.bail(ParseError::UnknownType(
+                "浮点字面量不能隐式转换为整型（4.1(1)）".to_string(),
+            ));
+        }
         if self.check(&Token::Semicolon) {
             self.advance();
         }
