@@ -1035,6 +1035,8 @@ impl Parser {
                                 | Expr::Var(_)
                                 | Expr::ConstructorCall { .. }
                                 | Expr::Invoke { .. }
+                                // super(..) { λ } — super 构造调用的尾随 Lambda
+                                | Expr::SuperCall { .. }
                         ) =>
                 {
                     // Peek ahead to check if this looks like a lambda: { ident => ... } or { => ... }
@@ -1209,6 +1211,19 @@ impl Parser {
                             all_args.push(closure);
                             Expr::Invoke {
                                 callee,
+                                args: all_args,
+                                named_args,
+                            }
+                        }
+                        Expr::SuperCall {
+                            method,
+                            args,
+                            named_args,
+                        } => {
+                            let mut all_args = args;
+                            all_args.push(closure);
+                            Expr::SuperCall {
+                                method,
                                 args: all_args,
                                 named_args,
                             }
@@ -1964,6 +1979,16 @@ impl Parser {
                     let mut depth = 1usize;
                     while depth > 0 {
                         match self.advance() {
+                            // 14.1.2(4)：quote 内 `$` 必须作为前缀插值（$ident 或 $(expr)），
+                            // 其后再无操作数（如 `x$`、`(x)$`）为语法错误。
+                            Some(Token::Dollar) => {
+                                if matches!(self.peek(), Some(Token::RParen) | None) {
+                                    return self.bail(ParseError::UnexpectedToken(
+                                        Token::Dollar,
+                                        "quote 中的 '$' 后缺少插值操作数".to_string(),
+                                    ));
+                                }
+                            }
                             Some(Token::LParen) => depth += 1,
                             Some(Token::RParen) => depth -= 1,
                             None => return self.bail(ParseError::UnexpectedEof),

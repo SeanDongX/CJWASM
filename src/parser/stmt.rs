@@ -78,13 +78,12 @@ impl Parser {
                 need_sep = false;
                 continue;
             }
-            // 下一 token 为 `{` 时存在“尾随 Lambda / 块表达式”歧义，不强制分隔符。
+            // 规范 4(1)：相邻表达式必须由操作符或 `;`/换行分隔。尾随 Lambda
+            // （`f() { x => ... }`）已在 parse_expr 的后缀循环内消费；回到语句层时
+            // 若同一行直接出现 `{`，它必定是新一条语句的起始（如两个相邻 Lambda
+            // 字面量 `{ => a } { => b }`，4(1) 明确非法），故不再对 `{` 例外。
             // 无 source（如部分单元测试）时无法判定换行，跳过检查。
-            if need_sep
-                && !self.source.is_empty()
-                && !self.newline_before_current()
-                && !self.check(&Token::LBrace)
-            {
+            if need_sep && !self.source.is_empty() && !self.newline_before_current() {
                 return self.bail(ParseError::UnexpectedToken(
                     self.peek().cloned().unwrap_or(Token::Semicolon),
                     "语句之间缺少分隔符（`;` 或换行）".to_string(),
@@ -1166,5 +1165,24 @@ main() {
         ok("main() {\n    let a = 1\n    let b = 2\n    let c = a + b\n}");
         // 分号分隔合法
         ok("main() { let a = 1; let b = 2; let c = a + b }");
+    }
+
+    // ==== w34a: 两个相邻 Lambda 字面量（4(1)）====
+
+    #[test]
+    fn test_w34a_two_adjacent_lambdas_rejected() {
+        // 4(1)：表达式不能由两个相邻 Lambda 字面量组成（conformance a01_145）
+        assert!(parse_source(
+            "main() { { a: Int64, b: Int64 => a + b } { a: Int64, b: Int64 => a - b } }"
+        )
+        .is_err());
+        // 换行分隔则为两条独立的 Lambda 表达式语句，合法
+        ok("main() {\n    { a: Int64, b: Int64 => a + b }\n    { a: Int64, b: Int64 => a - b }\n}");
+    }
+
+    #[test]
+    fn test_w34a_super_call_trailing_lambda_ok() {
+        // super(..) { λ } —— super 构造调用的尾随 Lambda 仍合法（5.3.3(10)）
+        ok("open class O { O(f: (Int64) -> Int64) {} }\nclass C <: O { init() { super({ i => i }) } }\nmain() {}");
     }
 }

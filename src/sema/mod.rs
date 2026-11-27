@@ -10994,6 +10994,18 @@ fn check_generic_declarations(program: &Program, errors: &mut Vec<SemanticError>
                     ),
                 });
             }
+            // 9.1(4)：类型约束的上界必须是类类型或接口类型，不能是类型参数
+            // （如 `where T <: U`，U 为同一声明中的类型参数）。
+            for b in &c.bounds {
+                if declared.iter().any(|t| t == b) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "泛型约束的上界不能是类型参数（9.1(4)）：{} 中的 '{} <: {}'",
+                            owner, c.param, b
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -29365,18 +29377,21 @@ fn check_supertype_constraint_violation(
                 continue;
             }
             for con in constraints {
-                // 仅处理 `T <: U`（U 为同一父类型参数）形式的约束。
-                for bound in &con.bounds {
-                    if !params.contains(bound) {
-                        continue;
-                    }
-                    let Some(pi) = params.iter().position(|p| p == &con.param) else {
-                        continue;
+                let Some(pi) = params.iter().position(|p| p == &con.param) else {
+                    continue;
+                };
+                for (bi, bound) in con.bounds.iter().enumerate() {
+                    // 上界为同一父类型的另一类型参数时，用该位置的显式实参判定；
+                    // 否则按具名类/接口（含泛型实参）判定。
+                    let bound_ty = if let Some(qi) = params.iter().position(|p| p == bound) {
+                        args[qi].clone()
+                    } else {
+                        Type::Struct(
+                            bound.clone(),
+                            con.bound_args.get(bi).cloned().unwrap_or_default(),
+                        )
                     };
-                    let Some(qi) = params.iter().position(|p| p == bound) else {
-                        continue;
-                    };
-                    if definitely_not_subtype(&args[pi], &args[qi], index) {
+                    if definitely_not_subtype(&args[pi], &bound_ty, index) {
                         errors.push(SemanticError {
                             message: format!(
                                 "类 '{}' 继承 '{}' 时类型实参不满足约束 '{} <: {}'（6.1.1.2）",
@@ -33449,34 +33464,64 @@ mod tests {
 
 
     #[test]
-    fn test_w6a_impl_may_not_strengthen_generic_constraints() {
-        // 6.2.4.1(5)：实现接口泛型函数时不得添加约束。
-        assert_invalid(
-            "interface I {\n\
-             \x20   static func f<T1, T2, T3, T4>(): Unit where T1 <: T2\n\
-             }\n\
-             class A <: I {\n\
-             \x20   public static func f<T1, T2, T3, T4>() where T1 <: T2, T3 <: T4 {}\n\
+    fn test_w34b_constraint_upper_bound_must_not_be_type_param() {
+        // 9.1(4)：类型约束的上界必须是类类型或接口类型，不能是类型参数。
+        let errs = assert_invalid(
+            "open public class TestA<P, Q> where P <: Q {\n\
+             \x20   static var v = 1\n\
              }\n\
              main() {}\n",
         );
-        // 反转上下界同样是更严格约束。
+        assert!(errs.iter().any(|e| e.message.contains("上界不能是类型参数")));
+        // 合法：类/接口上界；另一类型参数可出现在具名上界的类型实参中。
+        assert_valid(
+            "interface B {}\n\
+             class C<P, Q> where P <: B, Q <: B {\n\
+             }\n\
+             main() {}\n",
+        );
+        assert_valid(
+            "interface B<X> {}\n\
+             class C<P, Q> where P <: B<Q> {\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+
+    #[test]
+    fn test_w6a_impl_may_not_strengthen_generic_constraints() {
+        // 6.2.4.1(5)：实现接口泛型函数时不得添加约束。
         assert_invalid(
-            "interface I {\n\
-             \x20   static func f<T1, T2>(): Unit where T1 <: T2\n\
+            "interface J {}\n\
+             interface I {\n\
+             \x20   static func f<T1, T2, T3, T4>(): Unit where T1 <: J\n\
              }\n\
              class A <: I {\n\
-             \x20   public static func f<T1, T2>() where T2 <: T1 {}\n\
+             \x20   public static func f<T1, T2, T3, T4>() where T1 <: J, T3 <: J {}\n\
+             }\n\
+             main() {}\n",
+        );
+        // 收紧上界（Narrow <: J）同样是更严格约束。
+        assert_invalid(
+            "interface J {}\n\
+             interface Narrow <: J {}\n\
+             interface I {\n\
+             \x20   static func f<T1, T2>(): Unit where T1 <: J\n\
+             }\n\
+             class A <: I {\n\
+             \x20   public static func f<T1, T2>() where T1 <: Narrow {}\n\
              }\n\
              main() {}\n",
         );
         // 相同约束合法。
         assert_valid(
-            "interface I {\n\
-             \x20   static func f<T1, T2, T3, T4>(): Unit where T1 <: T2\n\
+            "interface J {}\n\
+             interface I {\n\
+             \x20   static func f<T1, T2, T3, T4>(): Unit where T1 <: J\n\
              }\n\
              class A <: I {\n\
-             \x20   public static func f<T1, T2, T3, T4>(): Unit where T1 <: T2 {}\n\
+             \x20   public static func f<T1, T2, T3, T4>(): Unit where T1 <: J {}\n\
              }\n\
              main() {}\n",
         );
@@ -33508,20 +33553,22 @@ mod tests {
     fn test_w6a_override_may_not_strengthen_generic_constraints() {
         // 6.3.4.1(5)：类重定义父类泛型函数时不得添加约束。
         assert_invalid(
-            "open class I {\n\
-             \x20   static func f<T1, T2, T3, T4>() where T1 <: T2 {}\n\
+            "interface J {}\n\
+             open class I {\n\
+             \x20   static func f<T1, T2, T3, T4>() where T1 <: J {}\n\
              }\n\
              class A <: I {\n\
-             \x20   public static func f<T1, T2, T3, T4>() where T1 <: T2, T3 <: T4 {}\n\
+             \x20   public static func f<T1, T2, T3, T4>() where T1 <: J, T3 <: J {}\n\
              }\n\
              main() {}\n",
         );
         assert_valid(
-            "open class I {\n\
-             \x20   static func f<T1, T2, T3, T4>() where T1 <: T2 {}\n\
+            "interface J {}\n\
+             open class I {\n\
+             \x20   static func f<T1, T2, T3, T4>() where T1 <: J {}\n\
              }\n\
              class A <: I {\n\
-             \x20   public static func f<T1, T2, T3, T4>() where T1 <: T2 {}\n\
+             \x20   public static func f<T1, T2, T3, T4>() where T1 <: J {}\n\
              }\n\
              main() {}\n",
         );
@@ -36958,16 +37005,16 @@ main() {}"#,
 
     #[test]
     fn test_w20b_supertype_constraint_violation() {
-        // 6.1.1.2：继承时 where T <: U 约束不满足。
+        // 6.1.1.2：继承时 where T <: Bound 约束不满足。
         assert_invalid(
-            "open class A<T1, T2> where T1 <: T2 {}\nclass B <: A<Any, Object> {}\nmain() {}\n",
+            "open class Base {}\nopen class A<T> where T <: Base {}\nclass B <: A<Int64> {}\nmain() {}\n",
         );
         assert_invalid(
-            "interface I<T1, T2> where T1 <: T2 {}\nclass A <: I<Int32, Float32> {}\nmain() {}\n",
+            "interface I {}\nclass A<T> where T <: I {}\nclass B <: A<Int64> {}\nmain() {}\n",
         );
         // 正例：满足约束。
         assert_valid(
-            "open class A<T1, T2> where T1 <: T2 {}\nclass B <: A<Object, Any> {}\nmain() {}\n",
+            "open class Base {}\nopen class Derived <: Base {}\nopen class A<T> where T <: Base {}\nclass B <: A<Derived> {}\nmain() {}\n",
         );
     }
 

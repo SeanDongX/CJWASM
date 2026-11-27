@@ -103,6 +103,109 @@ fn strip_quote_contents(source: &str) -> String {
     out
 }
 
+/// 校验 quote 表达式中的 `$` 只能作为前缀插值使用。
+///
+/// 14.1.2(4)：`quote` 内 `$` 是前缀插值运算符，可写 `$ident`（简单插值）
+/// 或 `$(expr)`（括号插值）；不能后置或孤立。官方 a03_01 `quote((x)$)`、
+/// a03_02 `quote(x$)` 中 `$` 之后即为 `)`（无操作数），均为负例。
+/// `strip_quote_contents` 会在词法前将 quote 内容整体抹掉，故此处先行校验。
+/// 调用方须先移除块注释，否则文档注释中的示例会被误判。
+fn check_quote_dollar_prefix(source: &str) -> Result<(), String> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // 行注释：跳到行尾
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 6 <= len && &bytes[i..i + 6] == b"quote(" {
+            i += 6; // 跳过 "quote("
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                let ch = bytes[i];
+                if ch == b'\\' {
+                    // quote 内的转义序列（如 \$、\(、\)）：跳过下一字节，
+                    // 被转义的 `$` 是字面量，不参与插值校验。
+                    i += 1;
+                } else if ch == b'(' {
+                    depth += 1;
+                } else if ch == b')' {
+                    depth -= 1;
+                } else if ch == b'"' {
+                    // 跳过字符串字面量（其中 `$` 不参与插值）
+                    i += 1;
+                    while i < len {
+                        let sc = bytes[i];
+                        if sc == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if sc == b'"' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                } else if ch == b'\'' {
+                    // 跳过字符（rune）字面量 'x' / '\n'
+                    i += 1;
+                    while i < len {
+                        let sc = bytes[i];
+                        if sc == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if sc == b'\'' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                } else if ch == b'$' {
+                    // `$` 后可跟可选空白，但操作数必须存在：`(` 或标识符起始字符。
+                    let mut k = i + 1;
+                    while k < len && matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r') {
+                        k += 1;
+                    }
+                    let ok = k < len
+                        && (bytes[k] == b'('
+                            || bytes[k] == b'_'
+                            || bytes[k] == b'`'
+                            || (bytes[k] as char).is_alphabetic());
+                    if !ok {
+                        return Err(
+                            "quote 中的 '$' 必须作为前缀插值（$ident 或 $(expr)）使用".to_string()
+                        );
+                    }
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // 跳过普通字符串字面量，避免把字符串内的 "quote(" 或 "$" 误判
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < len {
+                let sc = bytes[i];
+                if sc == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if sc == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// 找到块注释的关闭位置（返回 */ 之后的位置），支持嵌套块注释（规范 1.5(2)）
 ///
 /// 仓颉规范 A.1.1(1)：`DelimitedComment : '/*' ( DelimitedComment | . )*? '*/'`，
@@ -274,6 +377,7 @@ fn separate_hex_range(source: &str) -> String {
 /// 文件里的顶层名误判为未定义。
 pub fn parse_source_ast(source: &str) -> Result<Program, String> {
     let source = strip_block_comments(source);
+    check_quote_dollar_prefix(&source).map_err(|e| format!("语法错误: {}", e))?;
     let source = strip_quote_contents(&source);
     let source = separate_hex_range(&source);
     let lexer = Lexer::new(&source);

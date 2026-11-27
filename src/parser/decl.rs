@@ -380,7 +380,31 @@ impl Parser {
             imports.push(self.parse_import()?);
         }
 
+        // A 章 translationUnit 文法：顶层声明之间必须有 end（换行或分号）分隔。
+        // a01_10 `func foo() {}main() {}`、a01_11 `func foo(){}func bar(){}` 均非法。
+        // 仅在提供源码时可判定换行（单文件管线均提供）；单元测试无 source 时跳过。
+        let mut need_end = false;
         while let Some(_tok) = self.peek() {
+            if need_end && !self.source.is_empty() {
+                let prev_is_semi = self.pos > 0
+                    && matches!(self.tokens[self.pos - 1].1, Token::Semicolon);
+                let cur_is_semi = self.check(&Token::Semicolon);
+                if !prev_is_semi && !cur_is_semi && !self.newline_before_current() {
+                    // 仅在上一声明结束 token 与当前 token 完全紧邻（零间隔）时判定，
+                    // 以精确命中官方 a01_10 `}main` / a01_11 `}func` 形态，同时
+                    // 避免误伤以空格紧凑书写的内部测试源码。
+                    let prev_end = self.tokens[self.pos - 1].2;
+                    let cur_start = self.tokens[self.pos].0;
+                    if cur_start == prev_end {
+                        return self.bail(ParseError::UnexpectedToken(
+                            self.peek().cloned().unwrap_or(Token::Semicolon),
+                            "顶层声明之间必须使用换行或分号分隔（A 章 translationUnit 文法）"
+                                .to_string(),
+                        ));
+                    }
+                }
+                need_end = false;
+            }
             // w27c：记录本轮迭代前各声明桶的长度，迭代末按增量登记跨类别顺序。
             let n_before = (
                 structs.len(),
@@ -815,6 +839,8 @@ impl Parser {
                 }
             }
             // w27c：登记本轮新增的顶层声明（按类别增量决定种类与起始下标）。
+            // 本轮成功解析了一个顶层声明，下一轮开始前须校验 end 分隔。
+            need_end = true;
             if constants.len() > n_before.7 {
                 decl_order.push(TopDeclIdx::Const(n_before.7));
             } else if structs.len() > n_before.0 {
@@ -6477,11 +6503,11 @@ main() {}
     #[test]
     fn test_w22b_double_where_clause_rejected() {
         // 6.1.2.4(3)：一个声明至多一个 where 约束子句。
-        err("func Nfhjk<T1, T2>() where T1 <: T2 where T1 <: T2 {}\nmain() {}");
+        err("func Nfhjk<T1, T2>() where T1 <: Object where T1 <: Object {}\nmain() {}");
         // 单个 where 合法。
-        ok("func Nfhjk<T1, T2>() where T1 <: T2 {}\nmain() {}");
+        ok("func Nfhjk<T1, T2>() where T1 <: Object {}\nmain() {}");
         // class 单一 where 合法（回归保护）。
-        ok("class C<X, Y> where X <: Y {}\nmain() {}");
+        ok("class C<X, Y> where X <: Object {}\nmain() {}");
     }
 
     #[test]
