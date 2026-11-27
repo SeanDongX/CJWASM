@@ -1048,6 +1048,11 @@ struct Checker<'a> {
     /// Bool 参与算术、String 与非 String/Rune 的 `+`、以及返回类型可静态确定的
     /// 函数调用操作数，都可安全参与判定。非插值上下文保持原有保守行为不变。
     interp_depth: usize,
+    /// w27b：正在检查 `[]` 索引/切片的索引表达式。开放范围（省略 start/end）
+    /// 仅允许出现在此上下文（2.1.8.1(8)），例如 `x[1..]` 或用户类型
+    /// `operator func [](Range)` 的 `x[n-10..]`。切片语法由 SliceExpr 单独
+    /// 处理，不经此处；但仍需覆盖以 Range 作为自定义 `[]` 实参的情形。
+    in_index_ctx: bool,
 }
 
 /// 泛型定义的类型参数与约束（实例化约束检查用）。
@@ -2338,6 +2343,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         local_func_names: local_func_names,
         interp_local_func_added: Vec::new(),
         interp_depth: 0,
+        in_index_ctx: false,
     };
 
     // 结构体方法被脱糖为 `StructName.method` 顶层函数：为其注入实例字段作用域，
@@ -9008,7 +9014,14 @@ impl<'a> Checker<'a> {
                 if is_try_arr {
                     self.try_suffix_depth -= 1;
                 }
-                let idx_ty = self.check_expr(index);
+                let idx_ty = {
+                    // w27b：索引表达式处于开放范围合法的上下文（2.1.8.1(8)）。
+                    let saved = self.in_index_ctx;
+                    self.in_index_ctx = true;
+                    let t = self.check_expr(index);
+                    self.in_index_ctx = saved;
+                    t
+                };
                 // 2.1.4(2)：Unit 类型未定义下标运算符 []。
                 if base_ty == Ty::Unit {
                     self.err(
@@ -9143,6 +9156,22 @@ impl<'a> Checker<'a> {
                     || matches!(&**end, Expr::Range { .. })
                 {
                     self.err("范围表达式不能嵌套（形如 `a..b..c` 非法）".to_string());
+                }
+                // 2.1.8.1(8)：start/end 的省略只允许出现在以 Range<Int64> 作为
+                // 索引/切片的场景（切片是独立的 Expr::SliceExpr，不经本分支）。
+                // 值上下文（let 初始化、for-in 迭代对象、实参、普通表达式）中的
+                // 开放范围非法。解析器对省略的 end 有两种编码：
+                //   1) 分隔符场景（`0..)`/`0..]`/`0..,`）合成 `Expr::Integer(i64::MAX)` 哨兵；
+                //   2) 语句结束场景（`let r = 1..` 后紧跟 `return`/`break`/`continue`）
+                //      会把控制表达式误吞为 end。
+                // 二者在值上下文中都不是合法的范围结束值，统一判为非法。
+                let open_end = matches!(&**end, Expr::Integer(i64::MAX))
+                    || matches!(&**end, Expr::Return(_) | Expr::Break | Expr::Continue);
+                if open_end && !self.in_index_ctx {
+                    self.err(
+                        "范围表达式省略了结束值：起始值与结束值仅在作为数组索引/切片时可省略（2.1.8.1(8)）"
+                            .to_string(),
+                    );
                 }
                 // 2.1.4(2)：Unit 类型未定义范围运算符 '..'。
                 if self.check_expr_ty_peek(start) == Ty::Unit
@@ -10971,6 +11000,30 @@ mod tests {
             needle,
             errors
         );
+    }
+
+
+    // w27b：2.1.8.1(8) 值上下文中的开放范围（省略 start/end）非法；
+    // 省略只允许用于以 Range<Int64> 作为索引/切片（SliceExpr）的场景。
+    #[test]
+    fn test_w27b_open_range_value_rejected() {
+        // for-in 迭代开放范围（结束值省略）。
+        assert_err("main() { for (el in 0..) { } }", "结束值");
+        // let 初始化开放范围：解析器把 `1..` 后紧跟的 `return` 误吞为结束值。
+        assert_err("main() { let r = 1..\n return 0 }", "结束值");
+        assert_err("main() { let a = 200..\n return 0 }", "结束值");
+    }
+
+    #[test]
+    fn test_w27b_closed_and_slice_range_ok() {
+        // 完整范围 / 闭区间合法。
+        assert_ok("main() { let r = 0..10 }");
+        assert_ok("main() { let r = 0..=10 }");
+        assert_ok("main() { for (el in 0..10) { } }");
+        // 切片语法省略 start/end 合法（走 SliceExpr，不经 Range 分支）。
+        assert_ok("main() { let arr = [1, 2, 3]; let s = arr[1..]; let t = arr[..2] }");
+        assert_ok("main() { let arr = [1, 2, 3]; let s = arr[..] }");
+        assert_ok("main() { let arr = [1, 2, 3]; let s = arr[0..2] }");
     }
 
 

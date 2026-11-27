@@ -2821,7 +2821,10 @@ impl Parser {
     pub(crate) fn parse_extend(&mut self) -> Result<crate::ast::ExtendDef, ParseErrorAt> {
         self.expect(Token::Extend)?;
         // cjc: extend<T> Array<T> — 可选的扩展泛型参数
-        if self.check(&Token::Lt) {
+        // w27d：记录是否为泛型扩展。`where` 约束子句只能出现在带自身类型形参的
+        // 声明上（cjc: "unexpected 'where' in non-generic declaration"）。
+        let has_type_params = self.check(&Token::Lt);
+        if has_type_params {
             let _ = self.parse_type_params()?;
         }
         // 扩展目标可为普通类型名或类型关键字（extend Unit / Nothing / Tuple / Array<T> ...）
@@ -2912,6 +2915,14 @@ impl Parser {
             None
         };
         // cjc: extend Type where T <: Bound { ... }
+        // w27d：非泛型扩展（无 extend<...> 类型形参）不允许携带 where 约束子句，
+        // 官方报 "unexpected 'where' in non-generic declaration"。
+        if self.check(&Token::Where) && !has_type_params {
+            return self.bail(ParseError::UnexpectedToken(
+                Token::Where,
+                "非泛型扩展声明不允许 `where` 约束子句（8.3）".to_string(),
+            ));
+        }
         let _ = self.parse_where_clause()?;
         // 兜底: 接口名或 where 中 Bound 后的 <T> 若未消费，此处消费（避免 Lt 期望 LBrace）
         if self.check(&Token::Lt) {
@@ -6259,6 +6270,19 @@ main() {}
         ok("func Nfhjk<T1, T2>() where T1 <: T2 {}\nmain() {}");
         // class 单一 where 合法（回归保护）。
         ok("class C<X, Y> where X <: Y {}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w27d_extend_where_requires_type_params() {
+        // 8.3：`where` 约束子句只能用于带自身类型形参的声明。非泛型扩展
+        // `extend Foo<T> where ...`（缺少 `extend<T>` 形参表）应被拒绝，
+        // 官方报 "unexpected 'where' in non-generic declaration"。
+        err("struct S<T> {}\nextend S<T> where T <: ToString {}\nmain() {}");
+        err("class A {}\nclass E<X> {}\ninterface I1 {}\nextend E<X> <: I1 where X <: A {}\nmain() {}");
+        // 正确的泛型扩展形式仍合法。
+        ok("struct S<T> {}\nextend<T> S<T> where T <: ToString {}\nmain() {}");
+        // 无 where 的非泛型扩展仍合法。
+        ok("struct S<T> {}\nextend S<Int64> {}\nmain() {}");
     }
 
     #[test]
