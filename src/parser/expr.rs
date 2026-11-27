@@ -91,6 +91,20 @@ impl Parser {
         let mut left = self.parse_logical_or()?;
         while matches!(self.peek(), Some(Token::QuestionQuestion)) {
             self.advance();
+            // 4.22：`??` 需要右操作数。若 `??` 之后换行、且下一 token 是控制转移
+            // 表达式（`return`/`break`/`continue`），说明右操作数缺失；同一行内的
+            // `x ?? return`（return 作为 Nothing 类型操作数）仍合法。
+            if self.newline_before_current()
+                && matches!(
+                    self.peek(),
+                    Some(Token::Return) | Some(Token::Break) | Some(Token::Continue)
+                )
+            {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::QuestionQuestion,
+                    "`??` 缺少右操作数".to_string(),
+                ));
+            }
             let right = self.parse_logical_or()?;
             left = Expr::NullCoalesce {
                 option: Box::new(left),
@@ -634,9 +648,18 @@ impl Parser {
                     self.advance();
                     // 支持 arr[..end] 语法（从开头到 end）
                     if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
+                        let is_inclusive = self.check(&Token::DotDotEq);
                         self.advance(); // consume .. or ..=
                                         // 支持 arr[..] 语法（整个数组）
                         let end = if self.check(&Token::RBracket) {
+                            // 4.19：`..=`（含端）后必须有上界表达式；`..`（不含端）
+                            // 允许省略表示到末尾。
+                            if is_inclusive {
+                                return self.bail(ParseError::UnexpectedToken(
+                                    Token::DotDotEq,
+                                    "`..=` 缺少上界表达式".to_string(),
+                                ));
+                            }
                             Expr::Integer(i64::MAX)
                         } else {
                             self.parse_expr()?
@@ -3576,6 +3599,18 @@ main() { Test.f<Array<Int64>>(1) }
         parse_ok_only("main() { try {} finally {} }");
         // try-with-resources 允许既无 catch 也无 finally。
         parse_ok_only("main() { try (r = 1) {} }");
+    }
+
+    #[test]
+    fn test_w28a_parser_negative_clusters() {
+        // 4.22：`??` 缺少右操作数（换行后为 return）。
+        parse_err_only("main() { Option<Int64>.None ??\n return }");
+        parse_err_only("main() { let x = Option<Int64>.None\n x??\n return }");
+        // 同行的 `o ?? return 0` 仍合法（return 作 Nothing 类型操作数）。
+        parse_ok_only("main() { let o: Option<Int64> = None\n let x = o ?? return 0 }");
+        // 4.19：`[..=]` 缺少上界表达式；`[..]` 仍合法。
+        parse_err_only("main() { let a = [1, 2, 3]\n a[..=]\n return }");
+        parse_ok_only("main() { let a = [1, 2, 3]\n a[..]\n return }");
     }
 
     #[test]

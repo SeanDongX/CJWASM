@@ -37,13 +37,15 @@ impl Parser {
     }
 
     /// 将语句列表转换为 Expr：
-    /// - 空列表 → Expr::Integer(0) 回退值
+    /// - 空列表 → 空块（Unit，保留 `if (c) {}` 的空分支语义，不再折叠为整数字面量 0）
     /// - 只有一条 Expr 语句且无前置语句 → 直接使用该表达式
     /// - 最后一条是 Expr 语句 → Block(前置语句, Some(最后的表达式))
     /// - 其他情况 → Block(所有语句, None)，保留 return/let 等
     pub(crate) fn stmts_to_block_expr(stmts: Vec<Stmt>) -> Box<Expr> {
         if stmts.is_empty() {
-            return Box::new(Expr::Integer(0));
+            // 4.3(15)：空分支的类型为 Unit。此前折叠为 `0` 会让 `if (c) {1} else {}`
+            // 两分支都被视为整数，掩盖“Int64 与 Unit 无公共超类型”的负例。
+            return Box::new(Expr::Block(Vec::new(), None));
         }
         let last_is_expr = matches!(stmts.last(), Some(Stmt::Expr(_)));
         if last_is_expr {

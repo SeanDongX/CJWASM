@@ -190,6 +190,70 @@ fn literal_int(e: &Expr) -> Option<i64> {
     }
 }
 
+/// 是否为“括号化赋值表达式”`(x = v)` / `(x += v)` 的 AST 形态。
+///
+/// 解析器将其表示为 `Expr::Block([Stmt::Assign], None)`（见 parser/expr.rs 括号内
+/// 赋值分支）。4.23(20)：赋值表达式类型为 Unit，不能作为值被读取或返回，
+/// 故该形态出现在值上下文（初始化式 / 另一赋值的右值 / 运算符操作数）非法。
+fn is_assignment_block(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Block(stmts, None)
+            if stmts.len() == 1 && matches!(stmts[0], Stmt::Assign { .. })
+    )
+}
+
+/// 类型语法中是否出现类型形参引用（`TypeParam`）。
+fn type_mentions_type_param(t: &Type) -> bool {
+    match t {
+        Type::TypeParam(_) => true,
+        Type::Array(e) => type_mentions_type_param(e),
+        Type::Struct(_, args) => args.iter().any(type_mentions_type_param),
+        Type::Tuple(es) => es.iter().any(type_mentions_type_param),
+        Type::Function { params, ret } => {
+            params.iter().any(type_mentions_type_param)
+                || ret.as_ref().as_ref().map_or(false, type_mentions_type_param)
+        }
+        Type::Option(e) => type_mentions_type_param(e),
+        Type::Result(a, b) => type_mentions_type_param(a) || type_mentions_type_param(b),
+        Type::Slice(e) => type_mentions_type_param(e),
+        Type::Map(a, b) => type_mentions_type_param(a) || type_mentions_type_param(b),
+        _ => false,
+    }
+}
+
+/// 收集全部“泛型命名类型”（带类型形参的 class/struct/enum/interface）以及
+/// 泛型类型别名（底层类型引用类型形参）的名字，供 `as` 具体性判定使用。
+fn collect_generic_named_types(program: &Program) -> HashSet<String> {
+    let mut s: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        if !c.type_params.is_empty() {
+            s.insert(c.name.clone());
+        }
+    }
+    for st in &program.structs {
+        if !st.type_params.is_empty() {
+            s.insert(st.name.clone());
+        }
+    }
+    for e in &program.enums {
+        if !e.type_params.is_empty() {
+            s.insert(e.name.clone());
+        }
+    }
+    for i in &program.interfaces {
+        if !i.type_params.is_empty() {
+            s.insert(i.name.clone());
+        }
+    }
+    for (name, ty) in &program.type_aliases {
+        if type_mentions_type_param(ty) {
+            s.insert(name.clone());
+        }
+    }
+    s
+}
+
 /// 字面量类型后缀 → 具体整型 `Ty`。
 fn suffix_ty(s: IntSuffix) -> Ty {
     match s {
@@ -1068,6 +1132,9 @@ struct Checker<'a> {
     struct_with_ne: HashSet<String>,
     /// 用户泛型类型（class/struct/enum）名 → (类型参数个数, 是否可由构造实参推断)。
     generic_type_arity: HashMap<String, (usize, bool)>,
+    /// 全部泛型命名类型（class/struct/enum/interface）与泛型类型别名的名字集合。
+    /// 用于 `e as T` 中 T 必须是具体类型（须给全类型实参，4.17.2(1)）的判定。
+    generic_named_types: HashSet<String>,
     /// struct 名 → 字段名 → 是否可变。
     struct_fields: HashMap<String, HashMap<String, bool>>,
     /// 用户类型名 → 字段名 → 静态类型（4.13.4 可选链推导 / 复杂左值成员检查）。
@@ -1109,6 +1176,13 @@ struct Checker<'a> {
     const_funcs: HashSet<String>,
     /// 类型名 → 该类型的 const 成员函数名集合（用于 `obj.constMethod()` 判定）。
     const_type_methods: HashMap<String, HashSet<String>>,
+    /// 类型名 → 该类型的全部成员函数名集合（含非 const）。用于 const 上下文中
+    /// 判定 `obj.nonConstMethod()`——方法确属于该类型但非 const 时不是常量表达式
+    /// （16.2(14)）。
+    type_methods: HashMap<String, HashSet<String>>,
+    /// 类型名 → 该类型的属性名集合（getter 脱糖为 `Type.__get_prop`）。用于
+    /// const 上下文中排除属性访问（16.2(12)：const 表达式（排除属性访问））。
+    type_props: HashMap<String, HashSet<String>>,
     /// 拥有 const init 的类型名（可作为常量构造，16.2(7)）。
     const_init_types: HashSet<String>,
     /// 当前是否处于允许 `this`/`super` 作为常量表达式的上下文
@@ -2382,6 +2456,9 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     // 结构体类型细则（2.1.10）：仅凭声明即可判定的规则。
     check_struct_type_rules(program, &type_names, errors);
 
+    // 16.5(1)：const init 若显式调用父类 init，必须调用父类的 const init。
+    check_const_init_super(program, errors);
+
     // class 成员变量默认值类型（2.1.6(1)/2.1.10.1(1) 对应规则）。
     check_class_field_defaults(program, &type_names, errors);
 
@@ -2400,6 +2477,11 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     // 程序上启用——导入符号与同包其它文件的顶层名无法静态确定，必须放行。
     let strict_scope = program.imports.is_empty() && program.package_name.is_none();
     let owner_members = collect_owner_members(program);
+    let generic_named_types = collect_generic_named_types(program);
+
+    // 16.2(12)/(14)：收集每个用户类型的全部成员函数名与属性名，用于 const 上下文
+    // 判定“属性访问 / 非 const 成员方法调用”不是常量表达式。
+    let (type_methods, type_props) = collect_type_methods_props(program, &type_names);
 
     let mut checker = Checker {
         globals,
@@ -2459,6 +2541,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         struct_with_eq,
         struct_with_ne,
         generic_type_arity,
+        generic_named_types,
         cur_struct: None,
         enum_variants,
         qualified_methods,
@@ -2470,6 +2553,8 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         index_set_types,
         const_funcs,
         const_type_methods,
+        type_methods,
+        type_props,
         const_init_types,
         in_const_ctx: false,
         known_funcs,
@@ -2771,9 +2856,113 @@ fn merge_deferred_state(
 
 /// 3.2.3.3(1)：构建“各类型方法体内可不带资格引用的成员名集合”。
 ///
-/// 集合 = 本类型全部成员（字段 / 方法 / 枚举变体 / 接口成员）∪ 传递父类型
-/// （父类、实现的接口、父接口、extend 追加的方法）的成员。仅用于严格作用域
-/// 检查时放行合法的无资格成员引用，不用于成员存在性判定。
+/// 16.5(1)：当前类型为 class 且带 const init 时，const init 若显式调用父类 init
+/// （`super(args)`），必须调用父类的 const init。当父类存在同参数个数的非 const
+/// init 且不存在同参数个数的 const init 时，判定为非法。
+fn check_const_init_super(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 类名 → 其全部 init 的 (参数个数, 是否 const)。
+    let mut class_inits: HashMap<&str, Vec<(usize, bool)>> = HashMap::new();
+    for c in &program.classes {
+        let sigs: Vec<(usize, bool)> = c
+            .inits
+            .iter()
+            .map(|i| (i.params.len(), i.is_const))
+            .collect();
+        class_inits.insert(c.name.as_str(), sigs);
+    }
+    for c in &program.classes {
+        let parent = match c.extends.as_ref() {
+            Some(p) => p.as_str(),
+            None => continue,
+        };
+        let psigs = match class_inits.get(parent) {
+            Some(s) => s,
+            None => continue,
+        };
+        for init in c.inits.iter().filter(|i| i.is_const) {
+            for s in &init.body {
+                let argc = match s {
+                    Stmt::Expr(Expr::SuperCall { args, named_args, .. }) => {
+                        args.len() + named_args.len()
+                    }
+                    _ => continue,
+                };
+                let has_const_match = psigs.iter().any(|(n, c)| *n == argc && *c);
+                if has_const_match {
+                    continue;
+                }
+                let has_nonconst_match = psigs.iter().any(|(n, c)| *n == argc && !*c);
+                if has_nonconst_match {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "const init 显式调用了父类 '{}' 的非 const init（16.5(1)）",
+                            parent
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 收集每个用户类型的全部成员函数名（`type_methods`）与属性名（`type_props`）。
+/// 属性访问器被脱糖为 `Type.__get_prop` / `Type.__set_prop`；据此还原属性名。
+/// 仅用于 const 上下文（16.2(12)/(14)）的常量表达式判定。
+fn collect_type_methods_props(
+    program: &Program,
+    type_names: &HashSet<String>,
+) -> (HashMap<String, HashSet<String>>, HashMap<String, HashSet<String>>) {
+    let mut methods: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut props: HashMap<String, HashSet<String>> = HashMap::new();
+
+    let mut record = |qual: &str, methods: &mut HashMap<String, HashSet<String>>, props: &mut HashMap<String, HashSet<String>>| {
+        let (ty, member) = match qual.rsplit_once('.') {
+            Some(p) => p,
+            None => return,
+        };
+        if !type_names.contains(ty) {
+            return;
+        }
+        methods
+            .entry(ty.to_string())
+            .or_default()
+            .insert(member.to_string());
+        if let Some(p) = member
+            .strip_prefix("__get_")
+            .or_else(|| member.strip_prefix("__set_"))
+        {
+            props
+                .entry(ty.to_string())
+                .or_default()
+                .insert(p.to_string());
+        }
+    };
+
+    for f in &program.functions {
+        record(&f.name, &mut methods, &mut props);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            let bare = last_seg(&m.func.name).to_string();
+            let qual = format!("{}.{}", c.name, bare);
+            record(&qual, &mut methods, &mut props);
+        }
+    }
+    for ext in &program.extends {
+        for f in &ext.methods {
+            record(&f.name, &mut methods, &mut props);
+        }
+    }
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            let qual = format!("{}.{}", iface.name, m.name);
+            record(&qual, &mut methods, &mut props);
+        }
+    }
+
+    (methods, props)
+}
+
 fn collect_owner_members(program: &Program) -> HashMap<String, HashSet<String>> {
     let mut own: HashMap<String, HashSet<String>> = HashMap::new();
     let mut parents: HashMap<String, Vec<String>> = HashMap::new();
@@ -3489,6 +3678,17 @@ fn resolve_ann_ty(ty: &Type, type_names: &HashSet<String>) -> Ty {
 /// 其余返回 `Unknown`。
 fn infer_default_ty(e: &Expr, type_names: &HashSet<String>) -> Ty {
     match e {
+        // `None` / `None<T>`：类型为 Option<...>（类型实参在解析期丢失，内层未知）。
+        Expr::None => Ty::Option(Box::new(Ty::Unknown)),
+        // `None<T>`（构造名 + 类型实参、无调用括号，如 `None<Bool>`）。
+        Expr::Call {
+            name,
+            type_args: Some(tas),
+            args,
+            ..
+        } if name == "None" && tas.len() == 1 && args.is_empty() => {
+            Ty::Option(Box::new(resolve_ann_ty(&tas[0], type_names)))
+        }
         Expr::Integer(_) => Ty::Int64,
         Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
         Expr::Float(_) | Expr::Float32(_) => Ty::Float64,
@@ -5493,6 +5693,7 @@ impl<'a> Checker<'a> {
             }
             Stmt::While { cond, body } => {
                 self.check_expr(cond);
+                self.check_bool_condition(cond, "while");
                 // 3.2.3.2(22)/(23)/(25)：循环条件与循环体同级，不能引用体内局部名。
                 self.check_loop_cond_body_scope(cond, body);
                 self.check_conditional_body(body);
@@ -5501,6 +5702,7 @@ impl<'a> Checker<'a> {
                 self.check_conditional_body(body);
                 self.check_loop_cond_body_scope(cond, body);
                 self.check_expr(cond);
+                self.check_bool_condition(cond, "do-while");
             }
             Stmt::Loop { body } => {
                 self.check_conditional_body(body);
@@ -5846,6 +6048,20 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 4.5.2(3)/4.5.3(2)：while / do-while 的条件表达式必须为 Bool。
+    /// 仅在条件静态类型可确定为“非 Bool 的具体类型”时报错；调用结果等
+    /// 无法确定的形态（Unknown）保守跳过，避免误伤。
+    fn check_bool_condition(&mut self, cond: &Expr, ctx: &str) {
+        let t = self.check_expr_ty_peek(cond);
+        if t.is_definite() && t != Ty::Bool && t != Ty::IntLit {
+            self.err(format!(
+                "{} 的条件表达式必须为 Bool 类型，当前为 '{}'（4.5.2(3)/4.5.3(2)）",
+                ctx,
+                t.name()
+            ));
+        }
+    }
+
     fn bind_pattern(&mut self, pattern: &Pattern, ty: Ty, mutable: bool) {
         self.bind_pattern_const(pattern, ty, mutable, None, false, false)
     }
@@ -6063,7 +6279,23 @@ impl<'a> Checker<'a> {
                     && args.iter().all(|a| self.is_const_expr(a))
                     && named_args.iter().all(|(_, a)| self.is_const_expr(a))
             }
-            Expr::Field { object, .. } => self.is_const_expr(object),
+            Expr::Field { object, field } => {
+                // 16.2(12)：const 表达式的成员访问（排除属性访问）可构成常量表达式。
+                if !self.is_const_expr(object) {
+                    return false;
+                }
+                let ty = self.check_expr_ty_peek(object);
+                if let Ty::User(t) = ty {
+                    if self
+                        .type_props
+                        .get(&t)
+                        .map_or(false, |s| s.contains(field))
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
             Expr::OptionalChain { object, .. } => self.is_const_expr(object),
             // 16.2(10)：控制转移表达式不是常量表达式。
             Expr::Throw(_) | Expr::Return(_) | Expr::Break | Expr::Continue => false,
@@ -6072,7 +6304,8 @@ impl<'a> Checker<'a> {
             Expr::Match { expr, arms } => {
                 self.is_const_expr(expr)
                     && arms.iter().all(|arm| {
-                        arm.guard.as_ref().map_or(true, |g| self.is_const_expr(g))
+                        self.pattern_is_const(&arm.pattern)
+                            && arm.guard.as_ref().map_or(true, |g| self.is_const_expr(g))
                             && self.is_const_expr(&arm.body)
                     })
             }
@@ -6148,19 +6381,57 @@ impl<'a> Checker<'a> {
 
     /// 方法调用是否可构成常量表达式：接收者必须是常量表达式；若接收者类型已知
     /// 且该方法为非 const 成员函数，则不是常量表达式。
+    /// 16.2(11)：match 各 case 的模式必须是常量表达式的一部分。构造器/变体模式
+    /// 若引用了“已知的非 const 函数”（且不是枚举变体名），则不是常量表达式
+    /// （`case f()` 中 f 为普通非 const 函数）。
+    fn pattern_is_const(&self, p: &Pattern) -> bool {
+        match p {
+            Pattern::Wildcard | Pattern::Literal(_) | Pattern::Binding(_) | Pattern::Range { .. } => {
+                true
+            }
+            Pattern::Or(ps) | Pattern::Tuple(ps) => ps.iter().all(|q| self.pattern_is_const(q)),
+            Pattern::Struct { fields, .. } => {
+                fields.iter().all(|(_, q)| self.pattern_is_const(q))
+            }
+            Pattern::Variant {
+                variant_name,
+                payload,
+                ..
+            } => {
+                let is_enum_variant = self.variant_enum.contains_key(variant_name);
+                let fn_nonconst = !is_enum_variant
+                    && self.known_funcs.contains(variant_name)
+                    && !self.const_funcs.contains(variant_name);
+                if fn_nonconst {
+                    return false;
+                }
+                payload
+                    .as_ref()
+                    .map_or(true, |q| self.pattern_is_const(q))
+            }
+            Pattern::TypeTest { .. } | Pattern::Field { .. } => true,
+            Pattern::Guard(e) => self.is_const_expr(e),
+        }
+    }
+
     fn receiver_method_const(&self, object: &Expr, method: &str) -> bool {
         if !self.is_const_expr(object) {
             return false;
         }
         let ty = self.check_expr_ty_peek(object);
         if let Ty::User(t) = ty {
-            if let Some(set) = self.const_type_methods.get(&t) {
-                if set.contains(method) {
-                    return true;
+            // 16.2(14)：接收者类型已知且该方法确属该类型时，只有 const 成员函数才
+            // 可作为常量表达式；非 const 成员函数调用不是常量表达式。
+            if let Some(all) = self.type_methods.get(&t) {
+                if all.contains(method) {
+                    return self
+                        .const_type_methods
+                        .get(&t)
+                        .map_or(false, |s| s.contains(method));
                 }
-                // 该方法可能来自父类型，无法确定其 const 性，保守放行。
-                return true;
             }
+            // 本类型无该成员（可能来自父类型/内建）：无法确定其 const 性，保守放行。
+            return true;
         }
         true
     }
@@ -6421,6 +6692,15 @@ impl<'a> Checker<'a> {
         match target {
             AssignTarget::Var(name) => {
                 if let Some(info) = self.lookup(name).cloned() {
+                    // 4.23(20)：赋值表达式类型为 Unit；把 Unit（如 `(b = 0)`）赋给
+                    // 非 Unit 变量非法。即使目标为字面量占位类型（IntLit 等不可赋值
+                    // 判定的非 concrete 类型）也应报错。
+                    if *value_ty == Ty::Unit && !matches!(info.ty, Ty::Unit | Ty::Unknown) {
+                        self.err(format!(
+                            "赋值类型不匹配: 不能把 Unit 赋给 '{}'（4.23(20)）",
+                            name
+                        ));
+                    }
                     if info.uninit_let {
                         // 4.2(5)：延迟赋值 `let` 只能在直线代码中恰好赋一次初值；
                         // 循环体可能执行 0 次或多次，不能保证唯一一次赋值。
@@ -8922,6 +9202,10 @@ impl<'a> Checker<'a> {
                 }
                 let t = match trailing {
                     Some(e) => self.check_expr(e),
+                    // 括号化赋值表达式 `(x = v)` / `(x += v)`：整个块的值即赋值
+                    // 表达式的类型 Unit（4.23(20)）。此前返回 Unknown 使
+                    // `a = (b = 0)`（Unit 赋给 Int64）逃逸可赋值性检查。
+                    None if stmts.len() == 1 && matches!(stmts[0], Stmt::Assign { .. }) => Ty::Unit,
                     None => Ty::Unknown,
                 };
                 self.restore_interp_local_funcs(saved_local_funcs, interp_mark);
@@ -9697,6 +9981,16 @@ impl<'a> Checker<'a> {
 
             Expr::Cast { expr, target_ty } => {
                 self.check_expr(expr);
+                // 4.17.2(1)：`e as T` 的 T 必须是具体类型；泛型命名类型/泛型别名
+                // 未给全类型实参（如 `1 as A`，A 为 A<T>）不是具体类型，非法。
+                if let Type::Struct(name, args) = target_ty {
+                    if args.is_empty() && self.generic_named_types.contains(name) {
+                        self.err(format!(
+                            "'as' 的类型必须是具体类型，泛型类型 '{}' 必须给出类型实参（4.17.2(1)）",
+                            name
+                        ));
+                    }
+                }
                 ty_of(target_ty)
             }
 
@@ -9747,7 +10041,12 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
 
-            Expr::Some(inner) | Expr::Ok(inner) | Expr::Err(inner) => {
+            // `Some(x)` 的类型为 Option<x>（用于可选链来源推断与条件类型判定）。
+            Expr::Some(inner) => {
+                let t = self.check_expr(inner);
+                Ty::Option(Box::new(t))
+            }
+            Expr::Ok(inner) | Expr::Err(inner) => {
                 self.check_expr(inner);
                 Ty::Unknown
             }
@@ -9792,7 +10091,8 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
 
-            Expr::None => Ty::Unknown,
+            // `None` / `None<T>`：类型为 Option<...>（内层类型实参在解析期丢失）。
+            Expr::None => Ty::Option(Box::new(Ty::Unknown)),
 
             Expr::NullCoalesce { option, default } => {
                 let ot = self.check_expr(option);
@@ -11361,6 +11661,31 @@ mod tests {
         assert_err("main() { let a = 200..\n return 0 }", "结束值");
     }
 
+    // w28a：04_expressions 负例簇。
+    #[test]
+    fn test_w28a_expr_negative_clusters() {
+        // 4.5.2(3)/4.5.3(2)：while / do-while 条件必须为 Bool（Option<Bool> 非法）。
+        assert_err("main() { let t = None<Bool>\n while (t) { } }", "Bool");
+        assert_err("main() { let t = Some(false)\n do { } while (t) }", "Bool");
+        // 4.3(15)：if 两分支无公共超类型（整数字面量 vs 空 Unit 分支）。
+        assert_err(
+            "var x = 0\nmain() { var v = if (x == 0) { 1 } else { } }",
+            "公共超类型",
+        );
+        // 4.23(20)：把 Unit（赋值表达式）赋给非 Unit 变量。
+        assert_err("main() { var a = 1\n var b = 1\n a = (b = 0) }", "Unit");
+        // 4.17.2(1)：`as` 的目标必须是具体类型，泛型接口未给类型实参非法。
+        assert_err("interface A<T> {}\nmain() { 1 as A\n 0 }", "具体类型");
+    }
+
+    #[test]
+    fn test_w28a_expr_negative_positives() {
+        // 同形态正例：Unit 赋值表达式作值参与比较（类型为 Unit，合法）。
+        assert_ok("main() { var i = 1\n let u = (i = 5)\n let x = () != u }");
+        // 泛型函数名带类型实参作值合法（类型实参在解析期丢失，此处仅确保未误伤）。
+        assert_ok("func id<T>(a: T): T { a }\nmain() { let g = id<Int64>\n g }");
+    }
+
     #[test]
     fn test_w27b_closed_and_slice_range_ok() {
         // 完整范围 / 闭区间合法。
@@ -11371,6 +11696,64 @@ mod tests {
         assert_ok("main() { let arr = [1, 2, 3]; let s = arr[1..]; let t = arr[..2] }");
         assert_ok("main() { let arr = [1, 2, 3]; let s = arr[..] }");
         assert_ok("main() { let arr = [1, 2, 3]; let s = arr[0..2] }");
+    }
+
+
+    // w28b 16.2(14)：const 上下文中调用非 const 实例成员函数不是常量表达式。
+    #[test]
+    fn test_w28b_const_nonconst_method_rejected() {
+        assert_err(
+            "struct S { const init() { } func f(x: Int64) { x } }\n\
+             main() { const s = S(); const y = s.f(1) }",
+            "常量表达式",
+        );
+        // 对照正例：const 成员函数调用可作常量表达式。
+        assert_ok(
+            "struct S { const init() { } const func f(x: Int64) { x } }\n\
+             main() { const s = S(); const y = s.f(1) }",
+        );
+    }
+
+    // w28b 16.2(12)：const 上下文中的属性访问（getter）不是常量表达式；字段访问是。
+    #[test]
+    fn test_w28b_const_property_access_rejected() {
+        assert_err(
+            "struct S { prop p: Int64 { get() { 1 } } const init() { } }\n\
+             main() { const s = S(); const c = s.p }",
+            "常量表达式",
+        );
+        // 对照正例：普通字段访问可作常量表达式。
+        assert_ok(
+            "struct S { var x: Int64 = 1; const init() { } }\n\
+             main() { const s = S(); const c = s.x }",
+        );
+    }
+
+    // w28b 16.2(11)：match 的 case 模式引用已知非 const 函数时不是常量表达式。
+    #[test]
+    fn test_w28b_const_match_nonconst_pattern_rejected() {
+        assert_err(
+            "func f() { 1 }\n\
+             main() { const c = 1; const x = match (c) { case f() => \"1\" case _ => \"0\" } }",
+            "常量表达式",
+        );
+    }
+
+    // w28b 16.5(1)：const init 显式调用父类非 const init 非法。
+    #[test]
+    fn test_w28b_const_init_super_nonconst_rejected() {
+        assert_err(
+            "open class A { const init() { } init(x: Int64) { } }\n\
+             class B <: A { const init() { super(1) } }\n\
+             main() { }",
+            "非 const init",
+        );
+        // 对照正例：const init 调用父类的 const init。
+        assert_ok(
+            "open class A { const init() { } }\n\
+             class B <: A { const init() { super() } }\n\
+             main() { }",
+        );
     }
 
 

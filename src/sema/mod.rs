@@ -398,6 +398,14 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_lambda_to_scalar_annotation(program, &mut errors);
     // 5.3.3(1)/(7)：尾随 lambda 只能作为最后一个函数类型形参的实参。
     check_trailing_closure_last_param(program, &mut errors);
+    // w28d：01/12 章 数组常量下标越界 / 非数组下标。
+    check_w28d_array_index_and_numeric(program, &mut errors);
+    // 3.2.3.2(7)：局部函数只能引用其之前声明的局部函数（互递归不支持）。
+    check_w28d_local_func_forward_ref(program, &mut errors);
+    // 5.1.4(9)：无标注函数的 return 表达式须有公共超类型。
+    check_w28d_return_common_type(program, &mut errors);
+    // 01 章 4.4：Option 函数值调用需 `?`；`?` 不能作用于普通函数值。
+    check_w28d_option_syntax(program, &mut errors);
     // 3.3.1(7)：已初始化的 let 成员变量不能在构造函数中重新赋值。
     check_let_field_ctor_reassign(program, &mut errors);
     // 5.1.2 / 5.3.4：形参声明顺序、默认值必须是命名参数、默认值静态作用域、
@@ -1026,6 +1034,36 @@ fn check_mut_function_body(
         let mut cap_locals = locals.clone();
         for s in body {
             scan_mut_capture_stmt(s, &field_names, &mut cap_locals, false, errors);
+        }
+    }
+
+    // 7.3(8)：struct 的属性 setter 是 mut 函数，其闭包不能捕获 `this` 或实例字段。
+    // 解析器把 `mut prop` setter 脱糖为 `Type.__set_p` 方法（is_mut=false），故上面的
+    // 5.8.1(5) 不适用于它；这里对 setter 体内的 lambda 单独扫描。
+    if kind == MutOwnerKind::Struct
+        && is_member
+        && last_name_segment(fn_name).starts_with("__set_")
+    {
+        let mut tmp: Vec<SemanticError> = Vec::new();
+        let scan_locals = locals.clone();
+        walk_stmts(body, &mut |e| {
+            if let Expr::Lambda {
+                params,
+                body: lb, ..
+            } = e
+            {
+                let mut ll = scan_locals.clone();
+                for (p, _) in params {
+                    ll.insert(p.clone());
+                }
+                scan_mut_capture_expr(lb, &field_names, &ll, true, false, &mut tmp);
+            }
+        });
+        let mut seen: HashSet<String> = HashSet::new();
+        for e in tmp {
+            if seen.insert(e.message.clone()) {
+                errors.push(e);
+            }
         }
     }
 
@@ -2031,6 +2069,23 @@ fn check_const_declarations(program: &Program, errors: &mut Vec<SemanticError>) 
 }
 
 // ─── 16.4：const 函数体限制（只允许声明、常量表达式与 return） ───────────────
+
+/// 核心库中常见、但未列入 `is_prelude_identifier` 的接口/类型名。单文件负例检查
+/// （如 8.1.2(2) 未声明接口）必须放行这些依赖隐式/宏导入的名字，避免误伤 std。
+fn is_core_library_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Resource"
+            | "Countable"
+            | "AutoCloseable"
+            | "NamedResource"
+            // std.unittest 测试模式下隐式可见的策略接口。
+            | "DataStrategy"
+            | "DataProvider"
+            | "DataShrinker"
+            | "Configuration"
+    )
+}
 
 /// 内置数值/基础类型名（用于识别 `Float64(x)` 这类类型转换调用）。
 fn is_builtin_type_name(name: &str) -> bool {
@@ -15146,18 +15201,30 @@ fn check_local_class_member_existence(
                 errors.push(SemanticError { message: msg });
             }
         };
+        // 接收者静态类型解析：变量（按显式类型标注 / 同名类型名做静态访问）与
+        // 构造调用 `A()`（静态类型即 A）。构造调用形态仅在无 import 的单文件
+        // 程序上判定，避免同包多文件扩展等未建模成员被误判（负例 a01_03）。
+        let receiver_cls = |object: &Expr| -> Option<&ClassDef> {
+            match object {
+                Expr::Var(v) if v != "this" && v != "super" => {
+                    if let Some(c) = receiver_class(v, &var_types, index) {
+                        Some(c)
+                    } else {
+                        // 以类型名做静态成员访问（A.f / A.x）。
+                        index.classes.get(v.as_str()).copied()
+                    }
+                }
+                Expr::ConstructorCall { name, .. }
+                    if program.package_name.is_none() && program.imports.is_empty() =>
+                {
+                    index.classes.get(name.as_str()).copied()
+                }
+                _ => None,
+            }
+        };
         walk_stmts(body, &mut |e| match e {
             Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
-                let Expr::Var(v) = &**object else { return };
-                if v == "this" || v == "super" {
-                    return;
-                }
-                let cls = if let Some(c) = receiver_class(v, &var_types, index) {
-                    c
-                } else if let Some(c) = index.classes.get(v.as_str()) {
-                    // 以类型名做静态成员访问（A.f / A.x）。
-                    *c
-                } else {
+                let Some(cls) = receiver_cls(object) else {
                     return;
                 };
                 if let Some(members) = class_members(cls, program, index) {
@@ -15170,15 +15237,7 @@ fn check_local_class_member_existence(
                 }
             }
             Expr::MethodCall { object, method, .. } => {
-                let Expr::Var(v) = &**object else { return };
-                if v == "this" || v == "super" {
-                    return;
-                }
-                let cls = if let Some(c) = receiver_class(v, &var_types, index) {
-                    c
-                } else if let Some(c) = index.classes.get(v.as_str()) {
-                    *c
-                } else {
+                let Some(cls) = receiver_cls(object) else {
                     return;
                 };
                 if let Some(members) = class_members(cls, program, index) {
@@ -16679,6 +16738,40 @@ fn check_extension_member_shadowing_type_members(
             }
         }
         if members.is_empty() {
+            // 8.4(7)：目标类型经类型别名解析到内建基础类型时，该类型自身具有
+            // `toString`/`hashCode` 等成员，扩展定义同名零参成员即构成遮蔽
+            //（负例 a07_01：`type MyType = Int32; extend MyType { func toString() }`）。
+            // 仅在无包声明、无 import 的单文件程序上判定，避免同包多文件误伤。
+            if program.package_name.is_none() && program.imports.is_empty() {
+                if let Some(at) = index.aliases.get(base) {
+                    let builtin_prim = matches!(
+                        at,
+                        Type::Int8
+                            | Type::Int16
+                            | Type::Int32
+                            | Type::Int64
+                            | Type::IntNative
+                            | Type::UInt8
+                            | Type::UInt16
+                            | Type::UInt32
+                            | Type::UInt64
+                            | Type::UIntNative
+                            | Type::Float16
+                            | Type::Float32
+                            | Type::Float64
+                            | Type::Rune
+                            | Type::Bool
+                            | Type::String
+                    );
+                    if builtin_prim {
+                        for u in ["toString", "hashCode"] {
+                            members.push((u.to_string(), Vec::new()));
+                        }
+                    }
+                }
+            }
+        }
+        if members.is_empty() {
             continue;
         }
         for m in &ext.methods {
@@ -16705,7 +16798,7 @@ fn check_extension_member_shadowing_type_members(
 /// 8.1.2：接口扩展的合法性。
 ///
 /// - (2) 实现的接口必须是接口（若是本地 class/struct/enum 则非法；单文件无 import
-///   且非 prelude 名字时视为未声明）。
+///   且非 prelude/别名/内建名时视为未声明）。
 /// - (8)-(12) 类型已直接实现（或已通过其它扩展实现）的非泛型接口，不得再次通过
 ///   扩展实现。泛型接口实参在 AST 中丢失，保守跳过。
 fn check_extension_interface_rules(
@@ -16733,6 +16826,22 @@ fn check_extension_interface_rules(
                 errors.push(SemanticError {
                     message: format!(
                         "扩展实现的 '{}' 不是接口，接口扩展只能实现接口（8.1.2(2)）",
+                        iface_base
+                    ),
+                });
+            } else if program.package_name.is_none()
+                && program.imports.is_empty()
+                && !program.type_aliases.iter().any(|(a, _)| a == iface_base)
+                && !is_builtin_type_name(iface_base)
+                && !is_prelude_identifier(iface_base)
+                && !is_core_library_type_name(iface_base)
+            {
+                // 8.1.2(2)：接口扩展所实现的接口必须已声明。仅在**无包声明、无 import
+                // 的单文件**程序上判定——同包多文件（如 std.sort 的 SortByExtension）
+                // 与导入依赖均无法静态确定。
+                errors.push(SemanticError {
+                    message: format!(
+                        "接口扩展实现的接口 '{}' 未声明（8.1.2(2)）",
                         iface_base
                     ),
                 });
@@ -22362,6 +22471,33 @@ fn check_call_array_literal_args(program: &Program, errors: &mut Vec<SemanticErr
     let mut check_stmts = |stmts: &[Stmt]| {
         let mut locals: HashMap<String, String> = HashMap::new();
         scan_locals(stmts, &mut locals);
+        // 收集局部函数签名（含嵌套块）；重名即视为重载/歧义，不判定。
+        fn collect_local_sigs(
+            stmts: &[Stmt],
+            sigs: &mut HashMap<String, Option<Vec<Param>>>,
+        ) {
+            for s in stmts {
+                match s {
+                    Stmt::LocalFunc(f) => {
+                        if sigs.contains_key(&f.name) {
+                            sigs.insert(f.name.clone(), None);
+                        } else {
+                            sigs.insert(f.name.clone(), Some(f.params.clone()));
+                        }
+                        collect_local_sigs(&f.body, sigs);
+                    }
+                    Stmt::While { body, .. }
+                    | Stmt::DoWhile { body, .. }
+                    | Stmt::Loop { body }
+                    | Stmt::UnsafeBlock { body } => collect_local_sigs(body, sigs),
+                    Stmt::For { body, .. } => collect_local_sigs(body, sigs),
+                    Stmt::WhileLet { body, .. } => collect_local_sigs(body, sigs),
+                    _ => {}
+                }
+            }
+        }
+        let mut local_sigs: HashMap<String, Option<Vec<Param>>> = HashMap::new();
+        collect_local_sigs(stmts, &mut local_sigs);
         let mut report = |e: &Expr| {
             match e {
                 Expr::Call {
@@ -22370,6 +22506,20 @@ fn check_call_array_literal_args(program: &Program, errors: &mut Vec<SemanticErr
                     named_args,
                     ..
                 } => {
+                    // 局部函数优先于同名顶层函数（局部遮蔽）。
+                    if let Some(local) = local_sigs.get(name) {
+                        if let Some(params) = local {
+                            if check_args(params, args, named_args) {
+                                errors.push(SemanticError {
+                                    message: format!(
+                                        "调用 '{}' 时数组形参不能接受标量/元组实参（5.3.4(4)）",
+                                        name
+                                    ),
+                                });
+                            }
+                        }
+                        return;
+                    }
                     if let Some(params) = global_sigs.get(name) {
                         if check_args(params, args, named_args) {
                             errors.push(SemanticError {
@@ -24179,6 +24329,28 @@ fn check_generic_type_arg_names(
             value_names.insert(f.name.as_str());
         }
     }
+    // 全文件已声明的类型名 / 类型参数名（宽松并集，宁可放行）：显式类型实参中的
+    // 小写标识符若不在其中，视为把非类型名当作类型实参（负例 a04_21 的
+    // `A<(a, b)>()`：a/b 既非类型也非类型参数）。
+    let mut declared_typeish: HashSet<String> =
+        index.known_types.iter().map(|s| s.to_string()).collect();
+    for tps in index.type_params.values() {
+        for t in tps {
+            declared_typeish.insert(t.clone());
+        }
+    }
+    for f in &program.functions {
+        for t in &f.type_params {
+            declared_typeish.insert(t.clone());
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            for t in &m.type_params {
+                declared_typeish.insert(t.clone());
+            }
+        }
+    }
     let mut scan = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
         walk_stmts(body, &mut |e| {
             let Some(args) = explicit_type_args(e) else {
@@ -24195,6 +24367,21 @@ fn check_generic_type_arg_names(
                         errors.push(SemanticError {
                             message: format!(
                                 "泛型类型实参 '{}' 是值名而非类型（6.1.2.7(4)）",
+                                n
+                            ),
+                        });
+                    } else if program.package_name.is_none()
+                        && program.imports.is_empty()
+                        && n.chars().next().map_or(false, |c| c.is_lowercase())
+                        && !declared_typeish.contains(n)
+                        && !is_builtin_type_name(n)
+                        && !is_prelude_identifier(n)
+                    {
+                        // 6.1.2.7(4)：显式类型实参只能是类型。仅在无 import 的单文件
+                        // 程序上判定（导入依赖无法静态确定）。
+                        errors.push(SemanticError {
+                            message: format!(
+                                "泛型类型实参 '{}' 不是已声明的类型（6.1.2.7(4)）",
                                 n
                             ),
                         });
@@ -29637,6 +29824,888 @@ fn check_generic_enum_ctor_inference(program: &Program, errors: &mut Vec<Semanti
             }
         }
     }
+}
+
+// ─── w28d：01/12 章数组常量下标越界 / 非数组下标 / 数组参与算术 / 浮点混算 ───
+//
+// 轻量静态类型推断（仅覆盖字面量、数组字面量、下标、局部绑定与已知返回类型），
+// 用于在能“确凿判定非法”的位置报错：
+//  - 固定长度数组字面量绑定上的常量下标越界（`let a = [0,1,2]; a[3]`）；
+//  - 对确定的标量类型做下标（`arr[0][0]`，`arr[0]` 为 Int32）；
+//  - 数组作为算术/比较运算符操作数（`arr[1] + 1`）；
+//  - Float32 与 Float64 混算（`1.5f16 + 1.0f64`，f16 词法同化为 Float32）。
+#[derive(Clone, PartialEq, Debug)]
+enum W28Ty {
+    Int,
+    UInt,
+    F32,
+    F64,
+    Bool,
+    Rune,
+    Str,
+    Unit,
+    Array(Box<W28Ty>),
+    User,
+    Unknown,
+}
+
+fn w28_ty_of_type(t: &Type) -> W28Ty {
+    match t {
+        Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 | Type::IntNative => W28Ty::Int,
+        Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 | Type::UIntNative => W28Ty::UInt,
+        Type::Float16 | Type::Float32 => W28Ty::F32,
+        Type::Float64 => W28Ty::F64,
+        Type::Bool => W28Ty::Bool,
+        Type::Rune => W28Ty::Rune,
+        Type::String => W28Ty::Str,
+        Type::Unit => W28Ty::Unit,
+        Type::Array(x) => W28Ty::Array(Box::new(w28_ty_of_type(x))),
+        Type::Nothing => W28Ty::Unknown,
+        _ => W28Ty::User,
+    }
+}
+
+fn w28_infer_expr(
+    e: &Expr,
+    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    retmap: &HashMap<String, W28Ty>,
+) -> W28Ty {
+    match e {
+        Expr::Integer(_) => W28Ty::Int,
+        Expr::IntegerSuffixed(_, s) => {
+            if s.is_unsigned() {
+                W28Ty::UInt
+            } else {
+                W28Ty::Int
+            }
+        }
+        Expr::Float(_) => W28Ty::F64,
+        Expr::Float32(_) => W28Ty::F32,
+        Expr::Bool(_) => W28Ty::Bool,
+        Expr::Rune(_) => W28Ty::Rune,
+        Expr::String(_) => W28Ty::Str,
+        Expr::Array(items) => {
+            if items.is_empty() {
+                W28Ty::Unknown
+            } else {
+                W28Ty::Array(Box::new(w28_infer_expr(&items[0], env, retmap)))
+            }
+        }
+        Expr::Index { array, .. } => match w28_infer_expr(array, env, retmap) {
+            W28Ty::Array(t) => *t,
+            _ => W28Ty::Unknown,
+        },
+        Expr::Var(n) => env
+            .get(n)
+            .map(|(t, _)| t.clone())
+            .unwrap_or(W28Ty::Unknown),
+        Expr::Unary { expr, .. } => w28_infer_expr(expr, env, retmap),
+        Expr::Binary { left, right, .. } => {
+            let l = w28_infer_expr(left, env, retmap);
+            if matches!(l, W28Ty::Unknown) {
+                w28_infer_expr(right, env, retmap)
+            } else {
+                l
+            }
+        }
+        Expr::Cast { target_ty, .. } => w28_ty_of_type(target_ty),
+        Expr::ConstructorCall { .. } | Expr::StructInit { .. } => W28Ty::User,
+        Expr::Call { name, .. } => retmap.get(name).cloned().unwrap_or(W28Ty::Unknown),
+        Expr::Some(x) => w28_infer_expr(x, env, retmap),
+        _ => W28Ty::Unknown,
+    }
+}
+
+fn w28_is_int(t: &W28Ty) -> bool {
+    matches!(t, W28Ty::Int | W28Ty::UInt)
+}
+fn w28_is_float(t: &W28Ty) -> bool {
+    matches!(t, W28Ty::F32 | W28Ty::F64)
+}
+fn w28_is_array(t: &W28Ty) -> bool {
+    matches!(t, W28Ty::Array(_))
+}
+fn w28_is_arith_op(op: &BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Pow
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::Lt
+            | BinOp::Gt
+            | BinOp::LtEq
+            | BinOp::GtEq
+            | BinOp::Eq
+            | BinOp::NotEq
+    )
+}
+fn w28_const_int(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Integer(n) | Expr::IntegerSuffixed(n, _) => Some(*n),
+        Expr::Unary { op: crate::ast::UnaryOp::Neg, expr } => match expr.as_ref() {
+            Expr::Integer(n) => n.checked_neg(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn w28_check_single(
+    e: &Expr,
+    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    retmap: &HashMap<String, W28Ty>,
+    dups: &HashSet<String>,
+    has_index_op: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    if let Expr::Index { array, index } = e {
+        // 常量下标越界（仅针对长度可确定、且未被重新赋值的数组字面量绑定）。
+        if let Some(n) = w28_const_int(index) {
+            let (name, len) = match array.as_ref() {
+                Expr::Var(name) => match env.get(name) {
+                    Some((_, Some(l))) => (Some(name.as_str()), Some(*l)),
+                    _ => (None, None),
+                },
+                Expr::Array(items) => (None, Some(items.len())),
+                _ => (None, None),
+            };
+            if let Some(l) = len {
+                let shadowed = name.map(|nm| dups.contains(nm)).unwrap_or(false);
+                if !shadowed && (n < 0 || n as u64 >= l as u64) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "数组下标越界：常量下标 {} 超出数组长度 {}（1.4(3)/4.12）",
+                            n, l
+                        ),
+                    });
+                }
+            }
+        }
+        // 非数组下标：被下标对象确凿为标量类型（`arr[0][0]` 中 arr[0] 为 Int32）。
+        // 仅检查“对下标结果再次下标”的形态，避免把扫描期推断不确定的裸变量误判
+        // （如经宏/quote 处理、解析器降级为标量字面量的绑定）。
+        // 若程序中存在 `operator func[]` 重载（任意扩展/类型），则不判定（10.2.4(12)）。
+        if has_index_op || !matches!(array.as_ref(), Expr::Index { .. }) {
+            return;
+        }
+        let at = w28_infer_expr(array, env, retmap);
+        if matches!(
+            at,
+            W28Ty::Int | W28Ty::UInt | W28Ty::F32 | W28Ty::F64 | W28Ty::Bool | W28Ty::Rune
+        ) {
+            errors.push(SemanticError {
+                message: "下标访问的操作数不是数组（维度错误，1.4(3)）".to_string(),
+            });
+        }
+    }
+}
+
+/// 12.1.1.1：仅当 try 表达式的值被读取（绑定/赋值/返回/末尾值）时，
+/// try 与 catch 分支才需要公共超类型。
+fn w28_check_try_consumed(
+    body: &[Stmt],
+    catch_body: &[Stmt],
+    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    retmap: &HashMap<String, W28Ty>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let bt = w28_block_last_type(body, env, retmap);
+    let ct = w28_block_last_type(catch_body, env, retmap);
+    let incompatible = (w28_is_int(&bt) && w28_is_float(&ct))
+        || (w28_is_float(&bt) && w28_is_int(&ct))
+        || (bt == W28Ty::F32 && ct == W28Ty::F64)
+        || (bt == W28Ty::F64 && ct == W28Ty::F32)
+        || ((w28_is_int(&bt) || w28_is_float(&bt)) && ct == W28Ty::User)
+        || (bt == W28Ty::User && (w28_is_int(&ct) || w28_is_float(&ct)));
+    if incompatible {
+        errors.push(SemanticError {
+            message: "try 与 catch 分支类型不存在公共超类型（12.1.1）".to_string(),
+        });
+    }
+}
+
+fn w28_block_last_type(
+    stmts: &[Stmt],
+    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    retmap: &HashMap<String, W28Ty>,
+) -> W28Ty {
+    for s in stmts.iter().rev() {
+        match s {
+            Stmt::Expr(e) => return w28_infer_expr(e, env, retmap),
+            Stmt::Return(Some(e)) => return w28_infer_expr(e, env, retmap),
+            _ => {}
+        }
+    }
+    W28Ty::Unknown
+}
+
+fn w28_check_expr(
+    e: &Expr,
+    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    retmap: &HashMap<String, W28Ty>,
+    dups: &HashSet<String>,
+    has_index_op: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    walk_expr(e, &mut |sub| {
+        w28_check_single(sub, env, retmap, dups, has_index_op, errors)
+    });
+}
+
+/// 定位被“消费”的 TryBlock（绑定/赋值/返回/块末尾值），仅对这些做类型检查。
+fn w28_try_consumed_check(
+    e: &Expr,
+    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    retmap: &HashMap<String, W28Ty>,
+    errors: &mut Vec<SemanticError>,
+) {
+    if let Expr::TryBlock {
+        body, catch_body, ..
+    } = e
+    {
+        w28_check_try_consumed(body, catch_body, env, retmap, errors);
+    }
+}
+
+/// 收集函数体内被重新赋值的变量名（这些绑定的数组字面量长度信息不可靠）。
+fn w28_collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign { target, .. } => {
+                if let crate::ast::AssignTarget::Var(n) = target {
+                    out.insert(n.clone());
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => w28_collect_assigned(body, out),
+            Stmt::For { var, body, .. } => {
+                out.insert(var.clone());
+                w28_collect_assigned(body, out);
+            }
+            Stmt::WhileLet { body, .. } => w28_collect_assigned(body, out),
+            Stmt::LocalFunc(f) => w28_collect_assigned(&f.body, out),
+            _ => {}
+        }
+    }
+}
+
+fn w28_collect_dup_names(stmts: &[Stmt], seen: &mut HashSet<String>, dups: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, .. } | Stmt::Var { pattern, .. } => {
+                if let Pattern::Binding(n) = pattern {
+                    if !seen.insert(n.clone()) {
+                        dups.insert(n.clone());
+                    }
+                }
+            }
+            Stmt::Const { name, .. } => {
+                if !seen.insert(name.clone()) {
+                    dups.insert(name.clone());
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Loop { body }
+            | Stmt::UnsafeBlock { body } => w28_collect_dup_names(body, seen, dups),
+            Stmt::For { var, body, .. } => {
+                if !seen.insert(var.clone()) {
+                    dups.insert(var.clone());
+                }
+                w28_collect_dup_names(body, seen, dups);
+            }
+            Stmt::LocalFunc(f) => w28_collect_dup_names(&f.body, seen, dups),
+            _ => {}
+        }
+    }
+}
+
+fn w28_scan_stmts(
+    stmts: &[Stmt],
+    env: &mut HashMap<String, (W28Ty, Option<usize>)>,
+    retmap: &HashMap<String, W28Ty>,
+    dups: &HashSet<String>,
+    assigned: &HashSet<String>,
+    has_index_op: bool,
+    errors: &mut Vec<SemanticError>,
+) {
+    let last_idx = stmts.len().saturating_sub(1);
+    for (idx, s) in stmts.iter().enumerate() {
+        match s {
+            Stmt::Let { pattern, ty, value } | Stmt::Var { pattern, ty, value } => {
+                let is_var = matches!(s, Stmt::Var { .. });
+                w28_check_expr(value, env, retmap, dups, has_index_op, errors);
+                w28_try_consumed_check(value, env, retmap, errors);
+                if let Pattern::Binding(name) = pattern {
+                    let inferred = ty
+                        .as_ref()
+                        .map(w28_ty_of_type)
+                        .unwrap_or_else(|| w28_infer_expr(value, env, retmap));
+                    // 仅对不可变（let）且未被重新赋值的数组字面量绑定记录长度。
+                    // 可变数组的下标可能由运行时逻辑保证（官方 std 存在越界即
+                    // 触发运行时异常的用例），不据初值长度判定。
+                    let len = match value {
+                        Expr::Array(items) if !is_var && !assigned.contains(name) => {
+                            Some(items.len())
+                        }
+                        _ => None,
+                    };
+                    env.insert(name.clone(), (inferred, len));
+                }
+            }
+            Stmt::Const { name, ty, value } => {
+                w28_check_expr(value, env, retmap, dups, has_index_op, errors);
+                w28_try_consumed_check(value, env, retmap, errors);
+                let inferred = ty
+                    .as_ref()
+                    .map(w28_ty_of_type)
+                    .unwrap_or_else(|| w28_infer_expr(value, env, retmap));
+                env.insert(name.clone(), (inferred, None));
+            }
+            Stmt::Expr(e) => {
+                w28_check_expr(e, env, retmap, dups, has_index_op, errors);
+                // 块末尾表达式作为值被消费。
+                if idx == last_idx {
+                    w28_try_consumed_check(e, env, retmap, errors);
+                }
+            }
+            Stmt::Return(Some(e)) => {
+                w28_check_expr(e, env, retmap, dups, has_index_op, errors);
+                w28_try_consumed_check(e, env, retmap, errors);
+            }
+            Stmt::Assign { value, .. } => {
+                w28_check_expr(value, env, retmap, dups, has_index_op, errors);
+                w28_try_consumed_check(value, env, retmap, errors);
+            }
+            Stmt::While { cond, body } => {
+                w28_check_expr(cond, env, retmap, dups, has_index_op, errors);
+                let mut inner = env.clone();
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                w28_check_expr(expr, env, retmap, dups, has_index_op, errors);
+                let mut inner = env.clone();
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
+            }
+            Stmt::DoWhile { body, cond } => {
+                let mut inner = env.clone();
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
+                w28_check_expr(cond, env, retmap, dups, has_index_op, errors);
+            }
+            Stmt::For {
+                var,
+                iterable,
+                body,
+            } => {
+                w28_check_expr(iterable, env, retmap, dups, has_index_op, errors);
+                let mut inner = env.clone();
+                inner.insert(var.clone(), (W28Ty::Unknown, None));
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
+            }
+            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+                let mut inner = env.clone();
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
+            }
+            Stmt::LocalFunc(f) => {
+                let mut child = env.clone();
+                for p in &f.params {
+                    child.insert(p.name.clone(), (w28_ty_of_type(&p.ty), None));
+                }
+                w28_scan_stmts(
+                    &f.body,
+                    &mut child,
+                    retmap,
+                    dups,
+                    assigned,
+                    has_index_op,
+                    errors,
+                );
+            }
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                w28_check_expr(left, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(right, env, retmap, dups, has_index_op, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 构建全局函数的显式返回类型映射（供字面量之外的调用结果推断）。
+fn w28_return_map(program: &Program) -> HashMap<String, W28Ty> {
+    let mut map = HashMap::new();
+    for f in &program.functions {
+        if let Some(rt) = &f.return_type {
+            map.insert(f.name.clone(), w28_ty_of_type(rt));
+        }
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            if let Some(rt) = &m.func.return_type {
+                map.insert(m.func.name.clone(), w28_ty_of_type(rt));
+            }
+        }
+    }
+    map
+}
+
+fn check_w28d_array_index_and_numeric(program: &Program, errors: &mut Vec<SemanticError>) {
+    let retmap = w28_return_map(program);
+    // 是否存在 `operator func[]` 重载（扩展或类型成员），存在则不判定下标维度。
+    let has_index_op = {
+        let mut found = false;
+        let is_index_op = |member: &str| {
+            member.contains("[]") || member.contains("op_index") || member == "index"
+        };
+        for x in &program.extends {
+            for m in &x.methods {
+                let member = m.name.rsplit('.').next().unwrap_or(&m.name);
+                if is_index_op(member) {
+                    found = true;
+                }
+            }
+        }
+        for c in &program.classes {
+            for m in &c.methods {
+                let member = m.func.name.rsplit('.').next().unwrap_or(&m.func.name);
+                if is_index_op(member) {
+                    found = true;
+                }
+            }
+        }
+        for m in &program.functions {
+            let member = m.name.rsplit('.').next().unwrap_or(&m.name);
+            if is_index_op(member) {
+                found = true;
+            }
+        }
+        found
+    };
+    let mut run_body = |body: &[Stmt], params: &[Param]| {
+        let mut env: HashMap<String, (W28Ty, Option<usize>)> = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut dups = HashSet::new();
+        let mut assigned = HashSet::new();
+        for p in params {
+            env.insert(p.name.clone(), (w28_ty_of_type(&p.ty), None));
+            seen.insert(p.name.clone());
+        }
+        w28_collect_dup_names(body, &mut seen, &mut dups);
+        w28_collect_assigned(body, &mut assigned);
+        w28_scan_stmts(
+            body, &mut env, &retmap, &dups, &assigned, has_index_op, errors,
+        );
+    };
+    for f in &program.functions {
+        run_body(&f.body, &f.params);
+    }
+    for c in &program.classes {
+        for i in &c.inits {
+            run_body(&i.body, &i.params);
+        }
+        for m in &c.methods {
+            run_body(&m.func.body, &m.func.params);
+        }
+        if let Some(si) = &c.static_init {
+            run_body(si, &[]);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            run_body(&i.body, &i.params);
+        }
+    }
+    for i in &program.interfaces {
+        for m in &i.methods {
+            if let Some(b) = &m.default_body {
+                run_body(b, &[]);
+            }
+        }
+    }
+    for x in &program.extends {
+        for m in &x.methods {
+            run_body(&m.body, &m.params);
+        }
+    }
+}
+
+// ─── w28d：03 章 foreign 函数只能在 unsafe 上下文调用 ──────────────────────
+fn check_w28d_foreign_call(program: &Program, errors: &mut Vec<SemanticError>) {
+    use std::collections::HashSet;
+    let foreign: HashSet<&str> = program
+        .functions
+        .iter()
+        .filter(|f| f.extern_import.is_some())
+        .map(|f| f.name.as_str())
+        .collect();
+    if foreign.is_empty() {
+        return;
+    }
+    let scan = |body: &[Stmt], is_unsafe: bool, errors: &mut Vec<SemanticError>| {
+        walk_stmts_unsafe(body, 0, &mut |e, depth| {
+            if is_unsafe || depth > 0 {
+                return;
+            }
+            if let Expr::Call { name, .. } = e {
+                if foreign.contains(name.as_str()) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "foreign 函数 '{}' 只能在 unsafe 上下文中调用（3.4.2(7)）",
+                            name
+                        ),
+                    });
+                }
+            }
+        });
+    };
+    for f in &program.functions {
+        if f.extern_import.is_some() || f.body.is_empty() {
+            continue;
+        }
+        scan(&f.body, f.is_unsafe, errors);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            scan(&m.func.body, m.func.is_unsafe, errors);
+        }
+    }
+    for x in &program.extends {
+        for m in &x.methods {
+            scan(&m.body, m.is_unsafe, errors);
+        }
+    }
+}
+
+// ─── w28d：03 章 3.2.3.2(7) 局部函数只能引用其之前声明的局部函数 ────────────
+fn check_w28d_local_func_forward_ref(program: &Program, errors: &mut Vec<SemanticError>) {
+    use std::collections::HashMap as Map;
+    fn check_block(stmts: &[Stmt], errors: &mut Vec<SemanticError>) {
+        // 记录本级块内局部函数的声明顺序。
+        let mut order: Map<&str, usize> = Map::new();
+        for (i, s) in stmts.iter().enumerate() {
+            if let Stmt::LocalFunc(f) = s {
+                order.insert(f.name.as_str(), i);
+            }
+        }
+        if order.len() >= 2 {
+            for (i, s) in stmts.iter().enumerate() {
+                let Stmt::LocalFunc(f) = s else { continue };
+                let mut called: Vec<String> = Vec::new();
+                walk_stmts(&f.body, &mut |e| {
+                    if let Expr::Call { name, .. } = e {
+                        called.push(name.clone());
+                    }
+                });
+                for name in called {
+                    if let Some(&j) = order.get(name.as_str()) {
+                        if j > i {
+                            errors.push(SemanticError {
+                                message: format!(
+                                    "局部函数 '{}' 在前面的局部函数 '{}' 中不可见（须先声明后使用，3.2.3.2(7)）",
+                                    name, f.name
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // 递归到子块与局部函数体。
+        for s in stmts {
+            match s {
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body } => check_block(body, errors),
+                Stmt::For { body, .. } => check_block(body, errors),
+                Stmt::WhileLet { body, .. } => check_block(body, errors),
+                Stmt::LocalFunc(f) => check_block(&f.body, errors),
+                Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
+                    if let Expr::Block(inner, _) = value {
+                        check_block(inner, errors);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for f in &program.functions {
+        check_block(&f.body, errors);
+    }
+    for c in &program.classes {
+        for i in &c.inits {
+            check_block(&i.body, errors);
+        }
+        for m in &c.methods {
+            check_block(&m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            check_block(&i.body, errors);
+        }
+    }
+}
+
+// ─── w28d：5.1.4(9) 无返回类型标注函数的 return 表达式须有公共超类型 ────────
+fn check_w28d_return_common_type(program: &Program, errors: &mut Vec<SemanticError>) {
+    let retmap = w28_return_map(program);
+    fn collect_returns<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Expr>) {
+        fn expr_returns<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+            match e {
+                Expr::Return(Some(x)) => out.push(x.as_ref()),
+                Expr::Block(inner, tail) => {
+                    collect_returns(inner, out);
+                    if let Some(t) = tail {
+                        expr_returns(t, out);
+                    }
+                }
+                Expr::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    expr_returns(then_branch, out);
+                    if let Some(e) = else_branch {
+                        expr_returns(e, out);
+                    }
+                }
+                Expr::IfLet {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    expr_returns(then_branch, out);
+                    if let Some(e) = else_branch {
+                        expr_returns(e, out);
+                    }
+                }
+                Expr::Match { arms, .. } => {
+                    for arm in arms {
+                        expr_returns(&arm.body, out);
+                    }
+                }
+                Expr::TryBlock {
+                    body,
+                    catch_body,
+                    finally_body,
+                    ..
+                } => {
+                    collect_returns(body, out);
+                    collect_returns(catch_body, out);
+                    if let Some(fb) = finally_body {
+                        collect_returns(fb, out);
+                    }
+                }
+                // lambda 内的 return 属于 lambda，不计入外层。
+                Expr::Lambda { .. } => {}
+                _ => {}
+            }
+        }
+        for s in stmts {
+            match s {
+                Stmt::Return(Some(e)) => out.push(e),
+                Stmt::Expr(e) => expr_returns(e, out),
+                Stmt::While { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body } => collect_returns(body, out),
+                Stmt::For { body, .. } => collect_returns(body, out),
+                Stmt::WhileLet { body, .. } => collect_returns(body, out),
+                // 局部函数体内的 return 属于该局部函数，不计入外层返回类型。
+                Stmt::LocalFunc(_) => {}
+                _ => {}
+            }
+        }
+    }
+    let check = |body: &[Stmt], ret: Option<&Type>, errors: &mut Vec<SemanticError>| {
+        if ret.is_some() {
+            return;
+        }
+        let mut rets: Vec<&Expr> = Vec::new();
+        collect_returns(body, &mut rets);
+        // 末尾表达式也参与返回类型推导。
+        if let Some(Stmt::Expr(e)) = body.last() {
+            rets.push(e);
+        }
+        let env: HashMap<String, (W28Ty, Option<usize>)> = HashMap::new();
+        let mut has_int = false;
+        let mut has_float = false;
+        for e in rets {
+            // 裸整数字面量可适配浮点上下文，保守跳过以免误报。
+            let bare_int_lit = matches!(
+                e,
+                Expr::Integer(_)
+                    | Expr::IntegerSuffixed(_, _)
+                    | Expr::Unary {
+                        op: crate::ast::UnaryOp::Neg,
+                        ..
+                    }
+            );
+            if bare_int_lit {
+                continue;
+            }
+            let t = w28_infer_expr(e, &env, &retmap);
+            if w28_is_int(&t) {
+                has_int = true;
+            } else if w28_is_float(&t) {
+                has_float = true;
+            }
+        }
+        if has_int && has_float {
+            errors.push(SemanticError {
+                message:
+                    "函数 return 表达式的类型不存在公共超类型（Int 与 Float，5.1.4(9)）".to_string(),
+            });
+        }
+    };
+    for f in &program.functions {
+        check(&f.body, f.return_type.as_ref(), errors);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            check(&m.func.body, m.func.return_type.as_ref(), errors);
+        }
+    }
+}
+
+// ─── w28d：01 章 ? 运算符与 Option 函数值调用语法 ─────────────────────────
+//  - `Option<T>.Some/None` 绑定的变量是 Option 值，调用函数值必须写 `x?(...)`；
+//  - `?` 只能作用于 Option/Result 值，不能用于普通函数值。
+#[derive(Clone, Copy, PartialEq)]
+enum W28Kind {
+    OptionCallable,
+    FunctionValue,
+    Other,
+}
+
+fn check_w28d_option_syntax(program: &Program, errors: &mut Vec<SemanticError>) {
+    fn scan(
+        stmts: &[Stmt],
+        env: &mut HashMap<String, W28Kind>,
+        errors: &mut Vec<SemanticError>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Let { pattern, ty, value } | Stmt::Var { pattern, ty, value } => {
+                    check_kind(value, env, errors);
+                    if let Pattern::Binding(name) = pattern {
+                        let kind = if matches!(ty, Some(crate::ast::Type::Option(_))) {
+                            // 显式 `?T` 标注即为 Option 值。
+                            W28Kind::OptionCallable
+                        } else {
+                            match value {
+                                Expr::MethodCall {
+                                    object, method, ..
+                                } if method == "Some" && is_option_head(object) => {
+                                    W28Kind::OptionCallable
+                                }
+                                Expr::Field { object, field }
+                                    if field == "None" && is_option_head(object) =>
+                                {
+                                    W28Kind::OptionCallable
+                                }
+                                Expr::Lambda { .. } => W28Kind::FunctionValue,
+                                Expr::Var(n) => env.get(n).copied().unwrap_or(W28Kind::Other),
+                                _ => W28Kind::Other,
+                            }
+                        };
+                        env.insert(name.clone(), kind);
+                    }
+                }
+                Stmt::Expr(e) | Stmt::Return(Some(e)) => check_kind(e, env, errors),
+                Stmt::Assign { value, .. } => check_kind(value, env, errors),
+                Stmt::While { cond, body } => {
+                    check_kind(cond, env, errors);
+                    scan(body, env, errors);
+                }
+                Stmt::DoWhile { body, cond } => {
+                    scan(body, env, errors);
+                    check_kind(cond, env, errors);
+                }
+                Stmt::For { iterable, body, .. } => {
+                    check_kind(iterable, env, errors);
+                    scan(body, env, errors);
+                }
+                Stmt::Loop { body } | Stmt::UnsafeBlock { body } => scan(body, env, errors),
+                Stmt::LocalFunc(f) => scan(&f.body, env, errors),
+                _ => {}
+            }
+        }
+    }
+    let mut run_body = |body: &[Stmt], params: &[Param]| {
+        let mut env: HashMap<String, W28Kind> = HashMap::new();
+        for p in params {
+            env.insert(p.name.clone(), W28Kind::Other);
+        }
+        scan(body, &mut env, errors);
+    };
+    for f in &program.functions {
+        run_body(&f.body, &f.params);
+    }
+    for c in &program.classes {
+        for i in &c.inits {
+            run_body(&i.body, &i.params);
+        }
+        for m in &c.methods {
+            run_body(&m.func.body, &m.func.params);
+        }
+    }
+    for s in &program.structs {
+        for i in &s.inits {
+            run_body(&i.body, &i.params);
+        }
+    }
+}
+
+fn is_option_head(e: &Expr) -> bool {
+    // 语法层 `Option<T>.Some(...)` 解析为 object=Var("Option")；限定路径取末段。
+    match e {
+        Expr::Var(n) => n == "Option",
+        Expr::Field { object, .. } => is_option_head(object),
+        _ => false,
+    }
+}
+
+fn check_kind(
+    e: &Expr,
+    env: &HashMap<String, W28Kind>,
+    errors: &mut Vec<SemanticError>,
+) {
+    walk_expr(e, &mut |sub| match sub {
+        Expr::Call { name, .. } => {
+            if env.get(name) == Some(&W28Kind::OptionCallable) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "Option 函数值 '{}' 调用时缺少 `?`（应为 {}(...)）",
+                        name, name
+                    ),
+                });
+            }
+        }
+        Expr::Try(inner) => {
+            if let Expr::Var(n) = inner.as_ref() {
+                if env.get(n) == Some(&W28Kind::FunctionValue) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "`?` 运算符只能用于 Option/Result 值，'{}' 是普通函数值",
+                            n
+                        ),
+                    });
+                }
+            }
+        }
+        _ => {}
+    });
 }
 
 #[cfg(test)]
@@ -35716,6 +36785,215 @@ main() {}"#,
         assert_invalid(
             "struct S {\n    init(x: Float32) {}\n    init(x: Float64) {}\n}\n\
              main() { let s = S(64) }\n",
+        );
+    }
+
+    // ─── w28c：06/07/08 章负例（类/接口/属性/扩展） ─────────────────────────
+
+    // 7.3(8)：struct 属性 setter 是 mut 函数，其闭包不能捕获 this / 实例字段。
+    #[test]
+    fn test_w28c_struct_setter_lambda_capture_rejected() {
+        // 捕获本实例字段 `a`（a08_03）。
+        assert_invalid(
+            "struct A {\n\
+             \x20 var a: Int64 = 0\n\
+             \x20 mut prop p: Int64 { get() { a } set(v) { let f = { => a }\n\
+             \x20 a = v } }\n\
+             }\n\
+             main() { var x = A()\n return 0 }\n",
+        );
+        // 捕获 `this`（a08_02）。
+        assert_invalid(
+            "struct A {\n\
+             \x20 var a: Int64 = 0\n\
+             \x20 mut prop p: Int64 { get() { a } set(v) { let f = { => this }\n\
+             \x20 a = v } }\n\
+             }\n\
+             main() { var x = A()\n return 0 }\n",
+        );
+        // 类属性 setter 中捕获 this/字段合法（a08_04 正例）。
+        assert_valid(
+            "class A {\n\
+             \x20 var a: Int64 = 7\n\
+             \x20 mut prop p: Int64 { get() { a } set(v) {\n\
+             \x20   let f1 = { => this.a }\n\
+             \x20   if (v > f1()) { a = v }\n\
+             \x20 } }\n\
+             }\n\
+             main() { var x = A()\n return 0 }\n",
+        );
+    }
+
+    // 8.1.2(2)：接口扩展实现的接口必须已声明。
+    #[test]
+    fn test_w28c_extend_undeclared_interface_rejected() {
+        assert_invalid(
+            "extend Bool <: I {\n\
+             \x20 public func foo(): String { \"bool\" }\n\
+             }\n\
+             main() { }\n",
+        );
+        // 同文件声明后合法。
+        assert_valid(
+            "interface I {}\nextend Bool <: I {}\nmain() { }\n",
+        );
+    }
+
+    // 8.4(7)：经类型别名扩展内建类型不得遮蔽其 toString 等成员。
+    #[test]
+    fn test_w28c_extend_alias_builtin_shadow_rejected() {
+        assert_invalid(
+            "type MyType = Int32\n\
+             extend MyType { func toString() { \"AAA\" } }\n\
+             main(): Unit { }\n",
+        );
+        // 新增非遮蔽成员合法。
+        assert_valid(
+            "type MyType = Int32\n\
+             extend MyType { func foo() { \"AAA\" } }\n\
+             main(): Unit { }\n",
+        );
+    }
+
+    // 6.1.2.7(4)：显式类型实参只能是已声明的类型（泛型类不能用元组“模式”实例化）。
+    #[test]
+    fn test_w28c_generic_type_arg_non_type_rejected() {
+        assert_invalid(
+            "class A<T> {}\nmain() { A<(a, b)>() }\n",
+        );
+        // 合法元组类型实参。
+        assert_valid(
+            "class A<T> {}\nmain() { A<(Int64, Int64)>() }\n",
+        );
+    }
+
+    // 6.1.2(1)：构造调用接收者上访问不存在的成员（全局同名变量不构成成员）。
+    #[test]
+    fn test_w28c_ctor_receiver_missing_member_rejected() {
+        assert_invalid(
+            "var x = 1\ninterface I {}\nclass A <: I {}\nmain() { A().x }\n",
+        );
+        // 真实成员合法。
+        assert_valid(
+            "class A { let x = 1 }\nmain() { A().x }\n",
+        );
+    }
+
+    // ─── w28d：01/12 章 数组下标 / try 分支类型 / ? 运算符 / 局部函数 / 变长实参 ──
+
+    #[test]
+    fn test_w28d_array_const_index_bounds() {
+        // 固定长度数组字面量绑定的常量下标越界。
+        let errs = assert_invalid("main() { let a = [0, 1, 2]\n let x = a[3] }");
+        assert!(errs.iter().any(|e| e.message.contains("下标越界")), "{:?}", errs);
+        assert_invalid("main() { let a: Array<Int32> = [0, 2, 4]\n let y = a[5] }");
+        // 正例：合法下标；被重新赋值的变量不据初值判界。
+        assert_valid("main() { let a = [0, 1, 2]\n let x = a[2] }");
+        assert_valid(
+            "main() { let src = [0, 1, 2, 3]\n var a: Array<Int32> = []\n a = src[1..=2]\n let x = a[0] }",
+        );
+    }
+
+    #[test]
+    fn test_w28d_index_non_array() {
+        // 对下标结果的再次下标：内层元素为标量 → 维度错误。
+        let errs = assert_invalid(
+            "main() { var a: Array<Int32> = [1, 2]\n let x = a[0][0] }",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("维度错误")), "{:?}", errs);
+        // 正例：多维下标的合法形态。
+        assert_valid(
+            "main() { var a: Array<Array<Int32>> = [[1, 2], [3, 4]]\n let x = a[1][0] }",
+        );
+        // 正例：类型定义了 operator[] 时不判维度。
+        assert_valid(
+            "extend UInt64 { operator func[](i: Int64) { 42 } }\n\
+             main() { let x = 0_u64[1] }",
+        );
+    }
+
+    #[test]
+    fn test_w28d_try_branch_common_type() {
+        // 被读取的 try 表达式：Int 与 Float 分支无公共超类型。
+        let errs = assert_invalid("main() { let e = try { 1 } catch(_) { 1.0 } }");
+        assert!(
+            errs.iter().any(|e| e.message.contains("公共超类型")),
+            "{:?}",
+            errs
+        );
+        // 正例：try 值未被读取（Unit），不要求公共超类型。
+        assert_valid("main() { try { 1 } catch(_) { 1.0 }\n 0 }");
+        assert_valid("main() { try { 1 } catch(_) { 1.0 }\n return }");
+        // 正例：分支类型一致。
+        assert_valid("main() { let e = try { 1 } catch(_) { 2 } }");
+    }
+
+    #[test]
+    fn test_w28d_option_call_syntax() {
+        // Option 函数值调用缺少 ?。
+        let errs = assert_invalid(
+            "main() {\n let foo = {i: Int64 => i + 1}\n let f1 = Option<(Int64) -> Int64>.Some(foo)\n let r = f1(1)\n}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("缺少 `?`")), "{:?}", errs);
+        // ? 作用于普通函数值。
+        let errs = assert_invalid(
+            "main() {\n let foo = {i: Int64 => i + 1}\n let f1 = foo\n let r = f1?(1)\n}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("普通函数值")), "{:?}", errs);
+        // 正例：Option 值以 ? 调用。
+        assert_valid(
+            "main() {\n let foo = {i: Int64 => i + 1}\n let f1 = Option<(Int64) -> Int64>.Some(foo)\n let r = f1?(1)\n}",
+        );
+    }
+
+    #[test]
+    fn test_w28d_return_common_type() {
+        // 无返回类型标注的函数：Int 与 Float 返回无公共超类型。
+        let errs = assert_invalid(
+            "func fi(): Int64 { 1 }\nfunc ff(): Float64 { 1.0 }\n\
+             func g(a: Bool) { if (a) { return fi() }\n return ff() }\nmain() {}",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("公共超类型")),
+            "{:?}",
+            errs
+        );
+        // 正例：全为整型返回值。
+        assert_valid(
+            "func fi(): Int64 { 1 }\nfunc g(a: Bool) { if (a) { return fi() }\n return fi() }\nmain() {}",
+        );
+    }
+
+    #[test]
+    fn test_w28d_local_function_forward_ref() {
+        // 局部函数互递归（前向引用）不支持。
+        let errs = assert_invalid(
+            "main() {\n func f2(): Int32 { return f3() }\n func f3(): Int32 { return f2() }\n f2()\n}",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("不可见")),
+            "{:?}",
+            errs
+        );
+        // 正例：自递归；仅引用前面的局部函数。
+        assert_valid("main() {\n func f1(n: Int64): Int64 { if (n < 1) { 0 } else { f1(n - 1) } }\n f1(3)\n}");
+        assert_valid("main() {\n func f1(): Int32 { 1 }\n func f2(): Int32 { f1() }\n f2()\n}");
+    }
+
+    #[test]
+    fn test_w28d_local_array_param_scalar_arg() {
+        // 局部函数的数组形参收到标量实参（变长实参语法糖误用）。
+        let errs = assert_invalid(
+            "main() {\n func f0(arr: Array<Rune>, a: Bool): String { \"x\" }\n f0('d', true)\n}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("数组形参")), "{:?}", errs);
+        let errs = assert_invalid(
+            "main() {\n func f0(z: Int32, x!: Array<Int32>): String { \"x\" }\n f0(3, x: 5)\n}",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("数组形参")), "{:?}", errs);
+        // 正例：传入数组字面量。
+        assert_valid(
+            "main() {\n func f0(arr: Array<Rune>, a: Bool): String { \"x\" }\n f0(['d'], true)\n}",
         );
     }
 
