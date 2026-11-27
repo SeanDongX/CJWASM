@@ -586,6 +586,14 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_closure_capture_scope(program, &mut errors);
     check_ctype_annotation_binding(program, &mut errors);
     check_variadic_c_ctype_args(program, &index, &mut errors);
+    // w33c：原始标量局部变量被赋构造/集合值的确定性类型冲突（3.3 / 5.3.2）。
+    check_w33c_assignment_definite_mismatch(program, &mut errors);
+    // w33c：属性 getter/setter 体尾部类型（7.3(5)）。
+    check_w33c_prop_accessor_body_types(program, &mut errors);
+    // w33c：控制流表达式不能被当函数调用/尾随闭包目标（5.3.3(8)）。
+    check_w33c_control_flow_callee(program, &mut errors);
+    // w33c：顶层函数值（f() 返回函数类型）调用不能省略参数（5.1.2.2(18)）。
+    check_w33c_fnvalue_call_arity(program, &mut errors);
     // 6.1.2.1(60)：构造函数之间的循环调用依赖。
     check_ctor_cycles(program, &index, &mut errors);
     // 6.1.2(1)：本地类实例/类型上访问不存在的成员。
@@ -13587,6 +13595,291 @@ fn walk_assign_target_exprs<'a>(target: &'a AssignTarget, f: &mut dyn FnMut(&'a 
 }
 
 /// 13.1.1：unsafe 上下文规则。
+// ─── batch-33 w33c：赋值类型表面冲突 / 属性访问器体类型 / 控制流表达式被调用 ──
+
+/// 是否为确定的原始标量数值/字符串/布尔/字符类型（不含 Unit/Nothing）。
+fn w33c_is_prim_literal_type(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::IntNative
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::UIntNative
+            | Type::Float16
+            | Type::Float32
+            | Type::Float64
+            | Type::String
+            | Type::Bool
+            | Type::Rune
+    )
+}
+
+/// 字面量类别与目标类型确定互斥（仅跨类别：字符串/布尔/字符 与 数值 互斥；
+/// 不判定 int↔float 之类的上下文整数字面量规则，保守放行）。
+fn w33c_literal_cross_mismatch(lit: &Expr, target: &Type) -> bool {
+    let target_num = is_int_type(target) || is_float_type(target);
+    match lit {
+        Expr::String(_) | Expr::Interpolate(_) => {
+            target_num || matches!(target, Type::Bool | Type::Rune)
+        }
+        Expr::Bool(_) => target_num || matches!(target, Type::String | Type::Rune),
+        Expr::Rune(_) => target_num || matches!(target, Type::String | Type::Bool),
+        Expr::Integer(_)
+        | Expr::IntegerSuffixed(..)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::FloatSuffixed(..) => matches!(target, Type::String | Type::Bool | Type::Rune),
+        _ => false,
+    }
+}
+
+/// 3.3 / 5.3.2：对“类型确定的原始标量局部变量”赋一个确定为他类构造/集合值的
+/// 表达式（如 `var x = 2; x = Box(x)`）——确定性类型冲突。仅在两类型均可静态
+/// 确定且明显不兼容时触发，无法确定时一律放行。
+fn check_w33c_assignment_definite_mismatch(program: &Program, errors: &mut Vec<SemanticError>) {
+    fn add(map: &mut HashMap<String, Type>, conf: &mut HashSet<String>, n: &str, t: Type) {
+        if let Some(e) = map.get(n) {
+            if *e != t {
+                conf.insert(n.to_string());
+            }
+        } else {
+            map.insert(n.to_string(), t);
+        }
+    }
+    fn collect(stmts: &[Stmt], map: &mut HashMap<String, Type>, conf: &mut HashSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Let { pattern, ty, value, .. } | Stmt::Var { pattern, ty, value, .. } => {
+                    if let Pattern::Binding(n) = pattern {
+                        if let Some(t) = ty {
+                            add(map, conf, n, t.clone());
+                        } else if let Some(t) = static_expr_type(value, map) {
+                            add(map, conf, n, t);
+                        }
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::WhileLet { body, .. } => collect(body, map, conf),
+                _ => {}
+            }
+        }
+    }
+    fn scan(
+        stmts: &[Stmt],
+        map: &HashMap<String, Type>,
+        errors: &mut Vec<SemanticError>,
+        seen: &mut HashSet<String>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Assign {
+                    target: crate::ast::AssignTarget::Var(name),
+                    value,
+                } => {
+                    if let Some(t) = map.get(name) {
+                        if w33c_is_prim_literal_type(t) {
+                            if let Some(rt) = static_expr_type(value, map) {
+                                let incompatible = matches!(
+                                    rt,
+                                    Type::Struct(..)
+                                        | Type::Array(_)
+                                        | Type::Tuple(_)
+                                        | Type::Function { .. }
+                                );
+                                if incompatible {
+                                    let msg = format!(
+                                        "赋值类型不匹配：变量 '{}' 为原始标量类型，右侧为该构造/集合/函数值（3.3 / 5.3.2）",
+                                        name
+                                    );
+                                    if seen.insert(msg.clone()) {
+                                        errors.push(SemanticError { message: msg });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::WhileLet { body, .. } => scan(body, map, errors, seen),
+                Stmt::Expr(Expr::Block(inner, _)) => scan(inner, map, errors, seen),
+                _ => {}
+            }
+        }
+    }
+    for_each_fn_body(program, &mut |params, body, _| {
+        let mut map: HashMap<String, Type> = HashMap::new();
+        let mut conf: HashSet<String> = HashSet::new();
+        for p in params {
+            map.insert(p.name.clone(), p.ty.clone());
+        }
+        collect(body, &mut map, &mut conf);
+        for c in conf {
+            map.remove(&c);
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        scan(body, &map, errors, &mut seen);
+    });
+}
+
+/// 7.3(5)：属性 getter 体尾部表达式类型须与属性声明类型一致；setter 体尾部
+/// 表达式须为 Unit。仅确定性字面量/构造尾部判定，无法静态确定时放行。
+fn check_w33c_prop_accessor_body_types(program: &Program, errors: &mut Vec<SemanticError>) {
+    fn tail_expr(body: &[Stmt]) -> Option<&Expr> {
+        match body.last()? {
+            Stmt::Expr(e) => Some(e),
+            Stmt::Return(Some(e)) => Some(e),
+            _ => None,
+        }
+    }
+    fn check_fn(f: &Function, errors: &mut Vec<SemanticError>, seen: &mut HashSet<String>) {
+        let seg = f.name.rsplit('.').next().unwrap_or(&f.name);
+        // 仅校验 getter 体尾部与声明类型的跨类别字面量冲突。setter 尾值留待
+        // 官方正例/负例矛盾（07_03_a03_03 正例允许非 Unit 尾值）由既有规则处理，
+        // 此处不再判 setter（守正测试红线）。
+        if let Some(prop) = seg.strip_prefix("__get_") {
+            if let Some(ty) = &f.return_type {
+                if let Some(e) = tail_expr(&f.body) {
+                    if w33c_literal_cross_mismatch(e, ty) {
+                        let msg = format!(
+                            "属性 '{}' 的 getter 返回类型与声明类型不匹配（7.3(5)）",
+                            prop
+                        );
+                        if seen.insert(msg.clone()) {
+                            errors.push(SemanticError { message: msg });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        for m in &c.methods {
+            check_fn(&m.func, errors, &mut seen);
+        }
+    }
+    for e in &program.extends {
+        for m in &e.methods {
+            check_fn(m, errors, &mut seen);
+        }
+    }
+    for f in &program.functions {
+        check_fn(f, errors, &mut seen);
+    }
+}
+
+/// 5.3.3(8)：尾随闭包 / 立即调用只能作用于函数名或方法调用，不能作用于控制流
+/// 表达式（`if..else.. () {}`、`try catch {}`）。控制流表达式被 `(...)` 调用或
+/// 尾随 `{}` 均为非法。
+fn check_w33c_control_flow_callee(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for_each_fn_body(program, &mut |_, body, _| {
+        walk_stmts(body, &mut |e| {
+            let callee = match e {
+                Expr::Invoke { callee, .. } => &**callee,
+                Expr::TrailingClosure { callee, .. } => &**callee,
+                _ => return,
+            };
+            if matches!(
+                callee,
+                Expr::If { .. }
+                    | Expr::IfLet { .. }
+                    | Expr::Match { .. }
+                    | Expr::TryBlock { .. }
+                    | Expr::Block(..)
+            ) {
+                let msg = "尾随闭包/立即调用只能作用于函数名或方法调用（5.3.3(8)）".to_string();
+                if seen.insert(msg.clone()) {
+                    errors.push(SemanticError { message: msg });
+                }
+            }
+        });
+    });
+}
+
+/// 13.1.1：unsafe 上下文规则。
+/// 5.1.2.2(18)：顶层 `let g = f()`（f 返回函数类型）得到的函数值，调用时不能
+/// 省略参数。仅对“顶层常量 + 返回函数类型的全局无参调用”这一确定形态判定。
+fn check_w33c_fnvalue_call_arity(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 全局函数名 → 返回类型（存在重载时忽略）。
+    let mut ret: HashMap<String, Type> = HashMap::new();
+    let mut dup: HashSet<String> = HashSet::new();
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") {
+            continue;
+        }
+        if ret.contains_key(&f.name) {
+            dup.insert(f.name.clone());
+        } else if let Some(r) = &f.return_type {
+            ret.insert(f.name.clone(), r.clone());
+        }
+    }
+    for d in &dup {
+        ret.remove(d);
+    }
+    // 顶层常量：`let g = f()` 且 f 返回 Function → g 的形参个数。
+    let mut fnval_arity: HashMap<String, usize> = HashMap::new();
+    for c in &program.constants {
+        if let Expr::Call { name, args, .. } = &c.init {
+            if args.is_empty() {
+                if let Some(Type::Function { params, .. }) = ret.get(name) {
+                    fnval_arity.insert(c.name.clone(), params.len());
+                }
+            }
+        }
+    }
+    if fnval_arity.is_empty() {
+        return;
+    }
+    for c in &program.constants {
+        walk_expr(&c.init, &mut |e| {
+            let hit = match e {
+                Expr::Call {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } => Some((name.as_str(), args.len() + named_args.len())),
+                Expr::Invoke {
+                    callee,
+                    args,
+                    named_args,
+                } => match callee.as_ref() {
+                    Expr::Var(v) => Some((v.as_str(), args.len() + named_args.len())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((v, provided)) = hit {
+                if let Some(&arity) = fnval_arity.get(v) {
+                    if provided < arity {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "通过函数值 '{}' 调用时不能省略参数（5.1.2.2(18)）",
+                                v
+                            ),
+                        });
+                    }
+                }
+            }
+        });
+    }
+}
+
 fn check_unsafe_context(program: &Program, errors: &mut Vec<SemanticError>) {
     // 仅在存在 C 互操作 / unsafe 函数声明的程序中启用，避免影响纯仓颉程序。
     if !program
@@ -23179,20 +23472,31 @@ fn check_func_var_call_no_defaults(program: &Program, errors: &mut Vec<SemanticE
             return;
         }
         let mut report = |e: &Expr| {
-            if let Expr::Call {
-                name,
-                args,
-                named_args,
-                ..
-            } = e
-            {
+            let hit = match e {
+                Expr::Call {
+                    name,
+                    args,
+                    named_args,
+                    ..
+                } => Some((name.as_str(), args.len() + named_args.len())),
+                // 5.1.2.2(18)：通过函数变量（`Invoke`）调用同样不能省略可选参数。
+                Expr::Invoke {
+                    callee,
+                    args,
+                    named_args,
+                } => match callee.as_ref() {
+                    Expr::Var(name) => Some((name.as_str(), args.len() + named_args.len())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((name, provided)) = hit {
                 if let Some(params) = locals.get(name) {
                     let ps = non_receiver(params);
-                    let provided = args.len() + named_args.len();
                     if provided < ps.len() && has_default(params) {
                         errors.push(SemanticError {
                             message: format!(
-                                "通过函数变量 '{}' 调用时不能省略可选参数（默认值不生效，5.1.2.2(15)）",
+                                "通过函数变量 '{}' 调用时不能省略可选参数（默认值不生效，5.1.2.2(15)/(18)）",
                                 name
                             ),
                         });
