@@ -653,6 +653,7 @@ mod tests {
 
     fn make_program(functions: Vec<Function>) -> crate::ast::Program {
         crate::ast::Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             functions,
@@ -856,6 +857,7 @@ mod tests {
         };
 
         let program = crate::ast::Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             functions: vec![make_func("main", vec![], vec![Stmt::Return(Some(Expr::Integer(0)))])],

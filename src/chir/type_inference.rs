@@ -678,6 +678,7 @@ mod tests {
 
     fn empty_program() -> Program {
         Program {
+            attr_meta: Default::default(),
             functions: vec![],
             structs: vec![],
             classes: vec![],

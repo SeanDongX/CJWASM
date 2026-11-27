@@ -359,6 +359,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_function_groups(program, &index, &mut errors);
     // 11.1.5.1(8)：程序入口点 main 的签名。
     check_main_signature(program, &mut errors);
+    // 11.1.5(1)：根包（package default）空模块缺少程序入口（w41c，单文件可判子集）。
+    check_root_package_requires_entry(program, &mut errors);
     // 3.1(3)：顶层名称共享命名空间，禁止重复/跨类别冲突。
     check_top_level_name_collisions(program, &mut errors);
     // 3.1(2)：关键字不能用作声明名；预声明类型名不能被重新声明。
@@ -379,6 +381,10 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 3.2.3.2：自由函数体中引用本文件任何作用域都无法解析的裸变量名。
     // 仅在无 import 的单文件程序上启用（导入依赖无法静态确定），确保 std 零回归。
     check_undefined_identifiers(program, &mut errors);
+    // 17(3)/17.1：声明位置注解/宏名解析。收集在 parser（只登记不报错），
+    // 报错在检查阶段且门限（无 import、无 package）在函数内生效——std 各文件
+    // 均带 package 声明，故不触发。
+    check_annotation_name_resolution(program, &mut errors);
     // 3.3.2.2(8)：类/结构体的静态成员变量必须立即初始化（无 static init 时）。
     check_static_fields_initialized(program, &mut errors);
     // 3.2.3.1(1)/3.2.3(1)：顶层变量初始化式只能引用顶层可见的名字。
@@ -3080,6 +3086,39 @@ fn check_main_signature(program: &Program, errors: &mut Vec<SemanticError>) {
     }
 }
 
+/// 11.1.5(1)：源文件根目录是模块程序入口 `main` 所在的包。
+///
+/// 显式声明根包（`package default`）且整个编译单元没有任何顶层声明时，模块
+/// 无法构成可执行模块——官方 cjc 默认（exe）构建对此报 `'main' is missing`
+/// （见 conformance 11_01_05_a01_02）。单文件 harness 下这是唯一可判定的
+/// “根包无程序入口”子集。
+///
+/// 门限刻意收得极窄（package == "default" 且 0 顶层声明、0 import）：子包
+/// （`package foo` 等）是库包，不要求程序入口；std 的 `package default`
+/// 片段均带顶层声明（以库模式编译），均不受影响（w41c 已核 1413 零回归）。
+fn check_root_package_requires_entry(program: &Program, errors: &mut Vec<SemanticError>) {
+    if program.package_name.as_deref() != Some("default") {
+        return;
+    }
+    if !program.imports.is_empty() {
+        return;
+    }
+    let empty = program.structs.is_empty()
+        && program.interfaces.is_empty()
+        && program.classes.is_empty()
+        && program.enums.is_empty()
+        && program.functions.is_empty()
+        && program.extends.is_empty()
+        && program.type_aliases.is_empty()
+        && program.constants.is_empty();
+    if empty {
+        errors.push(SemanticError {
+            message: "根包 \"default\" 缺少程序入口 main：空模块无法构建可执行模块（11.1.5(1)）"
+                .to_string(),
+        });
+    }
+}
+
 /// 轻量类型名显示（仅用于错误信息）。
 fn type_display(ty: &Type) -> String {
     match ty {
@@ -4403,6 +4442,97 @@ fn imports_allow_undefined_check(program: &Program) -> bool {
         }
     }
     true
+}
+
+/// 内建属性 / 注解 / 宏名（无 import 单文件下，声明位置 `@Name` 视为合法）。
+///
+/// 覆盖官方内建注解（`@C` / `@When` / `@Derive` / `@Annotation` /
+/// `@OverflowWrapping` / `@CallingConv` / `@Deprecated` / `@Frozen` /
+/// `@Attribute`）以及 unittest 等常用宏库宏名——后者用于同包跨文件使用且
+/// 本文件无 import 时保守放行，避免误判。目标负例使用 `Version` / `IHello` /
+/// `Annotation1` 等未声明名字，均不在此列表内。
+fn is_builtin_user_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "C" | "c"
+            | "When"
+            | "Derive"
+            | "Annotation"
+            | "OverflowWrapping"
+            | "CallingConv"
+            | "Deprecated"
+            | "Frozen"
+            | "Attribute"
+            | "Test"
+            | "Bench"
+            | "TestCase"
+            | "TestTemplate"
+            | "TestBuilder"
+            | "Tag"
+            | "Types"
+            | "Skip"
+            | "SkipTest"
+            | "Strategy"
+            | "Timeout"
+            | "Measure"
+            | "BeforeAll"
+            | "AfterAll"
+            | "BeforeEach"
+            | "AfterEach"
+            | "Parallel"
+            | "Configure"
+            | "UnittestOption"
+            | "EnsurePreparedToMock"
+            | "FastNative"
+            | "Java"
+            | "ObjC"
+            | "CJ"
+    )
+}
+
+/// 17(3)/17.1：声明位置注解/宏名解析（仅在无 import、无 package 的单文件程序上启用）。
+///
+/// 收集发生在 parser 的 `skip_optional_attributes` / 顶层声明分派，只登记不报错；
+/// 此处统一报错。门限 `imports.is_empty() && package_name.is_none()` 在函数内生效：
+/// 带 import / package 的文件（多文件包、带 package 的标准库文件）一律跳过。
+/// 少数无 package/import 的 std unittest 用例使用 `@Tag` / `@TestTemplate` 等
+/// 框架宏，由 [`is_builtin_user_attr`] 白名单保守放行（w40b 因在 parser 层抛错
+/// 绕过门限、破 58 个 std 文件被回退；本实现将报错完全移到检查阶段）。
+///
+/// - 修饰符关键字紧贴 `@`（无 `[`/`(`）：`@` 后缺少注解名（官方 a03_03）。
+/// - 声明位置 `@Name` 既非内建、非本文件 `@Annotation` 类、也非本文件宏定义：
+///   未声明的注解/宏（官方 a03_02 / a03_04 / a05_01）。
+fn check_annotation_name_resolution(program: &Program, errors: &mut Vec<SemanticError>) {
+    if !program.imports.is_empty() || program.package_name.is_some() {
+        return;
+    }
+    let meta = &program.attr_meta;
+    let mut reported: HashSet<String> = HashSet::new();
+    for (name, bad_keyword) in &meta.used_decl_attrs {
+        if *bad_keyword {
+            let key = format!("\u{0}kw:{}", name);
+            if reported.insert(key) {
+                errors.push(SemanticError {
+                    message: format!(
+                        "'@' 后缺少注解名：修饰符关键字 '{}' 不能作为注解名（17(3)）",
+                        name
+                    ),
+                });
+            }
+            continue;
+        }
+        if is_builtin_user_attr(name)
+            || meta.annotation_decls.contains(name)
+            || meta.macro_decls.contains(name)
+        {
+            continue;
+        }
+        if reported.insert(name.clone()) {
+            errors.push(SemanticError {
+                message: format!("未声明的注解或宏 '{}'（17.1(3)）", name),
+            });
+        }
+    }
 }
 
 /// 预置（prelude）标识符：语言核心类型与常用内建函数名。这些名字无需 import
@@ -34662,6 +34792,7 @@ mod tests {
     #[test]
     fn test_analyze_simple_program_with_return_types() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -34716,6 +34847,7 @@ mod tests {
     #[test]
     fn test_analyze_function_with_return_stmt() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -34752,6 +34884,7 @@ mod tests {
     #[test]
     fn test_analyze_class_method_inference() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],

@@ -136,6 +136,7 @@ mod tests {
 
     fn codegen_with_main() -> CodeGen {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],

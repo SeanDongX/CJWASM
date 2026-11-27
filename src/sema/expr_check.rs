@@ -6282,6 +6282,16 @@ impl<'a> Checker<'a> {
             }
             Stmt::Return(Some(e)) => {
                 let t = self.check_expr(e);
+                // 4.3(15)：函数未声明返回类型时 `return if ...` 处于无期望类型
+                // 上下文，须存在最小公共超类型（官方负例 04_03 a17_02）。
+                if self.ret_ty.is_none() {
+                    if let Some((a, b)) = self.if_shared_iface_no_class_lcs(e) {
+                        self.err(format!(
+                            "if 表达式两个分支没有公共超类型：{} 与 {} 共享接口但无类层公共超类型（4.3(15)）",
+                            a, b
+                        ));
+                    }
+                }
                 self.check_return(&t);
             }
             Stmt::While { cond, body } => {
@@ -7819,7 +7829,113 @@ impl<'a> Checker<'a> {
                     e.name()
                 ));
             }
+            // 4.3(15)（cjc 1.0.5 实测窄化）：两用户 class 共享接口但无类层
+            // 公共超类型（a15_23）。
+            if let Some((a, b)) = self.if_shared_iface_no_class_lcs(value) {
+                self.err(format!(
+                    "if 表达式两个分支没有公共超类型：{} 与 {} 共享接口但无类层公共超类型（4.3(15)）",
+                    a, b
+                ));
+            }
         }
+    }
+
+    /// 4.3(15)（cjc 1.0.5 实测窄化，batch-41 w41b）：无期望类型的 `if` 表达式中，
+    /// 两分支均为用户 `class` 实例、二者无类层继承关系（无共用用户类祖先、互不为
+    /// 子类型），却共享至少一个接口时，官方（cjc 1.0.5）报「types ... mismatch /
+    /// do not have the smallest common supertype」（负例 04_03 a15_23 / a17_02）。
+    ///
+    /// 结构化类型（struct/enum）与类/结构体混合形态不在此列（官方正例 a15_21/24
+    /// 与实测 class+struct 均合法）。仅当两分支的祖先闭包全部由本地已声明类型
+    /// 构成时判定，避免跨文件/std（祖先含 prelude/导入）误伤。
+    fn if_shared_iface_no_class_lcs(&self, value: &Expr) -> Option<(String, String)> {
+        let Expr::If {
+            then_branch,
+            else_branch: Some(eb),
+            ..
+        } = value
+        else {
+            return None;
+        };
+        let ta = self.branch_peek_ty(then_branch);
+        let tb = self.branch_peek_ty(eb);
+        let (Ty::User(a), Ty::User(b)) = (&ta, &tb) else {
+            return None;
+        };
+        if a == b
+            || self.type_kinds.get(a) != Some(&TypeKind::Class)
+            || self.type_kinds.get(b) != Some(&TypeKind::Class)
+        {
+            return None;
+        }
+        // 祖先闭包必须全部本地可解析（保守，避免 std/跨文件误伤）。
+        if !closure_is_local(a, &self.type_kinds, &self.user_parents)
+            || !closure_is_local(b, &self.type_kinds, &self.user_parents)
+        {
+            return None;
+        }
+        // 互不为子类型（存在类层继承即有最近公共祖先，放行）。
+        if is_same_or_subtype_name(a, b, &self.user_parents)
+            || is_same_or_subtype_name(b, a, &self.user_parents)
+        {
+            return None;
+        }
+        // 存在共用用户 class 祖先则不属于本窄化形态（由其它规则覆盖），放行。
+        let ca = self.user_class_ancestors(a);
+        let cb = self.user_class_ancestors(b);
+        if ca.iter().any(|x| cb.contains(x)) {
+            return None;
+        }
+        // 共享接口（传递闭包非空即报错）。
+        let ia = self.user_iface_closure(a);
+        let ib = self.user_iface_closure(b);
+        ia.iter()
+            .find(|x| ib.contains(*x))
+            .map(|_| (a.clone(), b.clone()))
+    }
+
+    /// `name` 沿 `user_parents` 的传递闭包中，类别为 Interface 的类型名集合
+    /// （不含 `name` 自身）。
+    fn user_iface_closure(&self, name: &str) -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = vec![name.to_string()];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            if n != name && self.type_kinds.get(&n) == Some(&TypeKind::Interface) {
+                out.insert(n.clone());
+            }
+            if let Some(ps) = self.user_parents.get(&n) {
+                for p in ps {
+                    stack.push(p.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// `name` 沿 `user_parents` 的传递闭包中，类别为 Class 的祖先名集合
+    /// （不含 `name` 自身）。
+    fn user_class_ancestors(&self, name: &str) -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = vec![name.to_string()];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            if n != name && self.type_kinds.get(&n) == Some(&TypeKind::Class) {
+                out.insert(n.clone());
+            }
+            if let Some(ps) = self.user_parents.get(&n) {
+                for p in ps {
+                    stack.push(p.clone());
+                }
+            }
+        }
+        out
     }
 
     /// 4.3(15)：上下文无关时若无公共超类型则报错。仅对可确定的标量类型判定，
@@ -15175,9 +15291,18 @@ mod tests {
         );
         // 同类型分支：允许。
         assert_ok("var x = 0\nmain() { var v = if (x == 0) { 1 } else { 2 } }");
-        // 用户类型之间保守跳过（官方矛盾用例 a15_23）。
-        assert_ok(
+        // w41b（cjc 1.0.5 实测复测）：两个用户 class 共享接口但无类层公共超类型
+        // → 官方报错（负例 04_03 a15_23 / a17_02），不再是“矛盾保守跳过”。
+        assert_err(
             "interface I {}\nclass A <: I {}\nclass B <: I {}\n\
+             var x = 0\nmain() { var v = if (x == 0) { A() } else { B() } }",
+            "公共超类型",
+        );
+        // 无共享接口的两个 class（官方正例 a15_12）：允许。
+        assert_ok("class A {}\nclass B {}\nvar x = 0\nmain() { var v = if (x == 0) { A() } else { B() } }");
+        // 共享接口的两个 struct（官方正例 a15_24）：允许。
+        assert_ok(
+            "interface I {}\nstruct A <: I {}\nstruct B <: I {}\n\
              var x = 0\nmain() { var v = if (x == 0) { A() } else { B() } }",
         );
     }

@@ -206,6 +206,103 @@ fn check_quote_dollar_prefix(source: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验 quote 表达式内部的圆括号（考虑 `\` 转义）必须配对。
+///
+/// 14.1(11)：quote 表达式不支持不配对的圆括号；但通过 `\` 转义的圆括号
+/// （`\(` / `\)`）不计入配对。`strip_quote_contents` 的朴素计数把 `\)` 当作
+/// 右括号，会放过 `quote(() + quote(\))`（官方 a11_02 负例）。此处在抹除
+/// quote 内容前先行校验：从每个 `quote(` 开始按转义感知的深度计数，若在
+/// 源码结束前深度无法归零，则说明该 quote 表达式的括号不配对。
+///
+/// 调用方须先移除块注释（本函数另外跳过行注释、字符串与字符字面量）。
+/// a11_02 带 `import std.ast.*`，故本检查不套用单文件门限——它是源码的纯
+/// 词法结构约束；对 std 中合法 quote（末尾必然有一个未转义 `)`）不产生误报。
+fn check_quote_paren_balance(source: &str) -> Result<(), String> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // 行注释：跳到行尾
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 6 <= len && &bytes[i..i + 6] == b"quote(" {
+            i += 6; // 跳过 "quote("
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                let ch = bytes[i];
+                if ch == b'\\' {
+                    // 转义序列（\( \) \$ \@ 等）：被转义的圆括号不参与配对。
+                    i += 2;
+                    continue;
+                }
+                match ch {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    b'"' => {
+                        // 跳过字符串字面量
+                        i += 1;
+                        while i < len {
+                            if bytes[i] == b'\\' {
+                                i += 2;
+                                continue;
+                            }
+                            if bytes[i] == b'"' {
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    b'\'' => {
+                        // 跳过字符（rune）字面量
+                        i += 1;
+                        while i < len {
+                            if bytes[i] == b'\\' {
+                                i += 2;
+                                continue;
+                            }
+                            if bytes[i] == b'\'' {
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth != 0 {
+                return Err(
+                    "quote 表达式中的圆括号不配对：转义的 \\( \\) 不计入配对（14.1(11)）"
+                        .to_string(),
+                );
+            }
+            continue;
+        }
+        // 跳过普通字符串字面量，避免把字符串内的 "quote(" 误判
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// 找到块注释的关闭位置（返回 */ 之后的位置），支持嵌套块注释（规范 1.5(2)）
 ///
 /// 仓颉规范 A.1.1(1)：`DelimitedComment : '/*' ( DelimitedComment | . )*? '*/'`，
@@ -378,6 +475,7 @@ fn separate_hex_range(source: &str) -> String {
 pub fn parse_source_ast(source: &str) -> Result<Program, String> {
     let source = strip_block_comments(source);
     check_quote_dollar_prefix(&source).map_err(|e| format!("语法错误: {}", e))?;
+    check_quote_paren_balance(&source).map_err(|e| format!("语法错误: {}", e))?;
     let source = strip_quote_contents(&source);
     let source = separate_hex_range(&source);
     let lexer = Lexer::new(&source);
@@ -425,6 +523,7 @@ pub fn parse_file(path: &str) -> Result<(Program, String), String> {
 /// 合并多个 Program AST 为一个
 pub fn merge_programs(programs: Vec<Program>) -> Program {
     let mut merged = Program {
+        attr_meta: Default::default(),
         package_name: None,
         imports: vec![],
         structs: vec![],
@@ -450,6 +549,7 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
         merged.extends.extend(prog.extends);
         merged.type_aliases.extend(prog.type_aliases);
         merged.constants.extend(prog.constants);
+        merged.attr_meta.merge(prog.attr_meta);
     }
 
     merged

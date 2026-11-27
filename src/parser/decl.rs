@@ -566,10 +566,18 @@ impl Parser {
                             }
                             self.c_structs.insert(sd.name.clone());
                         }
+                        // 注解类声明登记（供无 import 单文件注解名解析）。
+                        if ann_attr {
+                            self.attr_meta.annotation_decls.insert(sd.name.clone());
+                        }
                         structs.push(sd)
                     }
                     Some(Token::Interface) => {
-                        interfaces.push(self.parse_interface_with_visibility(visibility)?)
+                        let it = self.parse_interface_with_visibility(visibility)?;
+                        if ann_attr {
+                            self.attr_meta.annotation_decls.insert(it.name.clone());
+                        }
+                        interfaces.push(it)
                     }
                     Some(Token::Class)
                     | Some(Token::Abstract)
@@ -612,10 +620,20 @@ impl Parser {
                                     ),
                                 ));
                             }
+                            // 注解类声明登记（供无 import 单文件注解名解析）。
+                            if ann_attr {
+                                self.attr_meta.annotation_decls.insert(cls.name.clone());
+                            }
                             classes.push(cls);
                         }
                     }
-                    Some(Token::Enum) => enums.push(self.parse_enum_with_visibility(visibility)?),
+                    Some(Token::Enum) => {
+                        let en = self.parse_enum_with_visibility(visibility)?;
+                        if ann_attr {
+                            self.attr_meta.annotation_decls.insert(en.name.clone());
+                        }
+                        enums.push(en)
+                    }
                     Some(Token::Extend) => {
                         // 8.6：扩展定义的可见性由被扩展类型的可见性决定，
                         // 不允许显式 `public extend`（private/protected 同理非法）。
@@ -721,7 +739,10 @@ impl Parser {
                         self.advance(); // consume macro
                         // 可能接 func 关键字（如 macro func Name）或直接是函数名
                         if self.check(&Token::Func) {
-                            functions.push(self.parse_function_with_visibility(visibility)?)
+                            let mf = self.parse_function_with_visibility(visibility)?;
+                            // 宏定义名登记（供无 import 单文件宏名解析）。
+                            self.attr_meta.macro_decls.insert(mf.name.clone());
+                            functions.push(mf)
                         } else {
                             // macro Name(params): RetType { body } — 无 func 关键字，跳过到匹配的 }
                             // 宏定义语法要求宏名后必须有参数列表 `(...)`；
@@ -730,6 +751,8 @@ impl Parser {
                                 Some(n) => n,
                                 None => return self.bail(ParseError::UnexpectedEof),
                             };
+                            // 宏定义名登记（供无 import 单文件宏名解析）。
+                            self.attr_meta.macro_decls.insert(_name.clone());
                             if !self.check(&Token::LParen) {
                                 return self.bail(ParseError::UnexpectedToken(
                                     self.peek().cloned().unwrap_or(Token::Macro),
@@ -1030,6 +1053,7 @@ impl Parser {
             }
         }
         Ok(Program {
+            attr_meta: std::mem::take(&mut self.attr_meta),
             package_name,
             imports,
             structs,

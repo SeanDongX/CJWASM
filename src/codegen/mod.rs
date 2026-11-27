@@ -7008,6 +7008,7 @@ mod tests {
     #[test]
     fn test_compile_simple_function() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7043,6 +7044,7 @@ mod tests {
     #[test]
     fn test_compile_struct() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![StructDef {
@@ -7125,6 +7127,7 @@ is_c: false,
     #[test]
     fn test_compile_struct_field_y() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![StructDef {
@@ -7206,6 +7209,7 @@ is_c: false,
     #[test]
     fn test_compile_binary_ops() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7245,6 +7249,7 @@ is_c: false,
     #[test]
     fn test_compile_if_expr() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7304,6 +7309,7 @@ is_c: false,
     #[test]
     fn test_compile_array_literal_and_index() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7354,6 +7360,7 @@ is_c: false,
         use crate::ast::{Literal, MatchArm, Pattern};
 
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7409,6 +7416,7 @@ is_c: false,
     #[test]
     fn test_compile_for_range() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7467,6 +7475,7 @@ is_c: false,
     #[test]
     fn test_compile_float_ops() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7505,6 +7514,7 @@ is_c: false,
     #[test]
     fn test_compile_multiple_functions() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7728,6 +7738,7 @@ is_c: false,
     #[test]
     fn test_compile_enum_with_variants() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7782,6 +7793,7 @@ is_c: false,
     #[test]
     fn test_compile_class_with_init_and_methods() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7907,6 +7919,7 @@ is_c: false,
     #[test]
     fn test_compile_while_loop() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -7962,6 +7975,7 @@ is_c: false,
     #[test]
     fn test_compile_unary_ops() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8005,6 +8019,7 @@ is_c: false,
     #[test]
     fn test_compile_unary_not() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8048,6 +8063,7 @@ is_c: false,
     #[test]
     fn test_compile_string_literal() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8081,6 +8097,7 @@ is_c: false,
     #[test]
     fn test_compile_tuple_creation_and_access() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8124,6 +8141,7 @@ is_c: false,
     #[test]
     fn test_compile_cast_expr() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8160,6 +8178,7 @@ is_c: false,
     #[test]
     fn test_compile_block_expr() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8200,6 +8219,7 @@ is_c: false,
     #[test]
     fn test_compile_return_void() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8233,6 +8253,7 @@ is_c: false,
     #[test]
     fn test_compile_let_var_declarations() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8282,6 +8303,7 @@ is_c: false,
     #[test]
     fn test_compile_interface_definition() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8336,6 +8358,7 @@ is_c: false,
     #[test]
     fn test_compile_extend_definition() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![StructDef {
@@ -8442,6 +8465,7 @@ is_c: false,
     #[test]
     fn test_compile_class_with_inheritance() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8579,6 +8603,7 @@ is_c: false,
     #[test]
     fn test_compile_lambda_expression() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8671,6 +8696,7 @@ is_c: false,
     #[test]
     fn test_compile_pipeline_expression() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8741,6 +8767,7 @@ is_c: false,
     #[test]
     fn test_compile_range_inclusive() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8798,6 +8825,7 @@ is_c: false,
     #[test]
     fn test_compile_println_statement() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8839,6 +8867,7 @@ is_c: false,
     #[test]
     fn test_compile_is_type_expr() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8907,6 +8936,7 @@ is_c: false,
     #[test]
     fn test_compile_binary_ops_variety() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -8944,6 +8974,7 @@ is_c: false,
     #[test]
     fn test_compile_try_block() {
         let program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],

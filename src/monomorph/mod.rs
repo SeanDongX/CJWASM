@@ -1957,6 +1957,7 @@ mod tests {
     #[test]
     fn test_monomorphize_empty_program() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -1975,6 +1976,7 @@ mod tests {
     #[test]
     fn test_monomorphize_no_generics() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -2007,6 +2009,7 @@ mod tests {
     #[test]
     fn test_monomorphize_generic_function_multi_type_params() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -2091,6 +2094,7 @@ mod tests {
     #[test]
     fn test_monomorphize_struct_with_generic_params() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![StructDef {
@@ -2164,6 +2168,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_nested_generics() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![StructDef {
@@ -2240,6 +2245,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_pass_through_no_instantiations() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![StructDef {
@@ -2300,6 +2306,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_generic_func_multi_call_sites() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -2373,6 +2380,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_generic_struct_as_param() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![StructDef {
@@ -2437,6 +2445,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_generic_class_with_methods() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -2568,6 +2577,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_array_of_pair() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![StructDef {
@@ -2641,6 +2651,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_type_param_in_return() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -2710,6 +2721,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_generic_enum() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -2769,6 +2781,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_inferred_type_args() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![],
@@ -2838,6 +2851,7 @@ is_c: false,
     #[test]
     fn test_monomorphize_multiple_struct_instances() {
         let mut program = Program {
+            attr_meta: Default::default(),
             package_name: None,
             imports: vec![],
             structs: vec![StructDef {

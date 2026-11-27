@@ -71,6 +71,8 @@ pub struct Parser {
     /// 低于移位（4.28），应由移位解析器在移位链之后统一处理，而非在右操作数
     /// 的 postfix 阶段被吞掉（如 `c << 4 as C` 应解析为 `(c << 4) as C`）。
     suppress_shift_as: bool,
+    /// 声明位置注解/宏收集元数据（供语义校验阶段使用；解析阶段只登记不报错）。
+    attr_meta: AttrMeta,
 }
 
 impl Parser {
@@ -103,6 +105,7 @@ impl Parser {
             pattern_tuple_depth: 0,
             pattern_int_suffixes: Vec::new(),
             suppress_shift_as: false,
+            attr_meta: AttrMeta::default(),
         }
     }
 
@@ -579,6 +582,30 @@ impl Parser {
             // 记录 `@Annotation`：其修饰的类必须提供 const init（17.1(5)）。
             if attr_name == "Annotation" {
                 self.last_attr_annotation = true;
+            }
+            // 17(3)/17.1：登记声明位置的 `@Name` 使用，供语义校验阶段（无 import、
+            // 无 package 的单文件门限内）做注解/宏名解析。解析阶段只登记不报错，
+            // 避免多文件 / 标准库包编译被误伤（w40b 教训）。
+            //
+            // - 修饰符关键字（abstract/open/...）紧跟 `@` 且其后不是 `[`/`(`：
+            //   说明 `@` 后缺少真正的注解名（官方 a03_03：`@` 换行 `public class`），
+            //   登记为错误形态（`true`）。
+            // - 宏调用参数列表 `@Macro(...)`：表达式/语句位置宏调用不在此处处理，
+            //   声明形式 `@Name(...)` 亦不参与名字解析，故排除。
+            let is_attr_keyword = matches!(
+                attr_name.as_str(),
+                "abstract" | "open" | "override" | "private" | "protected" | "public"
+                    | "redef" | "sealed"
+            );
+            let is_macro_call_paren = self.check(&Token::LParen);
+            if is_attr_keyword && !self.check(&Token::LBracket) && !is_macro_call_paren {
+                self.attr_meta
+                    .used_decl_attrs
+                    .push((attr_name.clone(), true));
+            } else if !is_attr_keyword && !is_macro_call_paren {
+                self.attr_meta
+                    .used_decl_attrs
+                    .push((attr_name.clone(), false));
             }
             if self.check(&Token::LBracket) {
                 self.advance();

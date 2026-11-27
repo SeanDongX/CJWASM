@@ -897,6 +897,29 @@ pub struct Import {
     pub alias: Option<String>,
 }
 
+/// 声明位置注解/宏的收集元数据（供语义校验阶段的名字解析使用）。
+///
+/// 解析阶段只登记、不报错；是否/如何报错由语义校验在（无 import、无 package
+/// 的）单文件门限内决定，避免在多文件 / 标准库包编译时误伤。
+#[derive(Debug, Clone, Default)]
+pub struct AttrMeta {
+    /// 本文件以 `@Annotation` 标记声明的注解类名。
+    pub annotation_decls: std::collections::HashSet<String>,
+    /// 本文件中的顶层宏定义名。
+    pub macro_decls: std::collections::HashSet<String>,
+    /// 声明位置出现的 `@Name` 使用：`(名字, 是否为修饰符关键字误作注解名)`。
+    pub used_decl_attrs: Vec<(String, bool)>,
+}
+
+impl AttrMeta {
+    /// 合并另一个文件的收集元数据（多文件编译时聚合）。
+    pub fn merge(&mut self, other: AttrMeta) {
+        self.annotation_decls.extend(other.annotation_decls);
+        self.macro_decls.extend(other.macro_decls);
+        self.used_decl_attrs.extend(other.used_decl_attrs);
+    }
+}
+
 /// 程序 (包, 与 cjc release/1.0 对齐)
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -915,4 +938,6 @@ pub struct Program {
     pub type_aliases: Vec<(String, Type)>,
     /// 顶层常量 (let/var name: Type = expr)
     pub constants: Vec<ConstDef>,
+    /// 声明位置注解/宏收集元数据（17.1 注解名解析用；不参与代码生成）。
+    pub attr_meta: AttrMeta,
 }
