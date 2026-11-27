@@ -8758,14 +8758,21 @@ impl<'a> Checker<'a> {
     fn check_unary(&mut self, op: &UnaryOp, t: &Ty) -> Ty {
         match op {
             UnaryOp::Neg => {
-                // Bool 参与加减通常源于解析器跨行合并（语法正例），保守跳过。
-                // 用户类型/Option 可能由用户自定义一元运算符处理，也跳过。
-                // 注意：官方套件对“无符号整数取负”存在矛盾——04/15 a04 判负
-                // （`-UInt16` 非法），而 02/01 a15 判正（一元负号对所有数值类型
-                // 有效，按位取负回绕）。为守住“正测试 100%”红线，此处放行无符号。
-                // `-Bool` 亦可能由 `-x is T` 这类跨行并入产生（04/17 a02 正例），放行。
-                if t.is_prim() && !t.is_numeric() && *t != Ty::Bool {
+                // 用户类型/Option 可能由用户自定义一元运算符处理，跳过。
+                // 4.15(4)：一元 '-' 只作用于有符号数值。Bool 非数值
+                // （04/15 a04_02 判负）；无符号取负非法（04/15 a04_06..10 判负，
+                // 此前担心的“无符号取负正例”经全套件复查不存在——带后缀负
+                // 字面量 `-0b…i16` 是 Int16 负字面量而非无符号取负）。
+                if t.is_prim() && !t.is_numeric() {
                     self.err(format!("一元运算符 '-' 不能作用于类型 {}", t.name()));
+                } else if matches!(
+                    t,
+                    Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 | Ty::UIntNative
+                ) {
+                    self.err(format!(
+                        "一元运算符 '-' 不能作用于无符号类型 {}（4.15(4)）",
+                        t.name()
+                    ));
                 }
                 // 4.15(4)：一元 `-` 只作用于数值类型。用户类型仅在定义了
                 // `operator func -`（记录为 op_sub）时合法；若程序中没有任何
@@ -11797,9 +11804,10 @@ mod tests {
 
     #[test]
     fn test_w11d_unary_neg_unsigned_contradiction_skipped() {
-        // 4.15(4) 与 2.1.1.2(15) 对“无符号整数取负”互相矛盾（04/15 a04 判负、
-        // 02/01 a15 判正）。为守住正测试 100% 红线，无符号取负保守放行。
-        assert_ok("main() { var v: UInt8 = 1; let x = -v }");
+        // 4.15(4)：无符号取负非法（04/15 a04_06..10 判负）。此前担心的
+        // “02/01 a15 无符号取负正例”经全套件复查不存在——带后缀负字面量
+        // `-0b…i16` 是 Int16 负字面量而非无符号取负，w25b 收紧为拒绝。
+        assert_err("main() { var v: UInt8 = 1; let x = -v }", "无符号");
         // 有符号整数取负正常通过。
         assert_ok("main() { var v: Int64 = 1; let x = -v }");
     }
@@ -12927,11 +12935,11 @@ mod tests {
 
     #[test]
     fn test_w21b_unary_neg_bool_preserved() {
-        // Bool 不是数值类型，但 `-x is T` 跨行并入等正例会形成 `-Bool` 形态，
-        // 为守住正测试红线保持放行（04/15 a04 负例归入放行档案）。
-        assert_ok("main() { var v: Bool = true\n let v2 = -v }");
-        // 无符号整数的取负存在官方矛盾（02/01 a15 正例），保持放行。
-        assert_ok("main() { var v: UInt8 = 1\n let v2 = -v }");
+        // 4.15(4)：一元 '-' 只作用于数值。Bool（04/15 a04_02 判负）与
+        // 无符号整数（a04_06..10 判负）均拒绝——此前担心的跨行并入/矛盾
+        // 正例经全套件复查不存在（w25b 收紧）。
+        assert_err("main() { var v: Bool = true\n let v2 = -v }", "不能作用于类型 Bool");
+        assert_err("main() { var v: UInt8 = 1\n let v2 = -v }", "无符号");
     }
 
     #[test]
