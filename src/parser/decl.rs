@@ -30,6 +30,97 @@ pub(crate) struct MemberModifiers {
     pub count: usize,
 }
 
+/// w27c 3.2.3.1(4)：解析期顶层声明的**跨类别顺序**记录。
+/// `Program` 按类别分桶（structs/classes/functions/constants...），不保留源顺序；
+/// 而“顶层变量必须在其使用前声明”需要该顺序，故在解析循环中按出现顺序记录索引。
+#[derive(Clone, Copy)]
+enum TopDeclIdx {
+    Struct(usize),
+    Interface(usize),
+    Class(usize),
+    Enum(usize),
+    Func(usize),
+    Extend(usize),
+    TypeAlias(usize),
+    Const(usize),
+}
+
+/// 3.2.3.1(4)：返回首个“引用了其后才声明的顶层变量”的（变量名, 引用者种类）描述。
+/// 仅在无 import / 无 package 的单文件程序上调用（调用方保证），避免影响 std 与多文件。
+fn first_global_use_before_decl(
+    order: &[TopDeclIdx],
+    consts: &[ConstDef],
+    funcs: &[Function],
+    structs: &[StructDef],
+    classes: &[ClassDef],
+) -> Option<String> {
+    use std::collections::HashMap;
+    let mut gpos: HashMap<&str, usize> = HashMap::new();
+    for (pos, d) in order.iter().enumerate() {
+        if let TopDeclIdx::Const(i) = *d {
+            if let Some(c) = consts.get(i) {
+                gpos.entry(c.name.as_str()).or_insert(pos);
+            }
+        }
+    }
+    if gpos.is_empty() {
+        return None;
+    }
+    for (pos, d) in order.iter().enumerate() {
+        let refs: Vec<String> = match *d {
+            TopDeclIdx::Const(i) => consts
+                .get(i)
+                .map(|c| crate::sema::order_refs_in_expr(&c.init))
+                .unwrap_or_default(),
+            TopDeclIdx::Func(i) => {
+                let f = match funcs.get(i) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                if f.name.contains('.') || f.name.contains("::") {
+                    continue;
+                }
+                crate::sema::order_refs_in_body(&f.params, &f.body)
+            }
+            TopDeclIdx::Struct(i) => {
+                let s = match structs.get(i) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let mut v = Vec::new();
+                for fld in &s.fields {
+                    if let Some(x) = &fld.default {
+                        v.extend(crate::sema::order_refs_in_expr(x));
+                    }
+                }
+                v
+            }
+            TopDeclIdx::Class(i) => {
+                let c = match classes.get(i) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let mut v = Vec::new();
+                for fld in &c.fields {
+                    if let Some(x) = &fld.default {
+                        v.extend(crate::sema::order_refs_in_expr(x));
+                    }
+                }
+                v
+            }
+            _ => continue,
+        };
+        for r in refs {
+            if let Some(&gp) = gpos.get(r.as_str()) {
+                if gp > pos {
+                    return Some(r);
+                }
+            }
+        }
+    }
+    None
+}
+
 impl Parser {
     /// 循环收集成员声明前的修饰符（任意顺序）。
     /// 只消费确定属于修饰符的 token：`const` 仅在后跟 `func`/`init` 时作为修饰符消费，
@@ -171,6 +262,8 @@ impl Parser {
         let mut public_alias_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut constants = Vec::new();
+        // w27c 3.2.3.1(4)：顶层声明跨类别顺序（用于“变量须先声明后使用”判定）。
+        let mut decl_order: Vec<TopDeclIdx> = Vec::new();
 
         // 解析可选的 package 声明（cjc: package prefix.path，支持点分路径）
         // cjc: macro package 宏包 — 忽略 macro 修饰符
@@ -288,6 +381,17 @@ impl Parser {
         }
 
         while let Some(_tok) = self.peek() {
+            // w27c：记录本轮迭代前各声明桶的长度，迭代末按增量登记跨类别顺序。
+            let n_before = (
+                structs.len(),
+                interfaces.len(),
+                classes.len(),
+                enums.len(),
+                functions.len(),
+                extends.len(),
+                type_aliases.len(),
+                constants.len(),
+            );
             // cjc 允许声明后出现多余分号（如 `class C {};`）
             if self.check(&Token::Semicolon) {
                 self.advance();
@@ -710,8 +814,41 @@ impl Parser {
                     }
                 }
             }
+            // w27c：登记本轮新增的顶层声明（按类别增量决定种类与起始下标）。
+            if constants.len() > n_before.7 {
+                decl_order.push(TopDeclIdx::Const(n_before.7));
+            } else if structs.len() > n_before.0 {
+                decl_order.push(TopDeclIdx::Struct(n_before.0));
+            } else if classes.len() > n_before.2 {
+                decl_order.push(TopDeclIdx::Class(n_before.2));
+            } else if functions.len() > n_before.4 {
+                decl_order.push(TopDeclIdx::Func(n_before.4));
+            } else if enums.len() > n_before.3 {
+                decl_order.push(TopDeclIdx::Enum(n_before.3));
+            } else if interfaces.len() > n_before.1 {
+                decl_order.push(TopDeclIdx::Interface(n_before.1));
+            } else if extends.len() > n_before.5 {
+                decl_order.push(TopDeclIdx::Extend(n_before.5));
+            } else if type_aliases.len() > n_before.6 {
+                decl_order.push(TopDeclIdx::TypeAlias(n_before.6));
+            }
         }
         functions.extend(self.pending_struct_methods.drain(..));
+        // w27c 3.2.3.1(4)：顶层变量必须在声明之前使用（函数/结构体/类体引用其后声明的
+        // 顶层变量即非法）。仅无 import / 无 package 的单文件程序判定，std 与多文件不受影响。
+        if imports.is_empty() && package_name.is_none() {
+            if let Some(name) =
+                first_global_use_before_decl(&decl_order, &constants, &functions, &structs, &classes)
+            {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Ident(name.clone()),
+                    format!(
+                        "顶层变量 '{}' 在其声明/初始化之前被使用（3.2.3.1(4)）",
+                        name
+                    ),
+                ));
+            }
+        }
         // 13.1.3.5(3)：@C 结构体字段必须是满足 CType 约束的类型。
         if !self.c_structs.is_empty() {
             let mut bad_users: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1687,6 +1824,15 @@ impl Parser {
                     .params
                     .iter()
                     .any(|p| p.name == "self" || p.name == "this");
+                // 10.1.2.1(15) / 10.1.2.1 a15_10：static 成员不能有 this/self 接收者形参。
+                // 实例成员允许显式 `this: T` 接收者（cjc-style struct 方法），但 static
+                // 成员无实例，显式写出 this/self 形参非法。
+                if mods.is_static && has_self {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::This,
+                        "static 成员函数不能声明 this/self 形参（10.1.2.1(15)）".to_string(),
+                    ));
+                }
                 if !has_self && !mods.is_static {
                     func.params.insert(
                         0,
@@ -2128,6 +2274,10 @@ impl Parser {
         self.expect(Token::LBrace)?;
         let mut variants = Vec::new();
         let mut props: Vec<crate::ast::PropDef> = Vec::new();
+        // 已进入“成员声明区”后，未知 Ident 若紧跟 `operator` 说明它是拼写错误的
+        // 修饰符（a15_09 `punlic operator func`）；变体区内 Ident 后跟 `operator`
+        // 属于合法形态（如 `enum Num { Zero, One\n operator func +(...) }`）。
+        let mut seen_member = false;
         while !self.check(&Token::RBrace) {
             // 容忍成员声明后的多余分号
             if self.check(&Token::Semicolon) {
@@ -2234,6 +2384,7 @@ impl Parser {
                         self.advance();
                     }
                     props.push(prop);
+                    seen_member = true;
                     continue;
                 }
                 self.expect(Token::LBrace)?;
@@ -2283,6 +2434,7 @@ impl Parser {
                 }
                 self.expect(Token::RBrace)?;
                 props.push(prop);
+                seen_member = true;
                 continue;
             }
             // cjc 兼容: enum 内部方法 → 转为外部方法 func EnumName.method(this, ...)
@@ -2312,6 +2464,13 @@ impl Parser {
                     .params
                     .iter()
                     .any(|p| p.name == "self" || p.name == "this");
+                // 10.1.2.1(15) / 10.1.2.1 a15_10：enum static 成员不能声明 this/self 形参。
+                if mods.is_static && has_self {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::This,
+                        "static 成员函数不能声明 this/self 形参（10.1.2.1(15)）".to_string(),
+                    ));
+                }
                 if !has_self && !mods.is_static {
                     func.params.insert(
                         0,
@@ -2333,6 +2492,7 @@ impl Parser {
                 }
                 func.is_const = mods.is_const;
                 self.pending_struct_methods.push(func);
+                seen_member = true;
                 continue;
             }
 
@@ -2359,6 +2519,15 @@ impl Parser {
                 }
                 None => return self.bail(ParseError::UnexpectedEof),
             };
+            // 10.1.2.1 a15_09：`punlic operator func ...` — 拼写错误的修饰符会被
+            // 当成枚举变体名吞掉。仅在已进入成员声明区（seen_member）且变体名紧跟
+            // `operator` 时判定；变体区 Ident 后跟 operator 属合法（变体 + 运算符重载）。
+            if seen_member && matches!(self.peek(), Some(Token::Operator)) {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Ident(v_name.clone()),
+                    format!("枚举体中未知的成员修饰符 '{}'（10.1.2.1 a15_09）", v_name),
+                ));
+            }
             let payload = if self.check(&Token::LParen) {
                 self.advance();
                 let mut types = vec![self.parse_type()?];
@@ -3133,6 +3302,13 @@ impl Parser {
                 .params
                 .iter()
                 .any(|p| p.name == "self" || p.name == "this");
+            // 10.1.2.1(15)：扩展中的 static 成员不能声明 this/self 形参。
+            if mods.is_static && has_self {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::This,
+                    "static 成员函数不能声明 this/self 形参（10.1.2.1(15)）".to_string(),
+                ));
+            }
             if !has_self && !func.name.starts_with("static ") {
                 func.params.insert(
                     0,
@@ -4166,6 +4342,13 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 // cjc 兼容: 无 self/this 时添加隐式 this 参数（P2.4: static 方法除外）
                 let has_self = params.iter().any(|p| p.name == "self" || p.name == "this");
+                // 10.1.2.1(15)：static 成员不能声明 this/self 形参。
+                if is_static && has_self {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::This,
+                        "static 成员函数不能声明 this/self 形参（10.1.2.1(15)）".to_string(),
+                    ));
+                }
                 if !has_self && !is_static {
                     params.insert(
                         0,

@@ -3686,6 +3686,50 @@ mod tests {
         parser.parse_program().unwrap()
     }
 
+    // ---- w27c：词法/作用域/重载相关解析期检查 ----
+
+    fn parse_err(source: &str) -> bool {
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
+        let mut parser = Parser::new(tokens);
+        parser.parse_program().is_err()
+    }
+
+    #[test]
+    fn test_w27_enum_static_this_param_rejected() {
+        // 10.1.2.1(15) / a15_10：static 成员不能声明 this/self 形参。
+        assert!(parse_err(
+            "enum E {\n A\n static func f(this: E, x: Int8) {}\n}\nmain() {}"
+        ));
+        // 实例成员允许显式 this 接收者（cjc-style）。
+        assert!(!parse_err(
+            "struct P {\n var x: Int64 = 0\n func area(this: P): Int64 { this.x }\n}\nmain() {}"
+        ));
+    }
+
+    #[test]
+    fn test_w27_enum_unknown_modifier_rejected() {
+        // a15_09：`punlic operator func` 出现在成员声明区时，拼写错误的修饰符不能被
+        // 当作枚举变体名吞掉（成员区内已出现 static func，说明不再处于变体列表）。
+        assert!(parse_err(
+            "enum E {\n A\n static func g() {}\n punlic operator func ==(r: E): Bool { true }\n}\nmain() {}"
+        ));
+        // 合法形态：变体区里变体后直接接 operator 重载。
+        assert!(!parse_err(
+            "enum Num {\n Zero, One\n operator func +(o: Num): Num { Zero }\n}\nmain() {}"
+        ));
+    }
+
+    #[test]
+    fn test_w27_top_level_global_use_before_decl() {
+        // 3.2.3.1(4)：函数体引用其后声明的顶层变量非法。
+        assert!(parse_err("func foo() { let a = ch1 }\nlet ch1 = 'p'\nmain() {}"));
+        assert!(parse_err("struct S { let n = g }\nlet g = 1\nmain() {}"));
+        assert!(parse_err("class C { let n = g }\nvar g = 1\nmain() {}"));
+        // 先声明后使用合法。
+        assert!(!parse_err("let ch1 = 'p'\nfunc foo() { let a = ch1 }\nmain() {}"));
+    }
+
     // ---- interface 内泛型方法 ----
 
     #[test]

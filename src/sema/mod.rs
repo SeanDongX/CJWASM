@@ -15670,6 +15670,29 @@ fn collect_expr_var_names(e: &Expr, out: &mut Vec<String>) {
     });
 }
 
+/// 3.2.3.1(4)（w27c）：解析期「顶层变量使用前声明」检查使用的表达式引用收集。
+/// 由 parser 在拿到顶层声明顺序后调用（顺序信息在 Program 中不保留）。
+pub(crate) fn order_refs_in_expr(e: &Expr) -> Vec<String> {
+    let mut v = Vec::new();
+    collect_expr_var_names(e, &mut v);
+    v
+}
+
+/// 3.2.3.1(4)（w27c）：收集函数体中对外层名字的引用，排除形参与体内任意
+/// 绑定名（含嵌套块/lambda 引入的同名局部，保守排除以避免误报遮蔽）。
+pub(crate) fn order_refs_in_body(params: &[Param], body: &[Stmt]) -> Vec<String> {
+    let bound = collect_body_bound_names(params, body);
+    let mut out: Vec<String> = Vec::new();
+    walk_stmts(body, &mut |e| {
+        if let Expr::Var(n) = e {
+            if !bound.contains(n) {
+                out.push(n.clone());
+            }
+        }
+    });
+    out
+}
+
 /// 递归收集语句中赋值目标的变量名。
 fn collect_assign_target_vars_in_stmts(stmts: &[Stmt], out: &mut Vec<String>) {
     for s in stmts {
@@ -30225,6 +30248,17 @@ mod tests {
             .expect("语法分析应成功")
     }
 
+    /// 同 program_of，但语法错误返回 None（用于 assert_invalid 容忍解析期拒绝）。
+    fn try_program_of(source: &str) -> Option<Program> {
+        let lexer = crate::lexer::Lexer::new(source);
+        let tokens: Result<Vec<_>, _> = lexer.collect();
+        let tokens = tokens.ok()?;
+        crate::parser::Parser::new(tokens)
+            .with_source(source)
+            .parse_program()
+            .ok()
+    }
+
 
     fn assert_valid(source: &str) {
         let program = program_of(source);
@@ -30235,7 +30269,12 @@ mod tests {
 
 
     fn assert_invalid(source: &str) -> Vec<SemanticError> {
-        let program = program_of(source);
+        // 解析期即拒绝（如 w27c 3.2.3.1(4) 顶层变量顺序在 parser 判定）同样视为非法；
+        // 需要检查具体语义错误信息的用例仍走 validate_program 分支。
+        let program = match try_program_of(source) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
         match validate_program(&program) {
             Ok(()) => panic!("非法程序未被拒绝: {}", source),
             Err(errs) => errs,
@@ -32713,6 +32752,22 @@ main() {}"#,
         assert_valid("func f() { 1 }\nlet a = f()\nmain() {}");
     }
 
+
+    #[test]
+    fn test_w27_composition_two_arg_func_rejected() {
+        // 10.1.3(5) / 01_04 a28_02：`f ~> g` 将 f 作为单参调用，f 不能是 2 参函数。
+        assert_invalid(
+            "func sum(x: Int32, y: Int32): Int32 { x + y }\n\
+             func quad(x: Int32): Int32 { x * x }\n\
+             main() { let qs = sum ~> quad }",
+        );
+        // 正例：一元函数组合合法。
+        assert_valid(
+            "func inc(x: Int32): Int32 { x + 1 }\n\
+             func quad(x: Int32): Int32 { x * x }\n\
+             main() { let qs = inc ~> quad }",
+        );
+    }
 
     // ---- w13c：@C 结构体/foreign func/CFunc 的 CType 细化（13.1.3.x/13.1.4(5)）----
 

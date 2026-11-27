@@ -21,8 +21,8 @@
 
 use super::SemanticError;
 use crate::ast::{
-    BinOp, Expr, Function, IntSuffix, Literal, Pattern, Program, Stmt, Type, TypeConstraint,
-    UnaryOp, Visibility,
+    BinOp, Expr, Function, IntSuffix, Literal, MatchArm, Pattern, Program, Stmt, Type,
+    TypeConstraint, UnaryOp, Visibility,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -491,6 +491,100 @@ fn pattern_literal_ty(l: &Literal) -> Ty {
     }
 }
 
+/// 模式（含 `|` 子模式）是否包含“布尔表达式守卫模式”（`case expr >= 0`）。
+/// 该形态仅无选择子的 match 合法（4.4(17)）。
+fn pattern_contains_guard(p: &Pattern) -> bool {
+    match p {
+        Pattern::Guard(_) => true,
+        Pattern::Or(ps) => ps.iter().any(pattern_contains_guard),
+        _ => false,
+    }
+}
+
+/// match 模式的顶层是否构成“兜底”（wildcard 或非枚举变体名的绑定），
+/// 一旦出现即整个 match 穷尽，无需再检查枚举覆盖（4.4(14)）。
+fn pattern_is_enum_catch_all(p: &Pattern, variants: &HashSet<String>) -> bool {
+    match p {
+        Pattern::Wildcard => true,
+        Pattern::Binding(n) => !variants.contains(n),
+        _ => false,
+    }
+}
+
+/// 收集模式中引用的全部枚举变体名（含 `|`/元组/变体实参内嵌套者）。
+fn collect_pattern_variant_refs(p: &Pattern, variants: &HashSet<String>, out: &mut Vec<String>) {
+    match p {
+        Pattern::Binding(n) => {
+            if variants.contains(n) {
+                out.push(n.clone());
+            }
+        }
+        Pattern::Variant {
+            variant_name,
+            payload,
+            ..
+        } => {
+            out.push(variant_name.clone());
+            if let Some(pl) = payload {
+                collect_pattern_variant_refs(pl, variants, out);
+            }
+        }
+        Pattern::Or(ps) | Pattern::Tuple(ps) => {
+            for q in ps {
+                collect_pattern_variant_refs(q, variants, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 变体实参模式是否为“不可反驳”（Wildcard/绑定/全不可反驳元组）。
+/// 变体名作绑定属于常量模式（可反驳），不算不可反驳。
+fn pattern_payload_irrefutable(p: &Pattern, variants: &HashSet<String>) -> bool {
+    match p {
+        Pattern::Wildcard => true,
+        Pattern::Binding(n) => !variants.contains(n),
+        Pattern::Tuple(ps) => ps.iter().all(|q| pattern_payload_irrefutable(q, variants)),
+        _ => false,
+    }
+}
+
+/// 收集一个模式（无守卫）能**完整覆盖**的枚举变体名。
+/// 参数化变体仅当其实参模式不可反驳时才视为完整覆盖。
+fn collect_fully_covered_variants(
+    p: &Pattern,
+    variants: &HashSet<String>,
+    arity: &HashMap<String, usize>,
+    out: &mut HashSet<String>,
+) {
+    match p {
+        Pattern::Binding(n) => {
+            if variants.contains(n) && arity.get(n).copied() == Some(0) {
+                out.insert(n.clone());
+            }
+        }
+        Pattern::Variant {
+            variant_name,
+            payload,
+            ..
+        } => {
+            let full = match payload {
+                None => arity.get(variant_name).copied() == Some(0),
+                Some(pl) => pattern_payload_irrefutable(pl, variants),
+            };
+            if full {
+                out.insert(variant_name.clone());
+            }
+        }
+        Pattern::Or(ps) => {
+            for q in ps {
+                collect_fully_covered_variants(q, variants, arity, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 两类型在“同类型”意义下是否兼容（字面量可适配对应类别）。
 fn compatible(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
@@ -867,6 +961,8 @@ struct Checker<'a> {
     ambiguous_funcs: HashSet<String>,
     /// 本程序中出现过重载的运算符方法名
     overloaded_ops: HashSet<String>,
+    /// 顶层重载函数名（4.2(10)/(11)：重载函数名作值有歧义，裸名非法）。
+    overloaded_func_names: HashSet<String>,
     errors: &'a mut Vec<SemanticError>,
     scopes: Vec<HashMap<String, VarInfo>>,
     /// 用户定义类型名（class/struct/interface/enum）
@@ -875,6 +971,10 @@ struct Checker<'a> {
     enum_names: HashSet<String>,
     /// 枚举构造器名 → 实参个数（跨枚举重名者不登记，避免歧义）。
     enum_variant_arity: HashMap<String, usize>,
+    /// enum 名 → [(变体名, 关联值个数)]（match 穷尽性检查，4.4(14)/4.4.1.6(7)）。
+    enum_variant_sets: HashMap<String, Vec<(String, usize)>>,
+    /// 变体名 → 所属 enum 名（仅跨枚举唯一者登记；歧义者不登记，保守跳过）。
+    variant_enum: HashMap<String, String>,
     /// class 名 → 字段名 → 是否可变
     class_fields: HashMap<String, HashMap<String, bool>>,
     /// class 名 → 成员名 → 静态性/可见性/定义类（6.1.2(4)、6.1.2.4(14)、6.1.2.4(28)）。
@@ -1399,6 +1499,18 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     collect_explicit_returns(program, &mut funcs, &mut generic_returns, &mut ambiguous_funcs);
     collect_inferred_returns(program, &mut funcs, &mut ambiguous_funcs);
 
+    // 4.2(10)/(11)：顶层重载函数名作值（裸名）非法。仅统计顶层自由函数的
+    // 同名重数；跨文件/std 同名不在此列（strict_scope 已限制单文件）。
+    let mut func_name_counts: HashMap<&str, usize> = HashMap::new();
+    for f in &program.functions {
+        *func_name_counts.entry(f.name.as_str()).or_insert(0) += 1;
+    }
+    let overloaded_func_names: HashSet<String> = func_name_counts
+        .into_iter()
+        .filter(|(_, c)| *c > 1)
+        .map(|(n, _)| n.to_string())
+        .collect();
+
     let mut overloaded_ops = HashSet::new();
     collect_operator_overloads(program, &mut overloaded_ops);
 
@@ -1795,6 +1907,30 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     }
     for d in &dup_variants {
         enum_variant_arity.remove(d);
+    }
+    // match 穷尽性检查所需的枚举变体全表与“变体→枚举”反查（4.4(14)/4.4.1.6(7)）。
+    let mut enum_variant_sets: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    let mut variant_enum: HashMap<String, String> = HashMap::new();
+    {
+        let mut dup_ve: HashSet<String> = HashSet::new();
+        for e in &program.enums {
+            let mut list: Vec<(String, usize)> = Vec::new();
+            for v in &e.variants {
+                let arity = match &v.payload {
+                    None => 0,
+                    Some(Type::Tuple(ts)) => ts.len(),
+                    Some(_) => 1,
+                };
+                list.push((v.name.clone(), arity));
+                if variant_enum.insert(v.name.clone(), e.name.clone()).is_some() {
+                    dup_ve.insert(v.name.clone());
+                }
+            }
+            enum_variant_sets.insert(e.name.clone(), list);
+        }
+        for d in &dup_ve {
+            variant_enum.remove(d);
+        }
     }
     let mut qualified_methods: HashSet<String> = HashSet::new();
     for f in &program.functions {
@@ -2271,11 +2407,14 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         generic_returns,
         ambiguous_funcs,
         overloaded_ops,
+        overloaded_func_names,
         errors,
         scopes: Vec::new(),
         type_names,
         enum_names,
         enum_variant_arity,
+        enum_variant_sets,
+        variant_enum,
         class_fields,
         class_members,
         type_kinds,
@@ -5171,6 +5310,9 @@ impl<'a> Checker<'a> {
         match stmt {
             Stmt::Let { pattern, ty, value } => {
                 let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                if ann_ty.is_none() {
+                    self.check_overloaded_func_value(value);
+                }
                 if let Some(t) = ty.as_ref() {
                     self.check_bad_type_spelling(t);
                 }
@@ -5249,6 +5391,9 @@ impl<'a> Checker<'a> {
             }
             Stmt::Var { pattern, ty, value } => {
                 let ann_ty = ty.as_ref().map(|t| self.ty_of_ann(t));
+                if ann_ty.is_none() {
+                    self.check_overloaded_func_value(value);
+                }
                 if let Some(t) = ty.as_ref() {
                     self.check_bad_type_spelling(t);
                 }
@@ -5476,6 +5621,48 @@ impl<'a> Checker<'a> {
                 ));
             }
         }
+        // 3.2.2(3) / 03/02/02 a03_04：内层作用域的同名值绑定会遮蔽类型名，
+        // 此时该名字不能再作为类型使用（`enum A{..}; { let A: Int64; let b: A }`）。
+        // 仅严格（无 import 单文件）程序、且名字确为已声明类型时判定。
+        self.check_type_name_not_shadowed(ty);
+    }
+
+    /// 3.2.2(3)：类型标注中的名字若被同作用域/外层作用域的值绑定遮蔽，则不能作类型用。
+    fn check_type_name_not_shadowed(&mut self, ty: &Type) {
+        match ty {
+            Type::Struct(name, args) => {
+                if self.type_names.contains(name) && self.lookup(name).is_some() {
+                    self.err(format!(
+                        "类型名 '{}' 已被同名值绑定遮蔽，不能作为类型使用（3.2.2(3)）",
+                        name
+                    ));
+                }
+                for a in args {
+                    self.check_type_name_not_shadowed(a);
+                }
+            }
+            Type::Array(t) | Type::Option(t) | Type::Slice(t) => {
+                self.check_type_name_not_shadowed(t)
+            }
+            Type::Result(a, b) | Type::Map(a, b) => {
+                self.check_type_name_not_shadowed(a);
+                self.check_type_name_not_shadowed(b);
+            }
+            Type::Tuple(ts) => {
+                for t in ts {
+                    self.check_type_name_not_shadowed(t);
+                }
+            }
+            Type::Function { params, ret } => {
+                for p in params {
+                    self.check_type_name_not_shadowed(p);
+                }
+                if let Some(r) = ret.as_ref() {
+                    self.check_type_name_not_shadowed(r);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// 4.1/4.2：初始化式中引用自身名字非法。解析器会把“下一行以二元运算符
@@ -5531,12 +5718,24 @@ impl<'a> Checker<'a> {
         let is_var = self.deferred_var.contains(name);
         if is_var {
             // 延迟 `var` 读取类型默认值是项目方言（std 依赖），state==0 保持放行；
-            // 仅在严格（无 import 单文件）程序上收紧“条件分支内可能已赋值”。
-            if state == 1 && self.strict_scope {
-                self.err(format!(
-                    "变量 '{}' 可能未初始化即被读取（3.2.3.2(4)）",
-                    name
-                ));
+            // 仅在严格（无 import 单文件）程序上按 3.2.3.2(4) 收紧：
+            //   state==0（从未赋值）→ 明确“初值赋值前被读取”；
+            //   state==1（条件分支内可能已赋）→ “可能未初始化”。
+            // 官方负例 03/02/03/02 a04_12（match）/a04_20（while）/a04_22（do-while）
+            // 均为 `var x: T;` 在赋值前读取；std 依赖的方言读取经 import 判定
+            // （strict_scope=false）不受影响。
+            if self.strict_scope {
+                if state == 0 {
+                    self.err(format!(
+                        "变量 '{}' 在初值赋值前被读取（未初始化）",
+                        name
+                    ));
+                } else if state == 1 {
+                    self.err(format!(
+                        "变量 '{}' 可能未初始化即被读取（3.2.3.2(4)）",
+                        name
+                    ));
+                }
             }
             return;
         }
@@ -6596,6 +6795,117 @@ impl<'a> Checker<'a> {
             return false;
         }
         !compatible(&a, &b) && !compatible(&b, &a)
+    }
+
+    /// 4.2(10)/(11)：无类型标注的 `let/var x = <重载函数名>` 作值有歧义。
+    /// 仅在 strict_scope（单文件）且该名未被变量/局部函数/类型/枚举变体遮蔽时判定；
+    /// 带类型标注或作实参（上下文可消歧）时不在此判定。
+    fn check_overloaded_func_value(&mut self, value: &Expr) {
+        if !self.strict_scope {
+            return;
+        }
+        let Expr::Var(name) = value else {
+            return;
+        };
+        if self.lookup(name).is_some()
+            || self.type_names.contains(name)
+            || self.enum_variants.contains(name)
+            || self.local_func_names.contains(name)
+        {
+            return;
+        }
+        if self.overloaded_func_names.contains(name) {
+            self.err(format!(
+                "重载函数 '{}' 作为值有歧义，不能单独使用（4.2(10)/(11)）",
+                name
+            ));
+        }
+    }
+
+    /// 4.4(17)：带选择子的 match 的 case 必须是模式；`case expr >= 0` 这类
+    /// 布尔表达式模式仅允许用于无选择子的 match。无选择子在解析器中以空块
+    /// `Expr::Block(vec![], None)` 作为选择子占位，据此区分。
+    fn check_match_bool_case_with_selector(&mut self, selector: &Expr, arms: &[MatchArm]) {
+        if !self.strict_scope {
+            return;
+        }
+        if matches!(selector, Expr::Block(stmts, None) if stmts.is_empty()) {
+            return;
+        }
+        for arm in arms {
+            if pattern_contains_guard(&arm.pattern) {
+                self.err(
+                    "带选择子的 match 的 case 必须是模式，不能将布尔表达式作为模式（4.4(17)）"
+                        .to_string(),
+                );
+                return;
+            }
+        }
+    }
+
+    /// 4.4(14)/4.4.1.6(7)：带选择子的 match 对枚举必须穷尽。
+    ///
+    /// 保守策略：仅在单文件（strict_scope）下判定；从**被引用的变体名**反推
+    /// 枚举（要求全部变体名跨枚举唯一且同属一个枚举）；出现 wildcard/非变体
+    /// 绑定（兜底）即视为穷尽；带守卫的臂不视为完整覆盖（守卫可能失败）。
+    /// 参数化变体仅当实参模式不可反驳时才算完整覆盖（4.4.1.6(7)）。
+    fn check_enum_match_exhaustive(&mut self, arms: &[MatchArm]) {
+        if !self.strict_scope {
+            return;
+        }
+        for arm in arms {
+            if pattern_is_enum_catch_all(&arm.pattern, &self.enum_variants) {
+                return;
+            }
+        }
+        let mut refs: Vec<String> = Vec::new();
+        let mut covered: HashSet<String> = HashSet::new();
+        for arm in arms {
+            collect_pattern_variant_refs(&arm.pattern, &self.enum_variants, &mut refs);
+            if arm.guard.is_some() {
+                continue;
+            }
+            collect_fully_covered_variants(
+                &arm.pattern,
+                &self.enum_variants,
+                &self.enum_variant_arity,
+                &mut covered,
+            );
+        }
+        if refs.is_empty() {
+            return;
+        }
+        let mut enum_nm: Option<String> = None;
+        for r in &refs {
+            let e = match self.variant_enum.get(r) {
+                Some(e) => e.clone(),
+                None => return,
+            };
+            match &enum_nm {
+                None => enum_nm = Some(e),
+                Some(x) if *x == e => {}
+                Some(_) => return,
+            }
+        }
+        let e = match enum_nm {
+            Some(e) => e,
+            None => return,
+        };
+        let missing: Vec<String> = match self.enum_variant_sets.get(&e) {
+            Some(vs) => vs
+                .iter()
+                .filter(|(n, _)| !covered.contains(n))
+                .map(|(n, _)| n.clone())
+                .collect(),
+            None => return,
+        };
+        if !missing.is_empty() {
+            self.err(format!(
+                "match 表达式未穷尽枚举 '{}'：缺少 {}（4.4(14)/4.4.1.6(7)）",
+                e,
+                missing.join("、")
+            ));
+        }
     }
 
     /// 在期望类型上下文中检查表达式（用于带类型标注的 `if` 初始化）。
@@ -8139,6 +8449,9 @@ impl<'a> Checker<'a> {
                         name
                     ));
                 }
+                // 4.2(10)/(11)：重载函数名作值有歧义，仅在无类型标注的
+                // let/var 绑定初始化式恰为裸函数名时判定（check_overloaded_func_value），
+                // 以免误伤按上下文消歧的重载函数实参（`fv(neg)`，见 w21b 正例）。
                 // 3.2.3.2：无 import 单文件程序中的未定义标识符。
                 self.check_strict_var(name);
                 self.lookup(name)
@@ -8929,6 +9242,17 @@ impl<'a> Checker<'a> {
                 for (_, a) in named_args {
                     self.check_expr(a);
                 }
+                // 10.1.3(5) / 01_04 a28_02：`f ~> g` 脱糖为 λx -> g(f(x))。若 f 是
+                // 本地自由函数且其可见签名要求的位置参数个数与实参个数不符（如 2 参
+                // 函数被组合成单参闭包），则组合非法。仅当被调用者为裸函数名（非局部
+                // 变量/形参）时判定；此刻实参恰好来自组合脱糖的单参调用。
+                if let Expr::Var(n) = &**callee {
+                    if self.lookup(n).is_none() && !self.local_func_names.contains(n) {
+                        let arg_tys: Vec<Ty> =
+                            args.iter().map(|a| self.check_expr_ty_peek(a)).collect();
+                        self.check_free_func_arity(n, &arg_tys, args, named_args);
+                    }
+                }
                 // 2.3.1(10)：字面量或类型名不能作为函数值被调用
                 // （如 `8_i8(Int32)` / `(Int32)(8_i8)`）。
                 match &**callee {
@@ -9364,6 +9688,10 @@ impl<'a> Checker<'a> {
                         result = t;
                     }
                 }
+                // 4.4(17)：带选择子时不能使用布尔表达式模式。
+                self.check_match_bool_case_with_selector(expr, arms);
+                // 4.4(14)/4.4.1.6(7)：枚举 match 穷尽性。
+                self.check_enum_match_exhaustive(arms);
                 result
             }
 
@@ -10640,6 +10968,25 @@ fn const_int_value(e: &Expr) -> Option<(i128, Ty)> {
     }
     match e {
         Expr::IntegerSuffixed(v, s) => Some((raw_lit(*v, *s)?, suffix_ty(*s))),
+        // 1.3.6(4) a04_031：折叠常量整型二元子表达式（同后缀类型的
+        // `+`/`-`/`*`），使 `4i8 - 2i8 + 126i8` 这类嵌套常量算术也能在
+        // 外层溢出检查中被判定（此前只识别单个字面量，嵌套子式被跳过）。
+        Expr::Binary { op, left, right }
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) =>
+        {
+            let (lv, lt) = const_int_value(left)?;
+            let (rv, rt) = const_int_value(right)?;
+            if lt != rt {
+                return None;
+            }
+            let r = match op {
+                BinOp::Add => lv.checked_add(rv)?,
+                BinOp::Sub => lv.checked_sub(rv)?,
+                BinOp::Mul => lv.checked_mul(rv)?,
+                _ => return None,
+            };
+            Some((r, lt))
+        }
         Expr::Unary {
             op: UnaryOp::Neg,
             expr,
@@ -11760,8 +12107,8 @@ mod tests {
         // 无 else 的 if 表达式类型为 Unit。
         assert_ok("main() { let x = 1; let u: Unit = if (x > 0) { } }");
         // 2.1.4(2)：Unit 只定义 == / !=，关系运算符非法。
-        assert_err("main() { var a: Unit; var b: Unit; a >= b }", "Unit");
-        assert_ok("main() { var a: Unit; var b: Unit; let c = a == b }");
+        assert_err("main() { var a: Unit = (); var b: Unit = (); a >= b }", "Unit");
+        assert_ok("main() { var a: Unit = (); var b: Unit = (); let c = a == b }");
     }
 
 
@@ -13511,11 +13858,12 @@ mod tests {
             "main() { let s = \"${var y: Int64; y + 1}\"; return }",
             "未初始化",
         );
-        // 赋值后读取合法；条件分支内赋值后读取也合法（保守不报）。
+        // 赋值后读取合法；条件分支内赋值后读取（state 1）仍保守放行（插值路径）。
         assert_ok("main() { var x: String; x = \"a\"; let s = \"${x}\"; return }");
         assert_ok("main() { let x: Int64; if (true) { x = 1 }; let s = \"${x}\"; return }");
-        // 插值外读取无初始化 var（方言默认值语义）不受影响。
-        assert_ok("main() { var x: Int64; let y = x + 1; return }");
+        // 插值外读取无初始化 var：w27c 起在严格程序上同样按未初始化拒绝（3.2.3.2(4)；
+        // 官方 03/02/03/02 a04_12/a04_20/a04_22）。std（带 import）仍走项目方言放行。
+        assert_err("main() { var x: Int64; let y = x + 1; return }", "未初始化");
     }
 
     #[test]
@@ -13647,8 +13995,42 @@ mod tests {
         assert_ok("main() {\n let x: Int64\n if (true) { x = 1 } else { x = 2 }\n var vv = x\n}");
         // 跨函数读取（声明在外层、读取在内层函数体）保守放行，避免调用时序误判。
         assert_ok("main() {\n let x: String\n func f() { var vv = x }\n x = \"\"\n f()\n}");
-        // 延迟 `var` 读取类型默认值属项目方言，非插值上下文保持放行。
-        assert_ok("main() { var x: Int64; let y = x + 1; return }");
+        // 延迟 `var` 未赋值即读取：w27c 起在严格程序上按 3.2.3.2(4) 拒绝
+        // （官方 a04_12/a04_20/a04_22）；std（带 import）仍按项目方言放行默认值读取。
+        assert_err("main() { var x: Int64; let y = x + 1; return }", "未初始化");
+    }
+
+    // ─── w27c：未初始化 var / 类型名遮蔽 / 嵌套常量算术溢出 ───────────────
+
+    #[test]
+    fn test_w27_deferred_var_uninit_read_rejected() {
+        // 3.2.3.2(4)：严格单文件程序中，延迟 var 未赋值即读取（含 match/while 条件）。
+        assert_err("main() { var x: Int64; let y = x + 1; return }", "未初始化");
+        assert_err("main() { var x: Int32; while (x < 1) { x++ } }", "未初始化");
+        assert_err(
+            "main() { var t: Int64; let s = match (t) { case 1 => \"a\" case _ => \"b\" }; s }",
+            "未初始化",
+        );
+        // 先赋值后读取合法。
+        assert_ok("main() { var x: Int64; x = 1; let y = x + 1; return }");
+    }
+
+    #[test]
+    fn test_w27_type_name_shadowed_by_value_rejected() {
+        // 3.2.2(3)：同名值绑定遮蔽类型名后，该名字不能再作类型使用。
+        assert_err(
+            "enum A { B }\nmain() { let A: Int64; let b: A }",
+            "遮蔽",
+        );
+        // 未被遮蔽时以该类型作标注合法。
+        assert_ok("enum A { B }\nmain() { let b: A = B }");
+    }
+
+    #[test]
+    fn test_w27_nested_const_arith_overflow_rejected() {
+        // 4.15(62)：嵌套常量算术子式折叠后仍能判溢出（`4i8-2i8+126i8` = 128 > 127）。
+        assert_err("main() { let x = 4i8 - 2i8 + 126i8; x }", "溢出");
+        assert_ok("main() { let x = 4i8 - 2i8 + 120i8; x }");
     }
 
     #[test]
@@ -14244,5 +14626,54 @@ mod tests {
              \x20   f()\n\
              }\n",
         );
+    }
+
+    // w27a 4.2(10)/(11)：重载函数名作值有歧义。
+    #[test]
+    fn test_w27a_overloaded_func_name_as_value() {
+        assert_err(
+            "func empty(i: Int64) {}\n\
+             func empty(i: Int64, s: String) {}\n\
+             main() { var f = empty }\n",
+            "重载函数",
+        );
+        // 单一非重载函数名作值（闭包）合法。
+        assert_ok("func g(i: Int64) {}\nmain() { var f = g }\n");
+    }
+
+    // w27a 4.4(14)/4.4.1.6(7)：枚举 match 穷尽性。
+    #[test]
+    fn test_w27a_enum_match_exhaustive() {
+        // 遗漏变体 → 拒绝。
+        assert_err(
+            "enum E { | A | B }\nmain() { match(A) { case A => true } }\n",
+            "未穷尽枚举",
+        );
+        // 覆盖全部变体 → 放行。
+        assert_ok("enum E { | A | B }\nmain() { match(A) { case A => true; case B => false } }\n");
+        // 兜底 wildcard → 放行。
+        assert_ok("enum E { | A | B }\nmain() { match(A) { case A => true; case _ => false } }\n");
+        // 参数化变体的实参模式为常量（可反驳）→ 未完整覆盖 → 拒绝。
+        assert_err(
+            "enum E { | A(Int64) | B(Int64, Int64) }\n\
+             main() { match(B(1, 2)) { case B(1, 2) => true; case A(_) => true } }\n",
+            "未穷尽枚举",
+        );
+        // 参数化变体全部以不可反驳模式覆盖 → 放行。
+        assert_ok(
+            "enum E { | A(Int64) | B(Int64, Int64) }\n\
+             main() { match(B(1, 2)) { case B(x, y) => true; case A(z) => false } }\n",
+        );
+    }
+
+    // w27a 4.4(17)：带选择子的 match 不能用布尔表达式作为 case 模式。
+    #[test]
+    fn test_w27a_match_bool_case_with_selector() {
+        assert_err(
+            "var expr = 1\nmain() { match expr { case expr >= 0 => 1; case _ => 2 } }\n",
+            "布尔表达式作为模式",
+        );
+        // 无选择子的 match 允许布尔表达式模式。
+        assert_ok("var r = 1\nmain() { match { case r > 0 => 0; case _ => 1 } }\n");
     }
 }
