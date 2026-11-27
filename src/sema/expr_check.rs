@@ -205,6 +205,80 @@ fn suffix_ty(s: IntSuffix) -> Ty {
 }
 
 /// 由 AST 类型映射到轻量类型。
+/// 表达式是否“确定非 Unit 类型”（w26c 5.5(7) 单元 lambda 返回检查用）。
+/// 只识别形态上必为非 Unit 的表达式，不依赖形参类型（可能被占位为 Unknown）。
+fn definitely_non_unit_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Integer(_)
+        | Expr::IntegerSuffixed(_, _)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::Bool(_)
+        | Expr::Rune(_)
+        | Expr::String(_)
+        | Expr::Interpolate(_) => true,
+        Expr::Binary { .. } | Expr::Unary { .. } | Expr::IsType { .. } => true,
+        Expr::Array(v) | Expr::Tuple(v) => !v.is_empty(),
+        _ => false,
+    }
+}
+
+/// 收集 lambda 体（不进入嵌套 lambda/局部函数）内的 `return` 操作数表达式。
+fn collect_unit_lambda_returns<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Lambda { .. } => {}
+        Expr::Return(Some(x)) => out.push(x),
+        Expr::Block(stmts, tail) => {
+            for s in stmts {
+                collect_unit_lambda_returns_stmt(s, out);
+            }
+            if let Some(t) = tail {
+                collect_unit_lambda_returns(t, out);
+            }
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_unit_lambda_returns(cond, out);
+            collect_unit_lambda_returns(then_branch, out);
+            if let Some(e2) = else_branch {
+                collect_unit_lambda_returns(e2, out);
+            }
+        }
+        Expr::Match { expr, arms } => {
+            collect_unit_lambda_returns(expr, out);
+            for arm in arms {
+                collect_unit_lambda_returns(&arm.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_unit_lambda_returns_stmt<'a>(s: &'a Stmt, out: &mut Vec<&'a Expr>) {
+    match s {
+        Stmt::Return(Some(e)) => out.push(e),
+        Stmt::Expr(e)
+        | Stmt::Var { value: e, .. }
+        | Stmt::Let { value: e, .. }
+        | Stmt::Const { value: e, .. }
+        | Stmt::Assign { value: e, .. } => collect_unit_lambda_returns(e, out),
+        Stmt::While { body, .. }
+        | Stmt::WhileLet { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::Loop { body }
+        | Stmt::UnsafeBlock { body } => {
+            for s in body {
+                collect_unit_lambda_returns_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn ty_of(ty: &Type) -> Ty {
     match ty {
         Type::Int8 => Ty::Int8,
@@ -905,6 +979,10 @@ struct Checker<'a> {
     /// 当前 `if` 表达式所处的期望类型上下文（如带类型标注的初始化）。
     /// 存在时按上下文逐分支检查可赋值性，而非套用 4.3(15) 的最小公共超类型。
     expected_ty: Option<Ty>,
+    /// 期望的 lambda 返回类型上下文（如 `var f: (..) -> Unit = { λ }`）。由带函数
+    /// 类型标注的初始化赋值在检查 lambda 前设置，Lambda 分支消费它作为 `return`
+    /// 的检查基准（5.5(7)：声明返回 Unit 的 lambda 内 `return 非Unit值` 非法）。
+    lambda_ret_ctx: Option<Ty>,
     /// 全部 enum 变体名（`E1 = E1` 这类构造值不可赋值，4.23(15)）。
     enum_variants: HashSet<String>,
     /// 以 `Type.method` 形式记录的所有成员函数名（class/struct/extend）。
@@ -913,6 +991,10 @@ struct Checker<'a> {
     /// 限定名 `Owner.member` → 各重载的普通位置形参元数。空 Vec 表示该名
     /// 存在非普通（命名/变长/inout）重载，保守放行不检查。
     method_arities: HashMap<String, Vec<MethodArity>>,
+    /// 限定名 `Owner.member` → 各重载的普通位置形参类型（用于 lambda 实参位置
+    /// 检查，w26c 5.3.3(1)）。`None` 表示存在命名/变长/inout/Array 形参等不可
+    /// 建模的重载，保守放行。与 `method_arities` 独立，避免影响既有元数判定。
+    method_param_types: HashMap<String, Option<Vec<Vec<Ty>>>>,
     /// (类型, 泛型成员方法裸名)：带类型形参的成员方法集合。作为值引用
     /// （无调用括号、无类型实参）时非法（4.13/a04_04）。
     generic_method_names: HashSet<(String, String)>,
@@ -1018,6 +1100,11 @@ struct FreeFuncSig {
     positional_types: Vec<Ty>,
     /// 是否含变长（Array 变长实参糖）形参
     variadic: bool,
+    /// 类型形参个数（显式类型实参计数检查，w26c/10.1.2.1 a24_03）
+    type_params: usize,
+    /// 是否含命名形参（`p.is_named`）。含命名形参时位置计数无法判定整体可接受性，
+    /// 显式类型实参计数检查对此类重载保守跳过。
+    has_named: bool,
 }
 
 /// 用户类型类别（用于 prelude 子类型关系与成员访问规则判定）。
@@ -1463,6 +1550,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         let mut positional_defaults: Vec<bool> = Vec::new();
         let mut positional_types: Vec<Ty> = Vec::new();
         let mut variadic = false;
+        let mut has_named = false;
         for p in &f.params {
             if p.name == "this" || p.name == "self" {
                 continue;
@@ -1471,6 +1559,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 variadic = true;
             }
             if p.is_named {
+                has_named = true;
                 continue;
             }
             positional += 1;
@@ -1490,6 +1579,8 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 positional_defaults,
                 positional_types,
                 variadic,
+                type_params: f.type_params.len(),
+                has_named,
             });
     }
     // 4.23(15)：赋值左侧可变性的辅助信息。
@@ -1827,6 +1918,73 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         }
     }
 
+    // w26c：成员方法位置形参类型表（仅供 lambda 实参位置检查 5.3.3(1) 使用）。
+    // 与 method_arities 独立：任一同名重载含命名/变长/inout/Array 形参或用户
+    // 显式接收者时，将该键置 `None`（不可建模，保守放行）。
+    let mut method_param_types: HashMap<String, Option<Vec<Vec<Ty>>>> = HashMap::new();
+    {
+        let mut record = |fq: &str, params: &[crate::ast::Param]| {
+            let member = fq.rsplit_once('.').map(|(_, m)| m).unwrap_or("");
+            if member.starts_with("op_") || member.starts_with("__") || member.is_empty() {
+                return;
+            }
+            let owner = fq.rsplit_once('.').map(|(o, _)| o).unwrap_or("");
+            let auto_receiver = params.first().map_or(false, |p| {
+                p.name == "this"
+                    && matches!(&p.ty, crate::ast::Type::Struct(o, _) if o == owner)
+            });
+            let has_user_receiver =
+                params.iter().any(|p| p.name == "this" || p.name == "self");
+            let entry = method_param_types.entry(fq.to_string()).or_insert_with(|| Some(Vec::new()));
+            if entry.is_none() {
+                return;
+            }
+            if has_user_receiver && !auto_receiver {
+                *entry = None;
+                return;
+            }
+            let plain: Vec<&crate::ast::Param> = if auto_receiver {
+                params.iter().skip(1).collect()
+            } else {
+                params.iter().collect()
+            };
+            if plain.iter().any(|p| {
+                p.is_named
+                    || p.variadic
+                    || p.is_inout
+                    || matches!(&p.ty, crate::ast::Type::Array(_))
+                    || matches!(&p.ty, crate::ast::Type::Struct(n, _)
+                        if n == "Array" || n == "VArray")
+            }) {
+                *entry = None;
+                return;
+            }
+            if let Some(Some(v)) = method_param_types.get_mut(fq) {
+                v.push(plain.iter().map(|p| ty_of_known(&p.ty, &type_names)).collect());
+            }
+        };
+        for f in &program.functions {
+            if f.name.contains('.') {
+                record(&f.name, &f.params);
+            }
+        }
+        for c in &program.classes {
+            for m in &c.methods {
+                record(&m.func.name, &m.func.params);
+            }
+        }
+        for ext in &program.extends {
+            for f in &ext.methods {
+                record(&f.name, &f.params);
+            }
+        }
+        for itf in &program.interfaces {
+            for m in &itf.methods {
+                record(&format!("{}.{}", itf.name, m.name), &m.params);
+            }
+        }
+    }
+
     // 继承闭包展开：父类/父接口的方法元数并入子类键（06/02 a15：`c1.f()`
     // 的 f 声明在父类/接口时，接收者类型解析为子类）。空 Vec（跳过哨兵）
     // 不传播；至多 32 轮不动点迭代（含环防御）。
@@ -2086,6 +2244,10 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     // class 成员变量默认值类型（2.1.6(1)/2.1.10.1(1) 对应规则）。
     check_class_field_defaults(program, &type_names, errors);
 
+    // 5.1.4(9)：显式声明为非 Unit 返回类型的顶层函数，函数体为空（无 return）
+    // 时必然无法返回该类型（w26c 05/01 a03_04：`func f(): String {}`）。
+    check_empty_body_explicit_returns(program, &type_names, errors);
+
     // enum 成员同名细则（2.1.11.4(3)）：构造器/成员函数/属性不可同名。
     check_enum_member_names(program, errors);
 
@@ -2145,6 +2307,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         field_types,
         method_returns,
         expected_ty: None,
+        lambda_ret_ctx: None,
         struct_private_fields,
         struct_private_ctor,
         struct_private_methods,
@@ -2156,6 +2319,7 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         enum_variants,
         qualified_methods,
         method_arities,
+        method_param_types,
         generic_method_names,
         try_suffix_depth: 0,
         index_op_types,
@@ -2853,6 +3017,42 @@ fn check_struct_type_rules(
 ///
 /// 仅当声明类型可静态确定（内建基础/聚合类型）且默认值是类型确定的字面量/范围
 /// 表达式时报错；用户类型、泛型、构造调用结果类型未知时一律保守放行。
+/// 5.1.4(9)：显式声明为非 Unit 返回类型的顶层函数，若函数体为空（既无 return
+/// 也无尾表达式），则无法返回该类型，属编译错误（w26c 05/01 a03_04）。
+/// 仅判定顶层函数（`program.functions`），跳过 external/import 声明。
+fn check_empty_body_explicit_returns(
+    program: &Program,
+    type_names: &HashSet<String>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for f in &program.functions {
+        if f.extern_import.is_some() {
+            continue;
+        }
+        let Some(rt) = &f.return_type else {
+            continue;
+        };
+        let t = resolve_ann_ty(rt, type_names);
+        if matches!(t, Ty::Unit | Ty::Unknown) || !t.is_concrete() {
+            continue;
+        }
+        let empty = f.body.is_empty()
+            || matches!(
+                f.body.as_slice(),
+                [Stmt::Expr(Expr::Tuple(v))] if v.is_empty()
+            );
+        if empty {
+            errors.push(SemanticError {
+                message: format!(
+                    "函数 '{}' 声明返回 '{}' 但函数体为空，无法返回该类型（5.1.4(9)）",
+                    f.name,
+                    t.name()
+                ),
+            });
+        }
+    }
+}
+
 fn check_class_field_defaults(
     program: &Program,
     type_names: &HashSet<String>,
@@ -2864,6 +3064,23 @@ fn check_class_field_defaults(
                 continue;
             };
             let target = resolve_ann_ty(&f.ty, type_names);
+            // 5.5(7)：声明返回 Unit 的函数类型成员变量，其 lambda 初始化式内
+            // `return 非Unit表达式` 非法（w26c a07_02）。
+            if let (Expr::Lambda { body, .. }, Ty::Func { ret, .. }) = (d, &target) {
+                if matches!(**ret, Ty::Unit) {
+                    let mut rets: Vec<&Expr> = Vec::new();
+                    collect_unit_lambda_returns(body, &mut rets);
+                    if rets.iter().any(|e| definitely_non_unit_expr(e)) {
+                        errors.push(SemanticError {
+                            message: format!(
+                                "类 '{}' 的成员变量 '{}' 的 lambda 声明返回 Unit，但 return 了非 Unit 表达式（5.5(7)）",
+                                cls.name, f.name
+                            ),
+                        });
+                    }
+                    continue;
+                }
+            }
             if !target.is_concrete() || !target.is_prim() {
                 continue;
             }
@@ -2891,6 +3108,25 @@ fn check_class_field_defaults(
                         value.name()
                     ),
                 });
+            }
+        }
+    }
+    // 5.5(7)：顶层 `var/let f: (..)->Unit = { λ }` 的 lambda 内 `return 非Unit`
+    // 非法（w26c a07_03）。
+    for c in &program.constants {
+        let target = resolve_ann_ty(&c.ty, type_names);
+        if let (Expr::Lambda { body, .. }, Ty::Func { ret, .. }) = (&c.init, &target) {
+            if matches!(**ret, Ty::Unit) {
+                let mut rets: Vec<&Expr> = Vec::new();
+                collect_unit_lambda_returns(body, &mut rets);
+                if rets.iter().any(|e| definitely_non_unit_expr(e)) {
+                    errors.push(SemanticError {
+                        message: format!(
+                            "顶层变量 '{}' 的 lambda 声明返回 Unit，但 return 了非 Unit 表达式（5.5(7)）",
+                            c.name
+                        ),
+                    });
+                }
             }
         }
     }
@@ -4345,6 +4581,28 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    /// 5.3.3(1)/5.5：成员方法调用中 lambda 实参的位置检查（w26c a01_02..04）。
+    /// `Owner.method` 的重载集可建模时，lambda 实参须落在函数类型形参上。
+    fn check_lambda_arg_positions_method(
+        &mut self,
+        recv_ty: &str,
+        method: &str,
+        args: &[Expr],
+    ) {
+        if !args.iter().any(|a| matches!(a, Expr::Lambda { .. })) {
+            return;
+        }
+        let key = format!("{}.{}", recv_ty, method);
+        let Some(Some(sigs)) = self.method_param_types.get(&key) else {
+            return;
+        };
+        if sigs.is_empty() {
+            return;
+        }
+        let slices: Vec<Vec<Ty>> = sigs.clone();
+        self.report_misplaced_lambda_args(&key, args, &slices);
+    }
+
     /// 6.1.2.1(8)/(9)：校验构造调用 `ClassName(args, named: ..)` 与某个构造函数
     /// 形参匹配（类型 / 个数 / 命名）。只要存在一个可匹配的重载即视为合法。
     /// 类型未知的实参/形参视为兼容，绝不误伤。
@@ -4418,6 +4676,117 @@ impl<'a> Checker<'a> {
                 name, npos
             ));
         }
+    }
+
+    /// 10.1.2.1：自由函数名对应的本地重载集是否“完整可枚举”（不含跨文件/std
+    /// 重载、类型名、全局变量、局部函数、成员方法、内建同名调用）。供显式类型
+    /// 实参计数与 lambda 形参位置检查共用。
+    fn free_func_set_complete(&self, name: &str) -> bool {
+        !name.contains('.')
+            && !self.type_names.contains(name)
+            && !self.enum_names.contains(name)
+            && !self.globals.contains_key(name)
+            && !self.local_func_names.contains(name)
+            && !self.is_known_member_name(name)
+            && !self.has_any_method_named(name)
+            && !is_builtin_free_call_name(name)
+    }
+
+    /// 5.3.2(2)/10.1.3.3：显式给出类型实参时，须存在某个重载其“类型形参个数 ==
+    /// 显式类型实参个数”且其位置形参个数能接受这些位置实参；否则无重载可匹配
+    ///（w26c a24_03：`custom_min<Int64,Int32>(a, b)` 中 2 个类型实参的候选需 3
+    /// 个位置实参，而 1 个类型形参的候选不接受 2 个类型实参）。
+    fn check_free_func_type_args_arity(
+        &mut self,
+        name: &str,
+        type_args: Option<&[Type]>,
+        npos: usize,
+        has_named: bool,
+    ) {
+        let Some(tas) = type_args else { return };
+        if tas.is_empty() || has_named || !self.free_func_set_complete(name) {
+            return;
+        }
+        let Some(sigs) = self.free_func_sigs.get(name) else {
+            return;
+        };
+        if sigs.is_empty() {
+            return;
+        }
+        // 变长/Array 形参会吸收任意多个位置实参，计数不可靠，保守跳过。
+        if sigs.iter().any(|s| {
+            s.variadic || s.positional_types.iter().any(|t| matches!(t, Ty::Array(_)))
+        }) {
+            return;
+        }
+        let matched: Vec<&FreeFuncSig> =
+            sigs.iter().filter(|s| s.type_params == tas.len()).collect();
+        if matched.is_empty() {
+            // 没有任何重载具有该数量的类型形参：显式类型实参个数非法。
+            self.err(format!(
+                "函数 '{}' 无具有 {} 个类型形参的重载（5.3.2(2)）",
+                name,
+                tas.len()
+            ));
+            return;
+        }
+        // 匹配类型形参个数的重载含命名形参时，仅凭位置实参不可判定可接受性，放行。
+        if matched.iter().any(|s| s.has_named) {
+            return;
+        }
+        if matched.iter().any(|s| free_sig_accepts(s, npos)) {
+            return;
+        }
+        self.err(format!(
+            "函数 '{}' 无重载同时匹配 {} 个类型实参和 {} 个位置实参（10.1.3.3/5.3.2(2)）",
+            name,
+            tas.len(),
+            npos
+        ));
+    }
+
+    /// 5.3.3(1)/5.5：位置上的 lambda 实参必须对应到函数类型形参；若该位置的
+    /// 全部候选形参都是非函数、非未知类型，则该 lambda 无处安放（w26c
+    /// 05/03/03 a01_05：`myFunc(44){ i => i/i }` 中尾随 lambda 落到 `a: Int64`）。
+    fn report_misplaced_lambda_args(&mut self, callee: &str, args: &[Expr], sigs: &[Vec<Ty>]) {
+        for (i, a) in args.iter().enumerate() {
+            if !matches!(a, Expr::Lambda { .. }) {
+                continue;
+            }
+            let strict_nonfunc = !sigs.is_empty()
+                && sigs.iter().all(|ts| {
+                    i < ts.len() && !matches!(ts[i], Ty::Func { .. } | Ty::Unknown)
+                });
+            if strict_nonfunc {
+                self.err(format!(
+                    "'{}' 的第 {} 个位置形参不是函数类型，不能传入 lambda 表达式（5.3.3(1)/5.5）",
+                    callee,
+                    i + 1
+                ));
+            }
+        }
+    }
+
+    fn check_lambda_arg_positions_free(&mut self, name: &str, args: &[Expr]) {
+        if !args.iter().any(|a| matches!(a, Expr::Lambda { .. })) {
+            return;
+        }
+        if !self.free_func_set_complete(name) {
+            return;
+        }
+        let Some(sigs) = self.free_func_sigs.get(name) else {
+            return;
+        };
+        if sigs.is_empty() {
+            return;
+        }
+        if sigs.iter().any(|s| {
+            s.variadic || s.positional_types.iter().any(|t| matches!(t, Ty::Array(_)))
+        }) {
+            return;
+        }
+        let slices: Vec<Vec<Ty>> = sigs.iter().map(|s| s.positional_types.clone()).collect();
+        self.report_misplaced_lambda_args(name, args, &slices);
     }
 
     fn lookup(&self, name: &str) -> Option<&VarInfo> {
@@ -4827,7 +5196,7 @@ impl<'a> Checker<'a> {
                     {
                         self.check_expr_in_expected(value, ann.clone())
                     }
-                    _ => self.check_expr(value),
+                    _ => self.check_init_value(value, ann_ty.as_ref()),
                 };
                 if suppress_self.is_some() {
                     self.self_init_ok.pop();
@@ -4901,7 +5270,7 @@ impl<'a> Checker<'a> {
                     {
                         self.check_expr_in_expected(value, ann.clone())
                     }
-                    _ => self.check_expr(value),
+                    _ => self.check_init_value(value, ann_ty.as_ref()),
                 };
                 if suppress_self.is_some() {
                     self.self_init_ok.pop();
@@ -5140,6 +5509,17 @@ impl<'a> Checker<'a> {
             return;
         }
         if !same_depth {
+            // 跨函数边界读取外部变量 = 捕获。被捕获的变量必须在捕获前已初始化
+            //（5.6(16)：未初始化即被捕获是编译错误；5.6(17) 同名捕获同理）。
+            // 仅对“延迟声明且确定从未赋值（state==0）”的 `var` 判定；可能已赋值
+            // （state==1）保守放行。`let` 的跨函数读取沿用既有保守放行策略，
+            // 避免误伤调用时序判定的合法写法（见 test_w19c_uninit_read_assigned_ok）。
+            if state == 0
+                && self.deferred_owner.contains_key(name)
+                && self.deferred_var.contains(name)
+            {
+                self.err(format!("捕获了未初始化的外部变量 '{}'（5.6(16)）", name));
+            }
             return;
         }
         let is_var = self.deferred_var.contains(name);
@@ -6806,6 +7186,19 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 解析枚举变体接收者 `Enum.Variant`（Field{Var(enum), variant}），返回枚举
+    /// 类型名（用于枚举成员方法调用的 lambda 形参位置检查，w26c a01_04）。
+    fn enum_variant_receiver(&self, e: &Expr) -> Option<String> {
+        if let Expr::Field { object, .. } = e {
+            if let Expr::Var(n) = &**object {
+                if self.enum_names.contains(n) {
+                    return Some(n.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// 在类成员表（含父类/接口继承）中查找成员信息。
     fn lookup_class_member(&self, ty: &str, member: &str) -> Option<MemberInfo> {
         let mut stack: Vec<&str> = vec![ty];
@@ -7652,6 +8045,37 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 5.5(7)：声明返回 Unit 的 lambda 内，`return 非Unit表达式` 非法。仅按表达式
+    /// 形态判定“确定非 Unit”的返回（算术、比较、字面量、非空聚合、is 等），避免
+    /// 依赖可能被占位为 Unknown 的形参类型而误伤 `return unitCall()` 之类。
+    fn check_unit_lambda_returns(&mut self, body: &Expr) {
+        let mut rets: Vec<&Expr> = Vec::new();
+        collect_unit_lambda_returns(body, &mut rets);
+        let mut reported = false;
+        for e in rets {
+            if definitely_non_unit_expr(e) && !reported {
+                reported = true;
+                self.err(
+                    "lambda 声明返回 Unit，但 return 了非 Unit 表达式（5.5(7)）".to_string(),
+                );
+            }
+        }
+    }
+
+    /// 检查带可选类型标注的初始化式。当标注为返回 Unit 的函数类型且初始化式为
+    /// lambda 时，登记 lambda 返回类型上下文（5.5(7)：声明返回 Unit 的 lambda 内
+    /// `return 非Unit值` 非法），随后交由 check_expr 处理（Lambda 分支消费该上下文）。
+    fn check_init_value(&mut self, value: &Expr, ann_ty: Option<&Ty>) -> Ty {
+        if let (Expr::Lambda { .. }, Some(Ty::Func { ret, .. })) = (value, ann_ty) {
+            if matches!(**ret, Ty::Unit) {
+                self.lambda_ret_ctx = Some(Ty::Unit);
+            }
+        }
+        let t = self.check_expr(value);
+        self.lambda_ret_ctx = None;
+        t
+    }
+
     fn check_expr(&mut self, expr: &Expr) -> Ty {
         match expr {
             Expr::Integer(_) => Ty::IntLit,
@@ -7871,6 +8295,14 @@ impl<'a> Checker<'a> {
                 self.check_builtin_conversion(name, args, &arg_tys);
                 // 10.1.2.1：自由函数重载集完整时，位置实参个数/类型无法匹配任一重载则报错。
                 self.check_free_func_arity(name, &arg_tys, args, named_args);
+                // w26c：显式类型实参计数 + lambda 形参位置（5.3.3(1)/10.1.3.3）。
+                self.check_free_func_type_args_arity(
+                    name,
+                    type_args.as_deref(),
+                    args.len(),
+                    !named_args.is_empty(),
+                );
+                self.check_lambda_arg_positions_free(name, args);
                 self.check_type_instantiation(name, type_args.as_deref());
                 // 6.2.2.1(3)：命名参数必须以 `名字:` 形式传入。
                 self.check_named_arg_positions(name, args);
@@ -7981,8 +8413,18 @@ impl<'a> Checker<'a> {
                             _ => None,
                         },
                     };
-                    if let Some(recv_ty) = recv {
+                    if let Some(recv_ty) = recv.clone() {
                         self.check_method_call_arity(&recv_ty, method, args.len());
+                    }
+                    // w26c：lambda 实参位置（5.3.3(1)）——尾随/普通 lambda 落到
+                    // 非函数形参则非法（a01_02..04 类/结构/枚举成员函数形态）。
+                    // 枚举变体接收者 `Enum.Variant.m()` 的 object 是 Field，元数
+                    // 检查的 recv 解析不含它，这里单独补充（仅用于 lambda 检查，
+                    // 不影响既有元数判定）。
+                    if let Some(recv_ty) =
+                        recv.or_else(|| self.enum_variant_receiver(object))
+                    {
+                        self.check_lambda_arg_positions_method(&recv_ty, method, args);
                     }
                 }
                 // 2.1.10.4(6)：结构体私有成员函数仅可在定义体内调用。
@@ -8928,13 +9370,23 @@ impl<'a> Checker<'a> {
                     );
                 }
                 self.scopes.push(scope);
-                // lambda 内的 return 属于 lambda 自身，不使用外层函数返回类型。
+                // lambda 内的 return 属于 lambda 自身。若外层提供了“声明返回类型”
+                // 上下文（`var f: (..) -> Unit = { λ }`，5.5(7)），用其作为 return
+                // 检查基准；否则不使用外层函数返回类型。
+                let ctx_ret = self.lambda_ret_ctx.take();
                 let saved_ret = self.ret_ty.take();
+                self.ret_ty = ctx_ret.clone();
                 self.defer_fn_depth += 1;
                 self.check_expr(body);
                 self.defer_fn_depth -= 1;
                 self.ret_ty = saved_ret;
                 self.scopes.pop();
+                // 5.5(7)：声明返回 Unit 的 lambda 内 `return 非Unit表达式` 非法。
+                // 形参类型被占位 Int64 遮蔽为 Unknown 时 check_return 无法判定，
+                // 故补充按表达式形态判定（算术/比较/字面量等确定非 Unit）。
+                if matches!(ctx_ret, Some(Ty::Unit)) {
+                    self.check_unit_lambda_returns(body);
+                }
                 Ty::Unknown
             }
 
@@ -13668,6 +14120,76 @@ mod tests {
         );
         assert_ok(
             "main() {\n    let a = [1, 2, 3, 4]\n    let s = a[1i64..3i64]\n}\n",
+        );
+    }
+
+    #[test]
+    fn test_w26c_function_conformance_checks() {
+        // 5.3.3(1)：尾随 lambda 落到非函数形参（全局函数）→ 拒绝。
+        assert_err(
+            "func myFunc(fn: (Int64) -> Int64, a: Int64) { fn(a) }\n\
+             main() { myFunc(44) { i => i / i } }\n",
+            "不是函数类型",
+        );
+        // 5.3.3(1)：类成员函数版本 → 拒绝。
+        assert_err(
+            "class C {\n\
+             \x20   func f(fn: (Int64) -> Int64, a: Int64) { fn(a) }\n\
+             }\n\
+             main() {\n\
+             \x20   let c = C()\n\
+             \x20   c.f(44) { i => i / i }\n\
+             }\n",
+            "不是函数类型",
+        );
+        // 合法尾随 lambda（末形参为函数类型）放行。
+        assert_ok(
+            "func apply(a: Int64, fn: (Int64) -> Int64) { fn(a) }\n\
+             main() { apply(3) { i => i + 1 } }\n",
+        );
+        // 5.3.2(2)：显式类型实参个数与位置实参无法同时匹配任一重载 → 拒绝。
+        assert_err(
+            "func m<T>(x: T, y: T): T where T <: Comparable<T> { x }\n\
+             func m<T, Z>(a: T, b: T, c: T): T where T <: Comparable<T> { a }\n\
+             main() {\n\
+             \x20   let v: Int64 = m<Int64, Int32>(-3, 4)\n\
+             }\n",
+            "类型实参",
+        );
+        // 5.1.4(9)：显式非 Unit 返回类型的空体函数 → 拒绝。
+        assert_err(
+            "func f(): String {}\nmain() { }\n",
+            "函数体为空",
+        );
+        // 5.5(7)：声明返回 Unit 的 lambda 内 return 非 Unit 表达式 → 拒绝。
+        assert_err(
+            "main() {\n\
+             \x20   var f: (Int64, Int64) -> Unit = { a: Int64, b: Int64 =>\n\
+             \x20       if (a > b) { return a - b }\n\
+             \x20       b - a\n\
+             \x20   }\n\
+             \x20   f(1, 2)\n\
+             }\n",
+            "lambda 声明返回 Unit",
+        );
+        // 5.6(16)：捕获未初始化的外部 var → 拒绝。
+        assert_err(
+            "main() {\n\
+             \x20   var x: Int64\n\
+             \x20   func f() { var v = x * 2; v }\n\
+             \x20   x = 3\n\
+             \x20   f()\n\
+             }\n",
+            "5.6(16)",
+        );
+        // 先初始化再捕获 → 放行。
+        assert_ok(
+            "main() {\n\
+             \x20   var x: Int64 = 1\n\
+             \x20   func f() { var v = x * 2; v }\n\
+             \x20   x = 3\n\
+             \x20   f()\n\
+             }\n",
         );
     }
 }
