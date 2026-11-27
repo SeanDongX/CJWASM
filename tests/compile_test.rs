@@ -141,7 +141,7 @@ fn test_compile_struct_and_field() {
 #[test]
 fn test_compile_enum_match() {
     let source = r#"
-        enum Color { Red, Green, Blue }
+        enum Color { Red | Green | Blue }
         func main() : Int64 {
             let c: Color = Color.Red
             match c {
@@ -159,7 +159,7 @@ fn test_compile_enum_match() {
 #[test]
 fn test_compile_enum_method() {
     let source = r#"
-        enum Color { Red, Green, Blue }
+        enum Color { Red | Green | Blue }
         func Color.disc(self: Color) : Int64 {
             match self {
                 Color.Red => 1,
@@ -254,7 +254,7 @@ func main() : Int64 {
 #[test]
 fn test_compile_enum_associated_value() {
     let source = r#"
-        enum MyResult { Success(Int64), Failure(Int64) }
+        enum MyResult { Success(Int64) | Failure(Int64) }
         func main() : Int64 {
             let r: MyResult = MyResult.Success(42)
             match r {
@@ -947,8 +947,8 @@ fn test_compile_enum_with_payload() {
     let source = r#"
         enum Action {
             Move(Int64)
-            Stop
-            Jump(Int64)
+            | Stop
+            | Jump(Int64)
         }
 
         func handle(a: Action) : Int64 {
@@ -997,7 +997,7 @@ fn test_compile_where_clause() {
 
         enum Holder<T> where T <: Comparable {
             Val(T)
-            Empty
+            | Empty
         }
 
         func main() : Int64 {
@@ -1092,8 +1092,8 @@ fn test_compile_match_all_patterns() {
     let source = r#"
         enum Color {
             Red
-            Green
-            Blue
+            | Green
+            | Blue
         }
 
         struct Point { x: Int64, y: Int64 }
@@ -1494,8 +1494,8 @@ fn test_compile_enum_methods_associated() {
     let source = r#"
         enum Shape {
             Circle(Int64)
-            Rect(Int64)
-            Unknown
+            | Rect(Int64)
+            | Unknown
         }
 
         func area(s: Shape) : Int64 {
@@ -1857,7 +1857,7 @@ fn test_compile_while_let_variant() {
     let source = r#"
         enum OptVal {
             Val(Int64)
-            Empty
+            | Empty
         }
 
         func main() : Int64 {
@@ -2005,8 +2005,8 @@ fn test_compile_match_enum_variant_payload() {
     let source = r#"
         enum Msg {
             Text(Int64)
-            Number(Int64)
-            Empty
+            | Number(Int64)
+            | Empty
         }
 
         func process(m: Msg) : Int64 {
@@ -2381,7 +2381,7 @@ fn test_compile_comprehensive_coverage() {
 
         enum Status {
             Active(Int64)
-            Inactive
+            | Inactive
         }
 
         func identity<T>(x: T): T { return x }
@@ -2602,7 +2602,7 @@ fn test_compile_match_enum_payload_guard() {
     let source = r#"
         enum Action {
             Move(Int64)
-            Stop
+            | Stop
         }
 
         func process(a: Action) : Int64 {
@@ -3385,7 +3385,7 @@ fn test_memory_enum_alloc() {
     let source = r#"
         enum Shape {
             Circle(Int64)
-            Rect(Int64)
+            | Rect(Int64)
         }
 
         func area(s: Shape) : Int64 {
@@ -3576,9 +3576,9 @@ fn test_memory_comprehensive() {
 
         enum Color {
             Red
-            Green
-            Blue
-            Custom(Int64)
+            | Green
+            | Blue
+            | Custom(Int64)
         }
 
         class Container {
@@ -3688,7 +3688,7 @@ fn test_parse_struct_generic() {
 #[test]
 fn test_parse_enum_basic() {
     let source = r#"
-        enum Direction { North, South, East, West }
+        enum Direction { North | South | East | West }
         func main() : Int64 {
             let d: Direction = Direction.North
             match d {
@@ -3707,7 +3707,7 @@ fn test_parse_enum_basic() {
 #[test]
 fn test_parse_enum_with_value() {
     let source = r#"
-        enum Result { Ok(Int64), Err(Int64) }
+        enum Result { Ok(Int64) | Err(Int64) }
         func main() : Int64 {
             let r: Result = Result.Ok(100)
             match r {
@@ -3724,7 +3724,7 @@ fn test_parse_enum_with_value() {
 #[test]
 fn test_parse_enum_with_methods() {
     let source = r#"
-        enum Status { Idle, Running(Int64) }
+        enum Status { Idle | Running(Int64) }
         func Status.value(self: Status) : Int64 {
             match self {
                 Status.Running(v) => v,
@@ -4168,7 +4168,7 @@ fn test_parse_nested_loops() {
 #[test]
 fn test_parse_match_enum() {
     let source = r#"
-        enum Tag { A, B, C }
+        enum Tag { A | B | C }
         func main() : Int64 {
             let t: Tag = Tag.B
             match t {
@@ -4826,7 +4826,7 @@ fn test_codegen_mutual_recursion() {
 #[test]
 fn test_codegen_complex_match() {
     let source = r#"
-        enum E { A(Int64), B(Int64), C }
+        enum E { A(Int64) | B(Int64) | C }
         func main() : Int64 {
             let e1: E = E.A(1)
             let e2: E = E.B(2)
@@ -4881,7 +4881,7 @@ fn test_codegen_generic_function() {
 #[test]
 fn test_codegen_enum_match() {
     let source = r#"
-        enum Opt { Some(Int64), None }
+        enum Opt { Some(Int64) | None }
         func main() : Int64 {
             let o: Opt = Opt.Some(99)
             match o {
@@ -5255,8 +5255,8 @@ fn test_enum_with_tuple_payload() {
     let source = r#"
         enum Shape {
             Circle(Int64)
-            Rectangle(Int64, Int64)
-            Point
+            | Rectangle(Int64, Int64)
+            | Point
         }
         func main() : Int64 { let s = Shape.Circle(5); return 0 }
     "#;
@@ -5269,7 +5269,7 @@ fn test_enum_subtype() {
     let source = r#"
         enum Status <: ToString {
             Active
-            Inactive
+            | Inactive
         }
         func main() : Int64 { return 0 }
     "#;
@@ -5861,7 +5861,7 @@ fn test_multiple_structs_and_enums() {
         struct Pixel { color: RGB, x: Int64, y: Int64 }
         enum Shape {
             Circle(Int64)
-            Rect(Int64, Int64)
+            | Rect(Int64, Int64)
         }
         func main() : Int64 {
             let red = RGB { r: 255, g: 0, b: 0 }
@@ -5934,8 +5934,8 @@ fn test_enum_with_method() {
     let source = r#"
         enum Color {
             Red
-            Green
-            Blue
+            | Green
+            | Blue
             func value(self: Color) : Int64 { return 0 }
         }
         func main() : Int64 { return 0 }
@@ -6251,7 +6251,7 @@ fn test_cg2_match_range() {
 #[test]
 fn test_cg2_match_enum_variant() {
     let source = r#"
-        enum E { A, B, C }
+        enum E { A | B | C }
         func main() : Int64 {
             let e: E = E.B
             match e {
@@ -6269,7 +6269,7 @@ fn test_cg2_match_enum_variant() {
 #[test]
 fn test_cg2_match_enum_payload() {
     let source = r#"
-        enum Result { Ok(Int64), Err(Int64) }
+        enum Result { Ok(Int64) | Err(Int64) }
         func main() : Int64 {
             let r = Result.Ok(42)
             match r {
@@ -6728,8 +6728,8 @@ fn test_cg2_enum_with_methods() {
     let source = r#"
         enum State {
             Idle
-            Running(Int64)
-            Done
+            | Running(Int64)
+            | Done
         }
         func main() : Int64 {
             let s = State.Running(5)
@@ -7348,7 +7348,7 @@ fn test_cg3_array_large() {
 #[test]
 fn test_cg3_match_complex_enum() {
     let source = r#"
-        enum Result { Ok(Int64), Err(Int64) }
+        enum Result { Ok(Int64) | Err(Int64) }
         func getValue(r: Result) : Int64 {
             return match r {
                 Result.Ok(v) => v,
@@ -7659,7 +7659,7 @@ fn test_cg3_match_multiple_arms() {
 #[test]
 fn test_cg3_match_nested_enum() {
     let source = r#"
-        enum MyOption { Some(Int64), None }
+        enum MyOption { Some(Int64) | None }
         func unwrap(opt: MyOption) : Int64 {
             return match opt {
                 MyOption.Some(v) => v,
@@ -7729,13 +7729,13 @@ fn test_cg3_enum_many_variants() {
     let source = r#"
         enum Token {
             Number(Int64)
-            Plus
-            Minus
-            Star
-            Slash
-            LParen
-            RParen
-            End
+            | Plus
+            | Minus
+            | Star
+            | Slash
+            | LParen
+            | RParen
+            | End
         }
         func main() : Int64 { let t = Token.Number(42); return 0 }
     "#;
@@ -8045,7 +8045,7 @@ fn test_cg3_struct_in_class() {
 #[test]
 fn test_cg3_enum_as_func_param() {
     let source = r#"
-        enum Direction { North, South, East, West }
+        enum Direction { North | South | East | West }
         func isNorth(d: Direction) : Bool {
             return match d {
                 Direction.North => true,
@@ -8433,7 +8433,7 @@ fn test_cg4_tuple_create_access() {
 #[test]
 fn test_cg4_enum_match_extract() {
     let source = r#"
-        enum Result { Ok(Int64), Err }
+        enum Result { Ok(Int64) | Err }
         func main() : Int64 {
             let r: Result = Result.Ok(42)
             match r {
@@ -8449,7 +8449,7 @@ fn test_cg4_enum_match_extract() {
 #[test]
 fn test_cg4_enum_as_param() {
     let source = r#"
-        enum Dir { North, South }
+        enum Dir { North | South }
         func go(d: Dir) : Int64 {
             match d {
                 Dir.North => 1,
@@ -8465,7 +8465,7 @@ fn test_cg4_enum_as_param() {
 #[test]
 fn test_cg4_enum_return() {
     let source = r#"
-        enum E { A, B }
+        enum E { A | B }
         func make() : E { E.A }
         func main() : Int64 {
             let e = make()
@@ -9215,7 +9215,7 @@ fn test_cg5_nested_lambda() {
 #[test]
 fn test_cg5_enum_match_all_variants() {
     let source = r#"
-        enum E { A, B(Int64), C }
+        enum E { A | B(Int64) | C }
         func main() : Int64 {
             let e1: E = E.A
             let e2: E = E.B(42)
@@ -9498,7 +9498,7 @@ fn test_cg6_interface_impl_dispatch() {
 #[test]
 fn test_cg6_complex_pattern_match_enum() {
     let source = r#"
-        enum E { A, B(Int64), C(String) }
+        enum E { A | B(Int64) | C(String) }
         func main() : Int64 {
             let e: E = E.B(42)
             match e {
@@ -9582,7 +9582,7 @@ fn test_cg6_struct_with_many_methods() {
 #[test]
 fn test_cg6_enum_match_payload_extract() {
     let source = r#"
-        enum Opt { None, Some(Int64) }
+        enum Opt { None | Some(Int64) }
         func main() : Int64 {
             let o: Opt = Opt.Some(100)
             match o {
@@ -10452,7 +10452,7 @@ fn test_cg8_class_deep_inheritance_3() {
 #[test]
 fn test_cg8_enum_with_3_payload_variants() {
     let source = r#"
-        enum E { A(Int64), B(Int64), C(Int64) }
+        enum E { A(Int64) | B(Int64) | C(Int64) }
         func main() : Int64 {
             let a = E.A(1)
             let b = E.B(2)
@@ -10472,7 +10472,7 @@ fn test_cg8_enum_with_3_payload_variants() {
 #[test]
 fn test_cg8_match_on_enum_3_arms() {
     let source = r#"
-        enum Op { Add(Int64), Sub(Int64), Mul(Int64) }
+        enum Op { Add(Int64) | Sub(Int64) | Mul(Int64) }
         func eval(o: Op) : Int64 {
             return match o {
                 Op.Add(n) => n,
@@ -10581,7 +10581,7 @@ fn test_cg8_interface_full() {
 fn test_cg8_complex_program() {
     let source = r#"
         struct Point { x: Int64, y: Int64 }
-        enum Dir { Up, Down, Left, Right }
+        enum Dir { Up | Down | Left | Right }
         class Game {
             var pos: Point;
             var dir: Dir;

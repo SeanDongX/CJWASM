@@ -633,7 +633,7 @@ extend<T> Array<T> <: SortByExtension<T> {
             class Box { var size: Int64; init(s: Int64) { this.size = s } }
         "#;
         let source2 = r#"
-            enum Color { Red Green Blue }
+            enum Color { Red | Green | Blue }
             interface Drawable { func draw(): Int64; }
         "#;
         let prog1 = parse_source(source1).unwrap();
@@ -832,10 +832,7 @@ extend<T> Array<T> <: SortByExtension<T> {
             struct Point { var x: Int64 = 0, var y: Int64 = 0 }
             
             enum Direction {
-                North
-                South
-                East
-                West
+                North | South | East | West
             }
             
             func add(a: Int64, b: Int64): Int64 { return a + b }

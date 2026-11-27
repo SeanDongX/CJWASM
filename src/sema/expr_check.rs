@@ -3584,6 +3584,18 @@ fn collect_inferred_returns(
     funcs: &mut HashMap<String, Ty>,
     ambiguous: &mut HashSet<String>,
 ) {
+    // 用户类型名（class/struct/enum）：用于把 `return S()` 的推断返回类型
+    // 记为 `User("S")`，使 `makeS().method()` 的接收者类型可解析（方法元数检查）。
+    let mut user_types: HashSet<&str> = HashSet::new();
+    for c in &program.classes {
+        user_types.insert(c.name.as_str());
+    }
+    for s in &program.structs {
+        user_types.insert(s.name.as_str());
+    }
+    for e in &program.enums {
+        user_types.insert(e.name.as_str());
+    }
     let mut infer = |name: &str, f: &Function| {
         if f.return_type.is_some() || f.extern_import.is_some() || f.body.is_empty() {
             return;
@@ -3600,7 +3612,14 @@ fn collect_inferred_returns(
             None
         };
         if let Some(e) = expr_opt {
-            let t = static_expr_ty(e);
+            let mut t = static_expr_ty(e);
+            if matches!(t, Ty::Unknown) {
+                if let Expr::ConstructorCall { name: cn, .. } = e {
+                    if user_types.contains(cn.as_str()) {
+                        t = Ty::User(cn.clone());
+                    }
+                }
+            }
             if t.is_definite() {
                 let t = default_literal(&t);
                 match funcs.get(name) {
@@ -5911,9 +5930,17 @@ impl<'a> Checker<'a> {
         let interp = self.interp_depth > 0;
         let same_depth = self.deferred_owner.get(name).copied() == Some(self.defer_fn_depth);
         if interp {
-            // 插值内读取“从未赋值”的变量一律报错（1.3.6(4)）；可能已赋值保持放行。
+            // 插值内读取“从未赋值”的变量一律报错（1.3.6(4)）；可能已赋值在非严格
+            // （含 import）程序上保持放行。严格单文件程序上，条件分支内可能赋值
+            // 的变量在插值中读取同样可能未初始化，按 3.2.3.2(4) 收紧
+            // （官方 03/02/03/02 a02_04：`var a: String; if(true){a="x"}; "${a}"`）。
             if state == 0 {
                 self.err(format!("变量 '{}' 在初值赋值前被读取（未初始化）", name));
+            } else if state == 1 && self.strict_scope {
+                self.err(format!(
+                    "变量 '{}' 可能未初始化即被读取（3.2.3.2(4)）",
+                    name
+                ));
             }
             return;
         }
@@ -5971,7 +5998,14 @@ impl<'a> Checker<'a> {
         match e {
             Expr::Integer(_) => Ty::IntLit,
             Expr::IntegerSuffixed(_, s) => suffix_ty(*s),
-            Expr::Float(_) | Expr::Float32(_) | Expr::FloatSuffixed(..) => Ty::FloatLit,
+            Expr::Float(_) | Expr::Float32(_) => Ty::FloatLit,
+            // 带后缀浮点字面量保留其精确类型，供 if 分支最小公共超类型判定
+            // 区分 Float16/Float32/Float64（4.3(15)，a15_04）。
+            Expr::FloatSuffixed(_, s) => match s {
+                crate::ast::FloatSuffix::F16 => Ty::Float16,
+                crate::ast::FloatSuffix::F32 => Ty::Float32,
+                crate::ast::FloatSuffix::F64 => Ty::Float64,
+            },
             Expr::Bool(_) => Ty::Bool,
             Expr::Rune(_) => Ty::Rune,
             Expr::String(_) | Expr::Interpolate(_) => Ty::String,
@@ -6189,7 +6223,15 @@ impl<'a> Checker<'a> {
     }
 
     /// 16.1(2)/16.2：检查 const 变量的初始化式是否为一个常量表达式。
-    fn check_const_initializer(&mut self, _ty: Option<&Type>, value: &Expr, name: &str) {
+    fn check_const_initializer(&mut self, ty: Option<&Type>, value: &Expr, name: &str) {
+        // 16.2(4)：数组字面量（类型为 Array）不是常量表达式。VArray 字面量的
+        // 标注类型为 VArray，不受此限制。
+        if matches!(ty, Some(Type::Array(_))) && matches!(value, Expr::Array(_)) {
+            self.err(format!(
+                "const 变量 '{}' 不能用 Array 数组字面量初始化（16.2(4)）",
+                name
+            ));
+        }
         if !self.is_const_expr(value) {
             self.err(format!(
                 "const 变量 '{}' 的初始化式不是常量表达式（16.1(2)/16.2）",
@@ -7160,6 +7202,48 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 4.4(21)：无选择子的 match 也必须穷尽（至少一个 case 恒成立）。
+    ///
+    /// 保守策略：仅在单文件（strict_scope）下判定；出现 wildcard / 变量绑定
+    /// （无守卫）即视为穷尽；或 case 同时覆盖布尔字面量 true 与 false 亦视为穷尽。
+    /// 其余形态（如 `case r > 0` / `case r < 0`）无法证明穷尽，报告错误。
+    fn check_selectorless_match_exhaustive(&mut self, selector: &Expr, arms: &[MatchArm]) {
+        if !self.strict_scope {
+            return;
+        }
+        if !matches!(selector, Expr::Block(stmts, None) if stmts.is_empty()) {
+            return;
+        }
+        let mut seen_true = false;
+        let mut seen_false = false;
+        for arm in arms {
+            if arm.guard.is_some() {
+                continue;
+            }
+            match &arm.pattern {
+                Pattern::Wildcard | Pattern::Binding(_) => return,
+                Pattern::Literal(Literal::Bool(true)) => seen_true = true,
+                Pattern::Literal(Literal::Bool(false)) => seen_false = true,
+                Pattern::Or(ps) => {
+                    for p in ps {
+                        match p {
+                            Pattern::Literal(Literal::Bool(true)) => seen_true = true,
+                            Pattern::Literal(Literal::Bool(false)) => seen_false = true,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !(seen_true && seen_false) {
+            self.err(
+                "无选择子的 match 表达式必须穷尽（至少一个 case 恒成立，如 `case _`）（4.4(21)）"
+                    .to_string(),
+            );
+        }
+    }
+
     /// 4.4(14)/4.4.1.6(7)：带选择子的 match 对枚举必须穷尽。
     ///
     /// 保守策略：仅在单文件（strict_scope）下判定；从**被引用的变体名**反推
@@ -7667,10 +7751,22 @@ impl<'a> Checker<'a> {
                 continue;
             };
             let arg_resolved = self.resolve_alias_type(arg);
-            let Some(arg_head) = type_head_name(&arg_resolved) else {
-                continue;
-            };
             for b in &c.bounds {
+                // 13.1.3.4(2)/13.1.4(1)：`<: CType` 约束——内建 CType 不在用户继承图
+                // 中，直接按 C 类型兼容规则判定实参是否为 CType（如 VArray<T,$N>
+                // 当且仅当元素 T 为 CType 时自身为 CType）。
+                if b == "CType" {
+                    if let Some(false) = self.ctype_status(&arg_resolved) {
+                        self.err(format!(
+                            "类型 '{:?}' 不满足泛型 '{}' 的类型参数 '{}' 的约束 '<: CType'（13.1.3.4(2)）",
+                            arg_resolved, name, c.param
+                        ));
+                    }
+                    continue;
+                }
+                let Some(arg_head) = type_head_name(&arg_resolved) else {
+                    continue;
+                };
                 let bound_ty = match subst.get(b) {
                     Some(t) => t.clone(),
                     None => Type::Struct(b.clone(), Vec::new()),
@@ -7697,6 +7793,54 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// 判断一个已解析类型是否为 CType（13.1.4(1)/13.1.3.4(2)）。
+    /// `Some(true)` 表示确定为 CType，`Some(false)` 表示确定为非 CType，
+    /// `None` 表示无法判定（保守放行）。
+    fn ctype_status(&self, t: &Type) -> Option<bool> {
+        match t {
+            Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::IntNative
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::UIntNative
+            | Type::Float16
+            | Type::Float32
+            | Type::Float64
+            | Type::Bool
+            | Type::Unit => Some(true),
+            Type::Rune
+            | Type::String
+            | Type::Array(_)
+            | Type::Tuple(_)
+            | Type::Range
+            | Type::Slice(_)
+            | Type::Map(_, _)
+            | Type::Option(_)
+            | Type::Result(_, _)
+            | Type::Function { .. } => Some(false),
+            // VArray<T, $N> 是 CType 当且仅当其元素类型 T 是 CType（13.1.3.4(2)）。
+            Type::VArray(elem, _) => self.ctype_status(elem),
+            Type::Struct(n, _) => {
+                if n == "CPointer" || n == "CString" || n == "CFunc" || n == "CType" {
+                    Some(true)
+                } else if self.c_structs.contains(n) {
+                    Some(true)
+                } else if self.type_kinds.contains_key(n) {
+                    // 本文件可见的非 @C 用户类型（class/struct/enum/interface）不是 CType。
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -8840,7 +8984,12 @@ impl<'a> Checker<'a> {
                 // 一定不是整数/数值，因此可安全判定 4.28(19)/(20)、4.23(27) 中
                 // `(a < b) << c`、`x >>= ()` 这类非法形态；比较/相等运算自身的
                 // 操作数仍用更严的 simple_operand 过滤（解析器跨行合并时不可靠）。
-                let gate_ok = if matches!(
+                let gate_ok = if matches!(op, BinOp::Pipeline) {
+                    // 管道 `e1 |> e2`：右操作数形态不限（lambda/函数名/调用等），
+                    // 但 `e2` 的结果若可静态确定为非函数标量类型（如
+                    // `e2 = f || true` 恒为 Bool），则该管道必然非法。
+                    true
+                } else if matches!(
                     op,
                     BinOp::Add
                         | BinOp::Sub
@@ -9245,6 +9394,33 @@ impl<'a> Checker<'a> {
                     // 表达式的类型 Unit（4.23(20)）。此前返回 Unknown 使
                     // `a = (b = 0)`（Unit 赋给 Int64）逃逸可赋值性检查。
                     None if stmts.len() == 1 && matches!(stmts[0], Stmt::Assign { .. }) => Ty::Unit,
+                    // 13.1.1(2)：`unsafe { ... }` 作为表达式时其类型即块的值类型（尾
+                    // 表达式类型）。parser 将其包成 `Block([UnsafeBlock{body}], None)`。
+                    // 取 body 尾表达式的静态类型，使 `var v: Int32 = unsafe { "abcd" }`
+                    // 这类标注类型不匹配能够被捕获（13.1.1(2)）。
+                    None if stmts.len() == 1 => match &stmts[0] {
+                        Stmt::UnsafeBlock { body } => match body.last() {
+                            Some(Stmt::Expr(inner)) => match inner {
+                                // 尾表达式为体内局部变量：取该绑定的声明类型
+                                // （`unsafe { var V: Int64 = ...; V }`）。
+                                Expr::Var(n) => body
+                                    .iter()
+                                    .find_map(|s| match s {
+                                        Stmt::Var { pattern: Pattern::Binding(bn), ty: Some(t), .. }
+                                        | Stmt::Let { pattern: Pattern::Binding(bn), ty: Some(t), .. }
+                                            if bn == n =>
+                                        {
+                                            Some(self.ty_of_ann(t))
+                                        }
+                                        _ => None,
+                                    })
+                                    .unwrap_or_else(|| static_expr_ty(inner)),
+                                _ => static_expr_ty(inner),
+                            },
+                            _ => Ty::Unknown,
+                        },
+                        _ => Ty::Unknown,
+                    },
                     None => Ty::Unknown,
                 };
                 self.restore_interp_local_funcs(saved_local_funcs, interp_mark);
@@ -9526,6 +9702,13 @@ impl<'a> Checker<'a> {
                     Expr::Binary { .. }
                         | Expr::Unary { .. }
                         | Expr::NullCoalesce { .. }
+                        | Expr::Block(..)
+                        | Expr::Array(_)
+                        | Expr::Tuple(_)
+                        | Expr::Integer(_)
+                        | Expr::IntegerSuffixed(..)
+                        | Expr::Bool(_)
+                        | Expr::String(_)
                 ) && callee_ty.is_definite()
                     && !matches!(callee_ty, Ty::User(_) | Ty::Func { .. })
                 {
@@ -10013,6 +10196,8 @@ impl<'a> Checker<'a> {
                 }
                 // 4.4(17)：带选择子时不能使用布尔表达式模式。
                 self.check_match_bool_case_with_selector(expr, arms);
+                // 4.4(21)：无选择子的 match 必须穷尽。
+                self.check_selectorless_match_exhaustive(expr, arms);
                 // 4.4(14)/4.4.1.6(7)：枚举 match 穷尽性。
                 self.check_enum_match_exhaustive(arms);
                 result
@@ -10029,6 +10214,17 @@ impl<'a> Checker<'a> {
                             name
                         ));
                     }
+                }
+                // 类型别名在 AST 中已展开为目标类型；含未实例化类型形参的
+                // **函数类型**别名（如 `type A<T> = (T, T) -> T` 的 `A`）不是
+                // 具体类型。裸类型形参 `e as T`（泛型函数内合法）不在此列。
+                if matches!(target_ty, Type::Function { .. })
+                    && type_mentions_type_param(target_ty)
+                {
+                    self.err(
+                        "'as' 的类型必须是具体类型，不能包含未实例化的类型参数（4.17.2(1)）"
+                            .to_string(),
+                    );
                 }
                 ty_of(target_ty)
             }
@@ -11084,6 +11280,33 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                // 右侧为**单一的**顶层自由函数名（非重载、无类型形参、无变长）时，
+                // 该函数名作值即 `(P) -> R` 函数类型；用其唯一位置形参类型检查
+                // `e1 |> f` 的实参类型（a02_08 / a37_05）。
+                if let Expr::Var(n) = right {
+                    if self.lookup(n).is_none() {
+                        if let Some(sigs) = self.free_func_sigs.get(n) {
+                            if sigs.len() == 1 {
+                                let s = &sigs[0];
+                                if s.type_params == 0 && !s.variadic
+                                    && s.positional_types.len() == 1
+                                {
+                                    let pt = &s.positional_types[0];
+                                    if lt.is_definite() && pt.is_definite()
+                                        && !compatible(&lt, pt)
+                                    {
+                                        self.err(format!(
+                                            "管道运算符 '|>' 左侧类型 {} 与函数 '{}' 的形参类型 {} 不匹配",
+                                            lt.name(),
+                                            n,
+                                            pt.name()
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 Ty::Unknown
             }
         }
@@ -11096,13 +11319,46 @@ impl<'a> Checker<'a> {
     /// 无符号后缀的字面量在词法阶段被按位折叠为 i64，这里通过 `as u64`
     /// 还原其真实数值。
     fn check_const_arith_overflow(&mut self, op: &BinOp, left: &Expr, right: &Expr) {
+        if matches!(op, BinOp::Pow) {
+            // 4.15(62)/(65)：整数幂的编译期溢出（`-2 ** 65`）。
+            let Some((lv, lt)) = self.const_int_operand(left) else {
+                return;
+            };
+            let Some((rv, rt)) = self.const_int_operand(right) else {
+                return;
+            };
+            if !lt.is_int() || !rt.is_int() || rv < 0 {
+                return;
+            }
+            let base_ty = if matches!(lt, Ty::IntLit) { Ty::Int64 } else { lt };
+            let Some((lo, hi)) = int_ty_range(&base_ty) else {
+                return;
+            };
+            let over = if rv > 1000 {
+                lv.abs() > 1
+            } else {
+                match lv.checked_pow(rv as u32) {
+                    Some(r) => r < lo || r > hi,
+                    None => true,
+                }
+            };
+            if over {
+                self.err(format!(
+                    "常量算术表达式溢出：{} ** {} 的结果超出类型 {} 的取值范围（4.15(62)/(65)）",
+                    lv,
+                    rv,
+                    base_ty.name()
+                ));
+            }
+            return;
+        }
         if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
             return;
         }
-        let Some((lv, lt)) = const_int_value(left) else {
+        let Some((lv, lt)) = self.const_int_operand(left) else {
             return;
         };
-        let Some((rv, rt)) = const_int_value(right) else {
+        let Some((rv, rt)) = self.const_int_operand(right) else {
             return;
         };
         if lt != rt {
@@ -11141,6 +11397,41 @@ impl<'a> Checker<'a> {
                 rv,
                 lt.name()
             ));
+        }
+    }
+
+    /// 编译期可确定的整型操作数 → (真实数值, 类型)。
+    ///
+    /// 在字面量后缀形态（`const_int_value`）之外，额外识别：
+    /// - 无后缀整数字面量及其一元负号（默认 Int64，2.3.1）；
+    /// - 不可变 `let` 绑定的编译期整数值（`let a: Int32 = 2147483647` 后的 `b + a`）。
+    /// 可变变量不参与，避免赋值导致的值失效。
+    fn const_int_operand(&self, e: &Expr) -> Option<(i128, Ty)> {
+        if let Some(v) = const_int_value(e) {
+            return Some(v);
+        }
+        match e {
+            Expr::Integer(v) if *v >= 0 => Some((*v as i128, Ty::Int64)),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                expr,
+            } => match &**expr {
+                Expr::Integer(v) if *v >= 0 => Some((-(*v as i128), Ty::Int64)),
+                _ => None,
+            },
+            Expr::Var(n) => {
+                let info = self.lookup(n)?;
+                if info.mutable {
+                    return None;
+                }
+                let v = info.const_int?;
+                if int_ty_range(&info.ty).is_some() {
+                    Some((v as i128, info.ty.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -14025,7 +14316,7 @@ mod tests {
         );
         assert_ok("enum E { A | B\n func foo() {} }\nmain() {}");
         // 同名构造器按参数个数重载是合法的（2.1.11.1(10)）。
-        assert_ok("enum E { A\n A(Int8) }\nmain() {}");
+        assert_ok("enum E { A | A(Int8) }\nmain() {}");
     }
 
 
@@ -14294,9 +14585,17 @@ mod tests {
             "main() { let s = \"${var y: Int64; y + 1}\"; return }",
             "未初始化",
         );
-        // 赋值后读取合法；条件分支内赋值后读取（state 1）仍保守放行（插值路径）。
+        // 赋值后读取合法。
         assert_ok("main() { var x: String; x = \"a\"; let s = \"${x}\"; return }");
-        assert_ok("main() { let x: Int64; if (true) { x = 1 }; let s = \"${x}\"; return }");
+        // 条件分支内赋值后读取（state 1）：严格单文件程序按 3.2.3.2(4) 拒绝
+        // （官方 03/02/03/02 a02_04）；带 import 的 std 程序仍走项目方言放行。
+        assert_err(
+            "main() { let x: Int64; if (true) { x = 1 }; let s = \"${x}\"; return }",
+            "可能未初始化",
+        );
+        assert_ok(
+            "import std.core.*\nmain() { let x: Int64; if (true) { x = 1 }; let s = \"${x}\"; return }",
+        );
         // 插值外读取无初始化 var：w27c 起在严格程序上同样按未初始化拒绝（3.2.3.2(4)；
         // 官方 03/02/03/02 a04_12/a04_20/a04_22）。std（带 import）仍走项目方言放行。
         assert_err("main() { var x: Int64; let y = x + 1; return }", "未初始化");
@@ -15111,5 +15410,70 @@ mod tests {
         );
         // 无选择子的 match 允许布尔表达式模式。
         assert_ok("var r = 1\nmain() { match { case r > 0 => 0; case _ => 1 } }\n");
+    }
+
+    #[test]
+    fn test_w30a_clusters() {
+        // 4.17.2(1)：`as` 目标为含未实例化类型形参的函数类型别名 → 非法。
+        assert_err("type A<T> = (T, T) -> T\nmain() { 1 as A\n 0 }", "具体类型");
+        // 裸类型形参的 `as T`（泛型函数内）仍合法。
+        assert_ok("func f<T>(x: T) { let y = x as T\n y }");
+
+        // 4.3(15)：if 两分支 Float16 / Float32 无最小公共超类型。
+        assert_err(
+            "var x = 0\nmain() { var v = if (x == 0) { 3.14_f16 } else { 3.14_f32 } }",
+            "公共超类型",
+        );
+        // 同类型浮点后缀分支合法。
+        assert_ok("var x = 0\nmain() { var v = if (x == 0) { 3.14_f32 } else { 3.14_f32 } }");
+
+        // 4.22.1(2)：管道右操作数的结果须为函数类型（`f || true` 恒为 Bool）。
+        assert_err("func f(x: Int64) { true }\nmain() { let e = 1 |> f || true }", "管道");
+        // 管道左侧类型与右函数形参类型不匹配。
+        assert_err(
+            "func f(x: Unit) { true }\nmain() { var v: Int64 = 0\n let e = (v = 1 |> f) }",
+            "形参类型",
+        );
+        assert_err(
+            "func add3(x: Int64) { return x + 3 }\nmain() { var y: Int64 = 0\n (y = 2) |> add3\n return }",
+            "形参类型",
+        );
+        // 匹配形参类型的管道合法。
+        assert_ok("func f(x: Int64): Int64 { x }\nmain() { let e = 1 |> f }");
+
+        // 4.13(4)：块表达式（括号化赋值，Unit）与数组字面量的结果不可调用。
+        assert_err(
+            "func f(x: String) { return 5.0 }\nfunc g(x: Int64) { return \"hi\" }\nmain() { var bar = g ~> f\n (bar = g) ~> f\n return }",
+            "不可调用",
+        );
+        assert_err("func f(_: Bool) { true }\nmain() { for (_ in [0] (false |> f)) {} }", "不可调用");
+
+        // 4.4(21)：无选择子的 match 未穷尽（无 case _）。
+        assert_err(
+            "var r = 1\nmain() { match { case r > 0 => 0\n case r < 0 => 1 }\n return }",
+            "穷尽",
+        );
+        assert_ok("var r = 1\nmain() { match { case r > 0 => 0\n case _ => 1 } }");
+
+        // 4.15(62)/(65)：常量幂与不可变 let 常量算术的编译期溢出。
+        assert_err("main() { -2 ** 65 }", "溢出");
+        assert_err(
+            "main() { let a: Int32 = 2147483647\n let b: Int32 = 1\n let c: Int32 = b + a }",
+            "溢出",
+        );
+        assert_ok("main() { let a: Int32 = 1\n let b: Int32 = 2\n let c: Int32 = b + a }");
+
+        // 4.21：`??` 链与 `as T` 作左操作数均为合法形态（避免与官方矛盾正例冲突）。
+        assert_ok(
+            "main() { let s1 = Option<String>.Some(\"hi\")\n let s2 = Option<String>.Some(\"hello\")\n let z = s1 ?? s2\n z }",
+        );
+        // `as T` 结果为 Option<T>，作 `??` 左操作数合法。
+        assert_ok("main() { let x: Any = 1\n let y = (x as Int8) ?? 0\n y }");
+
+        // 10.1.2.1：`makeS().apply(...)` 缺参（推断返类型 User 后元数检查生效）。
+        assert_err(
+            "struct S { func apply(x: Int64, fn: (Int64) -> Int64) { return fn(x) } }\nfunc makeS() { return S() }\nmain() { let x = makeS().apply(42) }",
+            "位置实参个数",
+        );
     }
 }

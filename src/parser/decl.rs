@@ -2512,9 +2512,18 @@ impl Parser {
                 continue;
             }
 
-            // cjc 兼容: 跳过可选的 | 前缀
+            // 2.1.11.1(1)：caseBody 之间必须用 `|` 分隔（首个变体的 `|` 可省略）。
+            // 无 `|` 直接开始下一个变体（a01_13）为语法错误。
+            let mut saw_pipe = false;
             if self.check(&Token::Pipe) {
                 self.advance();
+                saw_pipe = true;
+            }
+            if !variants.is_empty() && !saw_pipe {
+                return self.bail(ParseError::UnexpectedToken(
+                    self.peek().cloned().unwrap_or(Token::Pipe),
+                    "枚举变体之间必须用 '|' 分隔（2.1.11.1(1)）".to_string(),
+                ));
             }
             // cjc: `| ...` 是枚举的 "catch-all" 占位符，跳过即可
             if self.check(&Token::DotDotDot) {
@@ -2565,11 +2574,15 @@ impl Parser {
                 name: v_name,
                 payload,
             });
-            while self.check(&Token::Comma) || self.check(&Token::Semicolon) {
-                self.advance();
+            // 2.1.11.1(1)：caseBody 之间只能用 `|` 分隔；`,` 不是合法分隔符（a01_22）。
+            if self.check(&Token::Comma) {
+                return self.bail(ParseError::UnexpectedToken(
+                    Token::Comma,
+                    "枚举变体之间不能使用 ',' 分隔（2.1.11.1(1)）".to_string(),
+                ));
             }
             // cjc 兼容: 枚举变体也可用 ';' 分隔（如 enum E { A ; | B ; | C }）
-            if self.check(&Token::Semicolon) {
+            while self.check(&Token::Semicolon) {
                 self.advance();
             }
         }
@@ -6495,10 +6508,9 @@ main() {}
 
     #[test]
     fn test_w24b_enum_variant_comma_newline_dialect_ok() {
-        // 本方言（见 00 档案 S 类"枚举体逗号"）兼容以 `,` / `;` / 换行分隔枚举变体，
-        // 与官方 `|` 语法并行支持。此处固化该方言行为（回归保护）。
-        ok("enum E {\n    A\n    B\n}\nmain() {}");
-        ok("enum E {\n    A, B\n}\nmain() {}");
+        // 2.1.11.1(1)：caseBody 之间必须用 `|` 分隔（Conformance a01_13/a01_22）。
+        err("enum E {\n    A\n    B\n}\nmain() {}");
+        err("enum E {\n    A, B\n}\nmain() {}");
         ok("enum E {\n    | A\n    | B\n}\nmain() {}");
         ok("enum E {\n    A | B\n}\nmain() {}");
         ok("enum E {\n    A\n}\nmain() {}");

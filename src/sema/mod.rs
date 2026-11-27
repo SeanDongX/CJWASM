@@ -30022,14 +30022,47 @@ fn w28_const_int(e: &Expr) -> Option<i64> {
     }
 }
 
+/// 数组类型未实现、因而非法的二元运算符（算术 / 位运算 / 移位）。
+fn w30b_is_array_binop(op: &BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Pow
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+    )
+}
+
 fn w28_check_single(
     e: &Expr,
     env: &HashMap<String, (W28Ty, Option<usize>)>,
     retmap: &HashMap<String, W28Ty>,
     dups: &HashSet<String>,
     has_index_op: bool,
+    has_op_overload: bool,
     errors: &mut Vec<SemanticError>,
 ) {
+    // 数组作为算术 / 位运算 / 移位运算符的操作数：数组类型没有实现这些运算符
+    // （2.2.1）。存在任意运算符重载时不判定（可能由用户扩展接受数组实参）。
+    if let Expr::Binary { op, left, right } = e {
+        if !has_op_overload && w30b_is_array_binop(op) {
+            let lt = w28_infer_expr(left, env, retmap);
+            let rt = w28_infer_expr(right, env, retmap);
+            if w28_is_array(&lt) || w28_is_array(&rt) {
+                errors.push(SemanticError {
+                    message: "数组不能作为算术/位运算运算符的操作数（2.2.1 数组类型未实现该运算符）"
+                        .to_string(),
+                });
+            }
+        }
+    }
     if let Expr::Index { array, index } = e {
         // 常量下标越界（仅针对长度可确定、且未被重新赋值的数组字面量绑定）。
         if let Some(n) = w28_const_int(index) {
@@ -30117,10 +30150,11 @@ fn w28_check_expr(
     retmap: &HashMap<String, W28Ty>,
     dups: &HashSet<String>,
     has_index_op: bool,
+    has_op_overload: bool,
     errors: &mut Vec<SemanticError>,
 ) {
     walk_expr(e, &mut |sub| {
-        w28_check_single(sub, env, retmap, dups, has_index_op, errors)
+        w28_check_single(sub, env, retmap, dups, has_index_op, has_op_overload, errors)
     });
 }
 
@@ -30201,6 +30235,7 @@ fn w28_scan_stmts(
     dups: &HashSet<String>,
     assigned: &HashSet<String>,
     has_index_op: bool,
+    has_op_overload: bool,
     errors: &mut Vec<SemanticError>,
 ) {
     let last_idx = stmts.len().saturating_sub(1);
@@ -30208,7 +30243,7 @@ fn w28_scan_stmts(
         match s {
             Stmt::Let { pattern, ty, value } | Stmt::Var { pattern, ty, value } => {
                 let is_var = matches!(s, Stmt::Var { .. });
-                w28_check_expr(value, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(value, env, retmap, dups, has_index_op, has_op_overload, errors);
                 w28_try_consumed_check(value, env, retmap, errors);
                 if let Pattern::Binding(name) = pattern {
                     let inferred = ty
@@ -30216,8 +30251,9 @@ fn w28_scan_stmts(
                         .map(w28_ty_of_type)
                         .unwrap_or_else(|| w28_infer_expr(value, env, retmap));
                     // 仅对不可变（let）且未被重新赋值的数组字面量绑定记录长度。
-                    // 可变数组的下标可能由运行时逻辑保证（官方 std 存在越界即
-                    // 触发运行时异常的用例），不据初值长度判定。
+                    // 可变数组的下标可能由运行时逻辑保证（官方 std/unittest 存在
+                    // 普通可编译程序中“常量越界下标由运行时捕获异常”的用例），
+                    // 不据初值长度判定。
                     let len = match value {
                         Expr::Array(items) if !is_var && !assigned.contains(name) => {
                             Some(items.len())
@@ -30228,7 +30264,7 @@ fn w28_scan_stmts(
                 }
             }
             Stmt::Const { name, ty, value } => {
-                w28_check_expr(value, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(value, env, retmap, dups, has_index_op, has_op_overload, errors);
                 w28_try_consumed_check(value, env, retmap, errors);
                 let inferred = ty
                     .as_ref()
@@ -30237,18 +30273,18 @@ fn w28_scan_stmts(
                 env.insert(name.clone(), (inferred, None));
             }
             Stmt::Expr(e) => {
-                w28_check_expr(e, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(e, env, retmap, dups, has_index_op, has_op_overload, errors);
                 // 块末尾表达式作为值被消费。
                 if idx == last_idx {
                     w28_try_consumed_check(e, env, retmap, errors);
                 }
             }
             Stmt::Return(Some(e)) => {
-                w28_check_expr(e, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(e, env, retmap, dups, has_index_op, has_op_overload, errors);
                 w28_try_consumed_check(e, env, retmap, errors);
             }
             Stmt::Assign { target, value } => {
-                w28_check_expr(value, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(value, env, retmap, dups, has_index_op, has_op_overload, errors);
                 w28_try_consumed_check(value, env, retmap, errors);
                 // 常量下标写入越界：仅针对长度可确定、且未被重新赋值的数组字面量绑定。
                 if !has_index_op {
@@ -30269,33 +30305,33 @@ fn w28_scan_stmts(
                 }
             }
             Stmt::While { cond, body } => {
-                w28_check_expr(cond, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(cond, env, retmap, dups, has_index_op, has_op_overload, errors);
                 let mut inner = env.clone();
-                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, has_op_overload, errors);
             }
             Stmt::WhileLet { expr, body, .. } => {
-                w28_check_expr(expr, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(expr, env, retmap, dups, has_index_op, has_op_overload, errors);
                 let mut inner = env.clone();
-                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, has_op_overload, errors);
             }
             Stmt::DoWhile { body, cond } => {
                 let mut inner = env.clone();
-                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
-                w28_check_expr(cond, env, retmap, dups, has_index_op, errors);
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, has_op_overload, errors);
+                w28_check_expr(cond, env, retmap, dups, has_index_op, has_op_overload, errors);
             }
             Stmt::For {
                 var,
                 iterable,
                 body,
             } => {
-                w28_check_expr(iterable, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(iterable, env, retmap, dups, has_index_op, has_op_overload, errors);
                 let mut inner = env.clone();
                 inner.insert(var.clone(), (W28Ty::Unknown, None));
-                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, has_op_overload, errors);
             }
             Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
                 let mut inner = env.clone();
-                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, errors);
+                w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, has_op_overload, errors);
             }
             Stmt::LocalFunc(f) => {
                 let mut child = env.clone();
@@ -30309,12 +30345,13 @@ fn w28_scan_stmts(
                     dups,
                     assigned,
                     has_index_op,
+                    has_op_overload,
                     errors,
                 );
             }
             Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
-                w28_check_expr(left, env, retmap, dups, has_index_op, errors);
-                w28_check_expr(right, env, retmap, dups, has_index_op, errors);
+                w28_check_expr(left, env, retmap, dups, has_index_op, has_op_overload, errors);
+                w28_check_expr(right, env, retmap, dups, has_index_op, has_op_overload, errors);
             }
             _ => {}
         }
@@ -30568,6 +30605,8 @@ fn check_w28d_array_index_and_numeric(program: &Program, errors: &mut Vec<Semant
         }
         found
     };
+    // 程序中存在任意运算符重载时不判定“数组参与算术/位运算”（可能由用户运算符接受数组）。
+    let has_op_overload = w29c_has_operator_overload(program);
     let mut run_body = |body: &[Stmt], params: &[Param]| {
         let mut env: HashMap<String, (W28Ty, Option<usize>)> = HashMap::new();
         let mut seen = HashSet::new();
@@ -30580,7 +30619,7 @@ fn check_w28d_array_index_and_numeric(program: &Program, errors: &mut Vec<Semant
         w28_collect_dup_names(body, &mut seen, &mut dups);
         w28_collect_assigned(body, &mut assigned);
         w28_scan_stmts(
-            body, &mut env, &retmap, &dups, &assigned, has_index_op, errors,
+            body, &mut env, &retmap, &dups, &assigned, has_index_op, has_op_overload, errors,
         );
     };
     for f in &program.functions {
@@ -32219,7 +32258,7 @@ mod tests {
     #[test]
     fn test_validate_enum_variant_overload_ok() {
         // 同名但载荷不同 → 合法重载
-        assert_valid("enum E {\n    A\n    A(Int8)\n}\nmain() {}\n");
+        assert_valid("enum E {\n    A | A(Int8)\n}\nmain() {}\n");
     }
 
 

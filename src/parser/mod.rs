@@ -1103,7 +1103,7 @@ mod tests {
         let source = r#"
             enum Container<T> where T <: Comparable {
                 Full(T)
-                Empty
+                | Empty
             }
         "#;
         let lexer = Lexer::new(source);
@@ -1403,11 +1403,11 @@ mod tests {
     #[test]
     fn test_parse_enum_variants() {
         let source = r#"
-            enum Color { Red Green Blue }
+            enum Color { Red | Green | Blue }
             enum Value {
                 Num(Int64)
-                Str(String)
-                Empty
+                | Str(String)
+                | Empty
             }
         "#;
         let lexer = Lexer::new(source);
@@ -2160,7 +2160,7 @@ mod tests {
     #[test]
     fn test_p_enum_pipe_prefix() {
         let source = r#"
-            enum Color { | Red, | Green, | Blue }
+            enum Color { | Red | Green | Blue }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -2172,7 +2172,7 @@ mod tests {
     #[test]
     fn test_p_enum_tuple_payload() {
         let source = r#"
-            enum Result { Ok(Int64, String), Err(String) }
+            enum Result { Ok(Int64, String) | Err(String) }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -2184,7 +2184,7 @@ mod tests {
     #[test]
     fn test_p_enum_subtype_constraint() {
         let source = r#"
-            enum Foo <: Bar { A, B }
+            enum Foo <: Bar { A | B }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
@@ -2196,7 +2196,7 @@ mod tests {
     #[test]
     fn test_p_enum_with_methods() {
         let source = r#"
-            enum Color { Red, Green }
+            enum Color { Red | Green }
             func Color.name(): String { "color" }
         "#;
         let lexer = Lexer::new(source);
@@ -2210,7 +2210,7 @@ mod tests {
     fn test_p_enum_operator_func() {
         let source = r#"
             enum Num {
-                Zero, One
+                Zero | One
                 operator func +(other: Num): Num { Zero }
             }
         "#;
@@ -2225,7 +2225,7 @@ mod tests {
     fn test_p_enum_prop_inside() {
         let source = r#"
             enum Foo {
-                A, B
+                A | B
                 prop x: Int64 { get() { 0 } set(_) { } }
             }
         "#;
@@ -3394,15 +3394,14 @@ mod tests {
 
     #[test]
     fn test_pf_enum_with_comma_separators() {
+        // 2.1.11.1(1)：caseBody 之间只能用 `|` 分隔；`,` 不是合法分隔符（Conformance a01_22）。
         let source = r#"
-            enum E { A, B, C(Int64) }
+            enum E { A, B }
         "#;
         let lexer = Lexer::new(source);
         let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).collect();
         let mut parser = Parser::new(tokens);
-        let program = parser.parse_program().unwrap();
-        assert_eq!(program.enums.len(), 1);
-        assert!(program.enums[0].variants.len() >= 2);
+        assert!(parser.parse_program().is_err());
     }
 
     #[test]
@@ -3668,7 +3667,7 @@ mod tests {
     fn test_pg_enum_prop_with_body() {
         let source = r#"
             enum Foo {
-                A, B
+                A | B
                 prop x: Int64 { get() { 0 } set(_) { } }
             }
         "#;
@@ -3716,7 +3715,7 @@ mod tests {
         ));
         // 合法形态：变体区里变体后直接接 operator 重载。
         assert!(!parse_err(
-            "enum Num {\n Zero, One\n operator func +(o: Num): Num { Zero }\n}\nmain() {}"
+            "enum Num {\n Zero | One\n operator func +(o: Num): Num { Zero }\n}\nmain() {}"
         ));
     }
 
