@@ -725,6 +725,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_overload_candidate_types(program, &mut errors);
     // 10.1.3.2 / 5.3.2(9) / 5.3.4(11)：可确定的重载决议歧义（保守子集）。
     check_overload_resolution_ambiguity(program, &mut errors);
+    // 10.1.2.1(1)：private 成员函数在定义体外不可见（可见集裁剪，w38a #39）。
+    check_private_member_calls(program, &mut errors);
     // 4.22.2(1)：组合运算符 `~>` 的左函数返回类型须能作为右函数的形参（a37_07）。
     check_composition_type_chain(program, &mut errors);
     // 6.1.2.7(4)：泛型类限定访问成员须提供类型实参（w30c）。
@@ -14221,6 +14223,17 @@ fn check_inout_arguments(program: &Program, errors: &mut Vec<SemanticError>) {
                                         .to_string(),
                                 );
                             }
+                            // (B4) CPointer<T> 形参：实参须为指针值（CPointer/CString/
+                            // nil 等），不能是标量值。仅当实参确凿为标量（内建数值/
+                            // Bool/Rune/Unit 的变量或字面量）时判定，其余保守放行。
+                            if cpointer_pointee(pt).is_some()
+                                && arg_is_scalar_value_expr(pa, &local_types)
+                            {
+                                report(
+                                    "形参类型为 `CPointer<..>`，实参须为指针值，不能传入标量值（13.1.2.1/13.1.3.4）"
+                                        .to_string(),
+                                );
+                            }
                         }
                     }
                 }
@@ -14235,6 +14248,47 @@ fn cpointer_pointee(ty: &Type) -> Option<&Type> {
     match ty {
         Type::Struct(n, args) if n == "CPointer" && args.len() == 1 => Some(&args[0]),
         _ => None,
+    }
+}
+
+/// 是否为内建标量值类型（数值 / Bool / Rune / Unit）。用于判定某实参确凿为
+/// 标量值、不能隐式传给 `CPointer<T>` 形参（13.1.2.1 / 13.1.3.4）。
+fn is_scalar_value_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Int8
+            | Type::Int16
+            | Type::Int32
+            | Type::Int64
+            | Type::IntNative
+            | Type::UInt8
+            | Type::UInt16
+            | Type::UInt32
+            | Type::UInt64
+            | Type::UIntNative
+            | Type::Float16
+            | Type::Float32
+            | Type::Float64
+            | Type::Bool
+            | Type::Rune
+            | Type::Unit
+    )
+}
+
+/// 实参表达式是否确凿为标量值（内建数值/Bool/Rune/Unit 的局部变量或字面量）。
+/// 无法确定类型（调用、指针、数组等）一律返回 false，交由其他规则/保守放行。
+fn arg_is_scalar_value_expr(pa: &Expr, local_types: &HashMap<String, Type>) -> bool {
+    match pa {
+        Expr::Var(n) => local_types.get(n.as_str()).map_or(false, is_scalar_value_type),
+        Expr::Integer(_)
+        | Expr::IntegerSuffixed(..)
+        | Expr::IntegerOverflow(..)
+        | Expr::Float(_)
+        | Expr::Float32(_)
+        | Expr::FloatSuffixed(..)
+        | Expr::Bool(_)
+        | Expr::Rune(_) => true,
+        _ => false,
     }
 }
 
@@ -25976,6 +26030,8 @@ enum ArgClass {
     /// 本地用户名义类型（class/struct/enum 名）：形参匹配用子类型关系判定。
     /// 仅由 `check_overload_resolution_ambiguity` 的形参分类内部产生（w37b）。
     Nominal(Type),
+    /// 函数值实参（裸函数名/重载函数引用）：仅可匹配函数类型形参（w38a #42）。
+    FuncVal,
     /// 不可确定。
     Unknown,
 }
@@ -26083,6 +26139,8 @@ fn arg_param_ok(k: &ArgClass, p: &Type) -> bool {
         // 名义类型的子类型匹配需要继承图；共享路径无图时退化为相等判定
         //（歧义检查内部另用子类型感知的 `analyze_param_ok`）。
         ArgClass::Nominal(t) => t == p,
+        // 函数值只匹配函数类型形参。
+        ArgClass::FuncVal => matches!(p, Type::Function { .. }),
         ArgClass::Unknown => true,
     }
 }
@@ -26194,13 +26252,31 @@ fn verify_call_arg_types(
             if p.variadic || p.is_named || p.default.is_some() {
                 return;
             }
+            // w38a #42：允许函数类型形参（其对应实参须为裸函数名，见下）。
+            if matches!(p.ty, Type::Function { .. }) {
+                continue;
+            }
             if !is_scalar_scalar_ty(&p.ty) {
                 return;
             }
         }
     }
     let mut kinds: Vec<ArgClass> = Vec::with_capacity(args.len());
-    for a in args {
+    for (i, a) in args.iter().enumerate() {
+        // 所有候选在该位均为函数类型形参：实参须为裸函数名（重载函数引用），
+        // 归类为 FuncVal；否则无法安全判定，放行。
+        let func_pos = sigs
+            .iter()
+            .all(|s| matches!(s.params[i].ty, Type::Function { .. }));
+        if func_pos {
+            match a {
+                Expr::Var(n) if !vars.contains_key(n.as_str()) => {
+                    kinds.push(ArgClass::FuncVal);
+                    continue;
+                }
+                _ => return,
+            }
+        }
         let k = classify_arg(a, vars);
         if matches!(k, ArgClass::Unknown) {
             return;
@@ -26663,14 +26739,23 @@ fn check_overload_candidate_types(program: &Program, errors: &mut Vec<SemanticEr
                     ) {
                         return;
                     }
-                    let one: [Expr; 1];
-                    let args: &[Expr] = match arg {
-                        Some(e) => {
-                            one = [(**e).clone()];
-                            &one
-                        }
-                        None => &[],
+                    // w38a #42：`T.m(a, b)` 的多实参在 AST 中折叠为单个 Tuple 实参，
+                    // 按候选形参个数展开还原（仅当元组项数与形参数一致时）。
+                    let owned: Vec<Expr> = match arg {
+                        Some(e) => match e.as_ref() {
+                            Expr::Tuple(items)
+                                if cands
+                                    .iter()
+                                    .all(|s| s.params.len() == items.len())
+                                    && items.len() != 1 =>
+                            {
+                                items.clone()
+                            }
+                            other => vec![other.clone()],
+                        },
+                        None => Vec::new(),
                     };
+                    let args: &[Expr] = &owned;
                     verify_call_arg_types(variant_name, args, &cands, &vars, errors);
                 }
                 Expr::Invoke {
@@ -28008,6 +28093,223 @@ fn check_local_func_name_lvalue(program: &Program, errors: &mut Vec<SemanticErro
     }
 }
 
+/// w38a #48：把类型别名按其底层类型递归展开（`type MyInt8 = Int8` 使形参类型
+/// `MyInt8` 归一为 `Int8`），供重载决议中形参类型比较使用（10.1.3(5)）。
+fn w38_alias_canon(mut t: Type, m: &HashMap<String, Type>) -> Type {
+    let mut depth = 0;
+    while depth < 16 {
+        if let Type::Struct(n, args) = &t {
+            if args.is_empty() {
+                if let Some(target) = m.get(n.as_str()) {
+                    t = target.clone();
+                    depth += 1;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    t
+}
+
+/// w38a #48：补全 `let x = Int8(...)` / `let x = Float64(...)` 这类以基础类型转换
+/// 调用初始化的局部变量的类型（`local_var_types_full` 只识别构造式，不含基础类型
+/// 转换调用，导致重载实参分类拿不到 `i8:Int8` 这类已知标量）。仅补全未标注且
+/// 尚未推断出类型的绑定，不覆盖既有结果。
+fn w38_augment_prim_conv_vars(stmts: &[Stmt], vars: &mut HashMap<String, Type>) {
+    fn walk(stmts: &[Stmt], vars: &mut HashMap<String, Type>) {
+        for s in stmts {
+            match s {
+                Stmt::Let {
+                    pattern: Pattern::Binding(n),
+                    ty,
+                    value,
+                    ..
+                }
+                | Stmt::Var {
+                    pattern: Pattern::Binding(n),
+                    ty,
+                    value,
+                    ..
+                } => {
+                    if ty.is_some() || vars.contains_key(n.as_str()) {
+                        continue;
+                    }
+                    let conv = match value {
+                        Expr::Call { name, .. } | Expr::ConstructorCall { name, .. } => {
+                            primitive_ty_by_name(name)
+                        }
+                        _ => None,
+                    };
+                    if let Some(t) = conv {
+                        vars.insert(n.clone(), t);
+                    }
+                }
+                Stmt::While { body, .. }
+                | Stmt::Loop { body }
+                | Stmt::UnsafeBlock { body }
+                | Stmt::For { body, .. }
+                | Stmt::DoWhile { body, .. }
+                | Stmt::WhileLet { body, .. } => walk(body, vars),
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, vars);
+}
+
+/// w38a #39：10.1.2.1(1) — `private` 成员函数在定义体外不可见。当 `recv.M(args)`
+/// 的接收者为本地类型、按实参唯一解析到的成员函数为 `private`、而调用点所在类型
+/// 并非该成员所属类型时，报错（可见集裁剪）。
+/// 保守：仅当实参全为可判定原始标量、且恰有一个候选按标量类型精确匹配时判定。
+fn check_private_member_calls(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut type_names: HashSet<String> = HashSet::new();
+    for c in &program.classes {
+        type_names.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        type_names.insert(s.name.clone());
+    }
+    for e in &program.enums {
+        type_names.insert(e.name.clone());
+    }
+    for i in &program.interfaces {
+        type_names.insert(i.name.clone());
+    }
+
+    // (owner, 短名) → Vec<(位置形参, 是否 private)>
+    let mut members: HashMap<String, HashMap<String, Vec<(Vec<Param>, bool)>>> = HashMap::new();
+    {
+        let mut rec = |owner: &str, fname: &str, params: &[Param], vis: bool| {
+            let short = fname.rsplit('.').next().unwrap_or(fname);
+            if short.starts_with("__") {
+                return;
+            }
+            members
+                .entry(owner.to_string())
+                .or_default()
+                .entry(short.to_string())
+                .or_default()
+                .push((strip_self_params(params).to_vec(), vis));
+        };
+        for f in &program.functions {
+            if f.extern_import.is_some() {
+                continue;
+            }
+            if let Some((owner, short)) = f.name.rsplit_once('.') {
+                rec(
+                    owner,
+                    short,
+                    &f.params,
+                    matches!(f.visibility, crate::ast::Visibility::Private),
+                );
+            }
+        }
+        for c in &program.classes {
+            for m in &c.methods {
+                rec(
+                    &c.name,
+                    &m.func.name,
+                    &m.func.params,
+                    matches!(m.func.visibility, crate::ast::Visibility::Private),
+                );
+            }
+        }
+    }
+
+    let scan = |params: &[Param],
+                body: &[Stmt],
+                owner: Option<&str>,
+                errors: &mut Vec<SemanticError>| {
+        let mut vars = local_var_types_full(params, body);
+        w23_augment_ctor_call_vars(body, &mut vars, &type_names);
+        w38_augment_prim_conv_vars(body, &mut vars);
+        walk_stmts(body, &mut |e| {
+            let Expr::MethodCall {
+                object,
+                method,
+                args,
+                named_args,
+                ..
+            } = e
+            else {
+                return;
+            };
+            if !named_args.is_empty() {
+                return;
+            }
+            let Some(rt) = receiver_type_name(object, &vars, &type_names) else {
+                return;
+            };
+            // 同一类型内访问私有成员合法（含 extend 该类型）。
+            if owner == Some(rt.as_str()) {
+                return;
+            }
+            let Some(cands) = members.get(&rt).and_then(|m| m.get(method.as_str())) else {
+                return;
+            };
+            // 实参须全为可判定原始标量。
+            let mut classes: Vec<ArgClass> = Vec::with_capacity(args.len());
+            for a in args {
+                let k = classify_arg_exact(a, &vars);
+                if !matches!(k, ArgClass::Scalar(_)) {
+                    return;
+                }
+                classes.push(k);
+            }
+            let mut matched: Vec<usize> = Vec::new();
+            for (i, (ps, _)) in cands.iter().enumerate() {
+                if ps.len() != classes.len() {
+                    continue;
+                }
+                if ps
+                    .iter()
+                    .any(|p| p.is_named || p.variadic || p.default.is_some())
+                {
+                    continue;
+                }
+                if ps.iter().zip(classes.iter()).all(|(p, k)| arg_param_ok(k, &p.ty)) {
+                    matched.push(i);
+                }
+            }
+            if matched.len() != 1 {
+                return;
+            }
+            if cands[matched[0]].1 {
+                errors.push(SemanticError {
+                    message: format!(
+                        "调用 '{}.{}'：成员函数在类型 '{}' 定义体外不可见（private，10.1.2.1(1)）",
+                        rt, method, rt
+                    ),
+                });
+            }
+        });
+    };
+
+    for f in &program.functions {
+        let owner = f.name.rsplit_once('.').map(|(o, _)| o);
+        scan(&f.params, &f.body, owner, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, Some(&c.name), errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, Some(&c.name), errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, Some(&s.name), errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, Some(&ext.target_type), errors);
+        }
+    }
+}
+
 /// 10.1.3.2 / 5.3.2(9) / 5.3.4(11)：可确定的重载决议歧义（保守子集）。
 ///
 /// 既有 `verify_call_arg_types` 仅在“无任何候选可匹配”时报错，且对默认值/命名/
@@ -28056,6 +28358,13 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
     for (n, _) in &program.type_aliases {
         alias_names.insert(n.clone());
     }
+    // w38a #48：类型别名展开表，使签名比较时 `MyInt8` 与底层 `Int8` 归一
+    // （10.1.3(5)：经别名与底层类型同签名的重载构成歧义）。
+    let alias_targets: HashMap<String, Type> = program
+        .type_aliases
+        .iter()
+        .map(|(n, t)| (n.clone(), t.clone()))
+        .collect();
 
     fn same_sig(a: &Function, b: &Function) -> bool {
         let x = strip_self_params(&a.params);
@@ -28222,6 +28531,12 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
         let mut all_need_sugar = true;
         let mut sugar_capable = 0usize;
         for f in cands {
+            // 显式类型实参 `f<T>(...)` 只引用泛型候选；同名非泛型函数不参与解析
+            // （5.1.6(3)：泛型与非泛型同名不构成重定义，但带类型实参者只命中泛型）。
+            if type_args.is_some() && f.type_params.is_empty() {
+                accs.push((false, Vec::new()));
+                continue;
+            }
             let ps = strip_self_params(&f.params);
             let pp: Vec<&Param> = ps.iter().filter(|p| !p.is_named).collect();
             let np: Vec<&Param> = ps.iter().filter(|p| p.is_named).collect();
@@ -28241,10 +28556,11 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
                 }
             };
             let pty = |p: &Param| -> Type {
-                match &subst {
+                let raw = match &subst {
                     Some(s) => subst_type(&p.ty, s),
                     None => p.ty.clone(),
-                }
+                };
+                w38_alias_canon(raw, &alias_targets)
             };
             if args.len() <= pp.len() {
                 all_need_sugar = false;
@@ -28326,7 +28642,7 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
         }
 
         // 变长/数组语法糖歧义（5.3.4(11)）。
-        if all_need_sugar && named.is_empty() && sugar_capable >= 2 {
+        if all_need_sugar && named.is_empty() && sugar_capable >= 2 && type_args.is_none() {
             errors.push(SemanticError {
                 message: format!(
                     "调用 '{}'：{} 个候选均需变长/数组语法糖，无法唯一确定（5.3.4(11)）",
@@ -28381,6 +28697,7 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
                 // 名义类型实参：等级与具体标量等同，特异性交由随后按形参类型做的
                 // 子类型比较（`pos_ge` 中 `w23_subtype`）判定。
                 ArgClass::Nominal(_) => Some(4),
+                ArgClass::FuncVal => Some(4),
                 ArgClass::Unknown => None,
             }
         };
@@ -28429,6 +28746,19 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
     let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
         let mut vars = local_var_types_full(params, body);
         w23_augment_ctor_call_vars(body, &mut vars, &type_names);
+        w38_augment_prim_conv_vars(body, &mut vars);
+        // w38a #48/#43：收集本体内顶层声明的局部函数，用于嵌套作用域重载决议
+        // （内层同名集遮蔽外层/顶层；按调用位点之前是否已声明由词法顺序近似）。
+        let mut local_funcs: HashMap<String, Vec<&Function>> = HashMap::new();
+        for s in body {
+            if let Stmt::LocalFunc(f) = s {
+                let short = f.name.rsplit('.').next().unwrap_or(&f.name).to_string();
+                if short.starts_with("__") {
+                    continue;
+                }
+                local_funcs.entry(short).or_default().push(f);
+            }
+        }
         walk_stmts(body, &mut |e| match e {
             Expr::Call {
                 name,
@@ -28444,6 +28774,11 @@ fn check_overload_resolution_ambiguity(program: &Program, errors: &mut Vec<Seman
                 named_args,
                 ..
             } => {
+                // 局部函数优先：内层同名集遮蔽外层自由函数与类型名。
+                if let Some(sigs) = local_funcs.get(name.as_str()) {
+                    analyze(sigs, args, named_args, type_args.as_deref(), &vars, name, errors);
+                    return;
+                }
                 if name.contains('.') || vars.contains_key(name.as_str()) {
                     return;
                 }
@@ -29387,6 +29722,7 @@ fn check_ctor_arg_type_mismatch(program: &Program, errors: &mut Vec<SemanticErro
                         // 构造器形参分类不产生名义实参（`classify_arg` 对用户类型返回
                         // Unknown），此臂为穷尽性占位，保守放行。
                         ArgClass::Nominal(_) => true,
+                        ArgClass::FuncVal => matches!(ty, Type::Function { .. }),
                         ArgClass::Unknown => true,
                     }
                 })
@@ -31418,13 +31754,69 @@ fn check_generic_enum_ctor_inference(program: &Program, errors: &mut Vec<Semanti
             vmap.entry(v.name.as_str()).or_default().push(e);
         }
     }
-    if vmap.is_empty() {
-        return;
+    // 注意：不可在此因 vmap 为空而提前返回——即便没有泛型枚举的限定构造，
+    // 仍可能存在“裸名空变体”（如 `let x = Year`）需要判定，由下方
+    // empty_variant_owners 单独处理。
+    //
+    // #C(2.1.11.2(3) 裸名空变体子集)：按名登记**所有**枚举中无关联值的变体 →
+    // 所属枚举。裸名 `Year`（`Expr::Var`，无括号、无类型实参）若唯一对应某个
+    // **泛型枚举**的空变体，则缺少实参/类型实参，类型参数无法推断，须显式给出
+    // 枚举类型实参（`TimeUnit3<Int64,Int64>.Year` 或完整类型标注）。
+    // 保守约束：仅当该名字在**全部**枚举中恰有一个空变体、且该枚举为泛型时才报；
+    // 跨枚举多空变体（歧义簇，已归档 X）与其它名字类别一律放行。
+    let mut empty_variant_owners: HashMap<&str, Vec<&EnumDef>> = HashMap::new();
+    for e in &program.enums {
+        for v in &e.variants {
+            if v.payload.is_none() {
+                empty_variant_owners
+                    .entry(v.name.as_str())
+                    .or_default()
+                    .push(e);
+            }
+        }
+    }
+    // 裸名若同时是值名（局部/形参/字段/顶层函数/顶层变量）或类型名，则不是构造器。
+    let declared_value_names = w24_declared_value_names(program);
+    let mut declared_type_names: HashSet<String> = HashSet::new();
+    for e in &program.enums {
+        declared_type_names.insert(e.name.clone());
+    }
+    for c in &program.classes {
+        declared_type_names.insert(c.name.clone());
+    }
+    for s in &program.structs {
+        declared_type_names.insert(s.name.clone());
+    }
+    for i in &program.interfaces {
+        declared_type_names.insert(i.name.clone());
     }
     let annotation_ok = |ty: &Type, e: &EnumDef| -> bool {
         matches!(ty, Type::Struct(n, args) if n == &e.name && args.len() == e.type_params.len())
     };
     let mut check_use = |ty: Option<&Type>, value: &Expr| {
+        // 裸名空变体：`Expr::Var("Year")` 形如无括号、无类型实参，若 `Year` 为某个
+        // 泛型枚举的**唯一**空变体，则无法推断类型实参（2.1.11.2(3)）。完整枚举
+        // 类型标注可提供推断上下文。名称被值名/类型名遮蔽时放行；多空变体歧义
+        // （a07 铁证簇，已归档 X）放行。
+        if let Expr::Var(vname) = value {
+            if !declared_value_names.contains(vname) && !declared_type_names.contains(vname) {
+                if let Some(cands) = empty_variant_owners.get(vname.as_str()) {
+                    if cands.len() == 1 && !cands[0].type_params.is_empty() {
+                        let e = cands[0];
+                        let annotated = ty.map_or(false, |t| annotation_ok(t, e));
+                        if !annotated {
+                            errors.push(SemanticError {
+                                message: format!(
+                                    "泛型枚举 '{}' 的构造器 '{}' 类型实参无法完全推断，须显式指定类型实参（2.1.11.2(3)）",
+                                    e.name, vname
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            return;
+        }
         // 仅处理 `EnumName.Variant(...)` 限定形态：裸名变体（`Year`、
         // `Day<T1,T2>(...)`）在 AST 中不保留是否写了显式类型实参，无法可靠判定，
         // 故保守放行。
@@ -31544,7 +31936,7 @@ fn w28_ty_of_type(t: &Type) -> W28Ty {
 
 fn w28_infer_expr(
     e: &Expr,
-    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    env: &HashMap<String, (W28Ty, Option<usize>, Option<i64>)>,
     retmap: &HashMap<String, W28Ty>,
 ) -> W28Ty {
     match e {
@@ -31574,7 +31966,7 @@ fn w28_infer_expr(
         },
         Expr::Var(n) => env
             .get(n)
-            .map(|(t, _)| t.clone())
+            .map(|(t, _, _)| t.clone())
             .unwrap_or(W28Ty::Unknown),
         Expr::Unary { expr, .. } => w28_infer_expr(expr, env, retmap),
         Expr::Binary { left, right, .. } => {
@@ -31636,6 +32028,47 @@ fn w28_const_int(e: &Expr) -> Option<i64> {
     }
 }
 
+/// w38c：流敏感常量传播的最小实现。在 w28 轻量环境上求编译期整型常量：
+/// 字面量（含一元负号）或已绑定到常量的局部变量（`let size = 15; ... size`）。
+fn w28_const_int_env(
+    e: &Expr,
+    env: &HashMap<String, (W28Ty, Option<usize>, Option<i64>)>,
+) -> Option<i64> {
+    match e {
+        Expr::Var(n) => env.get(n).and_then(|v| v.2),
+        Expr::Unary { op: crate::ast::UnaryOp::Neg, expr } => {
+            w28_const_int_env(expr, env).and_then(|v| v.checked_neg())
+        }
+        _ => w28_const_int(e),
+    }
+}
+
+/// w38c：`Array<T>(size){...}`（解析为 ConstructorCall，或带尾随闭包时被包成
+/// `Invoke{callee: ConstructorCall}`）的 size 实参可求值为非负常量时返回长度，
+/// 供 2.2.1.2(1) 常量下标越界判定（#11：`Array<Int64>(size)` 跨语句常量传播）。
+fn w28_ctor_array_len(
+    value: &Expr,
+    env: &HashMap<String, (W28Ty, Option<usize>, Option<i64>)>,
+) -> Option<usize> {
+    let ctor = match value {
+        Expr::ConstructorCall { .. } => value,
+        Expr::Invoke { callee, .. } => callee.as_ref(),
+        _ => return None,
+    };
+    let Expr::ConstructorCall { name, args, .. } = ctor else {
+        return None;
+    };
+    if name != "Array" {
+        return None;
+    }
+    let n = args.first().and_then(|s| w28_const_int_env(s, env))?;
+    if (0..=i64::from(u32::MAX)).contains(&n) {
+        Some(n as usize)
+    } else {
+        None
+    }
+}
+
 /// 数组类型未实现、因而非法的二元运算符（算术 / 位运算 / 移位）。
 fn w30b_is_array_binop(op: &BinOp) -> bool {
     matches!(
@@ -31656,7 +32089,7 @@ fn w30b_is_array_binop(op: &BinOp) -> bool {
 
 fn w28_check_single(
     e: &Expr,
-    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    env: &HashMap<String, (W28Ty, Option<usize>, Option<i64>)>,
     retmap: &HashMap<String, W28Ty>,
     dups: &HashSet<String>,
     has_index_op: bool,
@@ -31682,7 +32115,7 @@ fn w28_check_single(
         if let Some(n) = w28_const_int(index) {
             let (name, len) = match array.as_ref() {
                 Expr::Var(name) => match env.get(name) {
-                    Some((_, Some(l))) => (Some(name.as_str()), Some(*l)),
+                    Some((_, Some(l), _)) => (Some(name.as_str()), Some(*l)),
                     _ => (None, None),
                 },
                 Expr::Array(items) => (None, Some(items.len())),
@@ -31724,7 +32157,7 @@ fn w28_check_single(
 fn w28_check_try_consumed(
     body: &[Stmt],
     catch_body: &[Stmt],
-    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    env: &HashMap<String, (W28Ty, Option<usize>, Option<i64>)>,
     retmap: &HashMap<String, W28Ty>,
     errors: &mut Vec<SemanticError>,
 ) {
@@ -31745,7 +32178,7 @@ fn w28_check_try_consumed(
 
 fn w28_block_last_type(
     stmts: &[Stmt],
-    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    env: &HashMap<String, (W28Ty, Option<usize>, Option<i64>)>,
     retmap: &HashMap<String, W28Ty>,
 ) -> W28Ty {
     for s in stmts.iter().rev() {
@@ -31760,7 +32193,7 @@ fn w28_block_last_type(
 
 fn w28_check_expr(
     e: &Expr,
-    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    env: &HashMap<String, (W28Ty, Option<usize>, Option<i64>)>,
     retmap: &HashMap<String, W28Ty>,
     dups: &HashSet<String>,
     has_index_op: bool,
@@ -31775,7 +32208,7 @@ fn w28_check_expr(
 /// 定位被“消费”的 TryBlock（绑定/赋值/返回/块末尾值），仅对这些做类型检查。
 fn w28_try_consumed_check(
     e: &Expr,
-    env: &HashMap<String, (W28Ty, Option<usize>)>,
+    env: &HashMap<String, (W28Ty, Option<usize>, Option<i64>)>,
     retmap: &HashMap<String, W28Ty>,
     errors: &mut Vec<SemanticError>,
 ) {
@@ -31844,7 +32277,7 @@ fn w28_collect_dup_names(stmts: &[Stmt], seen: &mut HashSet<String>, dups: &mut 
 
 fn w28_scan_stmts(
     stmts: &[Stmt],
-    env: &mut HashMap<String, (W28Ty, Option<usize>)>,
+    env: &mut HashMap<String, (W28Ty, Option<usize>, Option<i64>)>,
     retmap: &HashMap<String, W28Ty>,
     dups: &HashSet<String>,
     assigned: &HashSet<String>,
@@ -31864,17 +32297,25 @@ fn w28_scan_stmts(
                         .as_ref()
                         .map(w28_ty_of_type)
                         .unwrap_or_else(|| w28_infer_expr(value, env, retmap));
-                    // 仅对不可变（let）且未被重新赋值的数组字面量绑定记录长度。
+                    // 仅对不可变（let）或未被整体重赋值的数组绑定记录长度。
                     // 可变数组的下标可能由运行时逻辑保证（官方 std/unittest 存在
                     // 普通可编译程序中“常量越界下标由运行时捕获异常”的用例），
                     // 不据初值长度判定。
+                    let bound_unassigned = !assigned.contains(name);
                     let len = match value {
-                        Expr::Array(items) if !is_var && !assigned.contains(name) => {
+                        Expr::Array(items) if !is_var && bound_unassigned => {
                             Some(items.len())
                         }
-                        _ => None,
+                        // w38c（#11）：`Array<T>(size){...}` 的 size 跨语句常量传播。
+                        _ => w28_ctor_array_len(value, env).filter(|_| bound_unassigned),
                     };
-                    env.insert(name.clone(), (inferred, len));
+                    // w38c：记录简单整型常量，供后续 `Array<T>(size)` 长度传播。
+                    let cint = if bound_unassigned {
+                        w28_const_int_env(value, env)
+                    } else {
+                        None
+                    };
+                    env.insert(name.clone(), (inferred, len, cint));
                 }
             }
             Stmt::Const { name, ty, value } => {
@@ -31884,7 +32325,8 @@ fn w28_scan_stmts(
                     .as_ref()
                     .map(w28_ty_of_type)
                     .unwrap_or_else(|| w28_infer_expr(value, env, retmap));
-                env.insert(name.clone(), (inferred, None));
+                let cint = w28_const_int_env(value, env);
+                env.insert(name.clone(), (inferred, None, cint));
             }
             Stmt::Expr(e) => {
                 w28_check_expr(e, env, retmap, dups, has_index_op, has_op_overload, errors);
@@ -31903,7 +32345,7 @@ fn w28_scan_stmts(
                 // 常量下标写入越界：仅针对长度可确定、且未被重新赋值的数组字面量绑定。
                 if !has_index_op {
                     if let crate::ast::AssignTarget::Index { array, index } = target {
-                        if let Some((_, Some(l))) = env.get(array) {
+                        if let Some((_, Some(l), _)) = env.get(array) {
                             if let Some(n) = w28_const_int(index) {
                                 if !dups.contains(array) && (n < 0 || n as u64 >= *l as u64) {
                                     errors.push(SemanticError {
@@ -31940,7 +32382,7 @@ fn w28_scan_stmts(
             } => {
                 w28_check_expr(iterable, env, retmap, dups, has_index_op, has_op_overload, errors);
                 let mut inner = env.clone();
-                inner.insert(var.clone(), (W28Ty::Unknown, None));
+                inner.insert(var.clone(), (W28Ty::Unknown, None, None));
                 w28_scan_stmts(body, &mut inner, retmap, dups, assigned, has_index_op, has_op_overload, errors);
             }
             Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
@@ -31950,7 +32392,7 @@ fn w28_scan_stmts(
             Stmt::LocalFunc(f) => {
                 let mut child = env.clone();
                 for p in &f.params {
-                    child.insert(p.name.clone(), (w28_ty_of_type(&p.ty), None));
+                    child.insert(p.name.clone(), (w28_ty_of_type(&p.ty), None, None));
                 }
                 w28_scan_stmts(
                     &f.body,
@@ -32222,12 +32664,12 @@ fn check_w28d_array_index_and_numeric(program: &Program, errors: &mut Vec<Semant
     // 程序中存在任意运算符重载时不判定“数组参与算术/位运算”（可能由用户运算符接受数组）。
     let has_op_overload = w29c_has_operator_overload(program);
     let mut run_body = |body: &[Stmt], params: &[Param]| {
-        let mut env: HashMap<String, (W28Ty, Option<usize>)> = HashMap::new();
+        let mut env: HashMap<String, (W28Ty, Option<usize>, Option<i64>)> = HashMap::new();
         let mut seen = HashSet::new();
         let mut dups = HashSet::new();
         let mut assigned = HashSet::new();
         for p in params {
-            env.insert(p.name.clone(), (w28_ty_of_type(&p.ty), None));
+            env.insert(p.name.clone(), (w28_ty_of_type(&p.ty), None, None));
             seen.insert(p.name.clone());
         }
         w28_collect_dup_names(body, &mut seen, &mut dups);
@@ -32857,7 +33299,7 @@ fn check_w28d_return_common_type(program: &Program, errors: &mut Vec<SemanticErr
         if let Some(Stmt::Expr(e)) = body.last() {
             rets.push(e);
         }
-        let env: HashMap<String, (W28Ty, Option<usize>)> = HashMap::new();
+        let env: HashMap<String, (W28Ty, Option<usize>, Option<i64>)> = HashMap::new();
         let mut has_int = false;
         let mut has_float = false;
         for e in rets {
@@ -33751,6 +34193,65 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn test_w38a_overload_resolution_extras() {
+        // #48：经类型别名（MyInt8=Int8）的局部函数与底层类型同签名，且默认形参不参与
+        // 特异性 → 歧义（10.1.3(5) / 5.3.2(9)）。
+        let errs = assert_invalid(
+            "type MyInt8 = Int8\n\
+             func outer(arg: Int64) {\n\
+               func SCheck(arg: Int8) {}\n\
+               func SCheck(arg: MyInt8, b!: Bool = false) {}\n\
+               let i8 = Int8(0)\n\
+               SCheck(i8)\n\
+             }\n\
+             main() { outer(0) }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("重载决议歧义")));
+
+        // #39：外部调用 private 成员函数非法（10.1.2.1(1)）；同类型内访问合法。
+        let errs = assert_invalid(
+            "struct S {\n\
+               init() {}\n\
+               private func p(x: Int8) { x }\n\
+             }\n\
+             main() { let s = S()\n s.p(1i8)\n 0 }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("不可见")));
+        assert_valid(
+            "struct S {\n\
+               init() {}\n\
+               private func p(x: Int8) { x }\n\
+               func q(x: Int8) { this.p(x) }\n\
+             }\n\
+             main() { let s = S()\n s.q(1i8)\n 0 }\n",
+        );
+
+        // #49：省略返回类型的一元运算符按体推断为 Unit；赋给类类型非法（10.2.1(1)）。
+        let errs = assert_invalid(
+            "class IR {\n\
+               var v: Int64 = 0\n\
+               init() {}\n\
+               operator func -() { this.v = 0 }\n\
+             }\n\
+             main() { var a: IR = IR()\n var b: IR\n b = -a\n 0 }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("Unit")));
+
+        // #42：重载函数引用传给函数类型形参时，其余实参不匹配任一候选 → 无候选。
+        let errs = assert_invalid(
+            "let i32v: Int32 = 0i32\n\
+             class Klass {\n\
+               static func fv(f: (Int8) -> Int8, arg: Int8) {}\n\
+               static func fv(f: (Int16) -> Int16, arg: Int16) {}\n\
+             }\n\
+             func neg(arg: Int8): Int8 { arg }\n\
+             func neg(arg: Int16): Int16 { arg }\n\
+             main() { Klass.fv(neg, i32v)\n 0 }\n",
+        );
+        assert!(errs.iter().any(|e| e.message.contains("都不匹配")));
+    }
 
     #[test]
     fn test_validate_generic_vs_non_generic_not_redefinition() {

@@ -4408,8 +4408,35 @@ fn operator_func_return_ty(func: &Function, type_names: &HashSet<String>) -> Ty 
             }
         }
     }
-    if let Some(Stmt::Expr(e)) = func.body.last() {
-        return static_ret_ty(e);
+    // w38a #49：一元运算符（无除 this/self 外的形参）省略返回类型时按体推断；
+    // 体无值产出（末尾为无 else 的 if / 非值语句，且体无带值 return）→ Unit。
+    let non_self = func
+        .params
+        .iter()
+        .filter(|p| p.name != "this" && p.name != "self")
+        .count();
+    let has_value_return = func
+        .body
+        .iter()
+        .any(|s| matches!(s, Stmt::Return(Some(_))));
+    if let Some(last) = func.body.last() {
+        match last {
+            Stmt::Expr(e) => {
+                if non_self == 0 {
+                    if let Expr::If { else_branch, .. } = e {
+                        if else_branch.is_none() {
+                            return Ty::Unit;
+                        }
+                    }
+                }
+                return static_ret_ty(e);
+            }
+            Stmt::Return(None) if non_self == 0 => return Ty::Unit,
+            _ => {}
+        }
+    }
+    if non_self == 0 && !has_value_return && !func.body.is_empty() {
+        return Ty::Unit;
     }
     Ty::Unknown
 }
@@ -7623,6 +7650,26 @@ impl<'a> Checker<'a> {
         )
     }
 
+    /// 分支表达式是否为“裸类型名作值”（类/结构体名未加调用括号，表示类元类型值
+    /// `ClassType<T>`，而非其实例）。块取尾表达式。仅当该名是已知类型且未被
+    /// 变量/局部函数遮蔽时判定。
+    fn branch_is_bare_type_name_value(&self, e: &Expr) -> bool {
+        let inner = match e {
+            Expr::Block(stmts, trailing) => match trailing {
+                Some(t) => t.as_ref(),
+                None => match stmts.last() {
+                    Some(Stmt::Expr(t)) => t,
+                    _ => return false,
+                },
+            },
+            other => other,
+        };
+        match inner {
+            Expr::Var(name) => self.type_names.contains(name) && self.lookup(name).is_none(),
+            _ => false,
+        }
+    }
+
     /// 值上下文（无类型标注的绑定初始化）中对 `if` 表达式套用 4.3(15)：
     /// 两分支类型须存在最小公共超类型。
     fn check_if_supertype_in_value(&mut self, value: &Expr) {
@@ -7634,6 +7681,21 @@ impl<'a> Checker<'a> {
         {
             let t = self.branch_peek_ty(then_branch);
             let e = self.branch_peek_ty(eb);
+            // 4.3(15)（#14）：一分支为裸类型名作值（类元类型），另一分支为该类实例
+            // （`A()` / 构造值）时，二者无公共超类型。两分支同为类型名（`if c {A}
+            // else {B}`）合法，交由后续规则跳过。
+            let then_is_type = self.branch_is_bare_type_name_value(then_branch);
+            let else_is_type = self.branch_is_bare_type_name_value(eb);
+            if then_is_type != else_is_type {
+                let other = if then_is_type { &e } else { &t };
+                if matches!(other, Ty::User(_)) {
+                    self.err(format!(
+                        "if 表达式两个分支没有公共超类型：类名作值 与实例 {}（4.3(15)）",
+                        other.name()
+                    ));
+                    return;
+                }
+            }
             if Self::if_no_common_supertype(&t, &e) {
                 self.err(format!(
                     "if 表达式两个分支没有公共超类型：{} 与 {}（4.3(15)）",
