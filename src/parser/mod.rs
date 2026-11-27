@@ -1005,7 +1005,7 @@ mod tests {
                 var x: Int64;
                 var y: String;
                 init(x: Int64) { this.x = x }
-                ~init { }
+                ~init() { }
                 mut prop value: Int64 {
                     get() { return this.x }
                     set(v) { this.x = v }
@@ -1977,7 +1977,7 @@ mod tests {
     fn test_p_class_destructor_tilde_init() {
         let source = r#"
             class Foo {
-                ~init { }
+                ~init() { }
             }
         "#;
         let lexer = Lexer::new(source);
@@ -3605,7 +3605,7 @@ mod tests {
             class Foo {
                 var x: Int64
                 init(n: Int64) { this.x = n }
-                ~init { let _ = 1 }
+                ~init() { let _ = 1 }
             }
         "#;
         let lexer = Lexer::new(source);

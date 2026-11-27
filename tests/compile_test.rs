@@ -700,7 +700,7 @@ fn test_compile_class_inheritance_super_deinit() {
         class Finalizable {
             init() { }
 
-            ~init { }
+            ~init() { }
         }
 
         class Dog <: Animal {
@@ -3508,7 +3508,7 @@ fn test_memory_class_deinit() {
             init(v: Int64) {
                 this.value = v
             }
-            ~init {
+            ~init() {
                 let x = 0
             }
         }
@@ -5039,7 +5039,7 @@ fn test_class_with_deinit() {
         class Resource {
             var handle: Int64;
             init(h: Int64) { this.handle = h }
-            ~init { let _ = this.handle }
+            ~init() { let _ = this.handle }
             func getHandle(self: Resource) : Int64 { return self.handle }
         }
         func main() : Int64 { let r = Resource(42); return r.getHandle() }
@@ -9237,7 +9237,7 @@ fn test_cg5_class_deinit_with_body() {
         class C {
             var x: Int64
             init(n: Int64) { this.x = n }
-            ~init { }
+            ~init() { }
         }
         func main() : Int64 {
             let c = C(42)
@@ -10498,7 +10498,7 @@ fn test_cg8_class_with_all_features() {
         class C {
             var n: Int64;
             init(v: Int64) { this.n = v }
-            ~init { }
+            ~init() { }
             mut prop value: Int64 {
                 get() { return this.n }
                 set(v) { this.n = v }

@@ -294,6 +294,15 @@ impl Parser {
                 continue;
             }
             // 解析可见性修饰符
+            // a02_39：可见性修饰符不能单独出现在声明末尾（如 `interface I {} public`）。
+            // 记录本轮是否消费了可见性修饰符，供循环收尾（EOF）时判定悬空修饰符。
+            let had_vis = matches!(
+                self.peek(),
+                Some(Token::Public)
+                    | Some(Token::Private)
+                    | Some(Token::Protected)
+                    | Some(Token::Internal)
+            );
             let visibility = if self.check(&Token::Public) {
                 self.advance();
                 Visibility::Public
@@ -587,8 +596,18 @@ impl Parser {
                             functions.push(self.parse_function_with_visibility(visibility)?)
                         } else {
                             // macro Name(params): RetType { body } — 无 func 关键字，跳过到匹配的 }
-                            // 消费函数名
-                            let _ = self.advance_ident();
+                            // 宏定义语法要求宏名后必须有参数列表 `(...)`；
+                            // `macro A { ... }`（缺参数列表）为语法错误（见 Conformance a01_33）。
+                            let _name = match self.advance_ident() {
+                                Some(n) => n,
+                                None => return self.bail(ParseError::UnexpectedEof),
+                            };
+                            if !self.check(&Token::LParen) {
+                                return self.bail(ParseError::UnexpectedToken(
+                                    self.peek().cloned().unwrap_or(Token::Macro),
+                                    "宏定义必须在宏名后提供参数列表 `(...)`".to_string(),
+                                ));
+                            }
                             // 跳过 (params): RetType until {
                             let mut depth = 0i32;
                             loop {
@@ -620,6 +639,15 @@ impl Parser {
                     }
                     // cjc: main() 无需 func 关键字 (main 是保留字)
                     Some(Token::Main) => {
+                        // A.2.3.12：mainDefinition 不允许任何修饰符前缀（如 `public main`）。
+                        // a02_39 中 `interface I {} public` 的悬空 `public` 会被解析为
+                        // 下一个 `main` 的可见性，据此拒绝。
+                        if had_vis {
+                            return self.bail(ParseError::UnexpectedToken(
+                                Token::Main,
+                                "main 函数不能带有可见性修饰符（A.2.3.12）".to_string(),
+                            ));
+                        }
                         functions.push(self.parse_main_function(visibility)?);
                     }
                     // cjc: const func — const 作为函数前缀（常量求值语义）
@@ -672,7 +700,14 @@ impl Parser {
                                 .to_string(),
                         ))
                     }
-                    None => break,
+                    None => {
+                        // a02_39：可见性修饰符后无任何声明（如 `interface I {} public`），
+                        // 属于悬空修饰符，应为语法错误，不能静默接受。
+                        if had_vis {
+                            return self.bail(ParseError::UnexpectedEof);
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -3562,7 +3597,8 @@ impl Parser {
                         "finalizer 不能带修饰符".to_string(),
                     ));
                 }
-                // cjc: ~init 析构函数，规范写作 `~init()`（可带空参数括号）
+                // 6.1.2.5(3)：finalizer 专用语法 `~init ( ) block`——参数括号 `()` 必需，
+                // 不可省略（`~init {}` 为语法错误；见 Conformance a03_06）。
                 self.advance(); // consume ~
                 self.expect(Token::Init)?; // consume init
                 if self.check(&Token::Lt) {
@@ -3571,16 +3607,20 @@ impl Parser {
                         "finalizer 不能带泛型参数".to_string(),
                     ));
                 }
-                if self.check(&Token::LParen) {
-                    self.advance();
-                    if !self.check(&Token::RParen) {
-                        return self.bail(ParseError::UnexpectedToken(
-                            self.peek().cloned().unwrap_or(Token::RParen),
-                            "finalizer 不能带参数".to_string(),
-                        ));
-                    }
-                    self.expect(Token::RParen)?;
+                if !self.check(&Token::LParen) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        self.peek().cloned().unwrap_or(Token::Tilde),
+                        "finalizer 必须写成 `~init()`（6.1.2.5(3)）".to_string(),
+                    ));
                 }
+                self.advance();
+                if !self.check(&Token::RParen) {
+                    return self.bail(ParseError::UnexpectedToken(
+                        self.peek().cloned().unwrap_or(Token::RParen),
+                        "finalizer 不能带参数".to_string(),
+                    ));
+                }
+                self.expect(Token::RParen)?;
                 if self.check(&Token::Colon) {
                     return self.bail(ParseError::UnexpectedToken(
                         Token::Colon,
@@ -6053,6 +6093,35 @@ main() {}
         // 6.1.2.5(6)：一个类至多一个 finalizer。
         err("class C {\n ~init() {}\n ~init() {}\n}\nmain() {}");
         ok("class C {\n ~init() {}\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w26d_finalizer_requires_empty_parens() {
+        // 6.1.2.5(3)：finalizer 语法为 `~init ( ) block`，参数括号不可省略。
+        err("class C {\n ~init {}\n}\nmain() {}");
+        err("class C {\n ~init { let _ = 1 }\n}\nmain() {}");
+        ok("class C {\n ~init() {}\n}\nmain() {}");
+        ok("class C {\n ~init() { let _ = 1 }\n}\nmain() {}");
+    }
+
+    #[test]
+    fn test_w26d_macro_definition_requires_param_list() {
+        // 宏定义语法要求宏名后必须有参数列表 `(...)`；
+        // `macro A { ... }`（缺参数列表，如试图以 macro 定义接口）为语法错误。
+        err("macro A {\n    func f(): Unit\n}\n\nmain() {\n}");
+        err("macro A {\n    quote(1)\n}\n\nmain() {\n}");
+        // 正常宏定义（带参数列表）应通过。
+        ok("macro A(): Unit {\n    quote(1)\n}\n\nmain() {\n}");
+    }
+
+    #[test]
+    fn test_w26d_dangling_visibility_and_modifier_before_main() {
+        // A.2.3.12：main 定义不允许修饰符前缀；
+        // a02_39 中 `interface I {} public` 的悬空可见性会落到后续 main 上。
+        err("interface I {} public\n\nmain() {\n}");
+        // 悬空可见性后直接 EOF 亦应报错。
+        err("interface I {} public");
+        ok("interface I {}\n\nmain() {\n}");
     }
 
     #[test]

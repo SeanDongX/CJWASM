@@ -3380,7 +3380,16 @@ mod tests {
     #[test]
     fn test_destructor_with_parens() {
         parse_ok("class A { ~init() {} }");
-        parse_ok("class A { ~init {} }");
+        // 6.1.2.5(3)：finalizer 参数括号 `()` 必需，`~init {}` 为语法错误。
+        let src = "class A { ~init {} }";
+        let tokens: Result<Vec<_>, _> = Lexer::new(src).collect();
+        let tokens = tokens.expect("lex error");
+        let mut parser = Parser::new(tokens).with_source(src);
+        assert!(
+            parser.parse_program().is_err(),
+            "finalizer 缺参数括号应报语法错误:\n{}",
+            src
+        );
     }
 
     #[test]
