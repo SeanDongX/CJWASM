@@ -270,6 +270,8 @@ impl Parser {
         // 仅在紧跟 package 时按 `macro package` 处理，否则 macro 属于后续声明
         if self.check(&Token::Macro) && matches!(self.peek_at(1), Some(Token::Package)) {
             self.advance(); // 消费 macro
+            // 14.2.1(1)：宏声明只能位于宏包中，记录本文件为宏包。
+            self.attr_meta.is_macro_package = true;
         }
         // protected package 仅在紧跟 package 时才按包声明处理；
         // 否则 `protected` 是后续声明的可见性修饰符（如 protected class）
@@ -6384,7 +6386,8 @@ main() {}
         err("macro A {\n    func f(): Unit\n}\n\nmain() {\n}");
         err("macro A {\n    quote(1)\n}\n\nmain() {\n}");
         // 正常宏定义（带参数列表）应通过。
-        ok("macro A(): Unit {\n    quote(1)\n}\n\nmain() {\n}");
+        // 14.2.1：宏声明只能位于宏包，故以 `macro package` 声明包。
+        ok("macro package test\n\nmacro A(): Unit {\n    quote(1)\n}\n\nmain() {\n}");
     }
 
     #[test]

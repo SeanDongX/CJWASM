@@ -909,6 +909,9 @@ pub struct AttrMeta {
     pub macro_decls: std::collections::HashSet<String>,
     /// 声明位置出现的 `@Name` 使用：`(名字, 是否为修饰符关键字误作注解名)`。
     pub used_decl_attrs: Vec<(String, bool)>,
+    /// 本文件是否以 `macro package` 形式声明包（宏包）。14.2.1(1)：宏声明
+    /// 只能位于宏包中；非宏包（含无 package）内的宏声明为非法。
+    pub is_macro_package: bool,
 }
 
 impl AttrMeta {
@@ -917,6 +920,7 @@ impl AttrMeta {
         self.annotation_decls.extend(other.annotation_decls);
         self.macro_decls.extend(other.macro_decls);
         self.used_decl_attrs.extend(other.used_decl_attrs);
+        self.is_macro_package |= other.is_macro_package;
     }
 }
 

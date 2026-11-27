@@ -958,6 +958,14 @@ fn inject_static_field_throws(program: &mut Program) {
             pending.push((format!("{}.__static_init", s.name), e));
         }
     }
+    // 顶层变量初始化式为无条件 throw（`var n = throw X()`）：程序启动时求值并因
+    // 抛出而终止（4.7(8)：throw 在顶层作用域无同类规则，仍是合法表达式，运行期
+    // 终止）。与静态字段 throw 复用启动序 `.__static_init` 机制。
+    for (i, c) in program.constants.iter().enumerate() {
+        if let Expr::Throw(_) = &c.init {
+            pending.push((format!("GlobalInitThrow{}.__static_init", i), c.init.clone()));
+        }
+    }
     for (name, e) in pending {
         if existing.contains(&name) {
             continue;

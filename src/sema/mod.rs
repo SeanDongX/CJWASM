@@ -385,6 +385,13 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 报错在检查阶段且门限（无 import、无 package）在函数内生效——std 各文件
     // 均带 package 声明，故不触发。
     check_annotation_name_resolution(program, &mut errors);
+    // 14.2.1：宏声明只能位于宏包（`macro package`）中。无 package / import 的
+    // 单文件程序若声明宏，官方报「macro declaration must be defined in macro
+    // package」（01/04 a02_2）。
+    check_macro_declarations_in_macro_package(program, &mut errors);
+    // 1.4(6)：无符号整型常量的一元负号在常量折叠阶段溢出
+    // （01/04 a06_12…a06_17）。
+    check_unsigned_unary_negation(program, &index, &mut errors);
     // 3.3.2.2(8)：类/结构体的静态成员变量必须立即初始化（无 static init 时）。
     check_static_fields_initialized(program, &mut errors);
     // 3.2.3.1(1)/3.2.3(1)：顶层变量初始化式只能引用顶层可见的名字。
@@ -4487,6 +4494,18 @@ fn is_builtin_user_attr(name: &str) -> bool {
             | "Java"
             | "ObjC"
             | "CJ"
+            | "PowerAssert"
+            // std.unittest 断言 / mock 宏（无 package 的 std unittest 用例在
+            // 语句位置调用，如 `@Assert(...)` / `@AssertThrows[...]`）。
+            | "Assert"
+            | "Expect"
+            | "Fail"
+            | "AssertThrows"
+            | "ExpectThrows"
+            | "CustomAssertion"
+            | "FailExpect"
+            | "On"
+            | "Called"
     )
 }
 
@@ -4532,6 +4551,403 @@ fn check_annotation_name_resolution(program: &Program, errors: &mut Vec<Semantic
                 message: format!("未声明的注解或宏 '{}'（17.1(3)）", name),
             });
         }
+    }
+    // 表达式/语句位置宏调用 `@Name` 的名字解析：与声明位置同一门限，宏名必须是
+    // 内建框架宏或本文件定义的宏（官方 02/04 unit a02_02：`@u1` 为未定义宏）。
+    // 只扫描函数体 / 顶层常量初始化式 / 形参默认值（本编译器可静态确定的
+    // 全部执行体；与未定义标识符检查同域）。
+    let mut call_names: Vec<String> = Vec::new();
+    let mut collect = |e: &crate::ast::Expr| {
+        if let crate::ast::Expr::Macro { name, .. } = e {
+            call_names.push(name.clone());
+        }
+    };
+    for f in &program.functions {
+        walk_stmts(&f.body, &mut collect);
+        for p in &f.params {
+            if let Some(d) = &p.default {
+                walk_expr(d, &mut collect);
+            }
+        }
+    }
+    for c in &program.constants {
+        walk_expr(&c.init, &mut collect);
+    }
+    for name in call_names {
+        if is_builtin_user_attr(&name) || meta.macro_decls.contains(&name) {
+            continue;
+        }
+        if reported.insert(format!("\u{0}call:{}", name)) {
+            errors.push(SemanticError {
+                message: format!("未声明的宏 '{}'（17.1(3)）", name),
+            });
+        }
+    }
+}
+
+/// 14.2.1：宏声明只能位于宏包（`macro package`）中。
+///
+/// 门限：无 package、无 import 的单文件程序（与注解名解析一致，保证标准库 /
+/// 多文件包零误伤）。此形态下的任何宏声明都缺少宏包上下文，官方报
+/// 「macro declaration must be defined in macro package」（01/04 a02_2）。
+fn check_macro_declarations_in_macro_package(
+    program: &Program,
+    errors: &mut Vec<SemanticError>,
+) {
+    if program.package_name.is_some() || !program.imports.is_empty() {
+        return;
+    }
+    let meta = &program.attr_meta;
+    if meta.is_macro_package || meta.macro_decls.is_empty() {
+        return;
+    }
+    let mut names: Vec<&String> = meta.macro_decls.iter().collect();
+    names.sort();
+    for n in names {
+        errors.push(SemanticError {
+            message: format!("宏声明 '{}' 必须定义在宏包（macro package）中（14.2.1）", n),
+        });
+    }
+}
+
+/// 常量折叠下的整型常量：`(声明/推断类型, 值)`。
+#[derive(Clone)]
+struct ConstIntValue {
+    ty: Option<Type>,
+    val: i128,
+}
+
+/// 无符号整型常量的一元负号溢出（01/04 a06_12…a06_17）。
+///
+/// 官方在常量折叠阶段判定：`-c` 中 `c` 为存在常量值且值非 0 的无符号整型
+/// 常量时，取负必然溢出，报「arithmetic operation '-' overflow」。运行期值
+/// （形参、非恒定初始化）不参与折叠，故 `-x`（x 为无符号形参）合法。
+fn check_unsigned_unary_negation(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    // 全局不可变绑定常量表（按声明顺序折叠，后声明的可引用先声明的）。
+    let mut globals: HashMap<String, ConstIntValue> = HashMap::new();
+    for c in &program.constants {
+        if c.is_mut {
+            continue;
+        }
+        if let Some(mut cv) = eval_const_int(&c.init, &globals, index, 0) {
+            cv.ty = Some(c.ty.clone());
+            globals.insert(c.name.clone(), cv);
+        }
+    }
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") || f.body.is_empty() {
+            continue;
+        }
+        let mut env = globals.clone();
+        // 形参是运行期值，即使与全局同名也遮蔽为未知。
+        for p in &f.params {
+            env.remove(&p.name);
+        }
+        // 任何在函数体内被重新赋值的名字都不再是常量（含嵌套块 / lambda /
+        // 局部函数中的赋值与自增自减），避免把运行期值误当常量折叠。
+        let mut assigned: HashSet<String> = HashSet::new();
+        collect_assigned_var_names(&f.body, &mut assigned);
+        for n in &assigned {
+            env.remove(n);
+        }
+        scan_unsigned_neg_stmts(&f.body, &mut env, &assigned, index, errors);
+    }
+}
+
+/// 收集函数体内被赋值（`x = …` / `x++` / `x--`）的变量名（递归进入所有
+/// 语句块 / 表达式中的块、异常块、spawn 块、lambda 体与局部函数体）。
+fn collect_assigned_var_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign {
+                target: AssignTarget::Var(name),
+                value,
+            } => {
+                out.insert(name.clone());
+                collect_assigned_in_expr(value, out);
+            }
+            Stmt::Assign { value, .. } => collect_assigned_in_expr(value, out),
+            Stmt::Let { value, .. }
+            | Stmt::Var { value, .. }
+            | Stmt::Const { value, .. } => collect_assigned_in_expr(value, out),
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => collect_assigned_in_expr(e, out),
+            Stmt::While { cond, body } => {
+                collect_assigned_in_expr(cond, out);
+                collect_assigned_var_names(body, out);
+            }
+            Stmt::WhileLet { expr, body, .. } => {
+                collect_assigned_in_expr(expr, out);
+                collect_assigned_var_names(body, out);
+            }
+            Stmt::DoWhile { body, cond } => {
+                collect_assigned_var_names(body, out);
+                collect_assigned_in_expr(cond, out);
+            }
+            Stmt::For { iterable, body, .. } => {
+                collect_assigned_in_expr(iterable, out);
+                collect_assigned_var_names(body, out);
+            }
+            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+                collect_assigned_var_names(body, out)
+            }
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                collect_assigned_in_expr(left, out);
+                collect_assigned_in_expr(right, out);
+            }
+            Stmt::LocalFunc(func) => collect_assigned_var_names(&func.body, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_assigned_in_expr(e: &Expr, out: &mut HashSet<String>) {
+    walk_expr(e, &mut |sub| match sub {
+        Expr::PostfixIncr(inner)
+        | Expr::PostfixDecr(inner)
+        | Expr::PrefixIncr(inner)
+        | Expr::PrefixDecr(inner) => {
+            if let Expr::Var(name) = &**inner {
+                out.insert(name.clone());
+            }
+        }
+        Expr::Block(stmts, tail) => {
+            collect_assigned_var_names(stmts, out);
+            if let Some(t) = tail {
+                collect_assigned_in_expr(t, out);
+            }
+        }
+        Expr::TryBlock {
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            collect_assigned_var_names(body, out);
+            collect_assigned_var_names(catch_body, out);
+            if let Some(b) = finally_body {
+                collect_assigned_var_names(b, out);
+            }
+        }
+        Expr::Spawn { body } | Expr::Synchronized { body, .. } => {
+            collect_assigned_var_names(body, out)
+        }
+        _ => {}
+    });
+}
+
+fn scan_unsigned_neg_stmts(
+    stmts: &[Stmt],
+    env: &mut HashMap<String, ConstIntValue>,
+    assigned: &HashSet<String>,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::Let { pattern, ty, value } | Stmt::Var { pattern, ty, value } => {
+                scan_unsigned_neg_expr(value, env, index, errors);
+                if let Pattern::Binding(name) = pattern {
+                    // 函数体内被重新赋值过的名字不参与常量折叠。
+                    if !assigned.contains(name) {
+                        if let Some(mut cv) = eval_const_int(value, env, index, 0) {
+                            if let Some(t) = ty {
+                                cv.ty = Some(t.clone());
+                            }
+                            env.insert(name.clone(), cv);
+                            continue;
+                        }
+                    }
+                    env.remove(name);
+                }
+            }
+            Stmt::Const { name, ty, value } => {
+                scan_unsigned_neg_expr(value, env, index, errors);
+                if !assigned.contains(name) {
+                    if let Some(mut cv) = eval_const_int(value, env, index, 0) {
+                        if let Some(t) = ty {
+                            cv.ty = Some(t.clone());
+                        }
+                        env.insert(name.clone(), cv);
+                        continue;
+                    }
+                }
+                env.remove(name);
+            }
+            Stmt::Assign { target, value } => {
+                scan_unsigned_neg_expr(value, env, index, errors);
+                if let AssignTarget::Var(name) = target {
+                    env.remove(name);
+                }
+            }
+            Stmt::Expr(e) => scan_unsigned_neg_expr(e, env, index, errors),
+            Stmt::Return(Some(e)) => scan_unsigned_neg_expr(e, env, index, errors),
+            Stmt::While { cond, body } => {
+                scan_unsigned_neg_expr(cond, env, index, errors);
+                let mut inner = env.clone();
+                scan_unsigned_neg_stmts(body, &mut inner, assigned, index, errors);
+            }
+            Stmt::DoWhile { body, cond } => {
+                let mut inner = env.clone();
+                scan_unsigned_neg_stmts(body, &mut inner, assigned, index, errors);
+                scan_unsigned_neg_expr(cond, env, index, errors);
+            }
+            Stmt::For { iterable, body, var } => {
+                scan_unsigned_neg_expr(iterable, env, index, errors);
+                let mut inner = env.clone();
+                inner.remove(var);
+                scan_unsigned_neg_stmts(body, &mut inner, assigned, index, errors);
+            }
+            Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+                let mut inner = env.clone();
+                scan_unsigned_neg_stmts(body, &mut inner, assigned, index, errors);
+            }
+            Stmt::WhileLet {
+                pattern,
+                expr,
+                body,
+            } => {
+                scan_unsigned_neg_expr(expr, env, index, errors);
+                let mut inner = env.clone();
+                if let Pattern::Binding(name) = pattern {
+                    inner.remove(name);
+                }
+                scan_unsigned_neg_stmts(body, &mut inner, assigned, index, errors);
+            }
+            Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+                scan_unsigned_neg_expr(left, env, index, errors);
+                scan_unsigned_neg_expr(right, env, index, errors);
+            }
+            Stmt::LocalFunc(func) => {
+                let mut inner = env.clone();
+                for p in &func.params {
+                    inner.remove(&p.name);
+                }
+                scan_unsigned_neg_stmts(&func.body, &mut inner, assigned, index, errors);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_unsigned_neg_expr(
+    e: &Expr,
+    env: &mut HashMap<String, ConstIntValue>,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    walk_expr(e, &mut |sub| {
+        if let Expr::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } = sub
+        {
+            if let Some(cv) = eval_const_int(expr, env, index, 0) {
+                let unsigned = cv
+                    .ty
+                    .as_ref()
+                    .map(|t| is_unsigned_int_type(t, index))
+                    .unwrap_or(false);
+                if unsigned && cv.val != 0 {
+                    errors.push(SemanticError {
+                        message:
+                            "无符号整型常量的取负运算溢出（'-' 未对无符号类型定义，1.4(6)）"
+                                .to_string(),
+                    });
+                }
+            }
+        }
+    });
+}
+
+fn is_unsigned_int_type(t: &Type, index: &ProgramIndex<'_>) -> bool {
+    matches!(
+        expand_alias_type(t, index, 0),
+        Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 | Type::UIntNative
+    )
+}
+
+/// 轻量常量求值：只处理整型字面量、常量变量、一元负号与 `+ - *` 二元运算。
+/// 无法静态求值（运行期值、函数调用等）返回 `None`。
+fn eval_const_int(
+    e: &Expr,
+    env: &HashMap<String, ConstIntValue>,
+    index: &ProgramIndex<'_>,
+    depth: usize,
+) -> Option<ConstIntValue> {
+    if depth > 16 {
+        return None;
+    }
+    match e {
+        Expr::Integer(v) => Some(ConstIntValue {
+            ty: None,
+            val: *v as i128,
+        }),
+        Expr::IntegerSuffixed(v, suf) => Some(ConstIntValue {
+            ty: Some(suf.ty()),
+            val: *v as i128,
+        }),
+        Expr::IntegerOverflow(v, Some(suf)) => Some(ConstIntValue {
+            ty: Some(suf.ty()),
+            val: *v as i128,
+        }),
+        Expr::IntegerOverflow(v, None) => Some(ConstIntValue {
+            ty: None,
+            val: *v as i128,
+        }),
+        Expr::Var(name) => env.get(name).cloned(),
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Neg,
+            expr,
+        } => {
+            let c = eval_const_int(expr, env, index, depth + 1)?;
+            let unsigned = c
+                .ty
+                .as_ref()
+                .map(|t| is_unsigned_int_type(t, index))
+                .unwrap_or(false);
+            if unsigned {
+                // 无符号常量取负本身非法（由取负检查报错），不传播常量。
+                return None;
+            }
+            Some(ConstIntValue {
+                ty: c.ty,
+                val: -c.val,
+            })
+        }
+        Expr::Binary {
+            op: op @ (crate::ast::BinOp::Add | crate::ast::BinOp::Sub | crate::ast::BinOp::Mul),
+            left,
+            right,
+        } => {
+            let l = eval_const_int(left, env, index, depth + 1)?;
+            let r = eval_const_int(right, env, index, depth + 1)?;
+            let unsigned = l
+                .ty
+                .as_ref()
+                .or(r.ty.as_ref())
+                .map(|t| is_unsigned_int_type(t, index))
+                .unwrap_or(false);
+            let val = match op {
+                crate::ast::BinOp::Add => l.val.checked_add(r.val)?,
+                crate::ast::BinOp::Sub => l.val.checked_sub(r.val)?,
+                crate::ast::BinOp::Mul => l.val.checked_mul(r.val)?,
+                _ => return None,
+            };
+            if unsigned && (val < 0 || val > u64::MAX as i128) {
+                return None;
+            }
+            let ty = l.ty.or(r.ty);
+            Some(ConstIntValue { ty, val })
+        }
+        Expr::Cast {
+            expr,
+            target_ty: _,
+        } => eval_const_int(expr, env, index, depth + 1),
+        _ => None,
     }
 }
 
@@ -4635,7 +5051,14 @@ fn collect_bare_var_refs_stmt(stmt: &Stmt, out: &mut Vec<String>) {
         Stmt::While { cond, .. } | Stmt::DoWhile { cond, .. } => {
             collect_bare_var_refs_expr(cond, out)
         }
-        Stmt::For { iterable, .. } => collect_bare_var_refs_expr(iterable, out),
+        Stmt::For { iterable, body, .. } => {
+            collect_bare_var_refs_expr(iterable, out);
+            // for 体是当前函数的子作用域（不是 lambda / 局部函数体），其裸引用
+            // 同样适用未定义检查；循环变量与体内局部名已由声明集合过近似覆盖。
+            for s in body {
+                collect_bare_var_refs_stmt(s, out);
+            }
+        }
         Stmt::WhileLet { expr, .. } => collect_bare_var_refs_expr(expr, out),
         Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
             collect_bare_var_refs_expr(left, out);
@@ -4693,9 +5116,25 @@ fn collect_bare_var_refs_expr(expr: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::Call {
-            args, named_args, ..
+            name,
+            args,
+            named_args,
+            ..
+        } => {
+            // 3.2.3.2：以下划线开头的裸调用名不是隐式导入符号；若本文件任何
+            // 作用域都未声明，则在无 import（或仅单项目导入）的单文件程序里
+            // 按未定义标识符报错（官方 a03_05：`_add(3+RTZero)` 未定义）。
+            if name.starts_with('_') {
+                out.push(name.clone());
+            }
+            for a in args {
+                collect_bare_var_refs_expr(a, out);
+            }
+            for (_, a) in named_args {
+                collect_bare_var_refs_expr(a, out);
+            }
         }
-        | Expr::ConstructorCall {
+        Expr::ConstructorCall {
             args, named_args, ..
         }
         | Expr::SuperCall {
@@ -40831,19 +41270,63 @@ main() {}"#,
     }
 
     #[test]
-    fn test_w28d_local_array_param_scalar_arg() {
-        // 局部函数的数组形参收到标量实参（变长实参语法糖误用）。
+    fn test_w42a_macro_decl_requires_macro_package() {
+        // 14.2.1：无 package 单文件中的宏声明非法（01/04 a02_2）。
         let errs = assert_invalid(
-            "main() {\n func f0(arr: Array<Rune>, a: Bool): String { \"x\" }\n f0('d', true)\n}",
+            "public macro m(a: Int64) {\n quote(1)\n}\n\nmain() {\n}",
         );
-        assert!(errs.iter().any(|e| e.message.contains("数组形参")), "{:?}", errs);
-        let errs = assert_invalid(
-            "main() {\n func f0(z: Int32, x!: Array<Int32>): String { \"x\" }\n f0(3, x: 5)\n}",
+        assert!(
+            errs.iter().any(|e| e.message.contains("宏包")),
+            "{:?}",
+            errs
         );
-        assert!(errs.iter().any(|e| e.message.contains("数组形参")), "{:?}", errs);
-        // 正例：传入数组字面量。
+        // 宏包内合法。
         assert_valid(
-            "main() {\n func f0(arr: Array<Rune>, a: Bool): String { \"x\" }\n f0(['d'], true)\n}",
+            "macro package test\n\npublic macro m(a: Int64) {\n quote(1)\n}\n\nmain() {\n}",
+        );
+    }
+
+    #[test]
+    fn test_w42a_undeclared_macro_call_in_statement() {
+        // 17.1(3)：无 import/package 单文件中的 `@Name` 宏调用必须已声明
+        //（官方 02/04 unit a02_02：`@u1`）。
+        let errs = assert_invalid("func foo(): Unit {}\n\nmain() {\n var u1: Unit = foo()\n @u1\n}");
+        assert!(errs.iter().any(|e| e.message.contains("未声明的宏")), "{:?}", errs);
+        // 内建框架宏放行。
+        assert_valid("main() {\n @Test\n @PowerAssert(1 == 1)\n}");
+    }
+
+    #[test]
+    fn test_w42a_undefined_underscore_callee() {
+        // 3.2.3.2：以下划线开头的裸调用名未声明即为未定义（官方 a03_05）。
+        let errs = assert_invalid("main() {\n _add(3)\n}");
+        assert!(
+            errs.iter().any(|e| e.message.contains("'_add'")),
+            "{:?}",
+            errs
+        );
+        // 本文件定义的下划线函数合法。
+        assert_valid("func _add(x: Int64): Int64 { x }\n\nmain() {\n _add(3)\n}");
+    }
+
+    #[test]
+    fn test_w42a_unsigned_unary_negation_constant() {
+        // 1.4(6)：无符号整型常量取负在常量折叠阶段溢出（01/04 a06_12…）。
+        let errs = assert_invalid(
+            "type T = UInt16\nlet c: T = 1u16\n\nmain() {\n var p: T = c\n let r = -p\n}",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("取负")),
+            "{:?}",
+            errs
+        );
+        // 值 0 不溢出。
+        assert_valid("type T = UInt16\nlet c: T = 0u16\n\nmain() {\n let r = -c\n}");
+        // 形参等运行期值不参与常量折叠。
+        assert_valid("func f(x: UInt8): UInt8 {\n let y = -x\n y\n}\n\nmain() {\n}");
+        // 声明后被重新赋值的 var 不是常量（嵌套块内赋值同样使常量失效）。
+        assert_valid(
+            "func f(): UInt8 { 3 }\n\nmain() {\n var x: UInt8 = 5\n if (false) { x = f() }\n let y = -x\n}",
         );
     }
 

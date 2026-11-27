@@ -33,6 +33,8 @@
 
 <h1>CJWasm 官方 Conformance 套件矛盾档案<br><span style="font-size:.9rem;font-weight:400">一元负号作用于 Bool / 无符号整数（4.15(4) vs 2.1.1.2(2)）</span></h1>
 
+<div class="warn"><b>batch-42 终态更新（2026-11-27，w42d）：</b>本组 11 项中的 <b>10 项一元负号</b>（<code>01/04 a06_12/13/15/16/17</code>、<code>04/15 a04_06~10</code>）已被证明为<b>常量折叠溢出可区分负例</b>——官方正例 a15_01 的取值均为 <code>0</code>，而这些负例为非 0 常量（<code>ct1=1u16</code> / <code>var v=1</code>），官方在常量折叠期报 overflow，并非矛盾；已由 <code>check_unsigned_unary_negation</code> 修复。仅 Bool 取负 <code>a04_02</code> 仍归 L #23。<b>X 总数因此由 160 修正为 150。</b>终局口径见 <code>.compat-run/final-report/unary-minus_archive.md</code> 与 <code>final-report.md</code> §5.1/§7.11。</div>
+
 <p><b>记录时间：</b>2026-11-27（batch-25，commit 76fbb3d 存档）<br>
 <b>规则冲突双方：</b>《仓颉语言规范》4.15(4)「一元 <code>-</code> 只作用于数值类型（有符号语义）」 与 2.1.1.2(2)「所有列出的运算符（含一元负号）对全部整数类型（含 UInt 家族）定义」。</p>
 
