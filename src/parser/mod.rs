@@ -67,6 +67,10 @@ pub struct Parser {
     /// 当前 match case 顶层元组模式中各元素整数字面量的后缀（无后缀记 None）。
     /// 由 parse_match_arms 在解析每个 case 前清空、解析后消费。
     pattern_int_suffixes: Vec<Option<crate::ast::IntSuffix>>,
+    /// 解析移位运算符 `<<`/`>>` 的右操作数时为 true：此时后缀 `as` 绑定优先级
+    /// 低于移位（4.28），应由移位解析器在移位链之后统一处理，而非在右操作数
+    /// 的 postfix 阶段被吞掉（如 `c << 4 as C` 应解析为 `(c << 4) as C`）。
+    suppress_shift_as: bool,
 }
 
 impl Parser {
@@ -98,6 +102,7 @@ impl Parser {
             parsed_tuple_types: Vec::new(),
             pattern_tuple_depth: 0,
             pattern_int_suffixes: Vec::new(),
+            suppress_shift_as: false,
         }
     }
 

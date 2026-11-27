@@ -597,6 +597,16 @@ fn pattern_is_enum_catch_all(p: &Pattern, variants: &HashSet<String>) -> bool {
     }
 }
 
+/// 整型 match 模式是否为兜底（wildcard / 变量绑定，含 `|` 连接的子模式）。
+/// 整型选择子上出现即视为穷尽（4.4(14)）。
+fn pattern_is_int_catch_all(p: &Pattern) -> bool {
+    match p {
+        Pattern::Wildcard | Pattern::Binding(_) => true,
+        Pattern::Or(ps) => ps.iter().any(pattern_is_int_catch_all),
+        _ => false,
+    }
+}
+
 /// 收集模式中引用的全部枚举变体名（含 `|`/元组/变体实参内嵌套者）。
 fn collect_pattern_variant_refs(p: &Pattern, variants: &HashSet<String>, out: &mut Vec<String>) {
     match p {
@@ -1118,6 +1128,14 @@ struct Checker<'a> {
     ctor_types: HashSet<String>,
     /// (接收者类型名, 运算符方法名) → 该运算符声明的返回类型。
     operator_returns: HashMap<(String, String), Ty>,
+    /// (类型名, 运算符方法名) → 该运算符唯一声明的（非 this）形参类型。
+    /// 用于校验用户重载二元运算符的右操作数类型（如 `c << (4 as C)` 中
+    /// `C.operator<<(x: Int64)` 要求 Int64，而实参推导为 C，非法）。
+    operator_params: HashMap<(String, String), Ty>,
+    /// (接口名, 默认实现方法名) → 该默认实现的返回类型（无显式标注时从函数体保守推断，
+    /// `this` 的编译期类型即接口类型）。用于把经实现类型调用到的接口默认实现方法
+    /// 结果建模为接口类型（6.2.2.2）。
+    iface_default_returns: HashMap<(String, String), Ty>,
     /// (类型名, 方法名) → 静态/类型限定方法返回类型（`T.m()`）。
     static_method_returns: HashMap<(String, String), Ty>,
     /// (类型名, 静态方法名) → 该方法的类型参数与约束（显式类型实参检查，6.1.2.4(24)）。
@@ -1665,6 +1683,8 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     // 与静态方法返回类型，供赋值语句阶段校验。
     let (user_parents, ctor_types) = collect_user_graph(program);
     let operator_returns = collect_operator_returns(program, &type_names);
+    let operator_params = collect_operator_params(program, &type_names);
+    let iface_default_returns = collect_iface_default_returns(program, &type_names);
     let static_method_returns = collect_static_method_returns(program, &type_names);
 
     // 显式泛型实例化（`C<T>()` / `f<T>(..)`）的约束满足检查所需的定义表。
@@ -2674,6 +2694,8 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         user_parents,
         ctor_types,
         operator_returns,
+        operator_params,
+        iface_default_returns,
         static_method_returns,
         static_method_generics: collect_static_method_generics(program),
         ret_ty: None,
@@ -4051,6 +4073,71 @@ fn collect_method_returns(
     out
 }
 
+/// 收集 (接口名, 默认实现方法名) → 该默认实现的返回类型。
+///
+/// 6.2.2.2(4)：接口实例成员默认实现体内的 `this` 的编译期类型即接口自身。
+/// 因此当默认实现无显式返回标注、而 `return this` / 尾表达式为 `this` 时，
+/// 其返回类型即该接口。只处理零个额外形参的默认实现，避免对带参调用的过度推断。
+fn collect_iface_default_returns(
+    program: &Program,
+    type_names: &HashSet<String>,
+) -> HashMap<(String, String), Ty> {
+    let mut out: HashMap<(String, String), Ty> = HashMap::new();
+    let mut dup: HashSet<(String, String)> = HashSet::new();
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            if m.is_static {
+                continue;
+            }
+            let Some(body) = &m.default_body else {
+                continue;
+            };
+            if m.params
+                .iter()
+                .any(|p| p.name != "this" && p.name != "self")
+            {
+                continue;
+            }
+            let ty = match &m.return_type {
+                Some(rt) => ty_of_known(rt, type_names),
+                None => {
+                    let tail = match body.last() {
+                        Some(Stmt::Expr(e)) => Some(e),
+                        Some(Stmt::Return(Some(e))) => Some(e),
+                        _ => None,
+                    };
+                    match tail {
+                        // `this` 的编译期类型即接口类型。
+                        Some(Expr::Var(n)) if n == "this" || n == "self" => {
+                            Ty::User(iface.name.clone())
+                        }
+                        Some(e) => infer_default_ty(e, type_names),
+                        None => Ty::Unknown,
+                    }
+                }
+            };
+            if ty == Ty::Unknown {
+                continue;
+            }
+            let key = (iface.name.clone(), member_name(&m.name).to_string());
+            if dup.contains(&key) {
+                // 重载返回类型不一致：移除以免误判。
+                out.remove(&key);
+                continue;
+            }
+            if let Some(prev) = out.get(&key) {
+                if *prev != ty {
+                    out.remove(&key);
+                    dup.insert(key);
+                }
+                continue;
+            }
+            out.insert(key, ty);
+        }
+    }
+    out
+}
+
 const KNOWN_OPERATOR_METHODS: &[&str] = &[
     "op_add", "op_sub", "op_mul", "op_div", "op_mod", "op_pow", "op_eq", "op_ne", "op_lt",
     "op_gt", "op_le", "op_ge", "op_bitand", "op_bitor", "op_bitxor", "op_shl", "op_shr",
@@ -4229,6 +4316,91 @@ fn collect_operator_returns(
                 .as_ref()
                 .map(|t| ty_of_known(t, type_names))
                 .unwrap_or(Ty::Unknown);
+            if ty != Ty::Unknown {
+                out.insert((iface.name.clone(), member.to_string()), ty);
+            }
+        }
+    }
+    out
+}
+
+/// 收集 (类型名, 运算符方法名) → 该运算符唯一声明的（非 this/self）形参类型。
+///
+/// 仅记录形参可解析为确定类型者；同一 `(类型, 运算符)` 在多次声明间形参类型
+/// 不一致（重载）时移除，避免误判。用于校验用户重载二元运算符（尤其移位）
+/// 的右操作数类型。
+fn collect_operator_params(
+    program: &Program,
+    type_names: &HashSet<String>,
+) -> HashMap<(String, String), Ty> {
+    let mut out: HashMap<(String, String), Ty> = HashMap::new();
+    let mut dup: HashSet<(String, String)> = HashSet::new();
+    let mut record = |owner: &str, fname: &str, params: &[crate::ast::Param]| {
+        let member = member_name(fname);
+        if !KNOWN_OPERATOR_METHODS.contains(&member) {
+            return;
+        }
+        let mut it = params
+            .iter()
+            .filter(|p| p.name != "this" && p.name != "self");
+        let Some(p) = it.next() else {
+            return;
+        };
+        if it.next().is_some() {
+            return;
+        }
+        let ty = ty_of_known(&p.ty, type_names);
+        if ty == Ty::Unknown {
+            return;
+        }
+        let key = (owner.to_string(), member.to_string());
+        if dup.contains(&key) {
+            out.remove(&key);
+            return;
+        }
+        if let Some(prev) = out.get(&key) {
+            if *prev != ty {
+                out.remove(&key);
+                dup.insert(key);
+            }
+            return;
+        }
+        out.insert(key, ty);
+    };
+    for ext in &program.extends {
+        for f in &ext.methods {
+            record(&ext.target_type, &f.name, &f.params);
+        }
+    }
+    for cls in &program.classes {
+        for m in &cls.methods {
+            record(&cls.name, &m.func.name, &m.func.params);
+        }
+    }
+    // 类的运算符函数在部分降级路径中会被脱糖为 `Type.op_xxx` 顶层函数。
+    for f in &program.functions {
+        if let Some((owner, _)) = f.name.rsplit_once('.') {
+            if type_names.contains(owner) {
+                record(owner, &f.name, &f.params);
+            }
+        }
+    }
+    drop(record);
+    for iface in &program.interfaces {
+        for m in &iface.methods {
+            let member = member_name(&m.name);
+            if !KNOWN_OPERATOR_METHODS.contains(&member) {
+                continue;
+            }
+            let ps: Vec<&crate::ast::Param> = m
+                .params
+                .iter()
+                .filter(|p| p.name != "this" && p.name != "self")
+                .collect();
+            if ps.len() != 1 {
+                continue;
+            }
+            let ty = ty_of_known(&ps[0].ty, type_names);
             if ty != Ty::Unknown {
                 out.insert((iface.name.clone(), member.to_string()), ty);
             }
@@ -7143,7 +7315,33 @@ impl<'a> Checker<'a> {
         None
     }
 
-    /// 在用户类型（含父类型）中查找零参成员方法的返回类型。
+    /// 在用户类型（含父类型/接口实现链）中查找零参成员方法的返回类型。
+    fn user_iface_default_method_ty(&self, recv: &Ty, method: &str) -> Option<Ty> {
+        let Ty::User(name) = recv else {
+            return None;
+        };
+        let mut stack: Vec<&str> = vec![name.as_str()];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if let Some(ty) = self
+                .iface_default_returns
+                .get(&(t.to_string(), method.to_string()))
+            {
+                return Some(ty.clone());
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        None
+    }
+
+    /// 在用户类型（含父类型/接口实现链）中查找零参成员方法的返回类型。
     fn user_method_ty(&self, recv: &Ty, method: &str) -> Option<Ty> {
         let Ty::User(name) = recv else {
             return None;
@@ -7499,6 +7697,72 @@ impl<'a> Checker<'a> {
                 e,
                 missing.join("、")
             ));
+        }
+    }
+
+    /// 4.4(14)：带选择子的 `match` 对**整型**选择子必须穷尽。
+    ///
+    /// 整型值域无法由有限个字面量 case 完全覆盖，故缺少 `case _` / 变量绑定
+    /// 兜底（无守卫）即为未穷尽。官方编译器对整型 match 同样要求穷尽，并提示
+    /// 补充 `case _`（4.4(22)）。
+    ///
+    /// 保守策略：仅在单文件（strict_scope）下判定；仅当选择子静态类型确定为
+    /// 整型时判定（见 [`Self::selector_is_int`]），且仅当至少有一个字面量/
+    /// 范围模式（否则由其它规则处理）。出现 wildcard/非枚举变体绑定/`Or`
+    /// 含兜底即视为穷尽。
+    fn check_int_match_exhaustive(&mut self, selector: &Expr, sel_ty: &Ty, arms: &[MatchArm]) {
+        if !self.strict_scope {
+            return;
+        }
+        if !self.selector_is_int(selector, sel_ty) {
+            return;
+        }
+        let mut has_int_case = false;
+        for arm in arms {
+            // 带守卫的兜底不保证穷尽（守卫可能失败）。
+            if arm.guard.is_some() {
+                continue;
+            }
+            if pattern_is_int_catch_all(&arm.pattern) {
+                return;
+            }
+            if matches!(
+                &arm.pattern,
+                Pattern::Literal(Literal::Integer(_))
+                    | Pattern::Literal(Literal::Rune(_))
+                    | Pattern::Range { .. }
+            ) {
+                has_int_case = true;
+            }
+        }
+        // 仅在确实按整数字面量/范围分支时为“覆盖不足”，避免空 match 等由其它
+        // 规则报错的情况重复报告。
+        if has_int_case {
+            self.err(
+                "match 表达式未穷尽整型选择子：缺少 case _（4.4(14)/4.4(22)）".to_string(),
+            );
+        }
+    }
+
+    /// 选择子是否静态确定为整型（用于整型 match 穷尽性判定）。
+    ///
+    /// `IntLit`（无标注整型字面量初始化的变量 / 带后缀字面量）可靠；具体整型
+    /// 仅在字面量或带整数字面量初始化的变量上判定，避免把“无标注非整型初始化”
+    /// 退化成占位 `Int64` 的情形（如 `var t = (1, 2)`）误判为整型。
+    fn selector_is_int(&self, selector: &Expr, sel_ty: &Ty) -> bool {
+        if !sel_ty.is_int() {
+            return false;
+        }
+        if *sel_ty == Ty::IntLit {
+            return true;
+        }
+        match selector {
+            Expr::Integer(_) | Expr::IntegerSuffixed(_, _) => true,
+            Expr::Var(n) => self
+                .lookup(n)
+                .map(|v| v.const_int.is_some())
+                .unwrap_or(false),
+            _ => false,
         }
     }
 
@@ -8994,6 +9258,65 @@ impl<'a> Checker<'a> {
         None
     }
 
+    /// 查询用户类型（含继承链）上某运算符唯一声明的形参类型。
+    fn operator_param_for(&self, receiver: &Ty, member: &str) -> Option<Ty> {
+        let Ty::User(name) = receiver else {
+            return None;
+        };
+        let mut stack: Vec<&str> = vec![name.as_str()];
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if let Some(pt) = self
+                .operator_params
+                .get(&(t.to_string(), member.to_string()))
+            {
+                return Some(pt.clone());
+            }
+            if let Some(ps) = self.user_parents.get(t) {
+                for p in ps {
+                    stack.push(p.as_str());
+                }
+            }
+        }
+        None
+    }
+
+    /// 4.18：用户类型重载 `<<`/`>>` 时，右操作数须匹配该运算符唯一声明的形参类型。
+    /// 典型负例 `c << (4 as C)`：`C.operator<<(x: Int64)` 要求 Int64，而实参推导为 C。
+    /// 仅在右操作数类型可静态确定、且运算符形参类型确定且单一重载时判定。
+    fn check_overloaded_shift_arg(&mut self, op: &BinOp, lt: &Ty, right: &Expr) {
+        if !matches!(op, BinOp::Shl | BinOp::Shr) {
+            return;
+        }
+        let member = overload_name(op);
+        let Some(pt) = self.operator_param_for(lt, member) else {
+            return;
+        };
+        if !pt.is_definite() {
+            return;
+        }
+        // 右操作数有效类型：Cast 形态经 ty_of_known 解析出目标用户类型
+        // （`4 as C` → C；`x as Int64` → Int64）；其余按静态推导。
+        let rty = match right {
+            Expr::Cast { target_ty, .. } => ty_of_known(target_ty, &self.type_names),
+            _ => self.check_expr_ty_peek(right),
+        };
+        if !rty.is_definite() {
+            return;
+        }
+        if !compatible(&pt, &rty) {
+            self.err(format!(
+                "运算符 '{}' 的右操作数类型应为 {}，实际为 {}（4.18）",
+                bin_symbol(op),
+                pt.name(),
+                rty.name()
+            ));
+        }
+    }
+
     /// 按运算符成员名（如 `op_not` / `op_sub`）查询用户类型（含继承链）上
     /// 重载运算符的返回类型。用于一元运算符的结果类型推断。
     fn user_operator_return(&self, receiver: &Ty, member: &str) -> Option<Ty> {
@@ -9279,6 +9602,9 @@ impl<'a> Checker<'a> {
                 }
                 let lt = self.check_expr(left);
                 let rt = self.check_expr(right);
+                // 4.18：用户类型重载移位运算符时校验右操作数是否匹配其形参类型
+                // （不受下方“可静态确定操作数”门槛限制，覆盖 `c << (4 as C)`）。
+                self.check_overloaded_shift_arg(op, &lt, right);
                 // 解析器把所有比较/相等运算符放在同一优先级左结合解析。
                 // 规范 4.16(6)：同一优先级的关系运算符不可结合（`a < b < c`、
                 // `a == b == c` 非法）；但 `<` 与 `==` 属于不同优先级，
@@ -9660,6 +9986,16 @@ impl<'a> Checker<'a> {
                     let inner = self.check_expr_ty_peek(&args[0]);
                     if inner != Ty::Unknown {
                         return Ty::Option(Box::new(inner));
+                    }
+                }
+                // 6.2.2.2(4)：经实现类型调用到的接口默认实现方法，其返回类型可由
+                // 默认实现推断（`this` 类型即接口）。仅对零参实例调用、且能解析到
+                // 接口默认实现时启用，避免对普通成员方法过度推断。
+                if args.is_empty() && named_args.is_empty() {
+                    if let Ty::User(_) = &obj_ty {
+                        if let Some(rt) = self.user_iface_default_method_ty(&obj_ty, method) {
+                            return rt;
+                        }
                     }
                 }
                 Ty::Unknown
@@ -10614,6 +10950,8 @@ impl<'a> Checker<'a> {
                 self.check_selectorless_match_exhaustive(expr, arms);
                 // 4.4(14)/4.4.1.6(7)：枚举 match 穷尽性。
                 self.check_enum_match_exhaustive(arms);
+                // 4.4(14)/4.4(22)：整型 match 穷尽性。
+                self.check_int_match_exhaustive(expr, &sel_ty, arms);
                 result
             }
 
@@ -10746,6 +11084,32 @@ impl<'a> Checker<'a> {
             Expr::NullCoalesce { option, default } => {
                 let ot = self.check_expr(option);
                 let dt = self.check_expr(default);
+                // 4.28(36)/4.21(3)：`??` 右结合。显式括号形成左嵌套 `(a ?? b) ?? c`
+                // 时，内层 `a ?? b` 须产出 `a` 的载荷类型 U（非 Option）。若 `a` 为
+                // Option<U>（U 确定且本身非 Option），而内层默认值 `b` 也是 Option
+                // 类型，则 `a ?? b` 无法产出 U——官方 cjc 报 mismatched types
+                // （`(s1 ?? s2) ?? "x"`，a36_02）。仅在内层结果静态可定且非 Option 的
+                // 窄化条件下判定，避免误伤 `(None ?? "x") ?? y` 等合法形态。
+                if let Expr::NullCoalesce {
+                    option: inner_opt,
+                    default: inner_def,
+                } = &**option
+                {
+                    let ta = self.deq_ty(inner_opt);
+                    let tb = self.deq_ty(inner_def);
+                    if let Ty::Option(u) = &ta {
+                        if u.is_definite()
+                            && !matches!(u.as_ref(), Ty::Option(_))
+                            && matches!(tb, Ty::Option(_))
+                        {
+                            self.err(
+                                "空值合并运算符 '??' 的右侧类型不匹配: 左嵌套 '(a ?? b)' 中 \
+                                 a 为 Option<载荷>，b 须为载荷类型而非 Option（4.28(36)/4.21(3)）"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
                 // 2.1.4(2)：Unit 只定义了 =、==、!=，未定义 ??。
                 // 仅当左操作数本身为 Unit 时非法；`Option<Unit> ?? ()` 是合法的
                 // （左操作数为 Option<Unit>，右操作数为 Unit）。

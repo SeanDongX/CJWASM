@@ -48,6 +48,16 @@ impl Parser {
 
     /// 解析表达式（顶层为管道，再空值合并）
     pub(crate) fn parse_expr(&mut self) -> Result<Expr, ParseErrorAt> {
+        // 进入一个新的完整表达式上下文（括号/实参/元素/λ 体等）时，解除移位右操作数
+        // 的 `as` 抑制：只有“直接”作为移位右操作数的后缀 `as` 才让位给移位链。
+        let saved_suppress = self.suppress_shift_as;
+        self.suppress_shift_as = false;
+        let result = self.parse_expr_inner();
+        self.suppress_shift_as = saved_suppress;
+        result
+    }
+
+    fn parse_expr_inner(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_pipeline()?;
         // 函数组合 a ~> b：脱糖为单参闭包 λx -> b(a(x))
         while self.check(&Token::Composition) {
@@ -116,9 +126,12 @@ impl Parser {
     }
 
     /// 解析空值合并 (??)
+    ///
+    /// 4.28(36)：`??` 为**右结合**运算符（`a ?? b ?? c` ≡ `a ?? (b ?? c)`）。
+    /// 显式括号 `(a ?? b) ?? c` 才会形成左嵌套。
     pub(crate) fn parse_null_coalesce(&mut self) -> Result<Expr, ParseErrorAt> {
-        let mut left = self.parse_logical_or()?;
-        while matches!(self.peek(), Some(Token::QuestionQuestion)) {
+        let left = self.parse_logical_or()?;
+        if matches!(self.peek(), Some(Token::QuestionQuestion)) {
             self.advance();
             // 4.22：`??` 需要右操作数。若 `??` 之后换行、且下一 token 是控制转移
             // 表达式（`return`/`break`/`continue`），说明右操作数缺失；同一行内的
@@ -134,11 +147,12 @@ impl Parser {
                     "`??` 缺少右操作数".to_string(),
                 ));
             }
-            let right = self.parse_logical_or()?;
-            left = Expr::NullCoalesce {
+            // 右结合：右操作数继续按 `??` 层解析。
+            let right = self.parse_null_coalesce()?;
+            return Ok(Expr::NullCoalesce {
                 option: Box::new(left),
                 default: Box::new(right),
-            };
+            });
         }
         Ok(left)
     }
@@ -324,18 +338,47 @@ impl Parser {
     /// 解析移位 << >> >>>
     pub(crate) fn parse_shift(&mut self) -> Result<Expr, ParseErrorAt> {
         let mut left = self.parse_additive()?;
+        let mut saw_shift = false;
         while let Some(op) = match self.peek() {
             Some(Token::Shl) => Some(BinOp::Shl),
             Some(Token::Shr) => Some(BinOp::Shr),
             _ => None,
         } {
             self.advance();
-            let right = self.parse_additive()?;
+            // 4.28：移位运算符优先级**高于** `as`。右操作数的后缀 `as` 不能被
+            // 其 postfix 阶段吞掉（否则 `c << 4 as C` 会误解析为 `c << (4 as C)`）；
+            // 置位抑制标志，让右操作数在 `as` 前停下，由移位链末尾统一附加。
+            let saved = self.suppress_shift_as;
+            self.suppress_shift_as = true;
+            let right = self.parse_additive();
+            self.suppress_shift_as = saved;
+            let right = right?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
             };
+            saw_shift = true;
+        }
+        // 移位链之后若出现 `as`，作用于整个移位表达式（`<<` 优先于 `as`）。
+        if saw_shift {
+            while self.check(&Token::As) {
+                // 与 postfix 中一致：`as` 不满足结合性，括号可改变结合。
+                if matches!(left, Expr::Cast { .. } | Expr::IsType { .. })
+                    && !self.prev_token_is_rparen()
+                {
+                    return self.bail(ParseError::UnexpectedToken(
+                        Token::As,
+                        "'as' / 'is' 不满足结合性，不能链式使用".to_string(),
+                    ));
+                }
+                self.advance();
+                let target_ty = self.parse_type()?;
+                left = Expr::Cast {
+                    expr: Box::new(left),
+                    target_ty,
+                };
+            }
         }
         Ok(left)
     }
@@ -628,6 +671,11 @@ impl Parser {
     /// 从已解析的 base 表达式继续解析后缀操作 (.method()、[idx] 等)
     pub(crate) fn parse_postfix_from_expr(&mut self, mut expr: Expr) -> Result<Expr, ParseErrorAt> {
         loop {
+            // 作为移位右操作数时，后缀 `as` 的优先级低于移位（4.28），在此停下，
+            // 交由 parse_shift 在移位链末尾统一附加。
+            if self.suppress_shift_as && matches!(self.peek(), Some(Token::As)) {
+                break;
+            }
             match self.peek() {
                 // 立即调用表达式，如零参 lambda `{ => expr }()`：
                 // 无捕获、无参数的 lambda 直接求值其主体（语义等价于立即调用）。
@@ -1279,10 +1327,10 @@ impl Parser {
                 right: Box::new(right),
             };
         }
-        // ??
+        // ??（右结合，4.28(36)）
         if self.check(&Token::QuestionQuestion) {
             self.advance();
-            let right = self.parse_logical_or()?;
+            let right = self.parse_null_coalesce()?;
             left = Expr::NullCoalesce {
                 option: Box::new(left),
                 default: Box::new(right),
