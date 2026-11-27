@@ -2845,9 +2845,12 @@ impl Parser {
             if self.check(&Token::RParen) {
                 break;
             }
-            // C 互操作：inout 实参修饰符（按值传递，仅做语法接纳）
+            // C 互操作：inout 实参修饰符（13.1.2.3）。保留为 Expr::Inout 以便语义
+            // 分析校验“仅能用于 CFunc 调用”“VArray/CPointer 形参须 inout”等规则。
+            let mut has_inout = false;
             if self.check(&Token::Inout) {
                 self.advance();
+                has_inout = true;
             }
             // P2.9: 命名参数 name!: value 或 name: value (cjc 兼容)
             if let Some(Token::Ident(_)) = self.peek() {
@@ -2924,7 +2927,11 @@ impl Parser {
                     "位置实参不能出现在命名实参之后（3.2.3.1）".to_string(),
                 ));
             }
-            args.push(self.parse_expr()?);
+            let mut positional = self.parse_expr()?;
+            if has_inout {
+                positional = Expr::Inout(Box::new(positional));
+            }
+            args.push(positional);
             if !self.check(&Token::Comma) {
                 break;
             }

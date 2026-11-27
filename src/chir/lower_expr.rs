@@ -138,6 +138,11 @@ impl<'a> LoweringContext<'a> {
 
     /// 降低表达式
     pub fn lower_expr(&mut self, expr: &Expr) -> Result<CHIRExpr, String> {
+        // C 互操作实参 `inout x`：按值传递，语义等价于内部表达式（C 侧经指针修改
+        // 内存，调用方之后读回）。直接下放内部表达式，避免包装影响类型推断。
+        if let Expr::Inout(inner) = expr {
+            return self.lower_expr(inner);
+        }
         // 先推断类型
         let ty = self.type_ctx.infer_expr(expr)?;
         // Unit/Nothing 不映射到 WASM 值类型，用 I32 占位（不会被实际使用）

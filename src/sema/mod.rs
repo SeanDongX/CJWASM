@@ -578,6 +578,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 13.1.1 / 13.1.2.2 / 13.1.4(1)：unsafe 上下文、CFunc 细则与变长 CType 实参。
     check_unsafe_context(program, &mut errors);
     check_cfunc_lambda_capture(program, &mut errors);
+    // 13.1.2.3 / 13.1.3.4：`inout` 实参合法性。
+    check_inout_arguments(program, &mut errors);
     // 5.6(7)-(11)：捕获可变局部变量的闭包不能作为一等值使用。
     check_mutable_closure_capture(program, &mut errors);
     // 5.6(15)/(16)、5.1.3.2(2)：闭包捕获变量的可见性与初始化。
@@ -8756,6 +8758,8 @@ impl<'a, 'i> InstantiationScan<'a, 'i> {
 
     fn scan_expr(&mut self, expr: &Expr) {
         match expr {
+            // `inout x` 实参包装：内部表达式照常参与实例化扫描。
+            Expr::Inout(inner) => self.scan_expr(inner),
             Expr::Call { name, args, named_args, .. }
             | Expr::ConstructorCall { name, args, named_args, .. } => {
                 self.check_ctor_name(name);
@@ -12026,6 +12030,8 @@ fn walk_expr<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
                 walk_expr(a, f);
             }
         }
+        // `inout x` 实参包装：递归进入内部表达式。
+        Expr::Inout(inner) => walk_expr(inner, f),
         _ => {}
     }
 }
@@ -13322,6 +13328,8 @@ fn collect_local_funcs<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Function>) {
 fn walk_expr_unsafe<'a>(e: &'a Expr, depth: usize, f: &mut dyn FnMut(&'a Expr, usize)) {
     f(e, depth);
     match e {
+        // `inout x` 实参包装：递归进入内部表达式。
+        Expr::Inout(inner) => walk_expr_unsafe(inner, depth, f),
         Expr::Unary { expr, .. } => walk_expr_unsafe(expr, depth, f),
         Expr::Binary { left, right, .. } => {
             walk_expr_unsafe(left, depth, f);
@@ -13768,6 +13776,178 @@ fn check_unsafe_context(program: &Program, errors: &mut Vec<SemanticError>) {
     }
     for f in local_fns {
         scan_body(&f.params, &f.body, f.is_unsafe);
+    }
+}
+
+/// 13.1.2.3 / 13.1.3.4：`inout` 实参合法性。
+///
+/// 覆盖：
+///   * 13.1.2.3(3)：`inout` 只能用于 CFunc（foreign/@C/CFunc 值）调用的实参；
+///   * 13.1.3.4(4)：形参为 `VArray<T,$N>` 时实参必须带 `inout`；
+///   * 13.1.3.4(6)：形参为 `CPointer<T>` 时，VArray 值实参必须带 `inout`；
+///   * 13.1.3.4(8)：`CPointer<VArray<T,$N>>` 形参不能接收 `inout` 的 VArray 实参
+///     （VArray 实参等价于 `CPointer<T>`，而非 `CPointer<VArray<T,$N>>`）。
+///
+/// 所有无法本地精确解析的场景（同名重载、成员同名、局部遮蔽、实参个数与形参
+/// 不一致、非位置实参、未知类型）一律放行，只做可证明非法的判定。
+fn check_inout_arguments(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 快速路径：既无 C 互操作声明、也无 inout 实参的程序不参与。
+    let has_c_decl = program.functions.iter().any(|f| {
+        owner_name(&f.name).is_none() && (f.is_c_func || f.extern_import.is_some() || f.is_unsafe)
+    }) || program.constants.iter().any(|c| is_cfunc_type(&c.ty));
+    let mut has_inout = false;
+    for_each_fn_body(program, &mut |_, body, _| {
+        if !has_inout {
+            walk_stmts(body, &mut |e| {
+                if matches!(e, Expr::Inout(_)) {
+                    has_inout = true;
+                }
+            });
+        }
+    });
+    if !has_c_decl && !has_inout {
+        return;
+    }
+
+    let members = collect_all_member_names(program);
+    // 非成员顶层函数：名字 -> 声明列表（仅唯一名字参与判定）。
+    let mut top_funcs: HashMap<&str, Vec<&Function>> = HashMap::new();
+    for f in &program.functions {
+        if owner_name(&f.name).is_none() {
+            top_funcs.entry(f.name.as_str()).or_default().push(f);
+        }
+    }
+    // 顶层 CFunc 类型的 let/var 绑定。
+    let mut top_cfunc: HashMap<&str, Type> = HashMap::new();
+    for c in &program.constants {
+        if is_cfunc_type(&c.ty) {
+            top_cfunc.insert(c.name.as_str(), c.ty.clone());
+        }
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut scan_body = |params: &[Param], body: &[Stmt]| {
+        let local_types = local_var_types_full(params, body);
+        let bound = collect_body_bound_names(params, body);
+        let mut report = |msg: String| {
+            if seen.insert(msg.clone()) {
+                errors.push(SemanticError { message: msg });
+            }
+        };
+        walk_stmts(body, &mut |e| {
+            let (name, args) = match e {
+                Expr::Call { name, args, named_args, .. } => {
+                    if !named_args.is_empty() {
+                        return;
+                    }
+                    (name.clone(), args)
+                }
+                _ => return,
+            };
+            let has_inout_arg = args.iter().any(|a| matches!(a, Expr::Inout(_)));
+            // 解析被调用者：优先局部 CFunc 绑定，其次顶层 CFunc 绑定，最后顶层函数。
+            let cfunc_sig: Option<Vec<Type>> = if let Some(t) = local_types.get(&name) {
+                if is_cfunc_type(t) {
+                    cfunc_param_types(t)
+                } else {
+                    None // 被同名局部变量遮蔽，无法确定是函数调用
+                }
+            } else if let Some(t) = top_cfunc.get(name.as_str()) {
+                cfunc_param_types(t)
+            } else if !bound.contains(name.as_str()) && !members.contains(name.as_str()) {
+                match top_funcs.get(name.as_str()) {
+                    Some(fs) if fs.len() == 1 => {
+                        let f = fs[0];
+                        if f.is_c_func || f.extern_import.is_some() || f.is_unsafe {
+                            Some(f.params.iter().map(|p| p.ty.clone()).collect())
+                        } else {
+                            // 普通函数：不允许 inout 实参（13.1.2.3(3)）。
+                            if has_inout_arg {
+                                report(format!(
+                                    "`inout` 只能用于 CFunc 调用的实参，函数 '{}' 不是 CFunc（13.1.2.3(3)）",
+                                    name
+                                ));
+                            }
+                            return;
+                        }
+                    }
+                    _ => return,
+                }
+            } else {
+                return;
+            };
+
+            // 形参-实参逐位对应（仅位置实参、个数一致时判定）。
+            if let Some(ptys) = cfunc_sig {
+                if args.len() != ptys.len() {
+                    return;
+                }
+                for (pa, pt) in args.iter().zip(ptys.iter()) {
+                    match pa {
+                        Expr::Inout(_) => {
+                            // (B1) CPointer<VArray<..>> 形参不能接收 inout VArray 实参。
+                            if let Some(pointee) = cpointer_pointee(pt) {
+                                if matches!(pointee, Type::VArray(..)) {
+                                    report(
+                                        "VArray 实参等价于 `CPointer<T>`，不能传给 `CPointer<VArray<T,$N>>` 形参（13.1.3.4(8)）"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            // (B2) VArray 形参：实参须带 inout。
+                            if matches!(pt, Type::VArray(..)) {
+                                report(
+                                    "VArray 形参的实参必须加 `inout` 修饰符（13.1.3.4(4)）"
+                                        .to_string(),
+                                );
+                            }
+                            // (B3) CPointer<T> 形参：VArray 值实参须带 inout。
+                            if cpointer_pointee(pt).is_some()
+                                && is_varray_value_expr(pa, &local_types)
+                            {
+                                report(
+                                    "传给 `CPointer<T>` 形参的 VArray 实参必须加 `inout` 修饰符（13.1.3.4(6)）"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    };
+    for_each_fn_body(program, &mut |params, body, _| scan_body(params, body));
+}
+
+/// 提取 `CPointer<T>` 的 `T`。
+fn cpointer_pointee(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Struct(n, args) if n == "CPointer" && args.len() == 1 => Some(&args[0]),
+        _ => None,
+    }
+}
+
+/// 提取 `CFunc<F>` 中函数签名 F 的形参类型列表。
+fn cfunc_param_types(ty: &Type) -> Option<Vec<Type>> {
+    if let Type::Struct(n, args) = ty {
+        if n == "CFunc" && args.len() == 1 {
+            if let Type::Function { params, .. } = &args[0] {
+                return Some(params.clone());
+            }
+        }
+    }
+    None
+}
+
+/// 判断表达式是否为一个 VArray 值（数组字面量 / `Array` 构造 / VArray 类型变量）。
+fn is_varray_value_expr(e: &Expr, local_types: &HashMap<String, Type>) -> bool {
+    match e {
+        Expr::Array(_) => true,
+        Expr::ConstructorCall { name, .. } if name == "Array" => true,
+        Expr::Var(n) => matches!(local_types.get(n), Some(Type::VArray(..))),
+        _ => false,
     }
 }
 
@@ -20565,6 +20745,8 @@ fn scan_ct_expr(
     errors: &mut Vec<SemanticError>,
 ) {
     match expr {
+        // `inout x` 实参包装：内部表达式照常参与 break/continue/return 合法性检查。
+        Expr::Inout(inner) => scan_ct_expr(inner, loop_depth, in_func, errors),
         Expr::Break => {
             if loop_depth == 0 {
                 errors.push(SemanticError {

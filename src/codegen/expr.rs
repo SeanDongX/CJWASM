@@ -4735,6 +4735,8 @@ impl CodeGen {
         loop_ctx: Option<(u32, u32)>,
     ) {
         match expr {
+            // C 互操作实参 `inout x`：按值传递（语义等价于内部表达式）。
+            Expr::Inout(inner) => self.compile_expr(inner, locals, func, loop_ctx),
             Expr::Integer(n) => {
                 func.instruction(&Instruction::I64Const(*n));
             }

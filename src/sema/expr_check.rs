@@ -6270,6 +6270,8 @@ impl<'a> Checker<'a> {
     /// false，对未知形态（内建函数、类型名、枚举变体、未知类型等）保守返回 true。
     fn is_const_expr(&self, e: &Expr) -> bool {
         match e {
+            // `inout x` 按内部表达式判定常量性。
+            Expr::Inout(inner) => self.is_const_expr(inner),
             Expr::Integer(_)
             | Expr::IntegerSuffixed(..)
             | Expr::IntegerOverflow(..)
@@ -8894,6 +8896,8 @@ impl<'a> Checker<'a> {
 
     fn check_expr(&mut self, expr: &Expr) -> Ty {
         match expr {
+            // C 互操作实参 `inout x`：静态类型取内部表达式（按值传递）。
+            Expr::Inout(inner) => self.check_expr(inner),
             Expr::Integer(_) => Ty::IntLit,
             Expr::IntegerSuffixed(v, s) => {
                 self.check_suffixed_int_literal(*v, *s, false);

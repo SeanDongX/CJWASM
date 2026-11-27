@@ -1190,7 +1190,7 @@ impl AstWalk for Expr {
             }
             Cast { expr, .. } => expr.walk(f),
             Lambda { body, .. } => body.walk(f),
-            Some(e) | Ok(e) | Err(e) | Try(e) | Throw(e) => e.as_ref().walk(f),
+            Some(e) | Ok(e) | Err(e) | Try(e) | Throw(e) | Inout(e) => e.as_ref().walk(f),
             TryBlock {
                 body, catch_body, ..
             } => {
