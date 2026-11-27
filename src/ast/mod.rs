@@ -689,6 +689,9 @@ pub struct ClassDef {
     pub is_sealed: bool,
     /// 是否为 open 类（允许被继承，仓颉中类默认不可继承）
     pub is_open: bool,
+    /// 声明前是否带有属性注解（`@Test`/`@TestTemplate` 等宏）。宏展开能力受限时，
+    /// 语义检查需对带属性的类保守豁免（如 6.1.1.2(1) 多类继承检查）。
+    pub has_decl_attr: bool,
     /// 继承的父类
     pub extends: Option<String>,
     /// 实现的接口列表

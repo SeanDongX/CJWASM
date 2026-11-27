@@ -616,6 +616,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_extend_generic_target_args(program, &index, &mut errors);
     // 8.5(3)：子类不得覆写/重定义父类扩展新增的成员。
     check_extension_member_redefined_in_subclass(program, &index, &mut errors);
+    // 8.5(1)：父类扩展中的 private 成员不被子类继承。
+    check_private_extension_member_in_subclass(program, &index, &mut errors);
 
     // 6.3.5(3)/6.4.2(1)：extend 实现接口泛型函数时必须为 public。
     check_extension_generic_impl_visibility(program, &index, &mut errors);
@@ -709,6 +711,8 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     check_ctor_overload_conflict(program, &mut errors);
     // 6.1.2.7(2)/(4)：构造调用在本地可枚举构造器集上的重载歧义（保守子集）。
     check_ctor_overload_ambiguity(program, &index, &mut errors);
+    // 6.1.2.1(43)/10.1.2.1：构造调用实参类型与任何构造器都不匹配（保守子集）。
+    check_ctor_arg_type_mismatch(program, &mut errors);
     // 5.3.2(5)/(6)：函数/方法调用返回类型与上下文标注类型不兼容（保守子集）。
     check_call_return_context(program, &index, &mut errors);
     // w21c：泛型类在显式具体类型实参下实例化时，构造函数签名 / 实现的接口重复。
@@ -5624,6 +5628,19 @@ fn member_base_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+/// 沿字段/可选链回溯到表达式根的变量名或枚举类型名。
+/// 用于把 `MyEnum.A.p1` 这类静态链式访问归约为根类型名 `MyEnum`。
+fn static_root_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Var(n) => Some(n.clone()),
+        Expr::VariantConst { enum_name, .. } => Some(enum_name.clone()),
+        Expr::Field { object, .. } | Expr::OptionalChain { object, .. } => {
+            static_root_name(object)
+        }
+        _ => None,
+    }
+}
+
 /// 收集父类链上的字段名（extends 无法本地解析时返回 None，保守跳过）。
 fn collect_parent_field_names<'a>(
     cls: &ClassDef,
@@ -7897,12 +7914,14 @@ fn check_class_supertypes(
         }
     }
     for name in &cls.implements {
-        if let Some(p) = index.classes.get(name.as_str()) {
-            // 抽象类可能被误解析进 implements（如多模板标注用例 std/unittest/
-            // templates/checks/*：`class Suite <: Template1 & Template2` 两者均为
-            // abstract class，官方 std 用例期望其通过）；仅对非抽象类报错，避免误伤
-            // 合法/宏相关用例。open 类出现在 implements 一定是多继承。
-            if !p.is_abstract {
+        if index.classes.contains_key(name.as_str()) {
+            // 6.1.1.2(1)：类只能单继承，出现在 `implements`（即 `<:` 列表非首位）
+            // 的类名构成第二个父类，一律非法（抽象类同样不例外）。
+            // 例外：带宏属性注解（@Test/@TestTemplate 等）的类。std/unittest/
+            // templates/checks/* 中存在 `class Suite <: Template1 & Template2`（两者均
+            // 为 abstract class），官方以宏处理模板扫描；宏展开受限时保守放行，避免
+            // 误伤合法/宏相关用例。
+            if !cls.has_decl_attr {
                 errors.push(SemanticError {
                     message: format!(
                         "类 '{}' 只能单继承，不能从另一个类 '{}' 继承（父类须位于 <: 列表首位）",
@@ -17023,9 +17042,6 @@ fn check_extension_private_member_outside_access(
             }
         }
         supplement(&f.body, &priv_map, &mut var_types);
-        if var_types.is_empty() {
-            continue;
-        }
         let mut hits: Vec<(String, String)> = Vec::new();
         walk_stmts(&f.body, &mut |e| match e {
             Expr::MethodCall { object, method, .. } => {
@@ -17041,6 +17057,11 @@ fn check_extension_private_member_outside_access(
                 let ty = match object.as_ref() {
                     Expr::Var(v) => var_types.get(v).cloned(),
                     Expr::VariantConst { enum_name, .. } => Some(enum_name.clone()),
+                    // `Type.Variant.member` / 静态链式访问：沿字段链回溯到根名字。
+                    // 如 `${MyEnum.A.p1}` 的对象为 `MyEnum.A`（Field），根为 `MyEnum`。
+                    Expr::Field { .. } | Expr::OptionalChain { .. } => {
+                        static_root_name(object)
+                    }
                     _ => None,
                 };
                 if let Some(t) = ty {
@@ -17133,6 +17154,109 @@ fn check_extension_member_redefined_in_subclass(
                     ),
                 });
             }
+        }
+    }
+}
+
+/// 8.5(1)：类扩展中的 private 成员不会被扩展目标类的子类继承，
+/// 子类方法中通过 `this.<private>` 调用应报错。
+///
+/// 保守条件：该名字仅在祖先类型的扩展中以 private 出现；子类自身未定义同名成员；
+/// 祖先类自身也没有同名成员（否则 `this.x` 指向祖先类成员，合法）。
+fn check_private_extension_member_in_subclass(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let mut priv_by_base: HashMap<String, HashSet<String>> = HashMap::new();
+    for ext in &program.extends {
+        let base = ext
+            .target_type
+            .split('<')
+            .next()
+            .unwrap_or(&ext.target_type)
+            .trim()
+            .to_string();
+        for m in &ext.methods {
+            if m.visibility == Visibility::Private {
+                let seg = last_name_segment(&m.name);
+                let b = member_base_name(&seg).to_string();
+                if !b.starts_with("__") {
+                    priv_by_base.entry(base.clone()).or_default().insert(b);
+                }
+            }
+        }
+    }
+    if priv_by_base.is_empty() {
+        return;
+    }
+    for cls in &program.classes {
+        let own: HashSet<String> = cls
+            .methods
+            .iter()
+            .map(|m| member_base_name(&last_name_segment(&m.func.name)).to_string())
+            .collect();
+        // 祖先类链（本地可解析部分）。
+        let mut ancestors: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut cur = cls
+            .extends
+            .as_deref()
+            .map(|p| p.split('<').next().unwrap_or(p).trim().to_string());
+        while let Some(name) = cur {
+            if !seen.insert(name.clone()) {
+                break;
+            }
+            ancestors.push(name.clone());
+            cur = index
+                .classes
+                .get(name.as_str())
+                .and_then(|pc| pc.extends.as_deref())
+                .map(|p| p.split('<').next().unwrap_or(p).trim().to_string());
+        }
+        if ancestors.is_empty() {
+            continue;
+        }
+        // 祖先前类型扩展中的 private 成员名 + 祖先类自身成员名。
+        let mut priv_names: HashSet<String> = HashSet::new();
+        let mut ancestor_members: HashSet<String> = HashSet::new();
+        for a in &ancestors {
+            if let Some(s) = priv_by_base.get(a) {
+                priv_names.extend(s.iter().cloned());
+            }
+            if let Some(pc) = index.classes.get(a.as_str()) {
+                ancestor_members.extend(pc.fields.iter().map(|f| f.name.clone()));
+                ancestor_members.extend(
+                    pc.methods
+                        .iter()
+                        .map(|m| member_base_name(&last_name_segment(&m.func.name)).to_string()),
+                );
+            }
+        }
+        if priv_names.is_empty() {
+            continue;
+        }
+        let mut reported: HashSet<String> = HashSet::new();
+        for m in &cls.methods {
+            walk_stmts(&m.func.body, &mut |e| {
+                if let Expr::MethodCall { object, method, .. } = e {
+                    if let Expr::Var(v) = object.as_ref() {
+                        if v == "this"
+                            && priv_names.contains(method.as_str())
+                            && !own.contains(method.as_str())
+                            && !ancestor_members.contains(method.as_str())
+                            && reported.insert(method.clone())
+                        {
+                            errors.push(SemanticError {
+                                message: format!(
+                                    "类 '{}' 调用了父类扩展中的 private 成员 '{}'，该成员不被子类继承（8.5(1)）",
+                                    cls.name, method
+                                ),
+                            });
+                        }
+                    }
+                }
+            });
         }
     }
 }
@@ -27290,6 +27414,136 @@ fn w23_receiver(
     None
 }
 
+/// 6.1.2.1(43)/10.1.2.1：构造调用实参类型与全部本地构造器形参都不匹配时判错。
+///
+/// 保守子集：类型为本地 class/struct；显式给出与声明等量的具体类型实参（泛型类），
+/// 或类型非泛型；全部构造器形参个数与实参个数一致、无变长/命名/默认且替换后均为
+/// 原始标量；实参类型可精确判定。无后缀整数实参只适配整型（6.1.2.1(43)：
+/// `A<Float64>(12)` 非法），无后缀浮点只适配浮点。
+fn check_ctor_arg_type_mismatch(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut ctors: HashMap<&str, (&[String], Vec<&[Param]>)> = HashMap::new();
+    for c in &program.classes {
+        let mut ps: Vec<&[Param]> = c.inits.iter().map(|i| i.params.as_slice()).collect();
+        if ps.is_empty() && !c.primary_ctor_params.is_empty() {
+            ps.push(c.primary_ctor_params.as_slice());
+        }
+        if !ps.is_empty() {
+            ctors.insert(c.name.as_str(), (c.type_params.as_slice(), ps));
+        }
+    }
+    for s in &program.structs {
+        let mut ps: Vec<&[Param]> = s.inits.iter().map(|i| i.params.as_slice()).collect();
+        if ps.is_empty() && !s.primary_ctor_params.is_empty() {
+            ps.push(s.primary_ctor_params.as_slice());
+        }
+        if !ps.is_empty() {
+            ctors.insert(s.name.as_str(), (s.type_params.as_slice(), ps));
+        }
+    }
+    if ctors.is_empty() {
+        return;
+    }
+    let scan = |params: &[Param], body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        let vars = local_var_types_full(params, body);
+        walk_stmts(body, &mut |e| {
+            let Expr::ConstructorCall {
+                name,
+                type_args,
+                args,
+                named_args,
+            } = e
+            else {
+                return;
+            };
+            if !named_args.is_empty() {
+                return;
+            }
+            let base = name.split('<').next().unwrap_or(name).trim();
+            let targs: &[Type] = type_args.as_deref().unwrap_or(&[]);
+            let Some((tps, sigs)) = ctors.get(base) else {
+                return;
+            };
+            let subst: HashMap<String, Type> = if targs.is_empty() {
+                if !tps.is_empty() {
+                    return; // 泛型类未给类型实参：无法替换，保守放行。
+                }
+                HashMap::new()
+            } else {
+                if tps.len() != targs.len() || targs.iter().any(w24_type_has_param) {
+                    return;
+                }
+                tps.iter()
+                    .cloned()
+                    .zip(targs.iter().cloned())
+                    .collect()
+            };
+            // 全部构造器须可完整、精确判定。
+            for ps in sigs.iter() {
+                if ps.len() != args.len() {
+                    return;
+                }
+                for p in ps.iter() {
+                    if p.variadic || p.is_named || p.default.is_some() {
+                        return;
+                    }
+                    let ty = subst_type(&p.ty, &subst);
+                    if w24_type_has_param(&ty) || !is_scalar_scalar_ty(&ty) {
+                        return;
+                    }
+                }
+            }
+            let mut kinds: Vec<ArgClass> = Vec::with_capacity(args.len());
+            for a in args {
+                let k = classify_arg(a, &vars);
+                if matches!(k, ArgClass::Unknown) {
+                    return;
+                }
+                kinds.push(k);
+            }
+            let any_ok = sigs.iter().any(|ps| {
+                kinds.iter().zip(ps.iter()).all(|(k, p)| {
+                    let ty = subst_type(&p.ty, &subst);
+                    match k {
+                        ArgClass::IntLit => is_int_scalar_ty(&ty),
+                        ArgClass::FloatLit => is_float_scalar_ty(&ty),
+                        ArgClass::Scalar(t) => t == &ty,
+                        ArgClass::Unknown => true,
+                    }
+                })
+            });
+            if !any_ok {
+                errors.push(SemanticError {
+                    message: format!(
+                        "构造调用 '{}' 的实参类型与任何构造器的形参类型都不匹配（6.1.2.1(43)/10.1.2.1）",
+                        base
+                    ),
+                });
+            }
+        });
+    };
+    for f in &program.functions {
+        scan(&f.params, &f.body, errors);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            scan(&init.params, &init.body, errors);
+        }
+        for m in &c.methods {
+            scan(&m.func.params, &m.func.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            scan(&init.params, &init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            scan(&m.params, &m.body, errors);
+        }
+    }
+}
+
 /// 5.3.2(5)/(6)：函数/方法调用的返回类型与上下文（变量/赋值标注类型）不兼容判错。
 ///
 /// 保守子集（守正测试红线）：
@@ -28698,9 +28952,6 @@ fn check_supertype_generic_constraints(
                     continue;
                 }
                 for (bi, b) in con.bounds.iter().enumerate() {
-                    if con.bound_args.get(bi).map_or(false, |a| !a.is_empty()) {
-                        continue;
-                    }
                     let bound_res =
                         w20_resolve_alias_head(program, &Type::Struct(b.clone(), vec![]));
                     let Some(bound_head) = w20_type_head(&bound_res) else {
@@ -28709,17 +28960,52 @@ fn check_supertype_generic_constraints(
                     if !local_types.contains(bound_head) {
                         continue;
                     }
-                    if ext_ifaces
-                        .get(arg_head)
-                        .map_or(false, |s| s.contains(bound_head))
-                    {
+                    let bound_args_raw: &[Type] =
+                        con.bound_args.get(bi).map(|v| v.as_slice()).unwrap_or(&[]);
+                    if bound_args_raw.is_empty() {
+                        if ext_ifaces
+                            .get(arg_head)
+                            .map_or(false, |s| s.contains(bound_head))
+                        {
+                            continue;
+                        }
+                        if !index.is_subtype_name(arg_head, bound_head) {
+                            errors.push(SemanticError {
+                                message: format!(
+                                    "类 '{}' 继承泛型接口 '{}' 时，类型实参 '{}' 不满足约束 '<: {}'（9.2(1)）",
+                                    c.name, sup, arg_head, bound_head
+                                ),
+                            });
+                        }
                         continue;
                     }
-                    if !index.is_subtype_name(arg_head, bound_head) {
+                    // 9.3.5(4)：约束的上界自身带约束（如 `Ord<T> where T <: Eq<T>`），
+                    // 实现该接口时须把上界的约束一并引入——即 `T` 的实际类型还须实现
+                    // `Eq<...>`。仅在上界实参替换后完全具体、且实现关系本地可判定时判错。
+                    let mut req_args: Vec<Type> = Vec::new();
+                    let mut concrete = true;
+                    for bt in bound_args_raw {
+                        let mut sub_map: HashMap<String, Type> = HashMap::new();
+                        for (k, v) in &subst {
+                            sub_map.insert((*k).to_string(), (*v).clone());
+                        }
+                        let sub = subst_type(bt, &sub_map);
+                        if w24_type_has_param(&sub) {
+                            concrete = false;
+                            break;
+                        }
+                        req_args.push(sub);
+                    }
+                    if !concrete {
+                        continue;
+                    }
+                    if let Some(false) =
+                        w24_implements_iface(program, index, arg_head, bound_head, &req_args)
+                    {
                         errors.push(SemanticError {
                             message: format!(
-                                "类 '{}' 继承泛型接口 '{}' 时，类型实参 '{}' 不满足约束 '<: {}'（9.2(1)）",
-                                c.name, sup, arg_head, bound_head
+                                "类 '{}' 继承泛型接口 '{}' 时，上界 '{}' 的约束未引入：类型实参 '{}' 未实现 '{}'（9.3.5(4)）",
+                                c.name, sup, bound_head, arg_head, bound_head
                             ),
                         });
                     }
@@ -28727,6 +29013,104 @@ fn check_supertype_generic_constraints(
             }
         }
     }
+}
+
+/// 类型中是否残留未替换的类型参数。
+fn w24_type_has_param(ty: &Type) -> bool {
+    match ty {
+        Type::TypeParam(_) => true,
+        Type::Struct(_, args) | Type::Tuple(args) => args.iter().any(w24_type_has_param),
+        Type::Array(i) | Type::Option(i) | Type::Slice(i) => w24_type_has_param(i),
+        Type::Result(a, b) | Type::Map(a, b) => w24_type_has_param(a) || w24_type_has_param(b),
+        Type::Function { params, ret } => {
+            params.iter().any(w24_type_has_param)
+                || ret.as_ref().as_ref().map_or(false, w24_type_has_param)
+        }
+        _ => false,
+    }
+}
+
+/// 9.3.5(4)：判断本地类型 `cls_name` 是否（直接/经父类链/经扩展）实现了
+/// `bound<req_args>`。无法判定（本地类缺失、祖先外部不可解析）时返回 None（保守跳过）。
+fn w24_implements_iface(
+    program: &Program,
+    index: &ProgramIndex<'_>,
+    cls_name: &str,
+    bound: &str,
+    req_args: &[Type],
+) -> Option<bool> {
+    let canon_args_eq = |args: &[Type], req: &[Type]| -> Option<bool> {
+        if args.len() != req.len() {
+            return Some(false);
+        }
+        let mut m: HashMap<String, usize> = HashMap::new();
+        let mut ok = true;
+        for (a, b) in args.iter().zip(req.iter()) {
+            if canon_type(a, &[], &mut m) != canon_type(b, &[], &mut m) {
+                ok = false;
+                break;
+            }
+        }
+        Some(ok)
+    };
+    let mut current = Some(cls_name.to_string());
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(cn) = current {
+        if !seen.insert(cn.clone()) {
+            break;
+        }
+        let c = index.classes.get(cn.as_str())?;
+        for (n, args) in &c.supertype_args {
+            if n != bound {
+                continue;
+            }
+            if canon_args_eq(args, req_args)? {
+                return Some(true);
+            }
+        }
+        // 经扩展实现的接口（对泛型实参无法精确比较时保守视为满足）。
+        for ext in &program.extends {
+            let base = ext.target_type.trim().split('<').next().unwrap_or("").trim();
+            if base != cn {
+                continue;
+            }
+            let Some(i) = ext.interface.as_deref() else {
+                continue;
+            };
+            if i.trim().split('<').next().unwrap_or("").trim() != bound {
+                continue;
+            }
+            if ext.interface_args.is_empty() {
+                return Some(true);
+            }
+            if canon_args_eq(&ext.interface_args, req_args)? {
+                return Some(true);
+            }
+            // 参数不一致的扩展很难排除，保守按未满足继续考虑后续祖先。
+        }
+        // 仅沿本地 class 父类链上溯；父为接口/struct/enum 则停止（不再是类继承）。
+        current = match c
+            .extends
+            .as_deref()
+            .map(|p| p.split('<').next().unwrap_or(p).trim().to_string())
+        {
+            Some(p) => {
+                if index.classes.contains_key(p.as_str()) {
+                    Some(p)
+                } else if index.interfaces.contains_key(p.as_str())
+                    || index.structs.contains(p.as_str())
+                    || index.enums.contains(p.as_str())
+                {
+                    None
+                } else {
+                    // 父类外部不可解析：无法判定。
+                    return None;
+                }
+            }
+            None => None,
+        };
+    }
+    Some(false)
 }
 
 /// 类型中是否出现指定类型名（结构体头或嵌套实参）。
@@ -29776,6 +30160,7 @@ mod tests {
                 is_abstract: false,
                 is_sealed: false,
                 is_open: false,
+                has_decl_attr: false,
                 extends: None,
                 implements: vec![],
                 supertype_args: vec![],
@@ -35177,4 +35562,106 @@ main() {}"#,
             "enum G<T1, T2> {\n    | Year\n    | Month(T1)\n}\nlet t: G<String, Int64> = G.Month(\"x\")\nmain() {}\n",
         );
     }
+
+    #[test]
+    fn test_w24d_multiple_class_inheritance_rejected() {
+        // 6.1.1.2(1)：类只能单继承，`<:` 列表中出现第二个类（即使 abstract）非法。
+        let errs = assert_invalid(
+            "abstract class A {}\nabstract class B {}\nclass C <: A & B {}\nmain() {}\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("只能单继承")),
+            "{:?}",
+            errs
+        );
+        // 类 + 接口（父类位于首位）合法。
+        assert_valid("interface I {}\nopen class A {}\nclass C <: A & I {}\nmain() {}\n");
+    }
+
+    #[test]
+    fn test_w24d_private_extension_prop_outside_rejected() {
+        // 8.2.2.1(2)：扩展中 private 属性在扩展体外不可见（含 Type.Variant.member 链）。
+        let errs = assert_invalid(
+            "enum MyEnum { A }\n\
+             extend MyEnum {\n\
+             \x20   private prop p1: Int64 { get() { 1 } }\n\
+             }\n\
+             main(): Unit { print(\"${MyEnum.A.p1}\") }\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("private")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn test_w24d_private_extension_member_in_subclass_rejected() {
+        // 8.5(1)：父类扩展中的 private 成员不被子类继承。
+        let errs = assert_invalid(
+            "open class Base {\n    var v: Int64 = 1\n}\n\
+             extend Base {\n    private func secret(a: Int64) { a }\n}\n\
+             class Sub <: Base {\n    func call(a: Int64) { this.secret(a) }\n}\n\
+             main() {}\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("8.5(1)")),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn test_w24d_derived_upper_bound_constraint_rejected() {
+        // 9.3.5(4)：实现 `Ord<T> where T <: Eq<T>` 时须同时引入上界 Eq 的约束。
+        let errs = assert_invalid(
+            "interface Eq<T> { func eq(other: T): Bool }\n\
+             interface Ord<T> where T <: Eq<T> { func lt(other: T): Bool }\n\
+             class Number <: Ord<Number> {\n\
+             \x20   public func eq(other: Number): Bool { true }\n\
+             \x20   public func lt(other: Number): Bool { true }\n\
+             }\n\
+             main() {}\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("9.3.5(4)")),
+            "{:?}",
+            errs
+        );
+        // 同时显式实现 Eq<Number> 则合法。
+        assert_valid(
+            "interface Eq<T> { func eq(other: T): Bool }\n\
+             interface Ord<T> where T <: Eq<T> { func lt(other: T): Bool }\n\
+             class Number <: Eq<Number> & Ord<Number> {\n\
+             \x20   public func eq(other: Number): Bool { true }\n\
+             \x20   public func lt(other: Number): Bool { true }\n\
+             }\n\
+             main() {}\n",
+        );
+    }
+
+    #[test]
+    fn test_w24d_ctor_arg_type_mismatch_rejected() {
+        // 6.1.2.1(43)：显式类型实参下，构造实参与构造器形参类型不匹配。
+        let errs = assert_invalid(
+            "class A<T> {\n    init(x: T) {}\n}\n\
+             main() { let x = A<Float64>(12) }\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("构造调用")),
+            "{:?}",
+            errs
+        );
+        // 合法：浮点实参匹配 Float64 形参。
+        assert_valid(
+            "class A<T> {\n    init(x: T) {}\n}\n\
+             main() { let x = A<Float64>(1.5) }\n",
+        );
+        // 非泛型类：全部构造器均为 Float 形参时，整数字面量不匹配。
+        assert_invalid(
+            "struct S {\n    init(x: Float32) {}\n    init(x: Float64) {}\n}\n\
+             main() { let s = S(64) }\n",
+        );
+    }
+
 }
