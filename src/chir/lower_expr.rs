@@ -2194,7 +2194,7 @@ impl<'a> LoweringContext<'a> {
             }
 
             // 可选链 b?.field → b.field (单线程非 null 简化)
-            Expr::OptionalChain { object, field } => {
+            Expr::OptionalChain { object, field, .. } => {
                 let field_expr = Expr::Field {
                     object: object.clone(),
                     field: field.clone(),

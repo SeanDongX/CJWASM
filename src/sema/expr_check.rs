@@ -1098,6 +1098,12 @@ struct Checker<'a> {
     enum_names: HashSet<String>,
     /// 枚举构造器名 → 实参个数（跨枚举重名者不登记，避免歧义）。
     enum_variant_arity: HashMap<String, usize>,
+    /// 枚举构造器名 → 全部候选签名（跨枚举同名亦保留，用于使用点歧义消解，
+    /// 2.1.11.2(7)/(8)/(11)）。
+    enum_ctor_candidates: HashMap<String, Vec<EnumCtorSig>>,
+    /// 唯一非泛型顶层函数的函数类型（名字 → `Ty::Func`），仅用于“与枚举构造器
+    /// 同名的函数作值”解析（2.1.11.2(8)：函数优先，含用户类型返回值的解析）。
+    func_value_tys: HashMap<String, Ty>,
     /// enum 名 → [(变体名, 关联值个数)]（match 穷尽性检查，4.4(14)/4.4.1.6(7)）。
     enum_variant_sets: HashMap<String, Vec<(String, usize)>>,
     /// 变体名 → 所属 enum 名（仅跨枚举唯一者登记；歧义者不登记，保守跳过）。
@@ -1333,6 +1339,20 @@ struct CtorParam {
 #[derive(Clone)]
 struct CtorSig {
     params: Vec<CtorParam>,
+}
+
+/// 一个枚举构造器候选（2.1.11.2(7)/(8)/(11) 名称消歧的最小引擎）。
+///
+/// 记录构造器名所属枚举、关联值形参类型（泛型形参以 `Unknown` 占位，可匹配
+/// 任意实参）。用于在**使用点**按实参元数/类型消歧：多个候选均通过时无法解析
+/// （2.1.11.2(7)），枚举构造器与同名函数并存且都匹配时同样无法解析
+/// （2.1.11.2(8)）。
+#[derive(Clone)]
+struct EnumCtorSig {
+    /// 所属枚举名。
+    enum_name: String,
+    /// 关联值形参类型（无关联值为空）。
+    params: Vec<Ty>,
 }
 
 /// 一个成员方法的“位置实参接受能力”签名（10.1.2.1 方法调用元数判定，
@@ -1960,6 +1980,43 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
                 has_named,
             });
     }
+    // 唯一非泛型顶层函数的函数类型（用于 2.1.11.2(8) 与枚举构造器同名的函数作值）。
+    let mut func_value_tys: HashMap<String, Ty> = HashMap::new();
+    {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for f in &program.functions {
+            if !f.name.contains('.') {
+                *counts.entry(f.name.as_str()).or_insert(0) += 1;
+            }
+        }
+        for f in &program.functions {
+            if f.name.contains('.')
+                || counts.get(f.name.as_str()) != Some(&1)
+                || !f.type_params.is_empty()
+                || f.params.iter().any(|p| p.variadic || p.is_named || p.default.is_some())
+            {
+                continue;
+            }
+            let Some(rt) = &f.return_type else { continue };
+            let ret = ty_of_known(rt, &type_names);
+            if ret == Ty::Unknown {
+                continue;
+            }
+            let params: Vec<Ty> = f
+                .params
+                .iter()
+                .filter(|p| p.name != "this" && p.name != "self")
+                .map(|p| ty_of_known(&p.ty, &type_names))
+                .collect();
+            func_value_tys.insert(
+                f.name.clone(),
+                Ty::Func {
+                    params,
+                    ret: Box::new(ret),
+                },
+            );
+        }
+    }
     // 4.23(15)：赋值左侧可变性的辅助信息。
     // - struct 为值类型：成员赋值要求“基础对象可变”且“字段可变”；
     // - class 为引用类型：仅要求字段可变；
@@ -2167,6 +2224,27 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
     }
     for d in &dup_variants {
         enum_variant_arity.remove(d);
+    }
+    // 枚举构造器候选全表（跨枚举同名者全部保留）：使用点按实参元数/类型消歧。
+    // 泛型类型形参（`F2(T1, T2)` 的 T1/T2）解析为 Unknown，对任意实参兼容。
+    let mut enum_ctor_candidates: HashMap<String, Vec<EnumCtorSig>> = HashMap::new();
+    for e in &program.enums {
+        for v in &e.variants {
+            let params = match &v.payload {
+                None => Vec::new(),
+                Some(Type::Tuple(ts)) => {
+                    ts.iter().map(|t| ty_of_known(t, &type_names)).collect()
+                }
+                Some(t) => vec![ty_of_known(t, &type_names)],
+            };
+            enum_ctor_candidates
+                .entry(v.name.clone())
+                .or_default()
+                .push(EnumCtorSig {
+                    enum_name: e.name.clone(),
+                    params,
+                });
+        }
     }
     // match 穷尽性检查所需的枚举变体全表与“变体→枚举”反查（4.4(14)/4.4.1.6(7)）。
     let mut enum_variant_sets: HashMap<String, Vec<(String, usize)>> = HashMap::new();
@@ -2706,6 +2784,8 @@ pub(crate) fn check_program(program: &Program, errors: &mut Vec<SemanticError>) 
         type_names,
         enum_names,
         enum_variant_arity,
+        enum_ctor_candidates,
+        func_value_tys,
         enum_variant_sets,
         variant_enum,
         class_fields,
@@ -5614,6 +5694,138 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 2.1.11.2(8)：声明类型为枚举 E 的初始化式若为“E 的构造器名与同名顶层
+    /// 函数并存”的裸调用，则名字解析到函数而非构造器，不可能得到 E 值。
+    fn check_enum_ctor_binding_conflict(&mut self, ann: &Ty, value: &Expr) {
+        let Ty::User(en) = ann else { return };
+        let name = match value {
+            Expr::ConstructorCall { name, .. } | Expr::Call { name, .. } => name,
+            _ => return,
+        };
+        if self.type_names.contains(name) || self.local_func_names.contains(name) {
+            return;
+        }
+        let Some(cands) = self.enum_ctor_candidates.get(name) else {
+            return;
+        };
+        if !cands.iter().any(|c| &c.enum_name == en) {
+            return;
+        }
+        if self
+            .free_func_sigs
+            .get(name)
+            .map_or(false, |sigs| !sigs.is_empty())
+        {
+            self.err(format!(
+                "枚举 '{}' 的构造器 '{}' 与同名函数并存，裸名调用解析到函数而非构造器（2.1.11.2(8)）",
+                en, name
+            ));
+        }
+    }
+
+    /// 2.1.11.2(8)：名字同时是枚举构造器与**唯一**非泛型顶层函数时，作值的
+    /// 名字解析到函数（函数优先），返回其函数类型；否则 `None`（保持原行为）。
+    /// 仅在形参全部为普通位置形参、返回类型可确定且非 `Unknown` 时建模。
+    fn ctor_named_func_value_ty(&self, name: &str) -> Option<Ty> {
+        if !self.enum_ctor_candidates.contains_key(name) {
+            return None;
+        }
+        // 注：`known_funcs` 含全部已声明函数名（正是此处要建模的对象），不能用它排除。
+        if self.type_names.contains(name) || self.local_func_names.contains(name) {
+            return None;
+        }
+        self.func_value_tys.get(name).cloned()
+    }
+
+    /// 2.1.11.2(7)/(8)/(11)：枚举构造器使用点名称消歧（w43c 最小引擎）。
+    ///
+    /// 候选表 `enum_ctor_candidates` 保留跨枚举同名构造器，调用点按位置实参
+    /// 元数与类型过滤；多个候选同时通过即无法解析（2.1.11.2(7)）。与同名顶层
+    /// 函数并存的冲突判定（2.1.11.2(8)）仅在无 import 的单文件严格作用域下
+    /// 执行，避免跨文件/std 同名误伤正例。
+    fn check_enum_ctor_disambiguation(
+        &mut self,
+        name: &str,
+        arg_tys: &[Ty],
+        named_args: &[(String, Expr)],
+        has_explicit_type_args: bool,
+    ) {
+        if name.contains('.') || !named_args.is_empty() {
+            return;
+        }
+        // 显式类型实参（`Day<Int64, Float64>(1, 2.0, 3.0)`）已选定目标枚举
+        // （2.1.11.2(2) 省略枚举名的语法糖），不再按实参消歧。
+        if has_explicit_type_args {
+            return;
+        }
+        if self.lookup(name).is_some()
+            || self.local_func_names.contains(name)
+            || self.known_funcs.contains(name)
+            || self.globals.contains_key(name)
+            || self.type_names.contains(name)
+            || self.enum_names.contains(name)
+            || is_builtin_free_call_name(name)
+        {
+            return;
+        }
+        let Some(cands) = self.enum_ctor_candidates.get(name) else {
+            return;
+        };
+        if cands.is_empty() {
+            return;
+        }
+        let matching: Vec<&EnumCtorSig> = cands
+            .iter()
+            .filter(|c| {
+                c.params.len() == arg_tys.len()
+                    && c.params.iter().zip(arg_tys).all(|(p, a)| compatible(p, a))
+            })
+            .collect();
+        if matching.len() >= 2 {
+            let owners: Vec<&str> = matching.iter().map(|c| c.enum_name.as_str()).collect();
+            self.err(format!(
+                "枚举构造器 '{}' 同时匹配多个枚举的构造器（{}），无法解析（2.1.11.2(7)）",
+                name,
+                owners.join("/")
+            ));
+            return;
+        }
+        // 与同名顶层函数的冲突：仅无 import/package 的单文件（符号集完整）判定。
+        if !self.strict_scope {
+            return;
+        }
+        let Some(sigs) = self.free_func_sigs.get(name) else {
+            return;
+        };
+        if sigs.is_empty() || !arg_tys.iter().all(|t| t.is_definite()) {
+            return;
+        }
+        // 函数侧重载含变长/命名/类型形参时，本检查无法精确枚举，整体放行。
+        if sigs
+            .iter()
+            .any(|s| s.variadic || s.has_named || s.type_params > 0)
+        {
+            return;
+        }
+        // 同名函数可匹配时，裸名调用解析到函数（官方正例 a10_01：`f(1)`
+        // 与枚举构造器同名仍合法），不判冲突；仅当枚举构造器与函数侧**均**
+        // 无可用候选时才报“均不匹配”（2.1.11.2(8)，官方负例 a08_01）。
+        let func_ok = sigs.iter().any(|s| {
+            s.required == s.positional
+                && s.positional == arg_tys.len()
+                && s.positional_types
+                    .iter()
+                    .zip(arg_tys)
+                    .all(|(p, a)| compatible(p, a))
+        });
+        if !func_ok && matching.is_empty() {
+            self.err(format!(
+                "调用 '{}' 的实参与同名枚举构造器及函数均不匹配（2.1.11.2(8)）",
+                name
+            ));
+        }
+    }
+
     /// 10.1.2.1：自由函数名对应的本地重载集是否“完整可枚举”（不含跨文件/std
     /// 重载、类型名、全局变量、局部函数、成员方法、内建同名调用）。供显式类型
     /// 实参计数与 lambda 形参位置检查共用。
@@ -6128,6 +6340,25 @@ impl<'a> Checker<'a> {
         for stmt in body {
             self.check_stmt(stmt);
         }
+        // 2.1.11.2(8)：函数体尾表达式裸引用“与枚举构造器同名的唯一函数”时，
+        // 名字解析到函数值（函数优先）；若声明返回非函数类型则返回类型不匹配。
+        // 仅在尾语句恰为裸 `Var` 时判定（否则交既有 return 检查，避免误伤）。
+        if let Some(rt) = self.ret_ty.clone() {
+            if rt.is_definite() && !matches!(rt, Ty::Func { .. }) {
+                if let Some(Stmt::Expr(Expr::Var(n))) = body.last() {
+                    if let Some(ft) = self.ctor_named_func_value_ty(n) {
+                        if !compatible(&rt, &ft) {
+                            let n = n.clone();
+                            self.err(format!(
+                                "返回类型不匹配: 函数声明返回 {}，但尾表达式 '{}' 是函数值（2.1.11.2(8)）",
+                                rt.name(),
+                                n
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         self.defer_fn_depth -= 1;
         self.scopes.pop();
         self.ret_ty = saved_ret;
@@ -6191,6 +6422,10 @@ impl<'a> Checker<'a> {
                         self.check_array_literal_elems(ann, value);
                         self.check_literal_range(ann, value);
                         self.check_literal_annotation(ann, value);
+                        // 2.1.11.2(8)：枚举类型标注的初始化式若为“构造器与同名
+                        // 函数并存”的裸调用，名字解析到函数（非枚举构造器），
+                        // 不可能产生该枚举值。
+                        self.check_enum_ctor_binding_conflict(ann, value);
                     }
                 }
                 // 4.2(5)：`let x: T` 无初始化式（延迟赋值声明）允许在**之后恰好赋一次值**
@@ -6268,6 +6503,10 @@ impl<'a> Checker<'a> {
                         self.check_array_literal_elems(ann, value);
                         self.check_literal_range(ann, value);
                         self.check_literal_annotation(ann, value);
+                        // 2.1.11.2(8)：枚举类型标注的初始化式若为“构造器与同名
+                        // 函数并存”的裸调用，名字解析到函数（非枚举构造器），
+                        // 不可能产生该枚举值。
+                        self.check_enum_ctor_binding_conflict(ann, value);
                     }
                 }
                 let bind_ty = ann_ty.unwrap_or_else(|| default_binding_ty(&value_ty));
@@ -6311,6 +6550,13 @@ impl<'a> Checker<'a> {
                 self.bind_name(name, bind_ty, false, literal_int(value), true, false);
             }
             Stmt::Assign { target, value } => {
+                // 直线代码中的常量折叠：记录赋值前的常量值，赋值后按简单形态回填
+                // （用于 `var step = 5; step -= 5; 3..=10:step` 的步长 0 判定）。
+                let prev_const = match target {
+                    AssignTarget::Var(n) => self.lookup(n).and_then(|v| v.const_int),
+                    _ => None,
+                };
+                let straight = self.cond_depth == 0 && self.loop_depth == 0;
                 let value_ty = self.check_expr(value);
                 // 局部常量传播：`x op= const` 被解析器脱糖为 `x = x op const`。
                 // 若 x 已有已知编译期常量，则在覆盖（清空）之前折叠出新常量，供后续
@@ -7781,7 +8027,7 @@ impl<'a> Checker<'a> {
                 .lookup(name)
                 .map(|v| v.ty.clone())
                 .unwrap_or(Ty::Unknown),
-            crate::ast::Expr::OptionalChain { object, field }
+            crate::ast::Expr::OptionalChain { object, field, .. }
             | crate::ast::Expr::Field { object, field } => {
                 let recv = strip_option_ty(self.deq_ty(object));
                 self.user_field_ty(&recv, field).unwrap_or(Ty::Unknown)
@@ -10053,7 +10299,23 @@ impl<'a> Checker<'a> {
                 // 4.2(10)/(11)：重载函数名作值有歧义，仅在无类型标注的
                 // let/var 绑定初始化式恰为裸函数名时判定（check_overloaded_func_value），
                 // 以免误伤按上下文消歧的重载函数实参（`fv(neg)`，见 w21b 正例）。
-                // 3.2.3.2：无 import 单文件程序中的未定义标识符。
+                // 2.1.11.2(7)：裸名（无实参）引用时，若多个**无关联值**构造器同名，
+                // 全部通过类型检查即无法解析。仅当名字未被子句遮蔽时判定。
+                if self.lookup(name).is_none()
+                    && !self.type_names.contains(name)
+                    && !self.known_funcs.contains(name)
+                    && !self.local_func_names.contains(name)
+                {
+                    if let Some(cands) = self.enum_ctor_candidates.get(name) {
+                        let empty_count = cands.iter().filter(|c| c.params.is_empty()).count();
+                        if empty_count >= 2 {
+                            self.err(format!(
+                                "无参枚举构造器 '{}' 在多个枚举中同名，无法解析（2.1.11.2(7)）",
+                                name
+                            ));
+                        }
+                    }
+                }
                 self.check_strict_var(name);
                 // 4.2(9)：泛型函数名不带类型实参时不是合法表达式（闭包值需给全部
                 // 类型实参，如 `identity<Int64>`）。仅当该名字未被局部/全局变量、
@@ -10068,9 +10330,16 @@ impl<'a> Checker<'a> {
                         name
                     ));
                 }
-                self.lookup(name)
-                    .map(|v| v.ty.clone())
-                    .unwrap_or(Ty::Unknown)
+                if let Some(v) = self.lookup(name) {
+                    return v.ty.clone();
+                }
+                // 2.1.11.2(8)：与枚举构造器同名的唯一非泛型顶层函数作值时，
+                // 名字解析到函数，其静态类型为函数类型（使 `func B(): A { B }`
+                // 这类返回类型不匹配可被判定）。
+                if let Some(ft) = self.ctor_named_func_value_ty(name) {
+                    return ft;
+                }
+                Ty::Unknown
             }
 
             Expr::GenericFunctionRef { .. } => {
@@ -10090,6 +10359,16 @@ impl<'a> Checker<'a> {
                 // `-128i8` 由一元负号作用于 `128i8`：后者超出 i8 上界但整体合法，
                 // 因此在负号上下文按“取负后的值”做范围检查，并跳过内层检查。
                 if matches!(op, UnaryOp::Neg) {
+                    // 4.15(4)：一元 `-` 的操作数只能是数值类型。显式 `: Bool` 标注的
+                    // 变量作操作数必须判负（区别于官方正例中由组合推断产生的伪
+                    // Bool 形态，后者不来自显式标注，故不受影响）。
+                    if let Expr::Var(n) = &**expr {
+                        if self.lookup(n).map_or(false, |v| v.explicit_bool) {
+                            self.err(
+                                "一元运算符 '-' 不能作用于类型 Bool（4.15(4)）".to_string(),
+                            );
+                        }
+                    }
                     if let Expr::IntegerSuffixed(v, s) = &**expr {
                         self.check_suffixed_int_literal(*v, *s, true);
                         // 无符号后缀字面量取负：官方矛盾（见 check_unary Neg），放行。
@@ -10243,6 +10522,13 @@ impl<'a> Checker<'a> {
                 self.check_builtin_conversion(name, args, &arg_tys);
                 // 10.1.2.1：自由函数重载集完整时，位置实参个数/类型无法匹配任一重载则报错。
                 self.check_free_func_arity(name, &arg_tys, args, named_args);
+                // 2.1.11.2(7)/(8)：枚举构造器使用点消歧（候选表 + 实参元数/类型）。
+                self.check_enum_ctor_disambiguation(
+                    name,
+                    &arg_tys,
+                    named_args,
+                    type_args.as_ref().map_or(false, |v| !v.is_empty()),
+                );
                 // w26c：显式类型实参计数 + lambda 形参位置（5.3.3(1)/10.1.3.3）。
                 self.check_free_func_type_args_arity(
                     name,
@@ -10294,6 +10580,19 @@ impl<'a> Checker<'a> {
                             self.check_func_value_args(name, &params, args, &arg_tys);
                         }
                         return *ret;
+                    }
+                    // 2.1.11.2(11)：变量与枚举构造器同名时须前缀限定；此处变量
+                    // （非函数值）遮蔽构造器，对其调用 `C(true)` 必然非法。
+                    if !args.is_empty()
+                        && info.ty.is_definite()
+                        && self.enum_ctor_candidates.contains_key(name)
+                    {
+                        self.err(format!(
+                            "变量 '{}' 与枚举构造器同名，且其类型 '{}' 不是函数值，不能调用（2.1.11.2(11)）",
+                            name,
+                            info.ty.name()
+                        ));
+                        return Ty::Unknown;
                     }
                 }
                 if self.ctor_types.contains(name) {
@@ -10694,8 +10993,29 @@ impl<'a> Checker<'a> {
                 Ty::Unknown
             }
 
-            Expr::OptionalChain { object, field } => {
+            Expr::OptionalChain {
+                object,
+                field,
+                type_args,
+            } => {
                 self.check_expr(object);
+                // 4.13.4(5)：`. identifier typeArguments?` 中若被引用成员是泛型
+                // 方法，作为值时必须给出类型实参（`s?.id<T>` 合法，`s?.id` 非法）。
+                if type_args.is_none() {
+                    if let Ty::Option(inner) = self.deq_ty(object) {
+                        if let Ty::User(name) = inner.as_ref() {
+                            if self
+                                .generic_method_names
+                                .contains(&(name.clone(), field.clone()))
+                            {
+                                self.err(format!(
+                                    "泛型方法 '{}.{}' 作为值引用必须提供类型实参（4.13.4(5)）",
+                                    name, field
+                                ));
+                            }
+                        }
+                    }
+                }
                 // 4.13.4(9)：`a?.b` 要求 a 为某个 Option<T>；对确定非 Option 的
                 // 基础表达式使用 `?.` 非法。
                 // 兼容项目既有方言：引用类型（class/interface）实例上的 `?.`
@@ -11206,6 +11526,30 @@ impl<'a> Checker<'a> {
                 }
                 self.check_type_instantiation(name, type_args.as_deref());
                 self.check_ctor_call(name, &pos_tys, &named_tys);
+                // 2.1.11.2(7)/(8)：首字母大写的构造调用形态同样做枚举构造器消歧
+                // （`F2(r'z', 8_i8)` 等）。
+                self.check_enum_ctor_disambiguation(
+                    name,
+                    &pos_tys,
+                    named_args,
+                    type_args.as_ref().map_or(false, |v| !v.is_empty()),
+                );
+                // 2.1.11.2(11)：变量与枚举构造器同名时遮蔽构造器；变量非函数值
+                // 时 `C(true)` 非法（变量优先解析）。
+                if !args.is_empty() {
+                    let noncall_ty = self
+                        .lookup(name)
+                        .filter(|i| i.ty.is_definite() && !matches!(i.ty, Ty::Func { .. }))
+                        .map(|i| i.ty.name().to_string());
+                    if let Some(tname) = noncall_ty {
+                        if self.enum_ctor_candidates.contains_key(name) {
+                            self.err(format!(
+                                "变量 '{}' 与枚举构造器同名，且其类型 '{}' 不是函数值，不能调用（2.1.11.2(11)）",
+                                name, tname
+                            ));
+                        }
+                    }
+                }
                 // 2.1.11.1(6)：无参枚举构造器（首字母大写，被解析为构造调用形态）
                 // 是枚举值而非函数，`B()` 非法；同名类/结构体构造函数、函数或
                 // 局部函数除外（03/02 遮蔽正例中存在同名局部函数）。
@@ -16381,9 +16725,13 @@ mod tests {
 
     #[test]
     fn test_w21b_unary_neg_bool_preserved() {
-        // Bool 不是数值类型，但 `-x is T` 跨行并入等正例会形成 `-Bool` 形态，
-        // 为守住正测试红线保持放行（04/15 a04 负例归入放行档案）。
-        assert_ok("main() { var v: Bool = true\n let v2 = -v }");
+        // w43c 破局：显式 `: Bool` 标注变量的取负是可判定负例（04/15 a04_02 官方
+        // @Negative:yes）；此前为守正测试红线整体放行，现仅按“显式标注”窄化，
+        // 组合推断/解析换行形成的伪 Bool 形态不受影响。
+        assert_err(
+            "main() { var v: Bool = true\n let v2 = -v }",
+            "一元运算符 '-' 不能作用于类型 Bool",
+        );
         // 无符号整数的取负存在官方矛盾（02/01 a15 正例），保持放行。
         assert_ok("main() { var v: UInt8 = 1\n let v2 = -v }");
     }

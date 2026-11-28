@@ -8337,7 +8337,7 @@ impl CodeGen {
                 }
             }
             // P6.1: 可选链 obj?.field — 若 obj 为 0 (None 指针) 返回 0，否则访问字段
-            Expr::OptionalChain { object, field } => {
+            Expr::OptionalChain { object, field, .. } => {
                 // 推断字段类型以确定结果 WASM 类型
                 let field_access = Expr::Field {
                     object: object.clone(),

@@ -813,6 +813,7 @@ impl Parser {
             AssignTarget::OptionalField { object, field } => Expr::OptionalChain {
                 object: object.clone(),
                 field: field.clone(),
+                type_args: None,
             },
             AssignTarget::Slice { array, start, end } => Expr::SliceExpr {
                 array: array.clone(),
@@ -978,7 +979,7 @@ impl Parser {
                 start,
                 end,
             }),
-            Expr::OptionalChain { object, field } => {
+            Expr::OptionalChain { object, field, .. } => {
                 // 可选链赋值 a?.b = v：保留可选链形态，交由语义检查
                 // 4.23(15)/4.13.4 判定（目标字段可变且基础为引用类型时才合法）。
                 Ok(AssignTarget::OptionalField { object, field })

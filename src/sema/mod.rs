@@ -16702,7 +16702,7 @@ fn check_local_class_member_existence(
             }
         };
         walk_stmts(body, &mut |e| match e {
-            Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+            Expr::Field { object, field } | Expr::OptionalChain { object, field, .. } => {
                 let Some(cls) = receiver_cls(object) else {
                     return;
                 };
@@ -16806,7 +16806,7 @@ fn check_struct_member_existence(
             }
         };
         walk_stmts(body, &mut |e| match e {
-            Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+            Expr::Field { object, field } | Expr::OptionalChain { object, field, .. } => {
                 let Expr::Var(v) = &**object else { return };
                 if v == "this" || v == "super" {
                     return;
@@ -17561,7 +17561,7 @@ fn check_catch_union_member_access(program: &Program, errors: &mut Vec<SemanticE
                         }
                     }
                 }
-                Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+                Expr::Field { object, field } | Expr::OptionalChain { object, field, .. } => {
                     if let Expr::Var(v) = &**object {
                         if v == var {
                             accessed.push(field.clone());
@@ -17879,7 +17879,7 @@ fn check_unconstrained_type_param_usage(program: &Program, errors: &mut Vec<Sema
                     );
                 }
             }
-            if let Expr::Field { object, field } | Expr::OptionalChain { object, field } = e {
+            if let Expr::Field { object, field } | Expr::OptionalChain { object, field, .. } = e {
                 if is_uncon_var(object) && !any_members.contains(field.as_str()) {
                     push_semantic_err(
                         errors,
@@ -18214,7 +18214,7 @@ fn check_extension_private_member_access(
                         hits.insert(b);
                     }
                 }
-                Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+                Expr::Field { object, field } | Expr::OptionalChain { object, field, .. } => {
                     if is_this_receiver_expr(object) && private_members.contains(field.as_str()) {
                         hits.insert(field.clone());
                     }
@@ -18585,7 +18585,7 @@ fn check_extension_private_member_cross_reference(
                             hits.insert(method.clone());
                         }
                     }
-                    Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+                    Expr::Field { object, field } | Expr::OptionalChain { object, field, .. } => {
                         if is_this_receiver_expr(object)
                             && flagged.contains(field.as_str())
                             && !locals.contains(field)
@@ -18723,7 +18723,7 @@ fn check_extension_private_member_outside_access(
                     }
                 }
             }
-            Expr::Field { object, field } | Expr::OptionalChain { object, field } => {
+            Expr::Field { object, field } | Expr::OptionalChain { object, field, .. } => {
                 let ty = match object.as_ref() {
                     Expr::Var(v) => var_types.get(v).cloned(),
                     Expr::VariantConst { enum_name, .. } => Some(enum_name.clone()),

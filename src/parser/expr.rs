@@ -875,12 +875,14 @@ impl Parser {
                             expr = Expr::OptionalChain {
                                 object: Box::new(expr),
                                 field,
+                                type_args,
                             };
                         }
                     } else {
                         expr = Expr::OptionalChain {
                             object: Box::new(expr),
                             field,
+                            type_args: None,
                         };
                     }
                 }
@@ -1233,7 +1235,7 @@ impl Parser {
                             named_args: vec![],
                             type_args: None,
                         },
-                        Expr::OptionalChain { object, field } => Expr::MethodCall {
+                        Expr::OptionalChain { object, field, .. } => Expr::MethodCall {
                             object,
                             method: field,
                             args: vec![closure],
@@ -3270,6 +3272,7 @@ impl Parser {
                         expr = Expr::OptionalChain {
                             object: Box::new(expr),
                             field,
+                            type_args: None,
                         };
                     }
                 }

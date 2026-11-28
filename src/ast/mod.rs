@@ -297,6 +297,10 @@ pub enum Expr {
     OptionalChain {
         object: Box<Expr>,
         field: String,
+        /// 显式类型实参（`s?.id<T>` 的 `<T>`）。`None` 表示没有类型实参：
+        /// 若被引用的成员是泛型方法则非法（4.13.4(5)：`s?.id` 缺类型实参）；
+        /// `Some(..)`（含空）等价于合法的泛型成员值引用。
+        type_args: Option<Vec<Type>>,
     },
     /// P6.2: 尾随闭包调用 f(args) { params => body }
     TrailingClosure {
