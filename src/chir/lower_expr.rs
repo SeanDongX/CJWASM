@@ -2939,36 +2939,74 @@ impl<'a> LoweringContext<'a> {
                             )));
                         }
                     }
-                    // w51a: cjc 的 String.indexOf 返回 Option<Int64>：
-                    //   indexOf(str) / indexOf(str, fromIndex)（含 2 参重载，fromIndex 为 Int64 字节偏移）
-                    // 运行时助手 __str_index_of(haystack, needle, from) -> Option 盒指针。
-                    // 仅当首参推断为 String 时按此形态下放；Rune/UInt8 重载留给后续批次。
+                    // w51a/w52b: cjc 的 String.indexOf 返回 Option<Int64>：
+                    //   indexOf(str[, fromIndex])          → __str_index_of
+                    //   indexOf(byte: UInt8[, fromIndex])  → __str_index_of_byte
+                    // 运行时助手返回 Option 盒指针（命中 Some(字节偏移)，未命中 None）。
+                    // 首参推断为 String 时走字符串扫描；否则按 UInt8 单字节处理
+                    // （cjc 1.0.5 无 Rune 重载：`s.indexOf(r'a')` 是编译错误）。
                     "indexOf" if args.len() == 1 || args.len() == 2 => {
                         let first_is_string = match self.type_ctx.infer_expr(&args[0]) {
                             Ok(Type::String) => true,
                             Ok(_) => false,
                             Err(_) => true, // 推断失败时保持旧行为（按字符串处理）
                         };
-                        if first_is_string {
-                            if let Some(&func_idx) = self.func_indices.get("__str_index_of") {
-                                let obj = self.lower_expr(object)?;
-                                let obj = self.insert_cast_if_needed(obj, ValType::I32);
-                                let needle = self.lower_expr(&args[0])?;
-                                let needle = self.insert_cast_if_needed(needle, ValType::I32);
-                                let from = if args.len() == 2 {
-                                    let f = self.lower_expr(&args[1])?;
-                                    self.insert_cast_if_needed(f, ValType::I64)
-                                } else {
-                                    CHIRExpr::new(
-                                        CHIRExprKind::Integer(0),
-                                        Type::Int64, ValType::I64,
-                                    )
-                                };
-                                return Ok(Some(CHIRExpr::new(
-                                    CHIRExprKind::Call { func_idx, args: vec![obj, needle, from] },
-                                    Type::Option(Box::new(Type::Int64)), ValType::I32,
-                                )));
-                            }
+                        let helper = if first_is_string {
+                            "__str_index_of"
+                        } else {
+                            "__str_index_of_byte"
+                        };
+                        if let Some(&func_idx) = self.func_indices.get(helper) {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let needle = self.lower_expr(&args[0])?;
+                            let needle = self.insert_cast_if_needed(needle, ValType::I32);
+                            let from = if args.len() == 2 {
+                                let f = self.lower_expr(&args[1])?;
+                                self.insert_cast_if_needed(f, ValType::I64)
+                            } else {
+                                CHIRExpr::new(
+                                    CHIRExprKind::Integer(0),
+                                    Type::Int64, ValType::I64,
+                                )
+                            };
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, needle, from] },
+                                Type::Option(Box::new(Type::Int64)), ValType::I32,
+                            )));
+                        }
+                    }
+                    // w52b: lastIndexOf 与 indexOf 同样分派，但反向扫描、返回最右匹配
+                    // （语义：在 suffix this[max(from,0)..] 内找最右出现；空 needle → size）。
+                    "lastIndexOf" if args.len() == 1 || args.len() == 2 => {
+                        let first_is_string = match self.type_ctx.infer_expr(&args[0]) {
+                            Ok(Type::String) => true,
+                            Ok(_) => false,
+                            Err(_) => true,
+                        };
+                        let helper = if first_is_string {
+                            "__str_last_index_of"
+                        } else {
+                            "__str_last_index_of_byte"
+                        };
+                        if let Some(&func_idx) = self.func_indices.get(helper) {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let needle = self.lower_expr(&args[0])?;
+                            let needle = self.insert_cast_if_needed(needle, ValType::I32);
+                            let from = if args.len() == 2 {
+                                let f = self.lower_expr(&args[1])?;
+                                self.insert_cast_if_needed(f, ValType::I64)
+                            } else {
+                                CHIRExpr::new(
+                                    CHIRExprKind::Integer(0),
+                                    Type::Int64, ValType::I64,
+                                )
+                            };
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, needle, from] },
+                                Type::Option(Box::new(Type::Int64)), ValType::I32,
+                            )));
                         }
                     }
                     "replace" if args.len() == 2 => {

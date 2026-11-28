@@ -499,7 +499,8 @@ impl TypeInferenceContext {
                 "toInt64" => return Ok(Type::Int64),
                 // w51a: cjc 的 String.indexOf 返回 Option<Int64>（命中 Some(字节偏移)，未命中 None），
                 // 与 cjc 对齐，不再用 i64 -1 哨兵。
-                "indexOf" => return Ok(Type::Option(Box::new(Type::Int64))),
+                // w52b: lastIndexOf 同返回 Option<Int64>（UInt8/String 重载均如此）。
+                "indexOf" | "lastIndexOf" => return Ok(Type::Option(Box::new(Type::Int64))),
                 "isEmpty" | "isBlank" | "contains" | "startsWith" | "endsWith" => {
                     return Ok(Type::Bool)
                 }

@@ -234,6 +234,8 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         "__checked_str_eq",
         "__arr_get_i32", "__arr_get_i64", "__arr_get_f64",
         "__arr_set_i32", "__arr_set_i64", "__arr_set_f64",
+        // w52b: String API 余项（必须与 chir_codegen.rs 的 RT_NAMES 尾部一致）
+        "__str_index_of_byte", "__str_last_index_of", "__str_last_index_of_byte",
     ];
     for (i, name) in rt_names.iter().enumerate() {
         func_indices.insert(name.to_string(), rt_base + i as u32);

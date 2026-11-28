@@ -34,43 +34,32 @@ pub fn unescape_string(s: &str) -> String {
     out
 }
 
-/// 处理多行字符串：移除首行空行，并 strip 公共缩进
+/// 处理多行字符串的字面量内容。
+///
+/// 按 cjc 实测语义（1.0.5）：仅移除起始 `"""` 后紧跟的第一个行终止符
+/// （`\r\n` / `\n` / `\r`）；其后内容**原样保留**——每行前导空格/Tab、空行、
+/// 以及结尾 `"""` 之前的缩进空白都计入结果。cjc 并不 strip 公共缩进，也不丢弃
+/// 末尾空白行。例如：
+///
+/// ```text
+/// """
+///     abc
+///     def
+///     """      ⇒  "    abc\n    def\n    "
+/// ```
+///
+/// 注意：起始行终止符由 `lex_multiline_string` 保证存在（规范 1.3.6 要求 `"""`
+/// 后必须紧跟换行）；若传入不以换行开头的字符串则原样返回。
 pub fn process_multiline_string(s: &str) -> String {
-    let mut lines: Vec<&str> = s.lines().collect();
-
-    // 如果第一行是空的（紧跟 """ 后换行），移除它
-    if !lines.is_empty() && lines[0].trim().is_empty() {
-        lines.remove(0);
+    if let Some(rest) = s.strip_prefix("\r\n") {
+        rest.to_string()
+    } else if let Some(rest) = s.strip_prefix('\n') {
+        rest.to_string()
+    } else if let Some(rest) = s.strip_prefix('\r') {
+        rest.to_string()
+    } else {
+        s.to_string()
     }
-    // 如果最后一行只有空白（""" 前的缩进），移除它
-    if !lines.is_empty() && lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
-        lines.pop();
-    }
-
-    if lines.is_empty() {
-        return String::new();
-    }
-
-    // 计算公共缩进（最小非空行的前导空白数）
-    let min_indent = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .unwrap_or(0);
-
-    // 移除公共缩进并拼接
-    lines
-        .iter()
-        .map(|l| {
-            if l.len() >= min_indent {
-                &l[min_indent..]
-            } else {
-                l.trim_start()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// 解析十六进制浮点字面量（仓颉规范 1.3：0x<hex>(.<hex>)?[pP]<sign><digits>）
@@ -292,6 +281,9 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, 
     let mut current = String::new();
     let mut parts: Vec<StringPart> = Vec::new();
     let mut has_interpolation = false;
+    // cjc 语义：只有紧接起始 `"""` 后的字面量片段需要移除首个行终止符；
+    // 插值 `${...}` 之后的字面量片段原样保留（其中可能以下一个换行开头，不能再次剥离）。
+    let mut first_literal = true;
 
     // 规范 1.3.6：多行字符串的起始 `"""` 之后必须紧跟行终止符
     // （`""""""`、`"""123"""` 等无换行的形态均非法）。
@@ -312,7 +304,12 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, 
                 return Some(Ok(process_multiline_string(&current)));
             }
             if !current.is_empty() {
-                parts.push(StringPart::Literal(process_multiline_string(&current)));
+                let lit = if first_literal {
+                    process_multiline_string(&current)
+                } else {
+                    current.clone()
+                };
+                parts.push(StringPart::Literal(lit));
             }
             return Some(Err(parts));
         }
@@ -339,9 +336,15 @@ fn lex_multiline_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, 
             // 插值开始 ${
             has_interpolation = true;
             if !current.is_empty() {
-                parts.push(StringPart::Literal(process_multiline_string(&current)));
+                let lit = if first_literal {
+                    process_multiline_string(&current)
+                } else {
+                    current.clone()
+                };
+                parts.push(StringPart::Literal(lit));
                 current.clear();
             }
+            first_literal = false;
             pos += 2;
             let mut brace_depth = 1;
             let expr_start = pos;
@@ -1552,7 +1555,8 @@ mod tests {
         assert_eq!(
             tokens[3],
             Token::MultiLineStringLit(StringOrInterpolated::Plain(
-                "hello\nworld".to_string()
+                // cjc 保留源缩进：仅移除起始 """ 后的第一个换行，其余原样保留。
+                "    hello\n    world\n    ".to_string()
             ))
         );
     }
@@ -1657,7 +1661,8 @@ mod tests {
     fn test_process_multiline_string_basic() {
         let s = "\n    hello\n    world\n    ";
         let result = super::process_multiline_string(s);
-        assert_eq!(result, "hello\nworld");
+        // cjc 保留源缩进与结尾空白行
+        assert_eq!(result, "    hello\n    world\n    ");
     }
 
     #[test]
@@ -1669,7 +1674,36 @@ mod tests {
     fn test_process_multiline_string_no_indent() {
         let s = "\nhello\nworld\n";
         let result = super::process_multiline_string(s);
-        assert_eq!(result, "hello\nworld");
+        // 仅移除首个换行，保留末尾换行
+        assert_eq!(result, "hello\nworld\n");
+    }
+
+    #[test]
+    fn test_process_multiline_string_keeps_indent_and_blank_lines() {
+        // cjc 保留空格/Tab 前导、空行、末尾缩进（不 strip 公共缩进）
+        let s = "\n  x\n\ty\n\n  z\n  ";
+        assert_eq!(super::process_multiline_string(s), "  x\n\ty\n\n  z\n  ");
+    }
+
+    #[test]
+    fn test_multiline_string_interpolation_keeps_segment_indent() {
+        // 插值 ${x} 之后的字面量片段以其后的换行开头，必须原样保留（不被二次剥离）
+        let source = "let s = \"\"\"\n    a${x}\n    b\n    \"\"\"";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+        match &tokens[3] {
+            Token::MultiLineStringLit(StringOrInterpolated::Interpolated(parts)) => {
+                let lits: Vec<&StringPart> = parts
+                    .iter()
+                    .filter(|p| matches!(p, StringPart::Literal(_)))
+                    .collect();
+                assert_eq!(lits.len(), 2);
+                // 第一段移除首个换行、保留前导 4 空格；第二段整体原样保留
+                assert_eq!(lits[0], &StringPart::Literal("    a".to_string()));
+                assert_eq!(lits[1], &StringPart::Literal("\n    b\n    ".to_string()));
+            }
+            other => panic!("期望多行插值字符串，实际: {:?}", other),
+        }
     }
 
     #[test]
