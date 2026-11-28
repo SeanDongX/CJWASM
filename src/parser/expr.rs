@@ -86,6 +86,7 @@ impl Parser {
                 break;
             };
             self.advance();
+            let end_start = self.pos;
             let end = if self.check(&Token::RBracket)
                 || self.check(&Token::RParen)
                 || self.check(&Token::Comma)
@@ -96,7 +97,19 @@ impl Parser {
             } else {
                 Box::new(self.parse_pipeline()?)
             };
+            let end_end = self.pos;
             let step = if self.check(&Token::Colon) {
+                // cjc 区分性行为（1.0.5 实测）：步长语法 `a..b : s` 要求端点 b 的
+                // 顶层不得是位逻辑/关系/相等/逻辑/空值合并运算符；若端点是整体括号
+                // 组（如 `(x & y)`）则允许。此时冒号落在这里会报“found ':'”。
+                if Self::range_step_end_rejects(&end)
+                    && !self.span_is_whole_group(end_start, end_end)
+                {
+                    return self.bail(ParseError::Message(
+                        "范围步长 `:` 不能紧跟位逻辑/关系/逻辑运算构成的端点表达式（4.19(3)）"
+                            .to_string(),
+                    ));
+                }
                 self.advance();
                 Some(Box::new(self.parse_pipeline()?))
             } else {
@@ -110,6 +123,55 @@ impl Parser {
             };
         }
         Ok(left)
+    }
+
+    /// 范围步长端点表达式是否属于 cjc 拒绝的类别（顶层运算符为位逻辑/关系/
+    /// 相等/逻辑/空值合并）。见 [`Self::span_is_whole_group`] 的括号豁免。
+    fn range_step_end_rejects(e: &Expr) -> bool {
+        match e {
+            Expr::Binary { op, .. } => matches!(
+                op,
+                BinOp::Eq
+                    | BinOp::NotEq
+                    | BinOp::Lt
+                    | BinOp::Gt
+                    | BinOp::LtEq
+                    | BinOp::GtEq
+                    | BinOp::LogicalAnd
+                    | BinOp::LogicalOr
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::NotIn
+            ),
+            Expr::IsType { .. } | Expr::Cast { .. } | Expr::NullCoalesce { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// `tokens[start..end)` 是否恰好是一个整体括号组 `( ... )`。
+    /// 整体括号会改变 cjc 对范围步长端点的判定（`(x & y)` 允许 `:step`，
+    /// 裸 `x & y` 不允许）。pushback（`>>` 拆分）在场时保守返回 false。
+    fn span_is_whole_group(&self, start: usize, end: usize) -> bool {
+        if self.pushback.is_some() || end <= start + 1 || end > self.tokens.len() {
+            return false;
+        }
+        if !matches!(self.tokens[start].1, Token::LParen) {
+            return false;
+        }
+        let mut depth = 0isize;
+        for (off, (_, tok, _)) in self.tokens[start..end].iter().enumerate() {
+            match tok {
+                Token::LParen | Token::LBracket | Token::LBrace => depth += 1,
+                Token::RParen | Token::RBracket | Token::RBrace => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                // 括号组必须在最后一个 token 处闭合，才是“整体包裹”。
+                return off == end - start - 1;
+            }
+        }
+        false
     }
 
     /// 解析管道 (|>): left |> right 表示 right(left)
@@ -1495,6 +1557,7 @@ impl Parser {
             let inclusive = self.check(&Token::DotDotEq);
             self.advance();
             // 支持开放式范围 2.. (没有结束值)
+            let end_start = self.pos;
             let end = if self.check(&Token::RBracket)
                 || self.check(&Token::RParen)
                 || self.check(&Token::Comma)
@@ -1505,8 +1568,19 @@ impl Parser {
                 // 结束值：范围运算符优先级最低，按完整表达式解析（如 1..3 + 3）
                 Box::new(self.parse_pipeline()?)
             };
+            let end_end = self.pos;
             // P2.6: 可选步长 `: step`（支持负步长 -1）
+            // cjc 区分性行为（1.0.5 实测）：步长端点顶层为位逻辑/关系/逻辑/
+            // 空值合并运算时，`:` 不被接受（整体括号组除外）。
             let step = if self.check(&Token::Colon) {
+                if Self::range_step_end_rejects(&end)
+                    && !self.span_is_whole_group(end_start, end_end)
+                {
+                    return self.bail(ParseError::Message(
+                        "范围步长 `:` 不能紧跟位逻辑/关系/逻辑运算构成的端点表达式（4.19(3)）"
+                            .to_string(),
+                    ));
+                }
                 self.advance();
                 Some(Box::new(self.parse_pipeline()?))
             } else {
@@ -3289,8 +3363,18 @@ impl Parser {
         if self.check(&Token::DotDot) || self.check(&Token::DotDotEq) {
             let inclusive = self.check(&Token::DotDotEq);
             self.advance();
+            let end_start = self.pos;
             let end = self.parse_expr()?;
+            let end_end = self.pos;
             let step = if self.check(&Token::Colon) {
+                if Self::range_step_end_rejects(&end)
+                    && !self.span_is_whole_group(end_start, end_end)
+                {
+                    return self.bail(ParseError::Message(
+                        "范围步长 `:` 不能紧跟位逻辑/关系/逻辑运算构成的端点表达式（4.19(3)）"
+                            .to_string(),
+                    ));
+                }
                 self.advance();
                 Some(Box::new(self.parse_expr()?))
             } else {

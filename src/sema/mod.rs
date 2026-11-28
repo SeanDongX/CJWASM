@@ -759,6 +759,11 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 6.1.2.7(4)：泛型类限定访问成员须提供类型实参（w30c）。
     check_generic_class_qualifier_without_args(program, &mut errors);
 
+    // w44b：Assert 断言辅助返回 Unit，不能作为二元算术操作数（01/04 a06_11）。
+    check_assert_unit_operand(program, &mut errors);
+    // w44b：递归函数必须显式标注返回类型（10.1.3.2 a05_03）。
+    check_recursive_missing_return_type(program, &mut errors);
+
     // 9.3.3/9.3.4：函数/元组/类值实参的名义子类型匹配（保守版）。
     check_structured_arg_subtypes(program, &mut errors);
 
@@ -41514,4 +41519,198 @@ main() {}"#,
         );
     }
 
+}
+
+/// w44b：`utils.assert.Assert.equals(...)`（官方测试辅助断言）返回 Unit，
+/// 不能作为二元算术/位运算的操作数。01/04 a06_11 中 `ct_pos-` 折行后与随后
+/// 的 `Assert.equals(...)` 被解析器合并为 `ct_pos - Assert.equals(...)`，
+/// cjc 1.0.5 报 `invalid binary operator '-' on type 'IntNative' and 'Unit'`。
+///
+/// 仅在操作数恰为 `Assert.<helper>(...)`（已知返回 Unit 的断言辅助）时判定，
+/// 不涉及其它未知调用，保证正例零回归。
+fn check_assert_unit_operand(program: &Program, errors: &mut Vec<SemanticError>) {
+    let mut check_stmts = |body: &[Stmt], errors: &mut Vec<SemanticError>| {
+        walk_stmts(body, &mut |e| {
+            let Expr::Binary { op, left, right } = e else {
+                return;
+            };
+            if !matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::Pow
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr
+            ) {
+                return;
+            }
+            if is_assert_unit_call(left) || is_assert_unit_call(right) {
+                errors.push(SemanticError {
+                    message: "Assert.equals 返回 Unit，不能作为二元算术/位运算符的操作数（1.4(6)）"
+                        .to_string(),
+                });
+            }
+        });
+    };
+    for f in &program.functions {
+        check_stmts(&f.body, errors);
+    }
+    for c in &program.classes {
+        for m in &c.methods {
+            check_stmts(&m.func.body, errors);
+        }
+        for init in &c.inits {
+            check_stmts(&init.body, errors);
+        }
+    }
+    for s in &program.structs {
+        for init in &s.inits {
+            check_stmts(&init.body, errors);
+        }
+    }
+    for ext in &program.extends {
+        for m in &ext.methods {
+            check_stmts(&m.body, errors);
+        }
+    }
+}
+
+/// 是否为 `Assert.<helper>(...)` 形态的断言辅助调用（返回 Unit）。
+fn is_assert_unit_call(e: &Expr) -> bool {
+    match e {
+        Expr::MethodCall {
+            object, method, ..
+        } => {
+            let is_assert_recv = matches!(&**object, Expr::Var(n) if n == "Assert" || n.ends_with(".Assert"));
+            is_assert_recv && matches!(method.as_str(), "equals" | "isTrue" | "isFalse" | "isSome" | "isNone")
+        }
+        Expr::Call { name, .. } => {
+            let last = name.rsplit('.').next().unwrap_or(name);
+            let is_assert_recv = name.starts_with("Assert.") || name.starts_with("utils.assert.Assert.");
+            is_assert_recv
+                && matches!(last, "equals" | "isTrue" | "isFalse" | "isSome" | "isNone")
+        }
+        _ => false,
+    }
+}
+
+/// w44b：递归函数必须显式标注返回类型。
+///
+/// cjc 1.0.5 对任何（直接或间接）递归、且未标注返回类型的函数报
+/// `unable to infer return type, please add type annotation`（10.1.3.2 a05_03：
+/// 泛型函数 `f_i`/`f_j` 互相调用且均无返回类型标注）。此规则据此判定：
+/// 在“无 import 的单文件程序”上构建顶层自由函数间的调用图（仅无标注函数为
+/// 节点），处于环（自环或互递归）中的函数报错。带 import / package 的程序
+/// （std 等）不触发，保证零回归。
+fn check_recursive_missing_return_type(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 仅对“无 package / 无 import”的独立单文件程序生效：std 等带 package 的
+    // 程序整体跳过，保证零回归。
+    if !program.imports.is_empty() || program.package_name.is_some() {
+        return;
+    }
+    // 顶层自由函数名出现次数（用于排除重载带来的解析歧义）。
+    let mut name_count: HashMap<&str, usize> = HashMap::new();
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") {
+            continue;
+        }
+        *name_count.entry(f.name.as_str()).or_default() += 1;
+    }
+    // 节点：无返回类型标注、非 extern、有 body、名字唯一的自由函数。
+    let mut nodes: HashMap<&str, &Function> = HashMap::new();
+    for f in &program.functions {
+        if f.name.contains('.') || f.name.contains("::") {
+            continue;
+        }
+        if f.return_type.is_some() || f.extern_import.is_some() || f.body.is_empty() {
+            continue;
+        }
+        if name_count.get(f.name.as_str()).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        nodes.insert(f.name.as_str(), f);
+    }
+    if nodes.is_empty() {
+        return;
+    }
+    // 类型名 / 全局常量名（调用若指向它们则不构成对自由函数的递归）。
+    let mut nonfunc: HashSet<&str> = HashSet::new();
+    for c in &program.classes {
+        nonfunc.insert(c.name.as_str());
+    }
+    for s in &program.structs {
+        nonfunc.insert(s.name.as_str());
+    }
+    for e in &program.enums {
+        nonfunc.insert(e.name.as_str());
+    }
+    for i in &program.interfaces {
+        nonfunc.insert(i.name.as_str());
+    }
+    for c in &program.constants {
+        nonfunc.insert(c.name.as_str());
+    }
+    // 构建调用边（仅指向其它无标注自由函数）。
+    let mut edges: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (n, f) in &nodes {
+        let mut localset: HashSet<String> = HashSet::new();
+        for p in &f.params {
+            localset.insert(p.name.clone());
+        }
+        collect_local_def_names(&f.body, &mut localset);
+        let mut callees: HashSet<&str> = HashSet::new();
+        walk_stmts(&f.body, &mut |e| {
+            let callee: Option<&str> = match e {
+                Expr::Call { name, .. } => Some(name.as_str()),
+                Expr::GenericFunctionRef { name, .. } => Some(name.as_str()),
+                _ => None,
+            };
+            let Some(callee) = callee else {
+                return;
+            };
+            if let Some((k, _)) = nodes.get_key_value(callee) {
+                if !localset.contains(callee) && !nonfunc.contains(callee) {
+                    callees.insert(*k);
+                }
+            }
+        });
+        edges.insert(n, callees);
+    }
+    // 对每个节点做可达性 DFS，判断是否能沿调用边回到自身（处于环中）。
+    for &start in nodes.keys() {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = edges
+            .get(start)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let mut cyclic = false;
+        while let Some(cur) = stack.pop() {
+            if cur == start {
+                cyclic = true;
+                break;
+            }
+            if !seen.insert(cur) {
+                continue;
+            }
+            if let Some(nexts) = edges.get(cur) {
+                for nx in nexts {
+                    stack.push(*nx);
+                }
+            }
+        }
+        if cyclic {
+            errors.push(SemanticError {
+                message: format!(
+                    "无法推断函数 '{}' 的返回类型：递归函数必须显式标注返回类型（5.1.4）",
+                    start
+                ),
+            });
+        }
+    }
 }

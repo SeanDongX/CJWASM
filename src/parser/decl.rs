@@ -5839,7 +5839,7 @@ main() {}
     #[test]
     fn test_try_with_typed_resources() {
         ok(r#"
-class R {
+class R <: Resource {
     init() {}
 }
 main() {

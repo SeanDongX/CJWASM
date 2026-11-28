@@ -9594,6 +9594,71 @@ impl<'a> Checker<'a> {
         self.err(format!("未声明的函数 '{}'（3.2.3.2）", name));
     }
 
+    /// 12.1.2(7)：try-with-resources 的资源规格表达式类型必须实现 Resource 接口。
+    ///
+    /// 仅在无 import、无 package 的单文件（`strict_scope`）下判定：此时构造调用形态
+    /// 的资源实参名只能是本地用户类型或预置类型，无法来自导入的外部包。
+    /// - 本地类型：须（沿继承/实现链传递）实现 Resource（或 AutoCloseable/NamedResource）；
+    /// - 预置/内建类型（`Exception`、`String`、`Array` 等）：均不实现 Resource，非法；
+    /// - 其余大写名：单文件下不可能是外部类型 → 未定义类型，非法。
+    ///
+    /// 非构造调用形态（变量、函数调用、字段访问等）保守放行，避免误伤。
+    fn check_resource_spec(&mut self, e: &Expr) {
+        if !self.strict_scope {
+            return;
+        }
+        let Expr::ConstructorCall { name, .. } = e else {
+            return;
+        };
+        if name.contains('.') || name.contains("::") {
+            return;
+        }
+        // 类型别名：保守放行（避免把指向 Resource 类型的别名误判）。
+        if self.alias_types.contains_key(name) {
+            return;
+        }
+        if self.user_parents.contains_key(name) || self.type_names.contains(name) {
+            if !self.ty_implements_resource(name) {
+                self.err(format!(
+                    "资源规格表达式类型 '{}' 未实现 Resource 接口（12.1.2(7)）",
+                    name
+                ));
+            }
+            return;
+        }
+        if super::is_prelude_identifier(name) || is_builtin_class_name(name) {
+            self.err(format!(
+                "资源规格表达式类型 '{}' 未实现 Resource 接口（12.1.2(7)）",
+                name
+            ));
+            return;
+        }
+        self.err(format!(
+            "资源规格表达式使用了未定义的类型 '{}'（12.1.2(7)）",
+            name
+        ));
+    }
+
+    /// 判定本地用户类型 `ty` 是否沿继承/实现链传递实现 `Resource`。
+    fn ty_implements_resource(&self, ty: &str) -> bool {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = vec![ty.to_string()];
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t.clone()) {
+                continue;
+            }
+            if let Some(ps) = self.user_parents.get(&t) {
+                for p in ps {
+                    if p == "Resource" || p == "AutoCloseable" || p == "NamedResource" {
+                        return true;
+                    }
+                    stack.push(p.clone());
+                }
+            }
+        }
+        false
+    }
+
     fn is_known_member_name(&self, name: &str) -> bool {
         // 成员/方法名在表中可能以限定形态（`S.double`）或裸名（`double`）存储
         // （扩展方法、类方法两者皆有），两种形态都匹配。
@@ -12092,6 +12157,8 @@ impl<'a> Checker<'a> {
                 self.scopes.push(HashMap::new());
                 for (n, e) in resources {
                     let ty = self.check_expr(e);
+                    // 12.1.2(7)：资源规格表达式的类型必须实现 Resource 接口。
+                    self.check_resource_spec(e);
                     // try-with-resources 资源变量在其 try 体内可见（catch/finally 不可见）。
                     self.bind_name(n, ty, true, None, false, false);
                 }
