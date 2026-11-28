@@ -1513,9 +1513,18 @@ impl<'a> LoweringContext<'a> {
                     );
                     let store_value = if is_lambda_init {
                         // call_indirect lambda(i) to get value。
-                        // lambda 的声明返回类型默认等于参数类型（未标注时为 Int64），
-                        // 故以 (i64)->(i64) 调用；随后把结果转换为元素类型——类/指针元素
-                        // 在此从 I64 wrap 回 I32，从而按 4 字节正确落槽（与读侧步长一致）。
+                        // 构造 lambda 的声明返回类型按上下文期望取元素类型 T（见
+                        // lower.rs::emit_lambda_function 的 Array<T>(n,{λ}) 分支），
+                        // 故 call_indirect 的结果类型必须与该 lambda 函数签名一致——
+                        // 否则 Float64 等元素会被按 Int64 截断（如 `i + 0.5` 丢小数）。
+                        let lambda_ret_ty = match &args[1] {
+                            Expr::Lambda { return_type: Some(rt), .. } => rt.clone(),
+                            _ => elem_ast_ty.clone(),
+                        };
+                        let lambda_ret_wasm = match &lambda_ret_ty {
+                            crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                            t => t.to_wasm(),
+                        };
                         let i_as_i64 = CHIRExpr::new(
                             CHIRExprKind::Cast { expr: Box::new(i_get()), from_ty: ValType::I32, to_ty: ValType::I64 },
                             crate::ast::Type::Int64, ValType::I64,
@@ -1526,7 +1535,7 @@ impl<'a> LoweringContext<'a> {
                                 args: vec![i_as_i64],
                                 callee: Box::new(CHIRExpr::new(CHIRExprKind::Local(init_local), crate::ast::Type::Int32, ValType::I32)),
                             },
-                            crate::ast::Type::Int64, ValType::I64,
+                            lambda_ret_ty, lambda_ret_wasm,
                         );
                         self.insert_cast_if_needed(call, elem_wasm)
                     } else {

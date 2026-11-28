@@ -542,45 +542,91 @@ fn collect_lambdas_from_stmt(stmt: &crate::ast::Stmt, counter: &mut u32, out: &m
     }
 }
 
+/// 生成一个 `__lambda_N` 顶层函数（按收集顺序编号，与 lower_expr 的 lambda_counter 一致）。
+///
+/// `ret_override` 是上下文期望的返回类型（如 `Array<T>(n, {λ})` 的元素类型 T）。
+/// 返回类型推断优先级：显式标注 > 上下文期望 > 参数类型 > Int64。
+/// 未注解形参的 `Type` 只是占位，实际类型由上下文函数类型给出（此处 Array 构造为
+/// `(Int64) -> T`，故形参保持 Int64 占位即可）。
+fn emit_lambda_function(
+    params: &[(String, Type)],
+    body: &crate::ast::Expr,
+    explicit_ret: Option<Type>,
+    ret_override: Option<Type>,
+    counter: &mut u32,
+    out: &mut Vec<Function>,
+) {
+    use crate::ast::{Param, Visibility};
+    let idx = *counter;
+    *counter += 1;
+    let lambda_name = format!("__lambda_{}", idx);
+    let func_params: Vec<Param> = params.iter().map(|(name, ty)| Param {
+        name: name.clone(),
+        ty: ty.clone(),
+        default: None,
+        variadic: false,
+        is_named: false,
+        is_inout: false,
+    }).collect();
+    let ret_type = explicit_ret
+        .or(ret_override)
+        .or_else(|| params.first().map(|(_, ty)| ty.clone()))
+        .or(Some(Type::Int64));
+    let body_stmt = vec![crate::ast::Stmt::Return(Some(body.clone()))];
+    out.push(Function {
+        is_unsafe: false,
+        is_mut: false,
+        is_c_func: false,
+        is_const: false,
+        visibility: Visibility::Public,
+        name: lambda_name,
+        type_params: vec![],
+        constraints: vec![],
+        params: func_params,
+        return_type: ret_type,
+        throws: None,
+        body: body_stmt,
+        extern_import: None,
+    });
+}
+
+/// 收集一次调用/构造调用的实参中的 lambda。
+///
+/// 特例：`Array<T>(n, { i => ... })` 的构造 lambda 期望签名是 `(Int64) -> T`，
+/// 其返回类型必须取元素类型 T，而非未注解形参默认的 Int64。否则 Float64 等
+/// 元素类型的 lambda 体（如 `Float64(i) + 0.5`）会被按 Int64 截断后落槽。
+fn collect_call_args_with_ctor_hint(
+    name: &str,
+    args: &[crate::ast::Expr],
+    type_args: &Option<Vec<Type>>,
+    counter: &mut u32,
+    out: &mut Vec<Function>,
+) {
+    use crate::ast::Expr;
+    let ctor_elem_ty = if name == "Array" && args.len() == 2 {
+        type_args.as_ref().and_then(|tys| tys.first().cloned())
+    } else {
+        None
+    };
+    for (i, a) in args.iter().enumerate() {
+        if i == 1 {
+            if let (Some(elem_ty), Expr::Lambda { params, return_type, body, .. }) =
+                (ctor_elem_ty.as_ref(), a)
+            {
+                emit_lambda_function(params, body, return_type.clone(), Some(elem_ty.clone()), counter, out);
+                collect_lambdas_from_expr(body, counter, out);
+                continue;
+            }
+        }
+        collect_lambdas_from_expr(a, counter, out);
+    }
+}
+
 fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &mut Vec<Function>) {
-    use crate::ast::{Expr, Param, Visibility};
+    use crate::ast::Expr;
     match expr {
         Expr::Lambda { params, return_type, body, .. } => {
-            let idx = *counter;
-            *counter += 1;
-            let lambda_name = format!("__lambda_{}", idx);
-            let func_params: Vec<Param> = params.iter().map(|(name, ty)| Param {
-                name: name.clone(),
-                ty: ty.clone(),
-                default: None,
-                variadic: false,
-                is_named: false,
-                is_inout: false,
-            }).collect();
-            // Infer return type: explicit > parameter type > default Int64
-            let ret_type = return_type.clone().or_else(|| {
-                if let Some((_, ty)) = params.first() {
-                    Some(ty.clone())
-                } else {
-                    Some(Type::Int64)
-                }
-            });
-            let body_stmt = vec![crate::ast::Stmt::Return(Some(*body.clone()))];
-            out.push(Function {
-                is_unsafe: false,
-                is_mut: false,
-                is_c_func: false,
-                is_const: false,
-                visibility: Visibility::Public,
-                name: lambda_name,
-                type_params: vec![],
-                constraints: vec![],
-                params: func_params,
-                return_type: ret_type,
-                throws: None,
-                body: body_stmt,
-                extern_import: None,
-            });
+            emit_lambda_function(params, body, return_type.clone(), None, counter, out);
             collect_lambdas_from_expr(body, counter, out);
         }
         Expr::Binary { left, right, .. } => {
@@ -588,8 +634,8 @@ fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &m
             collect_lambdas_from_expr(right, counter, out);
         }
         Expr::Unary { expr, .. } => collect_lambdas_from_expr(expr, counter, out),
-        Expr::Call { args, .. } => {
-            for a in args { collect_lambdas_from_expr(a, counter, out); }
+        Expr::Call { name, args, type_args, .. } => {
+            collect_call_args_with_ctor_hint(name, args, type_args, counter, out);
         }
         Expr::MethodCall { object, args, .. } => {
             collect_lambdas_from_expr(object, counter, out);
@@ -607,8 +653,8 @@ fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &m
         Expr::Array(elems) | Expr::Tuple(elems) => {
             for e in elems { collect_lambdas_from_expr(e, counter, out); }
         }
-        Expr::ConstructorCall { args, .. } => {
-            for a in args { collect_lambdas_from_expr(a, counter, out); }
+        Expr::ConstructorCall { name, args, type_args, .. } => {
+            collect_call_args_with_ctor_hint(name, args, type_args, counter, out);
         }
         Expr::StructInit { fields, .. } => {
             for (_, e) in fields { collect_lambdas_from_expr(e, counter, out); }
