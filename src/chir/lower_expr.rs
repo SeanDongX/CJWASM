@@ -1419,7 +1419,7 @@ impl<'a> LoweringContext<'a> {
             }
 
             // 构造函数调用
-            Expr::ConstructorCall { name, args, .. } => {
+            Expr::ConstructorCall { name, args, named_args, .. } => {
                 // ArrayList<T>() → __arraylist_new
                 if name == "ArrayList" && args.is_empty() {
                     if let Some(&idx) = self.func_indices.get("__arraylist_new") {
@@ -1541,11 +1541,22 @@ impl<'a> LoweringContext<'a> {
                     ));
                 }
                 // Array<T>(n, init) → alloc + loop fill
-                if name == "Array" && args.len() == 2 {
+                // 同时支持命名实参形式 Array<T>(n, repeat: v)：语义等价于 n 个 v。
+                // 位置形态 Array<T>(n, v) 优先；仅当 args 只剩长度时，从 named_args
+                // 的 `repeat` 提取初值（此前该形态直接落空 → 数组长度/内容全为 0）。
+                let array_init_expr: Option<&Expr> = if args.len() == 2 {
+                    Some(&args[1])
+                } else if args.len() == 1 {
+                    named_args.iter().find(|(n, _)| n == "repeat").map(|(_, e)| e)
+                } else {
+                    None
+                };
+                if name == "Array" && !args.is_empty() && array_init_expr.is_some() {
+                    let init_expr = array_init_expr.unwrap();
                     let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
                     let n_chir = self.lower_expr(&args[0])?;
                     let n_chir = self.insert_cast_if_needed(n_chir, ValType::I32);
-                    let init_chir = self.lower_expr(&args[1])?;
+                    let init_chir = self.lower_expr(init_expr)?;
                     // 元素槽宽必须与 ArrayGet/ArraySet 的读写步长一致：二者均以
                     // wasm_ty_bytes(elem_wasm) 为步长。此前硬编码 8 会让类/指针元素
                     // （I32，4 字节）按 8 字节写入、却按 4 字节读出，导致索引错位。
@@ -1605,7 +1616,7 @@ impl<'a> LoweringContext<'a> {
                     ];
 
                     // loop: while i < n { arr[4 + i*elem_size] = init; i++ }
-                    let is_lambda_init = matches!(&args[1], Expr::Lambda { .. });
+                    let is_lambda_init = matches!(init_expr, Expr::Lambda { .. });
                     let init_local = self.alloc_local_typed("__arr_init".into(), if is_lambda_init { ValType::I32 } else { elem_wasm });
                     // 非 lambda 的固定初值需按元素类型归一化（如类指针 I32）
                     let init_value = if is_lambda_init { init_chir } else { self.insert_cast_if_needed(init_chir, elem_wasm) };
@@ -1647,7 +1658,7 @@ impl<'a> LoweringContext<'a> {
                         // lower.rs::emit_lambda_function 的 Array<T>(n,{λ}) 分支），
                         // 故 call_indirect 的结果类型必须与该 lambda 函数签名一致——
                         // 否则 Float64 等元素会被按 Int64 截断（如 `i + 0.5` 丢小数）。
-                        let lambda_ret_ty = match &args[1] {
+                        let lambda_ret_ty = match init_expr {
                             Expr::Lambda { return_type: Some(rt), .. } => rt.clone(),
                             _ => elem_ast_ty.clone(),
                         };

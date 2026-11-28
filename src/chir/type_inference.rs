@@ -485,6 +485,22 @@ impl TypeInferenceContext {
 
     /// 推断方法返回类型
     fn infer_method_return(&self, obj_ty: &Type, method: &str, _args: &[Expr]) -> Result<Type, String> {
+        // String 接收者：镜像 lower_expr::try_lower_builtin_method 的返回类型。
+        // 否则会落入通用 fallback 返回 Int64，导致 `let s = x.trim()` /
+        // `let r = x.replace(..)` 等局部变量被错误推断为 Int64（wasm_ty=I64），
+        // println 时打印出字符串指针的低位整数而非内容。
+        if matches!(obj_ty, Type::String) {
+            match method {
+                "trim" | "replace" | "toString" => return Ok(Type::String),
+                "toInt64" | "indexOf" => return Ok(Type::Int64),
+                "isEmpty" | "isBlank" | "contains" | "startsWith" | "endsWith" => {
+                    return Ok(Type::Bool)
+                }
+                "toArray" => return Ok(Type::Array(Box::new(Type::Int64))),
+                _ => {}
+            }
+        }
+
         // 优先按对象类型分派
         let obj_type_name = match obj_ty {
             Type::Struct(n, _) => n.as_str(),
@@ -947,6 +963,27 @@ mod tests {
         assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
     }
 
+    #[test]
+    fn test_infer_method_return_string_builtins() {
+        // 回归：String 接收者的内置方法返回类型不能落入默认 Int64，
+        // 否则 `let r = s.replace(..)` 会被推断成 Int64（wasm_ty=I64），
+        // println 打印出字符串指针低位而非内容。
+        let ctx = TypeInferenceContext::new();
+        let mk = |method: &str| Expr::MethodCall {
+            object: Box::new(Expr::String("aXb".into())),
+            method: method.into(),
+            args: vec![Expr::String("X".into())],
+            type_args: None,
+            named_args: vec![],
+        };
+        assert_eq!(ctx.infer_expr(&mk("replace")).unwrap(), Type::String);
+        assert_eq!(ctx.infer_expr(&mk("trim")).unwrap(), Type::String);
+        assert_eq!(ctx.infer_expr(&mk("toInt64")).unwrap(), Type::Int64);
+        assert_eq!(ctx.infer_expr(&mk("indexOf")).unwrap(), Type::Int64);
+        assert_eq!(ctx.infer_expr(&mk("isEmpty")).unwrap(), Type::Bool);
+        assert_eq!(ctx.infer_expr(&mk("contains")).unwrap(), Type::Bool);
+    }
+
     // ─── 字段推断 ───
 
     #[test]
@@ -1252,6 +1289,34 @@ is_c: false,
         assert_eq!(ctx.get_local("a").unwrap(), &Type::Int64);
         assert_eq!(ctx.get_local("x").unwrap(), &Type::Float64);
         assert_eq!(ctx.get_local("y").unwrap(), &Type::Int64);
+    }
+
+    #[test]
+    fn test_collect_locals_string_method_result() {
+        // 回归：`let r = "aXb".replace(...)` 的局部变量类型应为 String，
+        // 而非默认 Int64（否则 println 打印指针低位）。
+        let mut ctx = TypeInferenceContext::new();
+        let replace = Expr::MethodCall {
+            object: Box::new(Expr::String("aXb".into())),
+            method: "replace".into(),
+            args: vec![Expr::String("X".into()), Expr::String("-".into())],
+            type_args: None,
+            named_args: vec![],
+        };
+        let trim = Expr::MethodCall {
+            object: Box::new(Expr::String("  x  ".into())),
+            method: "trim".into(),
+            args: vec![],
+            type_args: None,
+            named_args: vec![],
+        };
+        let func = make_function("test", vec![], None, vec![
+            Stmt::Let { pattern: Pattern::Binding("r".into()), ty: None, value: replace },
+            Stmt::Let { pattern: Pattern::Binding("t".into()), ty: None, value: trim },
+        ]);
+        ctx.collect_locals_from_function(&func);
+        assert_eq!(ctx.get_local("r").unwrap(), &Type::String);
+        assert_eq!(ctx.get_local("t").unwrap(), &Type::String);
     }
 
     #[test]
