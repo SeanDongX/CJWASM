@@ -286,6 +286,12 @@ impl TypeInferenceContext {
                 self.infer_unary_result(op, &expr_ty)
             }
 
+            // w53a：自增/自减。cjc 中后缀 `x++`/`x--` 的结果类型为 Unit，
+            // 前缀形式返回操作数类型（前缀在 sema 已被拒绝）。此处与 sema 对齐，
+            // 使 `let u = x++` 的 u 推断为 Unit（打印为 "()"）。
+            Expr::PostfixIncr(_) | Expr::PostfixDecr(_) => Ok(Type::Unit),
+            Expr::PrefixIncr(inner) | Expr::PrefixDecr(inner) => self.infer_expr(inner),
+
             // 函数调用
             Expr::Call { name, args, .. } => {
                 // 优先按 name$arity 修饰名查找（支持重载函数精确匹配）

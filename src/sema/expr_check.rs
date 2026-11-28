@@ -10706,6 +10706,20 @@ impl<'a> Checker<'a> {
                 // 注意：`obj?.method()` 被解析器折叠为 MethodCall（与 `obj.method()`
                 // 形态相同），无法在此区分是否带 '?'，故不对 MethodCall 套用
                 // “Option 接收者缺 ?”规则，避免误伤合法的可选链方法调用。
+                // w53a：cjc 1.0.5 的 String.indexOf/lastIndexOf 仅接受 String 或
+                // UInt8 作首参，无 Rune 重载；`s.indexOf(r'a')` 报「cannot convert
+                // a character literal to type 'UInt8'」。显式转换（如
+                // `UInt8(UInt32(r'a'))`）才走字节路径。仅约束 String 接收者，
+                // 避免误伤 Array<Rune> 等集合的 indexOf(Rune)。
+                if matches!(&obj_ty, Ty::String)
+                    && (method == "indexOf" || method == "lastIndexOf")
+                    && !args.is_empty()
+                    && matches!(self.check_expr_ty_peek(&args[0]), Ty::Rune)
+                {
+                    self.err(
+                        "cannot convert a character literal to type 'UInt8'".to_string(),
+                    );
+                }
                 for a in args {
                     self.check_expr(a);
                 }
@@ -12536,13 +12550,14 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Index { array, .. } => {
-                // 元组元素恒为不可变左值；仅当基变量确为不可变 tuple 时判定，避免
-                // 误伤可变数组元素的合法自增/自减。
+                // 元组元素恒为不可赋值左值（cjc：「'tuple element' can not be
+                // assigned」），与基变量是否 mut 无关；`var t = (1,2,3); t[0]++`
+                // 同样报错。仅当基为元组时判定，避免误伤可变数组元素。
                 if let Expr::Var(n) = &**array {
                     if let Some(info) = self.lookup(n).cloned() {
-                        if !info.mutable && matches!(info.ty, Ty::Tuple(_)) {
+                        if matches!(info.ty, Ty::Tuple(_)) {
                             self.err(format!(
-                                "不可变元组元素 '{}[...]' 不能被自增/自减（4.14(7)）",
+                                "自增/自减：元组元素 '{}[...]' 不可被赋值（tuple element can not be assigned）",
                                 n
                             ));
                         }

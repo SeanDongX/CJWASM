@@ -662,7 +662,7 @@ impl<'a> LoweringContext<'a> {
     }
 
     /// 降低赋值目标
-    fn lower_assign_target(&mut self, target: &AssignTarget) -> Result<CHIRLValue, String> {
+    pub(crate) fn lower_assign_target(&mut self, target: &AssignTarget) -> Result<CHIRLValue, String> {
         match target {
             AssignTarget::Var(name) => {
                 if let Some(local_idx) = self.get_local(name) {

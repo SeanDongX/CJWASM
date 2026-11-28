@@ -314,12 +314,114 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
+    /// w53a：把自增/自减操作数转换为可赋值目标（AssignTarget）。
+    /// 支持变量、字段（含非 `Var` 基）、数组索引（含非 `Var` 基）。
+    /// 元组元素在 cjc 中不可赋值（"'tuple element' can not be assigned"），显式拒绝。
+    fn incr_decr_assign_target(&self, inner: &Expr) -> Result<crate::ast::AssignTarget, String> {
+        use crate::ast::AssignTarget;
+        match inner {
+            Expr::Var(name) => Ok(AssignTarget::Var(name.clone())),
+            Expr::Field { object, field } => {
+                if let Expr::Var(n) = object.as_ref() {
+                    Ok(AssignTarget::Field { object: n.clone(), field: field.clone() })
+                } else {
+                    Ok(AssignTarget::ExprField { object: object.clone(), field: field.clone() })
+                }
+            }
+            Expr::Index { array, index } => {
+                // 元组元素不可赋值（cjc: 'tuple element' can not be assigned）。
+                let base_ty = if let Expr::Var(n) = array.as_ref() {
+                    self.var_ast_type(n)
+                        .or_else(|| self.type_ctx.infer_expr(array.as_ref()).ok())
+                } else {
+                    self.type_ctx.infer_expr(array.as_ref()).ok()
+                };
+                if matches!(base_ty, Some(Type::Tuple(_))) {
+                    return Err("tuple element can not be assigned".to_string());
+                }
+                if let Expr::Var(n) = array.as_ref() {
+                    Ok(AssignTarget::Index { array: n.clone(), index: index.clone() })
+                } else {
+                    Ok(AssignTarget::ExprIndex { expr: array.clone(), index: index.clone() })
+                }
+            }
+            _ => Err("自增/自减的操作数不是可赋值左值".to_string()),
+        }
+    }
+
+    /// w53a：降低自增/自减表达式。cjc 语义：`x++` 结果类型为 Unit，但写回
+    /// `x = x ± 1`；前缀形式在 sema 已被拒绝（cjc 中 `++x` 是解析错误），此处仅
+    /// 为稳健性返回新值。实现为携带一条 `Assign` 语句的 Block，后缀无结果值。
+    fn lower_incr_decr(
+        &mut self,
+        inner: &Expr,
+        is_incr: bool,
+        prefix: bool,
+    ) -> Result<CHIRExpr, String> {
+        use crate::ast::BinOp;
+        let inner_ty = self.type_ctx.infer_expr(inner)?;
+        let wasm_ty = match &inner_ty {
+            Type::Unit | Type::Nothing => ValType::I32,
+            t => t.to_wasm(),
+        };
+        // 读旧值（Local/FieldGet/ArrayGet，均为无破坏性副作用的读取）。
+        let old = self.lower_expr(inner)?;
+        let one = CHIRExpr::new(CHIRExprKind::Integer(1), inner_ty.clone(), wasm_ty);
+        let op = if is_incr { BinOp::Add } else { BinOp::Sub };
+        let new_val = CHIRExpr::new(
+            CHIRExprKind::Binary { op: op.clone(), left: Box::new(old), right: Box::new(one) },
+            inner_ty.clone(),
+            wasm_ty,
+        );
+        // 写回目标：复用赋值语句的 lower_assign_target（处理字段/索引偏移与宽度）。
+        let target = self.incr_decr_assign_target(inner)?;
+        let lvalue = self.lower_assign_target(&target)?;
+        let assign = crate::chir::CHIRStmt::Assign { target: lvalue, value: new_val };
+
+        if prefix {
+            // 前缀返回新值：再读一次并自增（前缀在 sema 已被拒绝，此路径仅为稳健性）。
+            let old2 = self.lower_expr(inner)?;
+            let one2 = CHIRExpr::new(CHIRExprKind::Integer(1), inner_ty.clone(), wasm_ty);
+            let new_val2 = CHIRExpr::new(
+                CHIRExprKind::Binary { op: op.clone(), left: Box::new(old2), right: Box::new(one2) },
+                inner_ty.clone(),
+                wasm_ty,
+            );
+            Ok(CHIRExpr::new(
+                CHIRExprKind::Block(CHIRBlock {
+                    stmts: vec![assign],
+                    result: Some(Box::new(new_val2)),
+                }),
+                inner_ty,
+                wasm_ty,
+            ))
+        } else {
+            // 后缀结果为 Unit：Block 无结果值，副作用语句照常发射。
+            Ok(CHIRExpr::new(
+                CHIRExprKind::Block(CHIRBlock { stmts: vec![assign], result: None }),
+                Type::Unit,
+                ValType::I32,
+            ))
+        }
+    }
+
     /// 降低表达式
     pub fn lower_expr(&mut self, expr: &Expr) -> Result<CHIRExpr, String> {
         // C 互操作实参 `inout x`：按值传递，语义等价于内部表达式（C 侧经指针修改
         // 内存，调用方之后读回）。直接下放内部表达式，避免包装影响类型推断。
         if let Expr::Inout(inner) = expr {
             return self.lower_expr(inner);
+        }
+        // w53a：自增/自减。cjc 仅支持后缀 `x++`/`x--`（前缀 `++x` 为解析错误，
+        // sema 已拒绝前缀形式）；后缀表达式的结果类型为 Unit，但会写回操作数
+        // （`x = x ± 1`）。此处先于类型推断处理，把「读 + 写回」降低为带副作用
+        // 的 Block，避免落入 `_ => Nop` 导致静默不修改变量。
+        match expr {
+            Expr::PostfixIncr(inner) => return self.lower_incr_decr(inner, true, false),
+            Expr::PostfixDecr(inner) => return self.lower_incr_decr(inner, false, false),
+            Expr::PrefixIncr(inner) => return self.lower_incr_decr(inner, true, true),
+            Expr::PrefixDecr(inner) => return self.lower_incr_decr(inner, false, true),
+            _ => {}
         }
         // 先推断类型
         let ty = self.type_ctx.infer_expr(expr)?;
@@ -694,6 +796,30 @@ impl<'a> LoweringContext<'a> {
                         if let Some(arg_expr) = arg {
                             if let Some(inner_ty) = option_inner(&arg_expr.ty) {
                                 return Ok(self.lower_option_print(arg_expr, inner_ty, newline, fd));
+                            }
+                            // w53a：Unit/Nothing 实参输出 "()"（与 cjc 一致），
+                            // 但必须先发射其副作用（如 `println(x++)` 的写回、
+                            // `println(voidCall())` 的调用）。包成 Block：语句执行
+                            // 副作用，结果打印字面量 "()"。
+                            if matches!(arg_expr.ty, crate::ast::Type::Unit | crate::ast::Type::Nothing) {
+                                let lit = CHIRExpr::new(
+                                    CHIRExprKind::String("()".to_string()),
+                                    crate::ast::Type::String,
+                                    ValType::I32,
+                                );
+                                let print_unit = CHIRExpr::new(
+                                    CHIRExprKind::Print { arg: Some(Box::new(lit)), newline, fd },
+                                    crate::ast::Type::Unit,
+                                    ValType::I32,
+                                );
+                                return Ok(CHIRExpr::new(
+                                    CHIRExprKind::Block(CHIRBlock {
+                                        stmts: vec![crate::chir::CHIRStmt::Expr(arg_expr)],
+                                        result: Some(Box::new(print_unit)),
+                                    }),
+                                    crate::ast::Type::Unit,
+                                    ValType::I32,
+                                ));
                             }
                             return Ok(CHIRExpr::new(
                                 CHIRExprKind::Print { arg: Some(Box::new(arg_expr)), newline, fd },
@@ -1519,8 +1645,19 @@ impl<'a> LoweringContext<'a> {
 
             // 元组
             Expr::Tuple(elems) => {
+                // 元组每个元素占 8 字节槽，必须有值可写。Unit 元素（如
+                // `(p++, q++)` 的 `(Unit, Unit)`）需先以占位零值填充，
+                // 同时保留其副作用（x++ 写回）。用 insert_cast_if_needed 将
+                // Unit 表达式规约为「执行语句 + 零值」的 Block。
                 let elems_chir: Result<Vec<_>, _> = elems.iter()
-                    .map(|e| self.lower_expr(e))
+                    .map(|e| -> Result<_, String> {
+                        let v = self.lower_expr(e)?;
+                        Ok(if matches!(v.ty, Type::Unit | Type::Nothing) {
+                            self.insert_cast_if_needed(v, ValType::I32)
+                        } else {
+                            v
+                        })
+                    })
                     .collect();
 
                 CHIRExprKind::TupleNew {
@@ -2611,6 +2748,26 @@ impl<'a> LoweringContext<'a> {
                         }
                         crate::ast::InterpolatePart::Expr(e) => {
                             let inner = self.lower_expr(e)?;
+                            // w53a：Unit/Nothing 插值输出 "()"（与 cjc 一致），并保留
+                            // 副作用（如 `${x++}` 的写回）。改写为「先执行 inner，再产出
+                            // 字面量 "()"」的 Block，其类型为 String，走下方 String 分支。
+                            let inner = if matches!(inner.ty, Type::Unit | Type::Nothing) {
+                                let lit = CHIRExpr::new(
+                                    CHIRExprKind::String("()".to_string()),
+                                    Type::String,
+                                    ValType::I32,
+                                );
+                                CHIRExpr::new(
+                                    CHIRExprKind::Block(CHIRBlock {
+                                        stmts: vec![crate::chir::CHIRStmt::Expr(inner)],
+                                        result: Some(Box::new(lit)),
+                                    }),
+                                    Type::String,
+                                    ValType::I32,
+                                )
+                            } else {
+                                inner
+                            };
                             match inner.wasm_ty {
                                 ValType::I64 => {
                                     if let Some(idx) = i64_to_str {
@@ -2682,16 +2839,43 @@ impl<'a> LoweringContext<'a> {
 
     /// 插入类型转换（如果需要）
     pub fn insert_cast_if_needed(&self, expr: CHIRExpr, target_ty: ValType) -> CHIRExpr {
-        // Unit/Nothing 表达式不产生值，必须先替换为对应类型的零值 Nop，
-        // 否则 insert_cast_if_needed 返回原始 Unit 表达式，emit 时产生空栈
+        // Unit/Nothing 表达式不产生值。此前直接替换为 Nop 会丢弃其副作用
+        // （如 `let u = f()` 丢失 void 调用、`let old = x++` 丢失自增写回）。
+        // 改为包成 Block：先发射原表达式的语句（保留副作用），再以目标类型的
+        // 零值作为结果，保证栈平衡且副作用不丢失。
         if matches!(expr.ty, crate::ast::Type::Unit | crate::ast::Type::Nothing) {
-            let sub_ty = match target_ty {
-                ValType::I64 => crate::ast::Type::Int64,
-                ValType::F32 => crate::ast::Type::Float32,
-                ValType::F64 => crate::ast::Type::Float64,
-                _ => crate::ast::Type::Int32,
+            let (sub_ty, zero) = match target_ty {
+                ValType::I64 => (
+                    crate::ast::Type::Int64,
+                    CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int64, ValType::I64),
+                ),
+                ValType::F32 => (
+                    crate::ast::Type::Float32,
+                    CHIRExpr::new(CHIRExprKind::Float32(0.0), crate::ast::Type::Float32, ValType::F32),
+                ),
+                ValType::F64 => (
+                    crate::ast::Type::Float64,
+                    CHIRExpr::new(CHIRExprKind::Float(0.0), crate::ast::Type::Float64, ValType::F64),
+                ),
+                _ => (
+                    crate::ast::Type::Int32,
+                    CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int32, ValType::I32),
+                ),
             };
-            return CHIRExpr::new(CHIRExprKind::Nop, sub_ty, target_ty);
+            // 复用已有 Block 的语句；否则把原表达式作为单语句块。
+            let stmts = match expr.kind {
+                CHIRExprKind::Block(b) if b.result.is_none() => b.stmts,
+                other => vec![crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                    other,
+                    expr.ty.clone(),
+                    expr.wasm_ty,
+                ))],
+            };
+            return CHIRExpr::new(
+                CHIRExprKind::Block(CHIRBlock { stmts, result: Some(Box::new(zero)) }),
+                sub_ty,
+                target_ty,
+            );
         }
 
         if expr.wasm_ty == target_ty {
@@ -4117,6 +4301,96 @@ mod tests {
         let chir = ctx.lower_expr(&Expr::Var("x".into())).unwrap();
         assert!(matches!(chir.kind, CHIRExprKind::Local(0)));
         assert_eq!(chir.wasm_ty, ValType::F64);
+    }
+
+    #[test]
+    fn test_lower_postfix_incr_writes_back() {
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("x".into(), Type::Int64);
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("x".into(), ValType::I64);
+
+        let chir = ctx
+            .lower_expr(&Expr::PostfixIncr(Box::new(Expr::Var("x".into()))))
+            .unwrap();
+        // w53a：后缀自增结果类型为 Unit（与 cjc 一致）。
+        assert!(matches!(chir.ty, Type::Unit));
+        // 必须包含一条写回语句（Assign），否则 `x++` 语句不会修改变量。
+        match chir.kind {
+            CHIRExprKind::Block(b) => {
+                assert!(b.result.is_none());
+                assert_eq!(b.stmts.len(), 1);
+                assert!(matches!(b.stmts[0], crate::chir::CHIRStmt::Assign { .. }));
+            }
+            _ => panic!("expected Block for postfix incr"),
+        }
+    }
+
+    #[test]
+    fn test_lower_postfix_decr_writes_back() {
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("x".into(), Type::Int32);
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("x".into(), ValType::I32);
+
+        let chir = ctx
+            .lower_expr(&Expr::PostfixDecr(Box::new(Expr::Var("x".into()))))
+            .unwrap();
+        assert!(matches!(chir.ty, Type::Unit));
+        assert!(matches!(chir.kind, CHIRExprKind::Block(_)));
+    }
+
+    #[test]
+    fn test_lower_postfix_incr_tuple_element_rejected() {
+        // cjc：元组元素不可赋值（'tuple element' can not be assigned）。
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("t".into(), Type::Tuple(vec![Type::Int64, Type::Int64]));
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("t".into(), ValType::I32);
+
+        let expr = Expr::PostfixIncr(Box::new(Expr::Index {
+            array: Box::new(Expr::Var("t".into())),
+            index: Box::new(Expr::Integer(0)),
+        }));
+        assert!(ctx.lower_expr(&expr).is_err());
+    }
+
+    #[test]
+    fn test_insert_cast_unit_preserves_side_effect() {
+        // w53a：Unit 表达式转为目标类型时必须保留副作用语句，不能退化为裸 Nop。
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let side = CHIRExpr::new(
+            CHIRExprKind::Integer(7),
+            Type::Int32,
+            ValType::I32,
+        );
+        let unit_block = CHIRExpr::new(
+            CHIRExprKind::Block(CHIRBlock {
+                stmts: vec![crate::chir::CHIRStmt::Expr(side)],
+                result: None,
+            }),
+            Type::Unit,
+            ValType::I32,
+        );
+        let casted = ctx.insert_cast_if_needed(unit_block, ValType::I64);
+        match casted.kind {
+            CHIRExprKind::Block(b) => {
+                assert_eq!(b.stmts.len(), 1, "side-effect stmt must be preserved");
+                assert!(b.result.is_some(), "block must yield a zero value");
+            }
+            _ => panic!("expected Block preserving side effects"),
+        }
+        assert_eq!(casted.wasm_ty, ValType::I64);
     }
 
     #[test]
