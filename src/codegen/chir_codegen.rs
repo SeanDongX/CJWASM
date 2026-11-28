@@ -542,7 +542,7 @@ impl CHIRCodeGen {
             &[ValType::I32, ValType::I32],            // __str_ends_with
             &[ValType::I32],                          // __str_trim
             &[ValType::I32],                          // __str_to_array
-            &[ValType::I32, ValType::I32],            // __str_index_of
+            &[ValType::I32, ValType::I32, ValType::I64], // __str_index_of (haystack, needle, from → Option ptr)
             &[ValType::I32, ValType::I32, ValType::I32], // __str_replace
             &[],                                      // __arraylist_new
             &[ValType::I32, ValType::I64],            // __arraylist_append
@@ -906,11 +906,11 @@ impl CHIRCodeGen {
         // i32 → i32: __str_to_array (string → array pointer)
         functions.function(ty_i32_i32);
         rt_type_indices.push(ty_i32_i32);
-        // (i32, i32) → i64: __str_index_of (haystack, needle → index i64)
-        let ty_i32i32_i64 = types.len();
-        types.ty().function(vec![ValType::I32, ValType::I32], vec![ValType::I64]);
-        functions.function(ty_i32i32_i64 as u32);
-        rt_type_indices.push(ty_i32i32_i64 as u32);
+        // (i32, i32, i64) → i32: __str_index_of (haystack, needle, fromIndex → Option 盒指针)
+        let ty_i32i32i64_i32 = types.len();
+        types.ty().function(vec![ValType::I32, ValType::I32, ValType::I64], vec![ValType::I32]);
+        functions.function(ty_i32i32i64_i32);
+        rt_type_indices.push(ty_i32i32i64_i32);
         // (i32, i32, i32) → i32: __str_replace (str, old, new → new_str)
         let ty_i32i32i32_i32 = types.len();
         types.ty().function(vec![ValType::I32, ValType::I32, ValType::I32], vec![ValType::I32]);
@@ -1018,6 +1018,8 @@ impl CHIRCodeGen {
         functions.function(ty_i32i32_i32);
         rt_type_indices.push(ty_i32i32_i32);
         // __arr_get_i64: (i32, i32) → i64
+        let ty_i32i32_i64 = types.len();
+        types.ty().function(vec![ValType::I32, ValType::I32], vec![ValType::I64]);
         functions.function(ty_i32i32_i64);
         rt_type_indices.push(ty_i32i32_i64);
         // __arr_get_f64: (i32, i32) → f64
@@ -1107,7 +1109,7 @@ impl CHIRCodeGen {
         // 26: __str_to_array
         codes.function(&Self::build_rt_str_to_array(alloc_idx));
         // 27: __str_index_of
-        codes.function(&Self::build_rt_str_index_of());
+        codes.function(&Self::build_rt_str_index_of(alloc_idx));
         // 28: __str_replace
         codes.function(&Self::build_rt_str_replace(alloc_idx));
         // 29+: Collections
@@ -2941,106 +2943,173 @@ impl CHIRCodeGen {
         f
     }
 
-    /// __str_index_of(haystack: i32, needle: i32) -> i64: returns index or -1
-    fn build_rt_str_index_of() -> wasm_encoder::Function {
+    /// __str_index_of(haystack: i32, needle: i32, from_index: i64) -> i32
+    ///
+    /// w51a: 与 cjc 对齐返回 `Option<Int64>` 盒指针：
+    ///   命中 → `[tag=1:i32 @0][offset:i64 @4]`（offset 为 UTF-8 字节偏移）
+    ///   未命中 → `[tag=0:i32 @0]`（仅 4 字节）
+    /// 语义同 cjc String.indexOf：
+    ///   - from_index < 0 视为 0；
+    ///   - from_index > haystack.size → None；
+    ///   - needle 为空 → Some(max(from_index,0))；
+    ///   - 否则自 from_index 起按字节扫描首个匹配。
+    fn build_rt_str_index_of(alloc_idx: u32) -> wasm_encoder::Function {
         let mem = |offset: u64, align: u32| MemArg { offset, align, memory_index: 0 };
-        // locals: 0=haystack, 1=needle, 2=h_len, 3=n_len, 4=i, 5=j, 6=match_flag
-        let mut f = wasm_encoder::Function::new(vec![(5, ValType::I32)]);
+        // locals: 0=haystack, 1=needle, 2=from(i64),
+        //         3=h_len, 4=n_len, 5=i, 6=j, 7=match_flag, 8=opt_ptr, 9=from_i32
+        let mut f = wasm_encoder::Function::new(vec![(7, ValType::I32)]);
         // h_len = haystack[0]
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I32Load(mem(0, 2)));
-        f.instruction(&Instruction::LocalSet(2));
+        f.instruction(&Instruction::LocalSet(3));
         // n_len = needle[0]
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Load(mem(0, 2)));
-        f.instruction(&Instruction::LocalSet(3));
-        // if n_len == 0, return 0
+        f.instruction(&Instruction::LocalSet(4));
+        // if from > (i64)h_len → None（from 为负时按 0 处理，见下）
+        f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I64ExtendI32S);
+        f.instruction(&Instruction::I64GtS);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // from_i32 = max(from, 0) as i32
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::I64LtS);
+        f.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Else);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::LocalSet(9));
+        // if n_len == 0 → Some(from_i32)
+        f.instruction(&Instruction::LocalGet(4));
         f.instruction(&Instruction::I32Eqz);
         f.instruction(&Instruction::If(BlockType::Empty));
-        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::I32Const(12));
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I64ExtendI32S);
+        f.instruction(&Instruction::I64Store(mem(4, 3)));
+        f.instruction(&Instruction::LocalGet(8));
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
-        // if n_len > h_len, return -1
+        // if n_len > h_len → None
+        f.instruction(&Instruction::LocalGet(4));
         f.instruction(&Instruction::LocalGet(3));
-        f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::I32GtU);
         f.instruction(&Instruction::If(BlockType::Empty));
-        f.instruction(&Instruction::I64Const(-1));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+        f.instruction(&Instruction::LocalGet(8));
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
-        // i = 0
-        f.instruction(&Instruction::I32Const(0));
-        f.instruction(&Instruction::LocalSet(4));
+        // i = from_i32
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::LocalSet(5));
         // outer loop: while i <= h_len - n_len
         f.instruction(&Instruction::Block(BlockType::Empty));
         f.instruction(&Instruction::Loop(BlockType::Empty));
-        f.instruction(&Instruction::LocalGet(4));
-        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(5));
         f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(4));
         f.instruction(&Instruction::I32Sub);
         f.instruction(&Instruction::I32GtS); // if i > h_len - n_len, break
         f.instruction(&Instruction::BrIf(1));
         // match_flag = 1
         f.instruction(&Instruction::I32Const(1));
-        f.instruction(&Instruction::LocalSet(6));
+        f.instruction(&Instruction::LocalSet(7));
         // j = 0
         f.instruction(&Instruction::I32Const(0));
-        f.instruction(&Instruction::LocalSet(5));
+        f.instruction(&Instruction::LocalSet(6));
         // inner loop: while j < n_len
         f.instruction(&Instruction::Block(BlockType::Empty));
         f.instruction(&Instruction::Loop(BlockType::Empty));
-        f.instruction(&Instruction::LocalGet(5));
-        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::LocalGet(4));
         f.instruction(&Instruction::I32GeU);
         f.instruction(&Instruction::BrIf(1));
         // compare haystack[4 + i + j] vs needle[4 + j]
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::I32Const(4));
         f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::LocalGet(4));
-        f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(6));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::I32Load8U(mem(0, 0)));
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Const(4));
         f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::LocalGet(6));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::I32Load8U(mem(0, 0)));
         f.instruction(&Instruction::I32Ne);
         f.instruction(&Instruction::If(BlockType::Empty));
         // mismatch: match_flag = 0, break inner
         f.instruction(&Instruction::I32Const(0));
-        f.instruction(&Instruction::LocalSet(6));
+        f.instruction(&Instruction::LocalSet(7));
         f.instruction(&Instruction::Br(2)); // break inner loop
         f.instruction(&Instruction::End);
         // j++
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(6));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End); // end inner loop
+        f.instruction(&Instruction::End); // end inner block
+        // if match_flag → Some(i)
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::I32Const(12));
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I64ExtendI32S);
+        f.instruction(&Instruction::I64Store(mem(4, 3)));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+        // i++
         f.instruction(&Instruction::LocalGet(5));
         f.instruction(&Instruction::I32Const(1));
         f.instruction(&Instruction::I32Add);
         f.instruction(&Instruction::LocalSet(5));
         f.instruction(&Instruction::Br(0));
-        f.instruction(&Instruction::End); // end inner loop
-        f.instruction(&Instruction::End); // end inner block
-        // if match_flag, return i
-        f.instruction(&Instruction::LocalGet(6));
-        f.instruction(&Instruction::If(BlockType::Empty));
-        f.instruction(&Instruction::LocalGet(4));
-        f.instruction(&Instruction::I64ExtendI32S);
-        f.instruction(&Instruction::Return);
-        f.instruction(&Instruction::End);
-        // i++
-        f.instruction(&Instruction::LocalGet(4));
-        f.instruction(&Instruction::I32Const(1));
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::LocalSet(4));
-        f.instruction(&Instruction::Br(0));
         f.instruction(&Instruction::End); // end outer loop
         f.instruction(&Instruction::End); // end outer block
-        // not found: return -1
-        f.instruction(&Instruction::I64Const(-1));
+        // not found → None
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(8));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+        f.instruction(&Instruction::LocalGet(8));
         f.instruction(&Instruction::End);
         f
     }

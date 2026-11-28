@@ -2900,16 +2900,36 @@ impl<'a> LoweringContext<'a> {
                             )));
                         }
                     }
-                    "indexOf" if args.len() == 1 => {
-                        if let Some(&func_idx) = self.func_indices.get("__str_index_of") {
-                            let obj = self.lower_expr(object)?;
-                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
-                            let arg = self.lower_expr(&args[0])?;
-                            let arg = self.insert_cast_if_needed(arg, ValType::I32);
-                            return Ok(Some(CHIRExpr::new(
-                                CHIRExprKind::Call { func_idx, args: vec![obj, arg] },
-                                Type::Int64, ValType::I64,
-                            )));
+                    // w51a: cjc 的 String.indexOf 返回 Option<Int64>：
+                    //   indexOf(str) / indexOf(str, fromIndex)（含 2 参重载，fromIndex 为 Int64 字节偏移）
+                    // 运行时助手 __str_index_of(haystack, needle, from) -> Option 盒指针。
+                    // 仅当首参推断为 String 时按此形态下放；Rune/UInt8 重载留给后续批次。
+                    "indexOf" if args.len() == 1 || args.len() == 2 => {
+                        let first_is_string = match self.type_ctx.infer_expr(&args[0]) {
+                            Ok(Type::String) => true,
+                            Ok(_) => false,
+                            Err(_) => true, // 推断失败时保持旧行为（按字符串处理）
+                        };
+                        if first_is_string {
+                            if let Some(&func_idx) = self.func_indices.get("__str_index_of") {
+                                let obj = self.lower_expr(object)?;
+                                let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                                let needle = self.lower_expr(&args[0])?;
+                                let needle = self.insert_cast_if_needed(needle, ValType::I32);
+                                let from = if args.len() == 2 {
+                                    let f = self.lower_expr(&args[1])?;
+                                    self.insert_cast_if_needed(f, ValType::I64)
+                                } else {
+                                    CHIRExpr::new(
+                                        CHIRExprKind::Integer(0),
+                                        Type::Int64, ValType::I64,
+                                    )
+                                };
+                                return Ok(Some(CHIRExpr::new(
+                                    CHIRExprKind::Call { func_idx, args: vec![obj, needle, from] },
+                                    Type::Option(Box::new(Type::Int64)), ValType::I32,
+                                )));
+                            }
                         }
                     }
                     "replace" if args.len() == 2 => {
@@ -4109,6 +4129,54 @@ mod tests {
                 assert_eq!(args.len(), 2);
             }
             other => panic!("期望 __str_concat 调用，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lower_index_of_returns_option() {
+        // w51a: `s.indexOf(x)` 降为 __str_index_of(haystack, needle, from)，
+        // 返回 Option<Int64> 盒指针（wasm_ty = I32），而非旧的 i64 哨兵。
+        let type_ctx = TypeInferenceContext::new();
+        let mut fi = HashMap::new();
+        fi.insert("__str_index_of".to_string(), 27u32);
+        let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        // 单参重载：fromIndex 常量 0
+        let one_arg = Expr::MethodCall {
+            object: Box::new(Expr::String("hello world".into())),
+            method: "indexOf".into(),
+            args: vec![Expr::String("world".into())],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&one_arg).unwrap();
+        assert_eq!(chir.ty, Type::Option(Box::new(Type::Int64)));
+        assert_eq!(chir.wasm_ty, ValType::I32);
+        match chir.kind {
+            CHIRExprKind::Call { func_idx, args } => {
+                assert_eq!(func_idx, 27);
+                assert_eq!(args.len(), 3);
+                assert!(matches!(args[2].kind, CHIRExprKind::Integer(0)));
+            }
+            other => panic!("期望 __str_index_of 调用，实际 {:?}", other),
+        }
+
+        // 两参重载：fromIndex 透传为第三个参数
+        let two_arg = Expr::MethodCall {
+            object: Box::new(Expr::String("hello world".into())),
+            method: "indexOf".into(),
+            args: vec![Expr::String("o".into()), Expr::Integer(5)],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&two_arg).unwrap();
+        assert_eq!(chir.ty, Type::Option(Box::new(Type::Int64)));
+        assert_eq!(chir.wasm_ty, ValType::I32);
+        match chir.kind {
+            CHIRExprKind::Call { args, .. } => assert_eq!(args.len(), 3),
+            other => panic!("期望 __str_index_of 调用，实际 {:?}", other),
         }
     }
 

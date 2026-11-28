@@ -240,8 +240,9 @@ main() {
     let xIdx = s.indexOf("xyz")
     @Assert(hasWorld, 1)
     @Assert(hasXyz, 0)
-    @Assert(wIdx, 6)
-    @Assert(xIdx, -1)
+    // w51a: indexOf 现返回 Option<Int64>，@Assert 需先取载荷（?? -1 用于未命中）
+    @Assert(wIdx ?? -1, 6)
+    @Assert(xIdx ?? -1, -1)
 
     let replaced = s.replace("world", "cangjie")
     println(replaced)

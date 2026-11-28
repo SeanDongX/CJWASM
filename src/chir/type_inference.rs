@@ -496,7 +496,10 @@ impl TypeInferenceContext {
         if matches!(obj_ty, Type::String) {
             match method {
                 "trim" | "replace" | "toString" => return Ok(Type::String),
-                "toInt64" | "indexOf" => return Ok(Type::Int64),
+                "toInt64" => return Ok(Type::Int64),
+                // w51a: cjc 的 String.indexOf 返回 Option<Int64>（命中 Some(字节偏移)，未命中 None），
+                // 与 cjc 对齐，不再用 i64 -1 哨兵。
+                "indexOf" => return Ok(Type::Option(Box::new(Type::Int64))),
                 "isEmpty" | "isBlank" | "contains" | "startsWith" | "endsWith" => {
                     return Ok(Type::Bool)
                 }
@@ -983,9 +986,29 @@ mod tests {
         assert_eq!(ctx.infer_expr(&mk("replace")).unwrap(), Type::String);
         assert_eq!(ctx.infer_expr(&mk("trim")).unwrap(), Type::String);
         assert_eq!(ctx.infer_expr(&mk("toInt64")).unwrap(), Type::Int64);
-        assert_eq!(ctx.infer_expr(&mk("indexOf")).unwrap(), Type::Int64);
+        assert_eq!(
+            ctx.infer_expr(&mk("indexOf")).unwrap(),
+            Type::Option(Box::new(Type::Int64))
+        );
         assert_eq!(ctx.infer_expr(&mk("isEmpty")).unwrap(), Type::Bool);
         assert_eq!(ctx.infer_expr(&mk("contains")).unwrap(), Type::Bool);
+    }
+
+    #[test]
+    fn test_infer_index_of_with_from_index_is_option() {
+        // w51a: indexOf 的两参重载 indexOf(str, fromIndex) 同样返回 Option<Int64>。
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::String("hello world hello".into())),
+            method: "indexOf".into(),
+            args: vec![Expr::String("hello".into()), Expr::Integer(1)],
+            type_args: None,
+            named_args: vec![],
+        };
+        assert_eq!(
+            ctx.infer_expr(&expr).unwrap(),
+            Type::Option(Box::new(Type::Int64))
+        );
     }
 
     // ─── 字段推断 ───

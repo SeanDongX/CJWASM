@@ -6,8 +6,11 @@
 //   - 替换后再扫描从匹配段之后继续（"abab".replace("ab","aab") == "aabaab"）
 //
 // 注：@Assert 对 String 只做指针比较，故用 size + indexOf 组合判定内容相等。
+// w51a: cjc 的 String.indexOf 返回 Option<Int64>，用 `?? -1` 取字节偏移；
+// 且 cjc 的 String.size 是属性（无括号），故此处用 `a.size`（与 cjc 实测一致）。
 func eqstr(a: String, b: String): Bool {
-    return a.size() == b.size() && a.indexOf(b) == 0
+    let i = a.indexOf(b) ?? -1
+    return i == 0 && a.size == b.size
 }
 
 main() {
