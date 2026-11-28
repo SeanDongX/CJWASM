@@ -21,8 +21,8 @@
 
 use super::SemanticError;
 use crate::ast::{
-    BinOp, Expr, FloatSuffix, Function, IntSuffix, Literal, MatchArm, Pattern, Program, Stmt, Type,
-    TypeConstraint, UnaryOp, Visibility,
+    AssignTarget, BinOp, Expr, FloatSuffix, Function, IntSuffix, Literal, MatchArm, Pattern, Program,
+    Stmt, Type, TypeConstraint, UnaryOp, Visibility,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -5980,6 +5980,44 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// 将变量的编译期常量值设为已知（用于复合赋值的局部常量传播）。
+    fn set_const(&mut self, name: &str, value: i64) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(info) = scope.get_mut(name) {
+                info.const_int = Some(value);
+                return;
+            }
+        }
+        if let Some(info) = self.globals.get_mut(name) {
+            info.const_int = Some(value);
+        }
+    }
+
+    /// 复合赋值 `x op= const`（脱糖为 `x = x op const`）的编译期常量折叠。
+    /// 仅处理带溢出保护的加减乘；其余运算保守返回 `None`（维持清空语义）。
+    fn compound_assign_const(&self, target: &AssignTarget, value: &Expr) -> Option<i64> {
+        let name = match target {
+            AssignTarget::Var(n) => n,
+            _ => return None,
+        };
+        let (op, left, right) = match value {
+            Expr::Binary { op, left, right } => (op, left, right),
+            _ => return None,
+        };
+        match &**left {
+            Expr::Var(l) if l == name => {}
+            _ => return None,
+        }
+        let old = self.lookup(name)?.const_int?;
+        let r = self.const_int_of(right)?;
+        match op {
+            BinOp::Add => old.checked_add(r),
+            BinOp::Sub => old.checked_sub(r),
+            BinOp::Mul => old.checked_mul(r),
+            _ => None,
+        }
+    }
+
     fn check_function(&mut self, func: &Function) {
         if func.body.is_empty() {
             return;
@@ -6274,8 +6312,21 @@ impl<'a> Checker<'a> {
             }
             Stmt::Assign { target, value } => {
                 let value_ty = self.check_expr(value);
+                // 局部常量传播：`x op= const` 被解析器脱糖为 `x = x op const`。
+                // 若 x 已有已知编译期常量，则在覆盖（清空）之前折叠出新常量，供后续
+                // 判定复用。官方 cjc 即以此检出 `var step=5; step-=5; …:step` 的
+                // 步长为 0（见 02_08_01 a06_03 的 `step cannot be zero`）。
+                let propagated = self.compound_assign_const(target, value);
                 self.check_assign_target(target, &value_ty);
                 self.check_compound_operator_return(target, value);
+                // 仅在直线上下文中保留折叠结果：条件/循环分支内（cond_depth>0）的
+                // 复合赋值可能不执行，分支合流后常量不可靠，故此时维持 clear_const
+                // 的“清空”语义，避免误判（保守，仅漏判不误判）。
+                if self.cond_depth == 0 {
+                    if let (AssignTarget::Var(name), Some(c)) = (target, propagated) {
+                        self.set_const(name, c);
+                    }
+                }
             }
             Stmt::Expr(e) => {
                 self.check_expr(e);

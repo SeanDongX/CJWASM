@@ -6,7 +6,7 @@
 //!
 //! 设计目标：零 panic、无 I/O、纯函数，与 CodeGen 解耦。
 
-use crate::ast::{BinOp, Expr, Program, Stmt, Type, TypeConstraint};
+use crate::ast::{BinOp, Expr, Program, Stmt, Type, TypeConstraint, UnaryOp};
 use std::collections::HashMap;
 
 /// 语义分析上下文：保存预分析推断出的类型信息
@@ -389,6 +389,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
     // 单文件程序若声明宏，官方报「macro declaration must be defined in macro
     // package」（01/04 a02_2）。
     check_macro_declarations_in_macro_package(program, &mut errors);
+    // `import utils.macros.*`（官方测试辅助宏包）单通配导入下的宏名/宏值解析
+    // （01/04 a02_1 裸用宏名、a02_3 宏名拼写错误；cjc 1.0.5 均报 undeclared identifier）。
+    check_utils_macros_import_resolution(program, &mut errors);
     // 1.4(6)：无符号整型常量的一元负号在常量折叠阶段溢出
     // （01/04 a06_12…a06_17）。
     check_unsigned_unary_negation(program, &index, &mut errors);
@@ -646,6 +649,9 @@ pub fn validate_program(program: &Program) -> Result<(), Vec<SemanticError>> {
 
     // 8.4(9)：同一类型的多个扩展之间不得定义同名同签名的成员。
     check_extension_member_shadowing(program, &mut errors);
+    // 8.4(9)：接口扩展带入的接口默认实现成员，不得与同一类型的其它扩展成员重名同签名
+    //（官方 cjc 报 `extend member 'g' is not allowed to shadow members of 'extend Foo'`）。
+    check_interface_extend_default_shadowing(program, &mut errors);
     // 10.1.1(3)/(6)：扩展中静态成员函数与实例成员函数不得同名互为重载。
     check_extend_static_instance_conflict(program, &mut errors);
 
@@ -2983,14 +2989,28 @@ fn infer_main_return(func: &Function) -> Option<Type> {
     collect_explicit_local_types(&func.body, &mut locals);
 
     let mut found: Option<Type> = None;
+    let mut has_return = false;
     for stmt in &func.body {
         if let Stmt::Return(Some(e)) = stmt {
+            has_return = true;
             if let Some(t) = simple_expr_type(e, &locals) {
                 // 多次 return 类型不一致时不作判定。
                 match &found {
                     Some(prev) if *prev != t => return None,
                     _ => found = Some(t),
                 }
+            }
+        } else if matches!(stmt, Stmt::Return(None)) {
+            has_return = true;
+        }
+    }
+    // 尾表达式推断：当函数体不含任何 return 语句时，块的值即最后一个表达式语句
+    // 的类型，也就是 main 的实际返回类型。官方 cjc 对 `main() { …; !v }`（尾值 Bool）
+    // 报 `return type of 'main' is not 'Integer' or 'Unit'`（见 a02_175）。
+    if !has_return {
+        if let Some(Stmt::Expr(e)) = func.body.last() {
+            if let Some(t) = simple_expr_type(e, &locals) {
+                return Some(t);
             }
         }
     }
@@ -3050,6 +3070,14 @@ fn simple_expr_type(e: &Expr, locals: &HashMap<String, Type>) -> Option<Type> {
         Expr::String(_) | Expr::Interpolate(_) => Some(Type::String),
         Expr::Var(name) => locals.get(name).cloned(),
         Expr::Cast { target_ty, .. } => Some(target_ty.clone()),
+        // 逻辑非 `!b`：操作数为 Bool 时结果为 Bool（用于尾表达式返回类型推断）。
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => match simple_expr_type(expr, locals) {
+            Some(Type::Bool) => Some(Type::Bool),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -4607,6 +4635,98 @@ fn check_macro_declarations_in_macro_package(
         errors.push(SemanticError {
             message: format!("宏声明 '{}' 必须定义在宏包（macro package）中（14.2.1）", n),
         });
+    }
+}
+
+/// 官方 Conformance 测试辅助宏包 `utils.macros` 的公开宏集合（固定）。
+///
+/// 本编译器不做真实导入解析，无法从 `.cjo` 得知该包导出了哪些宏；此处登记其
+/// 已知的公开宏，仅用于 `import utils.macros.*` 单通配导入文件的宏名/宏值解析。
+/// `utils.macros` 是官方 Conformance 套件自带的测试辅助宏包（见
+/// `third_party/cangjie_test/.../src/utils/macros/macros_common.cj`），导出
+/// `matchOrThrow` / `notMatchOrThrow` 两个公开宏。
+const UTILS_MACROS_EXPORTS: &[&str] = &["matchOrThrow", "notMatchOrThrow"];
+
+/// `import utils.macros.*` 单通配导入下的宏名/宏值解析。
+///
+/// 门限：文件中**唯一**的通配导入是 `utils.macros.*`（若另有 `other.*` /
+/// `pkg1.*` / `std.ast.*` 等通配导入，其导出集合不可知，整体跳过，保证正测试
+/// 零误伤）。官方 cjc 1.0.5 实测：
+/// - 01/04 a02_3：`@mtchOrThrow`（宏名拼写错误）报 `undeclared identifier
+///   'mtchOrThrow'`；
+/// - 01/04 a02_1：`matchOrThrow [...] (...)`（缺 `@`，把宏当值调用）报
+///   `undeclared identifier 'matchOrThrow'`。
+///
+/// 二者同源：`utils.macros` 导出的名字是**宏**，只能以 `@name` 形式调用，既
+/// 不能作为值（裸用），也必须与导出的宏名一致。据此：
+/// - `@name` 既非 `utils.macros` 导出宏、非内建框架宏、也非本文件宏定义 → 未定义；
+/// - 裸值位置出现 `utils.macros` 导出宏名 → 未定义（宏不能作值）。
+///
+/// 与 [`check_annotation_name_resolution`] 的差别：后者门限于「无 import、无
+/// package」；本检查只对上述「单 `utils.macros.*` 通配导入」这一精确形态生效，
+/// 不影响 std / 宏包测试（它们经 `other.*` / `pkg1.*` / `std.ast.*` 通配导入）。
+fn check_utils_macros_import_resolution(program: &Program, errors: &mut Vec<SemanticError>) {
+    // 1. 定位 utils.macros 通配导入；若存在其它通配导入则门限不成立（导出集合不可知）。
+    let mut imports_utils_macros = false;
+    for imp in &program.imports {
+        if imp.items.is_none() {
+            let path = imp.module_path.join(".");
+            if path == "utils.macros" {
+                imports_utils_macros = true;
+            } else {
+                return;
+            }
+        }
+    }
+    if !imports_utils_macros {
+        return;
+    }
+
+    let meta = &program.attr_meta;
+    let mut reported_macro: HashSet<String> = HashSet::new();
+    let mut reported_value: HashSet<String> = HashSet::new();
+
+    let mut visit = |e: &Expr| match e {
+        Expr::Macro { name, .. } => {
+            if !(UTILS_MACROS_EXPORTS.contains(&name.as_str())
+                || is_builtin_user_attr(name)
+                || meta.macro_decls.contains(name))
+                && reported_macro.insert(name.clone())
+            {
+                errors.push(SemanticError {
+                    message: format!(
+                        "未定义的标识符 '{}'（宏名未声明，3.2.3.2）",
+                        name
+                    ),
+                });
+            }
+        }
+        Expr::Var(name) => {
+            // 宏名用作裸值（缺 `@`）：utils.macros 导出的是宏，不能作为值。
+            if UTILS_MACROS_EXPORTS.contains(&name.as_str())
+                && reported_value.insert(name.clone())
+            {
+                errors.push(SemanticError {
+                    message: format!(
+                        "未定义的标识符 '{}'（宏只能以 @ 调用，3.2.3.2）",
+                        name
+                    ),
+                });
+            }
+        }
+        _ => {}
+    };
+
+    for f in &program.functions {
+        walk_stmts(&f.body, &mut visit);
+        for p in &f.params {
+            if let Some(d) = &p.default {
+                walk_expr(d, &mut visit);
+            }
+        }
+    }
+    for c in &program.constants {
+        walk_expr(&c.init, &mut visit);
     }
 }
 
@@ -14708,6 +14828,11 @@ fn check_unsafe_context(program: &Program, errors: &mut Vec<SemanticError>) {
         if owner_name(&f.name).is_none()
             && f.extern_import.is_some()
             && f.params.is_empty()
+            // 仅豁免“非 Unit 返回”的无参 foreign：官方正例 13.1.2.4(4) 以
+            // `println(clock())` 直接调用 `clock(): Int32` 而未包裹 unsafe；
+            // 而 `foreign func foo(): Unit` 在非 unsafe 上下文调用应报错
+            // （03_04_02 a07_03）。故返回类型显式为 Unit 时不豁免。
+            && !matches!(f.return_type, Some(Type::Unit))
         {
             no_unsafe_needed.insert(f.name.as_str());
         }
@@ -16878,6 +17003,65 @@ fn check_extension_member_shadowing(program: &Program, errors: &mut Vec<Semantic
             } else {
                 entry.push(sig);
             }
+        }
+    }
+}
+
+/// 8.4(9)：接口扩展 `extend T <: I {}` 会带入接口 I 的默认实现成员。若这些默认
+/// 成员与同一被扩展类型 T 的其它扩展中同签名成员重名，则报错（官方 cjc：
+/// `extend member 'g' is not allowed to shadow members of 'extend Foo'`，见 a14_01）。
+///
+/// 仅比较“接口默认实现成员 ↔ 其它扩展成员”这一交叉情形（直接扩展之间的重名同
+/// 签名已由 `check_extension_member_shadowing` 处理，此处不重复报告）。签名比较
+/// 忽略扩展方法隐式插入的 `this` 接收者形参，并容忍接口默认成员未带 `this`。
+fn check_interface_extend_default_shadowing(program: &Program, errors: &mut Vec<SemanticError>) {
+    let ifaces: HashMap<&str, &crate::ast::InterfaceDef> = program
+        .interfaces
+        .iter()
+        .map(|i| (i.name.as_str(), i))
+        .collect();
+    // (target, 成员名, 签名) → (提供该签名的扩展下标集合, 是否含接口默认实现)。
+    let mut seen: HashMap<(String, String, Vec<String>), (HashSet<usize>, bool)> = HashMap::new();
+    for (ei, ext) in program.extends.iter().enumerate() {
+        let target = ext.target_type.trim().to_string();
+        for m in &ext.methods {
+            let mname = last_name_segment(&m.name);
+            let sig: Vec<String> = m
+                .params
+                .iter()
+                .filter(|p| p.name != "this" && p.name != "self")
+                .map(|p| type_display(&p.ty))
+                .collect();
+            seen.entry((target.clone(), mname, sig))
+                .or_default()
+                .0
+                .insert(ei);
+        }
+        if let Some(iface_name) = ext.interface.as_deref() {
+            if let Some(iface) = ifaces.get(iface_name) {
+                for im in &iface.methods {
+                    if im.default_body.is_none() {
+                        continue;
+                    }
+                    let sig: Vec<String> =
+                        im.params.iter().map(|p| type_display(&p.ty)).collect();
+                    let entry = seen
+                        .entry((target.clone(), im.name.clone(), sig))
+                        .or_default();
+                    entry.0.insert(ei);
+                    entry.1 = true;
+                }
+            }
+        }
+    }
+    for ((target, mname, _sig), (exts, has_iface_default)) in &seen {
+        if *has_iface_default && exts.len() >= 2 {
+            errors.push(SemanticError {
+                message: format!(
+                    "接口扩展的默认成员 '{}' 不能与类型 '{}' 的其它扩展成员重名且签名相同（8.4(9)）",
+                    mname, target
+                ),
+            });
         }
     }
 }

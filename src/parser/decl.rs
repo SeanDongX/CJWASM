@@ -1827,6 +1827,32 @@ impl Parser {
                             "static init 中不能调用构造函数 this(...)".to_string(),
                         ));
                     }
+                    // w43b：结构体 static init 体若为无条件 throw，将其合成为
+                    // `StructName.__static_init` 函数（与 class 路径一致），由程序
+                    // 启动序调用以终止程序（6.1.2.2(24)：static init 抛异常终止程序）。
+                    // 此前 struct 路径仅收集函数体做校验、未生成函数，导致 throw 被
+                    // 丢弃。仅对“恰好含顶层 throw”的体生成，避免影响带非平凡 static
+                    // init 的既有（正）用例，默认模式其余输出不变。
+                    if body
+                        .iter()
+                        .any(|s| matches!(s, Stmt::Expr(Expr::Throw(_))))
+                    {
+                        methods.push(Function {
+                            visibility: Visibility::Internal,
+                            name: format!("{}.__static_init", name),
+                            type_params: vec![],
+                            constraints: vec![],
+                            params: vec![],
+                            return_type: None,
+                            throws: None,
+                            body: body.clone(),
+                            extern_import: None,
+                            is_const: false,
+                            is_unsafe: false,
+                            is_c_func: false,
+                            is_mut: false,
+                        });
+                    }
                     continue;
                 }
                 // init 构造函数参数均为普通参数（无成员变量参数）。

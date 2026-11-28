@@ -501,6 +501,9 @@ pub fn parse_source(source: &str) -> Result<Program, String> {
     // 静态字段“无条件 throw”初始化式接入启动序（6.1.2.2(24)）。
     inject_static_field_throws(&mut program);
 
+    // 实例字段“无条件 throw”默认值的构造期 trap（4.7(8)，仅 --checked）。
+    inject_instance_field_throws(&mut program);
+
     Ok(program)
 }
 
@@ -977,6 +980,81 @@ fn inject_static_field_throws(program: &mut Program) {
             constraints: vec![],
             params: vec![],
             return_type: None,
+            throws: None,
+            body: vec![Stmt::Expr(e)],
+            extern_import: None,
+            is_const: false,
+            is_unsafe: false,
+            is_c_func: false,
+            is_mut: false,
+        });
+    }
+}
+
+/// w43b：实例字段“无条件 throw”默认值的构造期 trap（4.7(8)）。
+///
+/// `class C { var n = throw X() }` / `struct S { var n = throw X() }` 的字段默认
+/// 式在**构造实例**时求值即抛出而终止程序（cjc 实测：`C::init()` 栈帧抛出）。
+/// 既有代码生成不主动求值实例字段默认值（`C()` 仅分配内存），故此处为含
+/// “无条件 throw 字段”且**无显式构造函数**的类型合成一个以类型名命名的构造函数
+/// （body 为该 throw）。构造调用 `Type()` 在 CHIR lowering 中回退解析到同名函数
+/// 并调用它，函数体 lowering 为 `unreachable` 即 trap。
+///
+/// 命名用裸类型名（非 `__Type_init`）而非 init 前缀：避免 codegen 的 init 序言
+/// 去 alloc 并 `local.set 0`（合成函数体只有 `unreachable`，不声明任何局部变量，
+/// 会产出非法 wasm）。
+///
+/// 仅在 `--checked` 模式下启用：默认模式（正例）输出零变化；checked 模式仅用于
+/// @Mode:run 负测试的运行校验。仅当字段默认式恰为 `Expr::Throw` 时触发，避免
+/// 误伤一般字段默认值求值。
+fn inject_instance_field_throws(program: &mut Program) {
+    use crate::ast::{Expr, FieldDef, Function, Stmt, Type, Visibility};
+    if !crate::checked_mode() {
+        return;
+    }
+    let existing: HashSet<String> = program
+        .functions
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    let throw_of = |fields: &[FieldDef]| -> Option<Expr> {
+        fields
+            .iter()
+            .filter(|fld| !fld.is_static)
+            .find_map(|fld| match &fld.default {
+                Some(x @ Expr::Throw(_)) => Some(x.clone()),
+                _ => None,
+            })
+    };
+    let mut pending: Vec<(String, Expr)> = Vec::new();
+    for c in &program.classes {
+        // 有显式/主构造函数时不合成，避免与既有构造函数定义冲突。
+        if c.init.is_some() || !c.inits.is_empty() || !c.primary_ctor_params.is_empty() {
+            continue;
+        }
+        if let Some(e) = throw_of(&c.fields) {
+            pending.push((c.name.clone(), e));
+        }
+    }
+    for s in &program.structs {
+        if !s.inits.is_empty() || s.has_primary_ctor {
+            continue;
+        }
+        if let Some(e) = throw_of(&s.fields) {
+            pending.push((s.name.clone(), e));
+        }
+    }
+    for (ty_name, e) in pending {
+        if existing.contains(&ty_name) {
+            continue;
+        }
+        program.functions.push(Function {
+            visibility: Visibility::Private,
+            name: ty_name.clone(),
+            type_params: vec![],
+            constraints: vec![],
+            params: vec![],
+            return_type: Some(Type::Struct(ty_name, vec![])),
             throws: None,
             body: vec![Stmt::Expr(e)],
             extern_import: None,
