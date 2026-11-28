@@ -3449,6 +3449,21 @@ impl Parser {
             let body_stmts = self.parse_stmts_until_case_or_rbrace()?;
             let body = Box::new(if body_stmts.is_empty() {
                 Expr::Block(vec![], None)
+            } else if body_stmts.len() == 1
+                && matches!(body_stmts.first(), Some(Stmt::Expr(Expr::Block(_, _))))
+            {
+                // `case X => { ... }`：语句解析会把整个 `{...}` 当成一个块表达式语句，
+                // 若原样提升为 result 会形成「外层空块 + result=内层块」的双层结构，
+                // 内层块在 CHIR lowering 中可能落入默认 Nop 分支，导致分支体内的赋值/
+                // return 被静默丢弃（例如在 match 分支内重绑定循环变量会导致死循环）。
+                // 这里直接把单层花括号块展开为分支体，与多语句分支保持同构。
+                if let Some(Stmt::Expr(Expr::Block(inner_stmts, inner_result))) =
+                    body_stmts.into_iter().next()
+                {
+                    Expr::Block(inner_stmts, inner_result)
+                } else {
+                    unreachable!()
+                }
             } else {
                 // 与块表达式解析保持一致：最后一条 Stmt::Expr 提升为 block result，
                 // 使得 match arm body 能在表达式上下文中正确产生值。

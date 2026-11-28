@@ -5095,17 +5095,15 @@ impl CHIRCodeGen {
             }
 
             CHIRStmt::Break => {
-                // 使用当前 break 深度：直接在 loop body 内为 1，每嵌套一层 if/block +1
+                // 使用当前 break 深度：直接在 loop body 内为 1，每嵌套一层 if/block +1。
+                // 不能把深度钳制到 2：match 分支体位于层层嵌套的 if 中，钳制会让
+                // `break` 变成 br 到内层 loop（等价 continue），从而造成死循环。
                 let depth = self.loop_break_depth.get();
-                // Clamp depth to avoid invalid br instructions
-                // In most cases, depth should be 1 (loop body) or 2 (loop body + 1 if block)
-                let clamped_depth = if depth > 2 { 2 } else { depth };
-                // If depth >= 2, the target block might be an if i32 block that expects a value
-                // Push a zero value to satisfy the validator
+                // 目标 block 常是带结果类型的 if 块（分支需要栈上值），补零满足校验。
                 if depth >= 2 {
                     func.instruction(&Instruction::I32Const(0));
                 }
-                func.instruction(&Instruction::Br(if clamped_depth > 0 { clamped_depth } else { 1 }));
+                func.instruction(&Instruction::Br(if depth > 0 { depth } else { 1 }));
             }
             CHIRStmt::Continue => {
                 // continue 目标是 loop 标签，比 break 的 block 标签浅 1 级
@@ -5262,6 +5260,29 @@ impl CHIRCodeGen {
 
     // ─── Match ──────────────────────────────────────────────────────────────
 
+    /// 在正确的 break 深度下 emit 一个 match 分支体。
+    ///
+    /// match 的 if-else 链是逐层嵌套的：第 i 个 arm 的条件位于 i 层外层 else 内，
+    /// 其 body 若带自身 if 则再深一层（i+1）。`break`/`continue` 依赖
+    /// `loop_break_depth` 计算 br 目标，因此必须按 arm 序号和是否有自身 if 精确设置。
+    fn emit_match_arm_body(
+        &self,
+        body: &CHIRBlock,
+        result_ty: ValType,
+        base_depth: u32,
+        arm_index: usize,
+        has_own_if: bool,
+        func: &mut wasm_encoder::Function,
+    ) {
+        let prev = self.loop_break_depth.get();
+        if base_depth > 0 {
+            let extra = arm_index as u32 + if has_own_if { 1 } else { 0 };
+            self.loop_break_depth.set(base_depth + extra);
+        }
+        self.emit_block_with_ty(body, result_ty, func);
+        self.loop_break_depth.set(prev);
+    }
+
     fn emit_match(
         &self,
         subject: &CHIRExpr,
@@ -5290,12 +5311,10 @@ impl CHIRCodeGen {
 
         // 生成 if-else 链
         let arm_count = arms.len();
+        // match 入口处的 break 深度。每个 arm 的 body 位于「i 个外层 else + 自身 if」
+        // 中（无自身 if 的 arm 为 i 个），因此每个 arm 的 break 深度必须按 arm 序号
+        // 单独设置；对整个 match 统一 +1 会让靠后的 arm 得到过浅的深度。
         let match_base_depth = self.loop_break_depth.get();
-        // Increment loop_break_depth once for the entire match
-        // Each match arm's if-block adds one level of nesting
-        if match_base_depth > 0 {
-            self.loop_break_depth.set(match_base_depth + 1);
-        }
         for (i, arm) in arms.iter().enumerate() {
             let is_last = i == arm_count - 1;
             match &arm.pattern {
@@ -5321,14 +5340,14 @@ impl CHIRCodeGen {
                             func.instruction(&Instruction::I32WrapI64);
                         }
                         func.instruction(&Instruction::If(block_ty));
-                        self.emit_block_with_ty(&arm.body, result_ty, func);
+                        self.emit_match_arm_body(&arm.body, result_ty, match_base_depth, i, true, func);
                         func.instruction(&Instruction::Else);
                         if is_last {
                             emit_zero(result_ty, func);
                         }
                     } else {
                         // Wildcard with no guard: always matches, emit body and stop
-                        self.emit_block_with_ty(&arm.body, result_ty, func);
+                        self.emit_match_arm_body(&arm.body, result_ty, match_base_depth, i, false, func);
                         // Close all if-blocks opened by previous arms
                         for prev_arm in arms[..i].iter() {
                             let needs_end = match &prev_arm.pattern {
@@ -5374,7 +5393,7 @@ impl CHIRCodeGen {
                         }
                     };
                     func.instruction(&Instruction::If(block_ty));
-                    self.emit_block_with_ty(&arm.body, result_ty, func);
+                    self.emit_match_arm_body(&arm.body, result_ty, match_base_depth, i, true, func);
                     func.instruction(&Instruction::Else);
                     if is_last {
                         emit_zero(result_ty, func);
@@ -5394,11 +5413,6 @@ impl CHIRCodeGen {
                     func.instruction(&Instruction::I32Const(*discriminant));
                     func.instruction(&Instruction::I32Eq);
                     func.instruction(&Instruction::If(block_ty));
-                    // Increment loop_break_depth for the if block
-                    let prev_depth = self.loop_break_depth.get();
-                    if prev_depth > 0 {
-                        self.loop_break_depth.set(prev_depth + 1);
-                    }
                     if let Some(bind_idx) = payload_binding {
                         // 加载 payload（位于 ptr + 4）
                         func.instruction(&Instruction::I32Const(MATCH_SAVE));
@@ -5406,9 +5420,7 @@ impl CHIRCodeGen {
                         func.instruction(&Instruction::I64Load(MemArg { offset: 4, align: 3, memory_index: 0 }));
                         func.instruction(&Instruction::LocalSet(*bind_idx));
                     }
-                    self.emit_block_with_ty(&arm.body, result_ty, func);
-                    // Restore loop_break_depth
-                    self.loop_break_depth.set(prev_depth);
+                    self.emit_match_arm_body(&arm.body, result_ty, match_base_depth, i, true, func);
                     func.instruction(&Instruction::Else);
                     if is_last {
                         emit_zero(result_ty, func);
@@ -5432,20 +5444,13 @@ impl CHIRCodeGen {
                                 func.instruction(&Instruction::I32WrapI64);
                             }
                             func.instruction(&Instruction::If(block_ty));
-                            // Increment loop_break_depth for the if block
-                            let prev_depth = self.loop_break_depth.get();
-                            if prev_depth > 0 {
-                                self.loop_break_depth.set(prev_depth + 1);
-                            }
-                            self.emit_block_with_ty(&arm.body, result_ty, func);
-                            // Restore loop_break_depth
-                            self.loop_break_depth.set(prev_depth);
+                            self.emit_match_arm_body(&arm.body, result_ty, match_base_depth, i, true, func);
                             func.instruction(&Instruction::Else);
                             if is_last {
                                 emit_zero(result_ty, func);
                             }
                         } else {
-                            self.emit_block_with_ty(&arm.body, result_ty, func);
+                            self.emit_match_arm_body(&arm.body, result_ty, match_base_depth, i, false, func);
                         }
                     } else {
                         // Emit condition: AND of all literal field checks
@@ -5487,7 +5492,7 @@ impl CHIRCodeGen {
                         for f in fields {
                             Self::emit_struct_field_load(f, MATCH_SAVE, func);
                         }
-                        self.emit_block_with_ty(&arm.body, result_ty, func);
+                        self.emit_match_arm_body(&arm.body, result_ty, match_base_depth, i, true, func);
                         func.instruction(&Instruction::Else);
                         if is_last {
                             emit_zero(result_ty, func);
@@ -5527,17 +5532,13 @@ impl CHIRCodeGen {
                     };
                     func.instruction(&Instruction::I32And);
                     func.instruction(&Instruction::If(block_ty));
-                    self.emit_block_with_ty(&arm.body, result_ty, func);
+                    self.emit_match_arm_body(&arm.body, result_ty, match_base_depth, i, true, func);
                     func.instruction(&Instruction::Else);
                     if is_last {
                         emit_zero(result_ty, func);
                     }
                 }
             }
-        }
-        // Restore loop_break_depth after match
-        if match_base_depth > 0 {
-            self.loop_break_depth.set(match_base_depth);
         }
         // 关闭所有需要 End 的 if-else
         for arm in arms.iter() {

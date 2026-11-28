@@ -793,6 +793,7 @@ fn count_usage_in_block(block: &CHIRBlock, usage: &mut HashMap<u32, (u32, u32)>)
         for (idx, cnt) in reads {
             usage.entry(idx).or_default().1 += cnt;
         }
+        count_writes_in_expr(r, usage);
     }
 }
 
@@ -804,6 +805,7 @@ fn count_usage_in_stmt(stmt: &CHIRStmt, usage: &mut HashMap<u32, (u32, u32)>) {
             for (idx, cnt) in reads {
                 usage.entry(idx).or_default().1 += cnt;
             }
+            count_writes_in_expr(value, usage);
         }
         CHIRStmt::Assign { target, value } => {
             if let CHIRLValue::Local(idx) = target {
@@ -813,29 +815,172 @@ fn count_usage_in_stmt(stmt: &CHIRStmt, usage: &mut HashMap<u32, (u32, u32)>) {
             for (idx, cnt) in reads {
                 usage.entry(idx).or_default().1 += cnt;
             }
+            count_writes_in_expr(value, usage);
         }
         CHIRStmt::Expr(e) => {
             let reads = count_all_local_reads_in_expr(e);
             for (idx, cnt) in reads {
                 usage.entry(idx).or_default().1 += cnt;
             }
+            // 表达式内部的语句块（Match 分支体 / If 分支 / Block）可能写入局部变量，
+            // 这些写入也必须计入 usage；否则 eliminate_redundant_locals 会误判某个
+            // 局部“只写一次、只读一次”，把它的读替换成初值并删除 Let，破坏
+            // `var done=false; while(!done){ match {case None => done=true} }` 的终止条件。
+            count_writes_in_expr(e, usage);
         }
         CHIRStmt::Return(Some(e)) => {
             let reads = count_all_local_reads_in_expr(e);
             for (idx, cnt) in reads {
                 usage.entry(idx).or_default().1 += cnt;
             }
+            count_writes_in_expr(e, usage);
         }
         CHIRStmt::While { cond, body } => {
             let reads = count_all_local_reads_in_expr(cond);
             for (idx, cnt) in reads {
                 usage.entry(idx).or_default().1 += cnt;
             }
+            count_writes_in_expr(cond, usage);
             count_usage_in_block(body, usage);
         }
         CHIRStmt::Loop { body } => {
             count_usage_in_block(body, usage);
         }
+        _ => {}
+    }
+}
+
+/// 统计表达式内部嵌套语句块中的局部变量写入次数（Assign 目标 / Let 定义）。
+///
+/// `count_usage_in_stmt` 的读统计（collect_reads）会递归进入 If/Match/Block 的
+/// 分支体，但写统计不会。若不同样递归统计写入，`eliminate_redundant_locals`
+/// 会把“初始赋值 + 在 match/if 分支内被改写”的局部误判为只写一次，
+/// 进而用初值替换读并删除 Let，造成循环变量/终止标志被常量化的错误代码生成。
+fn count_writes_in_expr(expr: &CHIRExpr, usage: &mut HashMap<u32, (u32, u32)>) {
+    match &expr.kind {
+        CHIRExprKind::If { cond, then_block, else_block } => {
+            count_writes_in_expr(cond, usage);
+            count_writes_in_block(then_block, usage);
+            if let Some(b) = else_block {
+                count_writes_in_block(b, usage);
+            }
+        }
+        CHIRExprKind::Block(b) => count_writes_in_block(b, usage),
+        CHIRExprKind::Match { subject, arms } => {
+            count_writes_in_expr(subject, usage);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    count_writes_in_expr(g, usage);
+                }
+                count_writes_in_block(&arm.body, usage);
+            }
+        }
+        // 其余表达式：递归到子表达式，捕捉更深层嵌套的 if/block/match
+        CHIRExprKind::Binary { left, right, .. } => {
+            count_writes_in_expr(left, usage);
+            count_writes_in_expr(right, usage);
+        }
+        CHIRExprKind::Unary { expr, .. } => count_writes_in_expr(expr, usage),
+        CHIRExprKind::Cast { expr, .. } => count_writes_in_expr(expr, usage),
+        CHIRExprKind::FieldGet { object, .. } => count_writes_in_expr(object, usage),
+        CHIRExprKind::TupleGet { tuple, .. } => count_writes_in_expr(tuple, usage),
+        CHIRExprKind::Load { ptr, .. } => count_writes_in_expr(ptr, usage),
+        CHIRExprKind::Call { args, .. } => {
+            for a in args {
+                count_writes_in_expr(a, usage);
+            }
+        }
+        CHIRExprKind::MethodCall { receiver, args, .. } => {
+            count_writes_in_expr(receiver, usage);
+            for a in args {
+                count_writes_in_expr(a, usage);
+            }
+        }
+        CHIRExprKind::ArrayGet { array, index } => {
+            count_writes_in_expr(array, usage);
+            count_writes_in_expr(index, usage);
+        }
+        CHIRExprKind::ArraySet { array, index, value } => {
+            count_writes_in_expr(array, usage);
+            count_writes_in_expr(index, usage);
+            count_writes_in_expr(value, usage);
+        }
+        CHIRExprKind::TupleNew { elements } | CHIRExprKind::ArrayLiteral { elements } => {
+            for e in elements {
+                count_writes_in_expr(e, usage);
+            }
+        }
+        CHIRExprKind::FieldSet { object, value, .. } => {
+            count_writes_in_expr(object, usage);
+            count_writes_in_expr(value, usage);
+        }
+        CHIRExprKind::Store { ptr, value, .. } => {
+            count_writes_in_expr(ptr, usage);
+            count_writes_in_expr(value, usage);
+        }
+        CHIRExprKind::Print { arg, .. } => {
+            if let Some(a) = arg {
+                count_writes_in_expr(a, usage);
+            }
+        }
+        CHIRExprKind::MathUnary { arg, .. } => count_writes_in_expr(arg, usage),
+        CHIRExprKind::MathBinary { left, right, .. } => {
+            count_writes_in_expr(left, usage);
+            count_writes_in_expr(right, usage);
+        }
+        CHIRExprKind::BuiltinAbs { val, .. } => count_writes_in_expr(val, usage),
+        CHIRExprKind::BuiltinCompareTo { left, right } => {
+            count_writes_in_expr(left, usage);
+            count_writes_in_expr(right, usage);
+        }
+        CHIRExprKind::BuiltinStringIsEmpty { val } => count_writes_in_expr(val, usage),
+        CHIRExprKind::CallIndirect { args, callee, .. } => {
+            count_writes_in_expr(callee, usage);
+            for a in args {
+                count_writes_in_expr(a, usage);
+            }
+        }
+        CHIRExprKind::ArrayNew { len, init } => {
+            count_writes_in_expr(len, usage);
+            count_writes_in_expr(init, usage);
+        }
+        CHIRExprKind::StructNew { fields, .. } => {
+            for (_, e) in fields {
+                count_writes_in_expr(e, usage);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn count_writes_in_block(block: &CHIRBlock, usage: &mut HashMap<u32, (u32, u32)>) {
+    for stmt in &block.stmts {
+        count_writes_in_stmt(stmt, usage);
+    }
+    if let Some(r) = &block.result {
+        count_writes_in_expr(r, usage);
+    }
+}
+
+fn count_writes_in_stmt(stmt: &CHIRStmt, usage: &mut HashMap<u32, (u32, u32)>) {
+    match stmt {
+        CHIRStmt::Let { local_idx, value } => {
+            usage.entry(*local_idx).or_default().0 += 1;
+            count_writes_in_expr(value, usage);
+        }
+        CHIRStmt::Assign { target, value } => {
+            if let CHIRLValue::Local(idx) = target {
+                usage.entry(*idx).or_default().0 += 1;
+            }
+            count_writes_in_expr(value, usage);
+        }
+        CHIRStmt::Expr(e) => count_writes_in_expr(e, usage),
+        CHIRStmt::Return(Some(e)) => count_writes_in_expr(e, usage),
+        CHIRStmt::While { cond, body } => {
+            count_writes_in_expr(cond, usage);
+            count_writes_in_block(body, usage);
+        }
+        CHIRStmt::Loop { body } => count_writes_in_block(body, usage),
         _ => {}
     }
 }
