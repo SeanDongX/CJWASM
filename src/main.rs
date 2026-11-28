@@ -100,6 +100,11 @@ fn cmd_build(args: &[String]) {
                 unsafe { env::set_var("CJWASM_CHECKED", "1") };
                 i += 1;
             }
+            "--gc" => {
+                // G1：WasmGC 对象模型（叶子类 → GC struct），默认关闭
+                unsafe { env::set_var("CJWASM_GC", "1") };
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!("用法: cjwasm build [选项]");
                 eprintln!();
@@ -111,6 +116,7 @@ fn cmd_build(args: &[String]) {
                 eprintln!("  -v, --verbose          显示详细编译信息");
                 eprintln!("  --no-chir              使用旧版代码生成（不经过 CHIR）");
                 eprintln!("  --checked              开启运行时检查（整数溢出/数组越界/断言 trap）");
+                eprintln!("  --gc                   实验性：WasmGC 对象模型（叶子类 → GC struct）");
                 eprintln!("  -h, --help             显示帮助");
                 std::process::exit(0);
             }
@@ -218,6 +224,10 @@ fn cmd_compile(args: &[String]) {
         } else if args[i] == "--checked" {
             // w31a：运行时检查模式（溢出/越界/断言 trap），默认关闭
             unsafe { env::set_var("CJWASM_CHECKED", "1") };
+            i += 1;
+        } else if args[i] == "--gc" {
+            // G1：WasmGC 对象模型（叶子类 → GC struct），默认关闭
+            unsafe { env::set_var("CJWASM_GC", "1") };
             i += 1;
         } else if args[i].ends_with(".wasm") && input_files.len() == 1 && output_path.is_none() {
             output_path = Some(args[i].clone());

@@ -4,12 +4,14 @@ use crate::ast::{Function, Param, Program, Type};
 use crate::chir::{CHIRFunction, CHIRProgram, CHIRParam};
 use crate::chir::type_inference::TypeInferenceContext;
 use crate::chir::lower_expr::LoweringContext;
+use crate::chir::gc::GcTypeMap;
 use std::collections::HashMap;
 
 /// 降低函数
 pub fn lower_function(
     func: &Function,
     base_type_ctx: &TypeInferenceContext,
+    gc_types: &GcTypeMap,
     func_indices: &HashMap<String, u32>,
     func_params: &HashMap<String, Vec<Param>>,
     struct_field_offsets: &HashMap<String, HashMap<String, u32>>,
@@ -51,7 +53,7 @@ pub fn lower_function(
     let return_ty = func.return_type.clone().unwrap_or(crate::ast::Type::Unit);
     let return_wasm = match &return_ty {
         crate::ast::Type::Unit | crate::ast::Type::Nothing => None,
-        t => Some(t.to_wasm()),
+        t => Some(gc_types.gc_wasm_ty(t)),
     };
 
     let mut ctx = LoweringContext::new(
@@ -68,14 +70,12 @@ pub fn lower_function(
     ctx.func_return_types = func_return_types.clone();
     ctx.enum_defs = enum_defs.to_vec();
     ctx.lambda_counter = lambda_base;
+    ctx.gc_types = gc_types.clone();
 
     // 处理参数（分配局部变量索引，同时记录类型供赋值时强制类型转换）
     let mut params = Vec::new();
     for param in &func.params {
-        let wasm_ty = match &param.ty {
-            crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
-            t => t.to_wasm(),
-        };
+        let wasm_ty = gc_types.gc_wasm_ty(&param.ty);
         // 使用 alloc_local_typed 记录参数 WASM 类型，
         // 使 Stmt::Assign 对参数赋值时能正确插入类型强制转换（如 TCO 生成的 param = tmp）
         let local_idx = ctx.alloc_local_typed(param.name.clone(), wasm_ty);
@@ -94,7 +94,8 @@ pub fn lower_function(
         let is_init = func.name.starts_with("__") && func.name.ends_with("_init");
         if is_init {
             // init 函数：allocate this local after params（由 chir_codegen prologue 赋值）
-            let this_idx = ctx.alloc_local_typed("this".to_string(), wasm_encoder::ValType::I32);
+            let this_wasm = gc_types.gc_wasm_ty(&crate::ast::Type::Struct(class_name.to_string(), vec![]));
+            let this_idx = ctx.alloc_local_typed("this".to_string(), this_wasm);
             ctx.current_class = Some((class_name.to_string(), this_idx));
         } else if let Some(this_param) = params.first() {
             if this_param.name == "this" {
@@ -110,7 +111,7 @@ pub fn lower_function(
     let return_ty = func.return_type.clone().unwrap_or(Type::Unit);
     let return_wasm_ty = match &return_ty {
         Type::Unit | Type::Nothing => wasm_encoder::ValType::I32, // 占位，Unit 函数无返回值
-        t => t.to_wasm(),
+        t => gc_types.gc_wasm_ty(t),
     };
 
     Ok(CHIRFunction {
@@ -128,6 +129,209 @@ pub fn lower_function(
 pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     // 构建类型推断上下文
     let type_ctx = TypeInferenceContext::from_program(program);
+    // G1：WasmGC 类型映射（仅 --gc 下登记叶子类；否则为空表，行为不变）
+    let mut gc_types = GcTypeMap::build(program);
+
+    // G1 安全网：线性侧容器（Array/Option/...）仍存 i32 指针，不得承载 ref。
+    // 降落后扫描 CHIR，若某已登记类出现在容器类型中（包括推断出的
+    // `[C(...)]` / `Array<C>(...)`，无显式注解的场合），将其移出映射并重降。
+    for _ in 0..8 {
+        let chir = lower_program_with(program, &type_ctx, &gc_types)?;
+        if gc_types.structs.is_empty() {
+            return Ok(chir);
+        }
+        let mut bad: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for f in &chir.functions {
+            collect_chir_unsafe(&f.body, &gc_types, &mut bad);
+        }
+        if std::env::var("CJWASM_GC_DEBUG").is_ok() {
+            eprintln!("[gc] safety scan bad={:?}", bad);
+        }
+        if bad.is_empty() {
+            return Ok(chir);
+        }
+        for n in bad {
+            gc_types.structs.remove(&n);
+        }
+    }
+    lower_program_with(program, &type_ctx, &gc_types)
+}
+
+/// 收集 CHIR 中「出现在线性容器类型里的已登记类」。
+fn collect_chir_unsafe(
+    block: &crate::chir::CHIRBlock,
+    map: &GcTypeMap,
+    out: &mut std::collections::HashSet<String>,
+) {
+    let mut scan_expr = |e: &crate::chir::CHIRExpr,
+                         out: &mut std::collections::HashSet<String>| {
+        fn inner_ty(ty: &Type, map: &GcTypeMap, out: &mut std::collections::HashSet<String>) {
+            match ty {
+                Type::Array(t) | Type::VArray(t, _) | Type::Option(t) | Type::Slice(t) => {
+                    mark_inner(t, map, out)
+                }
+                Type::Result(a, b) | Type::Map(a, b) => {
+                    mark_inner(a, map, out);
+                    mark_inner(b, map, out);
+                }
+                Type::Tuple(ts) => {
+                    for t in ts {
+                        mark_inner(t, map, out);
+                    }
+                }
+                Type::Function { params, ret } => {
+                    for p in params {
+                        mark_inner(p, map, out);
+                    }
+                    if let Some(r) = ret.as_ref() {
+                        mark_inner(r, map, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn mark_inner(ty: &Type, map: &GcTypeMap, out: &mut std::collections::HashSet<String>) {
+            match ty {
+                Type::Struct(name, _) => {
+                    if map.structs.contains_key(name) {
+                        out.insert(name.clone());
+                    }
+                }
+                _ => inner_ty(ty, map, out),
+            }
+        }
+        inner_ty(&e.ty, map, out);
+        collect_chir_expr(e, map, out);
+    };
+    for st in &block.stmts {
+        match st {
+            crate::chir::CHIRStmt::Let { value, .. } => scan_expr(value, out),
+            crate::chir::CHIRStmt::Assign { target, value } => {
+                scan_expr(value, out);
+                if let crate::chir::CHIRLValue::Field { object, .. } = target {
+                    scan_expr(object, out);
+                }
+            }
+            crate::chir::CHIRStmt::Expr(e) => scan_expr(e, out),
+            crate::chir::CHIRStmt::Return(Some(e)) => scan_expr(e, out),
+            crate::chir::CHIRStmt::While { cond, body } => {
+                scan_expr(cond, out);
+                collect_chir_unsafe(body, map, out);
+            }
+            crate::chir::CHIRStmt::Loop { body } => collect_chir_unsafe(body, map, out),
+            _ => {}
+        }
+    }
+    if let Some(r) = &block.result {
+        scan_expr(r, out);
+    }
+}
+
+fn collect_chir_expr(
+    e: &crate::chir::CHIRExpr,
+    map: &GcTypeMap,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::chir::CHIRExprKind as K;
+    let scan = |x: &crate::chir::CHIRExpr, out: &mut std::collections::HashSet<String>| {
+        if let Type::Struct(name, _) = &x.ty {
+            // 直接裸露的类值不构成问题（GC 路径）；仅容器型有问题
+        }
+        let mut tmp: std::collections::HashSet<String> = std::collections::HashSet::new();
+        collect_chir_expr(x, map, &mut tmp);
+        out.extend(tmp);
+        // 容器类型检查
+        fn check(
+            ty: &Type,
+            map: &GcTypeMap,
+            out: &mut std::collections::HashSet<String>,
+        ) {
+            fn walk(
+                ty: &Type,
+                map: &GcTypeMap,
+                out: &mut std::collections::HashSet<String>,
+            ) {
+                match ty {
+                    Type::Struct(name, _) => {
+                        if map.structs.contains_key(name) {
+                            out.insert(name.clone());
+                        }
+                    }
+                    Type::Array(t) | Type::VArray(t, _) | Type::Option(t) | Type::Slice(t) => {
+                        walk(t, map, out)
+                    }
+                    Type::Result(a, b) | Type::Map(a, b) => {
+                        walk(a, map, out);
+                        walk(b, map, out);
+                    }
+                    Type::Tuple(ts) => {
+                        for t in ts {
+                            walk(t, map, out);
+                        }
+                    }
+                    Type::Function { params, ret } => {
+                        for p in params {
+                            walk(p, map, out);
+                        }
+                        if let Some(r) = ret.as_ref() {
+                            walk(r, map, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match ty {
+                Type::Array(_) | Type::VArray(_, _) | Type::Option(_) | Type::Slice(_)
+                | Type::Result(_, _) | Type::Map(_, _) | Type::Tuple(_)
+                | Type::Function { .. } => walk(ty, map, out),
+                _ => {}
+            }
+        }
+        check(&x.ty, map, out);
+    };
+    match &e.kind {
+        K::Binary { left, right, .. } => { scan(left, out); scan(right, out); }
+        K::Unary { expr, .. } => scan(expr, out),
+        K::Call { args, .. } => { for a in args { scan(a, out); } }
+        K::MethodCall { receiver, args, .. } => { scan(receiver, out); for a in args { scan(a, out); } }
+        K::Load { ptr, .. } => scan(ptr, out),
+        K::Store { ptr, value, .. } => { scan(ptr, out); scan(value, out); }
+        K::If { cond, then_block, else_block } => {
+            scan(cond, out);
+            collect_chir_unsafe(then_block, map, out);
+            if let Some(b) = else_block { collect_chir_unsafe(b, map, out); }
+        }
+        K::Match { subject, arms } => {
+            scan(subject, out);
+            for arm in arms { collect_chir_unsafe(&arm.body, map, out); }
+        }
+        K::Block(b) => collect_chir_unsafe(b, map, out),
+        K::Cast { expr, .. } => scan(expr, out),
+        K::ArrayNew { len, init } => { scan(len, out); scan(init, out); }
+        K::ArrayLiteral { elements } => { for el in elements { scan(el, out); } }
+        K::ArrayGet { array, index } => { scan(array, out); scan(index, out); }
+        K::ArraySet { array, index, value } => { scan(array, out); scan(index, out); scan(value, out); }
+        K::TupleNew { elements } => { for el in elements { scan(el, out); } }
+        K::TupleGet { tuple, .. } => scan(tuple, out),
+        K::StructNew { fields, .. } => { for (_, f) in fields { scan(f, out); } }
+        K::FieldGet { object, .. } => scan(object, out),
+        K::FieldSet { object, value, .. } => { scan(object, out); scan(value, out); }
+        K::Print { arg, .. } => { if let Some(a) = arg { scan(a, out); } }
+        K::MathUnary { arg, .. } => scan(arg, out),
+        K::MathBinary { left, right, .. } => { scan(left, out); scan(right, out); }
+        K::BuiltinAbs { val, .. } => scan(val, out),
+        K::BuiltinCompareTo { left, right } => { scan(left, out); scan(right, out); }
+        K::BuiltinStringIsEmpty { val } => scan(val, out),
+        K::CallIndirect { args, callee, .. } => { for a in args { scan(a, out); } scan(callee, out); }
+        _ => {}
+    }
+}
+
+fn lower_program_with(
+    program: &Program,
+    type_ctx: &TypeInferenceContext,
+    gc_types: &GcTypeMap,
+) -> Result<CHIRProgram, String> {
 
     // 构建函数索引表（偏移 4 跳过 WASI 导入：fd_write=0, proc_exit=1, clock_time_get=2, random_get=3）
     // 同名不同参数的函数（重载）使用 "name$arity" 修饰名，优先精确匹配
@@ -434,7 +638,8 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         global_lambda_offset += lambda_counts[fi];
         match lower_function(
             func,
-            &type_ctx,
+            type_ctx,
+            gc_types,
             &func_indices,
             &func_params,
             &struct_field_offsets,
@@ -455,10 +660,10 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
                 let return_ty = func.return_type.clone().unwrap_or(Type::Unit);
                 let return_wasm_ty = match &return_ty {
                     Type::Unit | Type::Nothing => wasm_encoder::ValType::I32,
-                    t => t.to_wasm(),
+                    t => gc_types.gc_wasm_ty(t),
                 };
                 let params: Vec<CHIRParam> = func.params.iter().enumerate().map(|(i, p)| {
-                    let wt = match &p.ty { Type::Unit | Type::Nothing => wasm_encoder::ValType::I32, t => t.to_wasm() };
+                    let wt = gc_types.gc_wasm_ty(&p.ty);
                     CHIRParam { name: p.name.clone(), ty: p.ty.clone(), wasm_ty: wt, local_idx: i as u32 }
                 }).collect();
                 chir_functions.push(CHIRFunction {
@@ -484,6 +689,8 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         classes,
         enums,
         globals,
+        gc: gc_types.enabled,
+        gc_types: gc_types.clone(),
     })
 }
 
@@ -732,6 +939,7 @@ mod tests {
         let chir_func = lower_function(
             &func,
             &type_ctx,
+            &GcTypeMap::default(),
             &func_indices,
             &func_params,
             &struct_offsets,
@@ -772,6 +980,7 @@ mod tests {
         let chir_func = lower_function(
             &func,
             &type_ctx,
+            &GcTypeMap::default(),
             &func_indices,
             &func_params,
             &struct_offsets,
@@ -837,6 +1046,7 @@ mod tests {
         let chir_func = lower_function(
             &func,
             &type_ctx,
+            &GcTypeMap::default(),
             &func_indices,
             &func_params,
             &struct_offsets,

@@ -13,18 +13,12 @@ impl<'a> LoweringContext<'a> {
                 // 已知声明类型时，数组字面量按声明元素类型归一化（步长与读侧一致）
                 let mut value_chir = self.lower_expr_expected(value, ty.as_ref())?;
                 let local_wasm_ty = if let Some(decl_ty) = ty {
-                    let decl_wasm = match decl_ty {
-                        crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
-                        t => t.to_wasm(),
-                    };
+                    let decl_wasm = self.gc_wasm_ty(decl_ty);
                     value_chir = self.insert_cast_if_needed(value_chir, decl_wasm);
                     decl_wasm
                 } else if let Pattern::Binding(name) = pattern {
                     self.type_ctx.locals.get(name.as_str())
-                        .map(|t| match t {
-                            crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
-                            t => t.to_wasm(),
-                        })
+                        .map(|t| self.gc_wasm_ty(t))
                         .unwrap_or(value_chir.wasm_ty)
                 } else {
                     value_chir.wasm_ty
@@ -63,18 +57,12 @@ impl<'a> LoweringContext<'a> {
                 // 已知声明类型时，数组字面量按声明元素类型归一化（步长与读侧一致）
                 let mut value_chir = self.lower_expr_expected(value, ty.as_ref())?;
                 let local_wasm_ty = if let Some(decl_ty) = ty {
-                    let decl_wasm = match decl_ty {
-                        crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
-                        t => t.to_wasm(),
-                    };
+                    let decl_wasm = self.gc_wasm_ty(decl_ty);
                     value_chir = self.insert_cast_if_needed(value_chir, decl_wasm);
                     decl_wasm
                 } else if let Pattern::Binding(name) = pattern {
                     self.type_ctx.locals.get(name.as_str())
-                        .map(|t| match t {
-                            crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
-                            t => t.to_wasm(),
-                        })
+                        .map(|t| self.gc_wasm_ty(t))
                         .unwrap_or(value_chir.wasm_ty)
                 } else {
                     value_chir.wasm_ty
@@ -496,10 +484,7 @@ impl<'a> LoweringContext<'a> {
             Stmt::Const { name, ty, value } => {
                 let mut value_chir = self.lower_expr_expected(value, ty.as_ref())?;
                 let local_wasm_ty = if let Some(decl_ty) = ty {
-                    let decl_wasm = match decl_ty {
-                        crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
-                        t => t.to_wasm(),
-                    };
+                    let decl_wasm = self.gc_wasm_ty(decl_ty);
                     value_chir = self.insert_cast_if_needed(value_chir, decl_wasm);
                     decl_wasm
                 } else {
@@ -671,10 +656,11 @@ impl<'a> LoweringContext<'a> {
                     // 隐式 this 字段赋值
                     if let Some(fields) = self.class_field_info.get(&class_name) {
                         if let Some((offset, _)) = fields.get(name) {
+                            let this_ty = crate::ast::Type::Struct(class_name.clone(), vec![]);
                             let this_expr = crate::chir::CHIRExpr::new(
                                 crate::chir::CHIRExprKind::Local(this_idx),
-                                crate::ast::Type::Struct(class_name.clone(), vec![]),
-                                wasm_encoder::ValType::I32,
+                                this_ty.clone(),
+                                self.gc_wasm_ty(&this_ty),
                             );
                             return Ok(crate::chir::CHIRLValue::Field {
                                 object: Box::new(this_expr),

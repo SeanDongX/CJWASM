@@ -79,6 +79,10 @@ pub struct LoweringContext<'a> {
     /// w31a：运行时检查模式（`--checked`）。开启后对整数算术、数组下标、
     /// Assert 断言插入 trap 检查；默认关闭，生产路径不变。
     pub checked: bool,
+
+    /// G1：WasmGC 类型映射（`--gc`）。登记类型 → typed ref；未开启时为空表，
+    /// 所有映射回退 `Type::to_wasm()`，默认路径行为不变。
+    pub gc_types: crate::chir::gc::GcTypeMap,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -112,7 +116,13 @@ impl<'a> LoweringContext<'a> {
             err_val_stack: Vec::new(),
             lambda_counter: 0,
             checked: crate::checked_mode(),
+            gc_types: crate::chir::gc::GcTypeMap::default(),
         }
+    }
+
+    /// G1：AST 类型 → WASM 类型（GC 登记的类 → typed ref）。
+    pub fn gc_wasm_ty(&self, ty: &crate::ast::Type) -> ValType {
+        self.gc_types.gc_wasm_ty(ty)
     }
 
     /// 分配新的局部变量索引
@@ -327,7 +337,7 @@ impl<'a> LoweringContext<'a> {
         let wasm_ty = match &ty {
             crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
             t => {
-                let inferred_wasm = t.to_wasm();
+                let inferred_wasm = self.gc_wasm_ty(t);
                 // 对于 Var 表达式，如果 type_ctx 推断为 Int32 但 lowering 阶段分配了
                 // 不同类型（如 For 循环变量），以 lowering 阶段的类型为准
                 if let Expr::Var(name) = expr {
@@ -394,10 +404,11 @@ impl<'a> LoweringContext<'a> {
                     // 隐式 this 字段访问：类方法内直接引用字段名（等价于 this.field）
                     if let Some(fields) = self.class_field_info.get(&class_name) {
                         if let Some((offset, field_ty)) = fields.get(name) {
+                            let this_ty = crate::ast::Type::Struct(class_name.clone(), vec![]);
                             let this_expr = CHIRExpr::new(
                                 CHIRExprKind::Local(this_idx),
-                                crate::ast::Type::Struct(class_name.clone(), vec![]),
-                                ValType::I32,
+                                this_ty.clone(),
+                                self.gc_wasm_ty(&this_ty),
                             );
                             return Ok(CHIRExpr::new(
                                 CHIRExprKind::FieldGet {
@@ -406,7 +417,7 @@ impl<'a> LoweringContext<'a> {
                                     field_ty: field_ty.clone(),
                                 },
                                 field_ty.clone(),
-                                field_ty.to_wasm(),
+                                self.gc_wasm_ty(field_ty),
                             ));
                         }
                     }
@@ -1225,7 +1236,7 @@ impl<'a> LoweringContext<'a> {
                                 .unwrap_or(ty.clone());
                             let ret_wasm = match &ret_ty {
                                 crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
-                                t => t.to_wasm(),
+                                t => self.gc_wasm_ty(t),
                             };
                             return Ok(CHIRExpr::new(
                                 CHIRExprKind::Call { func_idx, args: call_args },
@@ -1287,16 +1298,18 @@ impl<'a> LoweringContext<'a> {
                             self.type_ctx.functions
                                 .get(mangled_key.as_str())
                                 .or_else(|| self.type_ctx.functions.get(mangled_method.as_str()))
-                                .map(|sig| sig.params.iter().map(|p| match p {
-                                    crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
-                                    t => t.to_wasm(),
-                                }).collect())
+                                .map(|sig| sig.params.iter().map(|p| self.gc_wasm_ty(p)).collect())
                                 .unwrap_or_default()
                         };
 
                         // receiver 作为第一个参数（this）
                         let receiver_chir = self.lower_expr(object)?;
-                        let receiver_chir = self.insert_cast_if_needed(receiver_chir, ValType::I32);
+                        let receiver_target = param_tys.get(0).copied().unwrap_or(ValType::I32);
+                        let receiver_chir = if matches!(receiver_target, ValType::Ref(_)) {
+                            receiver_chir
+                        } else {
+                            self.insert_cast_if_needed(receiver_chir, receiver_target)
+                        };
                         let mut call_args = vec![receiver_chir];
 
                         // 普通参数（带类型对齐）
@@ -1322,7 +1335,7 @@ impl<'a> LoweringContext<'a> {
                             .map(|rt| {
                                 let wt = match rt {
                                     crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
-                                    t => t.to_wasm(),
+                                    t => self.gc_wasm_ty(t),
                                 };
                                 (rt.clone(), wt)
                             })
@@ -1409,11 +1422,16 @@ impl<'a> LoweringContext<'a> {
                     let getter_name = format!("{}.__get_{}", cls, field);
                     if let Some(&func_idx) = self.func_indices.get(&getter_name) {
                         let obj_chir = self.lower_expr(object)?;
-                        let obj_chir = self.insert_cast_if_needed(obj_chir, ValType::I32);
+                        let obj_target = self.gc_wasm_ty(&obj_ty);
+                        let obj_chir = if matches!(obj_target, ValType::Ref(_)) {
+                            obj_chir
+                        } else {
+                            self.insert_cast_if_needed(obj_chir, obj_target)
+                        };
                         let ret_ty = self.func_return_types.get(&getter_name)
                             .cloned()
                             .unwrap_or(crate::ast::Type::Int64);
-                        let ret_wasm = ret_ty.to_wasm();
+                        let ret_wasm = self.gc_wasm_ty(&ret_ty);
                         return Ok(CHIRExpr::new(
                             CHIRExprKind::Call { func_idx, args: vec![obj_chir] },
                             ret_ty, ret_wasm,
@@ -1424,12 +1442,14 @@ impl<'a> LoweringContext<'a> {
                 let obj_chir = self.lower_expr(object)?;
                 let offset = self.get_field_offset(&obj_ty, field)?;
                 let field_ty = self.type_ctx.infer_field_type(&obj_ty, field)?;
-                let obj_chir = self.insert_cast_if_needed(obj_chir, ValType::I32);
-
-                let field_wasm = match &field_ty {
-                    crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
-                    t => t.to_wasm(),
+                let obj_target = self.gc_wasm_ty(&obj_ty);
+                let obj_chir = if matches!(obj_target, ValType::Ref(_)) {
+                    obj_chir
+                } else {
+                    self.insert_cast_if_needed(obj_chir, obj_target)
                 };
+
+                let field_wasm = self.gc_wasm_ty(&field_ty);
                 return Ok(CHIRExpr::new(
                     CHIRExprKind::FieldGet {
                         object: Box::new(obj_chir),
@@ -1921,8 +1941,8 @@ impl<'a> LoweringContext<'a> {
                                     struct_name: name.clone(),
                                     fields: args_chir,
                                 },
+                                wasm_ty: self.gc_wasm_ty(&ty),
                                 ty,
-                                wasm_ty: ValType::I32,
                                 span: None,
                             });
                         }
@@ -1934,10 +1954,7 @@ impl<'a> LoweringContext<'a> {
                     .get(init_name.as_str())
                     .or_else(|| self.type_ctx.functions.get(name.as_str()))
                     .map(|sig| (
-                        sig.params.iter().map(|p| match p {
-                            crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
-                            t => t.to_wasm(),
-                        }).collect(),
+                        sig.params.iter().map(|p| self.gc_wasm_ty(p)).collect(),
                         sig.params.clone(),
                     ))
                     .unwrap_or_default();

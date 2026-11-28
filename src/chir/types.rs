@@ -319,6 +319,12 @@ pub struct CHIRProgram {
     pub classes: Vec<ClassDef>,
     pub enums: Vec<EnumDef>,
     pub globals: Vec<CHIRGlobal>,
+    /// WasmGC 模式（`--gc` / `CJWASM_GC=1`）：为 true 时 codegen 发射 GC 类型段，
+    /// 并以 `wasm_ty == ValType::Ref(_)` 判别 GC 路径。默认 false，行为不变。
+    pub gc: bool,
+    /// lowering 构建的 GC 类型映射（含已登记的叶子类及其类型索引）。
+    /// codegen 直接复用，保证类型索引与 lowering 完全一致。
+    pub gc_types: crate::chir::gc::GcTypeMap,
 }
 
 /// CHIR 全局变量
@@ -485,6 +491,8 @@ mod tests {
             classes: vec![],
             enums: vec![],
             globals: vec![],
+            gc: false,
+            gc_types: crate::chir::gc::GcTypeMap::default(),
         };
         assert!(prog.functions.is_empty());
     }

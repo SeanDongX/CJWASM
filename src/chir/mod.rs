@@ -12,6 +12,7 @@
 
 pub mod types;
 pub mod builder;
+pub mod gc;
 pub mod type_inference;
 pub mod lower_expr;
 pub mod lower_stmt;
@@ -20,5 +21,6 @@ pub mod optimize;
 
 pub use types::*;
 pub use builder::CHIRBuilder;
+pub use gc::{GcTypeMap, GcStructLayout, GcField};
 pub use type_inference::TypeInferenceContext;
 pub use lower::{lower_program, lower_function};

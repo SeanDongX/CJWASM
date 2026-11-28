@@ -9,6 +9,7 @@ use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, FunctionSection,
     GlobalSection, GlobalType, ImportSection, Instruction, MemArg, MemorySection,
     MemoryType, Module, TypeSection, ValType, ConstExpr,
+    CompositeInnerType, CompositeType, FieldType, StorageType, StructType, SubType,
 };
 use std::collections::HashMap;
 
@@ -196,6 +197,11 @@ pub struct CHIRCodeGen {
     /// 内存槽，避免内层表达式在求值时覆盖外层尚未用完的指针暂存
     /// （见 `expr_scratch_enter`）。
     expr_scratch_depth: std::cell::Cell<u32>,
+
+    /// G1：WasmGC 类型映射（`--gc` 下登记叶子类 → GC struct）。
+    gc_types: crate::chir::GcTypeMap,
+    /// G1：WasmGC 模式总开关（CHIRProgram.gc）。
+    gc: bool,
 }
 
 impl CHIRCodeGen {
@@ -216,6 +222,8 @@ impl CHIRCodeGen {
             func_param_types: HashMap::new(),
             checked: crate::checked_mode(),
             expr_scratch_depth: std::cell::Cell::new(0),
+            gc_types: crate::chir::GcTypeMap::default(),
+            gc: false,
         }
     }
 
@@ -502,6 +510,10 @@ impl CHIRCodeGen {
         // ── 0b. 构建结构体/类字段偏移表 ────────────────────────────────
         self.build_type_layout_info(program);
 
+        // ── 0c. G1：WasmGC 类型表（仅 --gc；与 lowering 同序构建，索引一致）──
+        self.gc = program.gc;
+        self.gc_types = program.gc_types.clone();
+
         // ── 用户函数索引 = 导入数量 + 用户序号 ─────────────────────────
         // 支持重载：用 "name$arity" 修饰名精确匹配；原名作为 fallback
         for (i, func) in program.functions.iter().enumerate() {
@@ -621,6 +633,41 @@ impl CHIRCodeGen {
         // ty 3: random_get (i32, i32) -> i32
         let ty_random = types.len();
         types.ty().function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
+        // G1：GC rec group 紧随 4 个 WASI 类型之后，索引 GC_TYPE_BASE (4) 起，
+        // 与 lowering 侧 GcTypeMap 的 type_index 分配保持一致。
+        if self.gc && !self.gc_types.structs.is_empty() {
+            let mut layouts: Vec<&crate::chir::GcStructLayout> =
+                self.gc_types.structs.values().collect();
+            layouts.sort_by_key(|l| l.type_index);
+            let mut subtypes: Vec<SubType> = Vec::with_capacity(layouts.len());
+            for layout in layouts {
+                let fields: Vec<FieldType> = layout
+                    .fields
+                    .iter()
+                    .map(|f| FieldType {
+                        element_type: StorageType::Val(self.gc_types.gc_wasm_ty(&f.ty)),
+                        mutable: true,
+                    })
+                    .collect();
+                subtypes.push(SubType {
+                    is_final: true,
+                    supertype_idx: None,
+                    composite_type: CompositeType {
+                        inner: CompositeInnerType::Struct(StructType {
+                            fields: fields.into(),
+                        }),
+                        shared: false,
+                    },
+                });
+            }
+            // 注意：wasm-encoder 的 TypeSection::rec() 不增加内部 len 计数，
+            // 而 rec group 内 N 个子类型各占一个类型索引。G1 的叶子类字段均为
+            // 值类型（无自引用/互引用），逐个 `subtype` 发射既保持索引精确可算
+            // （GC_TYPE_BASE=4 起），也避免 len 计数与真实索引错位（R10）。
+            for st in &subtypes {
+                types.ty().subtype(st);
+            }
+        }
         // ty 4+: 用户函数
         let mut user_type_indices: Vec<u32> = Vec::new();
         for func in &program.functions {
@@ -4749,6 +4796,18 @@ impl CHIRCodeGen {
         }
     }
 
+    /// G1：若 `object` 是 GC typed ref 且 offset 对应已登记字段，
+    /// 返回 (struct type index, field index)；否则 None（走线性路径）。
+    fn gc_field_ops(&self, object: &CHIRExpr, offset: u32) -> Option<(u32, u32)> {
+        if !self.gc || !matches!(object.wasm_ty, ValType::Ref(_)) {
+            return None;
+        }
+        let name = self.gc_types.resolve_struct_name(&object.ty)?;
+        let layout = self.gc_types.layout(name)?;
+        let idx = layout.fields.iter().position(|f| f.offset == offset)? as u32;
+        Some((layout.type_index, idx))
+    }
+
     fn emit_function(&self, func: &CHIRFunction, codes: &mut CodeSection) {
         let param_count = func.params.len() as u32;
         let is_init = Self::extract_init_class_name(&func.name).is_some();
@@ -4787,18 +4846,24 @@ impl CHIRCodeGen {
 
         // init 函数 prologue：分配对象，设 this local
         if let Some(class_name) = Self::extract_init_class_name(&func.name) {
-            let obj_size = self.class_object_sizes.get(&class_name).copied().unwrap_or(16);
-            let alloc_idx = self.func_indices.get(RT_ALLOC).copied().unwrap_or(0);
             // this local = param_count (第一个非参数 local，由 lowering 分配)
             let this_local = param_count;
-            wasm_func.instruction(&Instruction::I32Const(obj_size as i32));
-            wasm_func.instruction(&Instruction::Call(alloc_idx));
-            wasm_func.instruction(&Instruction::LocalSet(this_local));
-            // 如果有 vtable，在 offset 0 存储 vtable base（暂时存 0）
-            if *self.class_has_vtable.get(&class_name).unwrap_or(&false) {
-                wasm_func.instruction(&Instruction::LocalGet(this_local));
-                wasm_func.instruction(&Instruction::I32Const(0)); // vtable base placeholder
-                wasm_func.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
+            if let Some(layout) = self.gc_types.layout(&class_name) {
+                // G1：GC struct 分配（叶子类无 vtable，置于声明顺序字段默认值）
+                wasm_func.instruction(&Instruction::StructNewDefault(layout.type_index));
+                wasm_func.instruction(&Instruction::LocalSet(this_local));
+            } else {
+                let obj_size = self.class_object_sizes.get(&class_name).copied().unwrap_or(16);
+                let alloc_idx = self.func_indices.get(RT_ALLOC).copied().unwrap_or(0);
+                wasm_func.instruction(&Instruction::I32Const(obj_size as i32));
+                wasm_func.instruction(&Instruction::Call(alloc_idx));
+                wasm_func.instruction(&Instruction::LocalSet(this_local));
+                // 如果有 vtable，在 offset 0 存储 vtable base（暂时存 0）
+                if *self.class_has_vtable.get(&class_name).unwrap_or(&false) {
+                    wasm_func.instruction(&Instruction::LocalGet(this_local));
+                    wasm_func.instruction(&Instruction::I32Const(0)); // vtable base placeholder
+                    wasm_func.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
+                }
             }
         }
 
@@ -5324,7 +5389,19 @@ impl CHIRCodeGen {
                 }
             }
 
-            CHIRExprKind::FieldGet { object, field_offset, .. } => {
+            CHIRExprKind::FieldGet { object, field_offset, field_ty } => {
+                if let Some((type_idx, field_idx)) = self.gc_field_ops(object, *field_offset) {
+                    self.emit_expr(object, func);
+                    func.instruction(&Instruction::StructGet {
+                        struct_type_index: type_idx,
+                        field_index: field_idx,
+                    });
+                    let target = self.gc_types.gc_wasm_ty(field_ty);
+                    if expr.wasm_ty != target {
+                        self.emit_cast(expr.wasm_ty, target, func);
+                    }
+                    return;
+                }
                 self.emit_expr(object, func);
                 if !self.expr_produces_wasm_value_ctx(object) {
                     emit_zero(ValType::I32, func);
@@ -5623,6 +5700,29 @@ impl CHIRCodeGen {
                 func.instruction(&Instruction::Unreachable);
             }
             CHIRExprKind::StructNew { struct_name, fields } => {
+                // G1：GC struct 构造——按声明顺序把全部字段值压栈后 `struct.new`；
+                // 未提供的字段补默认零值（叶子类无 vtable，字段下标即声明序）。
+                if self.gc {
+                    if let Some(layout) = self.gc_types.layout(struct_name) {
+                        if matches!(expr.wasm_ty, ValType::Ref(_)) {
+                            for fld in &layout.fields {
+                                if let Some((_, fexpr)) =
+                                    fields.iter().find(|(n, _)| n == &fld.name)
+                                {
+                                    self.emit_expr(fexpr, func);
+                                    let target = self.gc_types.gc_wasm_ty(&fld.ty);
+                                    if fexpr.wasm_ty != target {
+                                        self.emit_cast(fexpr.wasm_ty, target, func);
+                                    }
+                                } else {
+                                    emit_zero(self.gc_types.gc_wasm_ty(&fld.ty), func);
+                                }
+                            }
+                            func.instruction(&Instruction::StructNew(layout.type_index));
+                            return;
+                        }
+                    }
+                }
                 let alloc_idx = self.func_indices.get(RT_ALLOC).copied().unwrap_or(0);
                 // 计算对象大小
                 let obj_size = self.class_object_sizes.get(struct_name).copied()
@@ -5729,6 +5829,21 @@ impl CHIRCodeGen {
             }
 
             CHIRExprKind::FieldSet { object, field_offset, value } => {
+                if let Some((type_idx, field_idx)) = self.gc_field_ops(object, *field_offset) {
+                    let name = crate::chir::GcTypeMap::struct_name_of(&object.ty).unwrap();
+                    let field_ty = self.gc_types.layout(name).unwrap().fields[field_idx as usize].ty.clone();
+                    self.emit_expr(object, func);
+                    self.emit_expr(value, func);
+                    let target = self.gc_types.gc_wasm_ty(&field_ty);
+                    if value.wasm_ty != target {
+                        self.emit_cast(value.wasm_ty, target, func);
+                    }
+                    func.instruction(&Instruction::StructSet {
+                        struct_type_index: type_idx,
+                        field_index: field_idx,
+                    });
+                    return;
+                }
                 self.emit_expr(object, func);
                 if object.wasm_ty == ValType::I64 {
                     func.instruction(&Instruction::I32WrapI64);
@@ -6007,6 +6122,21 @@ impl CHIRCodeGen {
                 func.instruction(&Instruction::LocalSet(*idx));
             }
             CHIRLValue::Field { object, offset } => {
+                if let Some((type_idx, field_idx)) = self.gc_field_ops(object, *offset) {
+                    let name = self.gc_types.resolve_struct_name(&object.ty).unwrap();
+                    let field_ty = self.gc_types.layout(name).unwrap().fields[field_idx as usize].ty.clone();
+                    self.emit_expr(object, func);
+                    self.emit_expr(value, func);
+                    let target = self.gc_types.gc_wasm_ty(&field_ty);
+                    if value.wasm_ty != target {
+                        self.emit_cast(value.wasm_ty, target, func);
+                    }
+                    func.instruction(&Instruction::StructSet {
+                        struct_type_index: type_idx,
+                        field_index: field_idx,
+                    });
+                    return;
+                }
                 self.emit_expr(object, func);
                 if !self.expr_produces_wasm_value_ctx(object) {
                     emit_zero(ValType::I32, func);
@@ -6610,6 +6740,14 @@ fn emit_zero(ty: ValType, func: &mut wasm_encoder::Function) {
         ValType::I64 => { func.instruction(&Instruction::I64Const(0)); }
         ValType::F32 => { func.instruction(&Instruction::F32Const(0.0)); }
         ValType::F64 => { func.instruction(&Instruction::F64Const(0.0)); }
+        ValType::Ref(rt) => {
+            // G1：可空 ref 用 ref.null；非空 concrete struct 用默认实例（全零字段）。
+            if rt.nullable {
+                func.instruction(&Instruction::RefNull(rt.heap_type));
+            } else if let wasm_encoder::HeapType::Concrete(idx) = rt.heap_type {
+                func.instruction(&Instruction::StructNewDefault(idx));
+            }
+        }
         _ => {}
     }
 }
@@ -6765,6 +6903,8 @@ mod tests {
             classes: vec![],
             enums: vec![],
             globals: vec![],
+            gc: false,
+            gc_types: crate::chir::GcTypeMap::default(),
         }
     }
 
