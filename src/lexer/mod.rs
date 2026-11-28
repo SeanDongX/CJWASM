@@ -492,8 +492,11 @@ fn lex_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, Vec<String
                 return Some(Ok(current_literal));
             }
         } else {
-            current_literal.push(c as char);
-            pos += 1;
+            // 按 UTF-8 解码整个字符，逐字节 `as char` 会把多字节字符
+            // 误当作 Latin-1 重新编码（mojibake），导致 size()/输出翻倍。
+            let ch = remainder[pos..].chars().next()?;
+            current_literal.push(ch);
+            pos += ch.len_utf8();
         }
     }
 
@@ -522,8 +525,13 @@ fn lex_backtick_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, V
                 b'\\' => current_literal.push('\\'),
                 b'$' => current_literal.push('$'),
                 _ => {
+                    // next 可能是多字节字符的首字节：按字符解码，
+                    // 保持 pos 落在 UTF-8 字符边界，避免后续切片 panic。
                     current_literal.push('\\');
-                    current_literal.push(next as char);
+                    let esc = remainder[pos + 1..].chars().next().unwrap_or(next as char);
+                    current_literal.push(esc);
+                    pos += 1 + esc.len_utf8();
+                    continue;
                 }
             }
             pos += 2;
@@ -584,8 +592,10 @@ fn lex_backtick_string(lex: &mut logos::Lexer<Token>) -> Option<Result<String, V
                 return Some(Ok(current_literal));
             }
         } else {
-            current_literal.push(c as char);
-            pos += 1;
+            // 按 UTF-8 解码整个字符，避免多字节编码 mojibake（同 lex_string）
+            let ch = remainder[pos..].chars().next()?;
+            current_literal.push(ch);
+            pos += ch.len_utf8();
         }
     }
     None
@@ -1396,6 +1406,52 @@ mod tests {
             tokens[3],
             Token::StringLit(StringOrInterpolated::Plain("a\nb\tc\"d\\e".to_string()))
         );
+    }
+
+    #[test]
+    fn test_string_literal_utf8_bytes_preserved() {
+        // 多字节字符必须原样保留（不被逐字节按 Latin-1 重新编码）
+        let source = r#"let s = "中文🙏🏿""#;
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(
+            tokens[3],
+            Token::StringLit(StringOrInterpolated::Plain("中文🙏🏿".to_string()))
+        );
+        if let Token::StringLit(StringOrInterpolated::Plain(s)) = &tokens[3] {
+            // 中文 6 字节 + emoji 组合 8 字节
+            assert_eq!(s.len(), 14);
+        }
+    }
+
+    #[test]
+    fn test_backtick_string_utf8_bytes_preserved() {
+        // 规范 1.3.4：反引号仅作原始标识符。内容先经 lex_backtick_string 词法化
+        // （必须 UTF-8 字节保真），再重解释为 Ident；多字节标识符不得 mojibake。
+        let source = "let `中x文` = 1";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        assert_eq!(tokens[1], Token::Ident("中x文".to_string()));
+    }
+
+    #[test]
+    fn test_interpolated_string_utf8_literal_parts_preserved() {
+        // 插值字符串的字面量部分同样不得 mojibake
+        let source = "let s = \"前${word}后\"";
+        let lexer = Lexer::new(source);
+        let tokens: Vec<_> = lexer.filter_map(|r| r.ok()).map(|(_, t, _)| t).collect();
+
+        match &tokens[3] {
+            Token::StringLit(StringOrInterpolated::Interpolated(parts)) => {
+                assert_eq!(parts.len(), 3);
+                assert_eq!(parts[0], StringPart::Literal("前".to_string()));
+                assert_eq!(parts[1], StringPart::Interpolation("word".to_string()));
+                assert_eq!(parts[2], StringPart::Literal("后".to_string()));
+            }
+            other => panic!("expected interpolated string, got {other:?}"),
+        }
     }
 
     #[test]
