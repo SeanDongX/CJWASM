@@ -17,6 +17,24 @@ fn type_cast_wasm(name: &str) -> Option<ValType> {
     }
 }
 
+/// 若语句是产生非 Unit 值的表达式语句（`Stmt::Expr(e)`），返回其结果类型与 WASM 类型。
+///
+/// w54d：用于 try/catch 块的“末表达式即块值”语义（try 表达式值）。
+fn stmt_value_ty(
+    ctx: &TypeInferenceContext,
+    stmt: &crate::ast::Stmt,
+) -> Option<(Type, ValType)> {
+    if let crate::ast::Stmt::Expr(e) = stmt {
+        if let Ok(t) = ctx.infer_expr(e) {
+            if !matches!(t, Type::Unit | Type::Nothing) {
+                let w = t.to_wasm();
+                return Some((t, w));
+            }
+        }
+    }
+    None
+}
+
 /// 降低（Lowering）上下文
 pub struct LoweringContext<'a> {
     /// 类型推断上下文
@@ -76,6 +94,10 @@ pub struct LoweringContext<'a> {
     /// Lambda 计数器（用于生成 __lambda_N 名称，与 lower.rs 中收集顺序一致）
     pub lambda_counter: u32,
 
+    /// w54d：局部变量 idx → 其闭包捕获值的类型（按捕获顺序）。
+    /// 由 `let f = {…捕获…}` 记录；直接调用 `f(...)` 时据此从闭包对象取捕获值。
+    pub closure_captures: HashMap<u32, Vec<Type>>,
+
     /// w31a：运行时检查模式（`--checked`）。开启后对整数算术、数组下标、
     /// Assert 断言插入 trap 检查；默认关闭，生产路径不变。
     pub checked: bool,
@@ -111,8 +133,25 @@ impl<'a> LoweringContext<'a> {
             err_flag_stack: Vec::new(),
             err_val_stack: Vec::new(),
             lambda_counter: 0,
+            closure_captures: HashMap::new(),
             checked: crate::checked_mode(),
         }
+    }
+
+    /// w54d：本函数可见的闭包捕获（只取当前作用域内的真实局部变量）。
+    ///
+    /// 隐式类字段等名字虽然在 `type_ctx.locals` 中可见，但不在 `local_map`，
+    /// 不能作为捕获实参传入（λ 函数签名里不会出现它们），故过滤掉，保证与
+    /// `emit_lambda_function` 的捕获判定一致。
+    pub fn closure_capture_types(
+        &self,
+        params: &[(String, crate::ast::Type)],
+        body: &Expr,
+    ) -> Vec<(String, crate::ast::Type)> {
+        crate::chir::lower::lambda_captures(params, body, &self.type_ctx.locals)
+            .into_iter()
+            .filter(|(n, _)| self.local_map.contains_key(n))
+            .collect()
     }
 
     /// 分配新的局部变量索引
@@ -242,6 +281,11 @@ impl<'a> LoweringContext<'a> {
             stmts.push(crate::chir::CHIRStmt::Expr(print(None, true)));
         }
         CHIRExpr::new(CHIRExprKind::Block(CHIRBlock { stmts, result: None }), unit, ValType::I32)
+    }
+
+    /// w54a: 运行时助手索引查询（供 lower_stmt 等兄弟模块使用，避免暴露 func_indices）。
+    pub(crate) fn rt_func_idx(&self, name: &str) -> Option<u32> {
+        self.func_indices.get(name).copied()
     }
 
     /// 变量名（含 `this`/`self`）→ 静态 AST 类型。
@@ -454,6 +498,8 @@ impl<'a> LoweringContext<'a> {
             // 字面量
             Expr::Integer(n) => CHIRExprKind::Integer(*n),
             Expr::IntegerSuffixed(n, _) => CHIRExprKind::Integer(*n),
+            // w54c: 超出 i64 范围的十进制字面量（如 UInt64 上限）按回绕位模式处理
+            Expr::IntegerOverflow(v, _) => CHIRExprKind::Integer(*v as i64),
             Expr::Float(f) => CHIRExprKind::Float(*f),
             Expr::Float32(f) => CHIRExprKind::Float32(*f),
             Expr::Bool(b) => CHIRExprKind::Bool(*b),
@@ -863,7 +909,8 @@ impl<'a> LoweringContext<'a> {
                         ));
                     }
                     // WASM 原生数学内置函数（f64 → f64），仅当无用户自定义函数时
-                    "sqrt" | "floor" | "ceil" | "trunc" | "nearest" | "abs"
+                    // w54c: cjc 的 round 为银行家舍入（half-to-even），与 f64.nearest 一致。
+                    "sqrt" | "floor" | "ceil" | "trunc" | "nearest" | "abs" | "round"
                     | "sin" | "cos" | "exp" | "log" if args.len() == 1
                         && !self.func_indices.contains_key(name.as_str())
                         && !self.func_indices.contains_key(&format!("{}$1", name)) => {
@@ -1070,13 +1117,39 @@ impl<'a> LoweringContext<'a> {
                     Some(idx) => idx,
                     None => {
                         // 检查是否为函数类型的局部变量调用（Lambda / call_indirect）
-                        if let Some(crate::ast::Type::Function { params: fn_params, ret }) = self.local_ast_types.get(name).cloned() {
+                        if let Some(crate::ast::Type::Function { params: _fn_params, ret }) = self.local_ast_types.get(name).cloned() {
+                            let callee_local = self.local_map.get(name).copied().unwrap_or(0);
+                            let ptr_get = || CHIRExpr::new(CHIRExprKind::Local(callee_local), crate::ast::Type::Int32, ValType::I32);
                             let mut lowered_args = Vec::new();
+                            // w54d：捕获 λ。若该局部记录为闭包对象，先把捕获值按顺序
+                            // 从对象中取出（lambda 签名为 [捕获...][形参...]），再从
+                            // offset 0 读取函数表索引；否则为裸表索引（无捕获 λ）。
+                            let callee_expr = if let Some(caps) = self.closure_captures.get(&callee_local).cloned() {
+                                for (i, cap_ty) in caps.iter().enumerate() {
+                                    let cap_wasm = match cap_ty {
+                                        crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                                        t => t.to_wasm(),
+                                    };
+                                    let align = match cap_wasm { ValType::I64 | ValType::F64 => 3u32, _ => 2 };
+                                    lowered_args.push(CHIRExpr::new(
+                                        CHIRExprKind::Load {
+                                            ptr: Box::new(ptr_get()),
+                                            offset: 8 + 8 * i as u32,
+                                            align,
+                                        },
+                                        cap_ty.clone(), cap_wasm,
+                                    ));
+                                }
+                                CHIRExpr::new(
+                                    CHIRExprKind::Load { ptr: Box::new(ptr_get()), offset: 0, align: 2 },
+                                    crate::ast::Type::Int32, ValType::I32,
+                                )
+                            } else {
+                                ptr_get()
+                            };
                             for arg in args {
                                 lowered_args.push(self.lower_expr(arg)?);
                             }
-                            let callee_local = self.local_map.get(name).copied().unwrap_or(0);
-                            let callee_expr = CHIRExpr::new(CHIRExprKind::Local(callee_local), crate::ast::Type::Int32, ValType::I32);
                             let ret_wasm = ret.as_ref().as_ref().map(|t| t.to_wasm()).unwrap_or(ValType::I64);
                             let ret_ty = ret.as_ref().as_ref().cloned().unwrap_or(crate::ast::Type::Int64);
                             return Ok(CHIRExpr::new(
@@ -1504,6 +1577,12 @@ impl<'a> LoweringContext<'a> {
 
             // 字段访问
             Expr::Field { object, field } => {
+                // w54c: 整数类型静态常量 Int64.Max / Int64.Min 等
+                if let Expr::Var(type_name) = object.as_ref() {
+                    if let Some(c) = Self::try_lower_int_static_const(type_name, field) {
+                        return Ok(c);
+                    }
+                }
                 let obj_ty = if let Expr::Var(name) = object.as_ref() {
                     self.local_ast_types.get(name).cloned()
                         .unwrap_or_else(|| self.type_ctx.infer_expr(object).unwrap_or(crate::ast::Type::Int32))
@@ -1633,6 +1712,35 @@ impl<'a> LoweringContext<'a> {
                     ));
                 }
 
+                // w54a: ArrayList / HashMap 的下标读 → 运行时 get
+                if let Some(result) = self.try_lower_collection_index_get(array, index, obj_ast_ty.as_ref())? {
+                    return Ok(result);
+                }
+
+                // w54a: 已知元素类型时以静态元素类型为准构造 ArrayGet。
+                // 类型推断对方法结果（如 slice/concat 后的局部变量）可能给出
+                // 错误元素类型，导致 codegen 按错误步长读取（String/Int32 元素
+                // 被当成 8 字节槽而读到垃圾）。此处用 lowering 阶段的精确类型。
+                if !matches!(index.as_ref(), Expr::Range { .. }) {
+                    if let Some(crate::ast::Type::Array(elem)) = &obj_ast_ty {
+                        let array_chir = self.lower_expr(array)?;
+                        let array_chir = self.insert_cast_if_needed(array_chir, ValType::I32);
+                        let index_chir = self.lower_expr(index)?;
+                        let elem_ty = (**elem).clone();
+                        let elem_wasm = match &elem_ty {
+                            crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                            t => t.to_wasm(),
+                        };
+                        return Ok(CHIRExpr::new(
+                            CHIRExprKind::ArrayGet {
+                                array: Box::new(array_chir),
+                                index: Box::new(index_chir),
+                            },
+                            elem_ty, elem_wasm,
+                        ));
+                    }
+                }
+
                 let array_chir_raw = self.lower_expr(array)?;
                 let array_chir = self.insert_cast_if_needed(array_chir_raw, ValType::I32);
                 let index_chir = self.lower_expr(index)?;
@@ -1711,13 +1819,19 @@ impl<'a> LoweringContext<'a> {
             }
 
             // 构造函数调用
-            Expr::ConstructorCall { name, args, named_args, .. } => {
+            Expr::ConstructorCall { name, args, named_args, type_args } => {
                 // ArrayList<T>() → __arraylist_new
+                // w54a: 返回 Struct("ArrayList", [T]) 而非 Type::Array(Int64)，
+                // 以便下标读写（a[i]）与 add 能分派到 ArrayList 运行时（否则会
+                // 按原生数组布局读取 12 字节头部，产生静默错误数据）。
                 if name == "ArrayList" && args.is_empty() {
+                    let elem = type_args.as_ref()
+                        .and_then(|ta| ta.first().cloned())
+                        .unwrap_or(crate::ast::Type::Int64);
                     if let Some(&idx) = self.func_indices.get("__arraylist_new") {
                         return Ok(CHIRExpr::new(
                             CHIRExprKind::Call { func_idx: idx, args: vec![] },
-                            crate::ast::Type::Array(Box::new(crate::ast::Type::Int64)),
+                            crate::ast::Type::Struct("ArrayList".to_string(), vec![elem]),
                             ValType::I32,
                         ));
                     }
@@ -2164,9 +2278,22 @@ impl<'a> LoweringContext<'a> {
             }
 
             // try-catch-finally using __err_flag pattern
+            //
+            // w54d：try 表达式的值 = try 块值（未抛异常）或 catch 块值（捕获后），
+            // 即两者最后一个非 Unit 表达式语句的值。原实现一律返回 Unit，
+            // 使 `let t = try {…} catch {42} finally {…}` 得 0。此处为结果分配
+            // 一个局部变量，在 try/catch 末尾把值写回，块结果取该局部。
             Expr::TryBlock { body, catch_body, catch_var, finally_body, resources, .. } => {
                 let has_catch = catch_var.is_some() || !catch_body.is_empty();
                 let mut stmts: Vec<crate::chir::CHIRStmt> = Vec::new();
+                // 结果类型：优先 catch 末表达式的类型，否则 try 末表达式；Unit/Nothing 不取值。
+                let val_info: Option<(Type, ValType)> = catch_body.last()
+                    .and_then(|s| stmt_value_ty(self.type_ctx, s))
+                    .or_else(|| body.last().and_then(|s| stmt_value_ty(self.type_ctx, s)));
+                let result_local: Option<(u32, Type, ValType)> = val_info.as_ref().map(|(t, w)| {
+                    let idx = self.alloc_local_typed("__try_val".into(), *w);
+                    (idx, t.clone(), *w)
+                });
 
                 // try-with-resources: lower resource declarations as let bindings
                 for (name, init_expr) in resources {
@@ -2175,6 +2302,14 @@ impl<'a> LoweringContext<'a> {
                     self.local_ast_types.insert(name.clone(), value_chir.ty.clone());
                     let local_idx = self.alloc_local_typed(name.clone(), local_wasm_ty);
                     stmts.push(crate::chir::CHIRStmt::Let { local_idx, value: value_chir });
+                }
+
+                // 结果局部初值 0（未抛异常且 try 无值/未走到末尾时保持 0）
+                if let Some((rl, rty, rw)) = &result_local {
+                    stmts.push(crate::chir::CHIRStmt::Let {
+                        local_idx: *rl,
+                        value: CHIRExpr::new(CHIRExprKind::Integer(0), rty.clone(), *rw),
+                    });
                 }
 
                 if has_catch {
@@ -2194,19 +2329,36 @@ impl<'a> LoweringContext<'a> {
                     self.err_val_stack.push(err_val);
 
                     // try body: wrap each stmt in if(!err_flag) { stmt }
-                    for stmt in body {
-                        if let Ok(s) = self.lower_stmt(stmt) {
-                            let flag_get = CHIRExpr::new(CHIRExprKind::Local(err_flag), crate::ast::Type::Int32, ValType::I32);
-                            let not_flag = CHIRExpr::new(
-                                CHIRExprKind::Unary { op: crate::ast::UnaryOp::Not, expr: Box::new(flag_get) },
-                                crate::ast::Type::Bool, ValType::I32,
-                            );
-                            let body_block = crate::chir::CHIRBlock { stmts: vec![s], result: None };
-                            stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
-                                CHIRExprKind::If { cond: Box::new(not_flag), then_block: body_block, else_block: None },
-                                crate::ast::Type::Unit, ValType::I32,
-                            )));
-                        }
+                    let body_len = body.len();
+                    for (bi, stmt) in body.iter().enumerate() {
+                        let is_last = bi + 1 == body_len;
+                        let s = if is_last
+                            && result_local.is_some()
+                            && stmt_value_ty(self.type_ctx, stmt).is_some()
+                        {
+                            if let (Some((rl, _, rw)), crate::ast::Stmt::Expr(e)) = (&result_local, stmt) {
+                                let raw = self.lower_expr(e)?;
+                                let v = self.insert_cast_if_needed(raw, *rw);
+                                crate::chir::CHIRStmt::Assign {
+                                    target: crate::chir::CHIRLValue::Local(*rl),
+                                    value: v,
+                                }
+                            } else {
+                                match self.lower_stmt(stmt) { Ok(s) => s, Err(_) => continue }
+                            }
+                        } else {
+                            match self.lower_stmt(stmt) { Ok(s) => s, Err(_) => continue }
+                        };
+                        let flag_get = CHIRExpr::new(CHIRExprKind::Local(err_flag), crate::ast::Type::Int32, ValType::I32);
+                        let not_flag = CHIRExpr::new(
+                            CHIRExprKind::Unary { op: crate::ast::UnaryOp::Not, expr: Box::new(flag_get) },
+                            crate::ast::Type::Bool, ValType::I32,
+                        );
+                        let body_block = crate::chir::CHIRBlock { stmts: vec![s], result: None };
+                        stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                            CHIRExprKind::If { cond: Box::new(not_flag), then_block: body_block, else_block: None },
+                            crate::ast::Type::Unit, ValType::I32,
+                        )));
                     }
 
                     self.err_flag_stack.pop();
@@ -2222,7 +2374,23 @@ impl<'a> LoweringContext<'a> {
                                 value: CHIRExpr::new(CHIRExprKind::Local(err_val), crate::ast::Type::Int64, ValType::I64),
                             });
                         }
-                        for stmt in catch_body {
+                        let cb_len = catch_body.len();
+                        for (ci, stmt) in catch_body.iter().enumerate() {
+                            let is_last = ci + 1 == cb_len;
+                            if is_last
+                                && result_local.is_some()
+                                && stmt_value_ty(self.type_ctx, stmt).is_some()
+                            {
+                                if let (Some((rl, _, rw)), crate::ast::Stmt::Expr(e)) = (&result_local, stmt) {
+                                    let raw = self.lower_expr(e)?;
+                                    let v = self.insert_cast_if_needed(raw, *rw);
+                                    catch_stmts.push(crate::chir::CHIRStmt::Assign {
+                                        target: crate::chir::CHIRLValue::Local(*rl),
+                                        value: v,
+                                    });
+                                    continue;
+                                }
+                            }
                             if let Ok(s) = self.lower_stmt(stmt) {
                                 catch_stmts.push(s);
                             }
@@ -2235,8 +2403,24 @@ impl<'a> LoweringContext<'a> {
                         )));
                     }
                 } else {
-                    // no catch: execute try body directly
-                    for stmt in body {
+                    // no catch: execute try body directly（末值写入结果局部）
+                    let body_len = body.len();
+                    for (bi, stmt) in body.iter().enumerate() {
+                        let is_last = bi + 1 == body_len;
+                        if is_last
+                            && result_local.is_some()
+                            && stmt_value_ty(self.type_ctx, stmt).is_some()
+                        {
+                            if let (Some((rl, _, rw)), crate::ast::Stmt::Expr(e)) = (&result_local, stmt) {
+                                let raw = self.lower_expr(e)?;
+                                let v = self.insert_cast_if_needed(raw, *rw);
+                                stmts.push(crate::chir::CHIRStmt::Assign {
+                                    target: crate::chir::CHIRLValue::Local(*rl),
+                                    value: v,
+                                });
+                                continue;
+                            }
+                        }
                         if let Ok(s) = self.lower_stmt(stmt) {
                             stmts.push(s);
                         }
@@ -2254,10 +2438,18 @@ impl<'a> LoweringContext<'a> {
                 if stmts.is_empty() {
                     CHIRExprKind::Nop
                 } else {
+                    let (res_expr, res_ty, res_wasm) = match &result_local {
+                        Some((rl, rty, rw)) => (
+                            Some(Box::new(CHIRExpr::new(CHIRExprKind::Local(*rl), rty.clone(), *rw))),
+                            rty.clone(),
+                            *rw,
+                        ),
+                        None => (None, crate::ast::Type::Unit, ValType::I32),
+                    };
                     return Ok(CHIRExpr::new(
-                        CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: None }),
-                        crate::ast::Type::Unit,
-                        ValType::I32,
+                        CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: res_expr }),
+                        res_ty,
+                        res_wasm,
                     ));
                 }
             }
@@ -2572,15 +2764,58 @@ impl<'a> LoweringContext<'a> {
                 }
             }
 
-            // Lambda → 返回 __lambda_N 的函数索引作为 i32 table index
-            Expr::Lambda { .. } => {
+            // Lambda 表达式求值：
+            // - 无捕获：直接返回 __lambda_N 的函数表索引（i32），零开销；
+            // - 有捕获：分配闭包对象 [fn_idx:i32][pad][cap0(8B)][cap1(8B)]...，
+            //   把捕获值复制进去，返回对象指针。直接调用点据 closure_captures
+            //   从对象中取捕获值压栈并读取 offset 0 的函数索引（见下方 Call 分支）。
+            Expr::Lambda { params, body, .. } => {
                 let idx = self.lambda_counter;
                 self.lambda_counter += 1;
                 let lambda_name = format!("__lambda_{}", idx);
-                if let Some(&func_idx) = self.func_indices.get(&lambda_name) {
+                let func_idx = *self.func_indices.get(&lambda_name).unwrap_or(&0);
+                let caps = self.closure_capture_types(params, body);
+                if caps.is_empty() {
                     CHIRExprKind::Integer(func_idx as i64)
                 } else {
-                    CHIRExprKind::Integer(0)
+                    let alloc_idx = *self.func_indices.get("__alloc").unwrap_or(&0);
+                    let ptr_local = self.alloc_local_typed("__closure".into(), ValType::I32);
+                    let ptr_get = || CHIRExpr::new(CHIRExprKind::Local(ptr_local), crate::ast::Type::Int32, ValType::I32);
+                    let size = 8 + 8 * caps.len() as i64;
+                    let alloc_call = CHIRExpr::new(
+                        CHIRExprKind::Call {
+                            func_idx: alloc_idx,
+                            args: vec![CHIRExpr::new(CHIRExprKind::Integer(size), crate::ast::Type::Int32, ValType::I32)],
+                        },
+                        crate::ast::Type::Int32, ValType::I32,
+                    );
+                    let mut stmts = vec![
+                        crate::chir::CHIRStmt::Let { local_idx: ptr_local, value: alloc_call },
+                        crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                            CHIRExprKind::Store {
+                                ptr: Box::new(ptr_get()),
+                                value: Box::new(CHIRExpr::new(CHIRExprKind::Integer(func_idx as i64), crate::ast::Type::Int32, ValType::I32)),
+                                offset: 0, align: 2,
+                            },
+                            crate::ast::Type::Unit, ValType::I32,
+                        )),
+                    ];
+                    for (i, (cname, _cty)) in caps.iter().enumerate() {
+                        let val = self.lower_expr(&Expr::Var(cname.clone()))?;
+                        let align = match val.wasm_ty { ValType::I64 | ValType::F64 => 3u32, _ => 2 };
+                        stmts.push(crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                            CHIRExprKind::Store {
+                                ptr: Box::new(ptr_get()),
+                                value: Box::new(val),
+                                offset: 8 + 8 * i as u32, align,
+                            },
+                            crate::ast::Type::Unit, ValType::I32,
+                        )));
+                    }
+                    return Ok(CHIRExpr::new(
+                        CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(ptr_get())) }),
+                        ty.clone(), ValType::I32,
+                    ));
                 }
             }
 
@@ -2949,6 +3184,14 @@ impl<'a> LoweringContext<'a> {
         args: &[Expr],
     ) -> Result<Option<CHIRExpr>, String> {
         use crate::ast::Type;
+        // w54c: Option<T> 内建方法 isSome/isNone/map。Option 运行时布局为
+        // [tag: i32 @0][value @4]（Some 的 tag=1）。兼容类型注解 Type::Option(inner)
+        // 与解析得到的 Struct("Option", [inner]) 两种形态。
+        if let Some(payload_ty) = Self::option_payload_type(obj_ty) {
+            if let Some(r) = self.try_lower_option_method(object, &payload_ty, method, args)? {
+                return Ok(Some(r));
+            }
+        }
         match obj_ty {
             Type::Int64 | Type::Int32 | Type::Int8 | Type::Int16 => {
                 match method {
@@ -3232,6 +3475,51 @@ impl<'a> LoweringContext<'a> {
             // Array/Struct methods: isEmpty, clone, slice
             Type::Array(_) | Type::Struct(_, _) => {
                 match method {
+                    // ── w54a: Array API（仅 Type::Array 接收者，guard 避免劫持用户 Struct）──
+                    "contains" if args.len() == 1 && matches!(obj_ty, Type::Array(_)) => {
+                        let idx_expr = self.lower_array_index_of_expr(object, obj_ty, &args[0])?;
+                        let tag = CHIRExpr::new(
+                            CHIRExprKind::Load { ptr: Box::new(idx_expr), offset: 0, align: 2 },
+                            Type::Int32, ValType::I32,
+                        );
+                        return Ok(Some(CHIRExpr::new(
+                            CHIRExprKind::Binary {
+                                op: crate::ast::BinOp::Eq,
+                                left: Box::new(tag),
+                                right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int32, ValType::I32)),
+                            },
+                            Type::Bool, ValType::I32,
+                        )));
+                    }
+                    "indexOf" if args.len() == 1 && matches!(obj_ty, Type::Array(_)) => {
+                        return Ok(Some(self.lower_array_index_of_expr(object, obj_ty, &args[0])?));
+                    }
+                    "reverse" if args.is_empty() && matches!(obj_ty, Type::Array(_)) => {
+                        return Ok(Some(self.lower_array_reverse_inline(object, obj_ty)?));
+                    }
+                    "concat" if args.len() == 1 && matches!(obj_ty, Type::Array(_)) => {
+                        return Ok(Some(self.lower_array_concat(object, obj_ty, &args[0])?));
+                    }
+                    "fill" if args.len() == 1 && matches!(obj_ty, Type::Array(_)) => {
+                        return Ok(Some(self.lower_array_fill_inline(object, obj_ty, &args[0])?));
+                    }
+                    "slice" if args.len() == 2 && matches!(obj_ty, Type::Array(_)) => {
+                        return Ok(Some(self.lower_array_slice(object, obj_ty, &args[0], &args[1])?));
+                    }
+                    "add" if args.len() == 1
+                        && matches!(obj_ty, Type::Struct(n, _) if n == "ArrayList") =>
+                    {
+                        if let Some(&func_idx) = self.func_indices.get("__arraylist_append") {
+                            let obj = self.lower_expr(object)?;
+                            let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                            let arg = self.lower_expr(&args[0])?;
+                            let arg = self.insert_cast_if_needed(arg, ValType::I64);
+                            return Ok(Some(CHIRExpr::new(
+                                CHIRExprKind::Call { func_idx, args: vec![obj, arg] },
+                                Type::Unit, ValType::I32,
+                            )));
+                        }
+                    }
                     "append" if args.len() == 1 => {
                         if let Some(&func_idx) = self.func_indices.get("__arraylist_append") {
                             let obj = self.lower_expr(object)?;
@@ -3970,6 +4258,735 @@ impl<'a> LoweringContext<'a> {
         Ok(None)
     }
 
+    // ── w54a: Array API 降级助手 ─────────────────────────────────────────
+
+    /// 数组元素类型 → (比较种类, 槽宽字节)。
+    /// 种类：0=i64、1=i32、2=String（内容比较）、3=Float64、4=Float32。
+    fn array_elem_kind(elem: &Type) -> (i32, u32) {
+        match elem {
+            Type::String => (2, 4),
+            _ => match elem.to_wasm() {
+                ValType::I64 => (0, 8),
+                ValType::F64 => (3, 8),
+                ValType::F32 => (4, 4),
+                _ => (1, 4),
+            },
+        }
+    }
+
+    /// Array.indexOf(elem) → 运行时线性查找，返回 Option<Int64> 盒指针。
+    fn lower_array_index_of_expr(
+        &mut self,
+        object: &Expr,
+        obj_ty: &Type,
+        needle: &Expr,
+    ) -> Result<CHIRExpr, String> {
+        let elem = match obj_ty {
+            Type::Array(e) => (**e).clone(),
+            _ => Type::Int64,
+        };
+        let (kind, esize) = Self::array_elem_kind(&elem);
+        let obj = self.lower_expr(object)?;
+        let obj = self.insert_cast_if_needed(obj, ValType::I32);
+        let opt_ty = Type::Option(Box::new(Type::Int64));
+        let esize_arg = CHIRExpr::new(CHIRExprKind::Integer(esize as i64), Type::Int32, ValType::I32);
+        if kind == 3 || kind == 4 {
+            let func_idx = *self.func_indices.get("__arr_index_of_f")
+                .ok_or_else(|| "缺少 __arr_index_of_f 运行时助手".to_string())?;
+            let n = self.lower_expr(needle)?;
+            let n = self.insert_cast_if_needed(n, ValType::F64);
+            let is_f32 = if kind == 4 { 1 } else { 0 };
+            return Ok(CHIRExpr::new(
+                CHIRExprKind::Call { func_idx, args: vec![
+                    obj, n, esize_arg,
+                    CHIRExpr::new(CHIRExprKind::Integer(is_f32), Type::Int32, ValType::I32),
+                ] },
+                opt_ty, ValType::I32,
+            ));
+        }
+        let func_idx = *self.func_indices.get("__arr_index_of")
+            .ok_or_else(|| "缺少 __arr_index_of 运行时助手".to_string())?;
+        let n = self.lower_expr(needle)?;
+        let n = self.insert_cast_if_needed(n, ValType::I64);
+        Ok(CHIRExpr::new(
+            CHIRExprKind::Call { func_idx, args: vec![
+                obj, n, esize_arg,
+                CHIRExpr::new(CHIRExprKind::Integer(kind as i64), Type::Int32, ValType::I32),
+            ] },
+            opt_ty, ValType::I32,
+        ))
+    }
+
+    /// Array.reverse() → 原地反转（内联循环，按元素实际槽宽经 ArrayGet/ArraySet 读写）。
+    fn lower_array_reverse_inline(&mut self, object: &Expr, obj_ty: &Type) -> Result<CHIRExpr, String> {
+        let elem = match obj_ty {
+            Type::Array(e) => (**e).clone(),
+            _ => Type::Int64,
+        };
+        let elem_wasm = match &elem {
+            Type::Unit | Type::Nothing => ValType::I32,
+            t => t.to_wasm(),
+        };
+        let obj = self.lower_expr(object)?;
+        let obj = self.insert_cast_if_needed(obj, ValType::I32);
+        let arr_local = self.alloc_local_typed("__arr_rev_ptr".into(), ValType::I32);
+        let len_local = self.alloc_local_typed("__arr_rev_len".into(), ValType::I64);
+        let i_local = self.alloc_local_typed("__arr_rev_i".into(), ValType::I64);
+        let tmp_local = self.alloc_local_typed("__arr_rev_tmp".into(), elem_wasm);
+        let arr_get = || CHIRExpr::new(CHIRExprKind::Local(arr_local), Type::Int32, ValType::I32);
+        let len_get = || CHIRExpr::new(CHIRExprKind::Local(len_local), Type::Int64, ValType::I64);
+        let i_get = || CHIRExpr::new(CHIRExprKind::Local(i_local), Type::Int64, ValType::I64);
+        let int64 = |v: i64| CHIRExpr::new(CHIRExprKind::Integer(v), Type::Int64, ValType::I64);
+        let len_cast = CHIRExpr::new(
+            CHIRExprKind::Cast {
+                expr: Box::new(CHIRExpr::new(
+                    CHIRExprKind::Load { ptr: Box::new(arr_get()), offset: 0, align: 2 },
+                    Type::Int32, ValType::I32,
+                )),
+                from_ty: ValType::I32,
+                to_ty: ValType::I64,
+            },
+            Type::Int64, ValType::I64,
+        );
+        let half = CHIRExpr::new(
+            CHIRExprKind::Binary {
+                op: crate::ast::BinOp::Div,
+                left: Box::new(len_get()),
+                right: Box::new(int64(2)),
+            },
+            Type::Int64, ValType::I64,
+        );
+        let cond = CHIRExpr::new(
+            CHIRExprKind::Binary { op: crate::ast::BinOp::Lt, left: Box::new(i_get()), right: Box::new(half) },
+            Type::Bool, ValType::I32,
+        );
+        let j_expr = || CHIRExpr::new(
+            CHIRExprKind::Binary {
+                op: crate::ast::BinOp::Sub,
+                left: Box::new(CHIRExpr::new(
+                    CHIRExprKind::Binary {
+                        op: crate::ast::BinOp::Sub,
+                        left: Box::new(len_get()),
+                        right: Box::new(int64(1)),
+                    },
+                    Type::Int64, ValType::I64,
+                )),
+                right: Box::new(i_get()),
+            },
+            Type::Int64, ValType::I64,
+        );
+        let elem_get = |idx: CHIRExpr| CHIRExpr::new(
+            CHIRExprKind::ArrayGet { array: Box::new(arr_get()), index: Box::new(idx) },
+            elem.clone(), elem_wasm,
+        );
+        let body = CHIRBlock {
+            stmts: vec![
+                crate::chir::CHIRStmt::Let { local_idx: tmp_local, value: elem_get(i_get()) },
+                crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                    CHIRExprKind::ArraySet {
+                        array: Box::new(arr_get()),
+                        index: Box::new(i_get()),
+                        value: Box::new(elem_get(j_expr())),
+                    },
+                    Type::Unit, ValType::I32,
+                )),
+                crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                    CHIRExprKind::ArraySet {
+                        array: Box::new(arr_get()),
+                        index: Box::new(j_expr()),
+                        value: Box::new(CHIRExpr::new(CHIRExprKind::Local(tmp_local), elem.clone(), elem_wasm)),
+                    },
+                    Type::Unit, ValType::I32,
+                )),
+                crate::chir::CHIRStmt::Assign {
+                    target: crate::chir::CHIRLValue::Local(i_local),
+                    value: CHIRExpr::new(
+                        CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Add,
+                            left: Box::new(i_get()),
+                            right: Box::new(int64(1)),
+                        },
+                        Type::Int64, ValType::I64,
+                    ),
+                },
+            ],
+            result: None,
+        };
+        let stmts = vec![
+            crate::chir::CHIRStmt::Let { local_idx: arr_local, value: obj },
+            crate::chir::CHIRStmt::Let { local_idx: len_local, value: len_cast },
+            crate::chir::CHIRStmt::Let { local_idx: i_local, value: int64(0) },
+            crate::chir::CHIRStmt::While { cond, body },
+        ];
+        Ok(CHIRExpr::new(
+            CHIRExprKind::Block(CHIRBlock { stmts, result: None }),
+            Type::Unit, ValType::I32,
+        ))
+    }
+
+    /// Array.fill(value) → 原地把每个元素置为 value（内联循环）。
+    fn lower_array_fill_inline(
+        &mut self,
+        object: &Expr,
+        obj_ty: &Type,
+        value: &Expr,
+    ) -> Result<CHIRExpr, String> {
+        let elem = match obj_ty {
+            Type::Array(e) => (**e).clone(),
+            _ => Type::Int64,
+        };
+        let elem_wasm = match &elem {
+            Type::Unit | Type::Nothing => ValType::I32,
+            t => t.to_wasm(),
+        };
+        let obj = self.lower_expr(object)?;
+        let obj = self.insert_cast_if_needed(obj, ValType::I32);
+        let val = self.lower_expr(value)?;
+        let val = self.insert_cast_if_needed(val, elem_wasm);
+        let arr_local = self.alloc_local_typed("__arr_fill_ptr".into(), ValType::I32);
+        let val_local = self.alloc_local_typed("__arr_fill_val".into(), elem_wasm);
+        let len_local = self.alloc_local_typed("__arr_fill_len".into(), ValType::I64);
+        let i_local = self.alloc_local_typed("__arr_fill_i".into(), ValType::I64);
+        let arr_get = || CHIRExpr::new(CHIRExprKind::Local(arr_local), Type::Int32, ValType::I32);
+        let len_get = || CHIRExpr::new(CHIRExprKind::Local(len_local), Type::Int64, ValType::I64);
+        let i_get = || CHIRExpr::new(CHIRExprKind::Local(i_local), Type::Int64, ValType::I64);
+        let int64 = |v: i64| CHIRExpr::new(CHIRExprKind::Integer(v), Type::Int64, ValType::I64);
+        let len_cast = CHIRExpr::new(
+            CHIRExprKind::Cast {
+                expr: Box::new(CHIRExpr::new(
+                    CHIRExprKind::Load { ptr: Box::new(arr_get()), offset: 0, align: 2 },
+                    Type::Int32, ValType::I32,
+                )),
+                from_ty: ValType::I32,
+                to_ty: ValType::I64,
+            },
+            Type::Int64, ValType::I64,
+        );
+        let cond = CHIRExpr::new(
+            CHIRExprKind::Binary { op: crate::ast::BinOp::Lt, left: Box::new(i_get()), right: Box::new(len_get()) },
+            Type::Bool, ValType::I32,
+        );
+        let body = CHIRBlock {
+            stmts: vec![
+                crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                    CHIRExprKind::ArraySet {
+                        array: Box::new(arr_get()),
+                        index: Box::new(i_get()),
+                        value: Box::new(CHIRExpr::new(CHIRExprKind::Local(val_local), elem.clone(), elem_wasm)),
+                    },
+                    Type::Unit, ValType::I32,
+                )),
+                crate::chir::CHIRStmt::Assign {
+                    target: crate::chir::CHIRLValue::Local(i_local),
+                    value: CHIRExpr::new(
+                        CHIRExprKind::Binary {
+                            op: crate::ast::BinOp::Add,
+                            left: Box::new(i_get()),
+                            right: Box::new(int64(1)),
+                        },
+                        Type::Int64, ValType::I64,
+                    ),
+                },
+            ],
+            result: None,
+        };
+        let stmts = vec![
+            crate::chir::CHIRStmt::Let { local_idx: arr_local, value: obj },
+            crate::chir::CHIRStmt::Let { local_idx: val_local, value: val },
+            crate::chir::CHIRStmt::Let { local_idx: len_local, value: len_cast },
+            crate::chir::CHIRStmt::Let { local_idx: i_local, value: int64(0) },
+            crate::chir::CHIRStmt::While { cond, body },
+        ];
+        Ok(CHIRExpr::new(
+            CHIRExprKind::Block(CHIRBlock { stmts, result: None }),
+            Type::Unit, ValType::I32,
+        ))
+    }
+
+    /// Array.slice(start, length) → 返回新数组（cjc 第二参数为长度）。
+    fn lower_array_slice(
+        &mut self,
+        object: &Expr,
+        obj_ty: &Type,
+        start: &Expr,
+        len: &Expr,
+    ) -> Result<CHIRExpr, String> {
+        let elem = match obj_ty {
+            Type::Array(e) => (**e).clone(),
+            _ => Type::Int64,
+        };
+        let (_, esize) = Self::array_elem_kind(&elem);
+        let func_idx = *self.func_indices.get("__arr_slice")
+            .ok_or_else(|| "缺少 __arr_slice 运行时助手".to_string())?;
+        let obj = self.lower_expr(object)?;
+        let obj = self.insert_cast_if_needed(obj, ValType::I32);
+        let start = self.lower_expr(start)?;
+        let start = self.insert_cast_if_needed(start, ValType::I64);
+        let len = self.lower_expr(len)?;
+        let len = self.insert_cast_if_needed(len, ValType::I64);
+        Ok(CHIRExpr::new(
+            CHIRExprKind::Call { func_idx, args: vec![
+                obj, start, len,
+                CHIRExpr::new(CHIRExprKind::Integer(esize as i64), Type::Int32, ValType::I32),
+            ] },
+            Type::Array(Box::new(elem)), ValType::I32,
+        ))
+    }
+
+    /// Array.concat(other) → 返回新数组（this 元素后接 other 元素）。
+    fn lower_array_concat(
+        &mut self,
+        object: &Expr,
+        obj_ty: &Type,
+        other: &Expr,
+    ) -> Result<CHIRExpr, String> {
+        let elem = match obj_ty {
+            Type::Array(e) => (**e).clone(),
+            _ => Type::Int64,
+        };
+        let (_, esize) = Self::array_elem_kind(&elem);
+        let func_idx = *self.func_indices.get("__arr_concat")
+            .ok_or_else(|| "缺少 __arr_concat 运行时助手".to_string())?;
+        let obj = self.lower_expr(object)?;
+        let obj = self.insert_cast_if_needed(obj, ValType::I32);
+        let other = self.lower_expr(other)?;
+        let other = self.insert_cast_if_needed(other, ValType::I32);
+        Ok(CHIRExpr::new(
+            CHIRExprKind::Call { func_idx, args: vec![
+                obj, other,
+                CHIRExpr::new(CHIRExprKind::Integer(esize as i64), Type::Int32, ValType::I32),
+            ] },
+            Type::Array(Box::new(elem)), ValType::I32,
+        ))
+    }
+
+    /// w54a: Option.isSome / isNone → 读 Option 盒 tag（1=Some，0=None）。
+    fn try_lower_option_predicate(
+        &mut self,
+        object: &Expr,
+        obj_ty: &Type,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<Option<CHIRExpr>, String> {
+        if !args.is_empty() {
+            return Ok(None);
+        }
+        let is_option = match obj_ty {
+            Type::Option(_) => true,
+            Type::Struct(name, _) => name == "Option",
+            _ => false,
+        };
+        if !is_option {
+            return Ok(None);
+        }
+        let op = match method {
+            "isSome" => crate::ast::BinOp::Eq,
+            "isNone" => crate::ast::BinOp::NotEq,
+            _ => return Ok(None),
+        };
+        let obj = self.lower_expr(object)?;
+        let obj = self.insert_cast_if_needed(obj, ValType::I32);
+        let tag = CHIRExpr::new(
+            CHIRExprKind::Load { ptr: Box::new(obj), offset: 0, align: 2 },
+            Type::Int32, ValType::I32,
+        );
+        Ok(Some(CHIRExpr::new(
+            CHIRExprKind::Binary {
+                op,
+                left: Box::new(tag),
+                right: Box::new(CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int32, ValType::I32)),
+            },
+            Type::Bool, ValType::I32,
+        )))
+    }
+
+    /// w54a: ArrayList / HashMap 的下标读 → 运行时 get（原生数组仍走 ArrayGet）。
+    fn try_lower_collection_index_get(
+        &mut self,
+        array: &Expr,
+        index: &Expr,
+        obj_ast_ty: Option<&Type>,
+    ) -> Result<Option<CHIRExpr>, String> {
+        let Some(base) = obj_ast_ty else { return Ok(None) };
+        match base {
+            Type::Struct(name, args) if name == "ArrayList" => {
+                let elem = args.first().cloned().unwrap_or(Type::Int64);
+                let elem_wasm = match &elem {
+                    Type::Unit | Type::Nothing => ValType::I32,
+                    t => t.to_wasm(),
+                };
+                if !matches!(elem_wasm, ValType::I32 | ValType::I64) {
+                    return Ok(None);
+                }
+                let Some(&get_idx) = self.func_indices.get("__arraylist_get") else {
+                    return Ok(None);
+                };
+                let arr = self.lower_expr(array)?;
+                let arr = self.insert_cast_if_needed(arr, ValType::I32);
+                let idx = self.lower_expr(index)?;
+                let idx = self.insert_cast_if_needed(idx, ValType::I64);
+                let call = CHIRExpr::new(
+                    CHIRExprKind::Call { func_idx: get_idx, args: vec![arr, idx] },
+                    Type::Int64, ValType::I64,
+                );
+                Ok(Some(if elem_wasm == ValType::I32 {
+                    CHIRExpr::new(
+                        CHIRExprKind::Cast { expr: Box::new(call), from_ty: ValType::I64, to_ty: ValType::I32 },
+                        elem, ValType::I32,
+                    )
+                } else {
+                    CHIRExpr::new(call.kind, elem, ValType::I64)
+                }))
+            }
+            Type::Map(_, v) => {
+                let val_ty = (**v).clone();
+                let val_wasm = match &val_ty {
+                    Type::Unit | Type::Nothing => ValType::I32,
+                    t => t.to_wasm(),
+                };
+                if !matches!(val_wasm, ValType::I32 | ValType::I64) {
+                    return Ok(None);
+                }
+                let Some(&get_idx) = self.func_indices.get("__hashmap_get") else {
+                    return Ok(None);
+                };
+                let arr = self.lower_expr(array)?;
+                let arr = self.insert_cast_if_needed(arr, ValType::I32);
+                let key = self.lower_expr(index)?;
+                let key = self.insert_cast_if_needed(key, ValType::I64);
+                let call = CHIRExpr::new(
+                    CHIRExprKind::Call { func_idx: get_idx, args: vec![arr, key] },
+                    Type::Int64, ValType::I64,
+                );
+                Ok(Some(if val_wasm == ValType::I32 {
+                    CHIRExpr::new(
+                        CHIRExprKind::Cast { expr: Box::new(call), from_ty: ValType::I64, to_ty: ValType::I32 },
+                        val_ty, ValType::I32,
+                    )
+                } else {
+                    CHIRExpr::new(call.kind, val_ty, ValType::I64)
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// w54c: 解析 Option 载荷类型。兼容 `Type::Option(inner)` 与
+    /// 解析 `Option<T>` 注解得到的 `Struct("Option", [inner])`。
+    fn option_payload_type(ty: &crate::ast::Type) -> Option<crate::ast::Type> {
+        match ty {
+            crate::ast::Type::Option(inner) => Some((**inner).clone()),
+            crate::ast::Type::Struct(name, args) if name == "Option" && args.len() == 1 => {
+                Some(args[0].clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// w54c: 降低 Option<T> 的内建方法 isSome / isNone / map。
+    /// 返回 Ok(None) 表示不是已处理的方法（交回通用分派）。
+    fn try_lower_option_method(
+        &mut self,
+        object: &Expr,
+        payload_ty: &crate::ast::Type,
+        method: &str,
+        args: &[Expr],
+    ) -> Result<Option<CHIRExpr>, String> {
+        use crate::ast::Type;
+        match method {
+            // isSome: tag == 1；isNone: tag != 1（tag 仅 0/1，等价 tag == 0）
+            "isSome" | "isNone" if args.is_empty() => {
+                let obj = self.lower_expr(object)?;
+                let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                let tag = CHIRExpr::new(
+                    CHIRExprKind::Load { ptr: Box::new(obj), offset: 0, align: 2 },
+                    Type::Int32, ValType::I32,
+                );
+                let one = CHIRExpr::new(CHIRExprKind::Integer(1), Type::Int32, ValType::I32);
+                let op = if method == "isSome" {
+                    crate::ast::BinOp::Eq
+                } else {
+                    crate::ast::BinOp::NotEq
+                };
+                Ok(Some(CHIRExpr::new(
+                    CHIRExprKind::Binary { op, left: Box::new(tag), right: Box::new(one) },
+                    Type::Bool, ValType::I32,
+                )))
+            }
+            // getOrThrow：Some(v) → v；None → trap（cjc 抛异常；此处以 unreachable 中止）
+            "getOrThrow" if args.is_empty() => {
+                let obj = self.lower_expr(object)?;
+                let obj = self.insert_cast_if_needed(obj, ValType::I32);
+                let src_local = self.alloc_local_typed("__opt_got_src".into(), ValType::I32);
+                let src_get = || {
+                    CHIRExpr::new(CHIRExprKind::Local(src_local), Type::Int32, ValType::I32)
+                };
+                let payload_wasm = match payload_ty {
+                    Type::Unit | Type::Nothing => ValType::I32,
+                    t => t.to_wasm(),
+                };
+                let payload_align: u32 =
+                    if payload_wasm == ValType::I64 || payload_wasm == ValType::F64 { 3 } else { 2 };
+                let payload_load = CHIRExpr::new(
+                    CHIRExprKind::Load {
+                        ptr: Box::new(src_get()),
+                        offset: 4,
+                        align: payload_align,
+                    },
+                    payload_ty.clone(),
+                    payload_wasm,
+                );
+                let cond = CHIRExpr::new(
+                    CHIRExprKind::Binary {
+                        op: crate::ast::BinOp::Eq,
+                        left: Box::new(CHIRExpr::new(
+                            CHIRExprKind::Load {
+                                ptr: Box::new(src_get()),
+                                offset: 0,
+                                align: 2,
+                            },
+                            Type::Int32,
+                            ValType::I32,
+                        )),
+                        right: Box::new(CHIRExpr::new(
+                            CHIRExprKind::Integer(1),
+                            Type::Int32,
+                            ValType::I32,
+                        )),
+                    },
+                    Type::Bool,
+                    ValType::I32,
+                );
+                let then_block = crate::chir::CHIRBlock {
+                    stmts: vec![],
+                    result: Some(Box::new(payload_load)),
+                };
+                let else_block = crate::chir::CHIRBlock {
+                    stmts: vec![],
+                    result: Some(Box::new(CHIRExpr::new(
+                        CHIRExprKind::Unreachable,
+                        payload_ty.clone(),
+                        payload_wasm,
+                    ))),
+                };
+                Ok(Some(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock {
+                        stmts: vec![crate::chir::CHIRStmt::Let { local_idx: src_local, value: obj }],
+                        result: Some(Box::new(CHIRExpr::new(
+                            CHIRExprKind::If {
+                                cond: Box::new(cond),
+                                then_block,
+                                else_block: Some(else_block),
+                            },
+                            payload_ty.clone(),
+                            payload_wasm,
+                        ))),
+                    }),
+                    payload_ty.clone(),
+                    payload_wasm,
+                )))
+            }
+            // map(λ)：Some(v) → Some(λ(v))；None → None（λ 不调用）
+            "map" if args.len() == 1 => {
+                let opt = self.lower_expr(object)?;
+                let opt = self.insert_cast_if_needed(opt, ValType::I32);
+                let opt_local = self.alloc_local_typed("__opt_map_src".into(), ValType::I32);
+                let lambda_chir = self.lower_expr(&args[0])?;
+
+                // λ 形参/返回类型：镜像 emit_lambda_function 的默认规则
+                // （未注解形参默认 Int64；返回类型缺省取首个形参类型）。
+                let (lam_param_ty, lam_ret_ty) = match &args[0] {
+                    Expr::Lambda { params, return_type, .. } => {
+                        let p = params.first().map(|(_, t)| t.clone()).unwrap_or(Type::Int64);
+                        let r = return_type
+                            .clone()
+                            .or_else(|| params.first().map(|(_, t)| t.clone()))
+                            .unwrap_or(Type::Int64);
+                        (p, r)
+                    }
+                    _ => (payload_ty.clone(), payload_ty.clone()),
+                };
+                let lam_param_wasm = lam_param_ty.to_wasm();
+                let lam_ret_wasm = match &lam_ret_ty {
+                    Type::Unit | Type::Nothing => ValType::I32,
+                    t => t.to_wasm(),
+                };
+                let ret_wide = lam_ret_wasm == ValType::I64 || lam_ret_wasm == ValType::F64;
+                let ret_align: u32 = if ret_wide { 3 } else { 2 };
+                let total_size: i64 = 4 + if ret_wide { 8 } else { 4 };
+
+                let res_local = self.alloc_local_typed("__opt_map_dst".into(), ValType::I32);
+                let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
+
+                let src_get = || {
+                    CHIRExpr::new(CHIRExprKind::Local(opt_local), Type::Int32, ValType::I32)
+                };
+                let dst_get = || {
+                    CHIRExpr::new(CHIRExprKind::Local(res_local), Type::Int32, ValType::I32)
+                };
+
+                // 载荷读取：按 Option 载荷的 wasm 宽度（与 Some(v) 存储步长一致）
+                let payload_wasm = match payload_ty {
+                    Type::Unit | Type::Nothing => ValType::I32,
+                    t => t.to_wasm(),
+                };
+                let payload_align: u32 =
+                    if payload_wasm == ValType::I64 || payload_wasm == ValType::F64 { 3 } else { 2 };
+                let payload_load = CHIRExpr::new(
+                    CHIRExprKind::Load {
+                        ptr: Box::new(src_get()),
+                        offset: 4,
+                        align: payload_align,
+                    },
+                    payload_ty.clone(),
+                    payload_wasm,
+                );
+                let payload_arg = self.insert_cast_if_needed(payload_load, lam_param_wasm);
+                let call = CHIRExpr::new(
+                    CHIRExprKind::CallIndirect {
+                        type_idx: 0,
+                        args: vec![payload_arg],
+                        callee: Box::new(lambda_chir),
+                    },
+                    lam_ret_ty.clone(),
+                    lam_ret_wasm,
+                );
+
+                let cond = CHIRExpr::new(
+                    CHIRExprKind::Binary {
+                        op: crate::ast::BinOp::Eq,
+                        left: Box::new(CHIRExpr::new(
+                            CHIRExprKind::Load {
+                                ptr: Box::new(src_get()),
+                                offset: 0,
+                                align: 2,
+                            },
+                            Type::Int32,
+                            ValType::I32,
+                        )),
+                        right: Box::new(CHIRExpr::new(
+                            CHIRExprKind::Integer(1),
+                            Type::Int32,
+                            ValType::I32,
+                        )),
+                    },
+                    Type::Bool,
+                    ValType::I32,
+                );
+                let then_block = crate::chir::CHIRBlock {
+                    stmts: vec![
+                        crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                            CHIRExprKind::Store {
+                                ptr: Box::new(dst_get()),
+                                value: Box::new(CHIRExpr::new(
+                                    CHIRExprKind::Integer(1),
+                                    Type::Int32,
+                                    ValType::I32,
+                                )),
+                                offset: 0,
+                                align: 2,
+                            },
+                            Type::Unit,
+                            ValType::I32,
+                        )),
+                        crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                            CHIRExprKind::Store {
+                                ptr: Box::new(dst_get()),
+                                value: Box::new(call),
+                                offset: 4,
+                                align: ret_align,
+                            },
+                            Type::Unit,
+                            ValType::I32,
+                        )),
+                    ],
+                    result: None,
+                };
+                let stmts = vec![
+                    crate::chir::CHIRStmt::Let { local_idx: opt_local, value: opt },
+                    crate::chir::CHIRStmt::Let {
+                        local_idx: res_local,
+                        value: CHIRExpr::new(
+                            CHIRExprKind::Call {
+                                func_idx: alloc_idx,
+                                args: vec![CHIRExpr::new(
+                                    CHIRExprKind::Integer(total_size),
+                                    Type::Int32,
+                                    ValType::I32,
+                                )],
+                            },
+                            Type::Int32,
+                            ValType::I32,
+                        ),
+                    },
+                    // 默认 None：先写 tag=0；Some 分支再覆盖为 tag=1 + 值
+                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::Store {
+                            ptr: Box::new(dst_get()),
+                            value: Box::new(CHIRExpr::new(
+                                CHIRExprKind::Integer(0),
+                                Type::Int32,
+                                ValType::I32,
+                            )),
+                            offset: 0,
+                            align: 2,
+                        },
+                        Type::Unit,
+                        ValType::I32,
+                    )),
+                    crate::chir::CHIRStmt::Expr(CHIRExpr::new(
+                        CHIRExprKind::If {
+                            cond: Box::new(cond),
+                            then_block,
+                            else_block: None,
+                        },
+                        Type::Unit,
+                        ValType::I32,
+                    )),
+                ];
+                Ok(Some(CHIRExpr::new(
+                    CHIRExprKind::Block(crate::chir::CHIRBlock {
+                        stmts,
+                        result: Some(Box::new(dst_get())),
+                    }),
+                    Type::Option(Box::new(lam_ret_ty)),
+                    ValType::I32,
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// w54c: 整数类型静态常量 `Type.Max` / `Type.Min`（cjc 编译期常量）。
+    /// 仅当 object 是基础整数类型名时匹配；否则返回 None 交给常规字段访问。
+    fn try_lower_int_static_const(
+        type_name: &str,
+        field: &str,
+    ) -> Option<CHIRExpr> {
+        use crate::ast::Type;
+        let (min_v, max_v, ty) = match type_name {
+            "Int8" => (i8::MIN as i64, i8::MAX as i64, Type::Int8),
+            "Int16" => (i16::MIN as i64, i16::MAX as i64, Type::Int16),
+            "Int32" => (i32::MIN as i64, i32::MAX as i64, Type::Int32),
+            "Int64" => (i64::MIN, i64::MAX, Type::Int64),
+            "IntNative" => (i64::MIN, i64::MAX, Type::IntNative),
+            "UInt8" => (0, u8::MAX as i64, Type::UInt8),
+            "UInt16" => (0, u16::MAX as i64, Type::UInt16),
+            "UInt32" => (0, u32::MAX as i64, Type::UInt32),
+            // u64::MAX as i64 == -1，位模式正确；打印走无符号路径
+            "UInt64" => (0, u64::MAX as i64, Type::UInt64),
+            "UIntNative" => (0, u64::MAX as i64, Type::UIntNative),
+            _ => return None,
+        };
+        let v = match field {
+            "Max" => max_v,
+            "Min" => min_v,
+            _ => return None,
+        };
+        let wasm = ty.to_wasm();
+        Some(CHIRExpr::new(CHIRExprKind::Integer(v), ty, wasm))
+    }
+
     pub fn lower_expr_to_block(&mut self, expr: &Expr) -> Result<CHIRBlock, String> {
         // Block 表达式直接转换为 CHIRBlock（保留语句）
         if let Expr::Block(stmts, block_result) = expr {
@@ -4582,6 +5599,129 @@ mod tests {
             CHIRExprKind::Call { args, .. } => assert_eq!(args.len(), 3),
             other => panic!("期望 __str_index_of 调用，实际 {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_lower_array_index_of_returns_option() {
+        // w54a: Array.indexOf 降为 __arr_index_of(arr, needle, elem_size, kind)，
+        // 返回 Option<Int64>（wasm_ty = I32）。
+        let type_ctx = TypeInferenceContext::new();
+        let mut fi = HashMap::new();
+        fi.insert("__arr_index_of".to_string(), 70u32);
+        let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::Array(vec![Expr::Integer(10), Expr::Integer(20)])),
+            method: "indexOf".into(),
+            args: vec![Expr::Integer(20)],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert_eq!(chir.ty, Type::Option(Box::new(Type::Int64)));
+        assert_eq!(chir.wasm_ty, ValType::I32);
+        match chir.kind {
+            CHIRExprKind::Call { func_idx, args } => {
+                assert_eq!(func_idx, 70);
+                assert_eq!(args.len(), 4);
+                // Int64 元素：kind=0、槽宽 8
+                assert!(matches!(args[2].kind, CHIRExprKind::Integer(8)));
+                assert!(matches!(args[3].kind, CHIRExprKind::Integer(0)));
+            }
+            other => panic!("期望 __arr_index_of 调用，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lower_array_contains_reads_option_tag() {
+        // w54a: contains 复用查找助手，结果 = (Option.tag == 1)。
+        let type_ctx = TypeInferenceContext::new();
+        let mut fi = HashMap::new();
+        fi.insert("__arr_index_of".to_string(), 70u32);
+        let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::Array(vec![Expr::Integer(1)])),
+            method: "contains".into(),
+            args: vec![Expr::Integer(1)],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert_eq!(chir.ty, Type::Bool);
+        match chir.kind {
+            CHIRExprKind::Binary { op: crate::ast::BinOp::Eq, left, .. } => {
+                assert!(matches!(left.kind, CHIRExprKind::Load { .. }));
+                match &left.kind {
+                    CHIRExprKind::Load { ptr, .. } => {
+                        assert!(matches!(ptr.kind, CHIRExprKind::Call { func_idx: 70, .. }));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            other => panic!("期望 tag == 1 比较，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lower_array_slice_length_semantics() {
+        // w54a: slice(start, length) 按长度调用 __arr_slice(arr, start, len, elem_size)。
+        let type_ctx = TypeInferenceContext::new();
+        let mut fi = HashMap::new();
+        fi.insert("__arr_slice".to_string(), 72u32);
+        let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::MethodCall {
+            object: Box::new(Expr::Array(vec![Expr::Integer(0), Expr::Integer(1), Expr::Integer(2)])),
+            method: "slice".into(),
+            args: vec![Expr::Integer(1), Expr::Integer(2)],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert_eq!(chir.ty, Type::Array(Box::new(Type::Int64)));
+        match chir.kind {
+            CHIRExprKind::Call { func_idx, args } => {
+                assert_eq!(func_idx, 72);
+                assert_eq!(args.len(), 4);
+                assert!(matches!(args[3].kind, CHIRExprKind::Integer(8)));
+            }
+            other => panic!("期望 __arr_slice 调用，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lower_option_is_some_reads_tag() {
+        // w54a: `Option.isSome()` → 读盒 tag == 1；isNone → tag != 1。
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let some_call = |method: &str| Expr::MethodCall {
+            object: Box::new(Expr::Some(Box::new(Expr::Integer(1)))),
+            method: method.into(),
+            args: vec![],
+            type_args: None,
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&some_call("isSome")).unwrap();
+        assert_eq!(chir.ty, Type::Bool);
+        assert!(matches!(
+            chir.kind,
+            CHIRExprKind::Binary { op: crate::ast::BinOp::Eq, .. }
+        ));
+        let chir = ctx.lower_expr(&some_call("isNone")).unwrap();
+        assert!(matches!(
+            chir.kind,
+            CHIRExprKind::Binary { op: crate::ast::BinOp::NotEq, .. }
+        ));
     }
 
     #[test]
@@ -5269,5 +6409,142 @@ mod tests {
             assert!(matches!(left.kind, CHIRExprKind::Binary { .. }));
             assert!(matches!(right.kind, CHIRExprKind::Integer(4)));
         }
+    }
+
+    // ───── w54c: Option 谓词/map、整数类型常量、round/pow ─────
+
+    #[test]
+    fn test_lower_int_static_constants() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let field = |ty: &str, f: &str| Expr::Field {
+            object: Box::new(Expr::Var(ty.into())),
+            field: f.into(),
+        };
+
+        let max = ctx.lower_expr(&field("Int64", "Max")).unwrap();
+        assert!(matches!(max.kind, CHIRExprKind::Integer(v) if v == i64::MAX));
+        assert_eq!(max.wasm_ty, ValType::I64);
+        assert!(matches!(max.ty, Type::Int64));
+
+        let min = ctx.lower_expr(&field("Int64", "Min")).unwrap();
+        assert!(matches!(min.kind, CHIRExprKind::Integer(v) if v == i64::MIN));
+
+        let i8max = ctx.lower_expr(&field("Int8", "Max")).unwrap();
+        assert!(matches!(i8max.kind, CHIRExprKind::Integer(127)));
+        assert_eq!(i8max.wasm_ty, ValType::I32);
+        assert!(matches!(i8max.ty, Type::Int8));
+
+        // UInt32.Max 的位模式在 i32 中为 -1，但 AST 类型须为 UInt32（打印走零扩展）
+        let u32max = ctx.lower_expr(&field("UInt32", "Max")).unwrap();
+        assert!(matches!(u32max.kind, CHIRExprKind::Integer(v) if v == u32::MAX as i64));
+        assert!(matches!(u32max.ty, Type::UInt32));
+
+        // UInt64.Max 位模式为 i64 -1，AST 类型 UInt64（打印走无符号路径）
+        let u64max = ctx.lower_expr(&field("UInt64", "Max")).unwrap();
+        assert!(matches!(u64max.kind, CHIRExprKind::Integer(v) if v == -1i64));
+        assert!(matches!(u64max.ty, Type::UInt64));
+        assert_eq!(u64max.wasm_ty, ValType::I64);
+    }
+
+    #[test]
+    fn test_lower_option_is_some_is_none() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let some = || Box::new(Expr::Some(Box::new(Expr::Integer(42))));
+        let is_some = Expr::MethodCall {
+            object: some(),
+            method: "isSome".into(),
+            args: vec![],
+            named_args: vec![],
+            type_args: None,
+        };
+        let chir = ctx.lower_expr(&is_some).unwrap();
+        assert!(matches!(chir.ty, Type::Bool));
+        assert_eq!(chir.wasm_ty, ValType::I32);
+        assert!(matches!(&chir.kind, CHIRExprKind::Binary { op: BinOp::Eq, .. }));
+
+        let is_none = Expr::MethodCall {
+            object: some(),
+            method: "isNone".into(),
+            args: vec![],
+            named_args: vec![],
+            type_args: None,
+        };
+        let chir = ctx.lower_expr(&is_none).unwrap();
+        assert!(matches!(chir.ty, Type::Bool));
+        assert!(matches!(&chir.kind, CHIRExprKind::Binary { op: BinOp::NotEq, .. }));
+    }
+
+    #[test]
+    fn test_lower_option_map_wraps_and_calls_lambda() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let lambda = Expr::Lambda {
+            params: vec![("x".into(), Type::Int64)],
+            param_annotated: vec![false],
+            return_type: None,
+            body: Box::new(Expr::Binary {
+                op: BinOp::Mul,
+                left: Box::new(Expr::Var("x".into())),
+                right: Box::new(Expr::Integer(2)),
+            }),
+        };
+        let map = Expr::MethodCall {
+            object: Box::new(Expr::Some(Box::new(Expr::Integer(42)))),
+            method: "map".into(),
+            args: vec![lambda],
+            named_args: vec![],
+            type_args: None,
+        };
+        let chir = ctx.lower_expr(&map).unwrap();
+        // map 返回 Option<Int64>（λ 返回类型为 Int64）
+        assert!(matches!(&chir.ty, Type::Option(inner) if matches!(**inner, Type::Int64)));
+        assert_eq!(chir.wasm_ty, ValType::I32);
+        match &chir.kind {
+            CHIRExprKind::Block(b) => {
+                // let src; let dst=alloc; store tag=0; if(tag==1){...}
+                assert!(b.stmts.len() >= 3);
+                assert!(b.result.is_some());
+            }
+            _ => panic!("expected Block for Option.map"),
+        }
+    }
+
+    #[test]
+    fn test_lower_round_and_pow_builtins() {
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let round = Expr::Call {
+            name: "round".into(),
+            type_args: None,
+            args: vec![Expr::Float(2.5)],
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&round).unwrap();
+        assert_eq!(chir.wasm_ty, ValType::F64);
+        assert!(matches!(&chir.kind, CHIRExprKind::MathUnary { op, .. } if op == "round"));
+
+        let pow = Expr::Call {
+            name: "pow".into(),
+            type_args: None,
+            args: vec![Expr::Float(2.0), Expr::Float(10.0)],
+            named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&pow).unwrap();
+        assert_eq!(chir.wasm_ty, ValType::F64);
+        assert!(matches!(&chir.kind, CHIRExprKind::MathBinary { op, .. } if op == "pow"));
     }
 }

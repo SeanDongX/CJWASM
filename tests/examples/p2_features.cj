@@ -134,8 +134,8 @@ func testArrayMethods(): Int64 {
     result = result + cloned[4]   // +50
     result = result + cloned.size // +5
 
-    // slice(start, end)
-    let sliced = arr.slice(1, 4)  // [20, 30, 40]
+    // slice(start, length)  — cjc 第二参数是长度
+    let sliced = arr.slice(1, 3)  // [20, 30, 40]
     result = result + sliced.size   // +3
     result = result + sliced[0]     // +20
     result = result + sliced[1]     // +30

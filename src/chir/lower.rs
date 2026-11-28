@@ -189,8 +189,11 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
     {
         let funcs_snapshot: Vec<&Function> = all_funcs.clone();
         for func in &funcs_snapshot {
+            // w54d：每个函数用独立的外层局部类型作用域做 λ 捕获分析。
+            let mut fctx = type_ctx.clone();
+            fctx.collect_locals_from_function(func);
             for stmt in &func.body {
-                collect_lambdas_from_stmt(stmt, &mut lambda_counter, &mut lambda_funcs);
+                collect_lambdas_from_stmt(stmt, &mut lambda_counter, &mut lambda_funcs, &fctx);
             }
         }
     }
@@ -236,6 +239,8 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         "__arr_set_i32", "__arr_set_i64", "__arr_set_f64",
         // w52b: String API 余项（必须与 chir_codegen.rs 的 RT_NAMES 尾部一致）
         "__str_index_of_byte", "__str_last_index_of", "__str_last_index_of_byte",
+        // w54a: Array API 余项（必须与 chir_codegen.rs 的 RT_NAMES 尾部一致）
+        "__arr_index_of", "__arr_index_of_f", "__arr_slice", "__arr_concat",
     ];
     for (i, name) in rt_names.iter().enumerate() {
         func_indices.insert(name.to_string(), rt_base + i as u32);
@@ -420,7 +425,7 @@ pub fn lower_program(program: &Program) -> Result<CHIRProgram, String> {
         let mut cnt = 0u32;
         let mut dummy = Vec::new();
         for stmt in &func.body {
-            collect_lambdas_from_stmt(stmt, &mut cnt, &mut dummy);
+            collect_lambdas_from_stmt(stmt, &mut cnt, &mut dummy, &type_ctx);
         }
         lambda_counts.push(cnt);
     }
@@ -509,48 +514,385 @@ fn collect_local_funcs_from_stmts(stmts: &[crate::ast::Stmt], out: &mut Vec<Func
     }
 }
 
-fn collect_lambdas_from_stmt(stmt: &crate::ast::Stmt, counter: &mut u32, out: &mut Vec<Function>) {
-    use crate::ast::{Stmt, Expr};
+fn collect_lambdas_from_stmt(
+    stmt: &crate::ast::Stmt,
+    counter: &mut u32,
+    out: &mut Vec<Function>,
+    ctx: &TypeInferenceContext,
+) {
+    use crate::ast::Stmt;
     match stmt {
         Stmt::Let { value, .. } | Stmt::Var { value, .. } => {
-            collect_lambdas_from_expr(value, counter, out);
+            collect_lambdas_from_expr(value, counter, out, ctx);
         }
         Stmt::Assign { value, .. } => {
-            collect_lambdas_from_expr(value, counter, out);
+            collect_lambdas_from_expr(value, counter, out, ctx);
         }
-        Stmt::Expr(e) => collect_lambdas_from_expr(e, counter, out),
-        Stmt::Return(Some(e)) => collect_lambdas_from_expr(e, counter, out),
+        Stmt::Expr(e) => collect_lambdas_from_expr(e, counter, out, ctx),
+        Stmt::Return(Some(e)) => collect_lambdas_from_expr(e, counter, out, ctx),
         Stmt::While { cond, body, .. } => {
-            collect_lambdas_from_expr(cond, counter, out);
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            collect_lambdas_from_expr(cond, counter, out, ctx);
+            for s in body { collect_lambdas_from_stmt(s, counter, out, ctx); }
         }
         Stmt::DoWhile { body, cond } => {
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
-            collect_lambdas_from_expr(cond, counter, out);
+            for s in body { collect_lambdas_from_stmt(s, counter, out, ctx); }
+            collect_lambdas_from_expr(cond, counter, out, ctx);
         }
         Stmt::For { iterable, body, .. } => {
-            collect_lambdas_from_expr(iterable, counter, out);
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            collect_lambdas_from_expr(iterable, counter, out, ctx);
+            for s in body { collect_lambdas_from_stmt(s, counter, out, ctx); }
         }
         Stmt::Loop { body, .. } => {
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            for s in body { collect_lambdas_from_stmt(s, counter, out, ctx); }
         }
         Stmt::UnsafeBlock { body } => {
-            for s in body { collect_lambdas_from_stmt(s, counter, out); }
+            for s in body { collect_lambdas_from_stmt(s, counter, out, ctx); }
         }
         Stmt::Const { value, .. } => {
-            collect_lambdas_from_expr(value, counter, out);
+            collect_lambdas_from_expr(value, counter, out, ctx);
         }
         _ => {}
+    }
+}
+
+// ─── w54d：λ 捕获分析 ──────────────────────────────────────────────────────
+//
+// 闭包捕获的实现方式：生成 `__lambda_N` 顶层函数时，把被捕获的外层局部变量作为
+// **前置形参**加入函数签名（捕获名与原局部同名，lambda 体内同名 Var 自然解析为
+// 该形参）；lambda 表达式求值处分配闭包对象 `[fn_idx:i32][pad][cap0][cap1]...`，
+// 把捕获值复制进去；直接调用点 `f(5)` 先从闭包对象取出捕获值压栈、再从 offset 0
+// 取出函数表索引做 call_indirect。无捕获的 λ 保持原有的“裸表索引”表示，零开销。
+//
+// 捕获判定是纯语法自由变量分析（不依赖外层作用域的具体值），类型由外层
+// TypeInferenceContext.locals 解析；无法解析的名字（函数名/全局常量）不捕获。
+
+/// 收集 lambda 需捕获的外层局部变量（名字, 类型），按首次引用顺序。
+pub(crate) fn lambda_captures(
+    params: &[(String, Type)],
+    body: &crate::ast::Expr,
+    locals: &HashMap<String, Type>,
+) -> Vec<(String, Type)> {
+    let mut bound: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+    collect_bound_names_expr(body, &mut bound);
+    let mut used: Vec<String> = Vec::new();
+    collect_used_vars_expr(body, &mut used);
+    let mut caps: Vec<(String, Type)> = Vec::new();
+    for name in used {
+        if bound.iter().any(|b| b == &name) {
+            continue;
+        }
+        if caps.iter().any(|(n, _)| n == &name) {
+            continue;
+        }
+        if let Some(ty) = locals.get(&name) {
+            caps.push((name, ty.clone()));
+        }
+    }
+    caps
+}
+
+fn collect_pattern_bound_names(pat: &crate::ast::Pattern, bound: &mut Vec<String>) {
+    use crate::ast::Pattern;
+    match pat {
+        Pattern::Binding(n) => bound.push(n.clone()),
+        Pattern::Tuple(ps) | Pattern::Or(ps) => {
+            for p in ps { collect_pattern_bound_names(p, bound); }
+        }
+        Pattern::Struct { fields, .. } => {
+            for (_, p) in fields { collect_pattern_bound_names(p, bound); }
+        }
+        Pattern::Variant { payload: Some(p), .. } => collect_pattern_bound_names(p, bound),
+        Pattern::TypeTest { binding, .. } => bound.push(binding.clone()),
+        _ => {}
+    }
+}
+
+fn collect_bound_names_stmt(stmt: &crate::ast::Stmt, bound: &mut Vec<String>) {
+    use crate::ast::Stmt;
+    match stmt {
+        Stmt::Let { pattern, value, .. } | Stmt::Var { pattern, value, .. } => {
+            collect_pattern_bound_names(pattern, bound);
+            collect_bound_names_expr(value, bound);
+        }
+        Stmt::Const { name, value, .. } => {
+            bound.push(name.clone());
+            collect_bound_names_expr(value, bound);
+        }
+        Stmt::Assign { value, .. } | Stmt::Expr(value) | Stmt::Return(Some(value)) => {
+            collect_bound_names_expr(value, bound);
+        }
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
+        Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
+            collect_bound_names_expr(cond, bound);
+            for s in body { collect_bound_names_stmt(s, bound); }
+        }
+        Stmt::WhileLet { pattern, expr, body } => {
+            collect_pattern_bound_names(pattern, bound);
+            collect_bound_names_expr(expr, bound);
+            for s in body { collect_bound_names_stmt(s, bound); }
+        }
+        Stmt::For { var, iterable, body } => {
+            bound.push(var.clone());
+            collect_bound_names_expr(iterable, bound);
+            for s in body { collect_bound_names_stmt(s, bound); }
+        }
+        Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+            for s in body { collect_bound_names_stmt(s, bound); }
+        }
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            collect_bound_names_expr(left, bound);
+            collect_bound_names_expr(right, bound);
+        }
+        Stmt::LocalFunc(f) => {
+            bound.push(f.name.clone());
+            for s in &f.body { collect_bound_names_stmt(s, bound); }
+        }
+    }
+}
+
+fn collect_bound_names_expr(expr: &crate::ast::Expr, bound: &mut Vec<String>) {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Block(stmts, result) => {
+            for s in stmts { collect_bound_names_stmt(s, bound); }
+            if let Some(e) = result { collect_bound_names_expr(e, bound); }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            collect_bound_names_expr(cond, bound);
+            collect_bound_names_expr(then_branch, bound);
+            if let Some(e) = else_branch { collect_bound_names_expr(e, bound); }
+        }
+        Expr::IfLet { pattern, expr, then_branch, else_branch } => {
+            collect_bound_names_expr(expr, bound);
+            collect_pattern_bound_names(pattern, bound);
+            collect_bound_names_expr(then_branch, bound);
+            if let Some(e) = else_branch { collect_bound_names_expr(e, bound); }
+        }
+        Expr::Match { expr, arms } => {
+            collect_bound_names_expr(expr, bound);
+            for arm in arms {
+                collect_pattern_bound_names(&arm.pattern, bound);
+                if let Some(g) = &arm.guard { collect_bound_names_expr(g, bound); }
+                collect_bound_names_expr(&arm.body, bound);
+            }
+        }
+        Expr::Lambda { params, body, .. } => {
+            for (n, _) in params { bound.push(n.clone()); }
+            collect_bound_names_expr(body, bound);
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_bound_names_expr(left, bound);
+            collect_bound_names_expr(right, bound);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Inout(expr)
+        | Expr::Some(expr) | Expr::Ok(expr) | Expr::Err(expr) | Expr::Throw(expr)
+        | Expr::Try(expr) | Expr::IsType { expr, .. } | Expr::PostfixIncr(expr)
+        | Expr::PostfixDecr(expr) | Expr::PrefixIncr(expr) | Expr::PrefixDecr(expr)
+        | Expr::Field { object: expr, .. } | Expr::TupleIndex { object: expr, .. }
+        | Expr::OptionalChain { object: expr, .. } => collect_bound_names_expr(expr, bound),
+        Expr::Call { args, named_args, .. } | Expr::Invoke { args, named_args, callee: _ } => {
+            for a in args { collect_bound_names_expr(a, bound); }
+            for (_, a) in named_args { collect_bound_names_expr(a, bound); }
+        }
+        Expr::MethodCall { object, args, named_args, .. } => {
+            collect_bound_names_expr(object, bound);
+            for a in args { collect_bound_names_expr(a, bound); }
+            for (_, a) in named_args { collect_bound_names_expr(a, bound); }
+        }
+        Expr::TrailingClosure { callee, args, closure } => {
+            collect_bound_names_expr(callee, bound);
+            for a in args { collect_bound_names_expr(a, bound); }
+            collect_bound_names_expr(closure, bound);
+        }
+        Expr::Tuple(es) | Expr::Array(es) => {
+            for e in es { collect_bound_names_expr(e, bound); }
+        }
+        Expr::Index { array, index } => {
+            collect_bound_names_expr(array, bound);
+            collect_bound_names_expr(index, bound);
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields { collect_bound_names_expr(e, bound); }
+        }
+        Expr::ConstructorCall { args, named_args, .. } => {
+            for a in args { collect_bound_names_expr(a, bound); }
+            for (_, a) in named_args { collect_bound_names_expr(a, bound); }
+        }
+        Expr::Range { start, end, step, .. } => {
+            collect_bound_names_expr(start, bound);
+            collect_bound_names_expr(end, bound);
+            if let Some(s) = step { collect_bound_names_expr(s, bound); }
+        }
+        Expr::VariantConst { arg: Some(a), .. } => collect_bound_names_expr(a, bound),
+        Expr::NullCoalesce { option, default } => {
+            collect_bound_names_expr(option, bound);
+            collect_bound_names_expr(default, bound);
+        }
+        Expr::TryBlock { body, catch_var, catch_body, finally_body, .. } => {
+            for s in body { collect_bound_names_stmt(s, bound); }
+            if let Some(cv) = catch_var { bound.push(cv.clone()); }
+            for s in catch_body { collect_bound_names_stmt(s, bound); }
+            if let Some(fin) = finally_body {
+                for s in fin { collect_bound_names_stmt(s, bound); }
+            }
+        }
+        Expr::SliceExpr { array, start, end } => {
+            collect_bound_names_expr(array, bound);
+            collect_bound_names_expr(start, bound);
+            collect_bound_names_expr(end, bound);
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                collect_bound_names_expr(k, bound);
+                collect_bound_names_expr(v, bound);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_used_vars_expr(expr: &crate::ast::Expr, out: &mut Vec<String>) {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Var(name) => {
+            if !out.iter().any(|n| n == name) {
+                out.push(name.clone());
+            }
+        }
+        Expr::Inout(e) | Expr::Unary { expr: e, .. } | Expr::Cast { expr: e, .. }
+        | Expr::Some(e) | Expr::Ok(e) | Expr::Err(e) | Expr::Throw(e) | Expr::Try(e)
+        | Expr::IsType { expr: e, .. } | Expr::PostfixIncr(e) | Expr::PostfixDecr(e)
+        | Expr::PrefixIncr(e) | Expr::PrefixDecr(e)
+        | Expr::Field { object: e, .. } | Expr::TupleIndex { object: e, .. }
+        | Expr::OptionalChain { object: e, .. } => collect_used_vars_expr(e, out),
+        Expr::Binary { left, right, .. } => {
+            collect_used_vars_expr(left, out);
+            collect_used_vars_expr(right, out);
+        }
+        Expr::Call { args, named_args, .. } | Expr::Invoke { args, named_args, .. } => {
+            for a in args { collect_used_vars_expr(a, out); }
+            for (_, a) in named_args { collect_used_vars_expr(a, out); }
+        }
+        Expr::MethodCall { object, args, named_args, .. } => {
+            collect_used_vars_expr(object, out);
+            for a in args { collect_used_vars_expr(a, out); }
+            for (_, a) in named_args { collect_used_vars_expr(a, out); }
+        }
+        Expr::If { cond, then_branch, else_branch } => {
+            collect_used_vars_expr(cond, out);
+            collect_used_vars_expr(then_branch, out);
+            if let Some(e) = else_branch { collect_used_vars_expr(e, out); }
+        }
+        Expr::IfLet { expr, then_branch, else_branch, .. } => {
+            collect_used_vars_expr(expr, out);
+            collect_used_vars_expr(then_branch, out);
+            if let Some(e) = else_branch { collect_used_vars_expr(e, out); }
+        }
+        Expr::Block(stmts, result) => {
+            for s in stmts { collect_used_vars_stmt(s, out); }
+            if let Some(e) = result { collect_used_vars_expr(e, out); }
+        }
+        Expr::Tuple(es) | Expr::Array(es) => {
+            for e in es { collect_used_vars_expr(e, out); }
+        }
+        Expr::Index { array, index } => {
+            collect_used_vars_expr(array, out);
+            collect_used_vars_expr(index, out);
+        }
+        Expr::StructInit { fields, .. } => {
+            for (_, e) in fields { collect_used_vars_expr(e, out); }
+        }
+        Expr::ConstructorCall { args, named_args, .. } => {
+            for a in args { collect_used_vars_expr(a, out); }
+            for (_, a) in named_args { collect_used_vars_expr(a, out); }
+        }
+        Expr::Range { start, end, step, .. } => {
+            collect_used_vars_expr(start, out);
+            collect_used_vars_expr(end, out);
+            if let Some(s) = step { collect_used_vars_expr(s, out); }
+        }
+        Expr::VariantConst { arg: Some(a), .. } => collect_used_vars_expr(a, out),
+        Expr::Match { expr, arms } => {
+            collect_used_vars_expr(expr, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard { collect_used_vars_expr(g, out); }
+                collect_used_vars_expr(&arm.body, out);
+            }
+        }
+        Expr::Lambda { body, .. } => collect_used_vars_expr(body, out),
+        Expr::NullCoalesce { option, default } => {
+            collect_used_vars_expr(option, out);
+            collect_used_vars_expr(default, out);
+        }
+        Expr::TryBlock { resources, body, catch_body, finally_body, .. } => {
+            for (_, e) in resources { collect_used_vars_expr(e, out); }
+            for s in body { collect_used_vars_stmt(s, out); }
+            for s in catch_body { collect_used_vars_stmt(s, out); }
+            if let Some(fin) = finally_body {
+                for s in fin { collect_used_vars_stmt(s, out); }
+            }
+        }
+        Expr::SliceExpr { array, start, end } => {
+            collect_used_vars_expr(array, out);
+            collect_used_vars_expr(start, out);
+            collect_used_vars_expr(end, out);
+        }
+        Expr::TrailingClosure { callee, args, closure } => {
+            collect_used_vars_expr(callee, out);
+            for a in args { collect_used_vars_expr(a, out); }
+            collect_used_vars_expr(closure, out);
+        }
+        Expr::MapLiteral { entries } => {
+            for (k, v) in entries {
+                collect_used_vars_expr(k, out);
+                collect_used_vars_expr(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_used_vars_stmt(stmt: &crate::ast::Stmt, out: &mut Vec<String>) {
+    use crate::ast::Stmt;
+    match stmt {
+        Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Const { value, .. }
+        | Stmt::Assign { value, .. } | Stmt::Expr(value) | Stmt::Return(Some(value)) => {
+            collect_used_vars_expr(value, out);
+        }
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
+        Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
+            collect_used_vars_expr(cond, out);
+            for s in body { collect_used_vars_stmt(s, out); }
+        }
+        Stmt::WhileLet { expr, body, .. } => {
+            collect_used_vars_expr(expr, out);
+            for s in body { collect_used_vars_stmt(s, out); }
+        }
+        Stmt::For { iterable, body, .. } => {
+            collect_used_vars_expr(iterable, out);
+            for s in body { collect_used_vars_stmt(s, out); }
+        }
+        Stmt::Loop { body } | Stmt::UnsafeBlock { body } => {
+            for s in body { collect_used_vars_stmt(s, out); }
+        }
+        Stmt::Assert { left, right, .. } | Stmt::Expect { left, right, .. } => {
+            collect_used_vars_expr(left, out);
+            collect_used_vars_expr(right, out);
+        }
+        Stmt::LocalFunc(f) => {
+            for s in &f.body { collect_used_vars_stmt(s, out); }
+        }
     }
 }
 
 /// 生成一个 `__lambda_N` 顶层函数（按收集顺序编号，与 lower_expr 的 lambda_counter 一致）。
 ///
 /// `ret_override` 是上下文期望的返回类型（如 `Array<T>(n, {λ})` 的元素类型 T）。
-/// 返回类型推断优先级：显式标注 > 上下文期望 > 参数类型 > Int64。
+/// 返回类型推断优先级：显式标注 > 上下文期望 > body 推断（与调用点一致）> 参数类型 > Int64。
 /// 未注解形参的 `Type` 只是占位，实际类型由上下文函数类型给出（此处 Array 构造为
 /// `(Int64) -> T`，故形参保持 Int64 占位即可）。
+///
+/// w54d：捕获的自由局部变量作为前置形参加入签名（见 `lambda_captures`）。
 fn emit_lambda_function(
     params: &[(String, Type)],
     body: &crate::ast::Expr,
@@ -558,23 +900,54 @@ fn emit_lambda_function(
     ret_override: Option<Type>,
     counter: &mut u32,
     out: &mut Vec<Function>,
+    ctx: &TypeInferenceContext,
 ) {
     use crate::ast::{Param, Visibility};
     let idx = *counter;
     *counter += 1;
     let lambda_name = format!("__lambda_{}", idx);
-    let func_params: Vec<Param> = params.iter().map(|(name, ty)| Param {
-        name: name.clone(),
-        ty: ty.clone(),
-        default: None,
-        variadic: false,
-        is_named: false,
-        is_inout: false,
-    }).collect();
+
+    let captures = lambda_captures(params, body, &ctx.locals);
+
+    // 返回类型：显式 > 上下文 > body 推断（形参与捕获名入作用域，与调用点
+    // type_inference 的 Lambda 推断完全一致，避免 call_indirect 结果类型不匹配）。
+    let inferred_ret = {
+        let mut sub = ctx.clone();
+        for (pname, pty) in params {
+            sub.add_local(pname.clone(), pty.clone());
+        }
+        for (cname, cty) in &captures {
+            sub.add_local(cname.clone(), cty.clone());
+        }
+        sub.infer_expr(body).ok()
+    };
     let ret_type = explicit_ret
         .or(ret_override)
+        .or(inferred_ret)
         .or_else(|| params.first().map(|(_, ty)| ty.clone()))
         .or(Some(Type::Int64));
+
+    let mut func_params: Vec<Param> = Vec::new();
+    for (cname, cty) in &captures {
+        func_params.push(Param {
+            name: cname.clone(),
+            ty: cty.clone(),
+            default: None,
+            variadic: false,
+            is_named: false,
+            is_inout: false,
+        });
+    }
+    for (name, ty) in params {
+        func_params.push(Param {
+            name: name.clone(),
+            ty: ty.clone(),
+            default: None,
+            variadic: false,
+            is_named: false,
+            is_inout: false,
+        });
+    }
     let body_stmt = vec![crate::ast::Stmt::Return(Some(body.clone()))];
     out.push(Function {
         is_unsafe: false,
@@ -604,6 +977,7 @@ fn collect_call_args_with_ctor_hint(
     type_args: &Option<Vec<Type>>,
     counter: &mut u32,
     out: &mut Vec<Function>,
+    ctx: &TypeInferenceContext,
 ) {
     use crate::ast::Expr;
     let ctor_elem_ty = if name == "Array" && args.len() == 2 {
@@ -616,51 +990,61 @@ fn collect_call_args_with_ctor_hint(
             if let (Some(elem_ty), Expr::Lambda { params, return_type, body, .. }) =
                 (ctor_elem_ty.as_ref(), a)
             {
-                emit_lambda_function(params, body, return_type.clone(), Some(elem_ty.clone()), counter, out);
-                collect_lambdas_from_expr(body, counter, out);
+                emit_lambda_function(params, body, return_type.clone(), Some(elem_ty.clone()), counter, out, ctx);
+                collect_lambdas_from_expr(body, counter, out, ctx);
                 continue;
             }
         }
-        collect_lambdas_from_expr(a, counter, out);
+        collect_lambdas_from_expr(a, counter, out, ctx);
     }
 }
 
-fn collect_lambdas_from_expr(expr: &crate::ast::Expr, counter: &mut u32, out: &mut Vec<Function>) {
+fn collect_lambdas_from_expr(
+    expr: &crate::ast::Expr,
+    counter: &mut u32,
+    out: &mut Vec<Function>,
+    ctx: &TypeInferenceContext,
+) {
     use crate::ast::Expr;
     match expr {
         Expr::Lambda { params, return_type, body, .. } => {
-            emit_lambda_function(params, body, return_type.clone(), None, counter, out);
-            collect_lambdas_from_expr(body, counter, out);
+            emit_lambda_function(params, body, return_type.clone(), None, counter, out, ctx);
+            collect_lambdas_from_expr(body, counter, out, ctx);
         }
         Expr::Binary { left, right, .. } => {
-            collect_lambdas_from_expr(left, counter, out);
-            collect_lambdas_from_expr(right, counter, out);
+            collect_lambdas_from_expr(left, counter, out, ctx);
+            collect_lambdas_from_expr(right, counter, out, ctx);
         }
-        Expr::Unary { expr, .. } => collect_lambdas_from_expr(expr, counter, out),
+        Expr::Unary { expr, .. } => collect_lambdas_from_expr(expr, counter, out, ctx),
         Expr::Call { name, args, type_args, .. } => {
-            collect_call_args_with_ctor_hint(name, args, type_args, counter, out);
+            collect_call_args_with_ctor_hint(name, args, type_args, counter, out, ctx);
         }
         Expr::MethodCall { object, args, .. } => {
-            collect_lambdas_from_expr(object, counter, out);
-            for a in args { collect_lambdas_from_expr(a, counter, out); }
+            collect_lambdas_from_expr(object, counter, out, ctx);
+            for a in args { collect_lambdas_from_expr(a, counter, out, ctx); }
         }
         Expr::If { cond, then_branch, else_branch, .. } => {
-            collect_lambdas_from_expr(cond, counter, out);
-            collect_lambdas_from_expr(then_branch, counter, out);
-            if let Some(e) = else_branch { collect_lambdas_from_expr(e, counter, out); }
+            collect_lambdas_from_expr(cond, counter, out, ctx);
+            collect_lambdas_from_expr(then_branch, counter, out, ctx);
+            if let Some(e) = else_branch { collect_lambdas_from_expr(e, counter, out, ctx); }
         }
         Expr::Block(stmts, expr) => {
-            for s in stmts { collect_lambdas_from_stmt(s, counter, out); }
-            if let Some(e) = expr { collect_lambdas_from_expr(e, counter, out); }
+            for s in stmts { collect_lambdas_from_stmt(s, counter, out, ctx); }
+            if let Some(e) = expr { collect_lambdas_from_expr(e, counter, out, ctx); }
+        }
+        // w54c: `(opt.map(λ)) ?? default` 的 λ 位于 ?? 左侧，需递归收集
+        Expr::NullCoalesce { option, default } => {
+            collect_lambdas_from_expr(option, counter, out, ctx);
+            collect_lambdas_from_expr(default, counter, out, ctx);
         }
         Expr::Array(elems) | Expr::Tuple(elems) => {
-            for e in elems { collect_lambdas_from_expr(e, counter, out); }
+            for e in elems { collect_lambdas_from_expr(e, counter, out, ctx); }
         }
         Expr::ConstructorCall { name, args, type_args, .. } => {
-            collect_call_args_with_ctor_hint(name, args, type_args, counter, out);
+            collect_call_args_with_ctor_hint(name, args, type_args, counter, out, ctx);
         }
         Expr::StructInit { fields, .. } => {
-            for (_, e) in fields { collect_lambdas_from_expr(e, counter, out); }
+            for (_, e) in fields { collect_lambdas_from_expr(e, counter, out, ctx); }
         }
         _ => {}
     }

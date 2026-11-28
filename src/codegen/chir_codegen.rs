@@ -85,6 +85,13 @@ const RT_STR_REPEAT: &str = "__str_repeat";
 const RT_STR_INDEX_OF_BYTE: &str = "__str_index_of_byte";
 const RT_STR_LAST_INDEX_OF: &str = "__str_last_index_of";
 const RT_STR_LAST_INDEX_OF_BYTE: &str = "__str_last_index_of_byte";
+// w54a: Array API 余项（追加于末尾，保持既有助手索引稳定）
+const RT_ARR_INDEX_OF: &str = "__arr_index_of";
+const RT_ARR_INDEX_OF_F: &str = "__arr_index_of_f";
+const RT_ARR_SLICE: &str = "__arr_slice";
+const RT_ARR_CONCAT: &str = "__arr_concat";
+// w54c: 无符号 i64 → 字符串（UInt64/UIntNative 打印）
+const RT_U64_TO_STR: &str = "__u64_to_str";
 // Collection runtime functions
 const RT_ARRAYLIST_NEW: &str = "__arraylist_new";
 const RT_ARRAYLIST_APPEND: &str = "__arraylist_append";
@@ -153,6 +160,10 @@ const RT_NAMES: &[&str] = &[
     RT_CHK_ARR_SET_I32, RT_CHK_ARR_SET_I64, RT_CHK_ARR_SET_F64,
     // w52b: String API 余项（追加于末尾）
     RT_STR_INDEX_OF_BYTE, RT_STR_LAST_INDEX_OF, RT_STR_LAST_INDEX_OF_BYTE,
+    // w54a: Array API 余项（追加于末尾）
+    RT_ARR_INDEX_OF, RT_ARR_INDEX_OF_F, RT_ARR_SLICE, RT_ARR_CONCAT,
+    // w54c: 无符号整数打印
+    RT_U64_TO_STR,
 ];
 
 // ─── CHIRCodeGen ──────────────────────────────────────────────────────────────
@@ -490,6 +501,12 @@ impl CHIRCodeGen {
             CHIRExprKind::Load { ptr, .. } => {
                 self.collect_call_indirect_types_expr(ptr, types);
             }
+            // w54c: println(x) 的参数可能包含 CallIndirect（如 Option.map(λ)）
+            CHIRExprKind::Print { arg, .. } => {
+                if let Some(a) = arg {
+                    self.collect_call_indirect_types_expr(a, types);
+                }
+            }
             _ => {}
         }
     }
@@ -593,6 +610,13 @@ impl CHIRCodeGen {
             &[ValType::I32, ValType::I32, ValType::I64], // __str_index_of_byte (hay, byte, from)
             &[ValType::I32, ValType::I32, ValType::I64], // __str_last_index_of (hay, needle, from)
             &[ValType::I32, ValType::I32, ValType::I64], // __str_last_index_of_byte (hay, byte, from)
+            // w54a: Array API 余项
+            &[ValType::I32, ValType::I64, ValType::I32, ValType::I32], // __arr_index_of (arr, needle, esize, kind)
+            &[ValType::I32, ValType::F64, ValType::I32, ValType::I32], // __arr_index_of_f (arr, needle, esize, is_f32)
+            &[ValType::I32, ValType::I64, ValType::I64, ValType::I32], // __arr_slice (arr, start, len, esize)
+            &[ValType::I32, ValType::I32, ValType::I32],               // __arr_concat (a, b, esize)
+            // w54c
+            &[ValType::I64],                          // __u64_to_str
         ];
         for (i, name) in RT_NAMES.iter().enumerate() {
             let idx = IMPORT_COUNT + user_count + i as u32;
@@ -1057,6 +1081,37 @@ impl CHIRCodeGen {
             functions.function(ty_i32i32i64_i32);
             rt_type_indices.push(ty_i32i32i64_i32);
         }
+        // ── w54a: Array API 余项（顺序须与 RT_NAMES 一致）──
+        // __arr_index_of: (i32, i64, i32, i32) → i32
+        let ty_i32i64i32i32_i32 = types.len();
+        types.ty().function(
+            vec![ValType::I32, ValType::I64, ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        );
+        functions.function(ty_i32i64i32i32_i32);
+        rt_type_indices.push(ty_i32i64i32i32_i32);
+        // __arr_index_of_f: (i32, f64, i32, i32) → i32
+        let ty_i32f64i32i32_i32 = types.len();
+        types.ty().function(
+            vec![ValType::I32, ValType::F64, ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        );
+        functions.function(ty_i32f64i32i32_i32);
+        rt_type_indices.push(ty_i32f64i32i32_i32);
+        // __arr_slice: (i32, i64, i64, i32) → i32
+        let ty_i32i64i64i32_i32 = types.len();
+        types.ty().function(
+            vec![ValType::I32, ValType::I64, ValType::I64, ValType::I32],
+            vec![ValType::I32],
+        );
+        functions.function(ty_i32i64i64i32_i32);
+        rt_type_indices.push(ty_i32i64i64i32_i32);
+        // __arr_concat: (i32, i32, i32) → i32
+        functions.function(ty_i32i32i32_i32);
+        rt_type_indices.push(ty_i32i32i32_i32);
+        // w54c: __u64_to_str: (i64) → i32
+        functions.function(ty_i64_i32);
+        rt_type_indices.push(ty_i64_i32);
         rt_type_indices
     }
 
@@ -1182,6 +1237,13 @@ impl CHIRCodeGen {
         codes.function(&Self::build_rt_str_index_of_byte(alloc_idx));
         codes.function(&Self::build_rt_str_last_index_of(alloc_idx));
         codes.function(&Self::build_rt_str_last_index_of_byte(alloc_idx));
+        // ── w54a: Array API 余项（顺序须与 RT_NAMES 一致）──
+        codes.function(&self.build_rt_arr_index_of());
+        codes.function(&self.build_rt_arr_index_of_f());
+        codes.function(&self.build_rt_arr_slice());
+        codes.function(&self.build_rt_arr_concat());
+        // ── w54c: 无符号整数打印（顺序须与 RT_NAMES 一致）──
+        codes.function(&Self::build_rt_u64_to_str(alloc_idx));
     }
 
     // ── w31a: checked 模式运行时助手 ─────────────────────────────────────
@@ -1873,14 +1935,104 @@ impl CHIRCodeGen {
         f
     }
 
-    /// pow(base, exp) = exp(exp * log(base))
+    /// pow(base, exp)：整数指数用重复平方精确求值，非整数指数回退 exp(exp*log(base))。
+    ///
+    /// w54c：此前的 exp/log 泰勒级数近似对 `pow(2.0, 10.0)` 得到 1023.987127。
+    /// cjc 对整数指数（含负数、负底数）可给出精确值，故整数指数改走平方求幂
+    /// （结果逐位精确，如 2^62 / (-8)^3 / 10^3），小数指数仍用 exp/log。
     fn build_rt_math_pow(exp_idx: u32, log_idx: u32) -> wasm_encoder::Function {
-        let mut f = wasm_encoder::Function::new(vec![]);
+        // locals: 2=k(i64) 3=result(f64) 4=base_pow(f64) 5=neg(i32)
+        let mut f = wasm_encoder::Function::new(vec![
+            (1, ValType::I64), // 2: k
+            (1, ValType::F64), // 3: result
+            (1, ValType::F64), // 4: base_pow
+            (1, ValType::I32), // 5: neg
+        ]);
+        // 条件：exp == trunc(exp) 且 |exp| <= 1024 → 走整数路径
         f.instruction(&Instruction::LocalGet(1)); // exp
-        f.instruction(&Instruction::LocalGet(0)); // base
-        f.instruction(&Instruction::Call(log_idx)); // log(base)
-        f.instruction(&Instruction::F64Mul); // exp * log(base)
-        f.instruction(&Instruction::Call(exp_idx)); // exp(exp * log(base))
+        f.instruction(&Instruction::F64Trunc);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::F64Eq);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::F64Abs);
+        f.instruction(&Instruction::F64Const(1024.0));
+        f.instruction(&Instruction::F64Le);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(BlockType::Result(ValType::F64)));
+        {
+            // k = |trunc(exp)| as i64
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::F64Trunc);
+            f.instruction(&Instruction::F64Abs);
+            f.instruction(&Instruction::I64TruncF64S);
+            f.instruction(&Instruction::LocalSet(2));
+            // neg = exp < 0
+            f.instruction(&Instruction::LocalGet(1));
+            f.instruction(&Instruction::F64Const(0.0));
+            f.instruction(&Instruction::F64Lt);
+            f.instruction(&Instruction::LocalSet(5));
+            // result = 1.0, base_pow = base
+            f.instruction(&Instruction::F64Const(1.0));
+            f.instruction(&Instruction::LocalSet(3));
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::LocalSet(4));
+            // 平方求幂
+            f.instruction(&Instruction::Block(BlockType::Empty));
+            f.instruction(&Instruction::Loop(BlockType::Empty));
+            {
+                f.instruction(&Instruction::LocalGet(2));
+                f.instruction(&Instruction::I64Eqz);
+                f.instruction(&Instruction::BrIf(1));
+                // if (k & 1) result *= base_pow
+                f.instruction(&Instruction::LocalGet(2));
+                f.instruction(&Instruction::I64Const(1));
+                f.instruction(&Instruction::I64And);
+                f.instruction(&Instruction::I64Eqz);
+                f.instruction(&Instruction::If(BlockType::Empty));
+                f.instruction(&Instruction::Else);
+                {
+                    f.instruction(&Instruction::LocalGet(3));
+                    f.instruction(&Instruction::LocalGet(4));
+                    f.instruction(&Instruction::F64Mul);
+                    f.instruction(&Instruction::LocalSet(3));
+                }
+                f.instruction(&Instruction::End);
+                // base_pow *= base_pow
+                f.instruction(&Instruction::LocalGet(4));
+                f.instruction(&Instruction::LocalGet(4));
+                f.instruction(&Instruction::F64Mul);
+                f.instruction(&Instruction::LocalSet(4));
+                // k >>= 1
+                f.instruction(&Instruction::LocalGet(2));
+                f.instruction(&Instruction::I64Const(1));
+                f.instruction(&Instruction::I64ShrU);
+                f.instruction(&Instruction::LocalSet(2));
+                f.instruction(&Instruction::Br(0));
+            }
+            f.instruction(&Instruction::End); // end loop
+            f.instruction(&Instruction::End); // end block
+            // if neg: result = 1 / result
+            f.instruction(&Instruction::LocalGet(5));
+            f.instruction(&Instruction::If(BlockType::Empty));
+            {
+                f.instruction(&Instruction::F64Const(1.0));
+                f.instruction(&Instruction::LocalGet(3));
+                f.instruction(&Instruction::F64Div);
+                f.instruction(&Instruction::LocalSet(3));
+            }
+            f.instruction(&Instruction::End);
+            f.instruction(&Instruction::LocalGet(3));
+        }
+        f.instruction(&Instruction::Else);
+        {
+            // 回退：exp(exp * log(base))
+            f.instruction(&Instruction::LocalGet(1)); // exp
+            f.instruction(&Instruction::LocalGet(0)); // base
+            f.instruction(&Instruction::Call(log_idx)); // log(base)
+            f.instruction(&Instruction::F64Mul); // exp * log(base)
+            f.instruction(&Instruction::Call(exp_idx)); // exp(exp * log(base))
+        }
+        f.instruction(&Instruction::End);
         f.instruction(&Instruction::End);
         f
     }
@@ -1926,9 +2078,19 @@ impl CHIRCodeGen {
         f
     }
 
-    /// __i64_to_str(val: i64) -> i32 (string pointer)
+    /// __i64_to_str(val: i64) -> i32 (string pointer)（有符号）
     /// Converts an i64 to a decimal string, allocates memory: [len: i32][bytes...]
     fn build_rt_i64_to_str(alloc_idx: u32) -> wasm_encoder::Function {
+        Self::build_rt_int_to_str(alloc_idx, false)
+    }
+
+    /// __u64_to_str(val: u64) -> i32（无符号；w54c：用于 UInt64/UIntNative 打印）
+    fn build_rt_u64_to_str(alloc_idx: u32) -> wasm_encoder::Function {
+        Self::build_rt_int_to_str(alloc_idx, true)
+    }
+
+    /// 十进制整数转字符串。`unsigned=true` 时按无符号位模式解释且不输出符号。
+    fn build_rt_int_to_str(alloc_idx: u32, unsigned: bool) -> wasm_encoder::Function {
         // locals: 0=val(i64), 1=buf_pos(i32), 2=is_neg(i32), 3=abs_val(i64),
         // 4=digit(i32), 5=str_len(i32), 6=result_ptr(i32)
         let mut f = wasm_encoder::Function::new(vec![
@@ -1959,21 +2121,27 @@ impl CHIRCodeGen {
         }
         f.instruction(&Instruction::Else);
         {
-            // is_neg = val < 0
-            f.instruction(&Instruction::LocalGet(0));
-            f.instruction(&Instruction::I64Const(0));
-            f.instruction(&Instruction::I64LtS);
-            f.instruction(&Instruction::LocalSet(2));
-            // abs_val = is_neg ? -val : val
-            f.instruction(&Instruction::LocalGet(2));
-            f.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-            f.instruction(&Instruction::I64Const(0));
-            f.instruction(&Instruction::LocalGet(0));
-            f.instruction(&Instruction::I64Sub);
-            f.instruction(&Instruction::Else);
-            f.instruction(&Instruction::LocalGet(0));
-            f.instruction(&Instruction::End);
-            f.instruction(&Instruction::LocalSet(3));
+            if unsigned {
+                // 无符号：abs_val = val，is_neg 保持 0
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::LocalSet(3));
+            } else {
+                // is_neg = val < 0
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Const(0));
+                f.instruction(&Instruction::I64LtS);
+                f.instruction(&Instruction::LocalSet(2));
+                // abs_val = is_neg ? -val : val
+                f.instruction(&Instruction::LocalGet(2));
+                f.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+                f.instruction(&Instruction::I64Const(0));
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::I64Sub);
+                f.instruction(&Instruction::Else);
+                f.instruction(&Instruction::LocalGet(0));
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::LocalSet(3));
+            }
 
             // while abs_val > 0: digit = abs_val % 10; buf[buf_pos] = '0' + digit; abs_val /= 10; buf_pos--
             f.instruction(&Instruction::Block(BlockType::Empty));
@@ -2370,6 +2538,35 @@ impl CHIRCodeGen {
         f
     }
 
+    /// w54c: 生成"分配 [len][bytes] 字面量字符串并 return 其指针"的指令序列。
+    /// 用于 __f64_to_str 的 inf/-inf/nan 特判。`local_idx` 为可复用的 i32 临时局部。
+    fn emit_float_literal_str(
+        f: &mut wasm_encoder::Function,
+        alloc_idx: u32,
+        local_idx: u32,
+        text: &[u8],
+    ) {
+        let mem = |offset: u64, align: u32| MemArg { offset, align, memory_index: 0 };
+        let len = text.len();
+        // ptr = alloc(4 + len)
+        f.instruction(&Instruction::I32Const((4 + len) as i32));
+        f.instruction(&Instruction::Call(alloc_idx));
+        f.instruction(&Instruction::LocalSet(local_idx));
+        // [0] = len
+        f.instruction(&Instruction::LocalGet(local_idx));
+        f.instruction(&Instruction::I32Const(len as i32));
+        f.instruction(&Instruction::I32Store(mem(0, 2)));
+        // bytes at offset 4..
+        for (i, b) in text.iter().enumerate() {
+            f.instruction(&Instruction::LocalGet(local_idx));
+            f.instruction(&Instruction::I32Const(*b as i32));
+            f.instruction(&Instruction::I32Store8(mem((4 + i) as u64, 0)));
+        }
+        // return ptr
+        f.instruction(&Instruction::LocalGet(local_idx));
+        f.instruction(&Instruction::Return);
+    }
+
     /// __f64_to_str(val: f64) -> i32
     ///
     /// 对齐 cjc 的 `Float64.toString()` / `%f` 语义：整数部分 + "." + 6 位小数
@@ -2390,20 +2587,53 @@ impl CHIRCodeGen {
             (1, ValType::I32), // 7: sign_str
             (1, ValType::I32), // 8: frac_buf
             (1, ValType::I32), // 9: i
+            (1, ValType::I32), // 10: lit_ptr（inf/-inf/nan 字面量指针）
         ]);
         let mem = |offset: u64, align: u32| MemArg { offset, align, memory_index: 0 };
 
-        // is_neg = val < 0
+        // ── w54c: inf / -inf / nan 特判（cjc：inf / -inf / nan）──
+        // 必须先于 I64TruncF64 处理，否则 Non-Finite → 整数会触发 wasm trap。
+        // nan: val != val
         f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::F64Const(0.0));
-        f.instruction(&Instruction::F64Lt);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Ne);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        {
+            Self::emit_float_literal_str(&mut f, alloc_idx, 10, b"nan");
+        }
+        f.instruction(&Instruction::End);
+        // +inf
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Const(f64::INFINITY));
+        f.instruction(&Instruction::F64Eq);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        {
+            Self::emit_float_literal_str(&mut f, alloc_idx, 10, b"inf");
+        }
+        f.instruction(&Instruction::End);
+        // -inf
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::F64Const(f64::NEG_INFINITY));
+        f.instruction(&Instruction::F64Eq);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        {
+            Self::emit_float_literal_str(&mut f, alloc_idx, 10, b"-inf");
+        }
+        f.instruction(&Instruction::End);
+
+        // is_neg = 符号位（-0.0 也应为负 → "-0.000000"）
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I64ReinterpretF64);
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::I64LtS);
         f.instruction(&Instruction::LocalSet(1));
 
         // int_val = trunc(abs(val)) as u64
         f.instruction(&Instruction::LocalGet(0));
         f.instruction(&Instruction::F64Abs);
         f.instruction(&Instruction::F64Trunc);
-        f.instruction(&Instruction::I64TruncF64U);
+        // saturating：超出 u64 范围的大有限值（如 1e308）不 trap（非有限值已在上方特判）
+        f.instruction(&Instruction::I64TruncSatF64U);
         f.instruction(&Instruction::LocalSet(6));
 
         // frac_val = round((abs(val) - trunc(abs(val))) * 1e6) as u64
@@ -2416,7 +2646,7 @@ impl CHIRCodeGen {
         f.instruction(&Instruction::F64Const(1000000.0));
         f.instruction(&Instruction::F64Mul);
         f.instruction(&Instruction::F64Nearest);
-        f.instruction(&Instruction::I64TruncF64U);
+        f.instruction(&Instruction::I64TruncSatF64U);
         f.instruction(&Instruction::LocalSet(5));
 
         // 进位：舍入到 1000000 时整数部分 +1（如 0.9999999 → 1.000000）
@@ -5456,6 +5686,22 @@ impl CHIRCodeGen {
                             (Type::String, _) => {
                                 if *newline { RT_PRINTLN_STR } else { RT_PRINT_STR }
                             }
+                            // w54c: 无符号窄整型按零扩展打印（cjc：UInt32.Max = 4294967295）
+                            (Type::UInt8, _) | (Type::UInt16, _) | (Type::UInt32, _) => {
+                                func.instruction(&Instruction::I64ExtendI32U);
+                                if *newline { RT_PRINTLN_I64 } else { RT_PRINT_I64 }
+                            }
+                            // w54c: UInt64/UIntNative 按无符号打印（cjc：18446744073709551615）
+                            (Type::UInt64, _) | (Type::UIntNative, _) => {
+                                if let Some(&idx) = self.func_indices.get(RT_U64_TO_STR) {
+                                    func.instruction(&Instruction::Call(idx));
+                                    if *newline { RT_PRINTLN_STR } else { RT_PRINT_STR }
+                                } else if *newline {
+                                    RT_PRINTLN_I64
+                                } else {
+                                    RT_PRINT_I64
+                                }
+                            }
                             (_, ValType::I64) => {
                                 if *newline { RT_PRINTLN_I64 } else { RT_PRINT_I64 }
                             }
@@ -5508,6 +5754,8 @@ impl CHIRCodeGen {
                     "ceil" => { func.instruction(&Instruction::F64Ceil); }
                     "trunc" => { func.instruction(&Instruction::F64Trunc); }
                     "nearest" => { func.instruction(&Instruction::F64Nearest); }
+                    // w54c: cjc 的 round 为银行家舍入（half-to-even），与 f64.nearest 等价
+                    "round" => { func.instruction(&Instruction::F64Nearest); }
                     "abs" => { func.instruction(&Instruction::F64Abs); }
                     "sin" | "cos" | "tan" | "exp" | "log" => {
                         let idx = self.func_indices[op.as_str()];
@@ -6560,6 +6808,319 @@ impl CHIRCodeGen {
             (ValType::F64, ValType::F32) => { func.instruction(&Instruction::F32DemoteF64); }
             _ => {} // 相同类型不需要指令
         }
+    }
+
+    // ── w54a: Array API 运行时助手 ─────────────────────────────────────────
+    // 数组布局: [len: i32][elem0][elem1]...（元素地址 = arr + 4 + i * elem_size）
+
+    /// __arr_index_of(arr: i32, needle: i64, elem_size: i32, kind: i32) -> i32
+    ///
+    /// 线性查找，返回 Option<Int64> 盒指针（tag 在偏移 0，值 i64 在偏移 4）：
+    /// 命中 → Some(第一个匹配下标)，未命中 → None。
+    /// kind: 0 = i64 槽、1 = i32 槽、2 = String（按内容比较）。
+    fn build_rt_arr_index_of(&self) -> wasm_encoder::Function {
+        use wasm_encoder::Instruction::*;
+        let mem = |o: u64, a: u32| MemArg { offset: o, align: a, memory_index: 0 };
+        let alloc_idx = self.func_indices[RT_ALLOC];
+        let str_eq_idx = self.func_indices[RT_CHK_STR_EQ];
+        // 参数 0..3；局部 4=len, 5=i, 6=addr, 7=found, 8=box
+        let mut f = wasm_encoder::Function::new(vec![
+            (1, ValType::I32), (1, ValType::I32), (1, ValType::I32),
+            (1, ValType::I32), (1, ValType::I32),
+        ]);
+        // len = i32.load(arr)
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Load(mem(0, 2)));
+        f.instruction(&LocalSet(4));
+        // i = 0
+        f.instruction(&I32Const(0));
+        f.instruction(&LocalSet(5));
+        f.instruction(&Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Loop(wasm_encoder::BlockType::Empty));
+        // if i >= len → break
+        f.instruction(&LocalGet(5));
+        f.instruction(&LocalGet(4));
+        f.instruction(&I32GeU);
+        f.instruction(&BrIf(1));
+        // addr = arr + 4 + i * elem_size
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(5));
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32Mul);
+        f.instruction(&I32Add);
+        f.instruction(&LocalSet(6));
+        // found = 按 kind 分派比较
+        f.instruction(&LocalGet(3));
+        f.instruction(&I32Const(1));
+        f.instruction(&I32LeS);
+        f.instruction(&If(wasm_encoder::BlockType::Result(ValType::I32)));
+        {
+            f.instruction(&LocalGet(3));
+            f.instruction(&I32Eqz);
+            f.instruction(&If(wasm_encoder::BlockType::Result(ValType::I32)));
+            {
+                // kind == 0: i64 槽
+                f.instruction(&LocalGet(6));
+                f.instruction(&I64Load(mem(0, 3)));
+                f.instruction(&LocalGet(1));
+                f.instruction(&I64Eq);
+            }
+            f.instruction(&Else);
+            {
+                // kind == 1: i32 槽
+                f.instruction(&LocalGet(6));
+                f.instruction(&I32Load(mem(0, 2)));
+                f.instruction(&LocalGet(1));
+                f.instruction(&I32WrapI64);
+                f.instruction(&I32Eq);
+            }
+            f.instruction(&End);
+        }
+        f.instruction(&Else);
+        {
+            // kind == 2: String 按内容比较
+            f.instruction(&LocalGet(6));
+            f.instruction(&I32Load(mem(0, 2)));
+            f.instruction(&LocalGet(1));
+            f.instruction(&I32WrapI64);
+            f.instruction(&Call(str_eq_idx));
+        }
+        f.instruction(&End);
+        f.instruction(&LocalSet(7));
+        // if found → Some(i)
+        f.instruction(&LocalGet(7));
+        f.instruction(&If(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&I32Const(12));
+            f.instruction(&Call(alloc_idx));
+            f.instruction(&LocalSet(8));
+            f.instruction(&LocalGet(8));
+            f.instruction(&I32Const(1));
+            f.instruction(&I32Store(mem(0, 2)));
+            f.instruction(&LocalGet(8));
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64ExtendI32U);
+            f.instruction(&I64Store(mem(4, 3)));
+            f.instruction(&LocalGet(8));
+            f.instruction(&Return);
+        }
+        f.instruction(&End);
+        // i++
+        f.instruction(&LocalGet(5));
+        f.instruction(&I32Const(1));
+        f.instruction(&I32Add);
+        f.instruction(&LocalSet(5));
+        f.instruction(&Br(0));
+        f.instruction(&End); // loop
+        f.instruction(&End); // block
+        // None
+        f.instruction(&I32Const(4));
+        f.instruction(&Call(alloc_idx));
+        f.instruction(&LocalSet(8));
+        f.instruction(&LocalGet(8));
+        f.instruction(&I32Const(0));
+        f.instruction(&I32Store(mem(0, 2)));
+        f.instruction(&LocalGet(8));
+        f.instruction(&End);
+        f
+    }
+
+    /// __arr_index_of_f(arr: i32, needle: f64, elem_size: i32, is_f32: i32) -> i32
+    ///
+    /// 浮点元素查找（Float64 / Float32），返回 Option<Int64> 盒指针。
+    /// 用浮点相等比较（+0.0 == -0.0、NaN != NaN 与 cjc 的 == 语义一致）。
+    fn build_rt_arr_index_of_f(&self) -> wasm_encoder::Function {
+        use wasm_encoder::Instruction::*;
+        let mem = |o: u64, a: u32| MemArg { offset: o, align: a, memory_index: 0 };
+        let alloc_idx = self.func_indices[RT_ALLOC];
+        // 参数 0..3；局部 4=len, 5=i, 6=addr, 7=found, 8=box
+        let mut f = wasm_encoder::Function::new(vec![
+            (1, ValType::I32), (1, ValType::I32), (1, ValType::I32),
+            (1, ValType::I32), (1, ValType::I32),
+        ]);
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Load(mem(0, 2)));
+        f.instruction(&LocalSet(4));
+        f.instruction(&I32Const(0));
+        f.instruction(&LocalSet(5));
+        f.instruction(&Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&LocalGet(5));
+        f.instruction(&LocalGet(4));
+        f.instruction(&I32GeU);
+        f.instruction(&BrIf(1));
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(5));
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32Mul);
+        f.instruction(&I32Add);
+        f.instruction(&LocalSet(6));
+        // is_f32 ?
+        f.instruction(&LocalGet(3));
+        f.instruction(&If(wasm_encoder::BlockType::Result(ValType::I32)));
+        {
+            f.instruction(&LocalGet(6));
+            f.instruction(&F32Load(mem(0, 2)));
+            f.instruction(&LocalGet(1));
+            f.instruction(&F32DemoteF64);
+            f.instruction(&F32Eq);
+        }
+        f.instruction(&Else);
+        {
+            f.instruction(&LocalGet(6));
+            f.instruction(&F64Load(mem(0, 3)));
+            f.instruction(&LocalGet(1));
+            f.instruction(&F64Eq);
+        }
+        f.instruction(&End);
+        f.instruction(&LocalSet(7));
+        f.instruction(&LocalGet(7));
+        f.instruction(&If(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&I32Const(12));
+            f.instruction(&Call(alloc_idx));
+            f.instruction(&LocalSet(8));
+            f.instruction(&LocalGet(8));
+            f.instruction(&I32Const(1));
+            f.instruction(&I32Store(mem(0, 2)));
+            f.instruction(&LocalGet(8));
+            f.instruction(&LocalGet(5));
+            f.instruction(&I64ExtendI32U);
+            f.instruction(&I64Store(mem(4, 3)));
+            f.instruction(&LocalGet(8));
+            f.instruction(&Return);
+        }
+        f.instruction(&End);
+        f.instruction(&LocalGet(5));
+        f.instruction(&I32Const(1));
+        f.instruction(&I32Add);
+        f.instruction(&LocalSet(5));
+        f.instruction(&Br(0));
+        f.instruction(&End);
+        f.instruction(&End);
+        f.instruction(&I32Const(4));
+        f.instruction(&Call(alloc_idx));
+        f.instruction(&LocalSet(8));
+        f.instruction(&LocalGet(8));
+        f.instruction(&I32Const(0));
+        f.instruction(&I32Store(mem(0, 2)));
+        f.instruction(&LocalGet(8));
+        f.instruction(&End);
+        f
+    }
+
+    /// __arr_slice(arr: i32, start: i64, len: i64, elem_size: i32) -> i32
+    ///
+    /// 返回新数组：从 start 起拷贝 len 个元素（cjc 的 slice(start, length) 语义；
+    /// 越界由调用方/检查模式负责，此处按给定范围拷贝）。
+    fn build_rt_arr_slice(&self) -> wasm_encoder::Function {
+        use wasm_encoder::Instruction::*;
+        let mem = |o: u64, a: u32| MemArg { offset: o, align: a, memory_index: 0 };
+        let alloc_idx = self.func_indices[RT_ALLOC];
+        // 参数 0..3；局部 4=dst
+        let mut f = wasm_encoder::Function::new(vec![(1, ValType::I32)]);
+        // dst = alloc(4 + len * elem_size)
+        f.instruction(&I32Const(4));
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32WrapI64);
+        f.instruction(&LocalGet(3));
+        f.instruction(&I32Mul);
+        f.instruction(&I32Add);
+        f.instruction(&Call(alloc_idx));
+        f.instruction(&LocalSet(4));
+        // 写长度
+        f.instruction(&LocalGet(4));
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32WrapI64);
+        f.instruction(&I32Store(mem(0, 2)));
+        // memory.copy(dst+4, arr+4+start*elem_size, len*elem_size)
+        f.instruction(&LocalGet(4));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(1));
+        f.instruction(&I32WrapI64);
+        f.instruction(&LocalGet(3));
+        f.instruction(&I32Mul);
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32WrapI64);
+        f.instruction(&LocalGet(3));
+        f.instruction(&I32Mul);
+        f.instruction(&MemoryCopy { src_mem: 0, dst_mem: 0 });
+        f.instruction(&LocalGet(4));
+        f.instruction(&End);
+        f
+    }
+
+    /// __arr_concat(a: i32, b: i32, elem_size: i32) -> i32
+    ///
+    /// 返回新数组 = a 的元素后接 b 的元素。
+    fn build_rt_arr_concat(&self) -> wasm_encoder::Function {
+        use wasm_encoder::Instruction::*;
+        let mem = |o: u64, a: u32| MemArg { offset: o, align: a, memory_index: 0 };
+        let alloc_idx = self.func_indices[RT_ALLOC];
+        // 参数 0..2；局部 3=alen, 4=blen, 5=dst
+        let mut f = wasm_encoder::Function::new(vec![
+            (1, ValType::I32), (1, ValType::I32), (1, ValType::I32),
+        ]);
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Load(mem(0, 2)));
+        f.instruction(&LocalSet(3));
+        f.instruction(&LocalGet(1));
+        f.instruction(&I32Load(mem(0, 2)));
+        f.instruction(&LocalSet(4));
+        // dst = alloc(4 + (alen + blen) * elem_size)
+        f.instruction(&I32Const(4));
+        f.instruction(&LocalGet(3));
+        f.instruction(&LocalGet(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32Mul);
+        f.instruction(&I32Add);
+        f.instruction(&Call(alloc_idx));
+        f.instruction(&LocalSet(5));
+        // 写长度
+        f.instruction(&LocalGet(5));
+        f.instruction(&LocalGet(3));
+        f.instruction(&LocalGet(4));
+        f.instruction(&I32Add);
+        f.instruction(&I32Store(mem(0, 2)));
+        // copy a: dst+4 ← a+4, alen*elem_size
+        f.instruction(&LocalGet(5));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(0));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(3));
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32Mul);
+        f.instruction(&MemoryCopy { src_mem: 0, dst_mem: 0 });
+        // copy b: dst+4+alen*elem_size ← b+4, blen*elem_size
+        f.instruction(&LocalGet(5));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(3));
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32Mul);
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(1));
+        f.instruction(&I32Const(4));
+        f.instruction(&I32Add);
+        f.instruction(&LocalGet(4));
+        f.instruction(&LocalGet(2));
+        f.instruction(&I32Mul);
+        f.instruction(&MemoryCopy { src_mem: 0, dst_mem: 0 });
+        f.instruction(&LocalGet(5));
+        f.instruction(&End);
+        f
     }
 }
 

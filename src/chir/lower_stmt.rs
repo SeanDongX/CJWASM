@@ -40,6 +40,16 @@ impl<'a> LoweringContext<'a> {
                         self.local_ast_types.insert(name.clone(), ast_ty);
                         let local_idx = self.alloc_local_typed(name.clone(), local_wasm_ty);
                         value_chir = self.insert_cast_if_needed(value_chir, local_wasm_ty);
+                        // w54d：记录 `let f = {…捕获…}` 的闭包捕获类型，
+                        // 供后续直接调用 `f(...)` 从闭包对象中取出捕获值。
+                        if let crate::ast::Expr::Lambda { params, body, .. } = value {
+                            let caps: Vec<crate::ast::Type> =
+                                self.closure_capture_types(params, body)
+                                    .into_iter().map(|(_, t)| t).collect();
+                            if !caps.is_empty() {
+                                self.closure_captures.insert(local_idx, caps);
+                            }
+                        }
                         Ok(CHIRStmt::Let {
                             local_idx,
                             value: value_chir,
@@ -90,6 +100,16 @@ impl<'a> LoweringContext<'a> {
                         self.local_ast_types.insert(name.clone(), ast_ty);
                         let local_idx = self.alloc_local_typed(name.clone(), local_wasm_ty);
                         value_chir = self.insert_cast_if_needed(value_chir, local_wasm_ty);
+                        // w54d：记录 `let f = {…捕获…}` 的闭包捕获类型，
+                        // 供后续直接调用 `f(...)` 从闭包对象中取出捕获值。
+                        if let crate::ast::Expr::Lambda { params, body, .. } = value {
+                            let caps: Vec<crate::ast::Type> =
+                                self.closure_capture_types(params, body)
+                                    .into_iter().map(|(_, t)| t).collect();
+                            if !caps.is_empty() {
+                                self.closure_captures.insert(local_idx, caps);
+                            }
+                        }
                         Ok(CHIRStmt::Let {
                             local_idx,
                             value: value_chir,
@@ -103,6 +123,10 @@ impl<'a> LoweringContext<'a> {
 
             // 赋值语句
             Stmt::Assign { target, value } => {
+                // w54a: ArrayList / HashMap 下标写 → 运行时 set/put
+                if let Some(stmt) = self.try_lower_collection_index_assign(target, value)? {
+                    return Ok(stmt);
+                }
                 // 已知赋值目标的静态类型时，数组字面量按目标元素类型归一化，
                 // 使写入步长与读侧（按目标静态元素类型取步长）一致。
                 let expected_ast = self.assign_target_ast_type(target);
@@ -659,6 +683,70 @@ impl<'a> LoweringContext<'a> {
             }
         }
         Ok(stmts)
+    }
+
+    /// w54a: ArrayList[i] = v → __arraylist_set；HashMap[k] = v → __hashmap_put。
+    ///
+    /// 原生数组下标写仍走 Empty 分支（CHIRLValue::Index）；这里只拦截集合类型，
+    /// 避免按 4 字节头部的数组布局错误读写集合对象。
+    fn try_lower_collection_index_assign(
+        &mut self,
+        target: &AssignTarget,
+        value: &crate::ast::Expr,
+    ) -> Result<Option<CHIRStmt>, String> {
+        let (base_expr, index) = match target {
+            AssignTarget::Index { array, index } => (crate::ast::Expr::Var(array.clone()), index),
+            AssignTarget::ExprIndex { expr, index } => ((**expr).clone(), index),
+            _ => return Ok(None),
+        };
+        let base_ty = if let crate::ast::Expr::Var(name) = &base_expr {
+            self.var_ast_type(name)
+                .or_else(|| self.type_ctx.infer_expr(&base_expr).ok())
+        } else {
+            self.type_ctx.infer_expr(&base_expr).ok()
+        };
+        let Some(base_ty) = base_ty else { return Ok(None) };
+        match &base_ty {
+            crate::ast::Type::Struct(name, args) if name == "ArrayList" => {
+                let elem = args.first().cloned().unwrap_or(crate::ast::Type::Int64);
+                if !matches!(elem.to_wasm(), wasm_encoder::ValType::I32 | wasm_encoder::ValType::I64) {
+                    return Ok(None);
+                }
+                let Some(set_idx) = self.rt_func_idx("__arraylist_set") else {
+                    return Ok(None);
+                };
+                let obj = self.lower_expr(&base_expr)?;
+                let obj = self.insert_cast_if_needed(obj, wasm_encoder::ValType::I32);
+                let idx = self.lower_expr(index)?;
+                let idx = self.insert_cast_if_needed(idx, wasm_encoder::ValType::I64);
+                let val = self.lower_expr(value)?;
+                let val = self.insert_cast_if_needed(val, wasm_encoder::ValType::I64);
+                Ok(Some(CHIRStmt::Expr(crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::Call { func_idx: set_idx, args: vec![obj, idx, val] },
+                    crate::ast::Type::Unit, wasm_encoder::ValType::I32,
+                ))))
+            }
+            crate::ast::Type::Map(_, v) => {
+                let val_ty = (**v).clone();
+                if !matches!(val_ty.to_wasm(), wasm_encoder::ValType::I32 | wasm_encoder::ValType::I64) {
+                    return Ok(None);
+                }
+                let Some(put_idx) = self.rt_func_idx("__hashmap_put") else {
+                    return Ok(None);
+                };
+                let obj = self.lower_expr(&base_expr)?;
+                let obj = self.insert_cast_if_needed(obj, wasm_encoder::ValType::I32);
+                let key = self.lower_expr(index)?;
+                let key = self.insert_cast_if_needed(key, wasm_encoder::ValType::I64);
+                let val = self.lower_expr(value)?;
+                let val = self.insert_cast_if_needed(val, wasm_encoder::ValType::I64);
+                Ok(Some(CHIRStmt::Expr(crate::chir::CHIRExpr::new(
+                    crate::chir::CHIRExprKind::Call { func_idx: put_idx, args: vec![obj, key, val] },
+                    crate::ast::Type::Unit, wasm_encoder::ValType::I32,
+                ))))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// 降低赋值目标

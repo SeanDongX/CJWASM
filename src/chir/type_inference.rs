@@ -309,7 +309,7 @@ impl TypeInferenceContext {
                     "abs" | "min" | "max" if !args.is_empty() => {
                         self.infer_expr(&args[0])
                     }
-                    "sqrt" | "floor" | "ceil" | "trunc" | "nearest"
+                    "sqrt" | "floor" | "ceil" | "trunc" | "nearest" | "round"
                     | "sin" | "cos" | "exp" | "log" | "pow" => Ok(Type::Float64),
                     // 整数类型转换构造函数 → 对应整数类型
                     "Int8" | "Int16" | "Int32" | "UInt8" | "UInt16" | "UInt32" => Ok(Type::Int32),
@@ -344,6 +344,12 @@ impl TypeInferenceContext {
 
             // 字段访问
             Expr::Field { object, field } => {
+                // w54c: 整数类型静态常量 Int64.Max/Min（cjc 编译期常量）
+                if let Expr::Var(name) = object.as_ref() {
+                    if let Some(ty) = Self::int_static_const_type(name, field) {
+                        return Ok(ty);
+                    }
+                }
                 let obj_ty = self.infer_expr(object)?;
                 self.infer_field_type(&obj_ty, field)
             }
@@ -423,23 +429,65 @@ impl TypeInferenceContext {
 
             // If 表达式
             Expr::If { then_branch, else_branch, .. } => {
-                let then_ty = self.infer_expr(then_branch)?;
                 if let Some(else_expr) = else_branch {
                     let _else_ty = self.infer_expr(else_expr)?;
-                    // 简化：返回 then 分支类型
-                    Ok(then_ty)
+                    // 简化：返回 then 分支类型（多语句分支需剥开 Block 取结果类型）
+                    self.infer_block_result_ty(then_branch)
                 } else {
                     Ok(Type::Unit)
                 }
             }
 
             // Match 表达式
+            //
+            // w54d：分支体在 parser 中总是被包装成 `Expr::Block(stmts, result)`
+            // （见 parse_match_arms），即使单表达式分支也是 `Block([], Some(e))`。
+            // 原先直接 `infer_expr(&arms[0].body)` 会命中 Block 的兜底分支得到
+            // Int32，使 `let y = match (...) { case _ => "big" }` 的 y 被当作
+            // i32 指针打印（S9：输出 136 而非 "big"）。此处剥开块取结果表达式
+            // 的类型；守卫（where）不影响类型，只是运行期分支选择。
             Expr::Match { arms, .. } => {
                 if arms.is_empty() {
                     Ok(Type::Unit)
                 } else {
-                    self.infer_expr(&arms[0].body)
+                    self.infer_block_result_ty(&arms[0].body)
                 }
+            }
+
+            // try 块表达式：值 = catch 块末表达式（捕获后）或 try 块末表达式，
+            // 取第一个非 Unit/Nothing 的类型；否则 Unit。
+            // （w54d：此前落入兜底 Int32，`let t = try{…}catch{ "caught" }` 被当整数打印指针。）
+            Expr::TryBlock { body, catch_body, .. } => {
+                let block_tail_ty = |stmts: &[Stmt]| -> Option<Type> {
+                    if let Some(Stmt::Expr(e)) = stmts.last() {
+                        if let Ok(t) = self.infer_expr(e) {
+                            if !matches!(t, Type::Unit | Type::Nothing) {
+                                return Some(t);
+                            }
+                        }
+                    }
+                    None
+                };
+                Ok(block_tail_ty(catch_body)
+                    .or_else(|| block_tail_ty(body))
+                    .unwrap_or(Type::Unit))
+            }
+
+            // Lambda 表达式：按 (params) -> ret 推断函数类型，
+            // 使 `let f = { v: Int64 => ... }` 得到 Type::Function，
+            // 后续 `f(x)` 能走 call_indirect 而非退化为未知函数零值。
+            // 推断 body 时必须把形参加入作用域，否则 `v * 3` 会把 v 当未知
+            // 变量推断为 Int32，导致返回类型与 lambda 函数实际签名不一致。
+            Expr::Lambda { params, return_type, body, .. } => {
+                let param_tys: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
+                let ret = return_type.clone().or_else(|| {
+                    let mut sub = self.clone();
+                    for (pname, pty) in params {
+                        sub.add_local(pname.clone(), pty.clone());
+                    }
+                    sub.infer_expr(body).ok()
+                }).or(Some(Type::Int64));
+                Ok(Type::Function { params: param_tys, ret: Box::new(ret) })
             }
 
             // 函数值调用：返回被调用者函数类型的返回值类型
@@ -454,6 +502,27 @@ impl TypeInferenceContext {
 
             // 其他表达式：保守推断为对象引用 (I32)
             _ => Ok(Type::Int32),
+        }
+    }
+
+    /// 推断“块式表达式”的结果类型。
+    ///
+    /// parser 对 match/if 多语句分支统一产出 `Expr::Block(stmts, result)`；
+    /// 单语句分支是 `Block([], Some(e))`。直接对 Block 调用 infer_expr 会落
+    /// 兜底分支得到 Int32（错误地按指针处理字符串等结果）。剥开块取 result
+    /// （或最后一条 `Stmt::Expr`）的类型；无结果则为 Unit。
+    fn infer_block_result_ty(&self, expr: &Expr) -> Result<Type, String> {
+        match expr {
+            Expr::Block(stmts, result) => {
+                if let Some(r) = result {
+                    self.infer_expr(r)
+                } else if let Some(Stmt::Expr(e)) = stmts.last() {
+                    self.infer_expr(e)
+                } else {
+                    Ok(Type::Unit)
+                }
+            }
+            _ => self.infer_expr(expr),
         }
     }
 
@@ -495,6 +564,24 @@ impl TypeInferenceContext {
 
     /// 推断方法返回类型
     fn infer_method_return(&self, obj_ty: &Type, method: &str, _args: &[Expr]) -> Result<Type, String> {
+        // w54c: Option<T> 内建方法（兼容 Type::Option 与 Struct("Option",[T])）
+        if let Some(inner) = Self::option_payload_type(obj_ty) {
+            match method {
+                "isSome" | "isNone" => return Ok(Type::Bool),
+                "map" => {
+                    if let Some(Expr::Lambda { params, return_type, .. }) = _args.first() {
+                        let r = return_type
+                            .clone()
+                            .or_else(|| params.first().map(|(_, t)| t.clone()))
+                            .unwrap_or(Type::Int64);
+                        return Ok(Type::Option(Box::new(r)));
+                    }
+                    return Ok(Type::Option(Box::new(inner)));
+                }
+                "getOrThrow" | "getOrElse" => return Ok(inner),
+                _ => {}
+            }
+        }
         // String 接收者：镜像 lower_expr::try_lower_builtin_method 的返回类型。
         // 否则会落入通用 fallback 返回 Int64，导致 `let s = x.trim()` /
         // `let r = x.replace(..)` 等局部变量被错误推断为 Int64（wasm_ty=I64），
@@ -511,6 +598,21 @@ impl TypeInferenceContext {
                     return Ok(Type::Bool)
                 }
                 "toArray" => return Ok(Type::Array(Box::new(Type::Int64))),
+                _ => {}
+            }
+        }
+
+        // w54a: Array<T> 内建方法的返回类型（镜像 lower_expr 的 Array 分支）。
+        // 否则 `a.indexOf(x).isSome()` 的接收者会被推断为 Int64，无法分派 Option 谓词；
+        // slice/concat 后的局部变量元素类型也会丢失，导致下标读取步长错误。
+        if let Type::Array(elem) = obj_ty {
+            match method {
+                "indexOf" | "lastIndexOf" => return Ok(Type::Option(Box::new(Type::Int64))),
+                "contains" => return Ok(Type::Bool),
+                "reverse" | "fill" => return Ok(Type::Unit),
+                "slice" | "concat" | "clone" => return Ok(Type::Array(elem.clone())),
+                "size" => return Ok(Type::Int64),
+                "isEmpty" => return Ok(Type::Bool),
                 _ => {}
             }
         }
@@ -533,7 +635,7 @@ impl TypeInferenceContext {
 
         match (obj_type_name, method) {
             // ArrayList
-            ("ArrayList", "append" | "set" | "clear") => return Ok(Type::Unit),
+            ("ArrayList", "append" | "add" | "set" | "clear") => return Ok(Type::Unit),
             ("ArrayList", "get" | "remove" | "size") => return Ok(Type::Int64),
             ("ArrayList", "isEmpty") => return Ok(Type::Bool),
             // HashMap
@@ -557,6 +659,37 @@ impl TypeInferenceContext {
             "toString" => Ok(Type::String),
             // 默认返回 Int64（保守推断，避免 empty-stack 错误）
             _ => Ok(Type::Int64),
+        }
+    }
+
+    /// w54c: Option 载荷类型（兼容 Type::Option 与 Struct("Option",[T])）。
+    fn option_payload_type(ty: &Type) -> Option<Type> {
+        match ty {
+            Type::Option(inner) => Some((**inner).clone()),
+            Type::Struct(name, args) if name == "Option" && args.len() == 1 => {
+                Some(args[0].clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// w54c: 整数类型静态常量 Max/Min 的类型。
+    fn int_static_const_type(type_name: &str, field: &str) -> Option<Type> {
+        if field != "Max" && field != "Min" {
+            return None;
+        }
+        match type_name {
+            "Int8" => Some(Type::Int8),
+            "Int16" => Some(Type::Int16),
+            "Int32" => Some(Type::Int32),
+            "Int64" => Some(Type::Int64),
+            "IntNative" => Some(Type::IntNative),
+            "UInt8" => Some(Type::UInt8),
+            "UInt16" => Some(Type::UInt16),
+            "UInt32" => Some(Type::UInt32),
+            "UInt64" => Some(Type::UInt64),
+            "UIntNative" => Some(Type::UIntNative),
+            _ => None,
         }
     }
 
@@ -1179,6 +1312,79 @@ mod tests {
             arms: vec![],
         };
         assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::Unit);
+    }
+
+    // w54d：parser 把 match/if 分支体包装为 Expr::Block(stmts, result)，
+    // 守卫绑定分支和字符串结果都必须按块结果推断（此前落兜底 Int32 → 按指针打印）。
+    #[test]
+    fn test_w54d_infer_match_guarded_block_body_string() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Integer(3)),
+            arms: vec![AstMatchArm {
+                pattern: Pattern::Binding("n".into()),
+                guard: Some(Box::new(Expr::Bool(true))),
+                body: Box::new(Expr::Block(vec![], Some(Box::new(Expr::String("big".into()))))),
+            }],
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
+    }
+
+    #[test]
+    fn test_w54d_infer_if_multi_stmt_block_result() {
+        let ctx = TypeInferenceContext::new();
+        let then_branch = Expr::Block(
+            vec![Stmt::Let {
+                pattern: Pattern::Binding("a".into()),
+                ty: None,
+                value: Expr::Integer(1),
+            }],
+            Some(Box::new(Expr::String("x".into()))),
+        );
+        let expr = Expr::If {
+            cond: Box::new(Expr::Bool(true)),
+            then_branch: Box::new(then_branch),
+            else_branch: Some(Box::new(Expr::String("y".into()))),
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
+    }
+
+    #[test]
+    fn test_w54d_infer_try_block_value_from_catch() {
+        let ctx = TypeInferenceContext::new();
+        let expr = Expr::TryBlock {
+            resources: vec![],
+            body: vec![Stmt::Expr(Expr::Throw(Box::new(Expr::String("bad".into()))))],
+            catch_var: Some("e".into()),
+            catch_type: None,
+            catch_types: vec![],
+            catch_body: vec![Stmt::Expr(Expr::String("caught".into()))],
+            finally_body: None,
+        };
+        assert_eq!(ctx.infer_expr(&expr).unwrap(), Type::String);
+    }
+
+    #[test]
+    fn test_w54d_infer_lambda_with_capture_ret() {
+        let mut ctx = TypeInferenceContext::new();
+        ctx.add_local("base".into(), Type::Int64);
+        let expr = Expr::Lambda {
+            params: vec![("v".into(), Type::Int64)],
+            param_annotated: vec![true],
+            return_type: None,
+            body: Box::new(Expr::Binary {
+                op: BinOp::Add,
+                left: Box::new(Expr::Var("v".into())),
+                right: Box::new(Expr::Var("base".into())),
+            }),
+        };
+        match ctx.infer_expr(&expr).unwrap() {
+            Type::Function { params, ret } => {
+                assert_eq!(params, vec![Type::Int64]);
+                assert_eq!(*ret, Some(Type::Int64));
+            }
+            other => panic!("expected Function, got {:?}", other),
+        }
     }
 
     // ─── add_local / get_local ───
