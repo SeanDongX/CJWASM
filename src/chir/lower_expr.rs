@@ -62,6 +62,9 @@ pub struct LoweringContext<'a> {
     /// 当前函数返回值的 WASM 类型（用于 Return 语句的类型强制转换）
     pub return_wasm_ty: Option<ValType>,
 
+    /// 当前函数返回值的 AST 类型（用于 Return 语句中数组字面量的期望类型）
+    pub return_ast_ty: Option<Type>,
+
     /// 局部变量的 AST 类型（用于内置方法推断）
     pub local_ast_types: HashMap<String, crate::ast::Type>,
 
@@ -103,6 +106,7 @@ impl<'a> LoweringContext<'a> {
             enum_defs: Vec::new(),
             next_local: 0,
             return_wasm_ty: None,
+            return_ast_ty: None,
             local_ast_types: HashMap::new(),
             err_flag_stack: Vec::new(),
             err_val_stack: Vec::new(),
@@ -134,6 +138,111 @@ impl<'a> LoweringContext<'a> {
     /// 获取局部变量索引
     pub fn get_local(&self, name: &str) -> Option<u32> {
         self.local_map.get(name).copied()
+    }
+
+    /// 以“期望类型”降低表达式。
+    ///
+    /// 目前仅对数组字面量生效：当上下文（let/var 声明、赋值目标、函数形参、
+    /// return 语句）给出 `Array<T>` 期望类型时，字面量元素按 `T` 归一化，并让
+    /// 结果的 CHIR 类型为期望的 `Array<T>`。这样 codegen 依 `expr.ty` 取到的
+    /// 元素步长与读侧 ArrayGet/ArraySet（按变量静态元素类型取步长）严格一致。
+    /// 例：`let a: Array<Int32> = [1, 2]` 的元素必须按 4 字节槽写入。
+    ///
+    /// 非数组表达式忽略期望类型，走普通 `lower_expr`。
+    pub fn lower_expr_expected(
+        &mut self,
+        expr: &Expr,
+        expected: Option<&Type>,
+    ) -> Result<CHIRExpr, String> {
+        if let (Expr::Array(elems), Some(Type::Array(elem))) = (expr, expected) {
+            let elem_ast_ty = (**elem).clone();
+            let elem_wasm = match &elem_ast_ty {
+                Type::Unit | Type::Nothing => ValType::I32,
+                t => t.to_wasm(),
+            };
+            let mut elements: Vec<CHIRExpr> = Vec::with_capacity(elems.len());
+            for e in elems {
+                // 嵌套数组字面量继续按期望元素类型下放
+                let v = self.lower_expr_expected(e, Some(&elem_ast_ty))?;
+                elements.push(self.insert_cast_if_needed(v, elem_wasm));
+            }
+            return Ok(CHIRExpr::new(
+                CHIRExprKind::ArrayLiteral { elements },
+                Type::Array(Box::new(elem_ast_ty)),
+                ValType::I32,
+            ));
+        }
+        self.lower_expr(expr)
+    }
+
+    /// 变量名（含 `this`/`self`）→ 静态 AST 类型。
+    pub fn var_ast_type(&self, name: &str) -> Option<Type> {
+        if (name == "this" || name == "self") && self.current_class.is_some() {
+            let (cls, _) = self.current_class.as_ref().unwrap();
+            return Some(Type::Struct(cls.clone(), vec![]));
+        }
+        self.local_ast_types.get(name).cloned()
+            .or_else(|| self.type_ctx.locals.get(name).cloned())
+    }
+
+    /// 基类型为类时解析字段的静态 AST 类型（类字段类型表来自 class_field_info）。
+    pub fn field_value_type(&self, base: &Type, field: &str) -> Option<Type> {
+        if let Type::Struct(name, args) = base {
+            for n in Self::resolve_type_names(name, args) {
+                if let Some(info) = self.class_field_info.get(n.as_str())
+                    .and_then(|m| m.get(field)) {
+                    return Some(info.1.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// 赋值目标的静态 AST 类型（供数组字面量取期望元素类型）。
+    /// 对索引目标返回数组的元素类型，其余返回目标本身的类型。
+    pub fn assign_target_ast_type(&self, target: &crate::ast::AssignTarget) -> Option<Type> {
+        use crate::ast::AssignTarget;
+        match target {
+            AssignTarget::Var(name) => self.var_ast_type(name),
+            AssignTarget::Field { object, field } => {
+                let base = self.var_ast_type(object)?;
+                self.field_value_type(&base, field)
+            }
+            AssignTarget::FieldPath { base, fields } => {
+                let mut ty = self.var_ast_type(base)?;
+                for f in fields {
+                    ty = self.field_value_type(&ty, f)?;
+                }
+                Some(ty)
+            }
+            AssignTarget::Index { array, .. } => {
+                match self.var_ast_type(array)? {
+                    Type::Array(e) => Some(*e),
+                    _ => None,
+                }
+            }
+            AssignTarget::ExprField { object, field } => {
+                let base = self.type_ctx.infer_expr(object.as_ref()).ok()?;
+                self.field_value_type(&base, field)
+            }
+            AssignTarget::ExprIndex { expr, .. } => {
+                match self.type_ctx.infer_expr(expr.as_ref()).ok()? {
+                    Type::Array(e) => Some(*e),
+                    _ => None,
+                }
+            }
+            AssignTarget::IndexPath { base, fields, .. } => {
+                let mut ty = self.var_ast_type(base)?;
+                for f in fields {
+                    ty = self.field_value_type(&ty, f)?;
+                }
+                match ty {
+                    Type::Array(e) => Some(*e),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// 降低表达式
@@ -711,15 +820,18 @@ impl<'a> LoweringContext<'a> {
                 // 查询函数签名以获取参数类型，用于插入必要的类型转换
                 // 优先用与实际 arity 匹配的签名（含 this 时 arity+1）
                 let actual_arity = if needs_this { args.len() + 1 } else { args.len() };
-                let param_tys: Vec<ValType> = {
+                let (param_tys, param_ast_tys): (Vec<ValType>, Vec<crate::ast::Type>) = {
                     let mangled_key = format!("{}${}", name, actual_arity);
                     self.type_ctx.functions
                         .get(mangled_key.as_str())
                         .or_else(|| self.type_ctx.functions.get(name.as_str()))
-                        .map(|sig| sig.params.iter().map(|p| match p {
-                            crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
-                            t => t.to_wasm(),
-                        }).collect())
+                        .map(|sig| (
+                            sig.params.iter().map(|p| match p {
+                                crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                                t => t.to_wasm(),
+                            }).collect(),
+                            sig.params.clone(),
+                        ))
                         .unwrap_or_default()
                 };
 
@@ -744,7 +856,8 @@ impl<'a> LoweringContext<'a> {
                     .enumerate()
                     .map(|(i, a)| {
                         let param_idx = this_offset + i;
-                        let mut arg_chir = self.lower_expr(a)?;
+                        // 形参的 AST 类型已知时，数组字面量实参按形参元素类型归一化
+                        let mut arg_chir = self.lower_expr_expected(a, param_ast_tys.get(param_idx))?;
                         if let Some(&target_wasm) = param_tys.get(param_idx) {
                             if matches!(arg_chir.ty, crate::ast::Type::Unit | crate::ast::Type::Nothing) {
                                 let sub_ty = match target_wasm {
@@ -781,7 +894,7 @@ impl<'a> LoweringContext<'a> {
                                 .find(|(n, _)| n == &param_def.name)
                                 .map(|(_, v)| v);
                             let arg_chir = if let Some(val_expr) = named_val {
-                                self.lower_expr(val_expr)?
+                                self.lower_expr_expected(val_expr, Some(&param_def.ty))?
                             } else if let Some(default_expr) = &param_def.default {
                                 // 使用参数的默认值
                                 self.lower_expr(default_expr)?
@@ -1175,9 +1288,24 @@ impl<'a> LoweringContext<'a> {
 
             // 数组
             Expr::Array(elems) => {
+                // 元素槽宽必须与 ArrayGet/ArraySet 的读写步长一致：二者均以
+                // wasm_ty_bytes(元素类型) 为步长。元素类型取自字面量的推断数组类型
+                // Array(elem)；逐个元素按该类型归一化，否则 4 字节元素（类/指针/
+                // Int32/Float32/嵌套数组）会按 8 字节写入而按 4 字节读出（索引错位）。
+                let elem_ast_ty = match &ty {
+                    crate::ast::Type::Array(e) => (**e).clone(),
+                    _ => crate::ast::Type::Int64,
+                };
+                let elem_wasm = match &elem_ast_ty {
+                    crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                    t => t.to_wasm(),
+                };
                 let elements: Vec<CHIRExpr> = elems.iter()
-                    .map(|e| self.lower_expr(e))
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|e| {
+                        let v = self.lower_expr_expected(e, Some(&elem_ast_ty))?;
+                        Ok(self.insert_cast_if_needed(v, elem_wasm))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
                 CHIRExprKind::ArrayLiteral { elements }
             }
 
@@ -1194,12 +1322,14 @@ impl<'a> LoweringContext<'a> {
                         ));
                     }
                 }
-                // Check if this is tuple indexing (pair[0]) vs array indexing
+                // Check if this is tuple indexing (pair[0]) vs array indexing。
+                // 非 Var 的被索引表达式（如元组嵌套 t[1][0]、函数返回元组 f()[0]）
+                // 也按类型推断判定：若为 Tuple 则走 TupleGet（无数组头 4 字节偏移）。
                 let obj_ast_ty = if let Expr::Var(name) = array.as_ref() {
                     self.local_ast_types.get(name).cloned()
                         .or_else(|| self.type_ctx.locals.get(name.as_str()).cloned())
                 } else {
-                    None
+                    self.type_ctx.infer_expr(array).ok()
                 };
 
                 if let Some(crate::ast::Type::Tuple(elem_types)) = &obj_ast_ty {
@@ -1634,19 +1764,22 @@ impl<'a> LoweringContext<'a> {
                     }
                 };
 
-                let param_tys: Vec<ValType> = self.type_ctx.functions
+                let (param_tys, param_ast_tys): (Vec<ValType>, Vec<crate::ast::Type>) = self.type_ctx.functions
                     .get(init_name.as_str())
                     .or_else(|| self.type_ctx.functions.get(name.as_str()))
-                    .map(|sig| sig.params.iter().map(|p| match p {
-                        crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
-                        t => t.to_wasm(),
-                    }).collect())
+                    .map(|sig| (
+                        sig.params.iter().map(|p| match p {
+                            crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                            t => t.to_wasm(),
+                        }).collect(),
+                        sig.params.clone(),
+                    ))
                     .unwrap_or_default();
 
                 let args_chir: Result<Vec<CHIRExpr>, String> = args.iter()
                     .enumerate()
                     .map(|(i, a)| {
-                        let mut arg_chir = self.lower_expr(a)?;
+                        let mut arg_chir = self.lower_expr_expected(a, param_ast_tys.get(i))?;
                         if let Some(&target_wasm) = param_tys.get(i) {
                             if matches!(arg_chir.ty, crate::ast::Type::Unit | crate::ast::Type::Nothing) {
                                 let sub_ty = match target_wasm {

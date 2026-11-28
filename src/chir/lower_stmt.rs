@@ -10,7 +10,8 @@ impl<'a> LoweringContext<'a> {
         match stmt {
             // Let 语句
             Stmt::Let { pattern, ty, value } => {
-                let mut value_chir = self.lower_expr(value)?;
+                // 已知声明类型时，数组字面量按声明元素类型归一化（步长与读侧一致）
+                let mut value_chir = self.lower_expr_expected(value, ty.as_ref())?;
                 let local_wasm_ty = if let Some(decl_ty) = ty {
                     let decl_wasm = match decl_ty {
                         crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
@@ -59,7 +60,8 @@ impl<'a> LoweringContext<'a> {
 
             // Var 语句
             Stmt::Var { pattern, ty, value } => {
-                let mut value_chir = self.lower_expr(value)?;
+                // 已知声明类型时，数组字面量按声明元素类型归一化（步长与读侧一致）
+                let mut value_chir = self.lower_expr_expected(value, ty.as_ref())?;
                 let local_wasm_ty = if let Some(decl_ty) = ty {
                     let decl_wasm = match decl_ty {
                         crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,
@@ -101,7 +103,10 @@ impl<'a> LoweringContext<'a> {
 
             // 赋值语句
             Stmt::Assign { target, value } => {
-                let mut value_chir = self.lower_expr(value)?;
+                // 已知赋值目标的静态类型时，数组字面量按目标元素类型归一化，
+                // 使写入步长与读侧（按目标静态元素类型取步长）一致。
+                let expected_ast = self.assign_target_ast_type(target);
+                let mut value_chir = self.lower_expr_expected(value, expected_ast.as_ref())?;
                 let target_chir = self.lower_assign_target(target)?;
 
                 // 若赋值目标是已知类型的局部变量，插入类型强制转换，防止 local.set 类型不匹配
@@ -132,7 +137,8 @@ impl<'a> LoweringContext<'a> {
                     expr_opt = inner.as_deref();
                 }
                 let chir_opt = if let Some(expr) = expr_opt {
-                    let mut val = self.lower_expr(expr)?;
+                    let ret_ast = self.return_ast_ty.clone();
+                    let mut val = self.lower_expr_expected(expr, ret_ast.as_ref())?;
                     // 确保返回值类型与函数签名一致
                     if let Some(ret_ty) = self.return_wasm_ty {
                         val = self.insert_cast_if_needed(val, ret_ty);
@@ -488,7 +494,7 @@ impl<'a> LoweringContext<'a> {
 
             // Const 语句：等价于 Let
             Stmt::Const { name, ty, value } => {
-                let mut value_chir = self.lower_expr(value)?;
+                let mut value_chir = self.lower_expr_expected(value, ty.as_ref())?;
                 let local_wasm_ty = if let Some(decl_ty) = ty {
                     let decl_wasm = match decl_ty {
                         crate::ast::Type::Unit | crate::ast::Type::Nothing => wasm_encoder::ValType::I32,

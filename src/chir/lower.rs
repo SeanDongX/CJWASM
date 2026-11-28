@@ -63,6 +63,7 @@ pub fn lower_function(
         class_field_info,
     );
     ctx.return_wasm_ty = return_wasm;
+    ctx.return_ast_ty = Some(return_ty.clone());
     ctx.class_extends = class_extends.clone();
     ctx.func_return_types = func_return_types.clone();
     ctx.enum_defs = enum_defs.to_vec();

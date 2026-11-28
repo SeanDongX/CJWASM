@@ -185,6 +185,11 @@ pub struct CHIRCodeGen {
     /// 版运行时助手（溢出/越界 trap），`_start` 按 main 返回值退出。
     /// 默认关闭，生产代码生成路径不变。
     checked: bool,
+
+    /// 复合字面量（数组/元组/结构体构造）的嵌套深度：用于为每层分配独立的临时
+    /// 内存槽，避免内层表达式在求值时覆盖外层尚未用完的指针暂存
+    /// （见 `expr_scratch_enter`）。
+    expr_scratch_depth: std::cell::Cell<u32>,
 }
 
 impl CHIRCodeGen {
@@ -204,7 +209,26 @@ impl CHIRCodeGen {
             current_local_types: std::cell::RefCell::new(HashMap::new()),
             func_param_types: HashMap::new(),
             checked: crate::checked_mode(),
+            expr_scratch_depth: std::cell::Cell::new(0),
         }
+    }
+
+    /// 取得一个 4 字节临时内存槽（供复合字面量在求值子表达式期间暂存指针）。
+    ///
+    /// 使用 88..128 的保留区（WASI_SCRATCH 占 80..88，数据段从 128 开始），
+    /// 按嵌套深度分配不同槽位：内层字面量覆盖不到外层的暂存值。
+    /// 深度超过槽数时退回 48（与旧行为一致）。
+    fn expr_scratch_enter(&self) -> i32 {
+        const BASE: i32 = 88;
+        const SLOTS: u32 = 10;
+        let d = self.expr_scratch_depth.get();
+        let slot = if d < SLOTS { BASE + (d as i32) * 4 } else { 48 };
+        self.expr_scratch_depth.set(d + 1);
+        slot
+    }
+
+    fn expr_scratch_exit(&self) {
+        self.expr_scratch_depth.set(self.expr_scratch_depth.get().saturating_sub(1));
     }
 
     fn find_or_create_func_type_idx(&self, params: &[ValType], results: &[ValType]) -> u32 {
@@ -4589,22 +4613,27 @@ impl CHIRCodeGen {
                 let alloc_idx = self.func_indices.get(RT_ALLOC).copied().unwrap_or(0);
                 let elem_count = elements.len();
                 let total_size = (elem_count * 8) as i32;
-                const TUPLE_SAVE: i32 = 48;
-                func.instruction(&Instruction::I32Const(TUPLE_SAVE));
+                // 按嵌套深度取独立暂存槽：元素可能是嵌套元组/数组字面量
+                let tuple_save = self.expr_scratch_enter();
+                func.instruction(&Instruction::I32Const(tuple_save));
                 func.instruction(&Instruction::I32Const(total_size));
                 func.instruction(&Instruction::Call(alloc_idx));
                 func.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
                 for (i, elem) in elements.iter().enumerate() {
-                    func.instruction(&Instruction::I32Const(TUPLE_SAVE));
+                    func.instruction(&Instruction::I32Const(tuple_save));
                     func.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
                     func.instruction(&Instruction::I32Const((i * 8) as i32));
                     func.instruction(&Instruction::I32Add);
                     self.emit_expr(elem, func);
-                    // Store as 8-byte value
+                    // Store as 8-byte slot (TupleGet 固定以 8 字节步长读取)
                     match elem.wasm_ty {
                         ValType::I32 => {
                             func.instruction(&Instruction::I64ExtendI32S);
                             func.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
+                        }
+                        ValType::F32 => {
+                            // Float32 元素按 4 字节存入槽首（读侧 F32Load 取同一地址）
+                            func.instruction(&Instruction::F32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
                         }
                         ValType::F64 => {
                             func.instruction(&Instruction::F64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
@@ -4614,8 +4643,9 @@ impl CHIRCodeGen {
                         }
                     }
                 }
-                func.instruction(&Instruction::I32Const(TUPLE_SAVE));
+                func.instruction(&Instruction::I32Const(tuple_save));
                 func.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+                self.expr_scratch_exit();
             }
 
             CHIRExprKind::TupleGet { tuple, index } => {
@@ -4815,10 +4845,11 @@ impl CHIRCodeGen {
                         })
                     });
                 let obj_size = std::cmp::max(obj_size, 8);
-                // 使用 IO buffer 保留区的 56-59 字节暂存分配的指针
-                const PTR_SAVE: i32 = 56;
-                // alloc → 暂存到 mem[56]
-                func.instruction(&Instruction::I32Const(PTR_SAVE));
+                // 按嵌套深度取独立暂存槽：字段初始化表达式可能是嵌套字面量构造，
+                // 其求值不得覆盖本层对象的指针暂存。
+                let ptr_save = self.expr_scratch_enter();
+                // alloc → 暂存到临时槽
+                func.instruction(&Instruction::I32Const(ptr_save));
                 func.instruction(&Instruction::I32Const(obj_size as i32));
                 func.instruction(&Instruction::Call(alloc_idx));
                 func.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
@@ -4834,7 +4865,7 @@ impl CHIRCodeGen {
                         (0, Type::Int64)
                     };
                     // ptr + offset
-                    func.instruction(&Instruction::I32Const(PTR_SAVE));
+                    func.instruction(&Instruction::I32Const(ptr_save));
                     func.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
                     if field_offset > 0 {
                         func.instruction(&Instruction::I32Const(field_offset as i32));
@@ -4848,8 +4879,9 @@ impl CHIRCodeGen {
                     emit_store_by_type(&field_ty, func);
                 }
                 // 将指针推入栈作为结果
-                func.instruction(&Instruction::I32Const(PTR_SAVE));
+                func.instruction(&Instruction::I32Const(ptr_save));
                 func.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+                self.expr_scratch_exit();
             }
 
             CHIRExprKind::Match { subject, arms } => {
@@ -4859,35 +4891,54 @@ impl CHIRCodeGen {
             CHIRExprKind::ArrayLiteral { elements } => {
                 let alloc_idx = self.func_indices.get(RT_ALLOC).copied().unwrap_or(0);
                 let elem_count = elements.len();
-                let elem_size = 8u32; // i64 elements
+                // 元素槽宽必须与 ArrayGet/ArraySet 的读写步长一致：二者均以
+                // wasm_ty_bytes(元素 wasm 类型) 为步长。此前硬编码 8 字节槽会让
+                // 类/指针/Int32/Float32/嵌套数组等 4 字节元素按 8 字节写入、却按
+                // 4 字节读出，导致索引错位（如 [N(0), N(1)] 的 a[1].v 得到 0）。
+                // 元素类型取字面量表达式的推断/期望数组类型 Array(elem)。
+                let elem_ast_ty = match &expr.ty {
+                    Type::Array(e) => (**e).clone(),
+                    _ => Type::Int64,
+                };
+                let elem_wasm = match &elem_ast_ty {
+                    Type::Unit | Type::Nothing => ValType::I32,
+                    t => t.to_wasm(),
+                };
+                let elem_size = wasm_ty_bytes(elem_wasm);
                 let total_size = std::cmp::max(4 + elem_count as u32 * elem_size, 8);
-                const ARR_PTR_SAVE: i32 = 48;
+                // 按嵌套深度取独立暂存槽：元素本身可能是嵌套字面量，
+                // 其求值不得覆盖本层数组指针（否则后续元素写到错误基址）。
+                let arr_ptr_save = self.expr_scratch_enter();
                 // alloc → save ptr
-                func.instruction(&Instruction::I32Const(ARR_PTR_SAVE));
+                func.instruction(&Instruction::I32Const(arr_ptr_save));
                 func.instruction(&Instruction::I32Const(total_size as i32));
                 func.instruction(&Instruction::Call(alloc_idx));
                 func.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
                 // store length at offset 0
-                func.instruction(&Instruction::I32Const(ARR_PTR_SAVE));
+                func.instruction(&Instruction::I32Const(arr_ptr_save));
                 func.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
                 func.instruction(&Instruction::I32Const(elem_count as i32));
                 func.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
                 // store each element at offset 4 + i * elem_size
                 for (i, elem) in elements.iter().enumerate() {
-                    func.instruction(&Instruction::I32Const(ARR_PTR_SAVE));
+                    func.instruction(&Instruction::I32Const(arr_ptr_save));
                     func.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
                     let elem_offset = 4 + i as u32 * elem_size;
                     func.instruction(&Instruction::I32Const(elem_offset as i32));
                     func.instruction(&Instruction::I32Add);
                     self.emit_expr(elem, func);
-                    if elem.wasm_ty == ValType::I32 {
-                        func.instruction(&Instruction::I64ExtendI32S);
+                    if !self.expr_produces_wasm_value_ctx(elem) {
+                        emit_zero(elem_wasm, func);
+                    } else if elem.wasm_ty != elem_wasm {
+                        // 元素值按元素类型归一化（如 Int64 字面量 → Int32 槽）
+                        self.emit_cast(elem.wasm_ty, elem_wasm, func);
                     }
-                    func.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
+                    emit_store(elem_wasm, func);
                 }
                 // push array pointer as result
-                func.instruction(&Instruction::I32Const(ARR_PTR_SAVE));
+                func.instruction(&Instruction::I32Const(arr_ptr_save));
                 func.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+                self.expr_scratch_exit();
             }
 
             CHIRExprKind::FieldSet { object, field_offset, value } => {
