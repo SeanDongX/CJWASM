@@ -481,6 +481,45 @@ impl<'a> LoweringContext<'a> {
                 let left_chir = self.lower_expr(left)?;
                 let right_chir = self.lower_expr(right)?;
 
+                // String == / !=：cjc 语义为按内容（字节）比较，而非比较堆指针。
+                // 字面量 vs 字面量因 interning 同指针而碰巧正确，但插值/concat/replace
+                // 等堆上构造的串与字面量比较会落到指针比较而错误。仅当两侧静态类型均为
+                // String 时才走内容比较；类实例等引用类型的 == 仍是引用比较（不受影响）。
+                // 复用 w31a 的 __checked_str_eq(a, b)：读 size 不一致返回 0，否则逐字节
+                // 比较，全部相等返回 1（纯谓词，不 trap），与 Assert.equals 使用一致。
+                if matches!(op, crate::ast::BinOp::Eq | crate::ast::BinOp::NotEq)
+                    && matches!(left_chir.ty, crate::ast::Type::String)
+                    && matches!(right_chir.ty, crate::ast::Type::String)
+                {
+                    if let Some(eq_idx) = self.func_indices.get("__checked_str_eq").copied() {
+                        let eq = CHIRExpr::new(
+                            CHIRExprKind::Call {
+                                func_idx: eq_idx,
+                                args: vec![
+                                    self.insert_cast_if_needed(left_chir, ValType::I32),
+                                    self.insert_cast_if_needed(right_chir, ValType::I32),
+                                ],
+                            },
+                            crate::ast::Type::Bool,
+                            ValType::I32,
+                        );
+                        return Ok(if matches!(op, crate::ast::BinOp::NotEq) {
+                            // != 语义：内容不等 → 对内容相等结果取反
+                            CHIRExpr::new(
+                                CHIRExprKind::Unary {
+                                    op: crate::ast::UnaryOp::Not,
+                                    expr: Box::new(eq),
+                                },
+                                crate::ast::Type::Bool,
+                                ValType::I32,
+                            )
+                        } else {
+                            eq
+                        });
+                    }
+                    // 运行时助手不可用时退回通用指针比较，保证编译不中断
+                }
+
                 // String * 整数：字符串重复重载 → 调用运行时 __str_repeat(str, n)
                 // （`"f" * 16` 这类写法在 std 用例中常见）
                 if matches!(op, crate::ast::BinOp::Mul) && matches!(ty, Type::String) {
@@ -4129,6 +4168,59 @@ mod tests {
                 assert_eq!(args.len(), 2);
             }
             other => panic!("期望 __str_concat 调用，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lower_string_eq_calls_runtime() {
+        // w52a: String == 必须降为 __checked_str_eq(a, b) 内容比较，
+        // 而不是比较两个字符串指针（后者会让堆串 vs 字面量误判）。
+        let type_ctx = TypeInferenceContext::new();
+        let mut fi = HashMap::new();
+        fi.insert("__checked_str_eq".to_string(), 55u32);
+        let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Binary {
+            op: crate::ast::BinOp::Eq,
+            left: Box::new(Expr::String("前${x}后".into())),
+            right: Box::new(Expr::String("前中后".into())),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert_eq!(chir.ty, Type::Bool);
+        assert_eq!(chir.wasm_ty, ValType::I32);
+        match chir.kind {
+            CHIRExprKind::Call { func_idx, args } => {
+                assert_eq!(func_idx, 55);
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("期望 __checked_str_eq 调用，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lower_string_neq_wraps_not() {
+        // w52a: String != 降为 Not(__checked_str_eq(a, b))。
+        let type_ctx = TypeInferenceContext::new();
+        let mut fi = HashMap::new();
+        fi.insert("__checked_str_eq".to_string(), 55u32);
+        let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Binary {
+            op: crate::ast::BinOp::NotEq,
+            left: Box::new(Expr::String("abc".into())),
+            right: Box::new(Expr::String("abd".into())),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert_eq!(chir.ty, Type::Bool);
+        match chir.kind {
+            CHIRExprKind::Unary { op: crate::ast::UnaryOp::Not, expr: inner } => {
+                assert!(matches!(inner.kind, CHIRExprKind::Call { .. }));
+            }
+            other => panic!("期望 Not(__checked_str_eq) 包裹，实际 {:?}", other),
         }
     }
 
