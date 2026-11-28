@@ -5713,60 +5713,145 @@ impl CodeGen {
     }
 
     /// __str_replace(str: i32, old: i32, new: i32) -> i32
-    /// 找到第一个匹配并替换
+    ///
+    /// 替换**全部**非重叠匹配（与 CHIR 路径 `build_rt_str_replace` 及 cjc 一致）。
+    /// 采用「游标扫描原串 + 逐段拼接」：每次用 index_of 在 suffix 上找最近匹配，
+    /// 追加 [0,rel) 段与 new，游标推进 rel+old_len，避免重扫已替换内容（防 "ab"→"aab" 死循环）。
+    /// old 为空时在每个字节边界插入 new；无匹配时返回原串。
+    ///
+    /// locals: 0=str 1=old 2=new
+    ///         3=str_len 4=old_len 5=new_len 6=cursor 7=result 8=suffix 9=rel 10=i
     fn emit_str_replace(&self) -> WasmFunc {
         let mem = |offset: u64, align: u32| wasm_encoder::MemArg {
             offset,
             align,
             memory_index: 0,
         };
-        // locals: 0=str, 1=old, 2=new, 3=idx(i64), 4=left(i32), 5=right(i32)
-        let mut f = WasmFunc::new(vec![
-            (1, ValType::I64), // 3: idx
-            (1, ValType::I32), // 4: left
-            (1, ValType::I32), // 5: right
-        ]);
-        // idx = __str_index_of(str, old)
+        let mut f = WasmFunc::new(vec![(8, ValType::I32)]);
+        // str_len / old_len / new_len
         f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::Call(self.func_indices["__str_index_of"]));
+        f.instruction(&Instruction::I32Load(mem(0, 2)));
         f.instruction(&Instruction::LocalSet(3));
-
-        // if idx == -1 → return str (no match)
-        f.instruction(&Instruction::LocalGet(3));
-        f.instruction(&Instruction::I64Const(-1));
-        f.instruction(&Instruction::I64Eq);
-        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-        f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::Return);
-        f.instruction(&Instruction::End);
-
-        // left = str_substring(str, 0, idx)
-        f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::I32Const(0));
-        f.instruction(&Instruction::LocalGet(3));
-        f.instruction(&Instruction::I32WrapI64);
-        f.instruction(&Instruction::Call(self.func_indices["__str_substring"]));
-        f.instruction(&Instruction::LocalSet(4));
-
-        // right = str_substring(str, idx + old.len, str.len)
-        f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::LocalGet(3));
-        f.instruction(&Instruction::I32WrapI64);
         f.instruction(&Instruction::LocalGet(1));
         f.instruction(&Instruction::I32Load(mem(0, 2)));
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalSet(4));
+        f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::I32Load(mem(0, 2)));
-        f.instruction(&Instruction::Call(self.func_indices["__str_substring"]));
         f.instruction(&Instruction::LocalSet(5));
 
-        // result = left + new + right
+        // ── 特例：old 为空 → 在每个字节边界插入 new ──
         f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // result = 空串
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::Call(self.func_indices["__str_substring"]));
+            f.instruction(&Instruction::LocalSet(7));
+            // i = 0
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::LocalSet(10));
+            f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::LocalGet(3));
+            f.instruction(&Instruction::I32GeU);
+            f.instruction(&Instruction::BrIf(1));
+            // result = concat(result, new)
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::Call(self.func_indices["__str_concat"]));
+            f.instruction(&Instruction::LocalSet(7));
+            // result = concat(result, substring(str, i, i+1))
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(0));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::Call(self.func_indices["__str_substring"]));
+            f.instruction(&Instruction::Call(self.func_indices["__str_concat"]));
+            f.instruction(&Instruction::LocalSet(7));
+            // i++
+            f.instruction(&Instruction::LocalGet(10));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::LocalSet(10));
+            f.instruction(&Instruction::Br(0));
+            f.instruction(&Instruction::End); // loop
+            f.instruction(&Instruction::End); // block
+            // 末尾再插一次 new
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(2));
+            f.instruction(&Instruction::Call(self.func_indices["__str_concat"]));
+            f.instruction(&Instruction::Return);
+        }
+        f.instruction(&Instruction::End);
+
+        // result = 空串；cursor = 0
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::Call(self.func_indices["__str_substring"]));
+        f.instruction(&Instruction::LocalSet(7));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(6));
+
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        // suffix = substring(str, cursor, str_len)
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::Call(self.func_indices["__str_substring"]));
+        f.instruction(&Instruction::LocalSet(8));
+        // rel = wrap(index_of(suffix, old))
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::Call(self.func_indices["__str_index_of"]));
+        f.instruction(&Instruction::I32WrapI64);
+        f.instruction(&Instruction::LocalSet(9));
+        // if rel == -1 { result = concat(result, suffix); break }
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Const(-1));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            f.instruction(&Instruction::LocalGet(7));
+            f.instruction(&Instruction::LocalGet(8));
+            f.instruction(&Instruction::Call(self.func_indices["__str_concat"]));
+            f.instruction(&Instruction::LocalSet(7));
+            f.instruction(&Instruction::Br(2));
+        }
+        f.instruction(&Instruction::End);
+        // result = concat(result, substring(suffix, 0, rel))
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::LocalGet(8));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::Call(self.func_indices["__str_substring"]));
+        f.instruction(&Instruction::Call(self.func_indices["__str_concat"]));
+        f.instruction(&Instruction::LocalSet(7));
+        // result = concat(result, new)
+        f.instruction(&Instruction::LocalGet(7));
         f.instruction(&Instruction::LocalGet(2));
         f.instruction(&Instruction::Call(self.func_indices["__str_concat"]));
-        f.instruction(&Instruction::LocalGet(5));
-        f.instruction(&Instruction::Call(self.func_indices["__str_concat"]));
+        f.instruction(&Instruction::LocalSet(7));
+        // cursor = cursor + rel + old_len
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::LocalGet(9));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(6));
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End); // loop
+        f.instruction(&Instruction::End); // block
+
+        // return result
+        f.instruction(&Instruction::LocalGet(7));
         f.instruction(&Instruction::End);
         f
     }

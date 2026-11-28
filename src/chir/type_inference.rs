@@ -382,6 +382,10 @@ impl TypeInferenceContext {
                 Ok(Type::Tuple(types?))
             }
 
+            // Option：Some(v) → Option<Tv>；None 无载荷类型信息（Option<Nothing>）
+            Expr::Some(inner) => Ok(Type::Option(Box::new(self.infer_expr(inner)?))),
+            Expr::None => Ok(Type::Option(Box::new(Type::Nothing))),
+
             // 结构体初始化
             Expr::StructInit { name, .. } => {
                 Ok(Type::Struct(name.clone(), vec![]))

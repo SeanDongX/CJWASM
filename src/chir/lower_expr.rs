@@ -175,6 +175,75 @@ impl<'a> LoweringContext<'a> {
         self.lower_expr(expr)
     }
 
+    /// 将 `println(option)` / `print(option)` 降低为按 Option tag 分派的两分支输出：
+    /// `Some(v)` → `Some(` + v + `)`；`None` → `None`。换行由调用处决定。
+    ///
+    /// Option 的运行时布局为 `[tag: i32][value]`（见 `Expr::Some` lowering），
+    /// 这里直接读 tag/载荷，无需新增运行时助手。
+    fn lower_option_print(
+        &mut self,
+        opt: CHIRExpr,
+        inner_ty: Type,
+        newline: bool,
+        fd: i32,
+    ) -> CHIRExpr {
+        let unit = crate::ast::Type::Unit;
+        let ptr = self.alloc_local_typed("__opt_print_ptr".into(), ValType::I32);
+        let ptr_get = || CHIRExpr::new(CHIRExprKind::Local(ptr), crate::ast::Type::Int32, ValType::I32);
+        let tag = CHIRExpr::new(
+            CHIRExprKind::Load { ptr: Box::new(ptr_get()), offset: 0, align: 2 },
+            crate::ast::Type::Int32, ValType::I32,
+        );
+        let one = CHIRExpr::new(CHIRExprKind::Integer(1), crate::ast::Type::Int32, ValType::I32);
+        let cond = CHIRExpr::new(
+            CHIRExprKind::Binary { op: crate::ast::BinOp::Eq, left: Box::new(tag), right: Box::new(one) },
+            crate::ast::Type::Bool, ValType::I32,
+        );
+        let inner_wasm = match &inner_ty {
+            crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+            t => t.to_wasm(),
+        };
+        let align = if inner_wasm == ValType::I64 || inner_wasm == ValType::F64 { 3 } else { 2 };
+        let value = CHIRExpr::new(
+            CHIRExprKind::Load { ptr: Box::new(ptr_get()), offset: 4, align },
+            inner_ty, inner_wasm,
+        );
+        let print = |arg: Option<Box<CHIRExpr>>, nl: bool| {
+            CHIRExpr::new(
+                CHIRExprKind::Print { arg, newline: nl, fd },
+                crate::ast::Type::Unit,
+                ValType::I32,
+            )
+        };
+        let str_lit = |s: &str| {
+            CHIRExpr::new(CHIRExprKind::String(s.to_string()), crate::ast::Type::String, ValType::I32)
+        };
+        let then_stmts = vec![
+            crate::chir::CHIRStmt::Expr(print(Some(Box::new(str_lit("Some("))), false)),
+            crate::chir::CHIRStmt::Expr(print(Some(Box::new(value)), false)),
+            crate::chir::CHIRStmt::Expr(print(Some(Box::new(str_lit(")"))), false)),
+        ];
+        let else_stmts = vec![
+            crate::chir::CHIRStmt::Expr(print(Some(Box::new(str_lit("None"))), false)),
+        ];
+        let if_expr = CHIRExpr::new(
+            CHIRExprKind::If {
+                cond: Box::new(cond),
+                then_block: CHIRBlock { stmts: then_stmts, result: None },
+                else_block: Some(CHIRBlock { stmts: else_stmts, result: None }),
+            },
+            unit.clone(), ValType::I32,
+        );
+        let mut stmts = vec![
+            crate::chir::CHIRStmt::Let { local_idx: ptr, value: opt },
+            crate::chir::CHIRStmt::Expr(if_expr),
+        ];
+        if newline {
+            stmts.push(crate::chir::CHIRStmt::Expr(print(None, true)));
+        }
+        CHIRExpr::new(CHIRExprKind::Block(CHIRBlock { stmts, result: None }), unit, ValType::I32)
+    }
+
     /// 变量名（含 `this`/`self`）→ 静态 AST 类型。
     pub fn var_ast_type(&self, name: &str) -> Option<Type> {
         if (name == "this" || name == "self") && self.current_class.is_some() {
@@ -436,6 +505,28 @@ impl<'a> LoweringContext<'a> {
                     });
                 }
 
+                // String + String：字符串拼接重载 → 调用运行时 __str_concat(ptr1, ptr2)。
+                // 若直接落到下方通用 Binary(Add) 会把两个字符串指针相加，
+                // 结果指向非法地址（表现为 println 输出空串）。
+                if matches!(op, crate::ast::BinOp::Add)
+                    && matches!(ty, Type::String)
+                    && matches!(left_chir.ty, Type::String)
+                    && matches!(right_chir.ty, Type::String)
+                {
+                    return Ok(match self.func_indices.get("__str_concat").copied() {
+                        Some(idx) => CHIRExpr::new(
+                            CHIRExprKind::Call {
+                                func_idx: idx,
+                                args: vec![left_chir, right_chir],
+                            },
+                            Type::String,
+                            ValType::I32,
+                        ),
+                        // 运行时助手不可用时退化为左操作数，保证编译不中断
+                        None => left_chir,
+                    });
+                }
+
                 let is_comparison = matches!(op,
                     crate::ast::BinOp::Eq | crate::ast::BinOp::NotEq
                     | crate::ast::BinOp::Lt | crate::ast::BinOp::LtEq
@@ -544,10 +635,35 @@ impl<'a> LoweringContext<'a> {
                         let arg = if args.is_empty() {
                             None
                         } else {
-                            Some(Box::new(self.lower_expr(&args[0])?))
+                            Some(self.lower_expr(&args[0])?)
                         };
+                        // Option<T>：按 tag 输出 "Some(<value>)" / "None"，
+                        // 与 cjc 的 Option.toString() 一致（此前直接打印底层指针）。
+                        // 类型注解 `Option<T>` 经类型解析后是 Struct("Option", [T])，
+                        // 而 `Some(v)` 表达式推断为 Type::Option(Tv)，两种形态都要识别。
+                        let option_inner = |t: &Type| -> Option<Type> {
+                            match t {
+                                Type::Option(inner) => Some((**inner).clone()),
+                                Type::Struct(name, args)
+                                    if name == "Option" && args.len() == 1 =>
+                                {
+                                    Some(args[0].clone())
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(arg_expr) = arg {
+                            if let Some(inner_ty) = option_inner(&arg_expr.ty) {
+                                return Ok(self.lower_option_print(arg_expr, inner_ty, newline, fd));
+                            }
+                            return Ok(CHIRExpr::new(
+                                CHIRExprKind::Print { arg: Some(Box::new(arg_expr)), newline, fd },
+                                crate::ast::Type::Unit,
+                                ValType::I32,
+                            ));
+                        }
                         return Ok(CHIRExpr::new(
-                            CHIRExprKind::Print { arg, newline, fd },
+                            CHIRExprKind::Print { arg: None, newline, fd },
                             crate::ast::Type::Unit,
                             ValType::I32,
                         ));
@@ -2056,6 +2172,7 @@ impl<'a> LoweringContext<'a> {
             Expr::Some(inner) => {
                 let alloc_idx = self.func_indices.get("__alloc").copied().unwrap_or(0);
                 let inner_chir = self.lower_expr(inner)?;
+                let inner_ty = inner_chir.ty.clone();
                 let value_wasm = inner_chir.wasm_ty;
                 let value_size: i64 = if value_wasm == ValType::I64 || value_wasm == ValType::F64 { 8 } else { 4 };
                 let total_size = 4 + value_size;
@@ -2082,7 +2199,7 @@ impl<'a> LoweringContext<'a> {
                 ];
                 return Ok(CHIRExpr::new(
                     CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(tmp_get())) }),
-                    crate::ast::Type::Int32, ValType::I32,
+                    crate::ast::Type::Option(Box::new(inner_ty)), ValType::I32,
                 ));
             }
 
@@ -2107,7 +2224,7 @@ impl<'a> LoweringContext<'a> {
                 ];
                 return Ok(CHIRExpr::new(
                     CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(tmp_get())) }),
-                    crate::ast::Type::Int32, ValType::I32,
+                    crate::ast::Type::Option(Box::new(crate::ast::Type::Nothing)), ValType::I32,
                 ));
             }
 
@@ -3963,6 +4080,94 @@ mod tests {
         };
         let chir = ctx.lower_expr(&expr).unwrap();
         assert!(matches!(chir.kind, CHIRExprKind::Print { .. }));
+    }
+
+    // ── w50b 运行时打印回归 ──────────────────────────────────────────────
+
+    #[test]
+    fn test_lower_string_concat_calls_runtime() {
+        // `"a" + x` 必须降为 __str_concat 调用，而不是把两个字符串指针相加
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local("x".into(), Type::String);
+        let mut fi = HashMap::new();
+        fi.insert("__str_concat".to_string(), 9u32);
+        let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("x".into(), ValType::I32);
+
+        let expr = Expr::Binary {
+            op: crate::ast::BinOp::Add,
+            left: Box::new(Expr::String("a".into())),
+            right: Box::new(Expr::Var("x".into())),
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert_eq!(chir.ty, Type::String);
+        match chir.kind {
+            CHIRExprKind::Call { func_idx, args } => {
+                assert_eq!(func_idx, 9);
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("期望 __str_concat 调用，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lower_print_option_some() {
+        // println(Some(1)) → 按 tag 分派输出 "Some(" + v + ")" / "None"
+        let type_ctx = TypeInferenceContext::new();
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+
+        let expr = Expr::Call {
+            name: "println".into(), args: vec![Expr::Some(Box::new(Expr::Integer(1)))],
+            type_args: None, named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        let CHIRExprKind::Block(block) = chir.kind else {
+            panic!("println(Some(..)) 应降为分派 Block");
+        };
+        let if_expr = block.stmts.iter().find_map(|s| match s {
+            crate::chir::CHIRStmt::Expr(e) => Some(e),
+            _ => None,
+        }).expect("缺少 If 分派表达式");
+        let CHIRExprKind::If { then_block, .. } = &if_expr.kind else {
+            panic!("期望 If 分派");
+        };
+        let first_is_some_prefix = matches!(
+            then_block.stmts.first(),
+            Some(crate::chir::CHIRStmt::Expr(CHIRExpr {
+                kind: CHIRExprKind::Print {
+                    arg: Some(a),
+                    newline: false,
+                    ..
+                },
+                ..
+            })) if matches!(&a.kind, CHIRExprKind::String(s) if s == "Some(")
+        );
+        assert!(first_is_some_prefix, "Some 分支应先输出 \"Some(\"");
+    }
+
+    #[test]
+    fn test_lower_print_option_annotated_none() {
+        // `let o: Option<Int64> = None; println(o)` 的类型注解解析为 Struct("Option",[T])
+        let mut type_ctx = TypeInferenceContext::new();
+        type_ctx.add_local(
+            "o".into(),
+            Type::Struct("Option".into(), vec![Type::Int64]),
+        );
+        let fi = HashMap::new(); let fp = HashMap::new();
+        let so = HashMap::new(); let co = HashMap::new(); let ci = HashMap::new();
+        let mut ctx = make_ctx(&type_ctx, &fi, &fp, &so, &co, &ci);
+        ctx.alloc_local_typed("o".into(), ValType::I32);
+
+        let expr = Expr::Call {
+            name: "println".into(), args: vec![Expr::Var("o".into())],
+            type_args: None, named_args: vec![],
+        };
+        let chir = ctx.lower_expr(&expr).unwrap();
+        assert!(matches!(chir.kind, CHIRExprKind::Block(_)));
     }
 
     #[test]
