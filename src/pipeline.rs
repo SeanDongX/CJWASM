@@ -704,6 +704,64 @@ pub fn check_multi_file_packages(units: &[(String, Program)]) -> Vec<String> {
         ));
     }
 
+    // 5) 子包名不得与父包中的顶层声明同名（11.1.2：确保访问路径唯一）。
+    //
+    // cjc 1.0.5 实测：包 `x` 中声明 `class b`/`func b`，且存在子包 `x.b` 时，
+    // 报 `top-level declaration 'b' is conflicted with possible sub-package 'x.b'`
+    // （大小写敏感：`class B` 与子包 `b` 不冲突）。这里仅当父包确有同名顶层
+    // 声明（函数/类/结构体/枚举/接口/常量/类型别名）且子包也在本组单元内时触发。
+    let mut pkg_names: HashSet<String> = HashSet::new();
+    let mut decls_by_pkg: HashMap<String, HashSet<String>> = HashMap::new();
+    for (_, prog) in units {
+        let Some(pkg) = pkg_of(prog) else { continue };
+        pkg_names.insert(pkg.to_string());
+        let names = decls_by_pkg.entry(pkg.to_string()).or_default();
+        for f in &prog.functions {
+            names.insert(f.name.clone());
+        }
+        for c in &prog.classes {
+            names.insert(c.name.clone());
+        }
+        for s in &prog.structs {
+            names.insert(s.name.clone());
+        }
+        for e in &prog.enums {
+            names.insert(e.name.clone());
+        }
+        for it in &prog.interfaces {
+            names.insert(it.name.clone());
+        }
+        for cd in &prog.constants {
+            names.insert(cd.name.clone());
+        }
+        for (n, _) in &prog.type_aliases {
+            names.insert(n.clone());
+        }
+    }
+    let mut sub_pkgs: Vec<(String, String, String)> = Vec::new(); // (子包, 父包, 末段)
+    for q in &pkg_names {
+        if let Some(idx) = q.rfind('.') {
+            let parent = &q[..idx];
+            let seg = &q[idx + 1..];
+            if pkg_names.contains(parent) {
+                sub_pkgs.push((q.clone(), parent.to_string(), seg.to_string()));
+            }
+        }
+    }
+    sub_pkgs.sort();
+    for (child, parent, seg) in sub_pkgs {
+        let conflicts = decls_by_pkg
+            .get(&parent)
+            .map(|d| d.contains(&seg))
+            .unwrap_or(false);
+        if conflicts {
+            errors.push(format!(
+                "顶层声明 '{}' 与子包 '{}' 冲突（11.1.2：子包不得与当前包成员同名，cjc: top-level declaration '{}' is conflicted with possible sub-package '{}'）",
+                seg, child, seg, child
+            ));
+        }
+    }
+
     errors
 }
 

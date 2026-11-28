@@ -19,6 +19,7 @@ fn print_usage() {
     eprintln!("  --use-chir       使用 CHIR 中间表示编译（实验性）");
     eprintln!("  --checked        开启运行时检查（整数溢出/数组越界/断言 trap）");
     eprintln!("  --check-packages 多文件编译时校验包结构（同目录单包/路径包名/循环 import/入口唯一）");
+    eprintln!("  --require-main   按可执行模块编译：要求顶层存在 main（缺失即报错，11.1.5.1(7)）");
     eprintln!();
     eprintln!("示例:");
     eprintln!("  cjwasm build                       # 编译 cjpm 工程");
@@ -195,6 +196,8 @@ fn cmd_compile(args: &[String]) {
     let mut use_chir = true;
     // w45a：多文件包结构校验（仅多文件 + 显式请求时启用；默认关闭，保持旧行为）。
     let mut check_packages = false;
+    // w46a：可执行模块入口校验（仅显式请求时启用；默认关闭，保持旧行为）。
+    let mut require_main = false;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "-o" && i + 1 < args.len() {
@@ -202,6 +205,9 @@ fn cmd_compile(args: &[String]) {
             i += 2;
         } else if args[i] == "--check-packages" {
             check_packages = true;
+            i += 1;
+        } else if args[i] == "--require-main" {
+            require_main = true;
             i += 1;
         } else if args[i] == "--no-chir" {
             use_chir = false;
@@ -315,6 +321,19 @@ fn cmd_compile(args: &[String]) {
         eprintln!("合并 {} 个文件...", file_count);
         pipeline::merge_programs(units.into_iter().map(|(_, p)| p).collect())
     };
+
+    // w46a：可执行模块入口校验（仅 --require-main 时启用）。
+    // 对应 11.1.5.1(7)：以可执行方式编译的包若顶层没有 main，cjc 报 "'main' is missing"。
+    if require_main {
+        let has_main = program
+            .functions
+            .iter()
+            .any(|f| f.name == "main" && f.extern_import.is_none());
+        if !has_main {
+            eprintln!("语义错误: 'main' is missing（11.1.5.1(7)：构建可执行模块要求顶层 main）");
+            std::process::exit(1);
+        }
+    }
 
     // w30c：跨文件包的 private 成员访问（单文件编译兜底，仅辅助包确有 private 成员时触发）。
     let cross_errs = pipeline::check_cross_file_private_member_access(&base_dir, &input_files, &program);
