@@ -1416,7 +1416,25 @@ impl<'a> LoweringContext<'a> {
                     let n_chir = self.lower_expr(&args[0])?;
                     let n_chir = self.insert_cast_if_needed(n_chir, ValType::I32);
                     let init_chir = self.lower_expr(&args[1])?;
-                    let elem_size: i64 = 8; // i64 elements
+                    // 元素槽宽必须与 ArrayGet/ArraySet 的读写步长一致：二者均以
+                    // wasm_ty_bytes(elem_wasm) 为步长。此前硬编码 8 会让类/指针元素
+                    // （I32，4 字节）按 8 字节写入、却按 4 字节读出，导致索引错位。
+                    let elem_ast_ty = match &ty {
+                        crate::ast::Type::Array(e) => (**e).clone(),
+                        _ => crate::ast::Type::Int64,
+                    };
+                    let elem_wasm = match &elem_ast_ty {
+                        crate::ast::Type::Unit | crate::ast::Type::Nothing => ValType::I32,
+                        t => t.to_wasm(),
+                    };
+                    let elem_size: i64 = match elem_wasm {
+                        ValType::I64 | ValType::F64 => 8,
+                        _ => 4,
+                    };
+                    let elem_align: u32 = match elem_wasm {
+                        ValType::I64 | ValType::F64 => 3,
+                        _ => 2,
+                    };
                     let ptr_local = self.alloc_local_typed("__arr_ptr".into(), ValType::I32);
                     let n_local = self.alloc_local_typed("__arr_n".into(), ValType::I32);
                     let i_local = self.alloc_local_typed("__arr_i".into(), ValType::I32);
@@ -1456,10 +1474,12 @@ impl<'a> LoweringContext<'a> {
                         crate::chir::CHIRStmt::Let { local_idx: i_local, value: CHIRExpr::new(CHIRExprKind::Integer(0), crate::ast::Type::Int32, ValType::I32) },
                     ];
 
-                    // loop: while i < n { arr[4 + i*8] = init; i++ }
+                    // loop: while i < n { arr[4 + i*elem_size] = init; i++ }
                     let is_lambda_init = matches!(&args[1], Expr::Lambda { .. });
-                    let init_local = self.alloc_local_typed("__arr_init".into(), if is_lambda_init { ValType::I32 } else { ValType::I64 });
-                    stmts.push(crate::chir::CHIRStmt::Let { local_idx: init_local, value: init_chir });
+                    let init_local = self.alloc_local_typed("__arr_init".into(), if is_lambda_init { ValType::I32 } else { elem_wasm });
+                    // 非 lambda 的固定初值需按元素类型归一化（如类指针 I32）
+                    let init_value = if is_lambda_init { init_chir } else { self.insert_cast_if_needed(init_chir, elem_wasm) };
+                    stmts.push(crate::chir::CHIRStmt::Let { local_idx: init_local, value: init_value });
 
                     let cond = CHIRExpr::new(
                         CHIRExprKind::Binary {
@@ -1492,24 +1512,28 @@ impl<'a> LoweringContext<'a> {
                         crate::ast::Type::Int32, ValType::I32,
                     );
                     let store_value = if is_lambda_init {
-                        // call_indirect lambda(i) to get value
+                        // call_indirect lambda(i) to get value。
+                        // lambda 的声明返回类型默认等于参数类型（未标注时为 Int64），
+                        // 故以 (i64)->(i64) 调用；随后把结果转换为元素类型——类/指针元素
+                        // 在此从 I64 wrap 回 I32，从而按 4 字节正确落槽（与读侧步长一致）。
                         let i_as_i64 = CHIRExpr::new(
                             CHIRExprKind::Cast { expr: Box::new(i_get()), from_ty: ValType::I32, to_ty: ValType::I64 },
                             crate::ast::Type::Int64, ValType::I64,
                         );
-                        CHIRExpr::new(
+                        let call = CHIRExpr::new(
                             CHIRExprKind::CallIndirect {
                                 type_idx: 0,
                                 args: vec![i_as_i64],
                                 callee: Box::new(CHIRExpr::new(CHIRExprKind::Local(init_local), crate::ast::Type::Int32, ValType::I32)),
                             },
                             crate::ast::Type::Int64, ValType::I64,
-                        )
+                        );
+                        self.insert_cast_if_needed(call, elem_wasm)
                     } else {
-                        CHIRExpr::new(CHIRExprKind::Local(init_local), crate::ast::Type::Int64, ValType::I64)
+                        CHIRExpr::new(CHIRExprKind::Local(init_local), elem_ast_ty.clone(), elem_wasm)
                     };
                     let store_stmt = crate::chir::CHIRStmt::Expr(CHIRExpr::new(
-                        CHIRExprKind::Store { ptr: Box::new(elem_addr), value: Box::new(store_value), offset: 0, align: 3 },
+                        CHIRExprKind::Store { ptr: Box::new(elem_addr), value: Box::new(store_value), offset: 0, align: elem_align },
                         crate::ast::Type::Unit, ValType::I32,
                     ));
                     let inc_stmt = crate::chir::CHIRStmt::Assign {
@@ -1528,7 +1552,7 @@ impl<'a> LoweringContext<'a> {
 
                     return Ok(CHIRExpr::new(
                         CHIRExprKind::Block(crate::chir::CHIRBlock { stmts, result: Some(Box::new(ptr_get())) }),
-                        crate::ast::Type::Array(Box::new(crate::ast::Type::Int64)), ValType::I32,
+                        ty.clone(), ValType::I32,
                     ));
                 }
 
