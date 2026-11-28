@@ -22,6 +22,14 @@
 //! ## Globals
 //! - Global 0: heap_ptr (bump allocator 指针)
 //! - Global 1: free_list_head (空闲链表头指针，初始为 0)
+//!
+//! ## 内存增长 (GC 路线 A)
+//!
+//! 默认后端为"bump + `memory.grow` 兜底"：`__alloc` 走 bump 分支前先比较
+//! `heap_ptr + actual_size` 与当前线性内存大小；只有原本就会越界写入时
+//! 才按需 `memory.grow`（向上取整到页），grow 失败（返回 -1，通常意味着
+//! 触顶声明的 max 页数）才 `unreachable`。默认路径（容量足够）不执行任何
+//! grow 指令，行为与旧版完全一致。详见 `.compat-run/gc-research.md` 路线 A。
 
 use wasm_encoder::{Function as WasmFunc, Instruction, ValType};
 
@@ -47,13 +55,15 @@ fn mem_arg(offset: u64, align: u32) -> wasm_encoder::MemArg {
 /// 1. actual_size = align8(size + 8)
 /// 2. 搜索空闲链表找到 >= actual_size 的块
 /// 3. 找到则从链表移除，设 refcount=1，返回 user_ptr
-/// 4. 否则 bump 分配，设头部，返回 user_ptr
+/// 4. 否则 bump 分配；bump 前若 `heap_ptr + actual_size` 超出当前线性内存
+///    大小，则按需 `memory.grow` 扩容，grow 失败（-1）才 trap
 ///
 /// Globals: [0] = heap_ptr, [1] = free_list_head
 pub fn emit_alloc_func(heap_start: i32) -> WasmFunc {
     // params:  [0] size: i32
     // locals:  [1] actual_size, [2] prev_ptr, [3] curr_ptr, [4] block_ptr, [5] next_ptr
-    let mut f = WasmFunc::new(vec![(5, ValType::I32)]);
+    //          [6] new_end (bump 后的堆尾), [7] grow_pages
+    let mut f = WasmFunc::new(vec![(7, ValType::I32)]);
 
     // --- 计算 actual_size = align8(size + 8) ---
     f.instruction(&Instruction::LocalGet(0));
@@ -145,6 +155,44 @@ pub fn emit_alloc_func(heap_start: i32) -> WasmFunc {
     f.instruction(&Instruction::End); // end block
 
     // --- 空闲链表中未找到合适块，使用 bump allocation ---
+    // 先确保线性内存足够（GC 路线 A：原本会越界的路径才 grow）
+    // new_end = global0 + actual_size
+    f.instruction(&Instruction::GlobalGet(0));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(6));
+
+    // if new_end > memory.size * 65536 → grow
+    f.instruction(&Instruction::LocalGet(6));
+    f.instruction(&Instruction::MemorySize(0));
+    f.instruction(&Instruction::I32Const(16));
+    f.instruction(&Instruction::I32Shl);
+    f.instruction(&Instruction::I32GtU);
+    f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    {
+        // grow_pages = ceil((new_end - mem_bytes) / 65536)
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::MemorySize(0));
+        f.instruction(&Instruction::I32Const(16));
+        f.instruction(&Instruction::I32Shl);
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::I32Const(65535));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(16));
+        f.instruction(&Instruction::I32ShrU);
+        f.instruction(&Instruction::LocalSet(7));
+
+        // if memory.grow(grow_pages) == -1 → unreachable（触顶 max 或宿主拒绝）
+        f.instruction(&Instruction::LocalGet(7));
+        f.instruction(&Instruction::MemoryGrow(0));
+        f.instruction(&Instruction::I32Const(-1i32));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+    }
+    f.instruction(&Instruction::End);
+
     // block_ptr = global0
     f.instruction(&Instruction::GlobalGet(0));
     f.instruction(&Instruction::LocalSet(4));
@@ -443,6 +491,23 @@ mod tests {
         let f = emit_alloc_func(1024);
         // 验证函数能正常生成（不 panic）
         let _ = f;
+    }
+
+    #[test]
+    fn test_alloc_func_emits_memory_grow_fallback() {
+        use wasm_encoder::Encode;
+        let f = emit_alloc_func(0);
+        let mut bytes = Vec::new();
+        f.encode(&mut bytes);
+        // bump 分支应包含 memory.size (0x3F 0x00) 与 memory.grow (0x40 0x00)
+        assert!(
+            bytes.windows(2).any(|w| w == [0x3f, 0x00]),
+            "__alloc 应包含 memory.size 容量检查"
+        );
+        assert!(
+            bytes.windows(2).any(|w| w == [0x40, 0x00]),
+            "__alloc 应包含 memory.grow 兜底"
+        );
     }
 
     #[test]

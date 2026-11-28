@@ -558,6 +558,155 @@ pub fn merge_programs(programs: Vec<Program>) -> Program {
     merged
 }
 
+/// 多文件包结构校验（仅当多文件编译且显式请求 `--check-packages` 时调用）。
+///
+/// 覆盖 11 章多文件负例的包规则（这些规则只在把 aux `.cj` 一并交给编译器时
+/// 才可判定，单文件模式不受影响）：
+///   - 同一目录必须属于同一个包（11.1.4(6)，双包声明）；
+///   - 非默认包的末段名必须与所在目录名一致（11.1.3(5)，路径/包名不符）；
+///   - 包之间不得存在循环 import（11.1.3(17)）；
+///   - 程序入口 `main` 至多一个（11.1.5.1(7)，重复入口）。
+///
+/// 返回错误消息列表（空 = 通过）。仅在 `cmd_compile` 的多文件分支且带
+/// `--check-packages` 时启用，因此不影响单文件模式与 cjpm `build` 路径。
+pub fn check_multi_file_packages(units: &[(String, Program)]) -> Vec<String> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::path::Path;
+    let mut errors = Vec::new();
+
+    // 归一化默认包：None 与 "default" 都视为默认根包（不参与路径/包名比对）。
+    fn pkg_of(p: &Program) -> Option<&str> {
+        match p.package_name.as_deref() {
+            None | Some("default") => None,
+            Some(x) => Some(x),
+        }
+    }
+
+    // 1) 同一目录只能有一个包声明。
+    //    key = (目录, 包名 key)。包名 key 用 Option<String>，None 代表默认包。
+    let mut by_dir: HashMap<String, HashMap<Option<String>, Vec<String>>> = HashMap::new();
+    for (path, prog) in units {
+        let dir = Path::new(path)
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default();
+        by_dir
+            .entry(dir)
+            .or_default()
+            .entry(prog.package_name.clone())
+            .or_default()
+            .push(path.clone());
+    }
+    let mut dirs: Vec<_> = by_dir.keys().cloned().collect();
+    dirs.sort();
+    for dir in dirs {
+        let pkgs = &by_dir[&dir];
+        if pkgs.len() > 1 {
+            let mut names: Vec<String> = pkgs
+                .keys()
+                .map(|k| k.clone().unwrap_or_else(|| "<default>".to_string()))
+                .collect();
+            names.sort();
+            errors.push(format!(
+                "同一目录 '{}' 包含多个包声明: {}（11.1.4(6)：同一目录的源文件必须属于同一个包）",
+                dir,
+                names.join(", ")
+            ));
+        }
+    }
+
+    // 2) 非默认包的末段名必须等于所在目录名。
+    let mut path_units: Vec<(&String, &Program)> = units.iter().map(|(p, g)| (p, g)).collect();
+    path_units.sort_by(|a, b| a.0.cmp(b.0));
+    for (path, prog) in &path_units {
+        let Some(pkg) = pkg_of(prog) else { continue };
+        let last = pkg.rsplit('.').next().unwrap_or(pkg);
+        if let Some(base) = Path::new(path).parent().and_then(|d| d.file_name()) {
+            let base = base.to_string_lossy();
+            if last != base {
+                errors.push(format!(
+                    "包名 '{}' 与所在目录名 '{}' 不一致（11.1.3(5)：导入路径与包名必须匹配）",
+                    pkg, base
+                ));
+            }
+        }
+    }
+
+    // 3) 包间循环 import。
+    let known: HashSet<String> = units
+        .iter()
+        .filter_map(|(_, p)| pkg_of(p).map(|s| s.to_string()))
+        .collect();
+    let mut graph: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for (_, prog) in units {
+        let Some(pkg) = pkg_of(prog) else { continue };
+        let edges = graph.entry(pkg.to_string()).or_default();
+        for imp in &prog.imports {
+            let target = imp.module_path.join(".");
+            if target != pkg && known.contains(&target) {
+                edges.insert(target);
+            }
+        }
+    }
+    // DFS 三色标记找环。
+    let mut color: HashMap<String, u8> = HashMap::new(); // 0=白 1=灰 2=黑
+    let mut cycle_found = false;
+    fn dfs(
+        node: &str,
+        graph: &HashMap<String, BTreeSet<String>>,
+        color: &mut HashMap<String, u8>,
+        cycle_found: &mut bool,
+    ) {
+        color.insert(node.to_string(), 1);
+        if let Some(neis) = graph.get(node) {
+            for n in neis {
+                match color.get(n).copied().unwrap_or(0) {
+                    1 => *cycle_found = true,
+                    0 => dfs(n, graph, color, cycle_found),
+                    _ => {}
+                }
+                if *cycle_found {
+                    break;
+                }
+            }
+        }
+        color.insert(node.to_string(), 2);
+    }
+    let mut nodes: Vec<String> = graph.keys().cloned().collect();
+    nodes.sort();
+    for node in &nodes {
+        if color.get(node).copied().unwrap_or(0) == 0 {
+            dfs(node, &graph, &mut color, &mut cycle_found);
+            if cycle_found {
+                break;
+            }
+        }
+    }
+    if cycle_found {
+        errors.push(
+            "包之间存在循环 import 依赖（11.1.3(17)：包之间禁止循环依赖导入）".to_string(),
+        );
+    }
+
+    // 4) 程序入口 main 至多一个。
+    let mut main_count = 0usize;
+    for (_, prog) in units {
+        for f in &prog.functions {
+            if f.name == "main" && f.extern_import.is_none() {
+                main_count += 1;
+            }
+        }
+    }
+    if main_count > 1 {
+        errors.push(format!(
+            "存在多个程序入口 main（共 {} 处）（11.1.5.1(7)：发现多个 main 方法应报错）",
+            main_count
+        ));
+    }
+
+    errors
+}
+
 /// 判断是否为 L1 std 模块（含子包，如 std.crypto.digest）
 fn is_l1_std_module(module_path: &[String]) -> bool {
     if module_path.is_empty() || module_path[0] != "std" {

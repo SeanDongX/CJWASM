@@ -34,8 +34,9 @@ const IDX_RANDOM_GET: u32 = 3;
 const IMPORT_COUNT: u32 = 4;
 
 /// 内存起始页（1页 = 64 KiB）
-const MEMORY_PAGES_MIN: u64 = 4;
-const MEMORY_PAGES_MAX: u64 = 64;
+const MEMORY_PAGES_MIN: u64 = 4; // 256KB 初始容量（覆盖绝大多数一次性运行）
+/// 最大页数：__alloc 在容量不足时按需 memory.grow，最多可长到 256 页 = 16MB
+const MEMORY_PAGES_MAX: u64 = 256;
 
 // ─── I/O 内存布局 ─────────────────────────────────────────────────────────────
 

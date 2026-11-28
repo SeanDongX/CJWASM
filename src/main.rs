@@ -18,6 +18,7 @@ fn print_usage() {
     eprintln!("  -o <文件>        指定输出文件名");
     eprintln!("  --use-chir       使用 CHIR 中间表示编译（实验性）");
     eprintln!("  --checked        开启运行时检查（整数溢出/数组越界/断言 trap）");
+    eprintln!("  --check-packages 多文件编译时校验包结构（同目录单包/路径包名/循环 import/入口唯一）");
     eprintln!();
     eprintln!("示例:");
     eprintln!("  cjwasm build                       # 编译 cjpm 工程");
@@ -192,11 +193,16 @@ fn cmd_compile(args: &[String]) {
     let mut input_files: Vec<String> = Vec::new();
     let mut output_path: Option<String> = None;
     let mut use_chir = true;
+    // w45a：多文件包结构校验（仅多文件 + 显式请求时启用；默认关闭，保持旧行为）。
+    let mut check_packages = false;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "-o" && i + 1 < args.len() {
             output_path = Some(args[i + 1].clone());
             i += 2;
+        } else if args[i] == "--check-packages" {
+            check_packages = true;
+            i += 1;
         } else if args[i] == "--no-chir" {
             use_chir = false;
             i += 1;
@@ -238,7 +244,7 @@ fn cmd_compile(args: &[String]) {
         .unwrap_or(Path::new("."))
         .to_path_buf();
 
-    let mut programs = Vec::new();
+    let mut units: Vec<(String, cjwasm::ast::Program)> = Vec::new();
     let mut visited = HashSet::new();
 
     for file in &input_files {
@@ -255,14 +261,14 @@ fn cmd_compile(args: &[String]) {
                 std::process::exit(1);
             }
         };
-        programs.push(prog);
+        units.push((file.clone(), prog));
     }
 
     // 自动解析 import 依赖（含 L1 std vendor）
     let vendor_std = pipeline::get_vendor_std_dir(&base_dir);
     let base_dirs = [base_dir.as_path()];
     let mut import_queue = Vec::new();
-    for prog in &programs {
+    for (_, prog) in &units {
         import_queue.extend(pipeline::collect_import_files(
             prog,
             &base_dirs,
@@ -287,15 +293,27 @@ fn cmd_compile(args: &[String]) {
             vendor_std.as_deref(),
         );
         import_queue.extend(new_imports);
-        programs.push(prog);
+        units.push((path_str, prog));
     }
 
-    let mut program = if programs.len() == 1 {
-        programs.into_iter().next().unwrap()
+    // w45a：多文件包结构校验（仅多文件 + --check-packages 时启用）。
+    // 覆盖 11 章多文件负例的包规则，单文件/默认调用零影响。
+    if check_packages && units.len() > 1 {
+        let errs = pipeline::check_multi_file_packages(&units);
+        if !errs.is_empty() {
+            for e in &errs {
+                eprintln!("语义错误: {}", e);
+            }
+            std::process::exit(1);
+        }
+    }
+
+    let mut program = if units.len() == 1 {
+        units.into_iter().next().unwrap().1
     } else {
-        let file_count = programs.len();
+        let file_count = units.len();
         eprintln!("合并 {} 个文件...", file_count);
-        pipeline::merge_programs(programs)
+        pipeline::merge_programs(units.into_iter().map(|(_, p)| p).collect())
     };
 
     // w30c：跨文件包的 private 成员访问（单文件编译兜底，仅辅助包确有 private 成员时触发）。
